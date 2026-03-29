@@ -551,7 +551,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
 }
 
 async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
-    let result = daemon.execute_query(command).await?;
+    let result = daemon.execute_query(command, uuid::Uuid::new_v4()).await?;
     match format {
         OutputFormat::Human => {
             print!("{}", format_command_result(&result));

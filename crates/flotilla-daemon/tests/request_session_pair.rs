@@ -22,12 +22,15 @@ async fn in_memory_request_client_routes_remote_command_result() {
     // broadcasting via CommandFinished, so use execute_query.
     let result = topology
         .client
-        .execute_query(Command {
-            host: Some(HostName::new("follower")),
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::QueryHostStatus { target_host: "follower".into() },
-        })
+        .execute_query(
+            Command {
+                host: Some(HostName::new("follower")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryHostStatus { target_host: "follower".into() },
+            },
+            uuid::Uuid::nil(),
+        )
         .await
         .expect("dispatch remote host status query");
 

@@ -161,7 +161,7 @@ async fn dispatch_request_with_state(
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, agent_state_store);
+    let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, agent_state_store, uuid::Uuid::nil());
     request_dispatcher.dispatch(id, request).await
 }
 
@@ -536,7 +536,7 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store);
+    let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil());
 
     // Query commands are executed locally and return QueryResult directly,
     // bypassing the remote command router entirely.
@@ -589,7 +589,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store);
+    let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil());
 
     let response = request_dispatcher
         .dispatch(402, Request::Execute {
@@ -1128,7 +1128,8 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
             &pending_remote_cancels_for_task,
             &next_remote_command_id_for_task,
         );
-        let request_dispatcher = RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task);
+        let request_dispatcher =
+            RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task, uuid::Uuid::nil());
         request_dispatcher.dispatch(41, Request::Cancel { command_id: 1u64 << 62 }).await
     });
 
@@ -1246,7 +1247,8 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
             &pending_remote_cancels_for_task,
             &next_remote_command_id_for_task,
         );
-        let request_dispatcher = RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task);
+        let request_dispatcher =
+            RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task, uuid::Uuid::nil());
         request_dispatcher.dispatch(403, Request::Cancel { command_id }).await
     });
 

@@ -27,6 +27,7 @@ struct CursorState {
     has_more: bool,
     total: Option<u32>,
     last_accessed: tokio::time::Instant,
+    session_id: uuid::Uuid,
 }
 
 pub struct GitHubIssueQueryService {
@@ -34,12 +35,21 @@ pub struct GitHubIssueQueryService {
     api: Arc<dyn GhApi>,
     runner: Arc<dyn CommandRunner>,
     cursors: Mutex<HashMap<CursorId, CursorState>>,
+    /// Tracks which session owns which cursors for disconnect cleanup.
+    session_cursors: Mutex<HashMap<uuid::Uuid, Vec<CursorId>>>,
     next_cursor_id: std::sync::atomic::AtomicU64,
 }
 
 impl GitHubIssueQueryService {
     pub fn new(repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { repo_slug, api, runner, cursors: Mutex::new(HashMap::new()), next_cursor_id: std::sync::atomic::AtomicU64::new(1) }
+        Self {
+            repo_slug,
+            api,
+            runner,
+            cursors: Mutex::new(HashMap::new()),
+            session_cursors: Mutex::new(HashMap::new()),
+            next_cursor_id: std::sync::atomic::AtomicU64::new(1),
+        }
     }
 }
 
@@ -51,7 +61,7 @@ fn expire_stale_cursors(cursors: &mut HashMap<CursorId, CursorState>) {
 
 #[async_trait]
 impl IssueQueryService for GitHubIssueQueryService {
-    async fn open_query(&self, _repo: &Path, params: IssueQuery) -> Result<CursorId, String> {
+    async fn open_query(&self, _repo: &Path, params: IssueQuery, session_id: uuid::Uuid) -> Result<CursorId, String> {
         let mut cursors = self.cursors.lock().await;
         expire_stale_cursors(&mut cursors);
 
@@ -64,8 +74,12 @@ impl IssueQueryService for GitHubIssueQueryService {
             has_more: true,
             total: None,
             last_accessed: tokio::time::Instant::now(),
+            session_id,
         };
         cursors.insert(cursor_id.clone(), state);
+        drop(cursors);
+
+        self.session_cursors.lock().await.entry(session_id).or_default().push(cursor_id.clone());
         Ok(cursor_id)
     }
 
@@ -129,7 +143,32 @@ impl IssueQueryService for GitHubIssueQueryService {
     }
 
     async fn close_query(&self, cursor: &CursorId) {
-        self.cursors.lock().await.remove(cursor);
+        let mut cursors = self.cursors.lock().await;
+        if let Some(state) = cursors.remove(cursor) {
+            drop(cursors);
+            let mut session_map = self.session_cursors.lock().await;
+            if let Some(list) = session_map.get_mut(&state.session_id) {
+                list.retain(|c| c != cursor);
+                if list.is_empty() {
+                    session_map.remove(&state.session_id);
+                }
+            }
+        }
+    }
+
+    async fn disconnect_session(&self, session_id: uuid::Uuid) -> Vec<CursorId> {
+        let cursor_ids = {
+            let mut session_map = self.session_cursors.lock().await;
+            session_map.remove(&session_id).unwrap_or_default()
+        };
+        if !cursor_ids.is_empty() {
+            let mut cursors = self.cursors.lock().await;
+            for cursor_id in &cursor_ids {
+                cursors.remove(cursor_id);
+            }
+            tracing::debug!(count = cursor_ids.len(), %session_id, "cleaned up cursors for disconnected session");
+        }
+        cursor_ids
     }
 
     async fn fetch_by_ids(&self, _repo: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
@@ -223,14 +262,14 @@ mod tests {
     #[tokio::test]
     async fn open_query_returns_valid_cursor_id() {
         let service = mock_service(vec![]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
         assert!(cursor.0.starts_with("gh-"), "cursor id should start with gh- prefix");
     }
 
     #[tokio::test]
     async fn close_query_removes_cursor() {
         let service = mock_service(vec![]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
         service.close_query(&cursor).await;
 
         let result = service.fetch_page(&cursor, 10).await;
@@ -251,7 +290,7 @@ mod tests {
     async fn fetch_page_returns_issues_from_list_endpoint() {
         let body = make_issues_json(3);
         let service = mock_service(vec![ok_response(&body, false)]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
         let page = service.fetch_page(&cursor, 10).await.unwrap();
         assert_eq!(page.items.len(), 3);
         assert!(!page.has_more);
@@ -263,7 +302,7 @@ mod tests {
     async fn fetch_page_with_search_uses_search_endpoint() {
         let body = make_search_json(2, 5);
         let service = mock_service(vec![ok_response(&body, true)]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery { search: Some("bug".into()) }).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery { search: Some("bug".into()) }, uuid::Uuid::nil()).await.unwrap();
         let page = service.fetch_page(&cursor, 10).await.unwrap();
         assert_eq!(page.items.len(), 2);
         assert!(page.has_more);
@@ -275,7 +314,7 @@ mod tests {
         let body1 = make_issues_json(2);
         let body2 = make_issues_json(1);
         let service = mock_service(vec![ok_response(&body1, true), ok_response(&body2, false)]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
 
         let page1 = service.fetch_page(&cursor, 2).await.unwrap();
         assert_eq!(page1.items.len(), 2);
@@ -290,7 +329,7 @@ mod tests {
     async fn fetch_page_when_exhausted_returns_empty() {
         let body = make_issues_json(1);
         let service = mock_service(vec![ok_response(&body, false)]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
 
         let _page1 = service.fetch_page(&cursor, 10).await.unwrap();
         let page2 = service.fetch_page(&cursor, 10).await.unwrap();
@@ -306,7 +345,7 @@ mod tests {
             {"number": 3, "title": "Another issue", "labels": []}
         ]"#;
         let service = mock_service(vec![ok_response(body, false)]);
-        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
         let page = service.fetch_page(&cursor, 10).await.unwrap();
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].0, "1");
@@ -352,6 +391,7 @@ mod tests {
         let mut cursors = HashMap::new();
         let fresh_id = CursorId::new("fresh");
         let stale_id = CursorId::new("stale");
+        let session = uuid::Uuid::new_v4();
 
         cursors.insert(fresh_id.clone(), CursorState {
             query: IssueQuery::default(),
@@ -360,6 +400,7 @@ mod tests {
             has_more: true,
             total: None,
             last_accessed: tokio::time::Instant::now(),
+            session_id: session,
         });
 
         // Create a stale cursor by setting last_accessed far in the past
@@ -370,6 +411,7 @@ mod tests {
             has_more: true,
             total: None,
             last_accessed: tokio::time::Instant::now() - std::time::Duration::from_secs(CURSOR_EXPIRY_SECS + 1),
+            session_id: session,
         });
 
         assert_eq!(cursors.len(), 2);
@@ -380,13 +422,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_session_removes_all_session_cursors() {
+        let service = mock_service(vec![]);
+        let session_a = uuid::Uuid::new_v4();
+        let session_b = uuid::Uuid::new_v4();
+
+        let cursor1 = service.open_query(Path::new("/repo"), IssueQuery::default(), session_a).await.unwrap();
+        let cursor2 = service.open_query(Path::new("/repo"), IssueQuery::default(), session_a).await.unwrap();
+        let cursor3 = service.open_query(Path::new("/repo"), IssueQuery::default(), session_b).await.unwrap();
+
+        // Disconnect session A — its cursors should be gone
+        service.disconnect_session(session_a).await;
+
+        assert!(service.fetch_page(&cursor1, 10).await.is_err(), "cursor1 should be cleaned up");
+        assert!(service.fetch_page(&cursor2, 10).await.is_err(), "cursor2 should be cleaned up");
+
+        // Session B's cursor is unaffected (but has no mock response, so just check the cursor map)
+        assert!(service.cursors.lock().await.contains_key(&cursor3), "cursor3 should still exist");
+    }
+
+    #[tokio::test]
+    async fn close_query_removes_from_session_cursors() {
+        let service = mock_service(vec![]);
+        let session = uuid::Uuid::new_v4();
+
+        let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), session).await.unwrap();
+        assert_eq!(service.session_cursors.lock().await.get(&session).map(|v| v.len()), Some(1));
+
+        service.close_query(&cursor).await;
+        // Session entry should be cleaned up since it had only one cursor
+        assert!(service.session_cursors.lock().await.get(&session).is_none());
+    }
+
+    #[tokio::test]
     async fn multiple_cursors_are_independent() {
         let body1 = make_issues_json(2);
         let body2 = make_search_json(1, 1);
         let service = mock_service(vec![ok_response(&body1, false), ok_response(&body2, false)]);
 
-        let cursor1 = service.open_query(Path::new("/repo"), IssueQuery::default()).await.unwrap();
-        let cursor2 = service.open_query(Path::new("/repo"), IssueQuery { search: Some("bug".into()) }).await.unwrap();
+        let cursor1 = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
+        let cursor2 = service.open_query(Path::new("/repo"), IssueQuery { search: Some("bug".into()) }, uuid::Uuid::nil()).await.unwrap();
 
         let page1 = service.fetch_page(&cursor1, 10).await.unwrap();
         let page2 = service.fetch_page(&cursor2, 10).await.unwrap();

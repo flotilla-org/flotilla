@@ -1581,6 +1581,27 @@ impl InProcessDaemon {
             .ok_or_else(|| "no issue query service available on this host".to_string())
     }
 
+    /// Clean up all issue query cursors owned by the given client session.
+    ///
+    /// Called when a socket client disconnects. Iterates all tracked repos
+    /// and delegates to each `IssueQueryService::disconnect_session`.
+    pub async fn disconnect_client_session(&self, session_id: uuid::Uuid) {
+        let repos = self.repos.read().await;
+        let mut removed_cursors = Vec::new();
+        for state in repos.values() {
+            if let Some(service) = state.registry().issue_query_services.preferred() {
+                removed_cursors.extend(service.disconnect_session(session_id).await);
+            }
+        }
+        if !removed_cursors.is_empty() {
+            let mut map = self.cursor_repo_map.write().await;
+            for cursor_id in &removed_cursors {
+                map.remove(cursor_id);
+            }
+            debug!(%session_id, count = removed_cursors.len(), "cleaned up cursors for disconnected client session");
+        }
+    }
+
     pub async fn execute_with_remote_executor(
         &self,
         command: Command,
@@ -2059,7 +2080,7 @@ impl DaemonHandle for InProcessDaemon {
         self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false).await
     }
 
-    async fn execute_query(&self, command: Command) -> Result<flotilla_protocol::CommandValue, String> {
+    async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         use flotilla_protocol::CommandAction;
         match &command.action {
             CommandAction::QueryRepoDetail { repo } => match self.get_repo_detail_internal(repo).await {
@@ -2091,7 +2112,7 @@ impl DaemonHandle for InProcessDaemon {
                 let identity =
                     self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| "no tracked repo for path".to_string())?;
                 let service = self.get_issue_query_service(&repo_path).await?;
-                let cursor = service.open_query(&repo_path, params.clone()).await?;
+                let cursor = service.open_query(&repo_path, params.clone(), session_id).await?;
                 self.cursor_repo_map.write().await.insert(cursor.clone(), identity);
                 Ok(flotilla_protocol::CommandValue::IssueQueryOpened { cursor })
             }

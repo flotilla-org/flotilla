@@ -636,7 +636,7 @@ impl DaemonHandle for SocketDaemon {
         }
     }
 
-    async fn execute_query(&self, command: Command) -> Result<flotilla_protocol::commands::CommandValue, String> {
+    async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::commands::CommandValue, String> {
         match into_success_response(self.request(Request::Execute { command }).await?)? {
             Response::QueryResult { value, .. } => Ok(value),
             Response::Execute { command_id } => Err(format!("expected QueryResult, got Execute response for command {command_id}")),

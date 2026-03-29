@@ -8,7 +8,7 @@ use tokio::time::Instant;
 /// Execute a query command via execute_query and return the result directly.
 async fn run_query(daemon: &dyn DaemonHandle, action: CommandAction) -> CommandValue {
     let command = Command { host: None, provisioning_target: None, context_repo: None, action };
-    daemon.execute_query(command).await.expect("execute_query")
+    daemon.execute_query(command, uuid::Uuid::nil()).await.expect("execute_query")
 }
 
 #[tokio::test]

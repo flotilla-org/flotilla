@@ -14,6 +14,7 @@ pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
     remote_command_router: &'a RemoteCommandRouter,
     agent_state_store: &'a SharedAgentStateStore,
+    session_id: uuid::Uuid,
 }
 
 impl<'a> RequestDispatcher<'a> {
@@ -21,8 +22,9 @@ impl<'a> RequestDispatcher<'a> {
         daemon: &'a Arc<InProcessDaemon>,
         remote_command_router: &'a RemoteCommandRouter,
         agent_state_store: &'a SharedAgentStateStore,
+        session_id: uuid::Uuid,
     ) -> Self {
-        Self { daemon, remote_command_router, agent_state_store }
+        Self { daemon, remote_command_router, agent_state_store, session_id }
     }
 
     pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
@@ -40,7 +42,7 @@ impl<'a> RequestDispatcher<'a> {
             Request::Execute { command } => {
                 if command.action.is_query() {
                     // Query commands: execute synchronously, return result directly
-                    match self.daemon.execute_query(command).await {
+                    match self.daemon.execute_query(command, self.session_id).await {
                         Ok(value) => Message::ok_response(id, Response::QueryResult { command_id: 0, value }),
                         Err(e) => Message::error_response(id, e),
                     }

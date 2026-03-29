@@ -33,25 +33,28 @@ impl ClientConnection {
     }
 
     pub(super) async fn run(self, session: Arc<MessageSession>, first_id: u64, first_request: Request) {
-        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session);
+        // Legacy clients without Hello handshake get a random session ID.
+        let session_id = uuid::Uuid::new_v4();
+        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, session_id);
 
         let first_response = request_dispatcher.dispatch(first_id, first_request).await;
         if session.write(first_response).await.is_ok() {
             request_loop(&session, &request_dispatcher, &mut shutdown_rx).await;
         }
 
-        self.finish_session(event_task);
+        self.finish_session(event_task, session_id).await;
     }
 
     /// Run a stateful client session that began with a Hello handshake.
     ///
     /// Unlike `run`, the first message (Hello) has already been consumed and
     /// replied to, so the loop starts by awaiting the next message. The
-    /// `_client_session_id` is stored for future cursor ownership (Task 12).
-    pub(super) async fn run_stateful(self, session: Arc<MessageSession>, _client_session_id: uuid::Uuid) {
-        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session);
+    /// `client_session_id` ties cursor ownership to this connection for
+    /// cleanup on disconnect.
+    pub(super) async fn run_stateful(self, session: Arc<MessageSession>, client_session_id: uuid::Uuid) {
+        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, client_session_id);
         request_loop(&session, &request_dispatcher, &mut shutdown_rx).await;
-        self.finish_session(event_task);
+        self.finish_session(event_task, client_session_id).await;
     }
 
     /// Common setup: increment client count, subscribe to events, create dispatcher.
@@ -59,7 +62,11 @@ impl ClientConnection {
     /// Returns the event relay task, request dispatcher, and the shutdown receiver
     /// (moved out of `self` so the caller can pass it to `request_loop` without
     /// conflicting borrows).
-    fn start_session(&self, session: &Arc<MessageSession>) -> (tokio::task::JoinHandle<()>, RequestDispatcher<'_>, watch::Receiver<bool>) {
+    fn start_session(
+        &self,
+        session: &Arc<MessageSession>,
+        session_id: uuid::Uuid,
+    ) -> (tokio::task::JoinHandle<()>, RequestDispatcher<'_>, watch::Receiver<bool>) {
         let count = self.client_count.fetch_add(1, Ordering::SeqCst) + 1;
         info!(%count, "client connected");
         self.client_notify.notify_one();
@@ -83,13 +90,14 @@ impl ClientConnection {
             }
         });
 
-        let request_dispatcher = RequestDispatcher::new(&self.daemon, &self.remote_command_router, &self.agent_state_store);
+        let request_dispatcher = RequestDispatcher::new(&self.daemon, &self.remote_command_router, &self.agent_state_store, session_id);
         (event_task, request_dispatcher, self.shutdown_rx.clone())
     }
 
-    /// Common teardown: abort event relay, decrement client count.
-    fn finish_session(&self, event_task: tokio::task::JoinHandle<()>) {
+    /// Common teardown: abort event relay, clean up session cursors, decrement client count.
+    async fn finish_session(&self, event_task: tokio::task::JoinHandle<()>, session_id: uuid::Uuid) {
         event_task.abort();
+        self.daemon.disconnect_client_session(session_id).await;
         let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
         info!(%count, "client disconnected");
         self.client_notify.notify_one();

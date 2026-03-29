@@ -34,8 +34,9 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
         let search_query = params.search.clone();
         let daemon = app.daemon.clone();
         let tx = app.issue_update_tx.clone();
+        let session_id = app.session_id;
         tokio::spawn(async move {
-            match daemon.execute_query(cmd).await {
+            match daemon.execute_query(cmd, session_id).await {
                 Ok(CommandValue::IssueQueryOpened { cursor }) => {
                     if is_search {
                         let _ = tx.send(IssueQueryUpdate::SearchCursorOpened {

@@ -5,6 +5,7 @@ use flotilla_protocol::{
     commands::CommandValue, Command, DaemonEvent, RepoInfo, RepoSelector, RepoSnapshot, StatusResponse, StreamKey, TopologyResponse,
 };
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 /// The boundary between daemon and client.
 /// Both InProcessDaemon and SocketDaemon implement this.
@@ -42,7 +43,8 @@ pub trait DaemonHandle: Send + Sync {
 
     /// Execute a query command synchronously. Returns the result directly
     /// without broadcasting. Only valid for commands where `action.is_query()`.
-    async fn execute_query(&self, command: Command) -> Result<CommandValue, String>;
+    /// The `session_id` ties cursor ownership to the calling client session.
+    async fn execute_query(&self, command: Command, session_id: Uuid) -> Result<CommandValue, String>;
 
     /// High-level status: repos, health, counts.
     async fn get_status(&self) -> Result<StatusResponse, String>;

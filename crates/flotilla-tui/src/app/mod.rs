@@ -280,6 +280,9 @@ pub struct App {
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
     /// Receiver half, drained each event-loop iteration.
     pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
+    /// Client session ID for cursor ownership. Passed to `execute_query` so
+    /// the daemon can associate cursors with this session for disconnect cleanup.
+    pub session_id: uuid::Uuid,
 }
 
 impl App {
@@ -332,6 +335,7 @@ impl App {
             issue_views: HashMap::new(),
             issue_update_tx,
             issue_update_rx,
+            session_id: uuid::Uuid::new_v4(),
         }
     }
 
@@ -548,6 +552,7 @@ impl App {
     fn spawn_fetch_page(&self, repo: RepoIdentity, cursor: flotilla_protocol::issue_query::CursorId, count: usize) {
         let daemon = self.daemon.clone();
         let tx = self.issue_update_tx.clone();
+        let session_id = self.session_id;
         tokio::spawn(async move {
             let cmd = Command {
                 host: None,
@@ -555,7 +560,7 @@ impl App {
                 context_repo: None,
                 action: CommandAction::QueryIssueFetchPage { cursor: cursor.clone(), count },
             };
-            match daemon.execute_query(cmd).await {
+            match daemon.execute_query(cmd, session_id).await {
                 Ok(CommandValue::IssuePage(page)) => {
                     let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched { repo, cursor, page });
                 }
@@ -583,6 +588,7 @@ impl App {
         let daemon = self.daemon.clone();
         let tx = self.issue_update_tx.clone();
         let repo_id = repo_identity.clone();
+        let session_id = self.session_id;
         let cmd = Command {
             host: None,
             provisioning_target: None,
@@ -593,7 +599,7 @@ impl App {
             },
         };
         tokio::spawn(async move {
-            match daemon.execute_query(cmd).await {
+            match daemon.execute_query(cmd, session_id).await {
                 Ok(CommandValue::IssueQueryOpened { cursor }) => {
                     let _ = tx.send(issue_view::IssueQueryUpdate::DefaultCursorOpened { repo: repo_id, cursor });
                 }

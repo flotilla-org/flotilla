@@ -1228,6 +1228,7 @@ dependencies = [
  "tracing-subscriber",
  "tui-input",
  "unicode-width",
+ "uuid",
 ]
 
 [[package]]

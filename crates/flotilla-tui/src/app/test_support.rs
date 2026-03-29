@@ -52,7 +52,7 @@ impl DaemonHandle for StubDaemon {
         Ok(1)
     }
 
-    async fn execute_query(&self, _command: Command) -> Result<flotilla_protocol::CommandValue, String> {
+    async fn execute_query(&self, _command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         Err("stub".into())
     }
 
