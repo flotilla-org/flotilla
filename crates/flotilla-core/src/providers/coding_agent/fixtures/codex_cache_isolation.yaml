@@ -1,3 +1,7 @@
+# Synthetic fixture: verifies per-repo cache isolation by calling list_sessions
+# for two repos on one agent. Recording requires two repos each with active Codex
+# tasks, which is hard to maintain as stable test state.
+# TODO: replace with recorded fixture when test account setup is automated.
 interactions:
 # repo-a: environment lookup returns env-a
 - channel: http
