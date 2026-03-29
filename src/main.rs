@@ -235,6 +235,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     // Spawn daemon init on a separate task so it runs concurrently with the splash
     // (show_splash uses blocking crossterm::event::poll calls).
     let daemon_log_path = paths.state_dir.as_path().join("daemon.log");
+    let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
         let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
@@ -273,6 +274,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
             flotilla_tui::terminal::restore_terminal();
             eprintln!("Error: {e}");
             eprintln!("  Check daemon log at {}", daemon_log_path.display());
+            eprintln!("  Check panic log at {}", daemon_panic_log_path.display());
             std::process::exit(1);
         }
         Err(e) => {

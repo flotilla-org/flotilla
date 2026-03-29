@@ -129,7 +129,7 @@ def topology():
         for node in ("node-a", "node-b"):
             docker_exec(
                 node,
-                "nohup flotilla daemon > /tmp/flotilla.log 2>&1 &",
+                "nohup flotilla daemon >/dev/null 2>~/.config/flotilla/daemon-panic.log &",
             )
 
         # Wait for daemon readiness on each node
@@ -165,13 +165,14 @@ def topology():
         yield {"node-a": "node-a", "node-b": "node-b"}
 
     finally:
-        # Print daemon logs for debugging
+        # Print daemon logs for debugging (daemon writes to state_dir/daemon.log)
         for node in ("node-a", "node-b"):
-            result = docker_exec(node, "cat /tmp/flotilla.log")
+            result = docker_exec(node, "cat ~/.local/state/flotilla/daemon.log")
             if result.stdout:
                 print(f"\n=== {node} daemon log ===\n{result.stdout}")
-            if result.stderr:
-                print(f"\n=== {node} daemon stderr ===\n{result.stderr}")
+            panic_result = docker_exec(node, "cat ~/.config/flotilla/daemon-panic.log")
+            if panic_result.stdout:
+                print(f"\n=== {node} daemon panic log ===\n{panic_result.stdout}")
 
         result = subprocess.run(
             [

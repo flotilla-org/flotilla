@@ -563,7 +563,11 @@ impl InProcessDaemon {
         }
     }
 
-    async fn resolve_checkout_selector(&self, selector: &flotilla_protocol::CheckoutSelector) -> Result<(PathBuf, String), String> {
+    async fn resolve_checkout_selector(
+        &self,
+        selector: &flotilla_protocol::CheckoutSelector,
+        target_host: Option<&HostName>,
+    ) -> Result<(PathBuf, String), String> {
         let peer_providers = self.peer_providers.read().await;
         let repos = self.repos.read().await;
         let mut matches = Vec::new();
@@ -580,6 +584,11 @@ impl InProcessDaemon {
                 &snapshot_owned.providers
             };
             for (host_path, checkout) in &providers.checkouts {
+                if let Some(host) = target_host {
+                    if host_path.host != *host {
+                        continue;
+                    }
+                }
                 let matched = match selector {
                     flotilla_protocol::CheckoutSelector::Path(path) => host_path.path == *path,
                     flotilla_protocol::CheckoutSelector::Query(query) => {
@@ -603,7 +612,9 @@ impl InProcessDaemon {
 
         match &command.action {
             CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await,
-            CommandAction::RemoveCheckout { checkout, .. } => self.resolve_checkout_selector(checkout).await.map(|(repo, _)| repo),
+            CommandAction::RemoveCheckout { checkout, .. } => {
+                self.resolve_checkout_selector(checkout, command.host.as_ref()).await.map(|(repo, _)| repo)
+            }
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
             CommandAction::FetchCheckoutStatus { .. }
             | CommandAction::OpenChangeRequest { .. }
