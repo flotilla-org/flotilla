@@ -72,18 +72,18 @@ impl<'a> CheckoutFlow<'a> {
     async fn checkout_created_result(&self) -> Result<CommandValue, String> {
         let checkout_service = CheckoutService::new(self.registry);
 
-        // In environment context, skip host-side branch validation — the
-        // CloneCheckoutManager validates during clone (git clone -b fails if
-        // branch doesn't exist; --no-checkout handles fresh branches).
-        if !self.is_environment {
-            checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
-        }
-
         if let Some(path) = self.existing_checkout_path() {
             if matches!(self.intent, CheckoutIntent::FreshBranch) {
                 return Err(format!("branch already exists: {}", self.branch));
             }
             return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path: path.into_path_buf() });
+        }
+
+        // In environment context, skip host-side branch validation — the
+        // CloneCheckoutManager validates during clone (git clone -b fails if
+        // branch doesn't exist; --no-checkout handles fresh branches).
+        if !self.is_environment {
+            checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
         }
 
         let path = checkout_service.create_checkout(self.repo_root, self.branch, self.create_branch).await?;

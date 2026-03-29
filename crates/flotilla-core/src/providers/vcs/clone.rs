@@ -44,6 +44,15 @@ impl CloneCheckoutManager {
         Ok(url.trim().to_string())
     }
 
+    /// Resolve the reference repo's current HEAD commit so fresh branch creation
+    /// does not depend on the remote advertising a usable symbolic HEAD.
+    async fn reference_head_commit(&self) -> Result<String, String> {
+        let ref_dir = self.ref_dir_str()?;
+        let commit =
+            self.runner.run("git", &["--git-dir", ref_dir, "rev-parse", "HEAD"], self.reference_dir.as_path(), &ChannelLabel::Noop).await?;
+        Ok(commit.trim().to_string())
+    }
+
     /// Sanitize a branch name for use as a directory name.
     /// Uses `%2F` encoding for `/` to avoid collisions (e.g. `feat/foo` vs `feat-foo`).
     fn sanitize_branch(branch: &str) -> String {
@@ -132,8 +141,11 @@ impl super::CheckoutManager for CloneCheckoutManager {
 
         if create_branch {
             self.validate_target(_repo_root, branch, flotilla_protocol::CheckoutIntent::FreshBranch).await?;
+            let start_point = self.reference_head_commit().await?;
 
-            // Fresh branch: clone without checkout, then create branch
+            // Fresh branch: clone without checkout, then create the branch from
+            // the reference repo's resolved HEAD commit instead of trusting the
+            // remote's symbolic HEAD configuration.
             self.runner
                 .run(
                     "git",
@@ -146,7 +158,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
             self.runner
                 .run(
                     "git",
-                    &["-C", &checkout_dir, "checkout", "-b", branch, "HEAD"],
+                    &["-C", &checkout_dir, "checkout", "-b", branch, &start_point],
                     std::path::Path::new(&checkout_dir),
                     &ChannelLabel::Noop,
                 )
@@ -362,9 +374,11 @@ mod tests {
             Err("".to_string()),
             // show-ref remote — not found
             Err("".to_string()),
+            // git --git-dir /ref/repo rev-parse HEAD
+            Ok("abc123\n".to_string()),
             // git clone --reference /ref/repo --no-checkout ... /workspace/my-feature
             Ok(String::new()),
-            // git -C /workspace/my-feature checkout -b my-feature HEAD
+            // git -C /workspace/my-feature checkout -b my-feature abc123
             Ok(String::new()),
         ]));
 
@@ -378,7 +392,7 @@ mod tests {
         assert_eq!(checkout.branch, "my-feature");
 
         let calls = runner.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 6);
 
         // First call: get remote URL
         assert_eq!(calls[0].0, "git");
@@ -390,18 +404,23 @@ mod tests {
         assert_eq!(calls[2].0, "git");
         assert!(calls[2].1.contains(&"show-ref".to_string()));
 
-        // Fourth call: git clone --reference ... --no-checkout
+        // Fourth call: git --git-dir /ref/repo rev-parse HEAD
         assert_eq!(calls[3].0, "git");
-        assert!(calls[3].1.contains(&"clone".to_string()));
-        assert!(calls[3].1.contains(&"--no-checkout".to_string()));
-        assert!(!calls[3].1.contains(&"-b".to_string()));
+        assert!(calls[3].1.contains(&"rev-parse".to_string()));
+        assert!(calls[3].1.contains(&"HEAD".to_string()));
 
-        // Fifth call: git checkout -b
+        // Fifth call: git clone --reference ... --no-checkout
         assert_eq!(calls[4].0, "git");
-        assert!(calls[4].1.contains(&"checkout".to_string()));
-        assert!(calls[4].1.contains(&"-b".to_string()));
-        assert!(calls[4].1.contains(&"my-feature".to_string()));
-        assert!(calls[4].1.contains(&"HEAD".to_string()));
+        assert!(calls[4].1.contains(&"clone".to_string()));
+        assert!(calls[4].1.contains(&"--no-checkout".to_string()));
+        assert!(!calls[4].1.contains(&"-b".to_string()));
+
+        // Sixth call: git checkout -b
+        assert_eq!(calls[5].0, "git");
+        assert!(calls[5].1.contains(&"checkout".to_string()));
+        assert!(calls[5].1.contains(&"-b".to_string()));
+        assert!(calls[5].1.contains(&"my-feature".to_string()));
+        assert!(calls[5].1.contains(&"abc123".to_string()));
     }
 
     #[tokio::test]
