@@ -1,5 +1,3 @@
-use std::path::Path;
-
 pub use flotilla_protocol::CheckoutIntent;
 use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
 use tracing::warn;
@@ -7,22 +5,28 @@ use tracing::warn;
 use crate::{
     path_context::ExecutionEnvironmentPath,
     provider_data::ProviderData,
-    providers::{registry::ProviderRegistry, run, CommandRunner},
+    providers::registry::ProviderRegistry,
     terminal_manager::TerminalManager,
 };
 
 pub(super) struct CheckoutService<'a> {
     registry: &'a ProviderRegistry,
-    runner: &'a dyn CommandRunner,
 }
 
 impl<'a> CheckoutService<'a> {
-    pub(super) fn new(registry: &'a ProviderRegistry, runner: &'a dyn CommandRunner) -> Self {
-        Self { registry, runner }
+    pub(super) fn new(registry: &'a ProviderRegistry) -> Self {
+        Self { registry }
     }
 
-    pub(super) async fn validate_target(&self, repo_root: &Path, branch: &str, intent: CheckoutIntent) -> Result<(), String> {
-        validate_checkout_target(repo_root, branch, intent, self.runner).await
+    pub(super) async fn validate_target(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        intent: CheckoutIntent,
+    ) -> Result<(), String> {
+        let checkout_manager =
+            self.registry.checkout_managers.preferred().cloned().ok_or_else(|| "No checkout manager available".to_string())?;
+        checkout_manager.validate_target(repo_root, branch, intent).await
     }
 
     pub(super) async fn create_checkout(
@@ -88,39 +92,6 @@ pub(super) fn resolve_checkout_branch(
                 1 => Ok(matches[0].clone()),
                 _ => Err(format!("checkout selector is ambiguous: {query}")),
             }
-        }
-    }
-}
-
-pub(super) async fn validate_checkout_target(
-    repo_root: &Path,
-    branch: &str,
-    intent: CheckoutIntent,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    let local_exists = run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/heads/{branch}")], repo_root).is_ok();
-    let remote_exists =
-        run!(runner, "git", &["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")], repo_root).is_ok();
-    match intent {
-        CheckoutIntent::ExistingBranch if local_exists || remote_exists => Ok(()),
-        CheckoutIntent::ExistingBranch => Err(format!("branch not found: {branch}")),
-        CheckoutIntent::FreshBranch if local_exists || remote_exists => Err(format!("branch already exists: {branch}")),
-        CheckoutIntent::FreshBranch => Ok(()),
-    }
-}
-
-pub(super) async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
-    use std::collections::HashMap;
-
-    let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
-    for (provider, id) in issue_ids {
-        by_provider.entry(provider.as_str()).or_default().push(id.as_str());
-    }
-    for (provider, ids) in by_provider {
-        let key = format!("branch.{branch}.flotilla.issues.{provider}");
-        let value = ids.join(",");
-        if let Err(err) = run!(runner, "git", &["config", &key, &value], repo_root) {
-            warn!(err = %err, "failed to write issue link");
         }
     }
 }

@@ -5,7 +5,7 @@ use std::{
 
 use super::{
     build_plan,
-    checkout::{resolve_checkout_branch, validate_checkout_target, write_branch_issue_links, CheckoutIntent},
+    checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutService},
     session_actions::resolve_attach_command,
     workspace_config, ExecutorStepResolver, RepoExecutionContext,
 };
@@ -23,7 +23,7 @@ use crate::{
         terminal::TerminalPool,
         testing::MockRunner,
         types::*,
-        vcs::CheckoutManager,
+        vcs::{write_branch_issue_links, CheckoutManager},
         workspace::WorkspaceManager,
         CommandRunner,
     },
@@ -51,6 +51,7 @@ fn hp(path: &str) -> HostPath {
 
 /// A mock CheckoutManager that returns a canned checkout or error.
 struct MockCheckoutManager {
+    validate_result: tokio::sync::Mutex<Option<Result<(), String>>>,
     create_result: tokio::sync::Mutex<Option<Result<(PathBuf, Checkout), String>>>,
     remove_result: tokio::sync::Mutex<Option<Result<(), String>>>,
 }
@@ -58,6 +59,7 @@ struct MockCheckoutManager {
 impl MockCheckoutManager {
     fn succeeding(branch: &str, path: &str) -> Self {
         Self {
+            validate_result: tokio::sync::Mutex::new(Some(Ok(()))),
             create_result: tokio::sync::Mutex::new(Some(Ok((PathBuf::from(path), Checkout {
                 branch: branch.to_string(),
                 is_main: false,
@@ -75,6 +77,7 @@ impl MockCheckoutManager {
 
     fn failing(msg: &str) -> Self {
         Self {
+            validate_result: tokio::sync::Mutex::new(Some(Err(msg.to_string()))),
             create_result: tokio::sync::Mutex::new(Some(Err(msg.to_string()))),
             remove_result: tokio::sync::Mutex::new(Some(Err(msg.to_string()))),
         }
@@ -83,6 +86,15 @@ impl MockCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for MockCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _intent: CheckoutIntent,
+    ) -> Result<(), String> {
+        self.validate_result.lock().await.take().expect("validate_target called more than expected")
+    }
+
     async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(vec![])
     }
@@ -2897,70 +2909,34 @@ async fn write_branch_issue_links_empty_is_noop() {
 }
 
 // -----------------------------------------------------------------------
-// Tests: validate_checkout_target
+// Tests: CheckoutService validation delegation
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn validate_fresh_branch_succeeds_when_neither_exists() {
-    // local check -> Err (not found), remote check -> Err (not found)
-    let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
+async fn checkout_service_validate_target_uses_checkout_manager() {
+    let mut registry = ProviderRegistry::new();
+    registry.checkout_managers.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/tmp/feat-x")));
+    let service = CheckoutService::new(&registry);
 
-    let result = validate_checkout_target(repo_root().as_path(), "new-branch", CheckoutIntent::FreshBranch, &runner).await;
+    let result = service.validate_target(&repo_root(), "new-branch", CheckoutIntent::FreshBranch).await;
 
     assert!(result.is_ok());
 }
 
 #[tokio::test]
-async fn validate_fresh_branch_fails_when_local_exists() {
-    // local check -> Ok (found), remote check -> Err (not found)
-    let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
+async fn checkout_service_validate_target_propagates_checkout_manager_error() {
+    let mut registry = ProviderRegistry::new();
+    registry.checkout_managers.insert(
+        "checkout",
+        desc("checkout"),
+        Arc::new(MockCheckoutManager::failing("branch already exists: existing")),
+    );
+    let service = CheckoutService::new(&registry);
 
-    let result = validate_checkout_target(repo_root().as_path(), "existing", CheckoutIntent::FreshBranch, &runner).await;
+    let result = service.validate_target(&repo_root(), "existing", CheckoutIntent::FreshBranch).await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("already exists"));
-}
-
-#[tokio::test]
-async fn validate_fresh_branch_fails_when_remote_exists() {
-    // local check -> Err (not found), remote check -> Ok (found)
-    let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
-
-    let result = validate_checkout_target(repo_root().as_path(), "remote-only", CheckoutIntent::FreshBranch, &runner).await;
-
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists"));
-}
-
-#[tokio::test]
-async fn validate_existing_branch_succeeds_when_local_exists() {
-    // local check -> Ok (found), remote check -> Err (not found)
-    let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
-
-    let result = validate_checkout_target(repo_root().as_path(), "local-branch", CheckoutIntent::ExistingBranch, &runner).await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn validate_existing_branch_succeeds_when_remote_exists() {
-    // local check -> Err (not found), remote check -> Ok (found)
-    let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
-
-    let result = validate_checkout_target(repo_root().as_path(), "remote-branch", CheckoutIntent::ExistingBranch, &runner).await;
-
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn validate_existing_branch_fails_when_neither_exists() {
-    // local check -> Err (not found), remote check -> Err (not found)
-    let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
-
-    let result = validate_checkout_target(repo_root().as_path(), "ghost-branch", CheckoutIntent::ExistingBranch, &runner).await;
-
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("branch not found"));
 }
 
 // -----------------------------------------------------------------------

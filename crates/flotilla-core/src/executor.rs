@@ -20,7 +20,7 @@ use flotilla_protocol::{
 use tracing::{debug, error, info};
 
 use self::{
-    checkout::{resolve_checkout_branch, write_branch_issue_links, CheckoutIntent, CheckoutService},
+    checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutService},
     session_actions::{resolve_attach_command, ReadOnlySessionActionService, TeleportFlow, TeleportSessionActionService},
     terminals::TerminalPreparationService,
     workspace::WorkspaceOrchestrator,
@@ -30,7 +30,7 @@ use crate::{
     data,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
-    providers::{registry::ProviderRegistry, run, types::WorkspaceConfig, CommandRunner},
+    providers::{registry::ProviderRegistry, run, types::WorkspaceConfig, vcs::write_branch_issue_links, CommandRunner},
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
     terminal_manager::TerminalManager,
 };
@@ -48,7 +48,6 @@ struct CheckoutFlow<'a> {
     repo_root: &'a ExecutionEnvironmentPath,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
-    runner: &'a dyn CommandRunner,
     local_host: &'a HostName,
     /// When true, skip host-side validation and de-duplication.
     /// Environment checkouts delegate validation to `CloneCheckoutManager`.
@@ -71,13 +70,13 @@ impl<'a> CheckoutFlow<'a> {
     }
 
     async fn checkout_created_result(&self) -> Result<CommandValue, String> {
-        let checkout_service = CheckoutService::new(self.registry, self.runner);
+        let checkout_service = CheckoutService::new(self.registry);
 
         // In environment context, skip host-side branch validation — the
         // CloneCheckoutManager validates during clone (git clone -b fails if
         // branch doesn't exist; --no-checkout handles fresh branches).
         if !self.is_environment {
-            checkout_service.validate_target(self.repo_root.as_path(), self.branch, self.intent).await?;
+            checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
         }
 
         if let Some(path) = self.existing_checkout_path() {
@@ -615,7 +614,6 @@ impl StepResolver for ExecutorStepResolver {
                     repo_root: &effective_repo_root,
                     registry: effective_registry.as_ref(),
                     providers_data: effective_providers_data.as_ref(),
-                    runner: effective_runner.as_ref(),
                     local_host: &self.local_host,
                     is_environment: context_environment_id.is_some(),
                 };
@@ -630,7 +628,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
-                let checkout_service = CheckoutService::new(effective_registry.as_ref(), effective_runner.as_ref());
+                let checkout_service = CheckoutService::new(effective_registry.as_ref());
                 let tm = self.terminal_manager();
                 checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, tm.as_ref()).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))

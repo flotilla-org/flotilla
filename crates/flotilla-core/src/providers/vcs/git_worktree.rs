@@ -176,6 +176,15 @@ impl GitCheckoutManager {
 
 #[async_trait]
 impl super::CheckoutManager for GitCheckoutManager {
+    async fn validate_target(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        super::validate_checkout_target_in_repo(repo_root.as_path(), branch, intent, &*self.runner).await
+    }
+
     async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         let root = repo_root.as_path();
         let output = run!(self.runner, "git", &["worktree", "list", "--porcelain"], root)?;

@@ -6,10 +6,12 @@ pub mod wt;
 use std::path::Path;
 
 use async_trait::async_trait;
+use flotilla_protocol::CheckoutIntent;
+use tracing::warn;
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{run, types::*, CommandRunner},
+    providers::{run, types::*, ChannelLabel, CommandRunner},
 };
 
 pub const TRUNK_NAMES: &[&str] = &["main", "master", "trunk"];
@@ -33,6 +35,12 @@ pub trait Vcs: Send + Sync {
 
 #[async_trait]
 pub trait CheckoutManager: Send + Sync {
+    async fn validate_target(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        intent: CheckoutIntent,
+    ) -> Result<(), String>;
     async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(
         &self,
@@ -128,6 +136,69 @@ pub async fn read_branch_issue_links(repo_root: &Path, branch: &str, runner: &dy
     }
 }
 
+/// Write issue links to git config for a specific branch.
+/// Errors are logged and ignored because issue linking is best-effort metadata.
+pub async fn write_branch_issue_links(repo_root: &Path, branch: &str, issue_ids: &[(String, String)], runner: &dyn CommandRunner) {
+    use std::collections::HashMap;
+
+    let mut by_provider: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (provider, id) in issue_ids {
+        by_provider.entry(provider.as_str()).or_default().push(id.as_str());
+    }
+    for (provider, ids) in by_provider {
+        let key = format!("branch.{branch}.flotilla.issues.{provider}");
+        let value = ids.join(",");
+        if let Err(err) = run!(runner, "git", &["config", &key, &value], repo_root) {
+            warn!(err = %err, "failed to write issue link");
+        }
+    }
+}
+
+async fn validate_checkout_target_with_prefix(
+    cwd: &Path,
+    prefix: &[&str],
+    branch: &str,
+    intent: CheckoutIntent,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let local_ref = format!("refs/heads/{branch}");
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+
+    let mut local_args = prefix.to_vec();
+    local_args.extend(["show-ref", "--verify", "--quiet", local_ref.as_str()]);
+    let local_exists = runner.run("git", &local_args, cwd, &ChannelLabel::Noop).await.is_ok();
+
+    let mut remote_args = prefix.to_vec();
+    remote_args.extend(["show-ref", "--verify", "--quiet", remote_ref.as_str()]);
+    let remote_exists = runner.run("git", &remote_args, cwd, &ChannelLabel::Noop).await.is_ok();
+
+    match intent {
+        CheckoutIntent::ExistingBranch if local_exists || remote_exists => Ok(()),
+        CheckoutIntent::ExistingBranch => Err(format!("branch not found: {branch}")),
+        CheckoutIntent::FreshBranch if local_exists || remote_exists => Err(format!("branch already exists: {branch}")),
+        CheckoutIntent::FreshBranch => Ok(()),
+    }
+}
+
+pub async fn validate_checkout_target_in_repo(
+    repo_root: &Path,
+    branch: &str,
+    intent: CheckoutIntent,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    validate_checkout_target_with_prefix(repo_root, &[], branch, intent, runner).await
+}
+
+pub async fn validate_checkout_target_in_git_dir(
+    git_dir: &str,
+    cwd: &Path,
+    branch: &str,
+    intent: CheckoutIntent,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    validate_checkout_target_with_prefix(cwd, &["--git-dir", git_dir], branch, intent, runner).await
+}
+
 /// Escape special regex characters in branch names for git config --get-regexp.
 fn regex_escape_branch(branch: &str) -> String {
     let mut escaped = String::with_capacity(branch.len());
@@ -145,7 +216,10 @@ fn regex_escape_branch(branch: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use flotilla_protocol::CheckoutIntent;
+
     use super::*;
+    use crate::providers::testing::MockRunner;
 
     #[test]
     fn parse_issue_links_single_provider() {
@@ -201,6 +275,111 @@ mod tests {
     #[test]
     fn parse_ahead_behind_malformed() {
         assert!(parse_ahead_behind("notanumber\t5").is_none());
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_single_provider_multiple_issues() {
+        let runner = MockRunner::new(vec![Ok(String::new())]);
+        let issue_ids = vec![("github".to_string(), "10".to_string()), ("github".to_string(), "20".to_string())];
+
+        write_branch_issue_links(Path::new("/repo"), "feat-x", &issue_ids, &runner).await;
+
+        assert_eq!(runner.remaining(), 0, "single provider should consume exactly 1 response");
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "git".to_string(),
+                vec!["config".to_string(), "branch.feat-x.flotilla.issues.github".to_string(), "10,20".to_string()],
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_multiple_providers() {
+        let runner = MockRunner::new(vec![Ok(String::new()), Ok(String::new())]);
+        let issue_ids = vec![("github".to_string(), "10".to_string()), ("jira".to_string(), "PROJ-5".to_string())];
+
+        write_branch_issue_links(Path::new("/repo"), "feat-x", &issue_ids, &runner).await;
+
+        assert_eq!(runner.remaining(), 0, "two providers should consume exactly 2 responses");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_git_error_tolerated() {
+        let runner = MockRunner::new(vec![Err("git config failed".to_string())]);
+        let issue_ids = vec![("github".to_string(), "10".to_string())];
+
+        write_branch_issue_links(Path::new("/repo"), "feat-x", &issue_ids, &runner).await;
+
+        assert_eq!(runner.remaining(), 0, "should still consume the response even on error");
+    }
+
+    #[tokio::test]
+    async fn write_branch_issue_links_empty_is_noop() {
+        let runner = MockRunner::new(vec![]);
+
+        write_branch_issue_links(Path::new("/repo"), "feat-x", &[], &runner).await;
+
+        assert_eq!(runner.remaining(), 0, "empty issue_ids should make zero calls");
+    }
+
+    #[tokio::test]
+    async fn validate_fresh_branch_succeeds_when_neither_exists() {
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target_in_repo(Path::new("/repo"), "new-branch", CheckoutIntent::FreshBranch, &runner).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_fresh_branch_fails_when_local_exists() {
+        let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target_in_repo(Path::new("/repo"), "existing", CheckoutIntent::FreshBranch, &runner).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn validate_fresh_branch_fails_when_remote_exists() {
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
+
+        let result = validate_checkout_target_in_repo(Path::new("/repo"), "remote-only", CheckoutIntent::FreshBranch, &runner).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn validate_existing_branch_succeeds_when_local_exists() {
+        let runner = MockRunner::new(vec![Ok(String::new()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target_in_repo(Path::new("/repo"), "local-branch", CheckoutIntent::ExistingBranch, &runner).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_existing_branch_succeeds_when_remote_exists() {
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Ok(String::new())]);
+
+        let result = validate_checkout_target_in_repo(Path::new("/repo"), "remote-branch", CheckoutIntent::ExistingBranch, &runner).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_existing_branch_fails_when_neither_exists() {
+        let runner = MockRunner::new(vec![Err("not found".to_string()), Err("not found".to_string())]);
+
+        let result = validate_checkout_target_in_repo(Path::new("/repo"), "ghost-branch", CheckoutIntent::ExistingBranch, &runner).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("branch not found"));
     }
 }
 
