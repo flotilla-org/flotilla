@@ -112,7 +112,11 @@ let host_id = env.host_id().cloned()
 Ok(Arc::new(WtCheckoutManager::new(runner, host_id)))
 ```
 
-The `HostName::local()` fallback covers test scenarios where factories are probed without a full discovery runtime. This is the same pattern as today, just producing a `HostId` instead.
+**Fallback policy:** The `HostName::local()` fallback exists only for two cases:
+1. **Tests** — factories probed without a full discovery runtime.
+2. **Docker discovery hack** — explicitly deferred to Phase B.
+
+In the local host discovery path (the normal daemon startup → host detection → repo discovery flow), absence of `host_id` on the bag is a bug. The production factory code should `expect("host_id must be set on bag during local discovery")` rather than silently falling back. The fallback only applies when `FLOTILLA_ENVIRONMENT_ID` is present in the bag (Docker path) or in test code.
 
 ### Provider Structs
 
