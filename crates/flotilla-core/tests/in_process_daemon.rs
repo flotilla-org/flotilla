@@ -306,6 +306,20 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
     (temp, repo, daemon)
 }
 
+async fn daemon_for_plain_dir_with_local_environment_id(
+    local_environment_id: &str,
+) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
+    let config = Arc::new(ConfigStore::with_base(config_dir));
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+    (temp, repo, daemon)
+}
+
 fn init_bare_git_remote(path: &Path) {
     let status = std::process::Command::new("git")
         .args(["init", "--bare", "--initial-branch=main"])
@@ -461,6 +475,24 @@ async fn get_topology_includes_configured_but_disconnected_peers() {
     assert!(!unreachable.connected, "configured-but-never-connected peer should show as disconnected");
     assert!(unreachable.direct, "disconnected peer should show as direct (no relay known)");
     assert!(unreachable.fallbacks.is_empty());
+}
+
+#[tokio::test]
+async fn daemon_uses_persisted_local_environment_id() {
+    let (temp, repo, daemon) = daemon_for_plain_dir_with_local_environment_id("test-local-environment-id").await;
+
+    assert_eq!(daemon.local_environment_id().as_str(), "test-local-environment-id");
+
+    drop(daemon);
+
+    let restarted = InProcessDaemon::new(
+        vec![repo],
+        Arc::new(ConfigStore::with_base(temp.path().join("config"))),
+        fake_discovery(false),
+        HostName::local(),
+    )
+    .await;
+    assert_eq!(restarted.local_environment_id().as_str(), "test-local-environment-id");
 }
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {

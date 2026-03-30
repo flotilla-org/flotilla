@@ -30,6 +30,7 @@ use crate::{
     daemon::DaemonHandle,
     environment_manager::EnvironmentManager,
     executor,
+    host_identity::resolve_or_create_environment_id,
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
@@ -310,7 +311,8 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
 
-        let local_environment_id = EnvironmentId::new("local-environment");
+        let local_environment_id = resolve_or_create_environment_id(config.state_dir().as_path())
+            .expect("failed to resolve local direct environment id");
         let environment_manager = Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await);
         let local_environment_bag = environment_manager.local_environment_bag();
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());

@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use flotilla_protocol::qualified_path::HostId;
+use flotilla_protocol::{qualified_path::HostId, EnvironmentId};
 use uuid::Uuid;
 
 use crate::providers::{ChannelLabel, CommandRunner};
@@ -112,6 +112,42 @@ pub fn resolve_or_create_host_id(state_dir: &Path) -> Result<HostId, String> {
     }
 }
 
+/// Resolve an existing direct-environment id from `<state_dir>/environment-id`,
+/// or generate and persist a new one atomically.
+pub fn resolve_or_create_environment_id(state_dir: &Path) -> Result<EnvironmentId, String> {
+    let target = state_dir.join("environment-id");
+
+    // Fast path: file already exists.
+    if let Ok(content) = fs::read_to_string(&target) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Ok(EnvironmentId::new(trimmed));
+        }
+    }
+
+    let new_id = Uuid::new_v4().to_string();
+    let temp = state_dir.join(format!(".environment-id.{}", std::process::id()));
+
+    fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir {}: {e}", state_dir.display()))?;
+    fs::write(&temp, format!("{new_id}\n")).map_err(|e| format!("failed to write temp environment-id: {e}"))?;
+
+    match fs::hard_link(&temp, &target) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temp);
+            Ok(EnvironmentId::new(new_id))
+        }
+        Err(_) => {
+            let _ = fs::remove_file(&temp);
+            let content = fs::read_to_string(&target).map_err(|e| format!("failed to read environment-id after link race: {e}"))?;
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                return Err("environment-id file exists but is empty".to_owned());
+            }
+            Ok(EnvironmentId::new(trimmed))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +169,24 @@ mod tests {
         std::fs::write(&file, "my-custom-id\n").unwrap();
         let id = resolve_or_create_host_id(dir.path()).unwrap();
         assert_eq!(id.as_str(), "my-custom-id");
+    }
+
+    #[test]
+    fn generates_and_persists_environment_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let id1 = resolve_or_create_environment_id(dir.path()).unwrap();
+        let id2 = resolve_or_create_environment_id(dir.path()).unwrap();
+        assert_eq!(id1, id2, "should return same ID on second call");
+        assert!(!id1.as_str().is_empty());
+    }
+
+    #[test]
+    fn reads_existing_environment_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("environment-id");
+        std::fs::write(&file, "my-custom-env-id\n").unwrap();
+        let id = resolve_or_create_environment_id(dir.path()).unwrap();
+        assert_eq!(id.as_str(), "my-custom-env-id");
     }
 
     #[tokio::test]
