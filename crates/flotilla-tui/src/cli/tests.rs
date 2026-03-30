@@ -260,7 +260,6 @@ mod watch_human {
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
             repo: PathBuf::from("/tmp/my-repo"),
             changes: vec![],
-            work_items: vec![],
             issue_total: None,
             issue_has_more: false,
             issue_search_results: None,

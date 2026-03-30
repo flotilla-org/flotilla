@@ -453,14 +453,12 @@ async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &s
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config_dir = temp.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
-    let machine_state_dir =
-        flotilla_core::host_identity::machine_scoped_state_dir(&config_dir, None, &flotilla_core::providers::ProcessCommandRunner)
-            .await
-            .expect("resolve machine-scoped state dir");
+    let discovery = fake_discovery(false);
+    let machine_state_dir = flotilla_core::host_identity::resolve_local_environment_state_dir(&config_dir, &*discovery.runner).await;
     std::fs::create_dir_all(&machine_state_dir).expect("create machine-scoped state dir");
     std::fs::write(machine_state_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
     let config = Arc::new(ConfigStore::with_base(config_dir));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     (temp, repo, daemon)
 }
 
@@ -1711,9 +1709,13 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
     let refresh_event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
     match refresh_event {
         DaemonEvent::RepoSnapshot(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
-        DaemonEvent::RepoDelta(delta) => {
-            assert!(delta.work_items.iter().any(|item| item.session_key.as_deref() == Some("sess-1")), "refresh should expose sess-1")
-        }
+        DaemonEvent::RepoDelta(delta) => assert!(delta.changes.iter().any(|change| matches!(
+            change,
+            flotilla_protocol::Change::WorkItem {
+                op: flotilla_protocol::EntryOp::Added(item) | flotilla_protocol::EntryOp::Updated(item),
+                ..
+            } if item.session_key.as_deref() == Some("sess-1")
+        ))),
         other => panic!("expected snapshot event, got {other:?}"),
     }
 
@@ -4000,9 +4002,13 @@ async fn two_commands_can_run_concurrently() {
     let refresh_event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
     match refresh_event {
         DaemonEvent::RepoSnapshot(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
-        DaemonEvent::RepoDelta(delta) => {
-            assert!(delta.work_items.iter().any(|item| item.session_key.as_deref() == Some("sess-1")), "refresh should expose sess-1")
-        }
+        DaemonEvent::RepoDelta(delta) => assert!(delta.changes.iter().any(|change| matches!(
+            change,
+            flotilla_protocol::Change::WorkItem {
+                op: flotilla_protocol::EntryOp::Added(item) | flotilla_protocol::EntryOp::Updated(item),
+                ..
+            } if item.session_key.as_deref() == Some("sess-1")
+        ))),
         other => panic!("expected snapshot event, got {other:?}"),
     }
 

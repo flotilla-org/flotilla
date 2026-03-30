@@ -109,7 +109,6 @@ pub(crate) fn delta(repo: &Path, changes: Vec<Change>) -> RepoDelta {
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },
         repo: repo.to_path_buf(),
         changes,
-        work_items: vec![],
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,

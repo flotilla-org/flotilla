@@ -287,6 +287,18 @@ fn diff_work_items_unchanged() {
 }
 
 #[test]
+fn apply_work_item_changes_removed_missing_identity_is_noop() {
+    let mut items = vec![work_item(flotilla_protocol::WorkItemIdentity::Issue("i1".into()), "existing issue")];
+    let changes = vec![Change::WorkItem { identity: flotilla_protocol::WorkItemIdentity::Issue("missing".into()), op: EntryOp::Removed }];
+
+    apply_work_item_changes(&mut items, &changes);
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].identity, flotilla_protocol::WorkItemIdentity::Issue("i1".into()));
+    assert_eq!(items[0].description, "existing issue");
+}
+
+#[test]
 fn diff_identical_snapshots_no_changes() {
     let mut pd = ProviderData::default();
     pd.checkouts.insert(hp("/wt/main"), checkout("main"));
