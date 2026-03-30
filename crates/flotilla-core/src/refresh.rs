@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use flotilla_protocol::EnvironmentId;
 use tokio::{
     sync::{watch, Notify},
     task::JoinHandle,
@@ -52,6 +53,7 @@ impl RepoRefreshHandle {
         repo_root: PathBuf,
         registry: Arc<ProviderRegistry>,
         criteria: RepoCriteria,
+        environment_id: Option<EnvironmentId>,
         attachable_store: SharedAttachableStore,
         agent_state_store: crate::agents::SharedAgentStateStore,
         interval: Duration,
@@ -71,8 +73,16 @@ impl RepoRefreshHandle {
 
                 // Fetch all provider data
                 let mut provider_data = ProviderData::default();
-                let errors =
-                    refresh_providers(&mut provider_data, &repo_root, &registry, &criteria, &attachable_store, &agent_state_store).await;
+                let errors = refresh_providers(
+                    &mut provider_data,
+                    &repo_root,
+                    &registry,
+                    &criteria,
+                    environment_id.as_ref(),
+                    &attachable_store,
+                    &agent_state_store,
+                )
+                .await;
                 let provider_health = compute_provider_health(&registry, &errors);
 
                 // Correlate
@@ -160,6 +170,7 @@ async fn refresh_providers(
     repo_root: &Path,
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
+    environment_id: Option<&EnvironmentId>,
     attachable_store: &SharedAttachableStore,
     agent_state_store: &crate::agents::SharedAgentStateStore,
 ) -> Vec<RefreshError> {
@@ -238,8 +249,15 @@ async fn refresh_providers(
     }
 
     let local_host = flotilla_protocol::HostName::local();
-    pd.checkouts =
-        checkouts.into_iter().map(|(path, co)| (flotilla_protocol::HostPath::new(local_host.clone(), path.as_path()), co)).collect();
+    pd.checkouts = checkouts
+        .into_iter()
+        .map(|(path, mut co)| {
+            if co.environment_id.is_none() {
+                co.environment_id = environment_id.cloned();
+            }
+            (flotilla_protocol::HostPath::new(local_host.clone(), path.as_path()), co)
+        })
+        .collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
 
     pd.change_requests = crs.into_iter().collect();

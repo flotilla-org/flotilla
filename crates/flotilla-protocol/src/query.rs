@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::{ProviderError, WorkItem},
-    HostName, HostSummary, PeerConnectionState,
+    EnvironmentInfo, HostName, HostSummary, PeerConnectionState,
 };
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
@@ -110,6 +110,8 @@ pub struct HostStatusResponse {
     pub connection_status: PeerConnectionState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<HostSummary>,
+    #[serde(default)]
+    pub visible_environments: Vec<EnvironmentInfo>,
     pub repo_count: usize,
     pub work_item_count: usize,
 }
@@ -122,6 +124,8 @@ pub struct HostProvidersResponse {
     pub configured: bool,
     pub connection_status: PeerConnectionState,
     pub summary: HostSummary,
+    #[serde(default)]
+    pub visible_environments: Vec<EnvironmentInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,8 +152,8 @@ mod tests {
         HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
     };
     use crate::{
-        test_helpers::assert_roundtrip, HostEnvironment, HostName, HostProviderStatus, HostSummary, PeerConnectionState, SystemInfo,
-        ToolInventory,
+        test_helpers::assert_roundtrip, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostProviderStatus,
+        HostSummary, ImageId, PeerConnectionState, SystemInfo, ToolInventory,
     };
 
     #[test]
@@ -191,6 +195,22 @@ mod tests {
         }
     }
 
+    fn sample_visible_environments() -> Vec<EnvironmentInfo> {
+        vec![
+            EnvironmentInfo::Direct {
+                id: EnvironmentId::new("direct-env"),
+                display_name: Some("direct".into()),
+                status: EnvironmentStatus::Running,
+            },
+            EnvironmentInfo::Provisioned {
+                id: EnvironmentId::new("provisioned-env"),
+                display_name: Some("provisioned".into()),
+                image: ImageId::new("mock:image"),
+                status: EnvironmentStatus::Running,
+            },
+        ]
+    }
+
     #[test]
     fn host_list_response_roundtrips_without_summary_data() {
         let response = HostListResponse {
@@ -216,6 +236,7 @@ mod tests {
             configured: true,
             connection_status: PeerConnectionState::Connected,
             summary: Some(sample_host_summary()),
+            visible_environments: sample_visible_environments(),
             repo_count: 2,
             work_item_count: 5,
         };
@@ -231,9 +252,29 @@ mod tests {
             configured: true,
             connection_status: PeerConnectionState::Connected,
             summary: sample_host_summary(),
+            visible_environments: sample_visible_environments(),
         };
 
         assert_roundtrip(&response);
+    }
+
+    #[test]
+    fn host_status_response_defaults_missing_visible_environments() {
+        let mut value = serde_json::to_value(HostStatusResponse {
+            host: HostName::new("desktop"),
+            is_local: true,
+            configured: true,
+            connection_status: PeerConnectionState::Connected,
+            summary: Some(sample_host_summary()),
+            visible_environments: vec![],
+            repo_count: 2,
+            work_item_count: 5,
+        })
+        .expect("serialize host status");
+        value.as_object_mut().expect("object").remove("visible_environments");
+
+        let decoded: HostStatusResponse = serde_json::from_value(value).expect("deserialize without visible environments");
+        assert!(decoded.visible_environments.is_empty());
     }
 
     #[test]

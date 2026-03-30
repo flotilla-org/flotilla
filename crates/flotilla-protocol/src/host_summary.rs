@@ -86,10 +86,10 @@ pub struct HostSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_helpers::assert_roundtrip, HostName};
+    use crate::{test_helpers::assert_roundtrip, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostName, ImageId};
 
     #[test]
-    fn host_summary_roundtrips_with_optional_fields() {
+    fn host_summary_roundtrips_with_direct_and_provisioned_environments() {
         let summary = HostSummary {
             host_name: HostName::new("desktop"),
             system: SystemInfo {
@@ -102,7 +102,19 @@ mod tests {
             },
             inventory: ToolInventory::default(),
             providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
-            environments: vec![],
+            environments: vec![
+                EnvironmentInfo::Direct {
+                    id: EnvironmentId::new("env-direct"),
+                    display_name: Some("ssh-dev".into()),
+                    status: EnvironmentStatus::Running,
+                },
+                EnvironmentInfo::Provisioned {
+                    id: EnvironmentId::new("env-provisioned"),
+                    display_name: None,
+                    image: ImageId::new("ubuntu:24.04"),
+                    status: EnvironmentStatus::Stopped,
+                },
+            ],
         };
 
         assert_roundtrip(&summary);

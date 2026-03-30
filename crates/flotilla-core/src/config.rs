@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -278,12 +278,26 @@ impl HostsConfig {
 }
 
 /// Daemon-level configuration.
+/// `daemon.toml` is the source of truth for execution environments.
+/// Peer-daemon mesh config stays in `hosts.toml`.
 /// Loaded from `~/.config/flotilla/daemon.toml`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub follower: bool,
     pub host_name: Option<String>,
+    #[serde(default)]
+    pub environments: BTreeMap<String, StaticEnvironmentConfig>,
+}
+
+/// Static SSH-backed direct execution environment configured in `daemon.toml`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StaticEnvironmentConfig {
+    pub hostname: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub flotilla_command: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -481,13 +495,13 @@ impl ConfigStore {
     }
 
     /// Load daemon config from `~/.config/flotilla/daemon.toml`.
-    pub fn load_daemon_config(&self) -> DaemonConfig {
+    pub fn load_daemon_config(&self) -> Result<DaemonConfig, String> {
         let path = self.base_path().join("daemon.toml");
         if path.as_path().exists() {
-            let content = std::fs::read_to_string(path.as_path()).unwrap_or_default();
-            toml::from_str(&content).unwrap_or_default()
+            let content = std::fs::read_to_string(path.as_path()).map_err(|err| format!("failed to read {path}: {err}"))?;
+            toml::from_str(&content).map_err(|err| format!("failed to parse {path}: {err}"))
         } else {
-            DaemonConfig::default()
+            Ok(DaemonConfig::default())
         }
     }
 

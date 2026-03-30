@@ -36,8 +36,9 @@ fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -
 
 mod status_human {
     use flotilla_protocol::{
-        HostEnvironment, HostListEntry, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse, HostStatusResponse,
-        HostSummary, PeerConnectionState, RepoSummary, StatusResponse, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+        EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse, HostName, HostProviderStatus,
+        HostProvidersResponse, HostStatusResponse, HostSummary, ImageId, PeerConnectionState, RepoSummary, StatusResponse, SystemInfo,
+        ToolInventory, TopologyResponse, TopologyRoute,
     };
 
     use super::*;
@@ -84,6 +85,22 @@ mod status_human {
         }
     }
 
+    fn sample_visible_environments() -> Vec<EnvironmentInfo> {
+        vec![
+            EnvironmentInfo::Direct {
+                id: EnvironmentId::new("direct-env"),
+                display_name: Some("direct".into()),
+                status: EnvironmentStatus::Running,
+            },
+            EnvironmentInfo::Provisioned {
+                id: EnvironmentId::new("provisioned-env"),
+                display_name: Some("provisioned".into()),
+                image: ImageId::new("mock:image"),
+                status: EnvironmentStatus::Running,
+            },
+        ]
+    }
+
     #[test]
     fn host_list_shows_hosts_and_counts() {
         let response = HostListResponse {
@@ -123,6 +140,7 @@ mod status_human {
             configured: false,
             connection_status: PeerConnectionState::Connected,
             summary: Some(sample_host_summary("local")),
+            visible_environments: sample_visible_environments(),
             repo_count: 2,
             work_item_count: 5,
         };
@@ -131,6 +149,9 @@ mod status_human {
         assert!(output.contains("Host: local"));
         assert!(output.contains("Repositories: 2"));
         assert!(output.contains("linux"));
+        assert!(output.contains("Visible Environments:"));
+        assert!(output.contains("direct-env"));
+        assert!(output.contains("provisioned-env"));
     }
 
     #[test]
@@ -141,11 +162,15 @@ mod status_human {
             configured: false,
             connection_status: PeerConnectionState::Connected,
             summary: sample_host_summary("local"),
+            visible_environments: sample_visible_environments(),
         };
 
         let output = format_host_providers_human(&response);
         assert!(output.contains("Providers:"));
         assert!(output.contains("Git"));
+        assert!(output.contains("Visible Environments:"));
+        assert!(output.contains("direct-env"));
+        assert!(output.contains("provisioned-env"));
     }
 
     #[test]

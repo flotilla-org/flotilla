@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{DeltaEntry, HostName, Issue, ProviderData, ProviderError, RepoSnapshot, WorkItem};
+use flotilla_protocol::{DeltaEntry, EnvironmentId, HostName, Issue, ProviderData, ProviderError, RepoSnapshot, WorkItem};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -111,6 +111,10 @@ impl RepoState {
 
     pub(crate) fn preferred_path(&self) -> &Path {
         &self.preferred_root().path
+    }
+
+    pub(crate) fn preferred_environment_id(&self) -> Option<&EnvironmentId> {
+        self.preferred_root().model.environment_id.as_ref()
     }
 
     pub(crate) fn registry(&self) -> Arc<crate::providers::registry::ProviderRegistry> {
@@ -561,5 +565,49 @@ mod tests {
         assert_eq!(state.last_broadcast_health, new_health);
         assert_eq!(state.last_broadcast_errors, new_errors);
         assert_eq!(state.delta_log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preferred_environment_id_tracks_the_preferred_root() {
+        let remote_env = EnvironmentId::new("remote-env");
+        let local_env = EnvironmentId::new("local-env");
+
+        let remote_root = RepoRootState {
+            path: PathBuf::from("/remote"),
+            model: crate::model::RepoModel::new(
+                PathBuf::from("/remote"),
+                crate::providers::registry::ProviderRegistry::new(),
+                None,
+                Some(remote_env.clone()),
+                crate::attachable::shared_in_memory_attachable_store(),
+                crate::agents::shared_in_memory_agent_state_store(),
+            ),
+            slug: None,
+            repo_bag: crate::providers::discovery::EnvironmentBag::new(),
+            unmet: Vec::new(),
+            is_local: false,
+        };
+        let mut state = RepoState::new(flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/repo".into() }, remote_root);
+
+        assert_eq!(state.preferred_environment_id(), Some(&remote_env));
+
+        let local_root = RepoRootState {
+            path: PathBuf::from("/local"),
+            model: crate::model::RepoModel::new(
+                PathBuf::from("/local"),
+                crate::providers::registry::ProviderRegistry::new(),
+                None,
+                Some(local_env.clone()),
+                crate::attachable::shared_in_memory_attachable_store(),
+                crate::agents::shared_in_memory_agent_state_store(),
+            ),
+            slug: None,
+            repo_bag: crate::providers::discovery::EnvironmentBag::new(),
+            unmet: Vec::new(),
+            is_local: true,
+        };
+
+        assert!(state.add_root(local_root), "adding a local root should promote it to preferred");
+        assert_eq!(state.preferred_environment_id(), Some(&local_env));
     }
 }

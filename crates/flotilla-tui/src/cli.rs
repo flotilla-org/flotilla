@@ -3,8 +3,9 @@ use std::{collections::HashMap, path::Path};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandValue, DaemonEvent, HostProvidersResponse, HostStatusResponse, PeerConnectionState,
-    RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
+    output::OutputFormat, Command, CommandValue, DaemonEvent, EnvironmentInfo, EnvironmentStatus, HostProvidersResponse,
+    HostStatusResponse, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey,
+    TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -69,6 +70,49 @@ fn inventory_is_empty(inventory: &flotilla_protocol::ToolInventory) -> bool {
     inventory.binaries.is_empty() && inventory.sockets.is_empty() && inventory.auth.is_empty() && inventory.env_vars.is_empty()
 }
 
+fn environment_status_label(status: &EnvironmentStatus) -> String {
+    match status {
+        EnvironmentStatus::Building => "building".to_string(),
+        EnvironmentStatus::Starting => "starting".to_string(),
+        EnvironmentStatus::Running => "running".to_string(),
+        EnvironmentStatus::Stopped => "stopped".to_string(),
+        EnvironmentStatus::Failed(message) => format!("failed: {message}"),
+    }
+}
+
+fn format_visible_environments_human(environments: &[EnvironmentInfo]) -> String {
+    if environments.is_empty() {
+        return String::new();
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Kind", "Id", "Display Name", "Status", "Image"]);
+    for environment in environments {
+        match environment {
+            EnvironmentInfo::Direct { id, display_name, status } => {
+                table.add_row(vec![
+                    Cell::new("direct"),
+                    Cell::new(id.as_str()),
+                    Cell::new(display_name.as_deref().unwrap_or("-")),
+                    Cell::new(environment_status_label(status)),
+                    Cell::new("-"),
+                ]);
+            }
+            EnvironmentInfo::Provisioned { id, display_name, image, status } => {
+                table.add_row(vec![
+                    Cell::new("provisioned"),
+                    Cell::new(id.as_str()),
+                    Cell::new(display_name.as_deref().unwrap_or("-")),
+                    Cell::new(environment_status_label(status)),
+                    Cell::new(image.as_str()),
+                ]);
+            }
+        }
+    }
+    format!("Visible Environments:\n{table}\n")
+}
+
 fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> String {
     if response.hosts.is_empty() {
         return "No hosts known.\n".into();
@@ -115,6 +159,8 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
         }
     }
 
+    out.push_str(&format_visible_environments_human(&response.visible_environments));
+
     out
 }
 
@@ -155,6 +201,7 @@ fn format_host_providers_human(response: &HostProvidersResponse) -> String {
     }
     out.push_str(&table.to_string());
     out.push('\n');
+    out.push_str(&format_visible_environments_human(&response.visible_environments));
     out
 }
 
