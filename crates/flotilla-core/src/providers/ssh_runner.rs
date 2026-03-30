@@ -23,7 +23,7 @@ impl SshCommandRunner {
     fn ssh_args<'a>(&'a self, script: &'a str) -> Vec<&'a str> {
         let mut args = vec!["-T", "-o", "BatchMode=yes"];
         if self.multiplex {
-            args.extend(["-o", "ControlMaster=auto", "-o", "ControlPersist=60"]);
+            args.extend(["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/flotilla-ssh-%C", "-o", "ControlPersist=60"]);
         }
         args.push(self.destination.as_str());
         args.push("sh");
@@ -184,11 +184,11 @@ mod tests {
         assert_eq!(args[0], "-T");
         assert_eq!(args[1], "-o");
         assert_eq!(args[2], "BatchMode=yes");
-        assert_eq!(&args[3..7], ["-o", "ControlMaster=auto", "-o", "ControlPersist=60"]);
-        assert_eq!(args[7], "alice@feta.local");
-        assert_eq!(args[8], "sh");
-        assert_eq!(args[9], "-lc");
-        assert_eq!(args[10], "cd '/repo' && exec 'git' 'status'");
+        assert_eq!(&args[3..9], ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/flotilla-ssh-%C", "-o", "ControlPersist=60"]);
+        assert_eq!(args[9], "alice@feta.local");
+        assert_eq!(args[10], "sh");
+        assert_eq!(args[11], "-lc");
+        assert_eq!(args[12], "cd '/repo' && exec 'git' 'status'");
     }
 
     #[tokio::test]

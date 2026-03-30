@@ -97,7 +97,7 @@ async fn load_env_vars(runner: &dyn CommandRunner, cwd: &Path) -> HashMap<String
         .collect()
 }
 
-const STATIC_SSH_REGISTRATION_TIMEOUT: Duration = Duration::from_millis(100);
+const STATIC_SSH_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn register_static_ssh_direct_environment(
     environment_manager: &EnvironmentManager,

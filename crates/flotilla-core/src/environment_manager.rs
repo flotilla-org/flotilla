@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![local_environment_id.clone(), provisioned_environment_id.clone(), ssh_environment_id.clone()],
-            "visible environments should be sorted deterministically by id",
+            "visible environments should be sorted deterministically by id (with direct environments ordered before provisioned only when ids match)",
         );
 
         match &visible[0] {

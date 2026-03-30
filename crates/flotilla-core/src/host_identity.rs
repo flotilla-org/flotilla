@@ -107,29 +107,40 @@ pub fn resolve_or_create_host_id(state_dir: &Path) -> Result<HostId, String> {
         }
     }
 
-    // Generate a new ID and write atomically.
-    let new_id = Uuid::new_v4().to_string();
-    let temp = state_dir.join(format!(".host-id.{}", std::process::id()));
-
     fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir {}: {e}", state_dir.display()))?;
-    fs::write(&temp, format!("{new_id}\n")).map_err(|e| format!("failed to write temp host-id: {e}"))?;
+    let new_id = Uuid::new_v4().to_string();
 
-    match fs::hard_link(&temp, &target) {
-        Ok(()) => {
-            let _ = fs::remove_file(&temp);
-            Ok(HostId::new(new_id))
+    for _ in 0..8 {
+        let temp = state_dir.join(format!(".host-id.{}", Uuid::new_v4()));
+        match fs::write(&temp, format!("{new_id}\n")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to write temp host-id: {e}")),
         }
-        Err(_) => {
-            // Another process won the race — use its value.
-            let _ = fs::remove_file(&temp);
-            let content = fs::read_to_string(&target).map_err(|e| format!("failed to read host-id after link race: {e}"))?;
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return Err("host-id file exists but is empty".to_owned());
+
+        let link_result = fs::hard_link(&temp, &target);
+        let _ = fs::remove_file(&temp);
+
+        match link_result {
+            Ok(()) => return Ok(HostId::new(new_id)),
+            Err(_) if target.exists() => {
+                let content = fs::read_to_string(&target).map_err(|e| format!("failed to read host-id after link race: {e}"))?;
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    return Err("host-id file exists but is empty".to_owned());
+                }
+                return Ok(HostId::new(trimmed));
             }
-            Ok(HostId::new(trimmed))
+            Err(_) => continue,
         }
     }
+
+    let content = fs::read_to_string(&target).map_err(|e| format!("failed to read host-id after retries: {e}"))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("host-id file exists but is empty".to_owned());
+    }
+    Ok(HostId::new(trimmed))
 }
 
 /// Resolve an existing direct-environment id from `<state_dir>/environment-id`,
@@ -274,6 +285,41 @@ mod tests {
         std::fs::write(&file, "my-custom-id\n").unwrap();
         let id = resolve_or_create_host_id(dir.path()).unwrap();
         assert_eq!(id.as_str(), "my-custom-id");
+    }
+
+    #[test]
+    fn concurrent_host_id_calls_share_the_same_persisted_value() {
+        use std::{
+            sync::{Arc, Barrier, Mutex},
+            thread,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let results: Arc<Mutex<Vec<HostId>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            let path = dir.path().to_path_buf();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let id = resolve_or_create_host_id(&path).expect("resolve host id");
+                results.lock().unwrap().push(id);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread join");
+        }
+
+        let ids = results.lock().unwrap();
+        assert_eq!(ids.len(), 8);
+        let first = ids.first().expect("first id").clone();
+        assert!(ids.iter().all(|id| *id == first), "all concurrent callers should observe the same id");
+        let file = fs::read_to_string(dir.path().join("host-id")).expect("host-id file");
+        assert_eq!(file.trim(), first.as_str());
     }
 
     #[test]
