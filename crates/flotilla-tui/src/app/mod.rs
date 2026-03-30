@@ -46,6 +46,19 @@ pub(super) enum OwnedSelectedRow {
     IssueRow(IssueRow),
 }
 
+/// Spawn a fire-and-forget `QueryIssueClose` so the server-side cursor is released.
+fn spawn_close_cursor(daemon: &Arc<dyn DaemonHandle>, cursor: &flotilla_protocol::issue_query::CursorId, session_id: uuid::Uuid) {
+    let daemon = daemon.clone();
+    let cursor = cursor.clone();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let cmd =
+                Command { action: CommandAction::QueryIssueClose { cursor }, host: None, provisioning_target: None, context_repo: None };
+            let _ = daemon.execute_query(cmd, session_id).await;
+        });
+    }
+}
+
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStatus {
@@ -522,6 +535,10 @@ impl App {
                 }
                 IssueQueryUpdate::SearchCursorOpened { repo, cursor, query } => {
                     let view = self.issue_views.entry(repo.clone()).or_default();
+                    // Close the old search cursor before replacing it.
+                    if let Some(old) = &view.search {
+                        spawn_close_cursor(&self.daemon, &old.cursor, self.session_id);
+                    }
                     view.search = Some(IssueCursorState {
                         cursor: cursor.clone(),
                         items: Vec::new(),
@@ -554,8 +571,11 @@ impl App {
                     tracing::warn!(%message, %is_search, "issue query failed");
                     self.set_status_message(Some(message));
                     if is_search {
-                        // Revert to the default listing.
+                        // Close the (possibly partially-opened) search cursor, then revert to the default listing.
                         if let Some(view) = self.issue_views.get_mut(&repo) {
+                            if let Some(old) = &view.search {
+                                spawn_close_cursor(&self.daemon, &old.cursor, self.session_id);
+                            }
                             view.search = None;
                             view.search_query = None;
                         }
@@ -881,8 +901,11 @@ impl App {
                     if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
                         page.active_search_query = None;
                     }
-                    // Clear the search cursor, reverting to the default listing.
+                    // Close the server-side search cursor and revert to the default listing.
                     if let Some(view) = self.issue_views.get_mut(&repo) {
+                        if let Some(old) = &view.search {
+                            spawn_close_cursor(&self.daemon, &old.cursor, self.session_id);
+                        }
                         view.search = None;
                         view.search_query = None;
                     }

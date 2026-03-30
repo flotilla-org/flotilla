@@ -59,16 +59,28 @@ impl GitHubIssueQueryService {
 }
 
 /// Opportunistically remove cursors that have not been accessed for `CURSOR_EXPIRY_SECS`.
-fn expire_stale_cursors(cursors: &mut HashMap<CursorId, CursorState>) {
+/// Also cleans `session_cursors` so expired cursor IDs don't accumulate in the secondary index.
+fn expire_stale_cursors(cursors: &mut HashMap<CursorId, CursorState>, session_cursors: &mut HashMap<uuid::Uuid, Vec<CursorId>>) {
     let threshold = tokio::time::Instant::now() - std::time::Duration::from_secs(CURSOR_EXPIRY_SECS);
-    cursors.retain(|_, state| state.last_accessed > threshold);
+    let expired: Vec<CursorId> = cursors.iter().filter(|(_, state)| state.last_accessed <= threshold).map(|(id, _)| id.clone()).collect();
+    for id in &expired {
+        if let Some(state) = cursors.remove(id) {
+            if let Some(session_ids) = session_cursors.get_mut(&state.session_id) {
+                session_ids.retain(|c| c != id);
+                if session_ids.is_empty() {
+                    session_cursors.remove(&state.session_id);
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl IssueQueryService for GitHubIssueQueryService {
     async fn open_query(&self, repo: &Path, params: IssueQuery, session_id: uuid::Uuid) -> Result<CursorId, String> {
         let mut cursors = self.cursors.lock().await;
-        expire_stale_cursors(&mut cursors);
+        let mut session_map = self.session_cursors.lock().await;
+        expire_stale_cursors(&mut cursors, &mut session_map);
 
         let id = self.next_cursor_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cursor_id = CursorId::new(format!("gh-{id}"));
@@ -83,15 +95,16 @@ impl IssueQueryService for GitHubIssueQueryService {
             session_id,
         };
         cursors.insert(cursor_id.clone(), state);
-        drop(cursors);
-
-        self.session_cursors.lock().await.entry(session_id).or_default().push(cursor_id.clone());
+        session_map.entry(session_id).or_default().push(cursor_id.clone());
         Ok(cursor_id)
     }
 
     async fn fetch_page(&self, cursor: &CursorId, count: usize) -> Result<IssueResultPage, String> {
         let mut cursors = self.cursors.lock().await;
-        expire_stale_cursors(&mut cursors);
+        {
+            let mut session_map = self.session_cursors.lock().await;
+            expire_stale_cursors(&mut cursors, &mut session_map);
+        }
 
         let state = cursors.get_mut(cursor).ok_or_else(|| format!("unknown cursor: {:?}", cursor.0))?;
         state.last_accessed = tokio::time::Instant::now();
@@ -398,6 +411,7 @@ mod tests {
     async fn cursor_expiry_removes_stale_cursors() {
         // Test the expire_stale_cursors function directly
         let mut cursors = HashMap::new();
+        let mut session_cursors: HashMap<uuid::Uuid, Vec<CursorId>> = HashMap::new();
         let fresh_id = CursorId::new("fresh");
         let stale_id = CursorId::new("stale");
         let session = uuid::Uuid::new_v4();
@@ -425,11 +439,20 @@ mod tests {
             session_id: session,
         });
 
+        session_cursors.insert(session, vec![fresh_id.clone(), stale_id.clone()]);
+
         assert_eq!(cursors.len(), 2);
-        expire_stale_cursors(&mut cursors);
+        assert_eq!(session_cursors.get(&session).map(|v| v.len()), Some(2));
+
+        expire_stale_cursors(&mut cursors, &mut session_cursors);
+
         assert_eq!(cursors.len(), 1);
         assert!(cursors.contains_key(&fresh_id));
         assert!(!cursors.contains_key(&stale_id));
+        // session_cursors should only contain the fresh cursor now
+        let remaining = session_cursors.get(&session).expect("session should still exist");
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains(&fresh_id));
     }
 
     #[tokio::test]
