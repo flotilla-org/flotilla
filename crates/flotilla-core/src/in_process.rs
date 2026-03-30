@@ -15,9 +15,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse, TopologyRoute,
+    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName, HostPath,
+    HostProvidersResponse, HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
+    TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +28,7 @@ use crate::{
     config::ConfigStore,
     convert::snapshot_to_proto,
     daemon::DaemonHandle,
+    environment_manager::EnvironmentManager,
     executor,
     host_registry::HostCounts,
     issue_cache::IssueCache,
@@ -277,9 +279,8 @@ pub struct InProcessDaemon {
     // holding those write locks.
     path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
     host_registry: crate::host_registry::HostRegistry,
-    /// Host-level environment assertions, computed once at startup and
-    /// reused for each repo discovery.
-    host_bag: EnvironmentBag,
+    local_environment_id: EnvironmentId,
+    environment_manager: Arc<EnvironmentManager>,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: DiscoveryRuntime,
@@ -309,8 +310,9 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
 
-        // Run host detection once before the repo loop
-        let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        let local_environment_id = EnvironmentId::new("local-environment");
+        let environment_manager = Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await);
+        let local_environment_bag = environment_manager.local_environment_bag();
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
         for path in repo_paths {
@@ -320,7 +322,7 @@ impl InProcessDaemon {
             let attachable_store = discovery.shared_attachable_store(&config);
             let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
             let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discovery::discover_providers(
-                &host_bag,
+                &local_environment_bag,
                 &ee_path,
                 &discovery.repo_detectors,
                 &discovery.factories,
@@ -350,13 +352,13 @@ impl InProcessDaemon {
 
         let local_host_summary = crate::host_summary::build_local_host_summary(
             &host_name,
-            &host_bag,
+            &environment_manager,
             crate::host_summary::provider_statuses_from_registries(
                 repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
             ),
             &*discovery.env,
-            vec![],
-        );
+        )
+        .await;
 
         let daemon = Arc::new(Self {
             repos: RwLock::new(repos),
@@ -370,7 +372,8 @@ impl InProcessDaemon {
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
             host_registry: crate::host_registry::HostRegistry::new(host_name.clone(), local_host_summary),
-            host_bag,
+            local_environment_id,
+            environment_manager,
             discovery,
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             session_id: uuid::Uuid::new_v4(),
@@ -409,8 +412,12 @@ impl InProcessDaemon {
         self.session_id
     }
 
-    pub fn local_host_summary(&self) -> &HostSummary {
-        self.host_registry.local_host_summary()
+    pub async fn local_host_summary(&self) -> HostSummary {
+        self.refresh_local_host_summary().await
+    }
+
+    pub fn local_environment_id(&self) -> &EnvironmentId {
+        &self.local_environment_id
     }
 
     pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
@@ -423,6 +430,11 @@ impl InProcessDaemon {
 
     pub async fn daemon_socket_path(&self) -> Option<PathBuf> {
         self.daemon_socket_path.read().await.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace_local_environment_bag_for_test(&self, env_bag: EnvironmentBag) -> Result<(), String> {
+        self.environment_manager.replace_local_environment_bag_for_test(env_bag)
     }
 
     /// Returns the current connection status for a peer host.
@@ -526,7 +538,7 @@ impl InProcessDaemon {
         for detector in &self.discovery.repo_detectors {
             repo_bag = repo_bag.extend(detector.detect(&ee_path, runner, env).await);
         }
-        let combined = self.host_bag.merge(&repo_bag);
+        let combined = self.environment_manager.local_environment_bag().merge(&repo_bag);
         repo_identity_from_bag_or_path(repo_path, &combined)
     }
 
@@ -1390,8 +1402,9 @@ impl InProcessDaemon {
 
         // Create the model outside the lock (spawns provider detection and refresh)
         let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
+        let local_environment_bag = self.environment_manager.local_environment_bag();
         let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
-            &self.host_bag,
+            &local_environment_bag,
             &ee_path,
             &self.discovery.repo_detectors,
             &self.discovery.factories,
@@ -1568,7 +1581,13 @@ impl InProcessDaemon {
             )),
         };
 
-        let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+        let host_discovery = self
+            .environment_manager
+            .local_environment_bag()
+            .assertions()
+            .iter()
+            .map(crate::convert::assertion_to_discovery_entry)
+            .collect();
         let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
 
         let provider_infos = state
@@ -1619,20 +1638,37 @@ impl InProcessDaemon {
     }
 
     pub async fn list_hosts_internal(&self) -> Result<HostListResponse, String> {
+        let _ = self.refresh_local_host_summary().await;
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
         Ok(self.host_registry.list_hosts(local_counts, &remote_counts).await)
     }
 
     pub async fn get_host_status_internal(&self, host: &str) -> Result<HostStatusResponse, String> {
+        let _ = self.refresh_local_host_summary().await;
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
         self.host_registry.get_host_status(host, local_counts, &remote_counts).await
     }
 
     pub async fn get_host_providers_internal(&self, host: &str) -> Result<HostProvidersResponse, String> {
+        let _ = self.refresh_local_host_summary().await;
         let remote_counts = self.remote_host_counts().await;
         self.host_registry.get_host_providers(host, &remote_counts).await
+    }
+
+    async fn refresh_local_host_summary(&self) -> HostSummary {
+        let summary = crate::host_summary::build_local_host_summary(
+            &self.host_name,
+            &self.environment_manager,
+            crate::host_summary::provider_statuses_from_registries(
+                self.repos.read().await.values().map(|state| state.preferred_root().model.registry.as_ref()),
+            ),
+            &*self.discovery.env,
+        )
+        .await;
+        self.host_registry.set_local_host_summary(summary.clone()).await;
+        summary
     }
 
     pub async fn execute_with_remote_executor(
@@ -1674,8 +1710,7 @@ impl InProcessDaemon {
             attachable_store,
             daemon_socket_path,
             local_host: self.host_name.clone(),
-            environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
-            environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            environment_manager: Arc::clone(&self.environment_manager),
         };
 
         let result = execute_local_remote_step_batch(self.host_name.clone(), request, progress_sink, cancel, &resolver).await;
@@ -1954,6 +1989,7 @@ impl InProcessDaemon {
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
+        let environment_manager = Arc::clone(&self.environment_manager);
         tokio::spawn(async move {
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
@@ -2002,8 +2038,7 @@ impl InProcessDaemon {
                         attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host.clone(),
-                        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
-                        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                        environment_manager: Arc::clone(&environment_manager),
                     };
                     let result = run_step_plan_with_remote_executor(
                         step_plan,
@@ -2155,6 +2190,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
+        let _ = self.refresh_local_host_summary().await;
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
         let mut events = self.host_registry.replay_host_events(last_seen).await;

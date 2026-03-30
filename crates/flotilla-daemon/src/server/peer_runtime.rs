@@ -878,7 +878,7 @@ pub(super) async fn send_local_to_peer(
     };
 
     let mut any_sent = false;
-    if let Err(e) = sender.send(PeerWireMessage::HostSummary(daemon.local_host_summary().clone())).await {
+    if let Err(e) = sender.send(PeerWireMessage::HostSummary(daemon.local_host_summary().await)).await {
         debug!(peer = %peer, err = %e, "failed to send host summary to peer");
     } else {
         any_sent = true;

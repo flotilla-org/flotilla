@@ -35,10 +35,7 @@ pub(crate) struct HostRegistry {
     hosts: RwLock<HashMap<HostName, HostState>>,
     configured_peer_names: RwLock<HashSet<HostName>>,
     topology_routes: RwLock<Vec<TopologyRoute>>,
-    /// Static snapshot of the local host's summary, computed once at startup.
-    /// Not updated at runtime — provider health changes are reflected in
-    /// per-repo snapshots, not in the host-level summary.
-    local_host_summary: HostSummary,
+    local_host_summary: RwLock<HostSummary>,
 }
 
 impl HostRegistry {
@@ -55,12 +52,34 @@ impl HostRegistry {
             hosts: RwLock::new(hosts),
             configured_peer_names: RwLock::new(HashSet::new()),
             topology_routes: RwLock::new(Vec::new()),
-            local_host_summary,
+            local_host_summary: RwLock::new(local_host_summary),
         }
     }
 
-    pub(crate) fn local_host_summary(&self) -> &HostSummary {
-        &self.local_host_summary
+    pub(crate) async fn local_host_summary(&self) -> HostSummary {
+        self.local_host_summary.read().await.clone()
+    }
+
+    pub(crate) async fn set_local_host_summary(&self, summary: HostSummary) {
+        let changed = {
+            let current = self.local_host_summary.read().await;
+            *current != summary
+        };
+        if !changed {
+            return;
+        }
+
+        {
+            let mut current = self.local_host_summary.write().await;
+            *current = summary.clone();
+        }
+
+        let mut hosts = self.hosts.write().await;
+        if let Some(state) = hosts.get_mut(&self.host_name) {
+            state.summary = Some(summary);
+            state.seq += 1;
+            state.removed = false;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -100,7 +119,7 @@ impl HostRegistry {
         let (statuses, summaries) = self.active_host_maps().await;
         let known = known_hosts(&self.host_name, &configured, &statuses, &summaries, remote_counts);
         let resolved = known.into_iter().find(|candidate| candidate.as_str() == host).ok_or_else(|| format!("host not found: {host}"))?;
-        let summary = if resolved == self.host_name { Some(self.local_host_summary.clone()) } else { summaries.get(&resolved).cloned() };
+        let summary = if resolved == self.host_name { Some(self.local_host_summary().await) } else { summaries.get(&resolved).cloned() };
 
         Ok(build_host_status(&resolved, &self.host_name, &configured, &statuses, summary, local_counts, remote_counts))
     }
@@ -115,7 +134,7 @@ impl HostRegistry {
         let known = known_hosts(&self.host_name, &configured, &statuses, &summaries, remote_counts);
         let resolved = known.into_iter().find(|candidate| candidate.as_str() == host).ok_or_else(|| format!("host not found: {host}"))?;
         let summary = if resolved == self.host_name {
-            self.local_host_summary.clone()
+            self.local_host_summary().await
         } else {
             summaries.get(&resolved).cloned().ok_or_else(|| format!("no summary available for host: {host}"))?
         };

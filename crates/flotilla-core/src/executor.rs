@@ -9,7 +9,6 @@ mod terminals;
 mod workspace;
 
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -28,6 +27,7 @@ use self::{
 use crate::{
     attachable::SharedAttachableStore,
     data,
+    environment_manager::{CreateProvisionedEnvironmentRequest, EnvironmentManager},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{registry::ProviderRegistry, run, types::WorkspaceConfig, CommandRunner},
@@ -545,9 +545,7 @@ pub(crate) struct ExecutorStepResolver {
     pub attachable_store: SharedAttachableStore,
     pub daemon_socket_path: Option<DaemonHostPath>,
     pub local_host: HostName,
-    // Environment lifecycle state
-    pub environment_handles: std::sync::Mutex<HashMap<flotilla_protocol::EnvironmentId, crate::providers::environment::EnvironmentHandle>>,
-    pub environment_registries: std::sync::Mutex<HashMap<flotilla_protocol::EnvironmentId, Arc<ProviderRegistry>>>,
+    pub environment_manager: Arc<EnvironmentManager>,
 }
 
 impl ExecutorStepResolver {
@@ -577,15 +575,12 @@ impl StepResolver for ExecutorStepResolver {
                 (self.registry.clone(), self.runner.clone(), self.repo.root.clone(), self.providers_data.clone())
             }
             StepExecutionContext::Environment(_, env_id) => {
-                let registry = {
-                    let registries = self.environment_registries.lock().expect("environment_registries lock");
-                    registries.get(env_id).cloned().ok_or_else(|| format!("environment registry not found: {env_id}"))?
-                };
-                let runner = {
-                    let handles = self.environment_handles.lock().expect("environment_handles lock");
-                    let handle = handles.get(env_id).ok_or_else(|| format!("environment handle not found: {env_id}"))?;
-                    handle.runner(self.runner.clone())
-                };
+                let registry = self
+                    .environment_manager
+                    .environment_registry(env_id)
+                    .ok_or_else(|| format!("environment registry not found: {env_id}"))?;
+                let runner =
+                    self.environment_manager.environment_runner(env_id).ok_or_else(|| format!("environment handle not found: {env_id}"))?;
                 // Interior repo root from prior CreateCheckout outcome, or /workspace
                 let repo_root = prior
                     .iter()
@@ -757,10 +752,8 @@ impl StepResolver for ExecutorStepResolver {
                         .collect()
                 };
 
-                let container_name = context_environment_id.as_ref().and_then(|env_id| {
-                    let handles = self.environment_handles.lock().expect("environment_handles lock");
-                    handles.get(env_id).and_then(|h| h.container_name().map(|s| s.to_string()))
-                });
+                let container_name =
+                    context_environment_id.as_ref().and_then(|env_id| self.environment_manager.environment_container_name(env_id));
 
                 Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
                     label,
@@ -1011,93 +1004,27 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Produced(CommandValue::ImageEnsured { image }))
             }
             StepAction::CreateEnvironment { env_id, provider, image: _ } => {
-                // Extract actual ImageId from prior EnsureEnvironmentImage outcome
-                let image = prior
-                    .iter()
-                    .find_map(|o| match o {
-                        StepOutcome::Produced(CommandValue::ImageEnsured { image }) => Some(image.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| "image not produced by prior EnsureEnvironmentImage step".to_string())?;
-
-                let (_, env_provider) = self
-                    .registry
-                    .environment_providers
-                    .get(&provider)
-                    .ok_or_else(|| format!("environment provider not available: {provider}"))?;
-
-                // Resolve reference repo path
                 let reference_repo = self.resolve_reference_repo().await;
-
                 let daemon_socket =
                     self.daemon_socket_path.clone().ok_or_else(|| "daemon socket path required for environment creation".to_string())?;
-
-                // Resolve token env vars from the environment spec (if available from prior ReadEnvironmentSpec)
-                let tokens: Vec<(String, String)> = prior
-                    .iter()
-                    .find_map(|o| match o {
-                        StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec }) => Some(spec.clone()),
-                        _ => None,
+                self.environment_manager
+                    .create_provisioned_environment(CreateProvisionedEnvironmentRequest {
+                        env_id: env_id.clone(),
+                        provider: &provider,
+                        registry: self.registry.as_ref(),
+                        daemon_socket_path: &daemon_socket,
+                        reference_repo,
+                        prior,
                     })
-                    .map(|spec| {
-                        spec.token_env_vars
-                            .iter()
-                            .filter_map(|name| match std::env::var(name) {
-                                Ok(val) => Some((name.clone(), val)),
-                                Err(_) => {
-                                    tracing::warn!(env_var = %name, "token env var not set on host, skipping");
-                                    None
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let opts = crate::providers::environment::CreateOpts {
-                    tokens,
-                    reference_repo,
-                    daemon_socket_path: daemon_socket,
-                    working_directory: None,
-                };
-
-                let handle = env_provider.create(env_id.clone(), &image, opts).await?;
-                self.environment_handles.lock().expect("environment_handles lock").insert(env_id.clone(), handle);
+                    .await?;
                 Ok(StepOutcome::Produced(CommandValue::EnvironmentCreated { env_id }))
             }
             StepAction::DiscoverEnvironmentProviders { env_id } => {
-                let handle = {
-                    let handles = self.environment_handles.lock().expect("environment_handles lock");
-                    handles.get(&env_id).cloned().ok_or_else(|| format!("environment handle not found: {env_id}"))?
-                };
-
-                let env_runner = handle.runner(self.runner.clone());
-
-                // Build a minimal EnvironmentBag from raw env vars
-                let raw_env_vars = handle.env_vars().await?;
-                let mut bag = crate::providers::discovery::EnvironmentBag::new();
-                for (key, value) in &raw_env_vars {
-                    bag = bag.with(crate::providers::discovery::EnvironmentAssertion::env_var(key, value));
-                }
-
-                // Probe factories with the environment runner.
-                // Scope config to the environment ID to avoid collisions between concurrent discoveries.
-                let config_base = self.config_base.as_path().join(format!("env-discovery/{env_id}"));
-                let config = crate::config::ConfigStore::with_base(config_base);
-                let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
-                let factory_registry = crate::providers::discovery::FactoryRegistry::default_all();
-                let provider_registry = factory_registry.probe_all(&bag, &config, &env_repo_root, env_runner).await;
-
-                self.environment_registries.lock().expect("environment_registries lock").insert(env_id, Arc::new(provider_registry));
-
+                self.environment_manager.discover_provisioned_environment_providers(&env_id, &self.config_base).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::DestroyEnvironment { env_id } => {
-                let handle = {
-                    let mut handles = self.environment_handles.lock().expect("environment_handles lock");
-                    handles.remove(&env_id).ok_or_else(|| format!("environment handle not found: {env_id}"))?
-                };
-                handle.destroy().await?;
-                self.environment_registries.lock().expect("environment_registries lock").remove(&env_id);
+                self.environment_manager.destroy_provisioned_environment(&env_id).await?;
                 Ok(StepOutcome::Completed)
             }
 

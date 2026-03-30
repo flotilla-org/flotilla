@@ -355,7 +355,7 @@ async fn host_summary_round_trip_between_connected_peers() {
     let (_peer, generation, mut leader_rx) = leader_receivers.pop().expect("leader receiver");
 
     follower_mgr
-        .send_to(&HostName::new("leader"), PeerWireMessage::HostSummary(follower_daemon.local_host_summary().clone()))
+        .send_to(&HostName::new("leader"), PeerWireMessage::HostSummary(follower_daemon.local_host_summary().await))
         .await
         .expect("send host summary");
 
@@ -375,7 +375,7 @@ async fn host_summary_round_trip_between_connected_peers() {
     assert_eq!(result, HandleResult::Ignored);
     let stored = leader_mgr.get_peer_host_summaries().get(&HostName::new("follower")).expect("leader stored follower summary");
     assert_eq!(stored.host_name, HostName::new("follower"));
-    assert_eq!(stored, follower_daemon.local_host_summary());
+    assert_eq!(stored, &follower_daemon.local_host_summary().await);
 
     let plan = leader_mgr.disconnect_peer(&HostName::new("follower"), generation);
     assert!(plan.was_active, "disconnect should clear active peer state");

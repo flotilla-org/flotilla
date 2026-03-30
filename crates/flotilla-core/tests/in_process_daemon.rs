@@ -25,6 +25,7 @@ use flotilla_core::{
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostPlatform, ProviderCategory, ProviderDescriptor,
             RepoDetector, UnmetRequirement,
         },
+        terminal::TerminalPool,
         types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus, Workspace},
     },
 };
@@ -181,6 +182,41 @@ fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
     runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility }));
     runtime
+}
+
+struct EnvGatedTerminalPoolFactory {
+    required_env_var: &'static str,
+    pool: Arc<dyn TerminalPool>,
+}
+
+#[async_trait]
+impl Factory for EnvGatedTerminalPoolFactory {
+    type Output = dyn TerminalPool;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::labeled_simple(
+            ProviderCategory::TerminalPool,
+            "managed-bag-terminal-pool",
+            "Managed Bag Terminals",
+            "TP",
+            "Terminals",
+            "terminal",
+        )
+    }
+
+    async fn probe(
+        &self,
+        env: &EnvironmentBag,
+        _: &ConfigStore,
+        _: &ExecutionEnvironmentPath,
+        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        if env.find_env_var(self.required_env_var).is_some() {
+            Ok(Arc::clone(&self.pool))
+        } else {
+            Err(vec![UnmetRequirement::MissingEnvVar(self.required_env_var.into())])
+        }
+    }
 }
 
 fn sample_remote_host_summary(name: &str) -> HostSummary {
@@ -2149,6 +2185,64 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
     assert!(
         providers.unmet_requirements.iter().any(|req| req.factory == "git" && req.kind == "no_vcs_checkout" && req.value.is_none()),
         "should expose valueless unmet requirements without forcing a placeholder string"
+    );
+}
+
+#[tokio::test]
+async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let daemon =
+        InProcessDaemon::new(vec![], config, fake_discovery_with_provider_set(FakeDiscoveryProviders::new()), HostName::local()).await;
+
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
+            HostPlatform::GitHub,
+            "owner",
+            "manager-backed-repo",
+            "origin",
+        )))
+        .expect("replace local environment bag");
+
+    let (tracked_path, resolved_from) = daemon.add_repo(&repo).await.expect("add repo");
+
+    assert_eq!(tracked_path, repo);
+    assert_eq!(resolved_from, None);
+    assert_eq!(
+        daemon.tracked_repo_identity_for_path(&tracked_path).await,
+        Some(RepoIdentity { authority: "github.com".into(), path: "owner/manager-backed-repo".into() })
+    );
+}
+
+#[tokio::test]
+async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let terminal_pool: Arc<dyn TerminalPool> = Arc::new(FakeTerminalPool::new());
+    let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+    discovery
+        .factories
+        .terminal_pools
+        .push(Box::new(EnvGatedTerminalPoolFactory { required_env_var: "ENABLE_MANAGER_TERMINALS", pool: terminal_pool }));
+    let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::local()).await;
+
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("ENABLE_MANAGER_TERMINALS", "1")))
+        .expect("replace local environment bag");
+    daemon.add_repo(&repo).await.expect("add repo");
+
+    let providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo.clone())).await.expect("get_repo_providers");
+
+    assert!(
+        providers
+            .providers
+            .iter()
+            .any(|provider| { provider.category == ProviderCategory::TerminalPool.slug() && provider.name == "Managed Bag Terminals" }),
+        "provider discovery should read the manager-backed local environment bag"
     );
 }
 
