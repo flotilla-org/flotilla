@@ -107,6 +107,9 @@ pub enum RoutedPeerMessage {
         target_host: HostName,
         remaining_hops: u8,
         command: Box<crate::Command>,
+        /// Session ID of the originating client, for cursor ownership on the target.
+        #[serde(default)]
+        session_id: Option<uuid::Uuid>,
     },
     CommandCancelRequest {
         cancel_id: u64,
@@ -396,6 +399,7 @@ mod tests {
                 context_repo: None,
                 action: CommandAction::Refresh { repo: Some(RepoSelector::Query("flotilla".into())) },
             }),
+            session_id: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");

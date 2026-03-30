@@ -211,6 +211,7 @@ async fn routed_command_request_reaches_target_through_relay() {
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
         }),
+        session_id: None,
     };
 
     net.manager(a).send_to(&HostName::new("host-c"), PeerWireMessage::Routed(request)).await.expect("send command request");
@@ -221,7 +222,7 @@ async fn routed_command_request_reaches_target_through_relay() {
     let c_results = net.process_peer_with_results(c).await;
     assert!(matches!(
         c_results.as_slice(),
-        [HandleResult::CommandRequested { request_id: 42, requester_host, reply_via, command }]
+        [HandleResult::CommandRequested { request_id: 42, requester_host, reply_via, command, .. }]
             if requester_host == &HostName::new("host-a")
                 && reply_via == &HostName::new("host-b")
                 && *command
@@ -262,6 +263,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                     context_repo: None,
                     action: CommandAction::Refresh { repo: None },
                 }),
+                session_id: None,
             }),
         )
         .await
@@ -352,6 +354,7 @@ async fn routed_command_returns_clear_error_for_unknown_target() {
                     context_repo: None,
                     action: CommandAction::Refresh { repo: None },
                 }),
+                session_id: None,
             }),
         )
         .await

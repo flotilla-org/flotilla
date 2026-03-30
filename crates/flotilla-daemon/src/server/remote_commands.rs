@@ -153,6 +153,7 @@ impl RemoteCommandRouter {
                     target_host: target_host.clone(),
                     remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                     command: Box::new(command),
+                    session_id: None,
                 };
                 let send_result = self.send_routed_to(&target_host, routed).await;
 
@@ -208,6 +209,7 @@ impl RemoteCommandRouter {
             target_host: target_host.clone(),
             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
             command: Box::new(command),
+            session_id: Some(session_id),
         };
         if let Err(err) = self.send_routed_to(&target_host, routed).await {
             self.pending_remote_commands.lock().await.remove(&request_id);
@@ -266,7 +268,14 @@ impl RemoteCommandRouter {
         }
     }
 
-    pub(super) async fn spawn_forwarded_command(&self, request_id: u64, requester_host: HostName, reply_via: HostName, command: Command) {
+    pub(super) async fn spawn_forwarded_command(
+        &self,
+        request_id: u64,
+        requester_host: HostName,
+        reply_via: HostName,
+        command: Command,
+        session_id: Option<uuid::Uuid>,
+    ) {
         let ready = Arc::new(Notify::new());
         self.forwarded_commands
             .lock()
@@ -274,7 +283,7 @@ impl RemoteCommandRouter {
             .insert(request_id, ForwardedCommand { state: ForwardedCommandState::Launching { ready: Arc::clone(&ready) } });
         let router = self.clone();
         tokio::spawn(async move {
-            router.execute_forwarded_command(request_id, requester_host, reply_via, command, ready).await;
+            router.execute_forwarded_command(request_id, requester_host, reply_via, command, session_id, ready).await;
         });
     }
 
@@ -492,6 +501,7 @@ impl RemoteCommandRouter {
         requester_host: HostName,
         reply_via: HostName,
         command: Command,
+        session_id: Option<uuid::Uuid>,
         ready: Arc<Notify>,
     ) {
         let responder_host = self.daemon.host_name().clone();
@@ -499,7 +509,8 @@ impl RemoteCommandRouter {
         // Query commands: execute synchronously via execute_query, send the
         // result back directly without subscribing to the event stream.
         if command.action.is_query() {
-            let result = match self.daemon.execute_query(command, uuid::Uuid::nil()).await {
+            let query_session = session_id.unwrap_or(uuid::Uuid::nil());
+            let result = match self.daemon.execute_query(command, query_session).await {
                 Ok(value) => value,
                 Err(message) => CommandValue::Error { message },
             };
@@ -628,7 +639,7 @@ impl RemoteCommandRouter {
         command: Command,
         ready: Arc<Notify>,
     ) {
-        self.execute_forwarded_command(request_id, requester_host, reply_via, command, ready).await;
+        self.execute_forwarded_command(request_id, requester_host, reply_via, command, None, ready).await;
     }
 
     #[cfg(test)]

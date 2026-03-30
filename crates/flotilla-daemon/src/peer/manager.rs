@@ -40,7 +40,7 @@ pub enum HandleResult {
     /// Caller should request a full resync from the origin.
     NeedsResync { from: HostName, repo: RepoIdentity },
     /// A routed command targeted this daemon and should be executed locally.
-    CommandRequested { request_id: u64, requester_host: HostName, reply_via: HostName, command: Command },
+    CommandRequested { request_id: u64, requester_host: HostName, reply_via: HostName, command: Command, session_id: Option<uuid::Uuid> },
     /// A routed command cancel request targeted this daemon.
     CommandCancelRequested { cancel_id: u64, requester_host: HostName, reply_via: HostName, command_request_id: u64 },
     /// A routed command lifecycle event reached the original requester.
@@ -744,12 +744,18 @@ impl PeerManager {
                 self.reverse_paths.remove(&key);
                 HandleResult::Ignored
             }
-            RoutedPeerMessage::CommandRequest { request_id, requester_host, target_host, remaining_hops, command } => {
+            RoutedPeerMessage::CommandRequest { request_id, requester_host, target_host, remaining_hops, command, session_id } => {
                 if remaining_hops == 0 {
                     return HandleResult::Ignored;
                 }
                 if target_host == self.local_host {
-                    return HandleResult::CommandRequested { request_id, requester_host, reply_via: connection_peer, command: *command };
+                    return HandleResult::CommandRequested {
+                        request_id,
+                        requester_host,
+                        reply_via: connection_peer,
+                        command: *command,
+                        session_id,
+                    };
                 }
 
                 let key = CommandReversePathKey { request_id, requester_host: requester_host.clone(), target_host: target_host.clone() };
@@ -766,6 +772,7 @@ impl PeerManager {
                     target_host: target_host.clone(),
                     remaining_hops: remaining_hops.saturating_sub(1),
                     command,
+                    session_id,
                 };
                 self.queue_send_to(&target_host, PeerWireMessage::Routed(forwarded));
                 HandleResult::Ignored

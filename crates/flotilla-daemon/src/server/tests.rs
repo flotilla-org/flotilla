@@ -1514,6 +1514,7 @@ async fn handle_inbound_command_request_does_not_hold_peer_manager_lock_across_s
                             context_repo: None,
                             action: CommandAction::Refresh { repo: None },
                         }),
+                        session_id: None,
                     }),
                     connection_generation: generation,
                     connection_peer,

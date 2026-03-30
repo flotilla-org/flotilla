@@ -51,6 +51,7 @@ enum PostHandleAction {
         requester_host: HostName,
         reply_via: HostName,
         command: flotilla_protocol::Command,
+        session_id: Option<uuid::Uuid>,
     },
     CommandCancelRequested {
         cancel_id: u64,
@@ -327,8 +328,8 @@ impl PeerRuntime {
                                         PostHandleAction::NeedsResync { from, sender, request_id, local_host, repo }
                                     }
                                     HandleResult::ReconnectSuppressed { peer } => PostHandleAction::ReconnectSuppressed { peer },
-                                    HandleResult::CommandRequested { request_id, requester_host, reply_via, command } => {
-                                        PostHandleAction::CommandRequested { request_id, requester_host, reply_via, command }
+                                    HandleResult::CommandRequested { request_id, requester_host, reply_via, command, session_id } => {
+                                        PostHandleAction::CommandRequested { request_id, requester_host, reply_via, command, session_id }
                                     }
                                     HandleResult::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id } => {
                                         PostHandleAction::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id }
@@ -464,8 +465,10 @@ impl PeerRuntime {
                                 PostHandleAction::ReconnectSuppressed { peer } => {
                                     info!(peer = %peer, "peer requested reconnect suppression");
                                 }
-                                PostHandleAction::CommandRequested { request_id, requester_host, reply_via, command } => {
-                                    remote_command_router_task.spawn_forwarded_command(request_id, requester_host, reply_via, command).await;
+                                PostHandleAction::CommandRequested { request_id, requester_host, reply_via, command, session_id } => {
+                                    remote_command_router_task
+                                        .spawn_forwarded_command(request_id, requester_host, reply_via, command, session_id)
+                                        .await;
                                 }
                                 PostHandleAction::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id } => {
                                     remote_command_router_task
