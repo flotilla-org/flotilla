@@ -563,9 +563,13 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
     let refresh_event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
     match refresh_event {
         DaemonEvent::RepoSnapshot(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
-        DaemonEvent::RepoDelta(delta) => {
-            assert!(delta.work_items.iter().any(|item| item.session_key.as_deref() == Some("sess-1")), "refresh should expose sess-1")
-        }
+        DaemonEvent::RepoDelta(delta) => assert!(delta.changes.iter().any(|change| matches!(
+            change,
+            flotilla_protocol::Change::WorkItem {
+                op: flotilla_protocol::EntryOp::Added(item) | flotilla_protocol::EntryOp::Updated(item),
+                ..
+            } if item.session_key.as_deref() == Some("sess-1")
+        ))),
         other => panic!("expected snapshot event, got {other:?}"),
     }
 
@@ -2523,9 +2527,13 @@ async fn two_commands_can_run_concurrently() {
     let refresh_event = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
     match refresh_event {
         DaemonEvent::RepoSnapshot(snap) => assert!(snap.providers.sessions.contains_key("sess-1"), "refresh should expose sess-1"),
-        DaemonEvent::RepoDelta(delta) => {
-            assert!(delta.work_items.iter().any(|item| item.session_key.as_deref() == Some("sess-1")), "refresh should expose sess-1")
-        }
+        DaemonEvent::RepoDelta(delta) => assert!(delta.changes.iter().any(|change| matches!(
+            change,
+            flotilla_protocol::Change::WorkItem {
+                op: flotilla_protocol::EntryOp::Added(item) | flotilla_protocol::EntryOp::Updated(item),
+                ..
+            } if item.session_key.as_deref() == Some("sess-1")
+        ))),
         other => panic!("expected snapshot event, got {other:?}"),
     }
 

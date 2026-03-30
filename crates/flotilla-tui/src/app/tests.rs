@@ -1,5 +1,5 @@
 use crossterm::event::KeyCode;
-use flotilla_protocol::{ProvisioningTarget, WorkItemIdentity};
+use flotilla_protocol::{Change, ProvisioningTarget, WorkItemIdentity};
 use tempfile::tempdir;
 use test_support::*;
 
@@ -446,6 +446,51 @@ fn apply_delta_health_only_change_does_not_set_unseen() {
     app.apply_delta(change);
 
     assert!(!app.model.repos[&inactive_repo].has_unseen_changes);
+}
+
+#[test]
+fn apply_delta_work_item_changes_update_repo_data() {
+    let mut app = stub_app();
+    let repo = app.model.active_repo_identity().clone();
+    let repo_path = active_repo_path(&app);
+
+    let mut snap = snapshot(&repo_path);
+    snap.work_items = vec![issue_item("1")];
+    app.apply_snapshot(snap);
+
+    let mut updated_issue = issue_item("1");
+    updated_issue.description = "Updated issue 1".into();
+    let added_issue = issue_item("2");
+
+    app.apply_delta(delta(&repo_path, vec![
+        Change::WorkItem { identity: updated_issue.identity.clone(), op: flotilla_protocol::EntryOp::Updated(updated_issue.clone()) },
+        Change::WorkItem { identity: added_issue.identity.clone(), op: flotilla_protocol::EntryOp::Added(added_issue.clone()) },
+    ]));
+
+    let data = app.repo_data[&repo].read();
+    assert_eq!(data.work_items.len(), 2);
+    assert!(data.work_items.iter().any(|item| item.identity == updated_issue.identity && item.description == "Updated issue 1"));
+    assert!(data.work_items.iter().any(|item| item.identity == added_issue.identity));
+}
+
+#[test]
+fn apply_delta_work_item_remove_updates_repo_data() {
+    let mut app = stub_app();
+    let repo = app.model.active_repo_identity().clone();
+    let repo_path = active_repo_path(&app);
+
+    let mut snap = snapshot(&repo_path);
+    snap.work_items = vec![issue_item("1"), issue_item("2")];
+    app.apply_snapshot(snap);
+
+    app.apply_delta(delta(&repo_path, vec![Change::WorkItem {
+        identity: flotilla_protocol::WorkItemIdentity::Issue("1".into()),
+        op: flotilla_protocol::EntryOp::Removed,
+    }]));
+
+    let data = app.repo_data[&repo].read();
+    assert_eq!(data.work_items.len(), 1);
+    assert_eq!(data.work_items[0].identity, flotilla_protocol::WorkItemIdentity::Issue("2".into()));
 }
 
 // -- handle_repo_added / handle_repo_removed --

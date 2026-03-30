@@ -126,5 +126,26 @@ pub fn diff_work_items(prev: &[WorkItem], curr: &[WorkItem]) -> Vec<Change> {
     diff_indexmap(&prev_map, &curr_map).into_iter().map(|(identity, op)| Change::WorkItem { identity, op }).collect()
 }
 
+/// Apply `Change::WorkItem` operations to a work-item vector in place.
+pub fn apply_work_item_changes(work_items: &mut Vec<WorkItem>, changes: &[Change]) {
+    let mut by_identity: IndexMap<WorkItemIdentity, WorkItem> =
+        work_items.iter().map(|item| (item.identity.clone(), item.clone())).collect();
+
+    for change in changes {
+        if let Change::WorkItem { identity, op } = change {
+            match op {
+                EntryOp::Added(item) | EntryOp::Updated(item) => {
+                    by_identity.insert(identity.clone(), item.clone());
+                }
+                EntryOp::Removed => {
+                    by_identity.shift_remove(identity);
+                }
+            }
+        }
+    }
+
+    *work_items = by_identity.into_values().collect();
+}
+
 #[cfg(test)]
 mod tests;

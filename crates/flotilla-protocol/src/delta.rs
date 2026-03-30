@@ -84,8 +84,6 @@ pub struct DeltaEntry {
     pub seq: u64,
     pub prev_seq: u64,
     pub changes: Vec<Change>,
-    /// Pre-correlated work items at this seq (needed for delta replay to clients).
-    pub work_items: Vec<crate::snapshot::WorkItem>,
 }
 
 #[cfg(test)]

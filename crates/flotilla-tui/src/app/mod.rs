@@ -1000,7 +1000,7 @@ impl App {
                 d.labels = rm.labels.clone();
                 d.provider_names = rm.provider_names.clone();
                 d.provider_health = rm.provider_health.clone();
-                d.work_items = delta.work_items;
+                flotilla_core::delta::apply_work_item_changes(&mut d.work_items, &delta.changes);
                 d.issue_has_more = rm.issue_has_more;
                 d.issue_total = rm.issue_total.map(|v| v as usize);
                 d.issue_search_active = rm.issue_search_active;

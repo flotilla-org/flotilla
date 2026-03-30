@@ -94,14 +94,13 @@ fn choose_event_uses_delta_for_non_initial_changes() {
         issue_search_results: None,
     };
 
-    let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![], work_items: vec![] };
+    let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![] };
     assert!(matches!(choose_event(snapshot.clone(), initial), DaemonEvent::RepoSnapshot(_)));
 
     let non_empty = DeltaEntry {
         seq: 2,
         prev_seq: 1,
         changes: vec![flotilla_protocol::Change::Branch { key: "feature/x".into(), op: flotilla_protocol::EntryOp::Removed }],
-        work_items: vec![],
     };
     assert!(matches!(choose_event(snapshot, non_empty), DaemonEvent::RepoDelta(_)));
 }
@@ -126,7 +125,6 @@ fn choose_event_falls_back_to_full_when_delta_is_larger() {
         seq: 3,
         prev_seq: 2,
         changes: vec![flotilla_protocol::Change::Branch { key: "feature/".repeat(128), op: flotilla_protocol::EntryOp::Removed }],
-        work_items: vec![],
     };
 
     assert!(matches!(choose_event(snapshot, delta), DaemonEvent::RepoSnapshot(_)));
@@ -196,7 +194,7 @@ fn choose_event_sends_full_when_delta_has_empty_changes() {
     };
 
     // prev_seq > 0 but changes is empty — should still send full
-    let delta = DeltaEntry { seq: 2, prev_seq: 1, changes: vec![], work_items: vec![] };
+    let delta = DeltaEntry { seq: 2, prev_seq: 1, changes: vec![] };
     assert!(matches!(choose_event(snapshot, delta), DaemonEvent::RepoSnapshot(_)));
 }
 

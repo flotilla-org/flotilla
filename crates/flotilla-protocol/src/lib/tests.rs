@@ -172,8 +172,28 @@ fn snapshot_delta_event_roundtrip() {
         changes: vec![
             Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) },
             Change::Issue { key: "42".into(), op: EntryOp::Removed },
+            Change::WorkItem {
+                identity: WorkItemIdentity::Issue("42".into()),
+                op: EntryOp::Added(WorkItem {
+                    kind: WorkItemKind::Issue,
+                    identity: WorkItemIdentity::Issue("42".into()),
+                    host: HostName::new("test-host"),
+                    branch: None,
+                    description: "Bug 42".into(),
+                    checkout: None,
+                    change_request_key: None,
+                    session_key: None,
+                    issue_keys: vec![],
+                    workspace_refs: vec![],
+                    is_main_checkout: false,
+                    debug_group: vec![],
+                    source: None,
+                    terminal_keys: vec![],
+                    attachable_set_id: None,
+                    agent_keys: vec![],
+                }),
+            },
         ],
-        work_items: vec![],
         issue_total: Some(100),
         issue_has_more: true,
         issue_search_results: None,
@@ -188,7 +208,14 @@ fn snapshot_delta_event_roundtrip() {
                 assert_eq!(d.prev_seq, 2);
                 assert_eq!(d.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() });
                 assert_eq!(d.repo, PathBuf::from("/tmp/my-repo"));
-                assert_eq!(d.changes.len(), 2);
+                assert_eq!(d.changes.len(), 3);
+                assert!(d.changes.iter().any(|change| matches!(
+                    change,
+                    Change::WorkItem {
+                        identity,
+                        op: EntryOp::Added(WorkItem { description, .. }),
+                    } if *identity == WorkItemIdentity::Issue("42".into()) && description == "Bug 42"
+                )));
                 assert_eq!(d.issue_total, Some(100));
                 assert!(d.issue_has_more);
                 assert!(d.issue_search_results.is_none());
@@ -307,7 +334,6 @@ fn snapshot_delta_roundtrip_preserves_repo_identity() {
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repo: PathBuf::from("/tmp/repo"),
         changes: vec![],
-        work_items: vec![],
         issue_total: Some(12),
         issue_has_more: true,
         issue_search_results: None,
