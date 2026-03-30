@@ -11,6 +11,7 @@ use std::{
 
 use flotilla_protocol::{qualified_path::HostId, EnvironmentId};
 use uuid::Uuid;
+use tracing::warn;
 
 use crate::providers::{ChannelLabel, CommandRunner};
 
@@ -70,6 +71,25 @@ async fn read_macos_platform_uuid(runner: &dyn CommandRunner) -> Option<String> 
     None
 }
 
+fn machine_scoped_state_dir_or_base(base_state_dir: &Path, resolved: Result<PathBuf, String>) -> PathBuf {
+    match resolved {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(base_state_dir = %base_state_dir.display(), err = %err, "machine-scoped state dir unavailable, using base state dir");
+            base_state_dir.to_path_buf()
+        }
+    }
+}
+
+/// Resolve the state directory to use for local direct-environment identity.
+///
+/// This prefers a machine-scoped subdirectory, but falls back to the provided
+/// base state directory if machine identity probing fails.
+pub async fn resolve_local_environment_state_dir(base_state_dir: &Path, runner: &dyn CommandRunner) -> PathBuf {
+    let resolved = machine_scoped_state_dir(base_state_dir, None, runner).await;
+    machine_scoped_state_dir_or_base(base_state_dir, resolved)
+}
+
 /// Resolve an existing `HostId` from `<state_dir>/host-id`, or generate and
 /// persist a new one atomically.
 ///
@@ -125,27 +145,40 @@ pub fn resolve_or_create_environment_id(state_dir: &Path) -> Result<EnvironmentI
         }
     }
 
-    let new_id = Uuid::new_v4().to_string();
-    let temp = state_dir.join(format!(".environment-id.{}", std::process::id()));
-
     fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir {}: {e}", state_dir.display()))?;
-    fs::write(&temp, format!("{new_id}\n")).map_err(|e| format!("failed to write temp environment-id: {e}"))?;
+    let new_id = Uuid::new_v4().to_string();
 
-    match fs::hard_link(&temp, &target) {
-        Ok(()) => {
-            let _ = fs::remove_file(&temp);
-            Ok(EnvironmentId::new(new_id))
+    for _ in 0..8 {
+        let temp = state_dir.join(format!(".environment-id.{}", Uuid::new_v4()));
+        match fs::write(&temp, format!("{new_id}\n")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to write temp environment-id: {e}")),
         }
-        Err(_) => {
-            let _ = fs::remove_file(&temp);
-            let content = fs::read_to_string(&target).map_err(|e| format!("failed to read environment-id after link race: {e}"))?;
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return Err("environment-id file exists but is empty".to_owned());
+
+        let link_result = fs::hard_link(&temp, &target);
+        let _ = fs::remove_file(&temp);
+
+        match link_result {
+            Ok(()) => return Ok(EnvironmentId::new(new_id)),
+            Err(_) if target.exists() => {
+                let content = fs::read_to_string(&target).map_err(|e| format!("failed to read environment-id after link race: {e}"))?;
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    return Err("environment-id file exists but is empty".to_owned());
+                }
+                return Ok(EnvironmentId::new(trimmed));
             }
-            Ok(EnvironmentId::new(trimmed))
+            Err(_) => continue,
         }
     }
+
+    let content = fs::read_to_string(&target).map_err(|e| format!("failed to read environment-id after retries: {e}"))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("environment-id file exists but is empty".to_owned());
+    }
+    Ok(EnvironmentId::new(trimmed))
 }
 
 #[cfg(test)]
@@ -187,6 +220,55 @@ mod tests {
         std::fs::write(&file, "my-custom-env-id\n").unwrap();
         let id = resolve_or_create_environment_id(dir.path()).unwrap();
         assert_eq!(id.as_str(), "my-custom-env-id");
+    }
+
+    #[test]
+    fn environment_state_dir_falls_back_to_base_when_machine_scoping_fails() {
+        let base = Path::new("/tmp/flotilla-test");
+        let resolved = machine_scoped_state_dir_or_base(base, Err("boom".to_string()));
+        assert_eq!(resolved, base);
+    }
+
+    #[test]
+    fn environment_state_dir_prefers_machine_scope_when_available() {
+        let base = Path::new("/tmp/flotilla-test");
+        let resolved = machine_scoped_state_dir_or_base(base, Ok(base.join("machine-123")));
+        assert_eq!(resolved, base.join("machine-123"));
+    }
+
+    #[test]
+    fn concurrent_environment_id_calls_share_the_same_persisted_value() {
+        use std::{
+            sync::{Arc, Barrier, Mutex},
+            thread,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let results: Arc<Mutex<Vec<EnvironmentId>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            let path = dir.path().to_path_buf();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let id = resolve_or_create_environment_id(&path).expect("resolve environment id");
+                results.lock().unwrap().push(id);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread join");
+        }
+
+        let ids = results.lock().unwrap();
+        assert_eq!(ids.len(), 8);
+        let first = ids.first().expect("first id").clone();
+        assert!(ids.iter().all(|id| *id == first), "all concurrent callers should observe the same id");
+        let file = fs::read_to_string(dir.path().join("environment-id")).expect("environment-id file");
+        assert_eq!(file.trim(), first.as_str());
     }
 
     #[tokio::test]
