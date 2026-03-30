@@ -1968,8 +1968,17 @@ async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_an
 
     assert_eq!(plan.steps.len(), 4);
     assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
+    assert!(matches!(
+        plan.steps[1].action,
+        StepAction::LinkIssuesToBranch { ref branch, ref issue_ids }
+            if branch == "feat-x" && issue_ids == &vec![(String::from("github"), String::from("123"))]
+    ));
     assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::new("feta")));
-    assert_eq!(plan.steps[2].description, "Prepare workspace for feat-x@feta");
+    assert!(matches!(
+        plan.steps[2].action,
+        StepAction::PrepareWorkspace { ref checkout_path, ref label }
+            if checkout_path == &None && label == "feat-x@feta"
+    ));
     assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::new("feta")));
     assert_eq!(plan.steps[3].description, "Attach workspace");
     assert_eq!(plan.steps[3].host, StepExecutionContext::Host(local));
