@@ -183,7 +183,7 @@ mod watch_human {
         RepoSnapshot {
             seq,
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.into() },
-            repo: PathBuf::from(repo),
+            repo: Some(PathBuf::from(repo)),
             host_name: HostName::new("test"),
             work_items: (0..work_item_count)
                 .map(|i| WorkItem {
@@ -233,7 +233,7 @@ mod watch_human {
             seq: 42,
             prev_seq: 41,
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
-            repo: PathBuf::from("/tmp/my-repo"),
+            repo: Some(PathBuf::from("/tmp/my-repo")),
             changes: vec![],
             work_items: vec![],
             issue_total: None,
@@ -250,7 +250,7 @@ mod watch_human {
         let event = DaemonEvent::RepoTracked(Box::new(flotilla_protocol::snapshot::RepoInfo {
             identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/added-repo".into() },
             name: "added-repo".into(),
-            path: PathBuf::from("/tmp/added-repo"),
+            path: Some(PathBuf::from("/tmp/added-repo")),
             labels: Default::default(),
             provider_names: Default::default(),
             provider_health: Default::default(),
@@ -266,7 +266,7 @@ mod watch_human {
     fn repo_untracked() {
         let event = DaemonEvent::RepoUntracked {
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/old-repo".into() },
-            path: PathBuf::from("/tmp/old-repo"),
+            path: Some(PathBuf::from("/tmp/old-repo")),
         };
         let line = format_event_human(&event);
         assert!(line.contains("[repo]"), "should have repo tag");
@@ -280,7 +280,7 @@ mod watch_human {
             command_id: 1,
             host: HostName::local(),
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
-            repo: PathBuf::from("/tmp/my-repo"),
+            repo: Some(PathBuf::from("/tmp/my-repo")),
             description: "Refreshing...".into(),
         };
         let line = format_event_human(&event);
@@ -295,7 +295,7 @@ mod watch_human {
             command_id: 1,
             host: HostName::local(),
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
-            repo: PathBuf::from("/tmp/my-repo"),
+            repo: Some(PathBuf::from("/tmp/my-repo")),
             result: CommandValue::Ok,
         };
         let line = format_event_human(&event);
@@ -310,7 +310,7 @@ mod watch_human {
             command_id: 1,
             host: HostName::local(),
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
-            repo: PathBuf::from("/tmp/my-repo"),
+            repo: Some(PathBuf::from("/tmp/my-repo")),
             result: CommandValue::Error { message: "boom".into() },
         };
         let line = format_event_human(&event);
@@ -776,19 +776,13 @@ mod query_event_formatting {
             command_id: 1,
             host: HostName::local(),
             repo_identity: test_identity(),
-            repo: PathBuf::default(),
+            repo: None,
             description: description.to_string(),
         }
     }
 
     fn query_finished(result: CommandValue) -> DaemonEvent {
-        DaemonEvent::CommandFinished {
-            command_id: 1,
-            host: HostName::local(),
-            repo_identity: test_identity(),
-            repo: PathBuf::default(),
-            result,
-        }
+        DaemonEvent::CommandFinished { command_id: 1, host: HostName::local(), repo_identity: test_identity(), repo: None, result }
     }
 
     #[test]
@@ -804,7 +798,7 @@ mod query_event_formatting {
             command_id: 1,
             host: HostName::local(),
             repo_identity: test_identity(),
-            repo: PathBuf::from("/tmp/myrepo"),
+            repo: Some(PathBuf::from("/tmp/myrepo")),
             description: "checkout".to_string(),
         };
         let output = format_event_human(&event);
@@ -832,7 +826,7 @@ mod query_event_formatting {
             command_id: 1,
             host: HostName::local(),
             repo_identity: test_identity(),
-            repo: PathBuf::from("/tmp/myrepo"),
+            repo: Some(PathBuf::from("/tmp/myrepo")),
             result: CommandValue::Ok,
         };
         let output = format_event_human(&event);

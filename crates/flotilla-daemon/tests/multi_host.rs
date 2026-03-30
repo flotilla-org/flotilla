@@ -43,7 +43,7 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
     PeerDataMessage {
         origin_host: HostName::new(origin),
         repo_identity: test_repo(),
-        repo_path: PathBuf::from("/home/dev/repo"),
+        host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(data), seq },
     }
@@ -93,7 +93,7 @@ async fn peer_manager_stores_snapshot_and_returns_updated() {
 
     let repo_state = &peer_data[&follower_host][&test_repo()];
     assert_eq!(repo_state.seq, 1);
-    assert_eq!(repo_state.repo_path, PathBuf::from("/home/dev/repo"));
+    assert_eq!(repo_state.host_repo_root, Some(PathBuf::from("/home/dev/repo")));
 
     // Verify the checkout is in the stored provider data
     let hp = HostPath::new(HostName::new("follower"), "/home/dev/repo");
@@ -551,7 +551,7 @@ async fn delta_message_returns_needs_resync() {
     let msg = PeerDataMessage {
         origin_host: HostName::new("follower"),
         repo_identity: test_repo(),
-        repo_path: PathBuf::from("/home/dev/repo"),
+        host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::Delta {
             changes: vec![Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) }],

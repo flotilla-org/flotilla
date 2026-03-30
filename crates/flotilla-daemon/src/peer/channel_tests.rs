@@ -20,7 +20,7 @@ fn snapshot_msg(origin: &str, repo: &RepoIdentity, seq: u64) -> PeerDataMessage 
     PeerDataMessage {
         origin_host: HostName::new(origin),
         repo_identity: repo.clone(),
-        repo_path: PathBuf::from("/repo"),
+        host_repo_root: Some(PathBuf::from("/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq },
     }
@@ -279,7 +279,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 event: Box::new(CommandPeerEvent::StepUpdate {
                     repo_identity: test_repo(),
-                    repo: PathBuf::from("/repo"),
+                    repo: Some(PathBuf::from("/repo")),
                     step_index: 0,
                     step_count: 2,
                     description: "Refreshing".into(),
@@ -298,7 +298,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                 && *event
                     == CommandPeerEvent::StepUpdate {
                         repo_identity: test_repo(),
-                        repo: PathBuf::from("/repo"),
+                        repo: Some(PathBuf::from("/repo")),
                         step_index: 0,
                         step_count: 2,
                         description: "Refreshing".into(),

@@ -536,7 +536,7 @@ fn handle_daemon_event_command_started_tracked() {
         command_id: 99,
         host: HostName::local(),
         repo_identity: app.model.active_repo_identity().clone(),
-        repo: repo.clone(),
+        repo: Some(repo.clone()),
         description: "test cmd".into(),
     });
 
@@ -560,7 +560,7 @@ fn step_failure_surfaces_error_in_status_message() {
         command_id: 42,
         host: HostName::local(),
         repo_identity,
-        repo: repo_path,
+        repo: Some(repo_path),
         step_index: 0,
         step_count: 1,
         description: "Create checkout for branch my-branch".into(),
@@ -714,7 +714,7 @@ fn command_finished_ok_clears_pending_action() {
         command_id: 42,
         host: HostName::local(),
         repo_identity: repo.clone(),
-        repo: repo_path,
+        repo: Some(repo_path),
         result: CommandValue::Ok,
     });
 
@@ -741,7 +741,7 @@ fn command_finished_error_transitions_to_failed() {
         command_id: 42,
         host: HostName::local(),
         repo_identity: repo.clone(),
-        repo: repo_path,
+        repo: Some(repo_path),
         result: CommandValue::Error { message: "boom".into() },
     });
 
@@ -769,7 +769,7 @@ fn command_finished_cancelled_clears_pending_action() {
         command_id: 42,
         host: HostName::local(),
         repo_identity: repo.clone(),
-        repo: repo_path,
+        repo: Some(repo_path),
         result: CommandValue::Cancelled,
     });
 
@@ -797,7 +797,7 @@ fn orphaned_command_finished_harmlessly_ignored() {
         command_id: 42,
         host: HostName::local(),
         repo_identity: repo.clone(),
-        repo: repo_path,
+        repo: Some(repo_path),
         result: CommandValue::Ok,
     });
 
@@ -818,7 +818,7 @@ fn local_checkout_created_does_not_queue_workspace() {
         command_id: 42,
         host: HostName::new("my-desktop"),
         repo_identity,
-        repo: repo_path,
+        repo: Some(repo_path),
         result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/tmp/repo/wt-feat") },
     });
 
@@ -838,7 +838,7 @@ fn remote_checkout_created_does_not_queue_workspace() {
         command_id: 42,
         host: HostName::new("remote-a"),
         repo_identity,
-        repo: repo_path,
+        repo: Some(repo_path),
         result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/remote/wt-feat") },
     });
 

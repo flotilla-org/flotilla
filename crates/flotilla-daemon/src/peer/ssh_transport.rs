@@ -632,7 +632,7 @@ mod tests {
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
                 origin_host: HostName::new("remote"),
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-                repo_path: PathBuf::from("/home/remote/repo"),
+                host_repo_root: Some(PathBuf::from("/home/remote/repo")),
                 clock: flotilla_protocol::VectorClock::default(),
                 kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(flotilla_protocol::ProviderData::default()), seq: 1 },
             }))))
@@ -645,12 +645,12 @@ mod tests {
         match msg {
             PeerWireMessage::Data(PeerDataMessage {
                 origin_host,
-                repo_path,
+                host_repo_root,
                 kind: flotilla_protocol::PeerDataKind::Snapshot { seq, .. },
                 ..
             }) => {
                 assert_eq!(origin_host, HostName::new("remote"));
-                assert_eq!(repo_path, PathBuf::from("/home/remote/repo"));
+                assert_eq!(host_repo_root, Some(PathBuf::from("/home/remote/repo")));
                 assert_eq!(seq, 1);
             }
             other => panic!("unexpected message: {other:?}"),

@@ -129,15 +129,20 @@ pub struct TuiModel {
 }
 
 impl TuiModel {
+    pub fn display_path(identity: &RepoIdentity, path: Option<PathBuf>) -> PathBuf {
+        path.unwrap_or_else(|| PathBuf::from(identity.path.clone()))
+    }
+
     pub fn from_repo_info(repos_info: Vec<RepoInfo>) -> Self {
         let mut repos = HashMap::new();
         let mut order = Vec::new();
         for info in repos_info {
             let identity = info.identity;
+            let path = Self::display_path(&identity, info.path);
             order.push(identity.clone());
             repos.insert(identity.clone(), TuiRepoModel {
                 identity,
-                path: info.path,
+                path,
                 providers: Arc::new(ProviderData::default()),
                 labels: info.labels,
                 provider_names: info.provider_names,
@@ -758,6 +763,9 @@ impl App {
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
             DaemonEvent::CommandStarted { command_id, repo_identity, repo, description, .. } => {
                 tracing::info!(%command_id, %description, "command started");
+                let repo = repo
+                    .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
+                    .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
                 self.in_flight.insert(command_id, InFlightCommand { repo_identity, repo, description });
             }
             DaemonEvent::CommandFinished { command_id, host: _, repo_identity: _, repo: _, result, .. } => {
@@ -842,7 +850,11 @@ impl App {
 
     fn apply_snapshot(&mut self, snap: RepoSnapshot) {
         let repo_identity = snap.repo_identity.clone();
-        let path = snap.repo.clone();
+        let path = snap
+            .repo
+            .clone()
+            .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
+            .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
         let rm = match self.model.repos.get_mut(&repo_identity) {
             Some(rm) => rm,
             None => return,
@@ -916,7 +928,11 @@ impl App {
 
     fn apply_delta(&mut self, delta: RepoDelta) {
         let repo_identity = delta.repo_identity.clone();
-        let path = delta.repo;
+        let path = delta
+            .repo
+            .clone()
+            .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
+            .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
         let mut status_message_update = None;
         let rm = match self.model.repos.get_mut(&repo_identity) {
             Some(rm) => rm,
@@ -1018,10 +1034,11 @@ impl App {
         if self.model.repos.contains_key(&identity) {
             return;
         }
+        let path = TuiModel::display_path(&identity, info.path.clone());
 
         // Create Shared<RepoData> and RepoPage for the new repo
         let shared = Shared::new(RepoData {
-            path: info.path.clone(),
+            path: path.clone(),
             providers: Arc::new(ProviderData::default()),
             labels: info.labels.clone(),
             provider_names: info.provider_names.clone(),
@@ -1038,7 +1055,7 @@ impl App {
 
         self.model.repos.insert(identity.clone(), TuiRepoModel {
             identity: info.identity,
-            path: info.path,
+            path,
             providers: Arc::new(ProviderData::default()),
             labels: info.labels,
             provider_names: info.provider_names,

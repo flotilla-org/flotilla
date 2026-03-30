@@ -308,10 +308,10 @@ impl HighFidelityHarness {
                 format!("host_snapshot host={} local={} status={:?}", snap.host_name, snap.is_local, snap.connection_status)
             }
             DaemonEvent::PeerStatusChanged { host, status } => format!("peer_status host={host} status={status:?}"),
-            DaemonEvent::RepoSnapshot(snap) => format!("repo_snapshot repo={} seq={}", snap.repo.display(), snap.seq),
-            DaemonEvent::RepoDelta(delta) => format!("repo_delta repo={} seq={}", delta.repo.display(), delta.seq),
-            DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", info.path.display()),
-            DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", path.display()),
+            DaemonEvent::RepoSnapshot(snap) => format!("repo_snapshot repo={} seq={}", fmt_optional_path(snap.repo.as_deref()), snap.seq),
+            DaemonEvent::RepoDelta(delta) => format!("repo_delta repo={} seq={}", fmt_optional_path(delta.repo.as_deref()), delta.seq),
+            DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
+            DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
             DaemonEvent::HostRemoved { host, .. } => format!("host_removed {host}"),
         };
         self.recent_events.push(summary);
@@ -382,6 +382,10 @@ fn drain_daemon_events(
     }
 }
 
+fn fmt_optional_path(path: Option<&std::path::Path>) -> String {
+    path.map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into())
+}
+
 fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEvent) {
     let summary = match event {
         DaemonEvent::CommandStarted { command_id, host, description, .. } => {
@@ -400,13 +404,13 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
             format!("{source}: peer_status host={host} status={status:?}")
         }
         DaemonEvent::RepoSnapshot(snap) => {
-            format!("{source}: repo_snapshot repo={} seq={}", snap.repo.display(), snap.seq)
+            format!("{source}: repo_snapshot repo={} seq={}", fmt_optional_path(snap.repo.as_deref()), snap.seq)
         }
         DaemonEvent::RepoDelta(delta) => {
-            format!("{source}: repo_delta repo={} seq={}", delta.repo.display(), delta.seq)
+            format!("{source}: repo_delta repo={} seq={}", fmt_optional_path(delta.repo.as_deref()), delta.seq)
         }
-        DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", info.path.display()),
-        DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", path.display()),
+        DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
+        DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),
         DaemonEvent::HostRemoved { host, .. } => format!("{source}: host_removed {host}"),
     };
     recent.push(summary);

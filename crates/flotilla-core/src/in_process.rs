@@ -1189,7 +1189,7 @@ impl InProcessDaemon {
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
-            path: synthetic_path.clone(),
+            path: Some(synthetic_path.clone()),
             name: repo_name(&synthetic_path),
             labels: model.labels.clone(),
             provider_names: provider_names_from_registry(&model.registry)
@@ -1417,7 +1417,7 @@ impl InProcessDaemon {
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
-            path: path.clone(),
+            path: Some(path.clone()),
             name: repo_name(&path),
             labels: root.model.labels.clone(),
             provider_names: provider_names_from_registry(&root.model.registry)
@@ -1518,7 +1518,7 @@ impl InProcessDaemon {
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path });
+            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path: Some(path) });
         } else if let Some(preferred_path) = new_preferred_path {
             self.broadcast_snapshot_inner(&preferred_path, false).await;
         }
@@ -1743,7 +1743,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: empty_identity.clone(),
-                repo: PathBuf::new(),
+                repo: None,
                 description: command.description().to_string(),
             });
 
@@ -1782,7 +1782,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: empty_identity,
-                repo: PathBuf::new(),
+                repo: None,
                 result,
             });
             return Ok(id);
@@ -1804,7 +1804,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: repo_identity.clone(),
-                repo: repo_path.clone(),
+                repo: Some(repo_path.clone()),
                 description,
             });
             let mut refreshed = Vec::new();
@@ -1824,7 +1824,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity,
-                repo: repo_path,
+                repo: Some(repo_path),
                 result,
             });
             return Ok(id);
@@ -1838,7 +1838,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: repo_identity.clone(),
-                repo: repo_path.clone(),
+                repo: Some(repo_path.clone()),
                 description,
             });
             let result = match self.add_repo(path).await {
@@ -1849,7 +1849,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
-                repo: repo_path,
+                repo: Some(repo_path),
                 result,
             });
             return Ok(id);
@@ -1864,7 +1864,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: repo_identity.clone(),
-                repo: repo_path.clone(),
+                repo: Some(repo_path.clone()),
                 description,
             });
             let result = match self.remove_repo(&repo_path).await {
@@ -1875,7 +1875,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity,
-                repo: repo_path,
+                repo: Some(repo_path),
                 result,
             });
             return Ok(id);
@@ -1890,7 +1890,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity: repo_identity.clone(),
-                repo: repo_path.clone(),
+                repo: Some(repo_path.clone()),
                 description,
             });
             let result = match self.refresh(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
@@ -1901,7 +1901,7 @@ impl InProcessDaemon {
                 command_id: id,
                 host: self.host_name.clone(),
                 repo_identity,
-                repo: repo_path,
+                repo: Some(repo_path),
                 result,
             });
             return Ok(id);
@@ -1947,7 +1947,7 @@ impl InProcessDaemon {
             command_id: id,
             host: command_host.clone(),
             repo_identity: repo_identity.clone(),
-            repo: repo_path.clone(),
+            repo: Some(repo_path.clone()),
             description,
         });
 
@@ -1988,7 +1988,7 @@ impl InProcessDaemon {
                         command_id: id,
                         host: command_host.clone(),
                         repo_identity: repo_identity.clone(),
-                        repo: repo_path,
+                        repo: Some(repo_path),
                         result,
                     });
                 }
@@ -2024,7 +2024,7 @@ impl InProcessDaemon {
                         command_id: id,
                         host: command_host,
                         repo_identity,
-                        repo: repo_path,
+                        repo: Some(repo_path),
                         result,
                     });
                 }
@@ -2127,7 +2127,7 @@ impl DaemonHandle for InProcessDaemon {
             if let Some(state) = repos.get(identity) {
                 result.push(RepoInfo {
                     identity: state.identity().clone(),
-                    path: state.preferred_path().to_path_buf(),
+                    path: Some(state.preferred_path().to_path_buf()),
                     name: repo_name(state.preferred_path()),
                     labels: state.labels().clone(),
                     provider_names: state.provider_names(),
@@ -2177,7 +2177,7 @@ impl DaemonHandle for InProcessDaemon {
                                 seq: entry.seq,
                                 prev_seq: entry.prev_seq,
                                 repo_identity: state.identity().clone(),
-                                repo: state.preferred_path().to_path_buf(),
+                                repo: Some(state.preferred_path().to_path_buf()),
                                 changes: entry.changes.clone(),
                                 work_items: entry.work_items.clone(),
                                 issue_total: snapshot.issue_total,

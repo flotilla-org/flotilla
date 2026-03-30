@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use flotilla_protocol::{StepAction, StepExecutionContext};
+
 use super::*;
 use crate::peer::{
     test_support::{ensure_test_connection_generation, handle_test_peer_data, MockPeerSender, MockTransport},
@@ -18,7 +20,7 @@ fn snapshot_msg(origin: &str, seq: u64) -> PeerDataMessage {
     PeerDataMessage {
         origin_host: HostName::new(origin),
         repo_identity: test_repo(),
-        repo_path: PathBuf::from("/home/dev/repo"),
+        host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq },
     }
@@ -63,7 +65,7 @@ async fn handle_snapshot_stores_data() {
     assert!(peer_data.contains_key(&remote_host));
     let repo_state = &peer_data[&remote_host][&test_repo()];
     assert_eq!(repo_state.seq, 1);
-    assert_eq!(repo_state.repo_path, PathBuf::from("/home/dev/repo"));
+    assert_eq!(repo_state.host_repo_root, Some(PathBuf::from("/home/dev/repo")));
 }
 
 #[tokio::test]
@@ -85,13 +87,32 @@ async fn handle_snapshot_updates_existing_data() {
 }
 
 #[tokio::test]
+async fn handle_snapshot_without_host_repo_root_stores_none() {
+    let mut mgr = PeerManager::new(HostName::new("local"));
+    let msg = PeerDataMessage {
+        origin_host: HostName::new("remote"),
+        repo_identity: test_repo(),
+        host_repo_root: None,
+        clock: VectorClock::default(),
+        kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
+    };
+
+    let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
+    assert_eq!(result, HandleResult::Updated(test_repo()));
+
+    let peer_data = mgr.get_peer_data();
+    let repo_state = &peer_data[&HostName::new("remote")][&test_repo()];
+    assert_eq!(repo_state.host_repo_root, None);
+}
+
+#[tokio::test]
 async fn legacy_direct_request_resync_is_ignored() {
     let mut mgr = PeerManager::new(HostName::new("local"));
 
     let msg = PeerDataMessage {
         origin_host: HostName::new("remote"),
         repo_identity: test_repo(),
-        repo_path: PathBuf::from("/home/dev/repo"),
+        host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::RequestResync { since_seq: 3 },
     };
@@ -112,7 +133,7 @@ async fn handle_delta_returns_needs_resync() {
     let msg = PeerDataMessage {
         origin_host: HostName::new("remote"),
         repo_identity: test_repo(),
-        repo_path: PathBuf::from("/home/dev/repo"),
+        host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::Delta {
             changes: vec![Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) }],
@@ -200,7 +221,7 @@ async fn relay_skips_peers_already_in_clock() {
     let msg = PeerDataMessage {
         origin_host: HostName::new("F1"),
         repo_identity: test_repo(),
-        repo_path: PathBuf::from("/home/dev/repo"),
+        host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
     };
@@ -268,6 +289,57 @@ fn clear_peer_data_for_restart_clears_host_summary() {
 }
 
 #[tokio::test]
+async fn routed_remote_step_request_for_local_host_surfaces_identity_and_steps() {
+    let mut mgr = PeerManager::new(HostName::new("local"));
+    let connection_peer = HostName::new("relay");
+    let generation = ensure_test_connection_generation(&mut mgr, &connection_peer, MockPeerSender::discard);
+    let repo_identity = test_repo();
+    let steps = vec![Step {
+        description: "Prepare terminal".into(),
+        host: StepExecutionContext::Host(HostName::new("local")),
+        action: StepAction::PrepareTerminalForCheckout {
+            checkout_path: flotilla_protocol::ExecutionEnvironmentPath::new("/repo"),
+            commands: vec![],
+        },
+    }];
+
+    let result = mgr
+        .handle_inbound(InboundPeerEnvelope {
+            msg: PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepRequest {
+                request_id: 77,
+                requester_host: HostName::new("workstation"),
+                target_host: HostName::new("local"),
+                remaining_hops: 4,
+                repo_identity: repo_identity.clone(),
+                step_offset: 3,
+                steps: steps.clone(),
+            }),
+            connection_generation: generation,
+            connection_peer: connection_peer.clone(),
+        })
+        .await;
+
+    match result {
+        HandleResult::RemoteStepRequested {
+            request_id,
+            requester_host,
+            reply_via,
+            repo_identity: received_identity,
+            step_offset,
+            steps: received_steps,
+        } => {
+            assert_eq!(request_id, 77);
+            assert_eq!(requester_host, HostName::new("workstation"));
+            assert_eq!(reply_via, connection_peer);
+            assert_eq!(received_identity, repo_identity);
+            assert_eq!(step_offset, 3);
+            assert_eq!(received_steps, steps);
+        }
+        other => panic!("expected RemoteStepRequested, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn connect_all_connects_peers() {
     let mut mgr = PeerManager::new(HostName::new("local"));
 
@@ -300,16 +372,22 @@ async fn disconnect_all_disconnects_peers() {
 fn synthetic_repo_path_format() {
     let host = HostName::new("desktop");
     let repo_path = std::path::Path::new("/home/dev/repo");
-    let path = super::synthetic_repo_path(&host, repo_path);
+    let path = super::synthetic_repo_path(&host, &test_repo(), Some(repo_path));
     assert_eq!(path, PathBuf::from("<remote>/desktop/home/dev/repo"));
 }
 
 #[test]
 fn synthetic_repo_path_different_hosts_produce_different_paths() {
     let repo_path = std::path::Path::new("/home/dev/repo");
-    let path_a = super::synthetic_repo_path(&HostName::new("host-a"), repo_path);
-    let path_b = super::synthetic_repo_path(&HostName::new("host-b"), repo_path);
+    let path_a = super::synthetic_repo_path(&HostName::new("host-a"), &test_repo(), Some(repo_path));
+    let path_b = super::synthetic_repo_path(&HostName::new("host-b"), &test_repo(), Some(repo_path));
     assert_ne!(path_a, path_b);
+}
+
+#[test]
+fn synthetic_repo_path_falls_back_to_repo_identity_without_host_root() {
+    let path = super::synthetic_repo_path(&HostName::new("desktop"), &test_repo(), None);
+    assert_eq!(path, PathBuf::from("<remote>/desktop/github.com/owner/repo"));
 }
 
 #[test]
@@ -576,7 +654,7 @@ async fn late_resync_snapshot_is_dropped_without_pending_request() {
                 responder_host: HostName::new("target"),
                 remaining_hops: 3,
                 repo_identity: test_repo(),
-                repo_path: PathBuf::from("/home/dev/repo"),
+                host_repo_root: Some(PathBuf::from("/home/dev/repo")),
                 clock: VectorClock::default(),
                 seq: 1,
                 data: Box::new(ProviderData::default()),
@@ -865,7 +943,7 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
                 responder_host: HostName::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
-                repo_path: baseline.repo_path.clone(),
+                host_repo_root: baseline.host_repo_root.clone(),
                 clock: baseline.clock.clone(),
                 seq: 1,
                 data: Box::new(ProviderData::default()),
@@ -877,6 +955,70 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
 
     assert_eq!(result, HandleResult::Updated(test_repo()));
     let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    assert!(!state.stale);
+    assert_eq!(state.via_peer, HostName::new("relay-b"));
+}
+
+#[tokio::test]
+async fn failover_resync_accepts_snapshot_without_host_repo_root() {
+    let mut mgr = PeerManager::new(HostName::new("local"));
+    let relay_a_generation =
+        accepted_generation(mgr.activate_connection(HostName::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+    let relay_b_generation =
+        accepted_generation(mgr.activate_connection(HostName::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+
+    let mut baseline = snapshot_msg("target", 1);
+    baseline.host_repo_root = None;
+    let _ = mgr
+        .handle_inbound(InboundPeerEnvelope {
+            msg: PeerWireMessage::Data(baseline.clone()),
+            connection_generation: relay_a_generation,
+            connection_peer: HostName::new("relay-a"),
+        })
+        .await;
+    mgr.routes.get_mut(&HostName::new("target")).expect("route exists").fallbacks.push(RouteHop {
+        next_hop: HostName::new("relay-b"),
+        next_hop_generation: relay_b_generation,
+        learned_epoch: 10,
+    });
+
+    let plan = mgr.disconnect_peer(&HostName::new("relay-a"), relay_a_generation);
+    let request_id = match &plan.resync_requests[0] {
+        RoutedPeerMessage::RequestResync { request_id, .. } => *request_id,
+        other => panic!("expected request_resync, got {:?}", other),
+    };
+
+    let result = mgr
+        .handle_inbound(InboundPeerEnvelope {
+            msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
+                request_id,
+                requester_host: HostName::new("local"),
+                responder_host: HostName::new("target"),
+                remaining_hops: 4,
+                repo_identity: baseline.repo_identity.clone(),
+                host_repo_root: None,
+                clock: baseline.clock.clone(),
+                seq: 1,
+                data: Box::new(ProviderData::default()),
+            }),
+            connection_generation: relay_b_generation,
+            connection_peer: HostName::new("relay-b"),
+        })
+        .await;
+
+    assert_eq!(result, HandleResult::Updated(test_repo()));
+    let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    assert_eq!(state.host_repo_root, None);
     assert!(!state.stale);
     assert_eq!(state.via_peer, HostName::new("relay-b"));
 }
@@ -985,7 +1127,7 @@ async fn failover_resync_clears_stale_and_rebinds_provenance() {
                 responder_host: HostName::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
-                repo_path: baseline.repo_path.clone(),
+                host_repo_root: baseline.host_repo_root.clone(),
                 clock: baseline.clock.clone(),
                 seq: 1,
                 data: Box::new(ProviderData::default()),

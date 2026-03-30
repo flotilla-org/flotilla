@@ -54,7 +54,8 @@ impl VectorClock {
 pub struct PeerDataMessage {
     pub origin_host: HostName,
     pub repo_identity: RepoIdentity,
-    pub repo_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_repo_root: Option<PathBuf>,
     /// Vector clock for causal ordering and deduplication.
     #[serde(default)]
     pub clock: VectorClock,
@@ -96,7 +97,8 @@ pub enum RoutedPeerMessage {
         responder_host: HostName,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
-        repo_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_repo_root: Option<PathBuf>,
         clock: VectorClock,
         seq: u64,
         data: Box<ProviderData>,
@@ -142,7 +144,6 @@ pub enum RoutedPeerMessage {
         target_host: HostName,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
-        repo_path: PathBuf,
         /// Global step index of the first step in this batch on the requester.
         ///
         /// The responder emits batch-relative progress indices only. The
@@ -189,9 +190,27 @@ pub enum RoutedPeerMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum CommandPeerEvent {
-    Started { repo_identity: RepoIdentity, repo: PathBuf, description: String },
-    StepUpdate { repo_identity: RepoIdentity, repo: PathBuf, step_index: usize, step_count: usize, description: String, status: StepStatus },
-    Finished { repo_identity: RepoIdentity, repo: PathBuf, result: CommandValue },
+    Started {
+        repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<PathBuf>,
+        description: String,
+    },
+    StepUpdate {
+        repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<PathBuf>,
+        step_index: usize,
+        step_count: usize,
+        description: String,
+        status: StepStatus,
+    },
+    Finished {
+        repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<PathBuf>,
+        result: CommandValue,
+    },
 }
 
 /// The payload kind within a peer data exchange.
@@ -295,9 +314,10 @@ mod tests {
     #[test]
     fn vector_clock_serde_default() {
         // Deserializing a message without a clock field should give default
-        let json = r#"{"origin_host":"desktop","repo_identity":{"authority":"github.com","path":"owner/repo"},"repo_path":"/repo","kind":{"type":"request_resync","since_seq":0}}"#;
+        let json = r#"{"origin_host":"desktop","repo_identity":{"authority":"github.com","path":"owner/repo"},"kind":{"type":"request_resync","since_seq":0}}"#;
         let msg: PeerDataMessage = serde_json::from_str(json).expect("deserialize without clock");
         assert!(msg.clock.0.is_empty(), "default clock should be empty");
+        assert_eq!(msg.host_repo_root, None);
     }
 
     #[test]
@@ -305,7 +325,7 @@ mod tests {
         let msg = PeerDataMessage {
             origin_host: HostName::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            repo_path: PathBuf::from("/home/dev/repo"),
+            host_repo_root: Some(PathBuf::from("/home/dev/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
         };
@@ -313,6 +333,22 @@ mod tests {
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.origin_host, msg.origin_host);
         assert_eq!(back.repo_identity, msg.repo_identity);
+        assert_eq!(back.host_repo_root, msg.host_repo_root);
+    }
+
+    #[test]
+    fn peer_data_message_snapshot_roundtrip_without_host_repo_root() {
+        let msg = PeerDataMessage {
+            origin_host: HostName::new("desktop"),
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            host_repo_root: None,
+            clock: VectorClock::default(),
+            kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(!json.contains("\"host_repo_root\""), "optional host repo root should be omitted when absent: {json}");
+        let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.host_repo_root, None);
     }
 
     #[test]
@@ -320,13 +356,14 @@ mod tests {
         let msg = PeerDataMessage {
             origin_host: HostName::new("cloud"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            repo_path: PathBuf::from("/opt/repo"),
+            host_repo_root: Some(PathBuf::from("/opt/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::RequestResync { since_seq: 5 },
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back.kind, PeerDataKind::RequestResync { since_seq: 5 }));
+        assert_eq!(back.host_repo_root, Some(PathBuf::from("/opt/repo")));
     }
 
     #[test]
@@ -363,7 +400,7 @@ mod tests {
         let msg = PeerDataMessage {
             origin_host: HostName::new("laptop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            repo_path: PathBuf::from("/home/dev/repo"),
+            host_repo_root: Some(PathBuf::from("/home/dev/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::Delta {
                 changes: vec![Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) }],
@@ -465,7 +502,7 @@ mod tests {
             remaining_hops: 5,
             event: Box::new(CommandPeerEvent::StepUpdate {
                 repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-                repo: PathBuf::from("/repo"),
+                repo: Some(PathBuf::from("/repo")),
                 step_index: 1,
                 step_count: 3,
                 description: "Creating worktree".into(),
@@ -482,7 +519,7 @@ mod tests {
                 assert_eq!(remaining_hops, 5);
                 assert_eq!(*event, CommandPeerEvent::StepUpdate {
                     repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-                    repo: PathBuf::from("/repo"),
+                    repo: Some(PathBuf::from("/repo")),
                     step_index: 1,
                     step_count: 3,
                     description: "Creating worktree".into(),
@@ -524,7 +561,6 @@ mod tests {
             target_host: HostName::new("feta"),
             remaining_hops: 6,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-            repo_path: PathBuf::from("/repo"),
             step_offset: 2,
             steps: vec![Step {
                 description: "Prepare terminal".into(),
@@ -536,6 +572,7 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(!json.contains("\"repo_path\""), "remote step request should not serialize repo root path: {json}");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::RemoteStepRequest {
@@ -544,7 +581,6 @@ mod tests {
                 target_host,
                 remaining_hops,
                 repo_identity,
-                repo_path,
                 step_offset,
                 steps,
             } => {
@@ -553,7 +589,6 @@ mod tests {
                 assert_eq!(target_host, HostName::new("feta"));
                 assert_eq!(remaining_hops, 6);
                 assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
-                assert_eq!(repo_path, PathBuf::from("/repo"));
                 assert_eq!(step_offset, 2);
                 assert_eq!(steps.len(), 1);
             }

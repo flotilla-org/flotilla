@@ -108,7 +108,7 @@ fn message_event_snapshot_roundtrip() {
     let snapshot = RepoSnapshot {
         seq: 7,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() },
-        repo: PathBuf::from("/tmp/my-repo"),
+        repo: Some(PathBuf::from("/tmp/my-repo")),
         host_name: HostName::new("test-host"),
         work_items: vec![WorkItem {
             kind: WorkItemKind::Checkout,
@@ -147,7 +147,7 @@ fn message_event_snapshot_roundtrip() {
                 let snap = *snap;
                 assert_eq!(snap.seq, 7);
                 assert_eq!(snap.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() });
-                assert_eq!(snap.repo, PathBuf::from("/tmp/my-repo"));
+                assert_eq!(snap.repo, Some(PathBuf::from("/tmp/my-repo")));
                 assert_eq!(snap.work_items.len(), 1);
                 assert_eq!(snap.work_items[0].branch.as_deref(), Some("feature-x"));
                 assert_eq!(snap.work_items[0].kind, WorkItemKind::Checkout);
@@ -168,7 +168,7 @@ fn snapshot_delta_event_roundtrip() {
         seq: 3,
         prev_seq: 2,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() },
-        repo: PathBuf::from("/tmp/my-repo"),
+        repo: Some(PathBuf::from("/tmp/my-repo")),
         changes: vec![
             Change::Branch { key: "feat-x".into(), op: EntryOp::Added(Branch { status: BranchStatus::Remote }) },
             Change::Issue { key: "42".into(), op: EntryOp::Removed },
@@ -187,7 +187,7 @@ fn snapshot_delta_event_roundtrip() {
                 assert_eq!(d.seq, 3);
                 assert_eq!(d.prev_seq, 2);
                 assert_eq!(d.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() });
-                assert_eq!(d.repo, PathBuf::from("/tmp/my-repo"));
+                assert_eq!(d.repo, Some(PathBuf::from("/tmp/my-repo")));
                 assert_eq!(d.changes.len(), 2);
                 assert_eq!(d.issue_total, Some(100));
                 assert!(d.issue_has_more);
@@ -253,7 +253,7 @@ fn daemon_event_command_started_roundtrip() {
         command_id: 42,
         host: HostName::new("desktop"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repo: PathBuf::from("/tmp/repo"),
+        repo: Some(PathBuf::from("/tmp/repo")),
         description: "Creating checkout...".to_string(),
     };
     let json = serde_json::to_string(&event).expect("serialize");
@@ -263,7 +263,7 @@ fn daemon_event_command_started_roundtrip() {
             assert_eq!(command_id, 42);
             assert_eq!(host, HostName::new("desktop"));
             assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
-            assert_eq!(repo, PathBuf::from("/tmp/repo"));
+            assert_eq!(repo, Some(PathBuf::from("/tmp/repo")));
             assert_eq!(description, "Creating checkout...");
         }
         other => panic!("expected CommandStarted, got {:?}", other),
@@ -276,7 +276,7 @@ fn daemon_event_command_finished_roundtrip() {
         command_id: 42,
         host: HostName::new("desktop"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repo: PathBuf::from("/tmp/repo"),
+        repo: Some(PathBuf::from("/tmp/repo")),
         result: CommandValue::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
     };
     let json = serde_json::to_string(&event).expect("serialize");
@@ -286,7 +286,7 @@ fn daemon_event_command_finished_roundtrip() {
             assert_eq!(command_id, 42);
             assert_eq!(host, HostName::new("desktop"));
             assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
-            assert_eq!(repo, PathBuf::from("/tmp/repo"));
+            assert_eq!(repo, Some(PathBuf::from("/tmp/repo")));
             match result {
                 CommandValue::CheckoutCreated { branch, path } => {
                     assert_eq!(branch, "feat-x");
@@ -305,7 +305,7 @@ fn snapshot_delta_roundtrip_preserves_repo_identity() {
         seq: 2,
         prev_seq: 1,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repo: PathBuf::from("/tmp/repo"),
+        repo: Some(PathBuf::from("/tmp/repo")),
         changes: vec![],
         work_items: vec![],
         issue_total: Some(12),
@@ -316,7 +316,38 @@ fn snapshot_delta_roundtrip_preserves_repo_identity() {
     let json = serde_json::to_string(&delta).expect("serialize");
     let decoded: RepoDelta = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(decoded.repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
-    assert_eq!(decoded.repo, PathBuf::from("/tmp/repo"));
+    assert_eq!(decoded.repo, Some(PathBuf::from("/tmp/repo")));
+}
+
+#[test]
+fn daemon_events_and_repo_delta_allow_missing_repo_path_metadata() {
+    let started = DaemonEvent::CommandStarted {
+        command_id: 1,
+        host: HostName::new("desktop"),
+        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repo: None,
+        description: "query".into(),
+    };
+    let started_json = serde_json::to_string(&started).expect("serialize command started");
+    assert!(!started_json.contains("\"repo\""), "command event repo path should be omitted when absent: {started_json}");
+    let decoded_started: DaemonEvent = serde_json::from_str(&started_json).expect("deserialize command started");
+    assert!(matches!(decoded_started, DaemonEvent::CommandStarted { repo: None, .. }));
+
+    let delta = RepoDelta {
+        seq: 2,
+        prev_seq: 1,
+        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repo: None,
+        changes: vec![],
+        work_items: vec![],
+        issue_total: None,
+        issue_has_more: false,
+        issue_search_results: None,
+    };
+    let delta_json = serde_json::to_string(&delta).expect("serialize repo delta");
+    assert!(!delta_json.contains("\"repo\""), "repo delta path should be omitted when absent: {delta_json}");
+    let decoded_delta: RepoDelta = serde_json::from_str(&delta_json).expect("deserialize repo delta");
+    assert_eq!(decoded_delta.repo, None);
 }
 
 #[test]
@@ -389,7 +420,7 @@ fn message_peer_data_roundtrip() {
     let msg = Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
         origin_host: HostName::new("desktop"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repo_path: PathBuf::from("/tmp/repo"),
+        host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 7 },
     })));
@@ -419,7 +450,7 @@ fn message_peer_routed_resync_snapshot_roundtrip() {
         responder_host: HostName::new("desktop"),
         remaining_hops: 4,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repo_path: PathBuf::from("/tmp/repo"),
+        host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         seq: 13,
         data: Box::new(ProviderData::default()),

@@ -74,11 +74,11 @@ async fn socket_roundtrip() {
     // list_repos — should have at least our repo
     let repos = client.list_repos().await.expect("list_repos");
     assert!(!repos.is_empty(), "should have at least one repo");
-    assert_eq!(repos[0].path, repo);
+    assert_eq!(repos[0].path.as_deref(), Some(repo.as_path()));
 
     // get_state — should return a snapshot for our repo
     let snapshot = client.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state");
-    assert_eq!(snapshot.repo, repo);
+    assert_eq!(snapshot.repo.as_deref(), Some(repo.as_path()));
 
     // Subscribe BEFORE refresh to avoid race — event may fire before subscribe
     let mut rx = client.subscribe();
@@ -133,7 +133,10 @@ async fn socket_roundtrip() {
     let replay = client.replay_since(&last_seen).await.expect("replay_since");
     let repo_snapshots: Vec<_> = replay.iter().filter(|e| matches!(e, DaemonEvent::RepoSnapshot(_))).collect();
     assert_eq!(repo_snapshots.len(), 1, "should get one full repo snapshot");
-    assert!(matches!(repo_snapshots[0], DaemonEvent::RepoSnapshot(snap) if snap.repo == repo), "expected RepoSnapshot for our repo");
+    assert!(
+        matches!(repo_snapshots[0], DaemonEvent::RepoSnapshot(snap) if snap.repo.as_deref() == Some(repo.as_path())),
+        "expected RepoSnapshot for our repo"
+    );
 
     // Clean up
     server_handle.abort();
@@ -339,13 +342,13 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
             match rx.recv().await {
                 Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: event_repo, description, .. }) if id == command_id => {
                     assert_eq!(host, flotilla_protocol::HostName::local());
-                    assert_eq!(event_repo, repo);
+                    assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                     assert_eq!(description, "Refreshing...");
                     started = Some(id);
                 }
                 Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: event_repo, result, .. }) if id == command_id => {
                     assert_eq!(host, flotilla_protocol::HostName::local());
-                    assert_eq!(event_repo, repo);
+                    assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                     break (started, Some((id, result)));
                 }
                 Ok(_) => {}

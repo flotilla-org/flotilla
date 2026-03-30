@@ -208,7 +208,7 @@ pub fn snapshot_to_proto(
     RepoSnapshot {
         seq,
         repo_identity,
-        repo: repo.to_path_buf(),
+        repo: Some(repo.to_path_buf()),
         host_name: host_name.clone(),
         work_items: refresh
             .work_items

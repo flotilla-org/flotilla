@@ -27,6 +27,9 @@ pub struct RemoteStepBatchRequest {
     pub command_id: u64,
     pub target_host: HostName,
     pub repo_identity: RepoIdentity,
+    /// Requester-local repo path used when remapping remote progress into
+    /// `DaemonEvent::CommandStepUpdate` for the UI. Remote execution itself
+    /// resolves the actual repo root from `repo_identity`.
     pub repo: ExecutionEnvironmentPath,
     /// Global step index of the first step in this batch on the requester.
     ///
@@ -295,7 +298,7 @@ fn emit_step_update(
         command_id,
         host,
         repo_identity,
-        repo,
+        repo: Some(repo),
         step_index,
         step_count,
         description,
