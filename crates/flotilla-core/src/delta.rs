@@ -138,7 +138,18 @@ pub fn apply_work_item_changes(work_items: &mut Vec<WorkItem>, changes: &[Change
     for change in changes {
         if let Change::WorkItem { identity, op } = change {
             match op {
-                EntryOp::Added(item) | EntryOp::Updated(item) => {
+                // Be lenient in release builds so replay remains idempotent if the client
+                // applies an op after state has already converged, but assert the expected
+                // protocol contract in debug builds to catch daemon/client drift early.
+                EntryOp::Added(item) => {
+                    debug_assert!(!by_identity.contains_key(identity), "work item Added op should target a new identity: {identity:?}");
+                    by_identity.insert(identity.clone(), item.clone());
+                }
+                EntryOp::Updated(item) => {
+                    debug_assert!(
+                        by_identity.contains_key(identity),
+                        "work item Updated op should target an existing identity: {identity:?}"
+                    );
                     by_identity.insert(identity.clone(), item.clone());
                 }
                 EntryOp::Removed => {
