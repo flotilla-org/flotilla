@@ -11,6 +11,7 @@ use crate::{
 
 pub struct WtCheckoutManager {
     runner: Arc<dyn CommandRunner>,
+    host_name: flotilla_protocol::HostName,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,9 +66,9 @@ struct WtCommit {
 }
 
 impl WtWorktree {
-    fn into_checkout(self) -> (ExecutionEnvironmentPath, Checkout) {
-        let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), &self.path);
-        let correlation_keys = vec![CorrelationKey::Branch(self.branch.clone()), CorrelationKey::CheckoutPath(host_path)];
+    fn into_checkout(self, host_name: &flotilla_protocol::HostName) -> (ExecutionEnvironmentPath, Checkout) {
+        let qp = flotilla_protocol::QualifiedPath::from_host_path(host_name, &self.path);
+        let correlation_keys = vec![CorrelationKey::Branch(self.branch.clone()), CorrelationKey::CheckoutPath(qp)];
         let ee_path = ExecutionEnvironmentPath::new(self.path);
         (ee_path, Checkout {
             branch: self.branch,
@@ -90,8 +91,8 @@ impl WtWorktree {
 }
 
 impl WtCheckoutManager {
-    pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+    pub fn new(runner: Arc<dyn CommandRunner>, host_name: flotilla_protocol::HostName) -> Self {
+        Self { runner, host_name }
     }
 
     /// Strip ANSI escape codes that `wt` may append after JSON output.
@@ -103,12 +104,22 @@ impl WtCheckoutManager {
 
 #[async_trait]
 impl super::CheckoutManager for WtCheckoutManager {
+    async fn validate_target(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        branch: &str,
+        intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        super::validate_checkout_target_in_repo(repo_root.as_path(), branch, intent, &*self.runner).await
+    }
+
     async fn list_checkouts(&self, repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         let root = repo_root.as_path();
         let output = run!(self.runner, "wt", &["list", "--format=json"], root)?;
         let json = Self::strip_to_json(&output);
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-        let mut checkouts: Vec<(ExecutionEnvironmentPath, Checkout)> = worktrees.into_iter().map(|wt| wt.into_checkout()).collect();
+        let mut checkouts: Vec<(ExecutionEnvironmentPath, Checkout)> =
+            worktrees.into_iter().map(|wt| wt.into_checkout(&self.host_name)).collect();
 
         // Enrich with issue links from git config
         let futures: Vec<_> = checkouts.iter().map(|(_, co)| super::read_branch_issue_links(root, &co.branch, &*self.runner)).collect();
@@ -152,7 +163,7 @@ impl super::CheckoutManager for WtCheckoutManager {
         for wt in worktrees {
             if wt.branch == branch || wt.branch.ends_with(&format!("/{branch}")) {
                 info!(%branch, path = %wt.path.display(), "wt: created worktree");
-                return Ok(wt.into_checkout());
+                return Ok(wt.into_checkout(&self.host_name));
             }
         }
 
@@ -273,7 +284,7 @@ mod tests {
         let session = replay::test_session(&fixture("wt_list.yaml"), masks);
         let runner = replay::test_runner(&session);
 
-        let mgr = WtCheckoutManager::new(runner);
+        let mgr = WtCheckoutManager::new(runner, flotilla_protocol::HostName::new("test-host"));
         let checkouts = mgr.list_checkouts(&repo_path).await.unwrap();
 
         assert_eq!(checkouts.len(), 2);
@@ -313,8 +324,8 @@ mod tests {
 
         // Correlation keys
         assert!(co_feat.correlation_keys.contains(&CorrelationKey::Branch("feature/foo".to_string())));
-        assert!(co_feat.correlation_keys.contains(&CorrelationKey::CheckoutPath(flotilla_protocol::HostPath::new(
-            flotilla_protocol::HostName::local(),
+        assert!(co_feat.correlation_keys.contains(&CorrelationKey::CheckoutPath(flotilla_protocol::QualifiedPath::from_host_path(
+            &flotilla_protocol::HostName::new("test-host"),
             path_feat.as_path()
         ),)));
 
@@ -333,7 +344,7 @@ mod tests {
         let session = replay::test_session(&fixture("wt_create.yaml"), masks);
         let runner = replay::test_runner(&session);
 
-        let mgr = WtCheckoutManager::new(runner);
+        let mgr = WtCheckoutManager::new(runner, flotilla_protocol::HostName::new("test-host"));
         let (path, checkout) = mgr.create_checkout(&repo_path, "new-feature", true).await.unwrap();
 
         assert!(path.as_path().to_str().unwrap().contains("new-feature"), "created worktree path should contain new-feature: {}", path);
@@ -363,7 +374,7 @@ mod tests {
         let session = replay::test_session(&fixture("wt_remove.yaml"), masks);
         let runner = replay::test_runner(&session);
 
-        let mgr = WtCheckoutManager::new(runner);
+        let mgr = WtCheckoutManager::new(runner, flotilla_protocol::HostName::new("test-host"));
         mgr.remove_checkout(&repo_path, "feat-remove").await.unwrap();
 
         session.finish();
@@ -383,7 +394,7 @@ mod tests {
         let session = replay::test_session(&fixture("wt_create_remote_branch.yaml"), masks);
         let runner = replay::test_runner(&session);
 
-        let mgr = WtCheckoutManager::new(runner.clone());
+        let mgr = WtCheckoutManager::new(runner.clone(), flotilla_protocol::HostName::new("test-host"));
 
         checkout_test_support::assert_checkout_tracks_remote_branch(&mgr, &runner, &repo_path).await;
 

@@ -3,7 +3,7 @@ mod support;
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    CheckoutRef, HostName, HostPath, HostSummary, ProviderData, RepoIdentity, SessionStatus, SystemInfo, WorkItem, WorkItemIdentity,
+    CheckoutRef, HostName, HostSummary, ProviderData, QualifiedPath, RepoIdentity, SessionStatus, SystemInfo, WorkItem, WorkItemIdentity,
 };
 use flotilla_tui::app::{
     ui_state::{PendingAction, PendingStatus},
@@ -409,7 +409,7 @@ fn delete_confirm_safe_to_delete() {
             uncommitted_files: vec![],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup"))),
         None,
     ));
     let output = harness.render_to_string();
@@ -428,7 +428,7 @@ fn delete_confirm_with_uncommitted_files() {
             uncommitted_files: vec![" M src/main.rs".into(), " M src/lib.rs".into(), "?? TODO.txt".into()],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-wip"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/my-project/feat-wip"))),
         None,
     ));
     let output = harness.render_to_string();
@@ -448,7 +448,7 @@ fn delete_confirm_with_many_uncommitted_files() {
             uncommitted_files: files,
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip"))),
         None,
     ));
     let output = harness.render_to_string();
@@ -467,7 +467,10 @@ fn delete_confirm_remote_host() {
             uncommitted_files: vec![],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::new("feta"), PathBuf::from("/home/dev/my-project/feat-remote"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(
+            &HostName::new("feta"),
+            PathBuf::from("/home/dev/my-project/feat-remote"),
+        )),
         Some(HostName::new("feta")),
     ));
     let output = harness.render_to_string();
@@ -630,7 +633,7 @@ fn close_confirm_widget_renders_on_short_terminals_without_overflow() {
 #[test]
 fn delete_confirm_widget_renders_on_short_terminals_without_overflow() {
     let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat/a"))),
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat/a"))),
         None,
         None,
     );
@@ -691,7 +694,8 @@ fn pending_action_in_flight_shows_spinner() {
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
     // Insert an in-flight pending action for the checkout item.
-    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-login")));
+    let identity =
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat-login")));
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
         command_id: 1,
@@ -735,7 +739,8 @@ fn pending_action_failed_shows_error_icon() {
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
     // Insert a failed pending action.
-    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-broken")));
+    let identity =
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat-broken")));
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
         command_id: 2,
@@ -797,8 +802,10 @@ fn multi_select_with_active_row_highlight() {
     let page = harness.screen.repo_pages.get_mut(&repo).expect("repo page exists");
 
     // Multi-select items 0 and 1.
-    let identity_a = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-a")));
-    let identity_b = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-b")));
+    let identity_a =
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat-a")));
+    let identity_b =
+        WorkItemIdentity::Checkout(QualifiedPath::from_host_path(&HostName::local(), PathBuf::from("/test/my-project/feat-b")));
     page.multi_selected.insert(identity_a);
     page.multi_selected.insert(identity_b);
 
@@ -858,8 +865,8 @@ fn remote_host_home_directory_shortening() {
     let remote_host = HostName::new("feta");
     let remote_path = PathBuf::from("/home/alice/dev/myrepo/feat-x");
     let remote_main_path = PathBuf::from("/home/alice/dev/myrepo");
-    let host_path = HostPath::new(remote_host.clone(), remote_path.clone());
-    let main_host_path = HostPath::new(remote_host.clone(), remote_main_path.clone());
+    let host_path = QualifiedPath::from_host_path(&remote_host, remote_path.clone());
+    let main_host_path = QualifiedPath::from_host_path(&remote_host, remote_main_path.clone());
 
     let main_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,

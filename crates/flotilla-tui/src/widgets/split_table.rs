@@ -361,7 +361,9 @@ impl SplitTable {
             for item in &table.items {
                 if item.is_main_checkout {
                     if let Some(co) = item.checkout_key() {
-                        host_repo_roots.insert(co.host.clone(), co.path.clone());
+                        if let Some(host_id) = co.host_id() {
+                            host_repo_roots.insert(HostName::new(host_id.as_str()), co.path.clone());
+                        }
                     }
                 }
             }
@@ -677,7 +679,7 @@ fn provider_table_widths() -> [Constraint; 3] {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{HostPath, WorkItemKind};
+    use flotilla_protocol::{HostId, QualifiedPath, WorkItemKind};
 
     use super::*;
 
@@ -707,7 +709,7 @@ mod tests {
     fn checkout_work_item(id: &str) -> WorkItem {
         WorkItem {
             kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(HostPath::new(flotilla_protocol::HostName::new("localhost"), format!("/tmp/{id}"))),
+            identity: WorkItemIdentity::Checkout(QualifiedPath::host(HostId::new("localhost"), format!("/tmp/{id}"))),
             host: flotilla_protocol::HostName::new("localhost"),
             branch: Some(format!("branch-{id}")),
             description: format!("Checkout {id}"),

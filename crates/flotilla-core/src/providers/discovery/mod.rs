@@ -100,6 +100,9 @@ impl EnvironmentAssertion {
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentBag {
     assertions: Vec<EnvironmentAssertion>,
+    /// The daemon's host name, set at startup and threaded through to providers
+    /// that need to qualify local paths.
+    host_name: Option<flotilla_protocol::HostName>,
 }
 
 impl EnvironmentBag {
@@ -191,10 +194,24 @@ impl EnvironmentBag {
             .map(|(owner, repo, _)| format!("{owner}/{repo}"))
     }
 
+    /// Set the daemon's host name on this bag so providers can qualify local paths.
+    pub fn set_host_name(&mut self, host_name: flotilla_protocol::HostName) {
+        self.host_name = Some(host_name);
+    }
+
+    /// The daemon's host name, if set during startup.
+    pub fn host_name(&self) -> Option<&flotilla_protocol::HostName> {
+        self.host_name.as_ref()
+    }
+
     /// Create a new bag containing assertions from both `self` and `other`.
     pub fn merge(&self, other: &EnvironmentBag) -> EnvironmentBag {
         let mut merged = self.clone();
         merged.assertions.extend(other.assertions.clone());
+        // Prefer self's host_name; fall back to other's.
+        if merged.host_name.is_none() {
+            merged.host_name = other.host_name.clone();
+        }
         merged
     }
 

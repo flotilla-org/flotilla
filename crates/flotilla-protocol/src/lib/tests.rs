@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use super::*;
-use crate::test_support::hp;
+use crate::test_support::qp;
 
 fn sample_command() -> Command {
     Command {
@@ -112,11 +112,11 @@ fn message_event_snapshot_roundtrip() {
         host_name: HostName::new("test-host"),
         work_items: vec![WorkItem {
             kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(hp("/tmp/my-repo/wt")),
+            identity: WorkItemIdentity::Checkout(qp("/tmp/my-repo/wt")),
             host: HostName::new("test-host"),
             branch: Some("feature-x".to_string()),
             description: "Feature X".to_string(),
-            checkout: Some(CheckoutRef { key: hp("/tmp/my-repo/wt"), is_main_checkout: false }),
+            checkout: Some(CheckoutRef { key: qp("/tmp/my-repo/wt"), is_main_checkout: false }),
             change_request_key: Some("10".to_string()),
             session_key: None,
             issue_keys: vec!["ISSUE-1".to_string()],

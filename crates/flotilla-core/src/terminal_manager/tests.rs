@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Mutex};
 
 use async_trait::async_trait;
-use flotilla_protocol::{HostName, HostPath, TerminalStatus};
+use flotilla_protocol::{HostName, QualifiedPath, TerminalStatus};
 
 use super::*;
 use crate::{
@@ -87,8 +87,8 @@ fn test_host() -> HostName {
     HostName::new("test-host")
 }
 
-fn test_checkout() -> HostPath {
-    HostPath::new(test_host(), PathBuf::from("/repo/wt-feat"))
+fn test_checkout() -> QualifiedPath {
+    QualifiedPath::from_host_path(&test_host(), PathBuf::from("/repo/wt-feat"))
 }
 
 #[tokio::test]

@@ -15,12 +15,12 @@ use std::{
 };
 
 use flotilla_protocol::{
-    arg::Arg, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand,
+    arg::Arg, CheckoutTarget, Command, CommandAction, CommandValue, HostName, PreparedWorkspace, QualifiedPath, ResolvedPaneCommand,
 };
 use tracing::{debug, error, info};
 
 use self::{
-    checkout::{resolve_checkout_branch, write_branch_issue_links, CheckoutIntent, CheckoutService},
+    checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutService},
     session_actions::{resolve_attach_command, ReadOnlySessionActionService, TeleportFlow, TeleportSessionActionService},
     terminals::TerminalPreparationService,
     workspace::WorkspaceOrchestrator,
@@ -30,7 +30,7 @@ use crate::{
     data,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
-    providers::{registry::ProviderRegistry, run, types::WorkspaceConfig, CommandRunner},
+    providers::{registry::ProviderRegistry, run, types::WorkspaceConfig, vcs::write_branch_issue_links, CommandRunner},
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
     terminal_manager::TerminalManager,
 };
@@ -48,7 +48,6 @@ struct CheckoutFlow<'a> {
     repo_root: &'a ExecutionEnvironmentPath,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
-    runner: &'a dyn CommandRunner,
     local_host: &'a HostName,
     /// When true, skip host-side validation and de-duplication.
     /// Environment checkouts delegate validation to `CloneCheckoutManager`.
@@ -61,9 +60,9 @@ impl<'a> CheckoutFlow<'a> {
             // Environment namespaces are independent — host checkouts don't apply
             return None;
         }
-        self.providers_data.checkouts.iter().find_map(|(hp, co)| {
-            if hp.host == *self.local_host && co.branch == self.branch {
-                Some(ExecutionEnvironmentPath::new(&hp.path))
+        self.providers_data.checkouts.iter().find_map(|(qp, co)| {
+            if qp.host_id().map(|h| h.as_str()) == Some(self.local_host.as_str()) && co.branch == self.branch {
+                Some(ExecutionEnvironmentPath::new(&qp.path))
             } else {
                 None
             }
@@ -71,20 +70,20 @@ impl<'a> CheckoutFlow<'a> {
     }
 
     async fn checkout_created_result(&self) -> Result<CommandValue, String> {
-        let checkout_service = CheckoutService::new(self.registry, self.runner);
-
-        // In environment context, skip host-side branch validation — the
-        // CloneCheckoutManager validates during clone (git clone -b fails if
-        // branch doesn't exist; --no-checkout handles fresh branches).
-        if !self.is_environment {
-            checkout_service.validate_target(self.repo_root.as_path(), self.branch, self.intent).await?;
-        }
+        let checkout_service = CheckoutService::new(self.registry);
 
         if let Some(path) = self.existing_checkout_path() {
             if matches!(self.intent, CheckoutIntent::FreshBranch) {
                 return Err(format!("branch already exists: {}", self.branch));
             }
             return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path: path.into_path_buf() });
+        }
+
+        // In environment context, skip host-side branch validation — the
+        // CloneCheckoutManager validates during clone (git clone -b fails if
+        // branch doesn't exist; --no-checkout handles fresh branches).
+        if !self.is_environment {
+            checkout_service.validate_target(self.repo_root, self.branch, self.intent).await?;
         }
 
         let path = checkout_service.create_checkout(self.repo_root, self.branch, self.create_branch).await?;
@@ -151,16 +150,16 @@ pub async fn build_plan(
         CommandAction::RemoveCheckout { checkout } => {
             debug!(
                 ?checkout, %target_host, %local_host,
-                checkout_hosts = ?providers_data.checkouts.keys().map(|hp| (&hp.host, &hp.path)).collect::<Vec<_>>(),
+                checkout_hosts = ?providers_data.checkouts.keys().map(|qp| (qp.host_id(), &qp.path)).collect::<Vec<_>>(),
                 "resolving checkout for removal"
             );
             match resolve_checkout_branch(&checkout, &providers_data, &target_host) {
                 Ok(branch) => {
-                    let deleted_paths: Vec<HostPath> = providers_data
+                    let deleted_paths: Vec<QualifiedPath> = providers_data
                         .checkouts
                         .iter()
-                        .filter(|(hp, co)| co.branch == branch && hp.host == target_host)
-                        .map(|(hp, _)| hp.clone())
+                        .filter(|(qp, co)| co.branch == branch && qp.host_id().map(|h| h.as_str()) == Some(target_host.as_str()))
+                        .map(|(qp, _)| qp.clone())
                         .collect();
                     info!(%branch, ?deleted_paths, %target_host, "built remove checkout plan");
                     Ok(build_remove_checkout_plan(branch, deleted_paths, target_host))
@@ -527,7 +526,7 @@ async fn build_teleport_session_plan(
 /// Steps:
 /// 1. Remove the checkout via the checkout manager
 /// 2. Clean up correlated terminal sessions (best-effort)
-fn build_remove_checkout_plan(branch: String, deleted_checkout_paths: Vec<HostPath>, local_host: HostName) -> StepPlan {
+fn build_remove_checkout_plan(branch: String, deleted_checkout_paths: Vec<QualifiedPath>, local_host: HostName) -> StepPlan {
     StepPlan::new(vec![Step {
         description: format!("Remove checkout for branch {branch}"),
         host: StepExecutionContext::Host(local_host),
@@ -615,7 +614,6 @@ impl StepResolver for ExecutorStepResolver {
                     repo_root: &effective_repo_root,
                     registry: effective_registry.as_ref(),
                     providers_data: effective_providers_data.as_ref(),
-                    runner: effective_runner.as_ref(),
                     local_host: &self.local_host,
                     is_environment: context_environment_id.is_some(),
                 };
@@ -630,7 +628,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
-                let checkout_service = CheckoutService::new(effective_registry.as_ref(), effective_runner.as_ref());
+                let checkout_service = CheckoutService::new(effective_registry.as_ref());
                 let tm = self.terminal_manager();
                 checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, tm.as_ref()).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))
@@ -704,7 +702,7 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::PrepareWorkspace { checkout_path: explicit_path, label } => {
                 let prepared_checkout: Option<(ExecutionEnvironmentPath, String)> = if let Some(p) = explicit_path {
-                    let host_key = HostPath::new(self.local_host.clone(), p.as_path().to_path_buf());
+                    let host_key = QualifiedPath::from_host_path(&self.local_host, p.as_path().to_path_buf());
                     let branch = self
                         .providers_data
                         .checkouts
@@ -744,7 +742,8 @@ impl StepResolver for ExecutorStepResolver {
                     workspace_config(self.repo.root.as_path(), &label, checkout_path.as_path(), "claude", self.config_base.as_path());
                 let template_yaml = workspace_config.template_yaml.clone();
                 let prepared_commands = if let Some(ref tm) = tm {
-                    let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
+                    let terminal_preparation =
+                        TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()), &self.local_host);
                     let workspace_config = workspace_config.clone();
                     terminal_preparation
                         .prepare_terminal_commands(&branch, checkout_path.as_path(), &[], move || workspace_config.clone())
@@ -844,7 +843,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::PrepareTerminalForCheckout { checkout_path, commands: requested_commands } => {
-                let host_key = HostPath::new(self.local_host.clone(), checkout_path.as_path().to_path_buf());
+                let host_key = QualifiedPath::from_host_path(&self.local_host, checkout_path.as_path().to_path_buf());
                 if let Some(co) = self.providers_data.checkouts.get(&host_key).cloned() {
                     let tm = self.terminal_manager();
                     let workspace_orchestrator = WorkspaceOrchestrator::new(
@@ -860,7 +859,7 @@ impl StepResolver for ExecutorStepResolver {
                         workspace_orchestrator.ensure_attachable_set_for_checkout(&self.local_host, checkout_path.as_path(), None);
                     let commands = if let Some(ref tm) = tm {
                         let terminal_preparation =
-                            TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
+                            TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()), &self.local_host);
                         terminal_preparation
                             .prepare_terminal_commands(&co.branch, checkout_path.as_path(), &requested_commands, || {
                                 workspace_config(

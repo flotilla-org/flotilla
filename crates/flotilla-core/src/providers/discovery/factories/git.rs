@@ -65,7 +65,10 @@ impl Factory for WtCheckoutManagerFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         if env.find_binary("wt").is_some() {
-            Ok(Arc::new(WtCheckoutManager::new(runner)))
+            // host_name is set on the EnvironmentBag at daemon startup. The fallback covers
+            // test scenarios where factories are probed without a full discovery runtime.
+            let host_name = env.host_name().cloned().unwrap_or_else(flotilla_protocol::HostName::local);
+            Ok(Arc::new(WtCheckoutManager::new(runner, host_name)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("wt".into())])
         }
@@ -95,7 +98,10 @@ impl Factory for GitCheckoutManagerFactory {
     ) -> Result<Arc<dyn CheckoutManager>, Vec<UnmetRequirement>> {
         if env.find_binary("git").is_some() {
             let checkout_config = config.resolve_checkout_config(repo_root);
-            Ok(Arc::new(GitCheckoutManager::new(checkout_config.path, runner)))
+            // host_name is set on the EnvironmentBag at daemon startup. The fallback covers
+            // test scenarios where factories are probed without a full discovery runtime.
+            let host_name = env.host_name().cloned().unwrap_or_else(flotilla_protocol::HostName::local);
+            Ok(Arc::new(GitCheckoutManager::new(checkout_config.path, runner, host_name)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("git".into())])
         }

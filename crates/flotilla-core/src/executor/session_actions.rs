@@ -171,7 +171,7 @@ impl<'a> TeleportSessionActionService<'a> {
 
     fn checkout_path_from_key(&self, checkout_key: Option<&ExecutionEnvironmentPath>) -> Option<ExecutionEnvironmentPath> {
         checkout_key.and_then(|key| {
-            let host_key = flotilla_protocol::HostPath::new(self.local_host.clone(), key.as_path().to_path_buf());
+            let host_key = flotilla_protocol::QualifiedPath::from_host_path(self.local_host, key.as_path().to_path_buf());
             self.read_only.providers_data.checkouts.get(&host_key).map(|_| key.clone())
         })
     }

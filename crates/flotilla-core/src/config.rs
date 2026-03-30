@@ -284,6 +284,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub follower: bool,
     pub host_name: Option<String>,
+    /// When true, skip environment detection for this machine. Pre-wired for
+    /// the environment model spec — behavior will be implemented when
+    /// per-environment discovery lands.
+    #[serde(default)]
+    pub suppress_local_environment: bool,
 }
 
 #[derive(Serialize, Deserialize)]

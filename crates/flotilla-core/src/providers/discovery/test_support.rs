@@ -598,6 +598,15 @@ impl FakeCheckoutManager {
 
 #[async_trait::async_trait]
 impl CheckoutManager for FakeCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
         Ok(self
             .state

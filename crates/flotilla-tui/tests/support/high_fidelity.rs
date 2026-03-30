@@ -589,6 +589,15 @@ impl SimpleCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for SimpleCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &flotilla_core::path_context::ExecutionEnvironmentPath,
+        _branch: &str,
+        _intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn list_checkouts(
         &self,
         _repo_root: &flotilla_core::path_context::ExecutionEnvironmentPath,
@@ -654,6 +663,15 @@ impl SteppedCheckoutManager {
 
 #[async_trait]
 impl CheckoutManager for SteppedCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &flotilla_core::path_context::ExecutionEnvironmentPath,
+        _branch: &str,
+        _intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn list_checkouts(
         &self,
         _repo_root: &flotilla_core::path_context::ExecutionEnvironmentPath,
