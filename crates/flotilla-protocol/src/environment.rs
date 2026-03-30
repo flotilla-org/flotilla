@@ -121,17 +121,105 @@ pub enum EnvironmentStatus {
     Failed(String),
 }
 
-/// Runtime information about a sandbox environment instance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvironmentInfo {
-    pub id: EnvironmentId,
-    pub image: ImageId,
-    pub status: EnvironmentStatus,
+/// Kind of managed environment visible in protocol summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentKind {
+    Direct,
+    Provisioned,
+}
+
+/// Runtime information about a visible managed environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnvironmentInfo {
+    Direct {
+        id: EnvironmentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        status: EnvironmentStatus,
+    },
+    Provisioned {
+        id: EnvironmentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        image: ImageId,
+        status: EnvironmentStatus,
+    },
+}
+
+impl EnvironmentInfo {
+    pub fn kind(&self) -> EnvironmentKind {
+        match self {
+            Self::Direct { .. } => EnvironmentKind::Direct,
+            Self::Provisioned { .. } => EnvironmentKind::Provisioned,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum EnvironmentInfoTagged {
+    Direct {
+        id: EnvironmentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        status: EnvironmentStatus,
+    },
+    Provisioned {
+        id: EnvironmentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        image: ImageId,
+        status: EnvironmentStatus,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyProvisionedEnvironmentInfo {
+    id: EnvironmentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    image: ImageId,
+    status: EnvironmentStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EnvironmentInfoRepr {
+    Tagged(EnvironmentInfoTagged),
+    LegacyProvisioned(LegacyProvisionedEnvironmentInfo),
+}
+
+impl From<EnvironmentInfoTagged> for EnvironmentInfo {
+    fn from(value: EnvironmentInfoTagged) -> Self {
+        match value {
+            EnvironmentInfoTagged::Direct { id, display_name, status } => Self::Direct { id, display_name, status },
+            EnvironmentInfoTagged::Provisioned { id, display_name, image, status } => Self::Provisioned { id, display_name, image, status },
+        }
+    }
+}
+
+impl From<LegacyProvisionedEnvironmentInfo> for EnvironmentInfo {
+    fn from(value: LegacyProvisionedEnvironmentInfo) -> Self {
+        Self::Provisioned { id: value.id, display_name: value.display_name, image: value.image, status: value.status }
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvironmentInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match EnvironmentInfoRepr::deserialize(deserializer)? {
+            EnvironmentInfoRepr::Tagged(value) => Ok(value.into()),
+            EnvironmentInfoRepr::LegacyProvisioned(value) => Ok(value.into()),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::assert_roundtrip;
 
     #[test]
     fn parse_environment_yaml_dockerfile() {
@@ -167,5 +255,65 @@ token_env_vars: []
 "#;
         let spec: EnvironmentSpec = serde_yml::from_str(yaml).expect("should parse with empty tokens");
         assert_eq!(spec.image, ImageSource::Dockerfile(PathBuf::from("Dockerfile")));
+    }
+
+    #[test]
+    fn environment_info_roundtrips_direct_environment_without_image() {
+        let info = EnvironmentInfo::Direct {
+            id: EnvironmentId::new("env-direct"),
+            display_name: Some("ssh-dev".into()),
+            status: EnvironmentStatus::Running,
+        };
+
+        assert_roundtrip(&info);
+    }
+
+    #[test]
+    fn environment_info_defaults_optional_display_metadata_and_image_for_direct_environments() {
+        let info: EnvironmentInfo = serde_json::from_str(r#"{"kind":"direct","id":"env-direct","status":"Running"}"#)
+            .expect("should deserialize direct environment without image");
+
+        assert_eq!(info, EnvironmentInfo::Direct {
+            id: EnvironmentId::new("env-direct"),
+            display_name: None,
+            status: EnvironmentStatus::Running,
+        });
+    }
+
+    #[test]
+    fn environment_info_roundtrips_provisioned_environment_with_image() {
+        let info = EnvironmentInfo::Provisioned {
+            id: EnvironmentId::new("env-provisioned"),
+            display_name: None,
+            image: ImageId::new("ubuntu:24.04"),
+            status: EnvironmentStatus::Stopped,
+        };
+
+        assert_roundtrip(&info);
+    }
+
+    #[test]
+    fn environment_info_requires_image_for_provisioned_environments() {
+        serde_json::from_str::<EnvironmentInfo>(r#"{"kind":"provisioned","id":"env-provisioned","status":"Stopped"}"#)
+            .expect_err("provisioned environments should require an image");
+    }
+
+    #[test]
+    fn environment_info_rejects_images_for_direct_environments() {
+        serde_json::from_str::<EnvironmentInfo>(r#"{"kind":"direct","id":"env-direct","image":"ubuntu:24.04","status":"Running"}"#)
+            .expect_err("direct environments should not accept an image");
+    }
+
+    #[test]
+    fn environment_info_deserializes_legacy_provisioned_shape_without_kind() {
+        let info: EnvironmentInfo = serde_json::from_str(r#"{"id":"env-provisioned","image":"ubuntu:24.04","status":"Stopped"}"#)
+            .expect("legacy provisioned environments without kind should still deserialize");
+
+        assert_eq!(info, EnvironmentInfo::Provisioned {
+            id: EnvironmentId::new("env-provisioned"),
+            display_name: None,
+            image: ImageId::new("ubuntu:24.04"),
+            status: EnvironmentStatus::Stopped,
+        });
     }
 }

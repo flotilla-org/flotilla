@@ -18,6 +18,7 @@ use std::{
 use flotilla_core::{
     config::{ConfigStore, RepoViewLayoutConfig},
     daemon::DaemonHandle,
+    delta::apply_work_item_changes,
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError,
@@ -1016,7 +1017,7 @@ impl App {
                 d.labels = rm.labels.clone();
                 d.provider_names = rm.provider_names.clone();
                 d.provider_health = rm.provider_health.clone();
-                d.work_items = delta.work_items;
+                apply_work_item_changes(&mut d.work_items, &delta.changes);
                 d.issue_has_more = rm.issue_has_more;
                 d.issue_total = rm.issue_total.map(|v| v as usize);
                 d.issue_search_active = rm.issue_search_active;

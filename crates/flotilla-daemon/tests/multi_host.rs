@@ -355,7 +355,7 @@ async fn host_summary_round_trip_between_connected_peers() {
     let (_peer, generation, mut leader_rx) = leader_receivers.pop().expect("leader receiver");
 
     follower_mgr
-        .send_to(&HostName::new("leader"), PeerWireMessage::HostSummary(follower_daemon.local_host_summary().clone()))
+        .send_to(&HostName::new("leader"), PeerWireMessage::HostSummary(follower_daemon.local_host_summary().await))
         .await
         .expect("send host summary");
 
@@ -375,7 +375,7 @@ async fn host_summary_round_trip_between_connected_peers() {
     assert_eq!(result, HandleResult::Ignored);
     let stored = leader_mgr.get_peer_host_summaries().get(&HostName::new("follower")).expect("leader stored follower summary");
     assert_eq!(stored.host_name, HostName::new("follower"));
-    assert_eq!(stored, follower_daemon.local_host_summary());
+    assert_eq!(stored, &follower_daemon.local_host_summary().await);
 
     let plan = leader_mgr.disconnect_peer(&HostName::new("follower"), generation);
     assert!(plan.was_active, "disconnect should clear active peer state");
@@ -576,10 +576,10 @@ async fn delta_message_returns_needs_resync() {
 async fn follower_mode_has_only_local_providers() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().to_path_buf();
-    std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+    init_git_repo(&repo);
 
     let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
-    let daemon = InProcessDaemon::new(vec![repo], config, fake_discovery(true), HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![repo], config, git_process_discovery(true), HostName::local()).await;
 
     assert!(daemon.is_follower(), "daemon should be in follower mode");
 
@@ -590,6 +590,7 @@ async fn follower_mode_has_only_local_providers() {
 
     // Local providers should be present
     assert!(provider_names.contains_key("vcs"), "follower should have VCS provider");
+    assert!(provider_names.contains_key("checkout_manager"), "follower should have checkout_manager provider");
 
     // External providers should be absent
     assert!(!provider_names.contains_key("change_request"), "follower should NOT have change_request");

@@ -57,7 +57,7 @@ async fn main() {
     let registry = Arc::new(registry);
     let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
     let handle =
-        RepoRefreshHandle::spawn(repo_root.clone(), registry, criteria, attachable_store, agent_state_store, Duration::from_secs(60));
+        RepoRefreshHandle::spawn(repo_root.clone(), registry, criteria, None, attachable_store, agent_state_store, Duration::from_secs(60));
 
     // Wait for the first snapshot
     let mut rx = handle.snapshot_rx.clone();

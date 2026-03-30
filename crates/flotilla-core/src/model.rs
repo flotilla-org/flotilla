@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-pub use flotilla_protocol::{CategoryLabels, RepoLabels};
+pub use flotilla_protocol::{CategoryLabels, EnvironmentId, RepoLabels};
 
 use crate::{
     attachable::SharedAttachableStore,
@@ -78,6 +78,7 @@ pub struct RepoModel {
     pub data: DataStore,
     pub labels: RepoLabels,
     pub refresh_handle: RepoRefreshHandle,
+    pub environment_id: Option<EnvironmentId>,
 }
 
 impl RepoModel {
@@ -85,15 +86,23 @@ impl RepoModel {
         repo_root: PathBuf,
         registry: ProviderRegistry,
         repo_slug: Option<String>,
+        environment_id: Option<EnvironmentId>,
         attachable_store: SharedAttachableStore,
         agent_state_store: crate::agents::SharedAgentStateStore,
     ) -> Self {
         let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
-        let refresh_handle =
-            RepoRefreshHandle::spawn(repo_root, registry.clone(), criteria, attachable_store, agent_state_store, Duration::from_secs(10));
-        Self { registry, data: DataStore::default(), labels, refresh_handle }
+        let refresh_handle = RepoRefreshHandle::spawn(
+            repo_root,
+            registry.clone(),
+            criteria,
+            environment_id.clone(),
+            attachable_store,
+            agent_state_store,
+            Duration::from_secs(10),
+        );
+        Self { registry, data: DataStore::default(), labels, refresh_handle, environment_id }
     }
 
     /// Create a model for a virtual (remote-only) repo.
@@ -109,7 +118,13 @@ impl RepoModel {
             issues: CategoryLabels::new("Issues", "issue", "I"),
             cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
         };
-        Self { registry: Arc::new(registry), data: DataStore::default(), labels, refresh_handle: RepoRefreshHandle::idle() }
+        Self {
+            registry: Arc::new(registry),
+            data: DataStore::default(),
+            labels,
+            refresh_handle: RepoRefreshHandle::idle(),
+            environment_id: None,
+        }
     }
 }
 

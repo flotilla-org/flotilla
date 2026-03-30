@@ -31,6 +31,16 @@ fn make_step(desc: &str) -> Step {
     Step { description: desc.to_string(), host: StepExecutionContext::Host(HostName::local()), action: StepAction::Noop }
 }
 
+fn remote_host() -> HostName {
+    let local = HostName::local();
+    let candidate = HostName::new("remote-step-host");
+    if candidate == local {
+        HostName::new("remote-step-host-alt")
+    } else {
+        candidate
+    }
+}
+
 fn setup() -> (CancellationToken, broadcast::Sender<DaemonEvent>) {
     let (tx, _rx) = broadcast::channel(64);
     (CancellationToken::new(), tx)
@@ -364,12 +374,13 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
     }
 
     let (cancel, tx) = setup();
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![
-        Step { description: "remote".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
         make_step("local"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![],
         wait_for_cancel: None,
         result: Ok(vec![StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach remote".into() })]),
@@ -410,12 +421,13 @@ async fn remote_failure_stops_execution() {
 
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![
-        Step { description: "remote".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
         make_step("local"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![
             RemoteStepProgressUpdate {
                 batch_step_index: 0,
@@ -475,12 +487,13 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
 
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![
-        Step { description: "remote".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
         make_step("local"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![RemoteStepProgressUpdate {
             batch_step_index: 0,
             batch_step_count: 1,
@@ -516,7 +529,7 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
                 description,
                 status: StepStatus::Failed { message },
                 ..
-            } if host == &HostName::new("feta") && description == "remote" && message == "boom"
+            } if host == &remote_host && description == "remote" && message == "boom"
         )
     }));
 }
@@ -526,13 +539,14 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed)]);
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![
         make_step("local"),
-        Step { description: "remote-a".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
-        Step { description: "remote-b".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote-a".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
+        Step { description: "remote-b".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![
             RemoteStepProgressUpdate {
                 batch_step_index: 0,
@@ -580,7 +594,7 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     assert!(matches!(
         &failure_events[0],
         (host, 2, description, StepStatus::Failed { message })
-            if host == &HostName::new("feta") && description == "remote-b" && message == "boom"
+            if host == &remote_host && description == "remote-b" && message == "boom"
     ));
 }
 
@@ -603,13 +617,14 @@ async fn remote_error_does_not_duplicate_failed_progress() {
 
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![Step {
         description: "remote".into(),
-        host: StepExecutionContext::Host(HostName::new("feta")),
+        host: StepExecutionContext::Host(remote_host.clone()),
         action: StepAction::Noop,
     }]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![
             RemoteStepProgressUpdate {
                 batch_step_index: 0,
@@ -654,14 +669,15 @@ async fn remote_progress_maps_to_global_step_indices() {
     let (cancel, tx) = setup();
     let mut rx = tx.subscribe();
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed), Ok(StepOutcome::Completed)]);
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![
         make_step("local-a"),
-        Step { description: "remote-a".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
-        Step { description: "remote-b".into(), host: StepExecutionContext::Host(HostName::new("feta")), action: StepAction::Noop },
+        Step { description: "remote-a".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
+        Step { description: "remote-b".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
         make_step("local-b"),
     ]);
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![
             RemoteStepProgressUpdate {
                 batch_step_index: 0,
@@ -709,7 +725,7 @@ async fn remote_progress_maps_to_global_step_indices() {
 
     let remote_indices: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|event| match event {
-            DaemonEvent::CommandStepUpdate { host, step_index, .. } if host == HostName::new("feta") => Some(step_index),
+            DaemonEvent::CommandStepUpdate { host, step_index, .. } if host == remote_host => Some(step_index),
             _ => None,
         })
         .collect();
@@ -773,8 +789,9 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
     }
 
     let wait_for_cancel = Arc::new(Notify::new());
+    let remote_host = remote_host();
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![RemoteStepProgressUpdate {
             batch_step_index: 0,
             batch_step_count: 1,
@@ -787,7 +804,7 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
     let (cancel, tx) = setup();
     let plan = StepPlan::new(vec![Step {
         description: "remote".into(),
-        host: StepExecutionContext::Host(HostName::new("feta")),
+        host: StepExecutionContext::Host(remote_host.clone()),
         action: StepAction::Noop,
     }]);
 
@@ -834,8 +851,9 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
     }
 
     let wait_for_cancel = Arc::new(Notify::new());
+    let remote_host = remote_host();
     let remote = TestRemoteExecutor::new(vec![TestRemoteBatch {
-        assert_host: HostName::new("feta"),
+        assert_host: remote_host.clone(),
         progress: vec![RemoteStepProgressUpdate {
             batch_step_index: 0,
             batch_step_count: 1,
@@ -849,7 +867,7 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
     let mut rx = tx.subscribe();
     let plan = StepPlan::new(vec![Step {
         description: "remote".into(),
-        host: StepExecutionContext::Host(HostName::new("feta")),
+        host: StepExecutionContext::Host(remote_host.clone()),
         action: StepAction::Noop,
     }]);
 
@@ -908,9 +926,10 @@ async fn cancellation_after_remote_cancel_timeout_returns_cancelled_without_wait
     let (cancel, tx) = setup();
     let started = Arc::new(Notify::new());
     let remote = StalledRemoteExecutor { started: Arc::clone(&started) };
+    let remote_host = remote_host();
     let plan = StepPlan::new(vec![Step {
         description: "remote".into(),
-        host: StepExecutionContext::Host(HostName::new("feta")),
+        host: StepExecutionContext::Host(remote_host.clone()),
         action: StepAction::Noop,
     }]);
 

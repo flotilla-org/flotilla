@@ -24,18 +24,19 @@ impl RepoDetector for VcsRepoDetector {
     async fn detect(
         &self,
         repo_root: &ExecutionEnvironmentPath,
-        _runner: &dyn CommandRunner,
+        runner: &dyn CommandRunner,
         _env: &dyn EnvVars,
     ) -> Vec<EnvironmentAssertion> {
-        let git_path = repo_root.as_path().join(".git");
-        if git_path.is_dir() {
-            vec![EnvironmentAssertion::vcs_checkout(repo_root.as_path(), VcsKind::Git, true)]
-        } else if git_path.is_file() {
-            // .git file indicates a worktree
-            vec![EnvironmentAssertion::vcs_checkout(repo_root.as_path(), VcsKind::Git, false)]
-        } else {
-            vec![]
-        }
+        let inside = match run!(runner, "git", &["rev-parse", "--is-inside-work-tree"], repo_root.as_path()) {
+            Ok(output) if output.trim() == "true" => output,
+            _ => return vec![],
+        };
+        let _ = inside;
+        let git_dir = run!(runner, "git", &["rev-parse", "--path-format=absolute", "--git-dir"], repo_root.as_path()).ok();
+        let git_common_dir = run!(runner, "git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], repo_root.as_path()).ok();
+        let is_main_checkout =
+            matches!((git_dir, git_common_dir), (Some(git_dir), Some(common_dir)) if git_dir.trim() == common_dir.trim());
+        vec![EnvironmentAssertion::vcs_checkout(repo_root.as_path(), VcsKind::Git, is_main_checkout)]
     }
 }
 
@@ -182,15 +183,17 @@ mod tests {
 
     #[tokio::test]
     async fn vcs_repo_detector_git_dir() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        std::fs::create_dir_all(dir.path().join(".git")).expect("create .git dir");
-        let runner = DiscoveryMockRunner::builder().build();
-        let repo_root = ExecutionEnvironmentPath::new(dir.path());
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--is-inside-work-tree"], Ok("true\n".into()))
+            .on_run("git", &["rev-parse", "--path-format=absolute", "--git-dir"], Ok("/tmp/repo/.git\n".into()))
+            .on_run("git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], Ok("/tmp/repo/.git\n".into()))
+            .build();
         let assertions = VcsRepoDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-                assert_eq!(root.as_path(), dir.path());
+                assert_eq!(root.as_path(), repo_root.as_path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(*is_main_checkout);
             }
@@ -200,15 +203,17 @@ mod tests {
 
     #[tokio::test]
     async fn vcs_repo_detector_git_file_is_worktree() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        std::fs::write(dir.path().join(".git"), "gitdir: /some/path\n").expect("write .git file");
-        let runner = DiscoveryMockRunner::builder().build();
-        let repo_root = ExecutionEnvironmentPath::new(dir.path());
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--is-inside-work-tree"], Ok("true\n".into()))
+            .on_run("git", &["rev-parse", "--path-format=absolute", "--git-dir"], Ok("/tmp/repo/.git/worktrees/feature\n".into()))
+            .on_run("git", &["rev-parse", "--path-format=absolute", "--git-common-dir"], Ok("/tmp/repo/.git\n".into()))
+            .build();
         let assertions = VcsRepoDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             EnvironmentAssertion::VcsCheckoutDetected { root, kind, is_main_checkout } => {
-                assert_eq!(root.as_path(), dir.path());
+                assert_eq!(root.as_path(), repo_root.as_path());
                 assert_eq!(*kind, VcsKind::Git);
                 assert!(!*is_main_checkout);
             }
@@ -218,9 +223,10 @@ mod tests {
 
     #[tokio::test]
     async fn vcs_repo_detector_no_git() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let runner = DiscoveryMockRunner::builder().build();
-        let repo_root = ExecutionEnvironmentPath::new(dir.path());
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--is-inside-work-tree"], Err("fatal: not a git repository".into()))
+            .build();
+        let repo_root = ExecutionEnvironmentPath::new("/tmp/repo");
         let assertions = VcsRepoDetector.detect(&repo_root, &runner, &TestEnvVars::default()).await;
         assert!(assertions.is_empty());
     }

@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{DeltaEntry, HostName, Issue, ProviderData, ProviderError, RepoSnapshot};
+use flotilla_protocol::{DeltaEntry, EnvironmentId, HostName, Issue, ProviderData, ProviderError, RepoSnapshot, WorkItem};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -67,6 +67,8 @@ pub(crate) struct RepoState {
     last_broadcast_health: HashMap<String, HashMap<String, bool>>,
     /// Last broadcast errors, used for delta computation.
     last_broadcast_errors: Vec<ProviderError>,
+    /// Last broadcast work items, used for incremental work-item deltas.
+    last_broadcast_work_items: Vec<WorkItem>,
     /// Bounded delta log for replay on client reconnect.
     delta_log: VecDeque<DeltaEntry>,
     /// Incremented only when local provider data changes (not peer data merges).
@@ -92,6 +94,7 @@ impl RepoState {
             last_broadcast_providers: ProviderData::default(),
             last_broadcast_health: HashMap::new(),
             last_broadcast_errors: Vec::new(),
+            last_broadcast_work_items: Vec::new(),
             delta_log: VecDeque::new(),
             local_data_version: 0,
             last_merged_snapshot: None,
@@ -108,6 +111,10 @@ impl RepoState {
 
     pub(crate) fn preferred_path(&self) -> &Path {
         &self.preferred_root().path
+    }
+
+    pub(crate) fn preferred_environment_id(&self) -> Option<&EnvironmentId> {
+        self.preferred_root().model.environment_id.as_ref()
     }
 
     pub(crate) fn registry(&self) -> Arc<crate::providers::registry::ProviderRegistry> {
@@ -247,9 +254,10 @@ impl RepoState {
         new_providers: &ProviderData,
         new_health: &HashMap<String, HashMap<String, bool>>,
         new_errors: &[ProviderError],
-        work_items: Vec<flotilla_protocol::snapshot::WorkItem>,
+        work_items: Vec<WorkItem>,
     ) -> DeltaEntry {
         let mut changes = delta::diff_provider_data(&self.last_broadcast_providers, new_providers);
+        changes.extend(delta::diff_work_items(&self.last_broadcast_work_items, &work_items));
 
         // Diff provider health (nested: category → provider → bool)
         for (category, providers) in new_health {
@@ -291,7 +299,7 @@ impl RepoState {
         }
 
         let prev_seq = self.seq;
-        let entry = DeltaEntry { seq: self.seq + 1, prev_seq, changes, work_items };
+        let entry = DeltaEntry { seq: self.seq + 1, prev_seq, changes };
 
         // Append to bounded log
         self.delta_log.push_back(entry.clone());
@@ -304,6 +312,7 @@ impl RepoState {
         self.last_broadcast_providers = new_providers.clone();
         self.last_broadcast_health = new_health.clone();
         self.last_broadcast_errors = new_errors.to_vec();
+        self.last_broadcast_work_items = work_items;
 
         entry
     }
@@ -313,7 +322,7 @@ impl RepoState {
 mod tests {
     use std::collections::HashMap;
 
-    use flotilla_protocol::{Checkout, HostName, ProviderData, ProviderError};
+    use flotilla_protocol::{Checkout, HostName, ProviderData, ProviderError, WorkItem, WorkItemIdentity, WorkItemKind};
 
     use super::*;
 
@@ -327,6 +336,27 @@ mod tests {
             unmet: Vec::new(),
             is_local: false,
         })
+    }
+
+    fn work_item(id: &str, description: &str) -> WorkItem {
+        WorkItem {
+            kind: WorkItemKind::Issue,
+            identity: WorkItemIdentity::Issue(id.into()),
+            host: HostName::new("host"),
+            branch: None,
+            description: description.into(),
+            checkout: None,
+            change_request_key: None,
+            session_key: None,
+            issue_keys: vec![],
+            workspace_refs: vec![],
+            is_main_checkout: false,
+            debug_group: vec![],
+            source: None,
+            terminal_keys: vec![],
+            attachable_set_id: None,
+            agent_keys: vec![],
+        }
     }
 
     #[tokio::test]
@@ -438,6 +468,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_delta_detects_work_item_changes() {
+        let mut state = make_repo_state();
+        state.last_broadcast_work_items = vec![work_item("1", "old issue")];
+
+        let entry = state.record_delta(&ProviderData::default(), &HashMap::new(), &[], vec![
+            work_item("1", "new issue"),
+            work_item("2", "second issue"),
+        ]);
+
+        assert!(entry.changes.iter().any(|change| matches!(
+            change,
+            flotilla_protocol::Change::WorkItem {
+                identity,
+                op: flotilla_protocol::EntryOp::Updated(WorkItem { description, .. }),
+            } if *identity == WorkItemIdentity::Issue("1".into()) && description == "new issue"
+        )));
+        assert!(entry.changes.iter().any(|change| matches!(
+            change,
+            flotilla_protocol::Change::WorkItem {
+                identity,
+                op: flotilla_protocol::EntryOp::Added(WorkItem { description, .. }),
+            } if *identity == WorkItemIdentity::Issue("2".into()) && description == "second issue"
+        )));
+    }
+
+    #[tokio::test]
     async fn record_delta_log_bounded_at_capacity() {
         let mut state = make_repo_state();
 
@@ -509,5 +565,49 @@ mod tests {
         assert_eq!(state.last_broadcast_health, new_health);
         assert_eq!(state.last_broadcast_errors, new_errors);
         assert_eq!(state.delta_log.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preferred_environment_id_tracks_the_preferred_root() {
+        let remote_env = EnvironmentId::new("remote-env");
+        let local_env = EnvironmentId::new("local-env");
+
+        let remote_root = RepoRootState {
+            path: PathBuf::from("/remote"),
+            model: crate::model::RepoModel::new(
+                PathBuf::from("/remote"),
+                crate::providers::registry::ProviderRegistry::new(),
+                None,
+                Some(remote_env.clone()),
+                crate::attachable::shared_in_memory_attachable_store(),
+                crate::agents::shared_in_memory_agent_state_store(),
+            ),
+            slug: None,
+            repo_bag: crate::providers::discovery::EnvironmentBag::new(),
+            unmet: Vec::new(),
+            is_local: false,
+        };
+        let mut state = RepoState::new(flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/repo".into() }, remote_root);
+
+        assert_eq!(state.preferred_environment_id(), Some(&remote_env));
+
+        let local_root = RepoRootState {
+            path: PathBuf::from("/local"),
+            model: crate::model::RepoModel::new(
+                PathBuf::from("/local"),
+                crate::providers::registry::ProviderRegistry::new(),
+                None,
+                Some(local_env.clone()),
+                crate::attachable::shared_in_memory_attachable_store(),
+                crate::agents::shared_in_memory_agent_state_store(),
+            ),
+            slug: None,
+            repo_bag: crate::providers::discovery::EnvironmentBag::new(),
+            unmet: Vec::new(),
+            is_local: true,
+        };
+
+        assert!(state.add_root(local_root), "adding a local root should promote it to preferred");
+        assert_eq!(state.preferred_environment_id(), Some(&local_env));
     }
 }

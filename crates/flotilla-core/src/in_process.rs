@@ -15,24 +15,31 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, HostListResponse, HostName, HostPath, HostProvidersResponse,
-    HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse, TopologyRoute,
+    AssociationKey, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName, HostPath,
+    HostProvidersResponse, HostStatusResponse, HostSummary, Issue, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
+    TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::ConfigStore,
+    config::{ConfigStore, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::DaemonHandle,
+    environment_manager::EnvironmentManager,
     executor,
+    host_identity::{resolve_local_environment_state_dir, resolve_or_create_environment_id, resolve_or_create_remote_environment_id},
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::discovery::{discover_providers, DiscoveryResult, DiscoveryRuntime, EnvironmentBag},
+    providers::{
+        discovery::{discover_providers, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag},
+        ssh_runner::SshCommandRunner,
+        ChannelLabel, CommandRunner,
+    },
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     step::{
@@ -40,12 +47,133 @@ use crate::{
     },
 };
 
+fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
+    let mut encoded = String::with_capacity(config_key.len() * 2);
+    for byte in config_key.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    let suffix = if encoded.is_empty() { "empty".to_string() } else { encoded };
+    // Remote direct environments do not have a persisted remote identity yet.
+    // Use a deterministic temporary id encoded directly from the daemon.toml
+    // entry key bytes so distinct legal config keys remain injective in this tranche.
+    EnvironmentId::new(format!("static-ssh-{suffix}"))
+}
+
+#[derive(Default)]
+struct StaticEnvVars {
+    vars: HashMap<String, String>,
+}
+
+impl StaticEnvVars {
+    fn from_bag(bag: &EnvironmentBag) -> Self {
+        let mut vars = HashMap::new();
+        for assertion in bag.assertions() {
+            if let crate::providers::discovery::EnvironmentAssertion::EnvVarSet { key, value } = assertion {
+                vars.insert(key.clone(), value.clone());
+            }
+        }
+        Self { vars }
+    }
+}
+
+impl crate::providers::discovery::EnvVars for StaticEnvVars {
+    fn get(&self, key: &str) -> Option<String> {
+        self.vars.get(key).cloned()
+    }
+}
+
+async fn load_env_vars(runner: &dyn CommandRunner, cwd: &Path) -> HashMap<String, String> {
+    let Ok(output) = runner.run("env", &[], cwd, &ChannelLabel::Noop).await else {
+        return HashMap::new();
+    };
+
+    output
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+const STATIC_SSH_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn register_static_ssh_direct_environment(
+    environment_manager: &EnvironmentManager,
+    discovery: &DiscoveryRuntime,
+    config_key: &str,
+    environment: &StaticEnvironmentConfig,
+) -> Result<(), String> {
+    let fallback_env_id = static_ssh_environment_id(config_key);
+    let runner = Arc::new(SshCommandRunner::new(environment.hostname.clone(), true, Arc::clone(&discovery.runner)));
+    tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Noop))
+        .await
+        .map_err(|_| format!("ssh preflight timed out for {}", environment.hostname))?
+        .map_err(|err| format!("ssh preflight failed for {}: {err}", environment.hostname))?;
+    let remote_env_vars =
+        tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, load_env_vars(&*runner, Path::new("/"))).await.unwrap_or_default();
+    let remote_env = StaticEnvVars { vars: remote_env_vars };
+    let env_id = resolve_or_create_remote_environment_id(&*runner, &remote_env, fallback_env_id).await?;
+    let mut env_bag =
+        tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, run_host_detectors(&discovery.host_detectors, &*runner, &remote_env))
+            .await
+            .map_err(|_| format!("host detector execution timed out for {}", environment.hostname))?;
+    if let Some(display_name) = environment.display_name.as_ref() {
+        env_bag = env_bag.with(EnvironmentAssertion::env_var("DISPLAY_NAME", display_name));
+    }
+    environment_manager.register_direct_environment(env_id, runner, env_bag)
+}
+
+async fn register_static_ssh_direct_environments(
+    config: &ConfigStore,
+    discovery: &DiscoveryRuntime,
+    environment_manager: &EnvironmentManager,
+) {
+    let daemon_config = match config.load_daemon_config() {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(%err, "failed to load daemon config for static SSH environments; continuing with local startup only");
+            return;
+        }
+    };
+
+    for (config_key, environment) in &daemon_config.environments {
+        if let Err(err) = register_static_ssh_direct_environment(environment_manager, discovery, config_key, environment).await {
+            warn!(
+                environment = %config_key,
+                hostname = %environment.hostname,
+                %err,
+                "failed to register static SSH direct environment; continuing startup"
+            );
+        }
+    }
+}
+
 fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.to_string_lossy().into_owned() }
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
     bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
+}
+
+async fn discover_repo_for_environment(
+    environment_manager: &EnvironmentManager,
+    discovery: &DiscoveryRuntime,
+    config: &ConfigStore,
+    local_environment_id: &EnvironmentId,
+    environment_id: &EnvironmentId,
+    repo_path: &Path,
+) -> Result<DiscoveryResult, String> {
+    let host_bag = environment_manager.environment_bag(environment_id).ok_or_else(|| format!("environment not found: {environment_id}"))?;
+    let runner =
+        environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
+    let ee_path = ExecutionEnvironmentPath::new(repo_path);
+    let remote_env = StaticEnvVars::from_bag(&host_bag);
+    let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
+
+    Ok(discover_providers(&host_bag, &ee_path, &discovery.repo_detectors, &discovery.factories, config, runner, env).await)
 }
 
 fn now_iso8601() -> String {
@@ -229,7 +357,6 @@ fn choose_event(snapshot: RepoSnapshot, delta: DeltaEntry) -> DaemonEvent {
         repo_identity: snapshot.repo_identity.clone(),
         repo: snapshot.repo.clone(),
         changes: delta.changes,
-        work_items: snapshot.work_items.clone(),
         issue_total: snapshot.issue_total,
         issue_has_more: snapshot.issue_has_more,
         issue_search_results: snapshot.issue_search_results.clone(),
@@ -277,9 +404,8 @@ pub struct InProcessDaemon {
     // holding those write locks.
     path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
     host_registry: crate::host_registry::HostRegistry,
-    /// Host-level environment assertions, computed once at startup and
-    /// reused for each repo discovery.
-    host_bag: EnvironmentBag,
+    local_environment_id: EnvironmentId,
+    environment_manager: Arc<EnvironmentManager>,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: DiscoveryRuntime,
@@ -301,7 +427,7 @@ impl InProcessDaemon {
     /// holds a reference. The poll loop checks every 100ms for new refresh
     /// snapshots and broadcasts delta or full events for each change.
     pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>, discovery: DiscoveryRuntime, host_name: HostName) -> Arc<Self> {
-        use crate::providers::discovery::{self, DiscoveryResult};
+        use crate::providers::discovery::DiscoveryResult;
 
         let follower = discovery.is_follower();
         let (event_tx, _) = broadcast::channel(256);
@@ -309,8 +435,11 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
 
-        // Run host detection once before the repo loop
-        let host_bag = discovery::run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
+        let local_environment_state_dir = resolve_local_environment_state_dir(config.state_dir().as_path(), &*discovery.runner).await;
+        let local_environment_id =
+            resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
+        let environment_manager = Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await);
+        register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
         for path in repo_paths {
@@ -318,24 +447,30 @@ impl InProcessDaemon {
                 continue;
             }
             let attachable_store = discovery.shared_attachable_store(&config);
-            let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
-            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discovery::discover_providers(
-                &host_bag,
-                &ee_path,
-                &discovery.repo_detectors,
-                &discovery.factories,
+            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
+                &environment_manager,
+                &discovery,
                 &config,
-                Arc::clone(&discovery.runner),
-                &*discovery.env,
+                &local_environment_id,
+                &local_environment_id,
+                &path,
             )
-            .await;
+            .await
+            .expect("local direct environment discovery should always be available");
             if !unmet.is_empty() {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
 
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
             let slug = repo_slug.clone();
-            let mut model = RepoModel::new(path.clone(), registry, repo_slug, attachable_store, Arc::clone(&agent_state_store));
+            let mut model = RepoModel::new(
+                path.clone(),
+                registry,
+                repo_slug,
+                Some(local_environment_id.clone()),
+                attachable_store,
+                Arc::clone(&agent_state_store),
+            );
             model.data.loading = true;
             let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
 
@@ -350,13 +485,13 @@ impl InProcessDaemon {
 
         let local_host_summary = crate::host_summary::build_local_host_summary(
             &host_name,
-            &host_bag,
+            &environment_manager,
             crate::host_summary::provider_statuses_from_registries(
                 repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
             ),
             &*discovery.env,
-            vec![],
-        );
+        )
+        .await;
 
         let daemon = Arc::new(Self {
             repos: RwLock::new(repos),
@@ -370,7 +505,8 @@ impl InProcessDaemon {
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
             host_registry: crate::host_registry::HostRegistry::new(host_name.clone(), local_host_summary),
-            host_bag,
+            local_environment_id,
+            environment_manager,
             discovery,
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             session_id: uuid::Uuid::new_v4(),
@@ -409,8 +545,12 @@ impl InProcessDaemon {
         self.session_id
     }
 
-    pub fn local_host_summary(&self) -> &HostSummary {
-        self.host_registry.local_host_summary()
+    pub async fn local_host_summary(&self) -> HostSummary {
+        self.refresh_local_host_summary().await
+    }
+
+    pub fn local_environment_id(&self) -> &EnvironmentId {
+        &self.local_environment_id
     }
 
     pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
@@ -423,6 +563,58 @@ impl InProcessDaemon {
 
     pub async fn daemon_socket_path(&self) -> Option<PathBuf> {
         self.daemon_socket_path.read().await.clone()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_direct_environment_for_test(
+        &self,
+        env_id: EnvironmentId,
+        runner: Arc<dyn CommandRunner>,
+        env_bag: EnvironmentBag,
+    ) -> Result<(), String> {
+        self.environment_manager.register_direct_environment(env_id, runner, env_bag)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_provisioned_environment_for_test(
+        &self,
+        env_id: EnvironmentId,
+        handle: crate::providers::environment::EnvironmentHandle,
+        env_bag: EnvironmentBag,
+    ) -> Result<(), String> {
+        self.environment_manager.register_provisioned_environment(env_id, handle, env_bag, None)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn replace_local_environment_bag_for_test(&self, env_bag: EnvironmentBag) -> Result<(), String> {
+        self.environment_manager.replace_local_environment_bag_for_test(env_bag)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn managed_environment_ids_for_test(&self) -> Vec<EnvironmentId> {
+        self.environment_manager.managed_environments().into_iter().map(|(env_id, _)| env_id).collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn environment_bag_for_test(&self, env_id: &EnvironmentId) -> Option<EnvironmentBag> {
+        self.environment_manager.environment_bag(env_id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn discover_repo_for_environment_for_test(
+        &self,
+        repo_path: &Path,
+        environment_id: &EnvironmentId,
+    ) -> Result<DiscoveryResult, String> {
+        discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            environment_id,
+            repo_path,
+        )
+        .await
     }
 
     /// Returns the current connection status for a peer host.
@@ -519,15 +711,19 @@ impl InProcessDaemon {
     }
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
-        let mut repo_bag = EnvironmentBag::new();
-        let runner = &*self.discovery.runner;
-        let env = &*self.discovery.env;
-        let ee_path = crate::path_context::ExecutionEnvironmentPath::new(repo_path);
-        for detector in &self.discovery.repo_detectors {
-            repo_bag = repo_bag.extend(detector.detect(&ee_path, runner, env).await);
+        match discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            &self.local_environment_id,
+            repo_path,
+        )
+        .await
+        {
+            Ok(result) => repo_identity_from_bag_or_path(repo_path, &result.host_repo_bag),
+            Err(_) => fallback_repo_identity(repo_path),
         }
-        let combined = self.host_bag.merge(&repo_bag);
-        repo_identity_from_bag_or_path(repo_path, &combined)
     }
 
     /// Returns the paths of all locally tracked repos.
@@ -1389,17 +1585,15 @@ impl InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
-        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
-            &self.host_bag,
-            &ee_path,
-            &self.discovery.repo_detectors,
-            &self.discovery.factories,
+        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
             &self.config,
-            Arc::clone(&self.discovery.runner),
-            &*self.discovery.env,
+            &self.local_environment_id,
+            &self.local_environment_id,
+            &path,
         )
-        .await;
+        .await?;
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
@@ -1409,6 +1603,7 @@ impl InProcessDaemon {
             path.clone(),
             registry,
             repo_slug,
+            Some(self.local_environment_id.clone()),
             self.discovery.shared_attachable_store(&self.config),
             Arc::clone(&self.agent_state_store),
         );
@@ -1568,7 +1763,11 @@ impl InProcessDaemon {
             )),
         };
 
-        let host_discovery = self.host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
+        let host_bag = state
+            .preferred_environment_id()
+            .and_then(|env_id| self.environment_manager.environment_bag(env_id))
+            .unwrap_or_else(|| self.environment_manager.local_environment_bag());
+        let host_discovery = host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
         let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
 
         let provider_infos = state
@@ -1619,20 +1818,45 @@ impl InProcessDaemon {
     }
 
     pub async fn list_hosts_internal(&self) -> Result<HostListResponse, String> {
+        let _ = self.refresh_local_host_summary().await;
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
         Ok(self.host_registry.list_hosts(local_counts, &remote_counts).await)
     }
 
     pub async fn get_host_status_internal(&self, host: &str) -> Result<HostStatusResponse, String> {
+        let _ = self.refresh_local_host_summary().await;
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
-        self.host_registry.get_host_status(host, local_counts, &remote_counts).await
+        let mut response = self.host_registry.get_host_status(host, local_counts, &remote_counts).await?;
+        if host == self.host_name.as_str() {
+            response.visible_environments = self.environment_manager.visible_environments().await;
+        }
+        Ok(response)
     }
 
     pub async fn get_host_providers_internal(&self, host: &str) -> Result<HostProvidersResponse, String> {
+        let _ = self.refresh_local_host_summary().await;
         let remote_counts = self.remote_host_counts().await;
-        self.host_registry.get_host_providers(host, &remote_counts).await
+        let mut response = self.host_registry.get_host_providers(host, &remote_counts).await?;
+        if host == self.host_name.as_str() {
+            response.visible_environments = self.environment_manager.visible_environments().await;
+        }
+        Ok(response)
+    }
+
+    async fn refresh_local_host_summary(&self) -> HostSummary {
+        let summary = crate::host_summary::build_local_host_summary(
+            &self.host_name,
+            &self.environment_manager,
+            crate::host_summary::provider_statuses_from_registries(
+                self.repos.read().await.values().map(|state| state.preferred_root().model.registry.as_ref()),
+            ),
+            &*self.discovery.env,
+        )
+        .await;
+        self.host_registry.set_local_host_summary(summary.clone()).await;
+        summary
     }
 
     pub async fn execute_with_remote_executor(
@@ -1674,8 +1898,7 @@ impl InProcessDaemon {
             attachable_store,
             daemon_socket_path,
             local_host: self.host_name.clone(),
-            environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
-            environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            environment_manager: Arc::clone(&self.environment_manager),
         };
 
         let result = execute_local_remote_step_batch(self.host_name.clone(), request, progress_sink, cancel, &resolver).await;
@@ -1954,6 +2177,7 @@ impl InProcessDaemon {
         let local_host = self.host_name.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
+        let environment_manager = Arc::clone(&self.environment_manager);
         tokio::spawn(async move {
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
@@ -2002,8 +2226,7 @@ impl InProcessDaemon {
                         attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_dhp.clone(),
                         local_host: resolver_local_host.clone(),
-                        environment_handles: std::sync::Mutex::new(std::collections::HashMap::new()),
-                        environment_registries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                        environment_manager: Arc::clone(&environment_manager),
                     };
                     let result = run_step_plan_with_remote_executor(
                         step_plan,
@@ -2155,6 +2378,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
+        let _ = self.refresh_local_host_summary().await;
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
         let mut events = self.host_registry.replay_host_events(last_seen).await;
@@ -2179,7 +2403,6 @@ impl DaemonHandle for InProcessDaemon {
                                 repo_identity: state.identity().clone(),
                                 repo: Some(state.preferred_path().to_path_buf()),
                                 changes: entry.changes.clone(),
-                                work_items: entry.work_items.clone(),
                                 issue_total: snapshot.issue_total,
                                 issue_has_more: snapshot.issue_has_more,
                                 issue_search_results: snapshot.issue_search_results.clone(),

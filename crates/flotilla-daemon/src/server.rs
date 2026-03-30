@@ -178,7 +178,7 @@ impl DaemonServer {
         socket_path: PathBuf,
         idle_timeout: Duration,
     ) -> Result<Self, String> {
-        let daemon_config = config.load_daemon_config();
+        let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
         let daemon = InProcessDaemon::new(repo_paths, Arc::clone(&config), discovery, host_name.clone()).await;
         let peer_manager = build_peer_manager(&daemon, &config)?;

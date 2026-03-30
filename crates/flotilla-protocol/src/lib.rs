@@ -10,6 +10,7 @@ pub mod path_context;
 pub mod peer;
 pub mod provider_data;
 mod provisioning_target;
+pub mod qualified_path;
 pub mod query;
 pub mod snapshot;
 pub mod step;
@@ -17,7 +18,7 @@ pub mod step;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
+pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, SystemInfo, ToolInventory};
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -69,7 +70,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -248,8 +249,6 @@ pub struct RepoDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<std::path::PathBuf>,
     pub changes: Vec<Change>,
-    /// Pre-correlated work items from the daemon (avoids re-correlation on TUI side).
-    pub work_items: Vec<snapshot::WorkItem>,
     /// Issue metadata (not part of delta log, but needed by TUI).
     pub issue_total: Option<u32>,
     pub issue_has_more: bool,

@@ -239,7 +239,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
     let config_clone = Arc::clone(&config);
     let daemon_task = tokio::spawn(async move {
         let daemon: Result<Arc<dyn DaemonHandle>, String> = if embedded {
-            let daemon_config = config_clone.load_daemon_config();
+            let daemon_config = config_clone.load_daemon_config()?;
             let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
             let discovery = flotilla_core::providers::discovery::DiscoveryRuntime::for_process(daemon_config.follower);
             let repo_root_paths = repo_roots.into_iter().map(|p| p.into_path_buf()).collect();

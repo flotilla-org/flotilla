@@ -51,7 +51,6 @@ fn make_delta(repo: &Path, prev_seq: u64, seq: u64) -> RepoDelta {
         repo_identity: repo_identity(),
         repo: Some(repo.to_path_buf()),
         changes: vec![],
-        work_items: vec![],
         issue_total: None,
         issue_has_more: false,
         issue_search_results: None,

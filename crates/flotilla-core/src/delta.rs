@@ -126,5 +126,41 @@ pub fn diff_work_items(prev: &[WorkItem], curr: &[WorkItem]) -> Vec<Change> {
     diff_indexmap(&prev_map, &curr_map).into_iter().map(|(identity, op)| Change::WorkItem { identity, op }).collect()
 }
 
+/// Apply `Change::WorkItem` operations to a work-item vector in place.
+pub fn apply_work_item_changes(work_items: &mut Vec<WorkItem>, changes: &[Change]) {
+    if !changes.iter().any(|change| matches!(change, Change::WorkItem { .. })) {
+        return;
+    }
+
+    let mut by_identity: IndexMap<WorkItemIdentity, WorkItem> =
+        work_items.iter().map(|item| (item.identity.clone(), item.clone())).collect();
+
+    for change in changes {
+        if let Change::WorkItem { identity, op } = change {
+            match op {
+                // Be lenient in release builds so replay remains idempotent if the client
+                // applies an op after state has already converged, but assert the expected
+                // protocol contract in debug builds to catch daemon/client drift early.
+                EntryOp::Added(item) => {
+                    debug_assert!(!by_identity.contains_key(identity), "work item Added op should target a new identity: {identity:?}");
+                    by_identity.insert(identity.clone(), item.clone());
+                }
+                EntryOp::Updated(item) => {
+                    debug_assert!(
+                        by_identity.contains_key(identity),
+                        "work item Updated op should target an existing identity: {identity:?}"
+                    );
+                    by_identity.insert(identity.clone(), item.clone());
+                }
+                EntryOp::Removed => {
+                    by_identity.shift_remove(identity);
+                }
+            }
+        }
+    }
+
+    *work_items = by_identity.into_values().collect();
+}
+
 #[cfg(test)]
 mod tests;

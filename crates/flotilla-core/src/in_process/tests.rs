@@ -1,6 +1,18 @@
-use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout};
+use std::sync::Arc;
+
+use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, EnvironmentId, RepoSelector};
 
 use super::*;
+use crate::{
+    agents::shared_in_memory_agent_state_store,
+    attachable::shared_in_memory_attachable_store,
+    config::ConfigStore,
+    model::RepoModel,
+    providers::discovery::{
+        test_support::{fake_discovery, DiscoveryMockRunner},
+        EnvironmentAssertion, EnvironmentBag,
+    },
+};
 
 fn checkout_with_issue(issue_id: &str) -> Checkout {
     Checkout {
@@ -94,14 +106,13 @@ fn choose_event_uses_delta_for_non_initial_changes() {
         issue_search_results: None,
     };
 
-    let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![], work_items: vec![] };
+    let initial = DeltaEntry { seq: 1, prev_seq: 0, changes: vec![] };
     assert!(matches!(choose_event(snapshot.clone(), initial), DaemonEvent::RepoSnapshot(_)));
 
     let non_empty = DeltaEntry {
         seq: 2,
         prev_seq: 1,
         changes: vec![flotilla_protocol::Change::Branch { key: "feature/x".into(), op: flotilla_protocol::EntryOp::Removed }],
-        work_items: vec![],
     };
     assert!(matches!(choose_event(snapshot, non_empty), DaemonEvent::RepoDelta(_)));
 }
@@ -126,7 +137,6 @@ fn choose_event_falls_back_to_full_when_delta_is_larger() {
         seq: 3,
         prev_seq: 2,
         changes: vec![flotilla_protocol::Change::Branch { key: "feature/".repeat(128), op: flotilla_protocol::EntryOp::Removed }],
-        work_items: vec![],
     };
 
     assert!(matches!(choose_event(snapshot, delta), DaemonEvent::RepoSnapshot(_)));
@@ -196,7 +206,7 @@ fn choose_event_sends_full_when_delta_has_empty_changes() {
     };
 
     // prev_seq > 0 but changes is empty — should still send full
-    let delta = DeltaEntry { seq: 2, prev_seq: 1, changes: vec![], work_items: vec![] };
+    let delta = DeltaEntry { seq: 2, prev_seq: 1, changes: vec![] };
     assert!(matches!(choose_event(snapshot, delta), DaemonEvent::RepoSnapshot(_)));
 }
 
@@ -418,5 +428,71 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
     assert!(
         !snapshot.providers.checkouts.contains_key(&ghost_checkout),
         "remote checkout path must not be duplicated under the local host"
+    );
+}
+
+#[tokio::test]
+async fn get_repo_providers_uses_preferred_root_environment_host_discovery_for_non_local_direct_repo() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(temp.path().join("config"))),
+        fake_discovery(false),
+        HostName::local(),
+    )
+    .await;
+
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("LOCAL_MARKER", "local")))
+        .expect("replace local environment bag");
+
+    let remote_environment_id = EnvironmentId::new("remote-direct-env");
+    daemon
+        .register_direct_environment_for_test(
+            remote_environment_id.clone(),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+            EnvironmentBag::new().with(EnvironmentAssertion::env_var("REMOTE_MARKER", "remote")),
+        )
+        .expect("register remote direct environment");
+
+    let mut model = RepoModel::new(
+        repo.clone(),
+        crate::providers::registry::ProviderRegistry::new(),
+        None,
+        Some(remote_environment_id.clone()),
+        shared_in_memory_attachable_store(),
+        shared_in_memory_agent_state_store(),
+    );
+    model.data.loading = false;
+
+    let identity = fallback_repo_identity(&repo);
+    let root = RepoRootState { path: repo.clone(), model, slug: None, repo_bag: EnvironmentBag::new(), unmet: Vec::new(), is_local: true };
+
+    {
+        let mut repos = daemon.repos.write().await;
+        let mut order = daemon.repo_order.write().await;
+        repos.insert(identity.clone(), RepoState::new(identity.clone(), root));
+        order.push(identity.clone());
+    }
+    daemon.path_identities.write().await.insert(repo.clone(), identity);
+
+    let providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo)).await.expect("repo providers should resolve");
+
+    assert!(
+        providers
+            .host_discovery
+            .iter()
+            .any(|entry| entry.kind == "env_var_set" && entry.detail.get("key").map(String::as_str) == Some("REMOTE_MARKER")),
+        "host discovery should report the preferred non-local direct environment bag"
+    );
+    assert!(
+        !providers
+            .host_discovery
+            .iter()
+            .any(|entry| entry.kind == "env_var_set" && entry.detail.get("key").map(String::as_str) == Some("LOCAL_MARKER")),
+        "host discovery should not fall back to the daemon-local environment bag"
     );
 }

@@ -2581,6 +2581,22 @@ async fn daemon_server_new_returns_error_for_invalid_hosts_config() {
 }
 
 #[tokio::test]
+async fn daemon_server_new_returns_error_for_invalid_daemon_config() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().join("config");
+    std::fs::create_dir_all(&base).expect("create config directory");
+    std::fs::write(base.join("daemon.toml"), "environments = 123\n").expect("write invalid daemon config");
+
+    let config = Arc::new(ConfigStore::with_base(&base));
+    let result = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await;
+
+    match result {
+        Ok(_) => panic!("invalid daemon config should return startup error"),
+        Err(err) => assert!(err.contains("failed to parse")),
+    }
+}
+
+#[tokio::test]
 async fn handle_client_relays_outbound_peer_messages() {
     let (_tmp, daemon) = empty_daemon().await;
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);

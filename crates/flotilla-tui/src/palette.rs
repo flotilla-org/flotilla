@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 
 use clap::Subcommand;
 use flotilla_commands::{complete::CompletionItem, NounCommand, Resolved};
+use flotilla_protocol::EnvironmentInfo;
 
 use crate::{app::TuiModel, keymap::Action};
 
@@ -563,7 +564,10 @@ fn target_completions(partial: &str, model: &TuiModel) -> Vec<PaletteCompletion>
 
         // =<env_id>@<hostname> — existing running environment
         for env in &summary.environments {
-            let value = format!("={}@{hostname}", env.id);
+            let EnvironmentInfo::Provisioned { id, .. } = env else {
+                continue;
+            };
+            let value = format!("={}@{hostname}", id);
             if partial.is_empty() || value.starts_with(partial) {
                 completions.push(PaletteCompletion { value, description: "existing environment".to_string(), key_hint: None });
             }
@@ -870,8 +874,9 @@ mod tests {
             implementation: "docker".to_string(),
             healthy: true,
         });
-        feta_summary.environments.push(EnvironmentInfo {
+        feta_summary.environments.push(EnvironmentInfo::Provisioned {
             id: EnvironmentId::new("env-abc123"),
+            display_name: Some("Feta Env".into()),
             image: ImageId::new("image-1"),
             status: EnvironmentStatus::Running,
         });
