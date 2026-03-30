@@ -499,8 +499,19 @@ impl ConfigStore {
     pub fn load_daemon_config(&self) -> DaemonConfig {
         let path = self.base_path().join("daemon.toml");
         if path.as_path().exists() {
-            let content = std::fs::read_to_string(path.as_path()).unwrap_or_default();
-            toml::from_str(&content).unwrap_or_default()
+            match std::fs::read_to_string(path.as_path()) {
+                Ok(content) => match toml::from_str(&content) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!(%path, err = %err, "failed to parse daemon config");
+                        DaemonConfig::default()
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(%path, err = %err, "failed to read daemon config");
+                    DaemonConfig::default()
+                }
+            }
         } else {
             DaemonConfig::default()
         }

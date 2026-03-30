@@ -477,6 +477,18 @@ fn load_daemon_config_from_file() {
 }
 
 #[test]
+fn load_daemon_config_invalid_file_returns_default() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    std::fs::write(base.join("daemon.toml"), "environments = 123\n").unwrap();
+    let store = ConfigStore::with_base(base);
+    let config = store.load_daemon_config();
+    assert!(!config.follower);
+    assert_eq!(config.host_name, None);
+    assert!(config.environments.is_empty());
+}
+
+#[test]
 fn load_hosts_with_ssh_config() {
     let dir = tempdir().unwrap();
     let base = dir.path();
