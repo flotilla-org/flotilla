@@ -164,9 +164,11 @@ mod tests {
 
     #[tokio::test]
     async fn build_local_host_summary_uses_manager_backed_local_inventory() {
+        use flotilla_protocol::EnvironmentId;
+
         let host_name = HostName::new("test-host");
         let manager = EnvironmentManager::from_local_state(
-            flotilla_protocol::EnvironmentId::new("local-environment"),
+            EnvironmentId::new("test-local-environment"),
             Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new().with(EnvironmentAssertion::versioned_binary("git", "/usr/bin/git", "2.40.0")),
         );
@@ -184,7 +186,7 @@ mod tests {
 
         let host_name = HostName::new("test-host");
         let manager = EnvironmentManager::from_local_state(
-            EnvironmentId::new("local-environment"),
+            EnvironmentId::new("test-local-environment"),
             Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new(),
         );

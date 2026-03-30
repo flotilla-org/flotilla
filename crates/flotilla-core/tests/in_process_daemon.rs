@@ -314,7 +314,15 @@ async fn daemon_for_plain_dir_with_local_environment_id(
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config_dir = temp.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
-    std::fs::write(config_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
+    let machine_state_dir = flotilla_core::host_identity::machine_scoped_state_dir(
+        &config_dir,
+        None,
+        &flotilla_core::providers::ProcessCommandRunner,
+    )
+    .await
+    .expect("resolve machine-scoped state dir");
+    std::fs::create_dir_all(&machine_state_dir).expect("create machine-scoped state dir");
+    std::fs::write(machine_state_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
     let config = Arc::new(ConfigStore::with_base(config_dir));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
     (temp, repo, daemon)

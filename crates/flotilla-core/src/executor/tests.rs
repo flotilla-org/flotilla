@@ -305,9 +305,13 @@ fn local_host() -> HostName {
     HostName::local()
 }
 
+fn local_environment_id() -> EnvironmentId {
+    EnvironmentId::new("test-local-environment")
+}
+
 async fn empty_environment_manager() -> Arc<EnvironmentManager> {
     let discovery = fake_discovery(false);
-    Arc::new(EnvironmentManager::new_local(&discovery, EnvironmentId::new("local-environment")).await)
+    Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id()).await)
 }
 
 fn repo_identity() -> flotilla_protocol::RepoIdentity {
