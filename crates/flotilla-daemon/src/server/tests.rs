@@ -183,7 +183,7 @@ fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, che
     PeerDataMessage {
         origin_host: HostName::new(host),
         repo_identity: repo_identity.clone(),
-        repo_path: repo_path.to_path_buf(),
+        host_repo_root: Some(repo_path.to_path_buf()),
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot {
             data: Box::new(ProviderData {
@@ -239,9 +239,12 @@ async fn dispatch_add_list_remove_repo_round_trip() {
         other => panic!("expected list repos response, got {:?}", other),
     };
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].path, repo_path);
+    assert_eq!(listed[0].path.as_deref(), Some(repo_path.as_path()));
 
-    let remove = dispatch_request_test(&daemon, 12, Request::RemoveRepo { path: listed[0].path.clone() }).await;
+    let remove = dispatch_request_test(&daemon, 12, Request::RemoveRepo {
+        path: listed[0].path.clone().expect("tracked repo should have local path"),
+    })
+    .await;
     assert!(matches!(ok_response(remove, 12), Response::RemoveRepo));
 }
 
@@ -641,19 +644,10 @@ async fn remote_command_mutations_route_remote_step_requests() {
     .expect("timeout waiting for routed message");
 
     match routed {
-        RoutedPeerMessage::RemoteStepRequest {
-            requester_host,
-            target_host,
-            repo_identity: identity,
-            repo_path,
-            step_offset,
-            steps,
-            ..
-        } => {
+        RoutedPeerMessage::RemoteStepRequest { requester_host, target_host, repo_identity: identity, step_offset, steps, .. } => {
             assert_eq!(requester_host, HostName::new("local"));
             assert_eq!(target_host, HostName::new("feta"));
             assert_eq!(identity, repo_identity);
-            assert_eq!(repo_path, repo);
             assert_eq!(step_offset, 0);
             assert_eq!(steps.len(), 3, "checkout with issue links should batch all remote pre-attach steps");
             assert!(steps.iter().all(|step| step.host == StepExecutionContext::Host(HostName::new("feta"))));
@@ -1591,12 +1585,12 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(responder_host, daemon.host_name());
                     match event.as_ref() {
                         CommandPeerEvent::Started { repo: event_repo, description, .. } => {
-                            assert_eq!(event_repo, &repo);
+                            assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                             assert_eq!(description, "Refreshing...");
                             saw_started = true;
                         }
                         CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
-                            assert_eq!(event_repo, &repo);
+                            assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                             assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()] });
                             saw_finished = true;
                         }
@@ -1713,13 +1707,13 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
                 match event.as_ref() {
                     CommandPeerEvent::Started { repo_identity: event_identity, repo: event_repo, description } => {
                         assert_eq!(event_identity, &repo_identity);
-                        assert_eq!(event_repo, &repo);
+                        assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                         assert_eq!(description, "Preparing terminal...");
                         saw_preparing = true;
                     }
                     CommandPeerEvent::Finished { repo_identity: event_identity, repo: event_repo, result } => {
                         assert_eq!(event_identity, &repo_identity);
-                        assert_eq!(event_repo, &repo);
+                        assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                         match result {
                             CommandValue::TerminalPrepared {
                                 repo_identity: result_identity,
@@ -1886,7 +1880,7 @@ fn test_peer_msg(host: &str) -> PeerDataMessage {
     PeerDataMessage {
         origin_host: HostName::new(host),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-        repo_path: PathBuf::from("/tmp/repo"),
+        host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::RequestResync { since_seq: 0 },
     }
@@ -2173,7 +2167,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
         command_id: 77,
         host: daemon.host_name().clone(),
         repo_identity: repo_identity.clone(),
-        repo: repo.clone(),
+        repo: Some(repo.clone()),
         description: "streamed event".to_string(),
     });
 
@@ -2188,7 +2182,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
             DaemonEvent::CommandStarted { command_id, repo_identity: event_identity, repo: event_repo, description, .. } => {
                 assert_eq!(command_id, 77);
                 assert_eq!(event_identity, repo_identity);
-                assert_eq!(event_repo, repo);
+                assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                 assert_eq!(description, "streamed event");
             }
             other => panic!("expected CommandStarted event, got {other:?}"),
@@ -2292,7 +2286,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
         command_id: 77,
         host: daemon.host_name().clone(),
         repo_identity: repo_identity.clone(),
-        repo: repo.clone(),
+        repo: Some(repo.clone()),
         description: "streamed event".to_string(),
     });
 
@@ -2301,7 +2295,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
             DaemonEvent::CommandStarted { command_id, repo_identity: event_identity, repo: event_repo, description, .. } => {
                 assert_eq!(command_id, 77);
                 assert_eq!(event_identity, repo_identity);
-                assert_eq!(event_repo, repo);
+                assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                 assert_eq!(description, "streamed event");
             }
             other => panic!("expected CommandStarted event, got {other:?}"),
@@ -2459,7 +2453,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
         });
     }
 
-    let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_path);
+    let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_identity, Some(&repo_path));
     daemon
         .add_virtual_repo(
             repo_identity.clone(),
@@ -2824,7 +2818,7 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
         );
     }
 
-    let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_path);
+    let synthetic = crate::peer::synthetic_repo_path(&HostName::new("peer-a"), &repo_identity, Some(&repo_path));
     daemon
         .add_virtual_repo(
             repo_identity.clone(),
@@ -2873,7 +2867,7 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
     let remaining_key = HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only");
     match event {
         DaemonEvent::RepoSnapshot(snapshot) => {
-            assert_eq!(snapshot.repo, synthetic);
+            assert_eq!(snapshot.repo.as_deref(), Some(synthetic.as_path()));
             assert!(
                 !snapshot.providers.checkouts.contains_key(&stale_key),
                 "first snapshot after disconnect should not include stale peer-a checkout"
@@ -2881,7 +2875,7 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
             assert_eq!(snapshot.providers.checkouts[&remaining_key].branch, "feature-b");
         }
         DaemonEvent::RepoDelta(delta) => {
-            assert_eq!(delta.repo, synthetic);
+            assert_eq!(delta.repo.as_deref(), Some(synthetic.as_path()));
             assert!(
                 delta.changes.iter().any(|change| matches!(
                     change,

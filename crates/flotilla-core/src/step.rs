@@ -27,7 +27,11 @@ pub struct RemoteStepBatchRequest {
     pub command_id: u64,
     pub target_host: HostName,
     pub repo_identity: RepoIdentity,
-    pub repo: ExecutionEnvironmentPath,
+    /// Requester-local repo path used when remapping remote progress into
+    /// `DaemonEvent::CommandStepUpdate` for the UI. Remote execution itself
+    /// resolves the actual repo root from `repo_identity`. This may be absent
+    /// when the requester only has identity metadata for the repo.
+    pub repo: Option<ExecutionEnvironmentPath>,
     /// Global step index of the first step in this batch on the requester.
     ///
     /// The executing host emits batch-relative progress indices. The requester
@@ -140,7 +144,7 @@ pub async fn run_step_plan_with_remote_executor(
                 command_id,
                 local_host.clone(),
                 repo_identity.clone(),
-                repo.as_path().to_path_buf(),
+                Some(repo.as_path().to_path_buf()),
                 i,
                 step_count,
                 step.description.clone(),
@@ -166,7 +170,7 @@ pub async fn run_step_plan_with_remote_executor(
                         command_id,
                         local_host.clone(),
                         repo_identity.clone(),
-                        repo.as_path().to_path_buf(),
+                        Some(repo.as_path().to_path_buf()),
                         i,
                         step_count,
                         step.description.clone(),
@@ -180,7 +184,7 @@ pub async fn run_step_plan_with_remote_executor(
                         command_id,
                         local_host.clone(),
                         repo_identity.clone(),
-                        repo.as_path().to_path_buf(),
+                        Some(repo.as_path().to_path_buf()),
                         i,
                         step_count,
                         step.description.clone(),
@@ -209,7 +213,7 @@ pub async fn run_step_plan_with_remote_executor(
                     command_id,
                     host: target_host.clone(),
                     repo_identity: repo_identity.clone(),
-                    repo: repo.clone(),
+                    repo: Some(repo.clone()),
                     step_offset: segment_start,
                     step_count,
                     event_tx: event_tx.clone(),
@@ -219,7 +223,7 @@ pub async fn run_step_plan_with_remote_executor(
                     command_id,
                     target_host: target_host.clone(),
                     repo_identity: repo_identity.clone(),
-                    repo: repo.clone(),
+                    repo: Some(repo.clone()),
                     step_offset: segment_start,
                     steps: segment_steps,
                 };
@@ -253,7 +257,7 @@ pub async fn run_step_plan_with_remote_executor(
                                 command_id,
                                 target_host.clone(),
                                 repo_identity.clone(),
-                                repo.as_path().to_path_buf(),
+                                Some(repo.as_path().to_path_buf()),
                                 segment_start + failure.batch_step_index,
                                 step_count,
                                 failure.description,
@@ -284,7 +288,7 @@ fn emit_step_update(
     command_id: u64,
     host: HostName,
     repo_identity: RepoIdentity,
-    repo: std::path::PathBuf,
+    repo: Option<std::path::PathBuf>,
     step_index: usize,
     step_count: usize,
     description: String,
@@ -315,7 +319,7 @@ struct EventForwardingProgressSink {
     command_id: u64,
     host: HostName,
     repo_identity: RepoIdentity,
-    repo: ExecutionEnvironmentPath,
+    repo: Option<ExecutionEnvironmentPath>,
     step_offset: usize,
     step_count: usize,
     event_tx: broadcast::Sender<DaemonEvent>,
@@ -365,7 +369,7 @@ impl RemoteStepProgressSink for EventForwardingProgressSink {
             self.command_id,
             self.host.clone(),
             self.repo_identity.clone(),
-            self.repo.as_path().to_path_buf(),
+            self.repo.as_ref().map(|repo| repo.as_path().to_path_buf()),
             self.step_offset + update.batch_step_index,
             self.step_count,
             update.description,

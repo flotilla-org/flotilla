@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -77,7 +76,6 @@ enum PostHandleAction {
         requester_host: HostName,
         reply_via: HostName,
         repo_identity: RepoIdentity,
-        repo_path: PathBuf,
         step_offset: usize,
         steps: Vec<flotilla_protocol::Step>,
     },
@@ -274,15 +272,15 @@ impl PeerRuntime {
                     tokio::select! {
                         maybe_env = rx.recv() => {
                             let Some(env) = maybe_env else { break };
-                            let (origin, repo_path) = match &env.msg {
-                                PeerWireMessage::Data(msg) => (msg.origin_host.clone(), msg.repo_path.clone()),
-                                PeerWireMessage::HostSummary(_) => (env.connection_peer.clone(), PathBuf::new()),
+                            let (origin, host_repo_root) = match &env.msg {
+                                PeerWireMessage::Data(msg) => (msg.origin_host.clone(), msg.host_repo_root.clone()),
+                                PeerWireMessage::HostSummary(_) => (env.connection_peer.clone(), None),
                                 PeerWireMessage::Routed(
-                                    flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { responder_host, repo_path, .. },
-                                ) => (responder_host.clone(), repo_path.clone()),
-                                PeerWireMessage::Routed(_) => (env.connection_peer.clone(), PathBuf::new()),
+                                    flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { responder_host, host_repo_root, .. },
+                                ) => (responder_host.clone(), host_repo_root.clone()),
+                                PeerWireMessage::Routed(_) => (env.connection_peer.clone(), None),
                                 PeerWireMessage::Goodbye { .. } | PeerWireMessage::Ping { .. } | PeerWireMessage::Pong { .. } => {
-                                    (env.connection_peer.clone(), PathBuf::new())
+                                    (env.connection_peer.clone(), None)
                                 }
                             };
 
@@ -347,7 +345,6 @@ impl PeerRuntime {
                                         requester_host,
                                         reply_via,
                                         repo_identity,
-                                        repo_path,
                                         step_offset,
                                         steps,
                                     } => PostHandleAction::RemoteStepRequested {
@@ -355,7 +352,6 @@ impl PeerRuntime {
                                         requester_host,
                                         reply_via,
                                         repo_identity,
-                                        repo_path,
                                         step_offset,
                                         steps,
                                     },
@@ -403,7 +399,8 @@ impl PeerRuntime {
                                     if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(&updated_repo_id).await {
                                         peer_daemon.set_peer_providers(&local_path, peers, overlay_version).await;
                                     } else {
-                                        let synthetic = crate::peer::synthetic_repo_path(&origin, &repo_path);
+                                        let synthetic =
+                                            crate::peer::synthetic_repo_path(&origin, &updated_repo_id, host_repo_root.as_deref());
                                         if let Err(e) =
                                             peer_daemon.add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), peers, overlay_version).await
                                         {
@@ -428,7 +425,7 @@ impl PeerRuntime {
                                                             responder_host: local_host,
                                                             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                                                             repo_identity: repo,
-                                                            repo_path: local_path,
+                                                            host_repo_root: Some(local_path),
                                                             clock: response_clock,
                                                             seq,
                                                             data: Box::new(local_providers),
@@ -485,10 +482,16 @@ impl PeerRuntime {
                                     requester_host,
                                     reply_via,
                                     repo_identity,
-                                    repo_path,
                                     step_offset,
                                     steps,
                                 } => {
+                                    let local_event_repo = peer_daemon
+                                        .preferred_local_path_for_identity(&repo_identity)
+                                        .await
+                                        .map(ExecutionEnvironmentPath::new);
+                                    if local_event_repo.is_none() {
+                                        warn!(%repo_identity, "forwarded remote step request has no local event repo path on responder");
+                                    }
                                     remote_command_router_task
                                         .spawn_forwarded_remote_step_batch(
                                             request_id,
@@ -498,7 +501,7 @@ impl PeerRuntime {
                                                 command_id: request_id,
                                                 target_host: peer_daemon.host_name().clone(),
                                                 repo_identity,
-                                                repo: ExecutionEnvironmentPath::new(&repo_path),
+                                                repo: local_event_repo,
                                                 step_offset,
                                                 steps,
                                             },
@@ -586,8 +589,8 @@ impl PeerRuntime {
                     }
                     event = event_rx.recv() => {
                         let repo_path = match event {
-                            Ok(DaemonEvent::RepoSnapshot(snapshot)) => Some(snapshot.repo.clone()),
-                            Ok(DaemonEvent::RepoDelta(delta)) => Some(delta.repo.clone()),
+                            Ok(DaemonEvent::RepoSnapshot(snapshot)) => snapshot.repo.clone(),
+                            Ok(DaemonEvent::RepoDelta(delta)) => delta.repo.clone(),
                             Ok(_) => None,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!(skipped = n, "outbound peer event subscriber lagged");
@@ -830,7 +833,7 @@ pub(super) async fn send_local_to_peers(
     let msg = PeerDataMessage {
         origin_host: host_name.clone(),
         repo_identity: identity,
-        repo_path: repo_path.to_path_buf(),
+        host_repo_root: Some(repo_path.to_path_buf()),
         clock: clock.clone(),
         kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(local_providers), seq: local_data_version },
     };
@@ -899,7 +902,7 @@ pub(super) async fn send_local_to_peer(
         let msg = PeerDataMessage {
             origin_host: host_name.clone(),
             repo_identity: identity,
-            repo_path: repo_path.clone(),
+            host_repo_root: Some(repo_path.clone()),
             clock: clock.clone(),
             kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(local_providers), seq: version },
         };

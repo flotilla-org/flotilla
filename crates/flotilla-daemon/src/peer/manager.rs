@@ -19,12 +19,18 @@ use super::transport::{PeerSender, PeerTransport};
 ///
 /// Remote-only repos have no local filesystem path. This function produces
 /// a deterministic `PathBuf` that serves as a stable key for tab identity
-/// and repo tracking, e.g. `<remote>/desktop/home/dev/repo`.
-pub fn synthetic_repo_path(host: &HostName, repo_path: &Path) -> PathBuf {
-    // Strip leading `/` from absolute paths to avoid double-slash in the
-    // resulting string (e.g. `<remote>/desktop//home/...`).
-    let stripped = repo_path.strip_prefix("/").unwrap_or(repo_path);
-    PathBuf::from(format!("<remote>/{}/{}", host, stripped.display()))
+/// and repo tracking. When a peer reports a concrete checkout root we fold
+/// it into the synthetic path for readability; otherwise we fall back to a
+/// repo-identity-based key.
+pub fn synthetic_repo_path(host: &HostName, repo_identity: &RepoIdentity, host_repo_root: Option<&Path>) -> PathBuf {
+    if let Some(host_repo_root) = host_repo_root {
+        // Strip leading `/` from absolute paths to avoid double-slash in the
+        // resulting string (e.g. `<remote>/desktop//home/...`).
+        let stripped = host_repo_root.strip_prefix("/").unwrap_or(host_repo_root);
+        return PathBuf::from(format!("<remote>/{}/{}", host, stripped.display()));
+    }
+
+    PathBuf::from(format!("<remote>/{}/{}/{}", host, repo_identity.authority, repo_identity.path))
 }
 
 /// Result of handling an inbound PeerDataMessage.
@@ -55,7 +61,6 @@ pub enum HandleResult {
         requester_host: HostName,
         reply_via: HostName,
         repo_identity: RepoIdentity,
-        repo_path: PathBuf,
         step_offset: usize,
         steps: Vec<Step>,
     },
@@ -220,7 +225,7 @@ pub struct DisconnectPlan {
 /// Per-repo state received from a single peer host.
 pub struct PerRepoPeerState {
     pub provider_data: ProviderData,
-    pub repo_path: PathBuf,
+    pub host_repo_root: Option<PathBuf>,
     pub seq: u64,
     pub via_peer: HostName,
     pub via_generation: u64,
@@ -549,7 +554,7 @@ impl PeerManager {
     fn store_snapshot_from(&mut self, via_peer: &HostName, via_generation: u64, msg: PeerDataMessage) -> HandleResult {
         let origin = msg.origin_host.clone();
         let repo = msg.repo_identity.clone();
-        let repo_path = msg.repo_path.clone();
+        let host_repo_root = msg.host_repo_root.clone();
 
         let dedup_key = (origin.clone(), repo.clone());
         if let Some(last_seen) = self.last_seen_clocks.get(&dedup_key) {
@@ -570,7 +575,7 @@ impl PeerManager {
                 let repo_states = self.peer_data.entry(origin.clone()).or_default();
                 repo_states.insert(repo.clone(), PerRepoPeerState {
                     provider_data: *data,
-                    repo_path,
+                    host_repo_root,
                     seq,
                     via_peer: via_peer.clone(),
                     via_generation,
@@ -685,7 +690,7 @@ impl PeerManager {
                 responder_host,
                 remaining_hops,
                 repo_identity,
-                repo_path,
+                host_repo_root,
                 clock,
                 seq,
                 data,
@@ -705,7 +710,7 @@ impl PeerManager {
                     return self.store_snapshot_from(&connection_peer, connection_generation, PeerDataMessage {
                         origin_host: responder_host,
                         repo_identity,
-                        repo_path,
+                        host_repo_root,
                         clock,
                         kind: PeerDataKind::Snapshot { data, seq },
                     });
@@ -729,7 +734,7 @@ impl PeerManager {
                     responder_host,
                     remaining_hops: remaining_hops.saturating_sub(1),
                     repo_identity,
-                    repo_path,
+                    host_repo_root,
                     clock,
                     seq,
                     data,
@@ -922,7 +927,6 @@ impl PeerManager {
                 target_host,
                 remaining_hops,
                 repo_identity,
-                repo_path,
                 step_offset,
                 steps,
             } => {
@@ -935,7 +939,6 @@ impl PeerManager {
                         requester_host,
                         reply_via: connection_peer,
                         repo_identity,
-                        repo_path,
                         step_offset,
                         steps,
                     };
@@ -955,7 +958,6 @@ impl PeerManager {
                     target_host: target_host.clone(),
                     remaining_hops: remaining_hops.saturating_sub(1),
                     repo_identity,
-                    repo_path,
                     step_offset,
                     steps,
                 };

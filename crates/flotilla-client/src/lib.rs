@@ -400,7 +400,7 @@ fn handle_event(
 ) {
     match &event {
         DaemonEvent::RepoSnapshot(snap) => {
-            debug!(repo_identity = %snap.repo_identity, repo = %snap.repo.display(), seq = snap.seq, "received full snapshot");
+            debug!(repo_identity = %snap.repo_identity, repo = ?snap.repo, seq = snap.seq, "received full snapshot");
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
             local_seqs.write().unwrap().insert(StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq);
@@ -421,7 +421,7 @@ fn handle_event(
                 Some(ls) if prev_seq == ls => {
                     // Happy path: apply delta (sync lock, no spawn needed)
                     local_seqs.write().unwrap().insert(stream_key, seq);
-                    debug!(repo_identity = %repo_identity, repo = %repo.display(), %prev_seq, %seq, "applied delta");
+                    debug!(repo_identity = %repo_identity, repo = ?repo, %prev_seq, %seq, "applied delta");
                     let _ = event_tx.send(event);
                 }
                 _ => {
@@ -431,7 +431,7 @@ fn handle_event(
                     // when a live delta arrives during the recovery window).
                     let mut guard = recovering.lock().unwrap();
                     if let Some(buf) = guard.get_mut(&repo_identity) {
-                        debug!(repo_identity = %repo_identity, repo = %repo.display(), %seq, "recovery in progress, buffering delta");
+                        debug!(repo_identity = %repo_identity, repo = ?repo, %seq, "recovery in progress, buffering delta");
                         buf.push(event);
                         return;
                     }
@@ -439,9 +439,9 @@ fn handle_event(
                     drop(guard);
 
                     if let Some(ls) = local_seq {
-                        warn!(repo_identity = %repo_identity, repo = %repo.display(), local_seq = ls, %prev_seq, "seq gap, requesting replay");
+                        warn!(repo_identity = %repo_identity, repo = ?repo, local_seq = ls, %prev_seq, "seq gap, requesting replay");
                     } else {
-                        warn!(repo_identity = %repo_identity, repo = %repo.display(), "received delta for unknown repo, requesting replay");
+                        warn!(repo_identity = %repo_identity, repo = ?repo, "received delta for unknown repo, requesting replay");
                     }
 
                     let local_seqs = Arc::clone(local_seqs);

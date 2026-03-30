@@ -183,15 +183,27 @@ pub enum DaemonEvent {
     #[serde(rename = "repo_tracked")]
     RepoTracked(Box<RepoInfo>),
     #[serde(rename = "repo_untracked")]
-    RepoUntracked { repo_identity: RepoIdentity, path: std::path::PathBuf },
+    RepoUntracked {
+        repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<std::path::PathBuf>,
+    },
     #[serde(rename = "command_started")]
-    CommandStarted { command_id: u64, host: HostName, repo_identity: RepoIdentity, repo: std::path::PathBuf, description: String },
+    CommandStarted {
+        command_id: u64,
+        host: HostName,
+        repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<std::path::PathBuf>,
+        description: String,
+    },
     #[serde(rename = "command_finished")]
     CommandFinished {
         command_id: u64,
         host: HostName,
         repo_identity: RepoIdentity,
-        repo: std::path::PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<std::path::PathBuf>,
         result: commands::CommandValue,
     },
     #[serde(rename = "command_step_update")]
@@ -199,7 +211,8 @@ pub enum DaemonEvent {
         command_id: u64,
         host: HostName,
         repo_identity: RepoIdentity,
-        repo: std::path::PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<std::path::PathBuf>,
         step_index: usize,
         step_count: usize,
         description: String,
@@ -233,7 +246,8 @@ pub struct RepoDelta {
     pub seq: u64,
     pub prev_seq: u64,
     pub repo_identity: RepoIdentity,
-    pub repo: std::path::PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<std::path::PathBuf>,
     pub changes: Vec<Change>,
     /// Issue metadata (not part of delta log, but needed by TUI).
     pub issue_total: Option<u32>,

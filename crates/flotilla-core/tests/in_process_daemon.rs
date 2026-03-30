@@ -1595,11 +1595,11 @@ async fn daemon_broadcasts_snapshots() {
 
     match event {
         DaemonEvent::RepoSnapshot(snap) => {
-            assert_eq!(snap.repo, repo);
+            assert_eq!(snap.repo.as_deref(), Some(repo.as_path()));
             assert!(snap.seq > 0);
         }
         DaemonEvent::RepoDelta(delta) => {
-            assert_eq!(delta.repo, repo);
+            assert_eq!(delta.repo.as_deref(), Some(repo.as_path()));
             assert!(delta.seq > 0);
         }
         other => panic!("expected RepoSnapshot or RepoDelta, got {:?}", other),
@@ -1637,14 +1637,14 @@ async fn execute_broadcasts_lifecycle_events() {
                 Ok(DaemonEvent::CommandStarted { command_id: id, host, repo_identity, repo: ref event_repo, .. }) => {
                     assert_eq!(host, HostName::local(), "CommandStarted host should default to local host");
                     assert_eq!(repo_identity, identity, "CommandStarted repo identity should match executed repo");
-                    assert_eq!(event_repo, &repo, "CommandStarted repo should match executed repo");
+                    assert_eq!(event_repo.as_deref(), Some(repo.as_path()), "CommandStarted repo should match executed repo");
                     started_id = Some(id);
                     got_started = true;
                 }
                 Ok(DaemonEvent::CommandFinished { command_id: id, host, repo_identity, repo: ref event_repo, .. }) => {
                     assert_eq!(host, HostName::local(), "CommandFinished host should default to local host");
                     assert_eq!(repo_identity, identity, "CommandFinished repo identity should match executed repo");
-                    assert_eq!(event_repo, &repo, "CommandFinished repo should match executed repo");
+                    assert_eq!(event_repo.as_deref(), Some(repo.as_path()), "CommandFinished repo should match executed repo");
                     finished_id = Some(id);
                     got_finished = true;
                 }
@@ -1827,7 +1827,7 @@ async fn replay_since_returns_full_snapshot_for_unknown_seq() {
     assert_eq!(repo_events.len(), 1, "should get exactly one repo snapshot");
     match &repo_events[0] {
         DaemonEvent::RepoSnapshot(snap) => {
-            assert_eq!(snap.repo, repo);
+            assert_eq!(snap.repo.as_deref(), Some(repo.as_path()));
         }
         other => panic!("expected RepoSnapshot, got {:?}", other),
     }
@@ -1849,7 +1849,7 @@ async fn replay_since_returns_full_snapshot_for_new_repo() {
     assert_eq!(repo_events.len(), 1, "should get one repo snapshot per tracked repo");
     match &repo_events[0] {
         DaemonEvent::RepoSnapshot(snap) => {
-            assert_eq!(snap.repo, repo);
+            assert_eq!(snap.repo.as_deref(), Some(repo.as_path()));
         }
         other => panic!("expected RepoSnapshot, got {:?}", other),
     }
@@ -2216,7 +2216,7 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
     let snap = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::RepoSnapshot(s) if s.repo == repo => Some(s),
+            DaemonEvent::RepoSnapshot(s) if s.repo.as_deref() == Some(repo.as_path()) => Some(s),
             _ => None,
         })
         .expect("should have a RepoSnapshot for our repo");
@@ -2271,7 +2271,7 @@ async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
     let snap = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::RepoSnapshot(s) if s.repo == repo => Some(s),
+            DaemonEvent::RepoSnapshot(s) if s.repo.as_deref() == Some(repo.as_path()) => Some(s),
             _ => None,
         })
         .expect("unknown-seq fallback should produce a RepoSnapshot");
@@ -2335,7 +2335,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
     let deltas: Vec<_> = events
         .iter()
         .filter_map(|e| match e {
-            DaemonEvent::RepoDelta(d) if d.repo == repo => Some(d),
+            DaemonEvent::RepoDelta(d) if d.repo.as_deref() == Some(repo.as_path()) => Some(d),
             _ => None,
         })
         .collect();
@@ -2358,7 +2358,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
     let full_snap = full_events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::RepoSnapshot(s) if s.repo == repo => Some(s),
+            DaemonEvent::RepoSnapshot(s) if s.repo.as_deref() == Some(repo.as_path()) => Some(s),
             _ => None,
         })
         .expect("full replay should produce RepoSnapshot");
@@ -2414,11 +2414,11 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     assert!(matches!(finished_result, CommandValue::RepoTracked { ref path, .. } if *path == repo));
     assert_eq!(finished_identity, added.identity, "CommandFinished should use the tracked repo identity");
     assert_eq!(started_add, added.identity, "CommandStarted should use the tracked repo identity");
-    assert_eq!(added.path, repo);
+    assert_eq!(added.path.as_deref(), Some(repo.as_path()));
 
     let repos = daemon.list_repos().await.expect("list_repos after add");
     assert_eq!(repos.len(), 1);
-    assert_eq!(repos[0].path, repo);
+    assert_eq!(repos[0].path.as_deref(), Some(repo.as_path()));
 
     let remove_id = daemon
         .execute(Command {
@@ -2447,7 +2447,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     .await
     .expect("timeout waiting for remove command events");
     assert!(matches!(finished_remove, CommandValue::RepoUntracked { ref path } if *path == repo));
-    assert_eq!(removed, repo);
+    assert_eq!(removed.as_deref(), Some(repo.as_path()));
 
     let repos = daemon.list_repos().await.expect("list_repos after remove");
     assert!(repos.is_empty());
@@ -2468,13 +2468,13 @@ async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "list_repos should expose one logical repo per identity");
     assert_eq!(repos[0].identity, identity_a);
-    assert_eq!(repos[0].path, repo_a, "first tracked root should remain the deterministic preferred path");
+    assert_eq!(repos[0].path.as_deref(), Some(repo_a.as_path()), "first tracked root should remain the deterministic preferred path");
 
     daemon.remove_repo(&repo_a).await.expect("remove preferred root");
     let repos = daemon.list_repos().await.expect("list_repos after removing preferred root");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].identity, identity_b);
-    assert_eq!(repos[0].path, repo_b, "remaining root should become the preferred path");
+    assert_eq!(repos[0].path.as_deref(), Some(repo_b.as_path()), "remaining root should become the preferred path");
     assert!(daemon.tracked_repo_identity_for_path(&repo_a).await.is_none());
     assert_eq!(daemon.tracked_repo_identity_for_path(&repo_b).await, Some(identity_b));
 }
@@ -2504,7 +2504,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let repos = daemon.list_repos().await.expect("list repos");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].identity, identity);
-    assert_eq!(repos[0].path, canonical_repo, "local clone should become the preferred executable path");
+    assert_eq!(repos[0].path.as_deref(), Some(canonical_repo.as_path()), "local clone should become the preferred executable path");
     assert_eq!(tracked_path, canonical_repo);
     assert_eq!(daemon.preferred_local_path_for_identity(&identity).await, Some(canonical_repo.clone()));
     assert!(daemon.get_local_providers(&canonical_repo).await.is_some(), "local providers should now resolve for the identity");
@@ -2535,7 +2535,7 @@ async fn removing_preferred_root_emits_snapshot_for_new_preferred_path() {
     .expect("timeout waiting for preferred-path snapshot")
     .expect("snapshot event");
 
-    assert_eq!(event, repo_b, "surviving root should be broadcast immediately as the new preferred path");
+    assert_eq!(event.as_deref(), Some(repo_b.as_path()), "surviving root should be broadcast immediately as the new preferred path");
 }
 
 #[tokio::test]
@@ -3193,7 +3193,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
     // Should appear in list_repos.
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1);
-    assert_eq!(repos[0].path, synthetic_path);
+    assert_eq!(repos[0].path.as_deref(), Some(synthetic_path.as_path()));
     assert!(!repos[0].loading);
 
     // get_state() should return the peer checkout data immediately.
@@ -3225,7 +3225,15 @@ async fn add_virtual_repo_is_idempotent() {
 #[tokio::test]
 async fn get_status_returns_repo_summaries() {
     let (_temp, _repo, daemon) = daemon_for_cwd().await;
-    let repo = daemon.list_repos().await.expect("list_repos").into_iter().next().expect("tracked repo").path;
+    let repo = daemon
+        .list_repos()
+        .await
+        .expect("list_repos")
+        .into_iter()
+        .next()
+        .expect("tracked repo")
+        .path
+        .expect("tracked repo should have a local path");
     let mut rx = daemon.subscribe();
     trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
@@ -3701,12 +3709,12 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
     let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoSnapshot(snap)) if snap.repo == repo => {
+                Ok(DaemonEvent::RepoSnapshot(snap)) if snap.repo.as_deref() == Some(repo.as_path()) => {
                     if snap.providers.issues.contains_key("42") {
                         return *snap;
                     }
                 }
-                Ok(DaemonEvent::RepoDelta(ref delta)) if delta.repo == repo => {
+                Ok(DaemonEvent::RepoDelta(ref delta)) if delta.repo.as_deref() == Some(repo.as_path()) => {
                     // Check if the delta contains an Issue change for "42"
                     let has_issue_42 = delta.changes.iter().any(|c| matches!(c, Change::Issue { key, .. } if key == "42"));
                     if has_issue_42 {
@@ -3714,7 +3722,7 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
                         let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
                         for event in events {
                             if let DaemonEvent::RepoSnapshot(snap) = event {
-                                if snap.repo == repo && snap.providers.issues.contains_key("42") {
+                                if snap.repo.as_deref() == Some(repo.as_path()) && snap.providers.issues.contains_key("42") {
                                     return *snap;
                                 }
                             }
@@ -3943,18 +3951,18 @@ async fn issue_refresh_escalation_resets_cache_and_refetches() {
     let found = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::RepoSnapshot(snap)) if snap.repo == repo => {
+                Ok(DaemonEvent::RepoSnapshot(snap)) if snap.repo.as_deref() == Some(repo.as_path()) => {
                     if snap.providers.issues.contains_key("56") {
                         return *snap;
                     }
                 }
-                Ok(DaemonEvent::RepoDelta(ref delta)) if delta.repo == repo => {
+                Ok(DaemonEvent::RepoDelta(ref delta)) if delta.repo.as_deref() == Some(repo.as_path()) => {
                     let has_new_issue = delta.changes.iter().any(|c| matches!(c, Change::Issue { key, .. } if key == "56"));
                     if has_new_issue {
                         let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
                         for event in events {
                             if let DaemonEvent::RepoSnapshot(snap) = event {
-                                if snap.repo == repo && snap.providers.issues.contains_key("56") {
+                                if snap.repo.as_deref() == Some(repo.as_path()) && snap.providers.issues.contains_key("56") {
                                     return *snap;
                                 }
                             }

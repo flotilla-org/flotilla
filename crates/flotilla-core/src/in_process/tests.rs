@@ -95,7 +95,7 @@ fn choose_event_uses_delta_for_non_initial_changes() {
     let snapshot = RepoSnapshot {
         seq: 2,
         repo_identity: fallback_repo_identity(&repo),
-        repo: repo.clone(),
+        repo: Some(repo.clone()),
         host_name: HostName::local(),
         work_items: vec![],
         providers: ProviderData::default(),
@@ -122,7 +122,7 @@ fn choose_event_falls_back_to_full_when_delta_is_larger() {
     let snapshot = RepoSnapshot {
         seq: 3,
         repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
-        repo: PathBuf::from("/tmp/repo"),
+        repo: Some(PathBuf::from("/tmp/repo")),
         host_name: HostName::local(),
         work_items: vec![],
         providers: ProviderData::default(),
@@ -194,7 +194,7 @@ fn choose_event_sends_full_when_delta_has_empty_changes() {
     let snapshot = RepoSnapshot {
         seq: 2,
         repo_identity: fallback_repo_identity(Path::new("/tmp/repo")),
-        repo: PathBuf::from("/tmp/repo"),
+        repo: Some(PathBuf::from("/tmp/repo")),
         host_name: HostName::local(),
         work_items: vec![],
         providers: ProviderData::default(),

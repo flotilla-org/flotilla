@@ -46,7 +46,8 @@ pub struct RepoLabels {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoInfo {
     pub identity: RepoIdentity,
-    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
     pub name: String,
     pub labels: RepoLabels,
     pub provider_names: HashMap<String, Vec<String>>,
@@ -59,7 +60,8 @@ pub struct RepoInfo {
 pub struct RepoSnapshot {
     pub seq: u64,
     pub repo_identity: RepoIdentity,
-    pub repo: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
     /// The daemon's host identity.
     pub host_name: HostName,
     pub work_items: Vec<WorkItem>,
@@ -175,7 +177,7 @@ mod tests {
 
         let info = RepoInfo {
             identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
-            path: PathBuf::from("/repos/test"),
+            path: Some(PathBuf::from("/repos/test")),
             name: "test".into(),
             labels,
             provider_names: HashMap::from([
@@ -188,7 +190,7 @@ mod tests {
         let json = serde_json::to_string(&info).expect("serialize");
         let decoded: RepoInfo = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.identity, RepoIdentity { authority: "github.com".into(), path: "owner/test".into() });
-        assert_eq!(decoded.path, PathBuf::from("/repos/test"));
+        assert_eq!(decoded.path, Some(PathBuf::from("/repos/test")));
         assert_eq!(decoded.name, "test");
         assert!(decoded.loading);
         assert_eq!(decoded.provider_names.len(), 2);
@@ -207,7 +209,7 @@ mod tests {
         let empty = RepoSnapshot {
             seq: 0,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/empty".into() },
-            repo: PathBuf::from("/repos/empty"),
+            repo: Some(PathBuf::from("/repos/empty")),
             host_name: HostName::new("test-host"),
             work_items: vec![],
             providers: ProviderData::default(),
@@ -226,7 +228,7 @@ mod tests {
         let populated = RepoSnapshot {
             seq: 42,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/project".into() },
-            repo: PathBuf::from("/repos/project"),
+            repo: Some(PathBuf::from("/repos/project")),
             host_name: HostName::new("test-host"),
             work_items: vec![
                 WorkItem {
@@ -280,6 +282,43 @@ mod tests {
         assert_eq!(decoded_populated.work_items[0].kind, WorkItemKind::Checkout);
         assert_eq!(decoded_populated.work_items[1].kind, WorkItemKind::Session);
         assert_eq!(decoded_populated.errors[0].category, "github");
+    }
+
+    #[test]
+    fn repo_info_and_snapshot_omit_optional_path_metadata_when_absent() {
+        let info = RepoInfo {
+            identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
+            path: None,
+            name: "test".into(),
+            labels: RepoLabels::default(),
+            provider_names: HashMap::new(),
+            provider_health: HashMap::new(),
+            loading: false,
+        };
+        let info_json = serde_json::to_string(&info).expect("serialize repo info");
+        let info_value: serde_json::Value = serde_json::from_str(&info_json).expect("parse repo info json");
+        assert!(info_value.get("path").is_none(), "repo info path should be omitted when absent: {info_json}");
+        let decoded_info: RepoInfo = serde_json::from_str(&info_json).expect("deserialize repo info");
+        assert_eq!(decoded_info.path, None);
+
+        let snapshot = RepoSnapshot {
+            seq: 7,
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
+            repo: None,
+            host_name: HostName::new("test-host"),
+            work_items: vec![],
+            providers: ProviderData::default(),
+            provider_health: HashMap::new(),
+            errors: vec![],
+            issue_total: None,
+            issue_has_more: false,
+            issue_search_results: None,
+        };
+        let snapshot_json = serde_json::to_string(&snapshot).expect("serialize repo snapshot");
+        let snapshot_value: serde_json::Value = serde_json::from_str(&snapshot_json).expect("parse repo snapshot json");
+        assert!(snapshot_value.get("repo").is_none(), "repo snapshot path should be omitted when absent: {snapshot_json}");
+        let decoded_snapshot: RepoSnapshot = serde_json::from_str(&snapshot_json).expect("deserialize repo snapshot");
+        assert_eq!(decoded_snapshot.repo, None);
     }
 
     #[test]

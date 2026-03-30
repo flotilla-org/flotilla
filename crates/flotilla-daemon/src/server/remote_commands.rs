@@ -267,7 +267,7 @@ impl RemoteCommandRouter {
         match event {
             CommandPeerEvent::Started { repo_identity, repo, description } => {
                 entry.repo_identity = Some(repo_identity.clone());
-                entry.repo = Some(repo.clone());
+                entry.repo = repo.clone();
                 self.daemon.send_event(DaemonEvent::CommandStarted {
                     command_id: entry.command_id,
                     host: responder_host,
@@ -278,7 +278,7 @@ impl RemoteCommandRouter {
             }
             CommandPeerEvent::StepUpdate { repo_identity, repo, step_index, step_count, description, status } => {
                 entry.repo_identity = Some(repo_identity.clone());
-                entry.repo = Some(repo.clone());
+                entry.repo = repo.clone();
                 self.daemon.send_event(DaemonEvent::CommandStepUpdate {
                     command_id: entry.command_id,
                     host: responder_host,
@@ -292,7 +292,7 @@ impl RemoteCommandRouter {
             }
             CommandPeerEvent::Finished { repo_identity, repo, result } => {
                 entry.repo_identity = Some(repo_identity.clone());
-                entry.repo = Some(repo.clone());
+                entry.repo = repo.clone();
                 entry.finished_via_event = true;
                 self.daemon.send_event(DaemonEvent::CommandFinished {
                     command_id: entry.command_id,
@@ -328,7 +328,7 @@ impl RemoteCommandRouter {
                     _ => None,
                 })
                 .unwrap_or_else(fallback_repo_identity),
-            repo: entry.repo.unwrap_or_default(),
+            repo: entry.repo,
             result,
         });
     }
@@ -613,7 +613,6 @@ impl RemoteStepExecutor for RemoteCommandRouter {
             target_host: request.target_host.clone(),
             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
             repo_identity: request.repo_identity,
-            repo_path: request.repo.as_path().to_path_buf(),
             step_offset: request.step_offset,
             steps: request.steps,
         };
