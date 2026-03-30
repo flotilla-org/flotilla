@@ -55,6 +55,26 @@ impl RepoDetector for FixedRemoteHostDetector {
     }
 }
 
+struct RunnerRemoteHostDetector {
+    probe: &'static str,
+    owner: &'static str,
+}
+
+#[async_trait]
+impl RepoDetector for RunnerRemoteHostDetector {
+    async fn detect(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        runner: &dyn flotilla_core::providers::CommandRunner,
+        _env: &dyn flotilla_core::providers::discovery::EnvVars,
+    ) -> Vec<EnvironmentAssertion> {
+        match runner.run("probe-env", &[self.probe], repo_root.as_path(), &ChannelLabel::Noop).await {
+            Ok(value) => vec![EnvironmentAssertion::remote_host(HostPlatform::GitHub, self.owner, value.trim(), "origin")],
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 struct RunnerEchoHostDetector {
     probe: &'static str,
     assertion_key: &'static str,
@@ -2692,6 +2712,133 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
             .iter()
             .any(|provider| { provider.category == ProviderCategory::TerminalPool.slug() && provider.name == "Managed Bag Terminals" }),
         "provider discovery should read the manager-backed local environment bag"
+    );
+}
+
+#[tokio::test]
+async fn repo_detectors_can_run_against_selected_static_ssh_direct_environment_runner() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let config_dir = temp.path().join("config");
+    write_static_environment_config(
+        &config_dir,
+        r#"
+[environments.buildbox]
+hostname = "buildbox.example"
+"#,
+    );
+
+    let ssh_runner = Arc::new(
+        DiscoveryMockRunner::builder()
+            .on_run("probe-env", &["REMOTE_REPO"], Ok("local-repo".into()))
+            .on_run(
+                "ssh",
+                &[
+                    "-T", "-o", "BatchMode=yes", "-o", "ControlMaster=auto", "-o", "ControlPersist=60", "buildbox.example", "sh",
+                    "-lc", "cd '/' && exec 'true'",
+                ],
+                Ok(String::new()),
+            )
+            .on_run(
+                "ssh",
+                &[
+                    "-T", "-o", "BatchMode=yes", "-o", "ControlMaster=auto", "-o", "ControlPersist=60", "buildbox.example", "sh",
+                    "-lc", format!("cd '{}' && exec 'probe-env' 'REMOTE_REPO'", repo.display()).as_str(),
+                ],
+                Ok("remote-repo".into()),
+            )
+            .build(),
+    );
+
+    let mut discovery = static_ssh_test_discovery(ssh_runner);
+    discovery.repo_detectors = vec![Box::new(RunnerRemoteHostDetector { probe: "REMOTE_REPO", owner: "owner" })];
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::local(),
+    )
+    .await;
+
+    let result = daemon
+        .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
+        .await
+        .expect("discover repo in remote direct environment");
+
+    assert_eq!(
+        result.host_repo_bag.repo_identity(),
+        Some(RepoIdentity { authority: "github.com".into(), path: "owner/remote-repo".into() })
+    );
+}
+
+#[tokio::test]
+async fn provider_discovery_for_selected_static_ssh_environment_uses_its_environment_bag() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let config_dir = temp.path().join("config");
+    write_static_environment_config(
+        &config_dir,
+        r#"
+[environments.buildbox]
+hostname = "buildbox.example"
+"#,
+    );
+
+    let ssh_runner = Arc::new(
+        DiscoveryMockRunner::builder()
+            .on_run(
+                "ssh",
+                &[
+                    "-T", "-o", "BatchMode=yes", "-o", "ControlMaster=auto", "-o", "ControlPersist=60", "buildbox.example", "sh",
+                    "-lc", "cd '/' && exec 'true'",
+                ],
+                Ok(String::new()),
+            )
+            .on_run(
+                "ssh",
+                &[
+                    "-T", "-o", "BatchMode=yes", "-o", "ControlMaster=auto", "-o", "ControlPersist=60", "buildbox.example", "sh",
+                    "-lc", "cd '/' && exec 'probe-env' 'ENABLE_REMOTE_TERMINALS'",
+                ],
+                Ok("1".into()),
+            )
+            .build(),
+    );
+
+    let terminal_pool: Arc<dyn TerminalPool> = Arc::new(FakeTerminalPool::new());
+    let mut discovery = static_ssh_test_discovery_with_env_and_detectors(
+        ssh_runner,
+        Arc::new(TestEnvVars::default()),
+        vec![Box::new(RunnerEchoHostDetector { probe: "ENABLE_REMOTE_TERMINALS", assertion_key: "ENABLE_REMOTE_TERMINALS" })],
+    );
+    discovery
+        .factories
+        .terminal_pools
+        .push(Box::new(EnvGatedTerminalPoolFactory { required_env_var: "ENABLE_REMOTE_TERMINALS", pool: terminal_pool }));
+    let daemon = InProcessDaemon::new(
+        vec![],
+        Arc::new(ConfigStore::with_base(config_dir)),
+        discovery,
+        HostName::local(),
+    )
+    .await;
+
+    let result = daemon
+        .discover_repo_for_environment_for_test(&repo, &EnvironmentId::new("static-ssh-6275696c64626f78"))
+        .await
+        .expect("discover repo providers in remote direct environment");
+
+    assert!(
+        result
+            .registry
+            .provider_infos()
+            .iter()
+            .any(|(category, name)| category == ProviderCategory::TerminalPool.slug() && name == "Managed Bag Terminals"),
+        "provider discovery should use the selected direct environment bag"
     );
 }
 

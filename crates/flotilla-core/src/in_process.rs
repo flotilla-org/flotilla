@@ -127,6 +127,26 @@ fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla
     bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
 }
 
+async fn discover_repo_for_environment(
+    environment_manager: &EnvironmentManager,
+    discovery: &DiscoveryRuntime,
+    config: &ConfigStore,
+    local_environment_id: &EnvironmentId,
+    environment_id: &EnvironmentId,
+    repo_path: &Path,
+) -> Result<DiscoveryResult, String> {
+    let host_bag =
+        environment_manager.environment_bag(environment_id).ok_or_else(|| format!("environment not found: {environment_id}"))?;
+    let runner =
+        environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
+    let ee_path = ExecutionEnvironmentPath::new(repo_path);
+    let remote_env = RemoteNeutralEnvVars;
+    let env: &dyn crate::providers::discovery::EnvVars =
+        if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
+
+    Ok(discover_providers(&host_bag, &ee_path, &discovery.repo_detectors, &discovery.factories, config, runner, env).await)
+}
+
 fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -379,7 +399,7 @@ impl InProcessDaemon {
     /// holds a reference. The poll loop checks every 100ms for new refresh
     /// snapshots and broadcasts delta or full events for each change.
     pub async fn new(repo_paths: Vec<PathBuf>, config: Arc<ConfigStore>, discovery: DiscoveryRuntime, host_name: HostName) -> Arc<Self> {
-        use crate::providers::discovery::{self, DiscoveryResult};
+        use crate::providers::discovery::DiscoveryResult;
 
         let follower = discovery.is_follower();
         let (event_tx, _) = broadcast::channel(256);
@@ -392,7 +412,6 @@ impl InProcessDaemon {
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let environment_manager = Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
-        let local_environment_bag = environment_manager.local_environment_bag();
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
         for path in repo_paths {
@@ -400,17 +419,16 @@ impl InProcessDaemon {
                 continue;
             }
             let attachable_store = discovery.shared_attachable_store(&config);
-            let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
-            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discovery::discover_providers(
-                &local_environment_bag,
-                &ee_path,
-                &discovery.repo_detectors,
-                &discovery.factories,
+            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
+                &environment_manager,
+                &discovery,
                 &config,
-                Arc::clone(&discovery.runner),
-                &*discovery.env,
+                &local_environment_id,
+                &local_environment_id,
+                &path,
             )
-            .await;
+            .await
+            .expect("local direct environment discovery should always be available");
             if !unmet.is_empty() {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
@@ -527,6 +545,23 @@ impl InProcessDaemon {
         self.environment_manager.environment_bag(env_id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn discover_repo_for_environment_for_test(
+        &self,
+        repo_path: &Path,
+        environment_id: &EnvironmentId,
+    ) -> Result<DiscoveryResult, String> {
+        discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            environment_id,
+            repo_path,
+        )
+        .await
+    }
+
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, host: &HostName) -> PeerConnectionState {
         self.host_registry.peer_connection_status(host).await
@@ -621,15 +656,19 @@ impl InProcessDaemon {
     }
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
-        let mut repo_bag = EnvironmentBag::new();
-        let runner = &*self.discovery.runner;
-        let env = &*self.discovery.env;
-        let ee_path = crate::path_context::ExecutionEnvironmentPath::new(repo_path);
-        for detector in &self.discovery.repo_detectors {
-            repo_bag = repo_bag.extend(detector.detect(&ee_path, runner, env).await);
+        match discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            &self.local_environment_id,
+            repo_path,
+        )
+        .await
+        {
+            Ok(result) => repo_identity_from_bag_or_path(repo_path, &result.host_repo_bag),
+            Err(_) => fallback_repo_identity(repo_path),
         }
-        let combined = self.environment_manager.local_environment_bag().merge(&repo_bag);
-        repo_identity_from_bag_or_path(repo_path, &combined)
     }
 
     /// Returns the paths of all locally tracked repos.
@@ -1491,18 +1530,15 @@ impl InProcessDaemon {
         }
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let ee_path = crate::path_context::ExecutionEnvironmentPath::new(&path);
-        let local_environment_bag = self.environment_manager.local_environment_bag();
-        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_providers(
-            &local_environment_bag,
-            &ee_path,
-            &self.discovery.repo_detectors,
-            &self.discovery.factories,
+        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
             &self.config,
-            Arc::clone(&self.discovery.runner),
-            &*self.discovery.env,
+            &self.local_environment_id,
+            &self.local_environment_id,
+            &path,
         )
-        .await;
+        .await?;
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
