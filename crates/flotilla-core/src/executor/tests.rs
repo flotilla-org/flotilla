@@ -7,7 +7,7 @@ use super::{
     build_plan,
     checkout::{resolve_checkout_branch, validate_checkout_target, write_branch_issue_links, CheckoutIntent},
     session_actions::resolve_attach_command,
-    workspace_config, ExecutorStepResolver, RepoExecutionContext,
+    workspace_config, workspace_label_for_host, ExecutorStepResolver, RepoExecutionContext,
 };
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, ProviderBinding, SharedAttachableStore},
@@ -1943,10 +1943,11 @@ async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
 }
 
 #[tokio::test]
-async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
+async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_and_attaches_locally() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
+    let local = HostName::new("laptop");
 
     let plan = build_plan(
         command_with_host("feta", CommandAction::Checkout {
@@ -1960,7 +1961,7 @@ async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
         config_base(),
         test_attachable_store(&config_base()),
         None,
-        local_host(),
+        local.clone(),
     )
     .await
     .expect("build plan");
@@ -1971,7 +1972,7 @@ async fn build_plan_remote_checkout_with_issue_links_keeps_workspace_local() {
     assert_eq!(plan.steps[2].description, "Prepare workspace for feat-x@feta");
     assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::new("feta")));
     assert_eq!(plan.steps[3].description, "Attach workspace");
-    assert_eq!(plan.steps[3].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[3].host, StepExecutionContext::Host(local));
 }
 
 #[tokio::test]
@@ -1999,6 +2000,16 @@ async fn build_plan_create_checkout_treats_local_host_as_local() {
     assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::local()));
     assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
     assert_eq!(plan.steps[2].host, StepExecutionContext::Host(HostName::local()));
+}
+
+#[tokio::test]
+async fn workspace_label_for_host_suffixes_only_for_remote_hosts() {
+    let local = HostName::new("laptop");
+    let remote_host = StepExecutionContext::Host(HostName::new("feta"));
+    let local_host = StepExecutionContext::Host(local.clone());
+
+    assert_eq!(workspace_label_for_host("feat", &remote_host, &local), "feat@feta");
+    assert_eq!(workspace_label_for_host("feat", &local_host, &local), "feat");
 }
 
 #[tokio::test]
@@ -2104,6 +2115,7 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     let mut data = empty_data();
     let path = PathBuf::from("/repo/wt-feat");
     data.checkouts.insert(HostPath::new(HostName::new("feta"), path.clone()), TestCheckout::new("feat").build());
+    let local = HostName::new("laptop");
 
     let plan = build_plan(
         command_with_host("feta", CommandAction::CreateWorkspaceForCheckout { checkout_path: path.clone(), label: "feat".into() }),
@@ -2113,7 +2125,7 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
         config_base(),
         test_attachable_store(&config_base()),
         None,
-        local_host(),
+        local.clone(),
     )
     .await
     .expect("build plan");
@@ -2122,10 +2134,10 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     assert_eq!(plan.steps[0].host, StepExecutionContext::Host(HostName::new("feta")));
     assert!(matches!(
         plan.steps[0].action,
-        StepAction::PrepareWorkspace { ref checkout_path, ref label }
+            StepAction::PrepareWorkspace { ref checkout_path, ref label }
             if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat@feta"
     ));
-    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(HostName::local()));
+    assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local));
     assert!(matches!(plan.steps[1].action, StepAction::AttachWorkspace));
 }
 
