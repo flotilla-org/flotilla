@@ -1,12 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
 };
-use flotilla_protocol::{AgentHookEvent, Command, CommandAction, DaemonEvent, Message, RepoSelector, Request, Response};
-use tokio::sync::broadcast;
+use flotilla_protocol::{AgentHookEvent, Command, CommandAction, Message, RepoSelector, Request, Response};
 use tracing::warn;
 
 use super::remote_commands::RemoteCommandRouter;
@@ -41,26 +40,11 @@ impl<'a> RequestDispatcher<'a> {
             },
 
             Request::Execute { command } => {
-                let target_is_local = match command.host.as_ref() {
-                    None => true,
-                    Some(h) => h == self.daemon.host_name(),
-                };
-                if command.action.is_query() && target_is_local {
-                    // Local query commands: execute synchronously, return result directly
-                    match self.daemon.execute_query(command, self.session_id).await {
+                if command.action.is_query() {
+                    // Query commands: execute synchronously (local or remote)
+                    // and return the result directly as a QueryResult.
+                    match self.remote_command_router.dispatch_query(command, self.session_id).await {
                         Ok(value) => Message::ok_response(id, Response::QueryResult { command_id: 0, value }),
-                        Err(e) => Message::error_response(id, e),
-                    }
-                } else if command.action.is_query() {
-                    // Remote query: forward via remote command router, then wait for the
-                    // CommandFinished event so we can return the result synchronously as
-                    // a QueryResult (the client's execute_query expects a direct response).
-                    let mut event_rx = self.daemon.subscribe();
-                    match self.remote_command_router.dispatch_execute(command).await {
-                        Ok(command_id) => match Self::await_command_finished(&mut event_rx, command_id).await {
-                            Ok(value) => Message::ok_response(id, Response::QueryResult { command_id, value }),
-                            Err(e) => Message::error_response(id, e),
-                        },
                         Err(e) => Message::error_response(id, e),
                     }
                 } else {
@@ -138,29 +122,6 @@ impl<'a> RequestDispatcher<'a> {
                 }
             },
         }
-    }
-
-    async fn await_command_finished(
-        event_rx: &mut broadcast::Receiver<DaemonEvent>,
-        command_id: u64,
-    ) -> Result<flotilla_protocol::CommandValue, String> {
-        const REMOTE_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-        tokio::time::timeout(REMOTE_QUERY_TIMEOUT, async {
-            loop {
-                match event_rx.recv().await {
-                    Ok(DaemonEvent::CommandFinished { command_id: cid, result, .. }) if cid == command_id => {
-                        return Ok(result);
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err("event channel closed while waiting for remote query result".to_string());
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| format!("timed out waiting for remote query result (command_id={command_id})"))?
     }
 
     fn handle_agent_hook(&self, event: AgentHookEvent) -> Result<(), String> {

@@ -576,8 +576,8 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
         &next_remote_command_id,
     );
     // Remote query commands (host targeting a different daemon) must be forwarded
-    // through the peer manager, not executed locally. Inject a CommandFinished
-    // event to unblock the await in the dispatcher.
+    // through the peer manager. The dispatcher calls dispatch_query, which sets
+    // up a oneshot and waits for complete_remote_command to resolve it.
     let dispatch_handle = tokio::spawn({
         let daemon = Arc::clone(&daemon);
         let remote_command_router = remote_command_router.clone();
@@ -598,12 +598,13 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
     });
 
     // Wait for the dispatched command to appear as a pending remote command,
-    // then extract its command_id and simulate the remote response.
-    let command_id = tokio::time::timeout(StdDuration::from_secs(5), async {
+    // then extract its request_id and simulate the remote response via
+    // complete_remote_command (which resolves the oneshot).
+    let request_id = tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             let pending = pending_remote_commands.lock().await;
-            if let Some(entry) = pending.values().next() {
-                return entry.command_id;
+            if let Some((&req_id, _)) = pending.iter().next() {
+                return req_id;
             }
             drop(pending);
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -612,14 +613,14 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
     .await
     .expect("timed out waiting for pending remote command");
 
-    // Inject a CommandFinished event to unblock the dispatcher's await_command_finished.
-    daemon.send_event(DaemonEvent::CommandFinished {
-        command_id,
-        host: HostName::new("feta"),
-        repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
-        repo: PathBuf::new(),
-        result: CommandValue::HostList(Box::new(flotilla_protocol::HostListResponse { hosts: vec![] })),
-    });
+    // Simulate the remote response arriving via complete_remote_command.
+    remote_command_router
+        .complete_remote_command(
+            request_id,
+            HostName::new("feta"),
+            CommandValue::HostList(Box::new(flotilla_protocol::HostListResponse { hosts: vec![] })),
+        )
+        .await;
 
     let response = tokio::time::timeout(StdDuration::from_secs(5), dispatch_handle)
         .await
@@ -1184,6 +1185,7 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
         repo_identity: None,
         repo: None,
         finished_via_event: false,
+        query_completion: None,
     });
 
     let daemon_for_task = Arc::clone(&daemon);

@@ -24,13 +24,17 @@ use tracing::info;
 
 use crate::peer::{PeerManager, PeerSender};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct PendingRemoteCommand {
     pub(super) command_id: u64,
     pub(super) target_host: HostName,
     pub(super) repo_identity: Option<RepoIdentity>,
     pub(super) repo: Option<PathBuf>,
     pub(super) finished_via_event: bool,
+    /// When set, the originator is waiting for a direct query result rather
+    /// than a broadcast `CommandFinished` event.  `complete_remote_command`
+    /// resolves this instead of broadcasting.
+    pub(super) query_completion: Option<oneshot::Sender<CommandValue>>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +144,7 @@ impl RemoteCommandRouter {
                     repo_identity: extract_command_repo_identity(&command),
                     repo: None,
                     finished_via_event: false,
+                    query_completion: None,
                 });
 
                 let routed = RoutedPeerMessage::CommandRequest {
@@ -164,6 +169,59 @@ impl RemoteCommandRouter {
             }
         } else {
             self.daemon.execute(command).await
+        }
+    }
+
+    /// Dispatch a query command and return the result synchronously.
+    ///
+    /// For local targets this calls `execute_query` directly.  For remote
+    /// targets the command is forwarded via the peer manager and we wait on a
+    /// oneshot for the `CommandResponse` to arrive — no `CommandFinished`
+    /// broadcast is synthesised.
+    pub(super) async fn dispatch_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        let target_host = command.host.clone().unwrap_or_else(|| self.daemon.host_name().clone());
+
+        if target_host == *self.daemon.host_name() {
+            return self.daemon.execute_query(command, session_id).await;
+        }
+
+        let request_id = {
+            let mut pm = self.peer_manager.lock().await;
+            pm.next_request_id()
+        };
+        let command_id = self.next_remote_command_id.fetch_add(1, Ordering::Relaxed);
+
+        let (tx, rx) = oneshot::channel();
+
+        self.pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
+            command_id,
+            target_host: target_host.clone(),
+            repo_identity: extract_command_repo_identity(&command),
+            repo: None,
+            finished_via_event: false,
+            query_completion: Some(tx),
+        });
+
+        let routed = RoutedPeerMessage::CommandRequest {
+            request_id,
+            requester_host: self.daemon.host_name().clone(),
+            target_host: target_host.clone(),
+            remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+            command: Box::new(command),
+        };
+        if let Err(err) = self.send_routed_to(&target_host, routed).await {
+            self.pending_remote_commands.lock().await.remove(&request_id);
+            return Err(err);
+        }
+
+        const REMOTE_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
+        match tokio::time::timeout(REMOTE_QUERY_TIMEOUT, rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err("remote query response channel closed".to_string()),
+            Err(_) => {
+                self.pending_remote_commands.lock().await.remove(&request_id);
+                Err(format!("timed out waiting for remote query result (command_id={command_id})"))
+            }
         }
     }
 
@@ -311,6 +369,13 @@ impl RemoteCommandRouter {
             return;
         };
 
+        // Query commands: resolve the oneshot directly without broadcasting
+        // a CommandFinished event.
+        if let Some(tx) = entry.query_completion {
+            let _ = tx.send(result);
+            return;
+        }
+
         if entry.finished_via_event {
             return;
         }
@@ -429,8 +494,29 @@ impl RemoteCommandRouter {
         command: Command,
         ready: Arc<Notify>,
     ) {
-        let mut event_rx = self.daemon.subscribe();
         let responder_host = self.daemon.host_name().clone();
+
+        // Query commands: execute synchronously via execute_query, send the
+        // result back directly without subscribing to the event stream.
+        if command.action.is_query() {
+            let result = match self.daemon.execute_query(command, uuid::Uuid::nil()).await {
+                Ok(value) => value,
+                Err(message) => CommandValue::Error { message },
+            };
+            self.forwarded_commands.lock().await.remove(&request_id);
+            ready.notify_waiters();
+            let response = RoutedPeerMessage::CommandResponse {
+                request_id,
+                requester_host,
+                responder_host,
+                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                result: Box::new(result),
+            };
+            let _ = self.send_routed_to(&reply_via, response).await;
+            return;
+        }
+
+        let mut event_rx = self.daemon.subscribe();
         let command_id = match self.daemon.execute(command).await {
             Ok(command_id) => command_id,
             Err(message) => {
