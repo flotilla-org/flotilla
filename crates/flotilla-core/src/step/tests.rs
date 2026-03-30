@@ -717,6 +717,45 @@ async fn remote_progress_maps_to_global_step_indices() {
 }
 
 #[tokio::test]
+async fn remote_progress_omits_repo_path_when_batch_context_missing() {
+    let (tx, mut rx) = {
+        let (tx, _rx) = broadcast::channel(16);
+        (tx.clone(), tx.subscribe())
+    };
+    let sink = EventForwardingProgressSink {
+        command_id: 9,
+        host: HostName::new("feta"),
+        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repo: None,
+        step_offset: 0,
+        step_count: 1,
+        event_tx: tx,
+        state: std::sync::Mutex::new(RemoteProgressState::default()),
+    };
+
+    sink.emit(RemoteStepProgressUpdate {
+        batch_step_index: 0,
+        batch_step_count: 1,
+        description: "remote".into(),
+        status: StepStatus::Started,
+    })
+    .await;
+
+    let event = rx.recv().await.expect("step update event");
+    assert!(matches!(
+        event,
+        DaemonEvent::CommandStepUpdate {
+            command_id: 9,
+            host,
+            repo: None,
+            description,
+            status: StepStatus::Started,
+            ..
+        } if host == HostName::new("feta") && description == "remote"
+    ));
+}
+
+#[tokio::test]
 async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
     struct PanicResolver;
 

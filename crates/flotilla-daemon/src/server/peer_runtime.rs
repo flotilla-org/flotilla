@@ -488,7 +488,10 @@ impl PeerRuntime {
                                     let local_event_repo = peer_daemon
                                         .preferred_local_path_for_identity(&repo_identity)
                                         .await
-                                        .unwrap_or_default();
+                                        .map(ExecutionEnvironmentPath::new);
+                                    if local_event_repo.is_none() {
+                                        warn!(%repo_identity, "forwarded remote step request has no local event repo path on responder");
+                                    }
                                     remote_command_router_task
                                         .spawn_forwarded_remote_step_batch(
                                             request_id,
@@ -498,7 +501,7 @@ impl PeerRuntime {
                                                 command_id: request_id,
                                                 target_host: peer_daemon.host_name().clone(),
                                                 repo_identity,
-                                                repo: ExecutionEnvironmentPath::new(local_event_repo),
+                                                repo: local_event_repo,
                                                 step_offset,
                                                 steps,
                                             },
