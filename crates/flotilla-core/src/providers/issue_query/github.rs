@@ -1,6 +1,10 @@
 //! GitHub implementation of the IssueQueryService.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::provider_data::Issue;
@@ -23,6 +27,7 @@ const PROVIDER_NAME: &str = "github";
 struct CursorState {
     query: IssueQuery,
     repo_slug: String,
+    repo_root: PathBuf,
     next_page: u32,
     has_more: bool,
     total: Option<u32>,
@@ -61,7 +66,7 @@ fn expire_stale_cursors(cursors: &mut HashMap<CursorId, CursorState>) {
 
 #[async_trait]
 impl IssueQueryService for GitHubIssueQueryService {
-    async fn open_query(&self, _repo: &Path, params: IssueQuery, session_id: uuid::Uuid) -> Result<CursorId, String> {
+    async fn open_query(&self, repo: &Path, params: IssueQuery, session_id: uuid::Uuid) -> Result<CursorId, String> {
         let mut cursors = self.cursors.lock().await;
         expire_stale_cursors(&mut cursors);
 
@@ -70,6 +75,7 @@ impl IssueQueryService for GitHubIssueQueryService {
         let state = CursorState {
             query: params,
             repo_slug: self.repo_slug.clone(),
+            repo_root: repo.to_path_buf(),
             next_page: 1,
             has_more: true,
             total: None,
@@ -97,6 +103,7 @@ impl IssueQueryService for GitHubIssueQueryService {
         let per_page = clamp_per_page(count);
         let page = state.next_page;
         let repo_slug = state.repo_slug.clone();
+        let repo_root = state.repo_root.clone();
         let query = state.query.clone();
 
         // Drop the lock while doing the network call.
@@ -105,7 +112,7 @@ impl IssueQueryService for GitHubIssueQueryService {
         let (items, has_more, total) = match &query.search {
             None => {
                 let endpoint = format!("repos/{}/issues?state=open&per_page={}&page={}", repo_slug, per_page, page);
-                let response = gh_api_get_with_headers!(self.api, &endpoint, Path::new("."))?;
+                let response = gh_api_get_with_headers!(self.api, &endpoint, &repo_root)?;
                 let raw_items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
                 let issues: Vec<(String, Issue)> = raw_items
                     .into_iter()
@@ -118,7 +125,7 @@ impl IssueQueryService for GitHubIssueQueryService {
                 let raw_query = format!("repo:{} is:issue is:open {}", repo_slug, search_term);
                 let encoded_query = urlencoding::encode(&raw_query);
                 let endpoint = format!("search/issues?q={}&per_page={}&page={}", encoded_query, per_page, page);
-                let response = gh_api_get_with_headers!(self.api, &endpoint, Path::new("."))?;
+                let response = gh_api_get_with_headers!(self.api, &endpoint, &repo_root)?;
                 let parsed: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
                 let total_count = parsed["total_count"].as_u64().map(|n| n as u32);
                 let items_array = parsed["items"].as_array().ok_or("no items array in search response")?;
@@ -171,19 +178,21 @@ impl IssueQueryService for GitHubIssueQueryService {
         cursor_ids
     }
 
-    async fn fetch_by_ids(&self, _repo: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
+    async fn fetch_by_ids(&self, repo: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
         use futures::stream::{
             StreamExt, {self},
         };
 
+        let repo_root = repo.to_path_buf();
         let futs: Vec<_> = ids
             .iter()
             .map(|id| {
                 let endpoint = format!("repos/{}/issues/{}", self.repo_slug, id);
                 let api = Arc::clone(&self.api);
                 let id = id.clone();
+                let repo_root = repo_root.clone();
                 async move {
-                    let body = gh_api_get!(api, &endpoint, Path::new("."))?;
+                    let body = gh_api_get!(api, &endpoint, &repo_root)?;
                     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
                     parse_issue(PROVIDER_NAME, &v).ok_or_else(|| format!("failed to parse issue {}", id))
                 }
@@ -396,6 +405,7 @@ mod tests {
         cursors.insert(fresh_id.clone(), CursorState {
             query: IssueQuery::default(),
             repo_slug: "owner/repo".into(),
+            repo_root: PathBuf::from("/repo"),
             next_page: 1,
             has_more: true,
             total: None,
@@ -407,6 +417,7 @@ mod tests {
         cursors.insert(stale_id.clone(), CursorState {
             query: IssueQuery::default(),
             repo_slug: "owner/repo".into(),
+            repo_root: PathBuf::from("/repo"),
             next_page: 1,
             has_more: true,
             total: None,
