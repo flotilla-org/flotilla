@@ -95,9 +95,19 @@ impl ClientConnection {
     }
 
     /// Common teardown: abort event relay, clean up session cursors, decrement client count.
+    ///
+    /// Closes any remote cursors owned by this session via the remote command
+    /// router before calling `disconnect_client_session` for local cleanup.
     async fn finish_session(&self, event_task: tokio::task::JoinHandle<()>, session_id: uuid::Uuid) {
         event_task.abort();
+
+        // Close remote cursors first — the remote command router forwards
+        // QueryIssueClose to the target daemon that owns each cursor.
+        self.remote_command_router.disconnect_session_cursors(session_id).await;
+
+        // Clean up local cursors.
         self.daemon.disconnect_client_session(session_id).await;
+
         let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
         info!(%count, "client disconnected");
         self.client_notify.notify_one();

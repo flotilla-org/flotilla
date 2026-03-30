@@ -101,6 +101,31 @@ impl SocketDaemon {
         Self::from_session(session)
     }
 
+    /// Build a client from an existing `MessageSession`, performing a Hello
+    /// handshake with `ConnectionRole::Client` so the server assigns cursor
+    /// ownership to our `session_id`.
+    pub async fn from_session_stateful(session: MessageSession) -> Result<Arc<Self>, String> {
+        let session_id = uuid::Uuid::new_v4();
+        session
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                host_name: HostName::new("client"),
+                session_id,
+                connection_role: Some(ConnectionRole::Client),
+                environment_id: None,
+            })
+            .await
+            .map_err(|e| format!("failed to send Hello: {e}"))?;
+
+        match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
+            Some(Message::Hello { .. }) => {}
+            Some(other) => return Err(format!("expected Hello reply, got: {other:?}")),
+            None => return Err("connection closed before Hello reply".into()),
+        }
+
+        Self::from_session(session)
+    }
+
     pub fn from_session(session: MessageSession) -> Result<Arc<Self>, String> {
         let session = Arc::new(session);
 

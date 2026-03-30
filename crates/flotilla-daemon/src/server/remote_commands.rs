@@ -15,12 +15,12 @@ use flotilla_core::{
     step::{RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, RemoteStepProgressUpdate, StepOutcome},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandValue, DaemonEvent, HostName, PeerWireMessage, RepoIdentity, RepoSelector,
-    RoutedPeerMessage, Step, StepStatus,
+    issue_query::CursorId, Command, CommandAction, CommandPeerEvent, CommandValue, DaemonEvent, HostName, PeerWireMessage, RepoIdentity,
+    RepoSelector, RoutedPeerMessage, Step, StepStatus,
 };
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::peer::{PeerManager, PeerSender};
 
@@ -89,6 +89,16 @@ type PendingRemoteStepCancelMap = Arc<Mutex<HashMap<u64, PendingRemoteStepCancel
 // waiting for normal task completion.
 type ForwardedRemoteStepBatchMap = Arc<Mutex<HashMap<u64, ForwardedRemoteStepBatch>>>;
 
+/// Tracks a cursor opened on a remote daemon via `dispatch_query` so it can
+/// be cleaned up when the client session disconnects.
+#[derive(Clone)]
+struct RemoteCursorEntry {
+    target_host: HostName,
+    session_id: uuid::Uuid,
+}
+
+type RemoteCursorMap = Arc<Mutex<HashMap<CursorId, RemoteCursorEntry>>>;
+
 #[derive(Clone)]
 pub(super) struct RemoteCommandRouter {
     daemon: Arc<InProcessDaemon>,
@@ -101,6 +111,10 @@ pub(super) struct RemoteCommandRouter {
     pending_remote_step_cancels: PendingRemoteStepCancelMap,
     forwarded_remote_step_batches: ForwardedRemoteStepBatchMap,
     next_remote_command_id: Arc<AtomicU64>,
+    /// Cursors opened on remote daemons on behalf of client sessions.
+    /// Populated by `dispatch_query` when it receives `IssueQueryOpened`;
+    /// drained by `disconnect_session_cursors` to forward close commands.
+    remote_cursors: RemoteCursorMap,
 }
 
 impl RemoteCommandRouter {
@@ -123,6 +137,7 @@ impl RemoteCommandRouter {
             pending_remote_step_cancels: Arc::new(Mutex::new(HashMap::new())),
             forwarded_remote_step_batches: Arc::new(Mutex::new(HashMap::new())),
             next_remote_command_id,
+            remote_cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -186,6 +201,12 @@ impl RemoteCommandRouter {
             return self.daemon.execute_query(command, session_id).await;
         }
 
+        // Capture the cursor ID for close tracking before the command is moved.
+        let close_cursor = match &command.action {
+            CommandAction::QueryIssueClose { cursor } => Some(cursor.clone()),
+            _ => None,
+        };
+
         let request_id = {
             let mut pm = self.peer_manager.lock().await;
             pm.next_request_id()
@@ -217,13 +238,59 @@ impl RemoteCommandRouter {
         }
 
         const REMOTE_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-        match tokio::time::timeout(REMOTE_QUERY_TIMEOUT, rx).await {
+        let result = match tokio::time::timeout(REMOTE_QUERY_TIMEOUT, rx).await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => Err("remote query response channel closed".to_string()),
             Err(_) => {
                 self.pending_remote_commands.lock().await.remove(&request_id);
                 Err(format!("timed out waiting for remote query result (command_id={command_id})"))
             }
+        };
+
+        // Track remote cursor lifecycle for disconnect cleanup.
+        if let Ok(ref value) = result {
+            match value {
+                CommandValue::IssueQueryOpened { cursor } => {
+                    self.remote_cursors.lock().await.insert(cursor.clone(), RemoteCursorEntry { target_host, session_id });
+                }
+                CommandValue::IssueQueryClosed => {
+                    if let Some(cursor) = &close_cursor {
+                        self.remote_cursors.lock().await.remove(cursor);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        result
+    }
+
+    /// Close all remote cursors owned by the given client session.
+    ///
+    /// Called during client disconnect. Sends `QueryIssueClose` commands
+    /// to the remote hosts that own each cursor.
+    pub(super) async fn disconnect_session_cursors(&self, session_id: uuid::Uuid) {
+        let cursors_to_close: Vec<(CursorId, HostName)> = {
+            let map = self.remote_cursors.lock().await;
+            map.iter()
+                .filter(|(_, entry)| entry.session_id == session_id)
+                .map(|(cid, entry)| (cid.clone(), entry.target_host.clone()))
+                .collect()
+        };
+
+        if cursors_to_close.is_empty() {
+            return;
+        }
+
+        debug!(%session_id, count = cursors_to_close.len(), "closing remote cursors for disconnecting client");
+        for (cursor, target_host) in cursors_to_close {
+            let cmd = Command {
+                host: Some(target_host),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryIssueClose { cursor },
+            };
+            let _ = self.dispatch_query(cmd, session_id).await;
         }
     }
 

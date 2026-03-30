@@ -111,6 +111,7 @@ pub struct FakeDiscoveryProviders {
     pub checkout_manager: Option<Arc<dyn CheckoutManager>>,
     pub change_request: Option<Arc<dyn ChangeRequestTracker>>,
     pub issue_tracker: Option<Arc<dyn IssueProvider>>,
+    pub issue_query_service: Option<Arc<dyn crate::providers::issue_query::IssueQueryService>>,
     pub workspace_manager: Option<Arc<dyn WorkspaceManager>>,
     pub terminal_pool: Option<Arc<dyn TerminalPool>>,
     pub attachable_store: Option<SharedAttachableStore>,
@@ -133,6 +134,11 @@ impl FakeDiscoveryProviders {
 
     pub fn with_issue_tracker(mut self, provider: Arc<dyn IssueProvider>) -> Self {
         self.issue_tracker = Some(provider);
+        self
+    }
+
+    pub fn with_issue_query_service(mut self, service: Arc<dyn crate::providers::issue_query::IssueQueryService>) -> Self {
+        self.issue_query_service = Some(service);
         self
     }
 
@@ -956,6 +962,34 @@ impl Factory for FakeWorkspaceManagerFactory {
     }
 }
 
+/// Factory that always returns a pre-constructed IssueQueryService.
+pub struct FakeIssueQueryServiceFactory(pub Arc<dyn crate::providers::issue_query::IssueQueryService>);
+
+#[async_trait::async_trait]
+impl Factory for FakeIssueQueryServiceFactory {
+    type Descriptor = super::ServiceDescriptor;
+    type Output = dyn crate::providers::issue_query::IssueQueryService;
+
+    fn descriptor(&self) -> super::ServiceDescriptor {
+        super::ServiceDescriptor {
+            category: super::ServiceCategory::IssueQuery,
+            backend: "fake-issue-query".into(),
+            implementation: "fake-issue-query".into(),
+            display_name: "Fake Issue Query".into(),
+        }
+    }
+
+    async fn probe(
+        &self,
+        _env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
+        _runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<dyn crate::providers::issue_query::IssueQueryService>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.0))
+    }
+}
+
 pub struct FakeTerminalPoolFactory(pub Arc<dyn TerminalPool>);
 
 #[async_trait::async_trait]
@@ -1082,6 +1116,11 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
     }
 
+    let mut issue_query_service_factories: Vec<Box<super::IssueQueryServiceFactory>> = Vec::new();
+    if let Some(iqs) = providers.issue_query_service {
+        issue_query_service_factories.push(Box::new(FakeIssueQueryServiceFactory(iqs)));
+    }
+
     let attachable_store = std::sync::OnceLock::new();
     if let Some(store) = providers.attachable_store {
         let _ = attachable_store.set(store);
@@ -1102,7 +1141,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             workspace_managers: workspace_manager_factories,
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![],
-            issue_query_services: vec![],
+            issue_query_services: issue_query_service_factories,
         },
         attachable_store,
     }
