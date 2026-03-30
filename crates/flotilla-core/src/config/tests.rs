@@ -375,6 +375,7 @@ host_name = "my-desktop"
     let config: DaemonConfig = toml::from_str(toml).unwrap();
     assert!(config.follower);
     assert_eq!(config.host_name, Some("my-desktop".into()));
+    assert!(config.environments.is_empty());
 }
 
 #[test]
@@ -382,6 +383,39 @@ fn parse_daemon_config_defaults() {
     let config: DaemonConfig = toml::from_str("").unwrap();
     assert!(!config.follower);
     assert_eq!(config.host_name, None);
+    assert!(config.environments.is_empty());
+}
+
+#[test]
+fn parse_daemon_config_static_environments() {
+    let toml = r#"
+[environments.buildbox]
+hostname = "buildbox.internal"
+display_name = "Build Box"
+flotilla_command = "/usr/local/bin/flotilla"
+
+[environments.linux]
+hostname = "linux.internal"
+"#;
+    let config: DaemonConfig = toml::from_str(toml).unwrap();
+
+    assert_eq!(config.environments.len(), 2);
+    assert_eq!(config.environments["buildbox"].hostname, "buildbox.internal");
+    assert_eq!(config.environments["buildbox"].display_name.as_deref(), Some("Build Box"));
+    assert_eq!(config.environments["buildbox"].flotilla_command.as_deref(), Some("/usr/local/bin/flotilla"));
+    assert_eq!(config.environments["linux"].hostname, "linux.internal");
+    assert_eq!(config.environments["linux"].display_name, None);
+    assert_eq!(config.environments["linux"].flotilla_command, None);
+}
+
+#[test]
+fn parse_daemon_config_rejects_malformed_environment_config() {
+    let toml = r#"
+environments = 123
+"#;
+    let err = toml::from_str::<DaemonConfig>(toml).expect_err("malformed environment config should fail");
+    let err = err.to_string();
+    assert!(err.contains("environments"), "unexpected error: {err}");
 }
 
 #[test]

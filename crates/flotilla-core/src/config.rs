@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -278,12 +279,26 @@ impl HostsConfig {
 }
 
 /// Daemon-level configuration.
+/// `daemon.toml` is the source of truth for execution environments.
+/// Peer-daemon mesh config stays in `hosts.toml`.
 /// Loaded from `~/.config/flotilla/daemon.toml`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DaemonConfig {
     #[serde(default)]
     pub follower: bool,
     pub host_name: Option<String>,
+    #[serde(default)]
+    pub environments: BTreeMap<String, StaticEnvironmentConfig>,
+}
+
+/// Static SSH-backed direct execution environment configured in `daemon.toml`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct StaticEnvironmentConfig {
+    pub hostname: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub flotilla_command: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
