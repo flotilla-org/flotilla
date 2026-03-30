@@ -651,6 +651,11 @@ impl App {
         if self.issue_views.get(repo_identity).and_then(|v| v.default.as_ref()).is_some() {
             return;
         }
+        // Remote-only repos have no local issue query service. Service-targeted
+        // routing to the owning host is future work; skip for now.
+        if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
+            return;
+        }
         // Guard: only spawn when inside a tokio runtime (unit tests that call
         // apply_snapshot directly may not have one).
         if tokio::runtime::Handle::try_current().is_err() {

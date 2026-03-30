@@ -81,7 +81,7 @@ impl FactoryRegistry {
             ai_utilities: vec![],
             workspace_managers: workspace_factories(),
             terminal_pools: terminal_pool_factories(),
-            environment_providers: vec![],
+            environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
             issue_query_services: vec![],
         }
     }
