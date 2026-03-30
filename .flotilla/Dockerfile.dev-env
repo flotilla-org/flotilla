@@ -31,11 +31,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
       > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y gh \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Terminal session managers
-RUN cargo install shpool --locked
+RUN cargo install shpool@0.9.5 --locked
 
 # --- Agent CLIs ---
 # Claude and Cursor use curl|bash installers that aren't version-pinned.
@@ -62,8 +62,8 @@ ENV PATH="/root/.local/bin:${PATH}"
 # Config dirs that agents expect to exist
 RUN mkdir -p /root/.gemini
 
-# Default interactive shell
-SHELL ["/bin/zsh", "-c"]
+# Default interactive shell (SHELL directive is build-time only; chsh sets runtime)
+RUN chsh -s /bin/zsh root
 ENV SHELL=/bin/zsh
 
 WORKDIR /workspace
