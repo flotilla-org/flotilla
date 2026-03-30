@@ -208,4 +208,40 @@ mod tests {
         assert_eq!(summary.environments[0].image, ImageId::new("test-image:latest"));
         assert_eq!(summary.environments[0].status, EnvironmentStatus::Running);
     }
+
+    #[tokio::test]
+    async fn build_local_host_summary_keeps_direct_environments_out_of_summary_environments() {
+        use flotilla_protocol::{EnvironmentId, EnvironmentStatus, ImageId};
+
+        let host_name = HostName::new("test-host");
+        let manager = EnvironmentManager::from_local_state(
+            EnvironmentId::new("test-local-environment"),
+            Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+            EnvironmentBag::new(),
+        );
+        let env = TestEnvVars;
+        let direct_env_id = EnvironmentId::new("direct-env");
+        manager
+            .register_direct_environment(
+                direct_env_id.clone(),
+                Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+                EnvironmentBag::new(),
+            )
+            .expect("register direct environment");
+
+        let handle: EnvironmentHandle = Arc::new(TestProvisionedEnvironment {
+            id: EnvironmentId::new("env-1"),
+            image: ImageId::new("test-image:latest"),
+            status: EnvironmentStatus::Running,
+        });
+        manager
+            .register_provisioned_environment(EnvironmentId::new("env-1"), handle, EnvironmentBag::new(), None)
+            .expect("register provisioned environment");
+
+        let summary = build_local_host_summary(&host_name, &manager, vec![], &env).await;
+
+        assert_eq!(summary.environments.len(), 1);
+        assert_eq!(summary.environments[0].id, EnvironmentId::new("env-1"));
+        assert!(manager.environment_bag(&direct_env_id).is_some());
+    }
 }

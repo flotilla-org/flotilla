@@ -75,6 +75,42 @@ impl EnvironmentManager {
         self.environment_bag(&self.local_environment_id).expect("local direct environment must be registered in EnvironmentManager")
     }
 
+    pub fn register_direct_environment(
+        &self,
+        env_id: EnvironmentId,
+        runner: Arc<dyn CommandRunner>,
+        env_bag: EnvironmentBag,
+    ) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.entry(env_id.clone()) {
+            Entry::Occupied(entry) => match entry.get() {
+                ManagedEnvironmentKind::Direct(_) if env_id == self.local_environment_id => {
+                    Err(format!("cannot replace local direct environment {env_id}"))
+                }
+                ManagedEnvironmentKind::Direct(_) => Err(format!("direct environment already registered: {env_id}")),
+                ManagedEnvironmentKind::Provisioned(_) => {
+                    Err(format!("cannot replace provisioned environment {env_id} with a direct environment"))
+                }
+            },
+            Entry::Vacant(entry) => {
+                entry.insert(ManagedEnvironmentKind::Direct(DirectEnvironmentState { runner, env_bag }));
+                Ok(())
+            }
+        }
+    }
+
+    pub fn update_direct_environment_bag(&self, env_id: &EnvironmentId, env_bag: EnvironmentBag) -> Result<(), String> {
+        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
+        match managed.get_mut(env_id) {
+            Some(ManagedEnvironmentKind::Direct(state)) => {
+                state.env_bag = env_bag;
+                Ok(())
+            }
+            Some(ManagedEnvironmentKind::Provisioned(_)) => Err(format!("environment is provisioned, not direct: {env_id}")),
+            None => Err(format!("direct environment not found: {env_id}")),
+        }
+    }
+
     pub fn environment_runner(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
         match self.managed_environment(env_id)? {
             ManagedEnvironmentKind::Direct(state) => Some(state.runner),
@@ -104,16 +140,14 @@ impl EnvironmentManager {
     }
 
     pub async fn host_summary_environments(&self) -> Vec<EnvironmentInfo> {
-        let provisioned: Vec<_> = {
-            let managed = self.managed.lock().expect("environment manager lock poisoned");
-            managed
-                .values()
-                .filter_map(|state| match state {
-                    ManagedEnvironmentKind::Direct(_) => None,
-                    ManagedEnvironmentKind::Provisioned(state) => Some(Arc::clone(&state.handle)),
-                })
-                .collect()
-        };
+        let provisioned: Vec<_> = self
+            .managed_environments()
+            .into_iter()
+            .filter_map(|(_, state)| match state {
+                ManagedEnvironmentKind::Direct(_) => None,
+                ManagedEnvironmentKind::Provisioned(state) => Some(Arc::clone(&state.handle)),
+            })
+            .collect();
 
         let mut environments = Vec::with_capacity(provisioned.len());
         for handle in provisioned {
@@ -218,17 +252,13 @@ impl EnvironmentManager {
     }
 
     pub fn remove_provisioned_environment(&self, env_id: &EnvironmentId) -> Option<ProvisionedEnvironmentState> {
-        if env_id == &self.local_environment_id {
-            return None;
-        }
-
         let mut managed = self.managed.lock().expect("environment manager lock poisoned");
-        match managed.remove(env_id) {
-            Some(ManagedEnvironmentKind::Provisioned(state)) => Some(state),
-            Some(ManagedEnvironmentKind::Direct(state)) => {
-                managed.insert(env_id.clone(), ManagedEnvironmentKind::Direct(state));
-                None
-            }
+        match managed.get(env_id) {
+            Some(ManagedEnvironmentKind::Direct(_)) => None,
+            Some(ManagedEnvironmentKind::Provisioned(_)) => match managed.remove(env_id) {
+                Some(ManagedEnvironmentKind::Provisioned(state)) => Some(state),
+                _ => None,
+            },
             None => None,
         }
     }
@@ -237,17 +267,21 @@ impl EnvironmentManager {
         self.managed.lock().expect("environment manager lock poisoned").get(env_id).cloned()
     }
 
+    pub fn managed_environments(&self) -> Vec<(EnvironmentId, ManagedEnvironmentKind)> {
+        let mut managed: Vec<_> = self
+            .managed
+            .lock()
+            .expect("environment manager lock poisoned")
+            .iter()
+            .map(|(env_id, state)| (env_id.clone(), state.clone()))
+            .collect();
+        managed.sort_by(|a, b| a.0.cmp(&b.0));
+        managed
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn replace_local_environment_bag_for_test(&self, env_bag: EnvironmentBag) -> Result<(), String> {
-        let mut managed = self.managed.lock().expect("environment manager lock poisoned");
-        match managed.get_mut(&self.local_environment_id) {
-            Some(ManagedEnvironmentKind::Direct(state)) => {
-                state.env_bag = env_bag;
-                Ok(())
-            }
-            Some(ManagedEnvironmentKind::Provisioned(_)) => Err("local environment unexpectedly registered as provisioned".into()),
-            None => Err("local environment missing from manager".into()),
-        }
+        self.update_direct_environment_bag(&self.local_environment_id, env_bag)
     }
 
     fn update_provisioned_environment_discovery(
@@ -440,6 +474,86 @@ mod tests {
         assert_eq!(removed.env_bag.find_env_var("PROVISIONED"), Some("true"));
         assert!(manager.environment_bag(&env_id).is_none());
         assert!(manager.environment_registry(&env_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_direct_environment_adds_an_independent_direct_environment() {
+        let discovery = fake_discovery(false);
+        let local_environment_id = test_local_environment_id();
+        let manager = EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await;
+        let direct_environment_id = EnvironmentId::new("direct-environment");
+        let direct_runner = Arc::new(DiscoveryMockRunner::builder().build()) as Arc<dyn CommandRunner>;
+        let direct_bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("DIRECT", "true"));
+
+        manager
+            .register_direct_environment(direct_environment_id.clone(), Arc::clone(&direct_runner), direct_bag.clone())
+            .expect("register direct environment");
+
+        let managed_ids: Vec<_> = manager.managed_environments().into_iter().map(|(id, _)| id).collect();
+        assert!(managed_ids.contains(&local_environment_id), "local direct environment should be enumerated");
+        assert!(managed_ids.contains(&direct_environment_id), "new direct environment should be enumerated");
+        assert!(Arc::ptr_eq(&manager.environment_runner(&direct_environment_id).expect("direct runner"), &direct_runner));
+        assert_eq!(manager.environment_bag(&direct_environment_id).expect("direct bag").find_env_var("DIRECT"), Some("true"));
+        assert!(manager.environment_runner(&local_environment_id).is_some(), "local direct environment should remain registered");
+    }
+
+    #[tokio::test]
+    async fn register_direct_environment_rejects_local_collision() {
+        let discovery = fake_discovery(false);
+        let local_environment_id = test_local_environment_id();
+        let manager = EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await;
+        let result = manager.register_direct_environment(
+            local_environment_id.clone(),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+            EnvironmentBag::new(),
+        );
+
+        assert!(result.is_err(), "local direct environment must not be replaceable through direct registration");
+        assert!(manager.environment_bag(&local_environment_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn register_direct_environment_rejects_provisioned_collision() {
+        let env_id = EnvironmentId::new("shared-environment");
+        let discovery = fake_discovery(false);
+        let manager = EnvironmentManager::new_local(&discovery, test_local_environment_id()).await;
+        let (handle, _) = mock_handle(&env_id, HashMap::new(), None);
+        manager
+            .register_provisioned_environment(env_id.clone(), handle, EnvironmentBag::new(), None)
+            .expect("register provisioned environment");
+
+        let result =
+            manager.register_direct_environment(env_id.clone(), Arc::new(DiscoveryMockRunner::builder().build()), EnvironmentBag::new());
+
+        assert!(result.is_err(), "existing provisioned environments must not be replaced by direct environments");
+    }
+
+    #[tokio::test]
+    async fn update_direct_environment_bag_refreshes_lookup_state() {
+        let discovery = fake_discovery(false);
+        let local_environment_id = test_local_environment_id();
+        let manager = EnvironmentManager::new_local(&discovery, local_environment_id.clone()).await;
+        let direct_environment_id = EnvironmentId::new("refreshable-direct-environment");
+
+        manager
+            .register_direct_environment(
+                direct_environment_id.clone(),
+                Arc::new(DiscoveryMockRunner::builder().build()),
+                EnvironmentBag::new().with(EnvironmentAssertion::env_var("INITIAL", "true")),
+            )
+            .expect("register direct environment");
+
+        manager
+            .update_direct_environment_bag(
+                &direct_environment_id,
+                EnvironmentBag::new().with(EnvironmentAssertion::env_var("REFRESHED", "true")),
+            )
+            .expect("update direct environment bag");
+
+        assert!(manager.environment_bag(&direct_environment_id).expect("direct bag").find_env_var("INITIAL").is_none());
+        assert_eq!(manager.environment_bag(&direct_environment_id).expect("direct bag").find_env_var("REFRESHED"), Some("true"));
+        assert!(manager.update_direct_environment_bag(&EnvironmentId::new("missing"), EnvironmentBag::new()).is_err());
+        assert!(manager.environment_bag(&local_environment_id).is_some(), "local direct environment should remain registered");
     }
 
     #[tokio::test]

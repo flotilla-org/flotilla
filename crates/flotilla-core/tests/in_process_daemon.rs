@@ -306,21 +306,16 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
     (temp, repo, daemon)
 }
 
-async fn daemon_for_plain_dir_with_local_environment_id(
-    local_environment_id: &str,
-) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &str) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config_dir = temp.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
-    let machine_state_dir = flotilla_core::host_identity::machine_scoped_state_dir(
-        &config_dir,
-        None,
-        &flotilla_core::providers::ProcessCommandRunner,
-    )
-    .await
-    .expect("resolve machine-scoped state dir");
+    let machine_state_dir =
+        flotilla_core::host_identity::machine_scoped_state_dir(&config_dir, None, &flotilla_core::providers::ProcessCommandRunner)
+            .await
+            .expect("resolve machine-scoped state dir");
     std::fs::create_dir_all(&machine_state_dir).expect("create machine-scoped state dir");
     std::fs::write(machine_state_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
     let config = Arc::new(ConfigStore::with_base(config_dir));

@@ -10,8 +10,8 @@ use std::{
 };
 
 use flotilla_protocol::{qualified_path::HostId, EnvironmentId};
-use uuid::Uuid;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::providers::{ChannelLabel, CommandRunner};
 
