@@ -1181,6 +1181,25 @@ async fn get_host_providers_returns_local_summary_and_errors_for_unknown_remote_
 }
 
 #[tokio::test]
+async fn get_repo_providers_uses_preferred_root_environment_host_discovery_for_local_repo() {
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("LOCAL_MARKER", "local")))
+        .expect("replace local environment bag");
+
+    let providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo)).await.expect("repo providers should resolve");
+
+    assert!(
+        providers
+            .host_discovery
+            .iter()
+            .any(|entry| entry.kind == "env_var_set" && entry.detail.get("key").map(String::as_str) == Some("LOCAL_MARKER")),
+        "host discovery should report the preferred local environment bag"
+    );
+}
+
+#[tokio::test]
 async fn local_host_queries_include_visible_environments_without_changing_summary_environments() {
     let (_temp, _repo, daemon, _identity) = daemon_for_fake_repo().await;
 

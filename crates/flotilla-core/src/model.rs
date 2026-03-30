@@ -78,6 +78,7 @@ pub struct RepoModel {
     pub data: DataStore,
     pub labels: RepoLabels,
     pub refresh_handle: RepoRefreshHandle,
+    pub environment_id: Option<EnvironmentId>,
 }
 
 impl RepoModel {
@@ -96,12 +97,12 @@ impl RepoModel {
             repo_root,
             registry.clone(),
             criteria,
-            environment_id,
+            environment_id.clone(),
             attachable_store,
             agent_state_store,
             Duration::from_secs(10),
         );
-        Self { registry, data: DataStore::default(), labels, refresh_handle }
+        Self { registry, data: DataStore::default(), labels, refresh_handle, environment_id }
     }
 
     /// Create a model for a virtual (remote-only) repo.
@@ -117,7 +118,13 @@ impl RepoModel {
             issues: CategoryLabels::new("Issues", "issue", "I"),
             cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
         };
-        Self { registry: Arc::new(registry), data: DataStore::default(), labels, refresh_handle: RepoRefreshHandle::idle() }
+        Self {
+            registry: Arc::new(registry),
+            data: DataStore::default(),
+            labels,
+            refresh_handle: RepoRefreshHandle::idle(),
+            environment_id: None,
+        }
     }
 }
 

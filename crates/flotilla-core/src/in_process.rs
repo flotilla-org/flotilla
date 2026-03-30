@@ -1764,13 +1764,11 @@ impl InProcessDaemon {
             )),
         };
 
-        let host_discovery = self
-            .environment_manager
-            .local_environment_bag()
-            .assertions()
-            .iter()
-            .map(crate::convert::assertion_to_discovery_entry)
-            .collect();
+        let host_bag = state
+            .preferred_environment_id()
+            .and_then(|env_id| self.environment_manager.environment_bag(env_id))
+            .unwrap_or_else(|| self.environment_manager.local_environment_bag());
+        let host_discovery = host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
         let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
 
         let provider_infos = state
