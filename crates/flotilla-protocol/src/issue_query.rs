@@ -6,11 +6,15 @@ use crate::provider_data::Issue;
 
 /// Opaque identifier for a paginated query cursor.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CursorId(pub String);
+pub struct CursorId(String);
 
 impl CursorId {
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

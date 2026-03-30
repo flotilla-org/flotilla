@@ -1304,7 +1304,7 @@ impl InProcessDaemon {
     ) -> Result<Arc<dyn crate::providers::issue_query::IssueQueryService>, String> {
         let identity = {
             let map = self.cursor_repo_map.read().await;
-            map.get(cursor).map(|(id, _)| id.clone()).ok_or_else(|| format!("unknown cursor: {}", cursor.0))?
+            map.get(cursor).map(|(id, _)| id.clone()).ok_or_else(|| format!("unknown cursor: {}", cursor.as_str()))?
         };
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| "repo no longer tracked".to_string())?;
@@ -1412,6 +1412,8 @@ impl InProcessDaemon {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
 
         if command.action.is_query() {
+            // Query commands should be dispatched through `execute_query`,
+            // not through `execute`. Return an error to surface misrouting.
             let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -1420,45 +1422,7 @@ impl InProcessDaemon {
                 repo: PathBuf::new(),
                 description: command.description().to_string(),
             });
-
-            let result = match &command.action {
-                flotilla_protocol::CommandAction::QueryRepoDetail { repo } => match self.get_repo_detail_internal(repo).await {
-                    Ok(v) => flotilla_protocol::CommandValue::RepoDetail(Box::new(v)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                flotilla_protocol::CommandAction::QueryRepoProviders { repo } => match self.get_repo_providers_internal(repo).await {
-                    Ok(v) => flotilla_protocol::CommandValue::RepoProviders(Box::new(v)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                flotilla_protocol::CommandAction::QueryRepoWork { repo } => match self.get_repo_work_internal(repo).await {
-                    Ok(v) => flotilla_protocol::CommandValue::RepoWork(Box::new(v)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                flotilla_protocol::CommandAction::QueryHostList {} => match self.list_hosts_internal().await {
-                    Ok(v) => flotilla_protocol::CommandValue::HostList(Box::new(v)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                flotilla_protocol::CommandAction::QueryHostStatus { target_host } => match self.get_host_status_internal(target_host).await
-                {
-                    Ok(v) => flotilla_protocol::CommandValue::HostStatus(Box::new(v)),
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                },
-                flotilla_protocol::CommandAction::QueryHostProviders { target_host } => {
-                    match self.get_host_providers_internal(target_host).await {
-                        Ok(v) => flotilla_protocol::CommandValue::HostProviders(Box::new(v)),
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                    }
-                }
-                flotilla_protocol::CommandAction::QueryIssueOpen { .. }
-                | flotilla_protocol::CommandAction::QueryIssueFetchPage { .. }
-                | flotilla_protocol::CommandAction::QueryIssueClose { .. }
-                | flotilla_protocol::CommandAction::QueryIssueFetchByIds { .. }
-                | flotilla_protocol::CommandAction::QueryIssueOpenInBrowser { .. } => {
-                    flotilla_protocol::CommandValue::Error { message: "issue query commands should use execute_query".into() }
-                }
-                _ => unreachable!("is_query() returned true for non-query action"),
-            };
-
+            let result = flotilla_protocol::CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
                 host: self.host_name.clone(),

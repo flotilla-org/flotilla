@@ -106,7 +106,7 @@ impl IssueQueryService for GitHubIssueQueryService {
             expire_stale_cursors(&mut cursors, &mut session_map);
         }
 
-        let state = cursors.get_mut(cursor).ok_or_else(|| format!("unknown cursor: {:?}", cursor.0))?;
+        let state = cursors.get_mut(cursor).ok_or_else(|| format!("unknown cursor: {:?}", cursor.as_str()))?;
         state.last_accessed = tokio::time::Instant::now();
 
         if !state.has_more {
@@ -284,7 +284,7 @@ mod tests {
     async fn open_query_returns_valid_cursor_id() {
         let service = mock_service(vec![]);
         let cursor = service.open_query(Path::new("/repo"), IssueQuery::default(), uuid::Uuid::nil()).await.unwrap();
-        assert!(cursor.0.starts_with("gh-"), "cursor id should start with gh- prefix");
+        assert!(cursor.as_str().starts_with("gh-"), "cursor id should start with gh- prefix");
     }
 
     #[tokio::test]

@@ -267,30 +267,34 @@ impl RemoteCommandRouter {
 
     /// Close all remote cursors owned by the given client session.
     ///
-    /// Called during client disconnect. Sends `QueryIssueClose` commands
-    /// to the remote hosts that own each cursor.
+    /// Called during client disconnect. Each close command is spawned as a
+    /// fire-and-forget task — if the peer doesn't respond quickly the
+    /// cursor's expiry timer will clean it up anyway.
     pub(super) async fn disconnect_session_cursors(&self, session_id: uuid::Uuid) {
         let cursors_to_close: Vec<(CursorId, HostName)> = {
-            let map = self.remote_cursors.lock().await;
-            map.iter()
-                .filter(|(_, entry)| entry.session_id == session_id)
-                .map(|(cid, entry)| (cid.clone(), entry.target_host.clone()))
-                .collect()
+            let mut map = self.remote_cursors.lock().await;
+            let matching: Vec<CursorId> =
+                map.iter().filter(|(_, entry)| entry.session_id == session_id).map(|(cid, _)| cid.clone()).collect();
+            matching.iter().map(|cid| (cid.clone(), map.remove(cid).expect("just matched").target_host)).collect()
         };
 
         if cursors_to_close.is_empty() {
             return;
         }
 
-        debug!(%session_id, count = cursors_to_close.len(), "closing remote cursors for disconnecting client");
+        debug!(%session_id, count = cursors_to_close.len(), "closing remote cursors for disconnecting client (fire-and-forget)");
         for (cursor, target_host) in cursors_to_close {
-            let cmd = Command {
-                host: Some(target_host),
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryIssueClose { cursor },
-            };
-            let _ = self.dispatch_query(cmd, session_id).await;
+            let router = self.clone();
+            tokio::spawn(async move {
+                let cmd = Command {
+                    host: Some(target_host),
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryIssueClose { cursor },
+                };
+                // Best-effort close — expiry timer is the fallback.
+                let _ = router.dispatch_query(cmd, session_id).await;
+            });
         }
     }
 

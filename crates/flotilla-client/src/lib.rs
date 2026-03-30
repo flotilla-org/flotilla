@@ -51,6 +51,30 @@ impl Drop for SpawnLockGuard {
     }
 }
 
+/// Perform the client-side Hello handshake on a `MessageSession`.
+///
+/// Sends a `Hello` with `ConnectionRole::Client` and a fresh `session_id`,
+/// then waits for the server's Hello reply.
+async fn do_client_hello(session: &MessageSession) -> Result<(), String> {
+    let session_id = uuid::Uuid::new_v4();
+    session
+        .write(Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            host_name: HostName::new("client"),
+            session_id,
+            connection_role: Some(ConnectionRole::Client),
+            environment_id: None,
+        })
+        .await
+        .map_err(|e| format!("failed to send Hello: {e}"))?;
+
+    match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
+        Some(Message::Hello { .. }) => Ok(()),
+        Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
+        None => Err("connection closed before Hello reply".into()),
+    }
+}
+
 pub struct SocketDaemon {
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
@@ -79,25 +103,7 @@ impl SocketDaemon {
     /// The `session_id` enables cursor ownership for directed query responses.
     pub async fn connect_stateful(socket_path: &Path) -> Result<Arc<Self>, String> {
         let session = connect_unix_message_session(socket_path).await?;
-
-        let session_id = uuid::Uuid::new_v4();
-        session
-            .write(Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                host_name: HostName::new("client"),
-                session_id,
-                connection_role: Some(ConnectionRole::Client),
-                environment_id: None,
-            })
-            .await
-            .map_err(|e| format!("failed to send Hello: {e}"))?;
-
-        match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
-            Some(Message::Hello { .. }) => {}
-            Some(other) => return Err(format!("expected Hello reply, got: {other:?}")),
-            None => return Err("connection closed before Hello reply".into()),
-        }
-
+        do_client_hello(&session).await?;
         Self::from_session(session)
     }
 
@@ -105,24 +111,7 @@ impl SocketDaemon {
     /// handshake with `ConnectionRole::Client` so the server assigns cursor
     /// ownership to our `session_id`.
     pub async fn from_session_stateful(session: MessageSession) -> Result<Arc<Self>, String> {
-        let session_id = uuid::Uuid::new_v4();
-        session
-            .write(Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                host_name: HostName::new("client"),
-                session_id,
-                connection_role: Some(ConnectionRole::Client),
-                environment_id: None,
-            })
-            .await
-            .map_err(|e| format!("failed to send Hello: {e}"))?;
-
-        match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
-            Some(Message::Hello { .. }) => {}
-            Some(other) => return Err(format!("expected Hello reply, got: {other:?}")),
-            None => return Err("connection closed before Hello reply".into()),
-        }
-
+        do_client_hello(&session).await?;
         Self::from_session(session)
     }
 
@@ -661,6 +650,12 @@ impl DaemonHandle for SocketDaemon {
         }
     }
 
+    /// Execute a query command and return the result directly.
+    ///
+    /// The `session_id` parameter is ignored by `SocketDaemon` because cursor
+    /// ownership uses the Hello-handshake session_id assigned on the server
+    /// side. The parameter exists on the `DaemonHandle` trait for
+    /// `InProcessDaemon`'s use, where there is no Hello handshake.
     async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::commands::CommandValue, String> {
         match into_success_response(self.request(Request::Execute { command }).await?)? {
             Response::QueryResult { value, .. } => Ok(value),

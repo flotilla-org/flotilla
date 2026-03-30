@@ -235,7 +235,7 @@ impl Command {
             CommandAction::QueryIssueFetchPage { .. } => "query issue fetch page",
             CommandAction::QueryIssueClose { .. } => "query issue close",
             CommandAction::QueryIssueFetchByIds { .. } => "query issue fetch by ids",
-            CommandAction::QueryIssueOpenInBrowser { .. } => "Opening issue in browser...",
+            CommandAction::QueryIssueOpenInBrowser { .. } => "query issue open in browser",
             CommandAction::QueryRepoDetail { .. } => "query repo detail",
             CommandAction::QueryRepoProviders { .. } => "query repo providers",
             CommandAction::QueryRepoWork { .. } => "query repo work",
