@@ -540,7 +540,24 @@ hostname = "buildbox.example"
                     "-lc",
                     "cd '/' && exec 'env'",
                 ],
-                Ok("TERM=screen-256color\nCOLORTERM=truecolor\n".into()),
+                Ok("XDG_STATE_HOME=/var/state\nTERM=screen-256color\nCOLORTERM=truecolor\n".into()),
+            )
+            .on_run(
+                "ssh",
+                &[
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    "ControlPersist=60",
+                    "buildbox.example",
+                    "sh",
+                    "-lc",
+                    "cd '/' && exec 'cat' '/var/state/flotilla/environment-id'",
+                ],
+                Ok("buildbox-env-id\n".into()),
             )
             .build(),
     );
@@ -558,7 +575,7 @@ hostname = "buildbox.example"
     ];
     let daemon = InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::local()).await;
 
-    let remote_env_id = EnvironmentId::new("static-ssh-6275696c64626f78");
+    let remote_env_id = EnvironmentId::new("buildbox-env-id");
     let managed_ids = daemon.managed_environment_ids_for_test();
     assert!(managed_ids.contains(daemon.local_environment_id()));
     assert!(managed_ids.contains(&remote_env_id));
@@ -608,6 +625,40 @@ display_name = "Build Box"
                 ],
                 Ok(String::new()),
             )
+            .on_run(
+                "ssh",
+                &[
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    "ControlPersist=60",
+                    "buildbox.example",
+                    "sh",
+                    "-lc",
+                    "cd '/' && exec 'env'",
+                ],
+                Ok("HOME=/home/build\n".into()),
+            )
+            .on_run(
+                "ssh",
+                &[
+                    "-T",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ControlMaster=auto",
+                    "-o",
+                    "ControlPersist=60",
+                    "buildbox.example",
+                    "sh",
+                    "-lc",
+                    "cd '/' && exec 'cat' '/home/build/.local/state/flotilla/environment-id'",
+                ],
+                Ok("buildbox-visible-id\n".into()),
+            )
             .build(),
     );
 
@@ -624,7 +675,7 @@ display_name = "Build Box"
         .visible_environments
         .iter()
         .find_map(|environment| match environment {
-            EnvironmentInfo::Direct { id, display_name, .. } if id.as_str() == "static-ssh-6275696c64626f78" => {
+            EnvironmentInfo::Direct { id, display_name, .. } if id.as_str() == "buildbox-visible-id" => {
                 Some(display_name.clone())
             }
             _ => None,

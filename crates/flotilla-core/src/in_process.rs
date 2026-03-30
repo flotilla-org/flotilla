@@ -30,7 +30,7 @@ use crate::{
     daemon::DaemonHandle,
     environment_manager::EnvironmentManager,
     executor,
-    host_identity::{resolve_local_environment_state_dir, resolve_or_create_environment_id},
+    host_identity::{resolve_local_environment_state_dir, resolve_or_create_environment_id, resolve_or_create_remote_environment_id},
     host_registry::HostCounts,
     issue_cache::IssueCache,
     model::{provider_names_from_registry, repo_name, RepoModel},
@@ -105,7 +105,7 @@ async fn register_static_ssh_direct_environment(
     config_key: &str,
     environment: &StaticEnvironmentConfig,
 ) -> Result<(), String> {
-    let env_id = static_ssh_environment_id(config_key);
+    let fallback_env_id = static_ssh_environment_id(config_key);
     let runner = Arc::new(SshCommandRunner::new(environment.hostname.clone(), true, Arc::clone(&discovery.runner)));
     tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, runner.run("true", &[], Path::new("/"), &ChannelLabel::Noop))
         .await
@@ -114,6 +114,7 @@ async fn register_static_ssh_direct_environment(
     let remote_env_vars =
         tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, load_env_vars(&*runner, Path::new("/"))).await.unwrap_or_default();
     let remote_env = StaticEnvVars { vars: remote_env_vars };
+    let env_id = resolve_or_create_remote_environment_id(&*runner, &remote_env, fallback_env_id).await?;
     let mut env_bag =
         tokio::time::timeout(STATIC_SSH_REGISTRATION_TIMEOUT, run_host_detectors(&discovery.host_detectors, &*runner, &remote_env))
             .await
