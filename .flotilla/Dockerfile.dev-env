@@ -1,16 +1,69 @@
+# Omnibus dev environment for flotilla agents.
+# Includes Rust toolchain, system tools, and all agent CLIs.
+# Composition (per-agent images) is a future concern.
+
 FROM rust:1-bookworm
 
-# System tools for development
-RUN apt-get update && apt-get install -y \
+# System tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
+    openssh-client \
+    ca-certificates \
+    pkg-config \
+    libssl-dev \
+    jq \
+    zsh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install shpool (terminal pool)
+# Pinned nightly for rustfmt and coverage
+RUN rustup toolchain install nightly-2026-03-12 \
+    && rustup component add --toolchain nightly-2026-03-12 rustfmt llvm-tools-preview \
+    && rustup component add clippy
+
+# Node.js (for npm-installed agent CLIs)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Terminal session managers
 RUN cargo install shpool --locked
 
-# Working directory
+# --- Agent CLIs ---
+
+# Claude Code (direct install)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+# OpenAI Codex
+RUN npm install -g @openai/codex
+
+# Google Gemini CLI
+RUN npm install -g @google/gemini-cli
+
+# GitHub Copilot CLI
+RUN npm install -g @github/copilot
+
+# Cursor agent
+RUN curl -fsSL https://cursor.com/install | bash
+
+# PATH for agent CLIs installed to ~/.local/bin (claude, cursor)
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Config dirs that agents expect to exist
+RUN mkdir -p /root/.gemini
+
+# Default interactive shell
+SHELL ["/bin/zsh", "-c"]
+ENV SHELL=/bin/zsh
+
 WORKDIR /workspace
 
-# Keep container running
 CMD ["sleep", "infinity"]

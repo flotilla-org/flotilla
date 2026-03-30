@@ -2,3 +2,7 @@ image:
   dockerfile: .flotilla/Dockerfile.dev-env
 token_env_vars:
   - GITHUB_TOKEN
+  - ANTHROPIC_API_KEY
+  - CURSOR_API_KEY
+  - OPENAI_API_KEY
+  - GOOGLE_API_KEY
