@@ -46,19 +46,6 @@ pub(super) enum OwnedSelectedRow {
     IssueRow(IssueRow),
 }
 
-/// Spawn a fire-and-forget `QueryIssueClose` so the server-side cursor is released.
-fn spawn_close_cursor(daemon: &Arc<dyn DaemonHandle>, cursor: &flotilla_protocol::issue_query::CursorId, session_id: uuid::Uuid) {
-    let daemon = daemon.clone();
-    let cursor = cursor.clone();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(async move {
-            let cmd =
-                Command { action: CommandAction::QueryIssueClose { cursor }, host: None, provisioning_target: None, context_repo: None };
-            let _ = daemon.execute_query(cmd, session_id).await;
-        });
-    }
-}
-
 /// Per-provider auth/health status from last refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderStatus {
@@ -301,14 +288,13 @@ pub struct App {
     /// Per-repo shared data handles. Written by `apply_snapshot()`/`apply_delta()`,
     /// read by `RepoPage` widgets during reconciliation and rendering.
     pub repo_data: HashMap<RepoIdentity, Shared<RepoData>>,
-    /// Per-repo issue cursor state, driven by `IssueQueryService`.
+    /// Per-repo issue paging state, driven by stateless queries.
     pub issue_views: HashMap<RepoIdentity, issue_view::IssueViewState>,
     /// Sender half for background issue query tasks. Cloned into spawned tasks.
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
     /// Receiver half, drained each event-loop iteration.
     pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
-    /// Client session ID for cursor ownership. Passed to `execute_query` so
-    /// the daemon can associate cursors with this session for disconnect cleanup.
+    /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
 }
 
@@ -522,177 +508,96 @@ impl App {
     }
 
     pub(crate) fn drain_background_updates(&mut self) {
-        use issue_view::{IssueCursorState, IssueQueryUpdate};
+        use issue_view::{IssuePagingState, IssueQueryUpdate};
 
         while let Ok(update) = self.issue_update_rx.try_recv() {
             match update {
-                IssueQueryUpdate::DefaultCursorOpened { repo, cursor } => {
+                IssueQueryUpdate::PageFetched { repo, params, page } => {
+                    let is_search = params.search.is_some();
                     let view = self.issue_views.entry(repo.clone()).or_default();
-                    view.default = Some(IssueCursorState {
-                        cursor: cursor.clone(),
-                        items: Vec::new(),
-                        total: None,
-                        has_more: true,
-                        fetch_pending: true,
-                    });
-                    // Immediately fetch the first page.
-                    self.spawn_fetch_page(repo, cursor, 50);
-                }
-                IssueQueryUpdate::SearchCursorOpened { repo, cursor, query } => {
-                    let view = self.issue_views.entry(repo.clone()).or_default();
-                    // Close the old search cursor before replacing it.
-                    if let Some(old) = &view.search {
-                        spawn_close_cursor(&self.daemon, &old.cursor, self.session_id);
-                    }
-                    view.search = Some(IssueCursorState {
-                        cursor: cursor.clone(),
-                        items: Vec::new(),
-                        total: None,
-                        has_more: true,
-                        fetch_pending: true,
-                    });
-                    view.search_query = Some(query);
-                    // Immediately fetch the first page.
-                    self.spawn_fetch_page(repo, cursor, 50);
-                }
-                IssueQueryUpdate::PageFetched { repo, cursor, page } => {
-                    if let Some(view) = self.issue_views.get_mut(&repo) {
-                        // Match cursor to search or default.
-                        let target = if view.search.as_ref().is_some_and(|s| s.cursor == cursor) {
-                            view.search.as_mut()
-                        } else if view.default.as_ref().is_some_and(|d| d.cursor == cursor) {
-                            view.default.as_mut()
-                        } else {
-                            None
-                        };
-                        if let Some(cursor_state) = target {
-                            cursor_state.append_page(page);
+                    let target = if is_search {
+                        if view.search.is_none() {
+                            view.search = Some(IssuePagingState::new(params.clone()));
+                            view.search_query = params.search.clone();
                         }
-                        // Push updated issue items into Shared<RepoData>.
-                        self.push_issue_items_to_repo_data(&repo);
+                        view.search.as_mut()
+                    } else {
+                        if view.default.is_none() {
+                            view.default = Some(IssuePagingState::new(params.clone()));
+                        }
+                        view.default.as_mut()
+                    };
+                    if let Some(state) = target {
+                        state.append_page(page);
                     }
+                    self.push_issue_items_to_repo_data(&repo);
                 }
                 IssueQueryUpdate::QueryFailed { repo, message, is_search } => {
                     tracing::warn!(%message, %is_search, "issue query failed");
                     self.set_status_message(Some(message));
                     if is_search {
-                        // Close the (possibly partially-opened) search cursor, then revert to the default listing.
                         if let Some(view) = self.issue_views.get_mut(&repo) {
-                            if let Some(old) = &view.search {
-                                spawn_close_cursor(&self.daemon, &old.cursor, self.session_id);
-                            }
                             view.search = None;
                             view.search_query = None;
                         }
                         self.push_issue_items_to_repo_data(&repo);
                     } else {
-                        // Remove the entry so `maybe_open_default_issue_cursor`
-                        // can retry on the next snapshot.
                         self.issue_views.remove(&repo);
-                    }
-                }
-                IssueQueryUpdate::PageFetchFailed { repo, cursor, message } => {
-                    tracing::warn!(%message, "issue page fetch failed");
-                    self.set_status_message(Some(message));
-                    if let Some(view) = self.issue_views.get_mut(&repo) {
-                        // Clear fetch_pending on the matching cursor so the user
-                        // can scroll to trigger a retry.
-                        let target = if view.search.as_ref().is_some_and(|s| s.cursor == cursor) {
-                            view.search.as_mut()
-                        } else if view.default.as_ref().is_some_and(|d| d.cursor == cursor) {
-                            view.default.as_mut()
-                        } else {
-                            None
-                        };
-                        if let Some(cursor_state) = target {
-                            cursor_state.fetch_pending = false;
-                        }
                     }
                 }
             }
         }
     }
 
-    /// Spawn a background task to fetch one page of issue results.
-    fn spawn_fetch_page(&self, repo: RepoIdentity, cursor: flotilla_protocol::issue_query::CursorId, count: usize) {
+    /// Spawn a background task to query one page of issue results.
+    fn spawn_query_page(&self, repo: RepoIdentity, params: flotilla_protocol::issue_query::IssueQuery, page: u32, count: usize) {
         let daemon = self.daemon.clone();
         let tx = self.issue_update_tx.clone();
         let session_id = self.session_id;
+        let params_clone = params.clone();
         tokio::spawn(async move {
             let cmd = Command {
                 host: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryIssueFetchPage { cursor: cursor.clone(), count },
+                action: CommandAction::QueryIssues {
+                    repo: RepoSelector::Identity(repo.clone()),
+                    params: params_clone.clone(),
+                    page,
+                    count,
+                },
             };
             match daemon.execute_query(cmd, session_id).await {
-                Ok(CommandValue::IssuePage(page)) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched { repo, cursor, page });
+                Ok(CommandValue::IssuePage(result_page)) => {
+                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched { repo, params: params_clone, page: result_page });
                 }
                 Ok(other) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetchFailed {
+                    let _ = tx.send(issue_view::IssueQueryUpdate::QueryFailed {
                         repo,
-                        cursor,
                         message: format!("unexpected query result: {other:?}"),
+                        is_search: params_clone.search.is_some(),
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetchFailed { repo, cursor, message: e });
+                    let _ =
+                        tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo, message: e, is_search: params_clone.search.is_some() });
                 }
             }
         });
     }
 
-    /// Open a default issue cursor for a repo if one hasn't been opened yet.
-    fn maybe_open_default_issue_cursor(&self, repo_identity: &RepoIdentity) {
-        // Only open if there is no valid default cursor yet. Checking the inner
-        // `default` field (rather than the map key) allows retry after a
-        // previous failure removed the cursor state.
+    /// Fetch default issues for a repo if they haven't been fetched yet.
+    fn maybe_fetch_default_issues(&self, repo_identity: &RepoIdentity) {
         if self.issue_views.get(repo_identity).and_then(|v| v.default.as_ref()).is_some() {
             return;
         }
-        // Remote-only repos have no local issue query service. Service-targeted
-        // routing to the owning host is future work; skip for now.
         if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
             return;
         }
-        // Guard: only spawn when inside a tokio runtime (unit tests that call
-        // apply_snapshot directly may not have one).
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let daemon = self.daemon.clone();
-        let tx = self.issue_update_tx.clone();
-        let repo_id = repo_identity.clone();
-        let session_id = self.session_id;
-        let cmd = Command {
-            host: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::QueryIssueOpen {
-                repo: RepoSelector::Identity(repo_id.clone()),
-                params: flotilla_protocol::issue_query::IssueQuery::default(),
-            },
-        };
-        tokio::spawn(async move {
-            match daemon.execute_query(cmd, session_id).await {
-                Ok(CommandValue::IssueQueryOpened { cursor }) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::DefaultCursorOpened { repo: repo_id, cursor });
-                }
-                Ok(other) => {
-                    tracing::debug!(repo = %repo_id.path, ?other, "default issue cursor open: unexpected result");
-                    let _ = tx.send(issue_view::IssueQueryUpdate::QueryFailed {
-                        repo: repo_id,
-                        message: format!("unexpected query result: {other:?}"),
-                        is_search: false,
-                    });
-                }
-                Err(e) => {
-                    tracing::debug!(repo = %repo_id.path, %e, "default issue cursor open failed (expected when no issue provider)");
-                    let _ = tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo: repo_id, message: e, is_search: false });
-                }
-            }
-        });
+        self.spawn_query_page(repo_identity.clone(), flotilla_protocol::issue_query::IssueQuery::default(), 1, 50);
     }
 
     /// Push issue rows from `IssueViewState` into the `Shared<RepoData>` for
@@ -911,11 +816,7 @@ impl App {
                     if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
                         page.active_search_query = None;
                     }
-                    // Close the server-side search cursor and revert to the default listing.
                     if let Some(view) = self.issue_views.get_mut(&repo) {
-                        if let Some(old) = &view.search {
-                            spawn_close_cursor(&self.daemon, &old.cursor, self.session_id);
-                        }
                         view.search = None;
                         view.search_query = None;
                     }
@@ -933,19 +834,24 @@ impl App {
             DaemonEvent::RepoDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
-            DaemonEvent::CommandStarted { command_id, repo_identity, repo, description, .. } => {
-                tracing::info!(%command_id, %description, "command started");
+            DaemonEvent::CommandStarted { command_id, host, repo_identity, repo, description, .. } => {
+                tracing::info!(%command_id, %host, %description, repo = %repo_identity.path, "command started");
                 let repo = repo
                     .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
                     .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
                 self.in_flight.insert(command_id, InFlightCommand { repo_identity, repo, description });
             }
             DaemonEvent::CommandFinished { command_id, host: _, repo_identity: _, repo: _, result, .. } => {
-                if let Some(_cmd) = self.in_flight.remove(&command_id) {
-                    tracing::info!(%command_id, "command finished");
+                if let Some(cmd) = self.in_flight.remove(&command_id) {
                     let error_message = match &result {
-                        CommandValue::Error { message } => Some(message.clone()),
-                        _ => None,
+                        CommandValue::Error { message } => {
+                            tracing::warn!(%command_id, description = %cmd.description, error = %message, "command failed");
+                            Some(message.clone())
+                        }
+                        _ => {
+                            tracing::info!(%command_id, description = %cmd.description, "command finished");
+                            None
+                        }
                     };
                     executor::handle_result(result, self);
 
@@ -971,20 +877,22 @@ impl App {
                     }
                 }
             }
-            DaemonEvent::CommandStepUpdate { command_id, description, step_index, step_count, status, .. } => {
+            DaemonEvent::CommandStepUpdate { command_id, description, step_index, step_count, status, host, .. } => {
                 if let Some(cmd) = self.in_flight.get_mut(&command_id) {
+                    let step_label = format!("{}/{}", step_index + 1, step_count);
                     match status {
                         StepStatus::Started => {
-                            cmd.description = format!("{} ({}/{})", description, step_index + 1, step_count);
+                            tracing::info!(%command_id, %host, step = %step_label, %description, "step started");
+                            cmd.description = format!("{} ({})", description, step_label);
                         }
                         StepStatus::Skipped => {
-                            tracing::info!(%command_id, %description, "step skipped");
+                            tracing::info!(%command_id, %host, step = %step_label, %description, "step skipped");
                         }
                         StepStatus::Succeeded => {
-                            tracing::info!(%command_id, %description, "step succeeded");
+                            tracing::info!(%command_id, %host, step = %step_label, %description, "step succeeded");
                         }
                         StepStatus::Failed { ref message } => {
-                            tracing::warn!(%command_id, %description, error = %message, "step failed");
+                            tracing::warn!(%command_id, %host, step = %step_label, %description, error = %message, "step failed");
                             self.set_status_message(Some(format!("{description}: {message}")));
                         }
                     }
@@ -1079,8 +987,8 @@ impl App {
         // Log and display errors (clears status when errors resolve)
         self.set_status_message(format_error_status(&snap.errors, &path));
 
-        // On first snapshot for a repo, open a default issue cursor.
-        self.maybe_open_default_issue_cursor(&repo_identity);
+        // On first snapshot for a repo, fetch default issues.
+        self.maybe_fetch_default_issues(&repo_identity);
     }
 
     fn apply_delta(&mut self, delta: RepoDelta) {

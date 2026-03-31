@@ -149,10 +149,10 @@ fn dispatch_action_confirm_submits_issue_search() {
     assert_eq!(active_search_query(&app), Some("bug fix"));
     let (cmd, _) = app.proto_commands.take_next().expect("expected search command");
     match cmd {
-        Command { action: CommandAction::QueryIssueOpen { params, .. }, .. } => {
+        Command { action: CommandAction::QueryIssues { params, .. }, .. } => {
             assert_eq!(params.search.as_deref(), Some("bug fix"));
         }
-        other => panic!("expected QueryIssueOpen, got {:?}", other),
+        other => panic!("expected QueryIssues, got {:?}", other),
     }
 }
 
@@ -935,10 +935,10 @@ fn issue_search_enter_submits_query() {
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     let (cmd, _) = app.proto_commands.take_next().unwrap();
     match cmd {
-        Command { action: CommandAction::QueryIssueOpen { params, .. }, .. } => {
+        Command { action: CommandAction::QueryIssues { params, .. }, .. } => {
             assert_eq!(params.search.as_deref(), Some("bug fix"));
         }
-        other => panic!("expected QueryIssueOpen, got {:?}", other),
+        other => panic!("expected QueryIssues, got {:?}", other),
     }
 }
 

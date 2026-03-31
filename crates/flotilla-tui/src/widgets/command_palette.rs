@@ -166,9 +166,11 @@ impl CommandPaletteWidget {
                         host: None,
                         provisioning_target: None,
                         context_repo: None,
-                        action: CommandAction::QueryIssueOpen {
+                        action: CommandAction::QueryIssues {
                             repo: RepoSelector::Identity(repo_identity.clone()),
                             params: flotilla_protocol::issue_query::IssueQuery { search: Some(query.clone()) },
+                            page: 1,
+                            count: 50,
                         },
                     };
                     ctx.commands.push(cmd);
@@ -343,7 +345,7 @@ pub fn refresh_dir_listing_standalone(path_str: &str, model: &crate::app::TuiMod
 fn fill_repo_sentinels(action: &mut CommandAction, repo: RepoSelector) {
     match action {
         CommandAction::Checkout { repo: r, .. } if *r == RepoSelector::Query(String::new()) => *r = repo,
-        CommandAction::QueryIssueOpen { repo: r, .. } if *r == RepoSelector::Query(String::new()) => *r = repo,
+        CommandAction::QueryIssues { repo: r, .. } if *r == RepoSelector::Query(String::new()) => *r = repo,
         _ => {}
     }
 }
@@ -656,12 +658,12 @@ mod tests {
         let outcome = widget.handle_action(Action::Confirm, &mut ctx);
         assert!(matches!(outcome, Outcome::Finished));
 
-        let (cmd, _) = harness.commands.take_next().expect("expected QueryIssueOpen command");
+        let (cmd, _) = harness.commands.take_next().expect("expected QueryIssues command");
         match cmd {
-            Command { action: CommandAction::QueryIssueOpen { params, .. }, .. } => {
+            Command { action: CommandAction::QueryIssues { params, .. }, .. } => {
                 assert_eq!(params.search.as_deref(), Some("bug fix"));
             }
-            other => panic!("expected QueryIssueOpen, got {:?}", other),
+            other => panic!("expected QueryIssues, got {:?}", other),
         }
     }
 

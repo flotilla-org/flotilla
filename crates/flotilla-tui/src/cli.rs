@@ -294,9 +294,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ImageEnsured { image } => format!("image ensured: {image}"),
         CommandValue::EnvironmentCreated { env_id } => format!("environment created: {env_id}"),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),
-        CommandValue::IssueQueryOpened { cursor } => format!("issue query opened: {}", cursor.as_str()),
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
-        CommandValue::IssueQueryClosed => "issue query closed".to_string(),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
     }
 }

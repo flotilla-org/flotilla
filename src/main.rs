@@ -383,7 +383,7 @@ fn inject_repo_context(cmd: &mut Command, cli: &Cli) -> Result<()> {
         CommandAction::Checkout { repo, .. } if *repo == RepoSelector::Query(String::new()) => {
             *repo = repo_selector.ok_or_else(|| color_eyre::eyre::eyre!("checkout create requires --repo or FLOTILLA_REPO"))?;
         }
-        CommandAction::QueryIssueOpen { repo, .. } if *repo == RepoSelector::Query(String::new()) => {
+        CommandAction::QueryIssues { repo, .. } if *repo == RepoSelector::Query(String::new()) => {
             *repo = repo_selector.clone().ok_or_else(|| color_eyre::eyre::eyre!("issue search requires --repo or FLOTILLA_REPO"))?;
             cmd.context_repo = repo_selector;
         }
