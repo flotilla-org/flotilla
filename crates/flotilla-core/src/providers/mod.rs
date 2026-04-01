@@ -78,6 +78,8 @@ impl ChannelLabeler for TaskId {
 pub(crate) const REPLAY_LABELS_ENABLED: bool = cfg!(any(test, feature = "replay"));
 pub(crate) const INSTALL_MANAGED_SCRIPT: &str = include_str!("scripts/install_managed_script.sh");
 pub(crate) const INSTALL_MANAGED_SCRIPT_BOOTSTRAP_NAME: &str = "flotilla-bootstrap-install-managed-script";
+pub(crate) const FLOTILLA_HELPER_NAME: &str = "flotilla-helper";
+pub(crate) const FLOTILLA_HELPER_SCRIPT: &str = include_str!("scripts/flotilla_helper.sh");
 
 #[inline]
 pub(crate) fn noop_channel_label() -> ChannelLabel {

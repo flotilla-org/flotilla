@@ -3,7 +3,10 @@ use std::{path::Path, sync::Arc};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::providers::{helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::{
+    helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME,
+    FLOTILLA_HELPER_SCRIPT,
+};
 
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. The caller's working directory (a path inside the container)
@@ -17,9 +20,6 @@ impl EnvironmentRunner {
     pub fn new(container_name: String, inner: Arc<dyn CommandRunner>) -> Self {
         Self { container_name, inner }
     }
-
-    const FLOTILLA_HELPER_NAME: &str = "flotilla-helper";
-    const FLOTILLA_HELPER_SCRIPT: &str = include_str!("../scripts/flotilla_helper.sh");
 
     fn docker_exec_prefix(&self) -> Vec<&str> {
         vec!["exec", &self.container_name]
@@ -50,14 +50,9 @@ impl CommandRunner for EnvironmentRunner {
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
         let path_str = path.to_string_lossy().into_owned();
-        let helper_path = install_managed_helper_script(
-            &*self.inner,
-            "docker",
-            &self.docker_exec_prefix(),
-            Self::FLOTILLA_HELPER_NAME,
-            Self::FLOTILLA_HELPER_SCRIPT,
-        )
-        .await?;
+        let helper_path =
+            install_managed_helper_script(&*self.inner, "docker", &self.docker_exec_prefix(), FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT)
+                .await?;
         let mut owned_args: Vec<String> = self.docker_exec_prefix().into_iter().map(str::to_string).collect();
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);

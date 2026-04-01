@@ -3,7 +3,10 @@ use std::{path::Path, sync::Arc};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::providers::{helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::{
+    helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME,
+    FLOTILLA_HELPER_SCRIPT,
+};
 
 /// Command runner that executes commands on a remote host over SSH.
 ///
@@ -19,9 +22,6 @@ impl SshCommandRunner {
     pub fn new(destination: impl Into<String>, multiplex: bool, runner: Arc<dyn CommandRunner>) -> Self {
         Self { destination: destination.into(), multiplex, runner }
     }
-
-    const FLOTILLA_HELPER_NAME: &str = "flotilla-helper";
-    const FLOTILLA_HELPER_SCRIPT: &str = include_str!("scripts/flotilla_helper.sh");
 
     fn ssh_prefix_args(&self) -> Vec<&str> {
         let mut args = vec!["-T", "-o", "BatchMode=yes"];
@@ -76,14 +76,9 @@ impl CommandRunner for SshCommandRunner {
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
         let path_str = path.to_string_lossy().into_owned();
-        let helper_path = install_managed_helper_script(
-            &*self.runner,
-            "ssh",
-            &self.ssh_prefix_args(),
-            Self::FLOTILLA_HELPER_NAME,
-            Self::FLOTILLA_HELPER_SCRIPT,
-        )
-        .await?;
+        let helper_path =
+            install_managed_helper_script(&*self.runner, "ssh", &self.ssh_prefix_args(), FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT)
+                .await?;
         let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
         let mut owned_args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
