@@ -510,7 +510,7 @@ mod tests {
                 action: CommandAction::QueryIssues {
                     repo: RepoSelector::Query("test".into()),
                     params: crate::issue_query::IssueQuery::default(),
-                    page: 0,
+                    page: 1,
                     count: 50,
                 },
             },
@@ -893,7 +893,7 @@ mod tests {
                 action: CommandAction::QueryIssues {
                     repo: RepoSelector::Query("test".into()),
                     params: crate::issue_query::IssueQuery::default(),
-                    page: 0,
+                    page: 1,
                     count: 50,
                 },
             },

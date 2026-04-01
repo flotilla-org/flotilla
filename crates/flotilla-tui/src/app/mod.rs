@@ -540,14 +540,27 @@ impl App {
                 IssueQueryUpdate::QueryFailed { repo, message, is_search } => {
                     tracing::warn!(%message, %is_search, "issue query failed");
                     self.set_status_message(Some(message));
+                    // Clear fetch_pending so the user can retry by scrolling,
+                    // but preserve already-loaded results. Only remove the
+                    // entire view if there's no paging state at all (i.e. the
+                    // very first page failed).
                     if is_search {
                         if let Some(view) = self.issue_views.get_mut(&repo) {
-                            view.search = None;
-                            view.search_query = None;
+                            match view.search.as_mut() {
+                                Some(state) => state.fetch_pending = false,
+                                None => {
+                                    view.search_query = None;
+                                    self.push_issue_items_to_repo_data(&repo);
+                                }
+                            }
                         }
-                        self.push_issue_items_to_repo_data(&repo);
-                    } else {
-                        self.issue_views.remove(&repo);
+                    } else if let Some(view) = self.issue_views.get_mut(&repo) {
+                        match view.default.as_mut() {
+                            Some(state) => state.fetch_pending = false,
+                            None => {
+                                self.issue_views.remove(&repo);
+                            }
+                        }
                     }
                 }
             }
@@ -555,6 +568,12 @@ impl App {
     }
 
     /// Spawn a background task to query one page of issue results.
+    ///
+    /// Currently always queries the local daemon (`host: None`). Remote-only
+    /// repos are skipped in `maybe_fetch_default_issues` and the search widgets
+    /// don't set a host. If future code paths need to query a remote host's
+    /// issues, this method (or the executor interception) will need to forward
+    /// the original `Command.host`.
     fn spawn_query_page(&self, repo: RepoIdentity, params: flotilla_protocol::issue_query::IssueQuery, page: u32, count: usize) {
         let daemon = self.daemon.clone();
         let tx = self.issue_update_tx.clone();
