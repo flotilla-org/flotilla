@@ -184,10 +184,8 @@ impl App {
         if flat_idx + 5 >= total_items {
             let params = active.params.clone();
             let next_page = active.next_page;
-            if let Some(view) = self.issue_views.get_mut(&repo_identity) {
-                if let Some(c) = view.active_mut() {
-                    c.fetch_pending = true;
-                }
+            if !self.begin_issue_page_fetch(&repo_identity, &params, next_page) {
+                return;
             }
             self.spawn_query_page(repo_identity, params, next_page, 50);
         }

@@ -1634,7 +1634,7 @@ fn set_search_query_resets_search_paging_state() {
 fn stale_search_results_discarded_by_drain() {
     use flotilla_protocol::issue_query::{IssueQuery, IssueResultPage};
 
-    use crate::app::issue_view::{IssueQueryUpdate, IssueViewState};
+    use crate::app::issue_view::{IssuePagingState, IssueQueryUpdate, IssueViewState};
 
     let mut app = stub_app();
     let repo = app.model.repo_order[0].clone();
@@ -1642,6 +1642,14 @@ fn stale_search_results_discarded_by_drain() {
     // Set up: user has searched for "beta" (search_query is set).
     let mut view = IssueViewState::new();
     view.search_query = Some("beta".into());
+    view.search = Some(IssuePagingState {
+        params: IssueQuery { search: Some("beta".into()) },
+        items: vec![],
+        next_page: 1,
+        total: None,
+        has_more: true,
+        fetch_pending: true,
+    });
     app.issue_views.insert(repo.clone(), view);
 
     // A stale result from an earlier "alpha" search arrives.
@@ -1649,6 +1657,7 @@ fn stale_search_results_discarded_by_drain() {
         .send(IssueQueryUpdate::PageFetched {
             repo: repo.clone(),
             params: IssueQuery { search: Some("alpha".into()) },
+            requested_page: 1,
             page: IssueResultPage {
                 items: vec![("stale".into(), flotilla_protocol::provider_data::Issue {
                     title: "Stale alpha result".into(),
@@ -1668,6 +1677,7 @@ fn stale_search_results_discarded_by_drain() {
         .send(IssueQueryUpdate::PageFetched {
             repo: repo.clone(),
             params: IssueQuery { search: Some("beta".into()) },
+            requested_page: 1,
             page: IssueResultPage {
                 items: vec![("fresh".into(), flotilla_protocol::provider_data::Issue {
                     title: "Fresh beta result".into(),

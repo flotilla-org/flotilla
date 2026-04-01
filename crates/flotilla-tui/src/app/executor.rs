@@ -28,6 +28,9 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
                 return;
             }
         };
+        if !app.begin_issue_page_fetch(&repo_identity, &params, page) {
+            return;
+        }
         app.spawn_query_page(repo_identity, params, page, count);
         return;
     }
