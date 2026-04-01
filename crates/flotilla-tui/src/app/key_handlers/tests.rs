@@ -1557,6 +1557,140 @@ fn command_palette_enter_dispatches_action() {
     );
 }
 
+// ── Issue query routing and stale-result filtering ──────────────
+
+#[test]
+fn query_issues_command_intercepted_by_executor_dispatch() {
+    // QueryIssues must NOT be dispatched through daemon.execute() — it should
+    // be intercepted by executor::dispatch() and routed through spawn_query_page.
+    // The stub daemon's execute() would succeed but the real socket client would
+    // fail because execute() expects Response::Execute, not Response::QueryResult.
+    //
+    // We verify this by checking that after handle_key submits the search,
+    // the proto_commands queue is drained but no command_id appears in
+    // in_flight (spawn_query_page is fire-and-forget, not tracked as in-flight).
+    let mut app = stub_app();
+    push_issue_search_widget_with_text(&mut app, "routing test");
+    app.handle_key(key(KeyCode::Enter));
+
+    // The command was queued by the widget.
+    let (cmd, _) = app.proto_commands.take_next().expect("expected QueryIssues command");
+    assert!(matches!(cmd.action, CommandAction::QueryIssues { .. }));
+
+    // Simulate the event loop: dispatch through executor.
+    // spawn_query_page requires a tokio runtime but won't block — it spawns
+    // a task that will fail (stub daemon). We just need to verify the
+    // interception path runs without error.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        crate::app::executor::dispatch(cmd, &mut app, None).await;
+    });
+
+    // Key assertion: no in-flight command was recorded. If the command had
+    // gone through daemon.execute() it would have produced a command_id.
+    assert!(app.in_flight.is_empty(), "QueryIssues should not create an in-flight command");
+    assert!(app.model.status_message.is_none(), "dispatch should not set an error");
+}
+
+#[test]
+fn set_search_query_resets_search_paging_state() {
+    use flotilla_protocol::issue_query::IssueQuery;
+
+    use crate::app::issue_view::{IssuePagingState, IssueViewState};
+
+    let mut app = stub_app();
+    let repo = app.model.repo_order[0].clone();
+
+    // Simulate an existing search for "alpha" with accumulated results.
+    let mut view = IssueViewState::new();
+    view.search_query = Some("alpha".into());
+    view.search = Some(IssuePagingState {
+        params: IssueQuery { search: Some("alpha".into()) },
+        items: vec![("1".into(), flotilla_protocol::provider_data::Issue {
+            title: "Alpha result".into(),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: "gh".into(),
+            provider_display_name: "GitHub".into(),
+        })],
+        next_page: 2,
+        total: Some(10),
+        has_more: true,
+        fetch_pending: false,
+    });
+    app.issue_views.insert(repo.clone(), view);
+
+    // Now start a new search for "beta" — this triggers SetSearchQuery.
+    push_issue_search_widget_with_text(&mut app, "beta");
+    app.handle_key(key(KeyCode::Enter));
+
+    // SetSearchQuery should have reset the search paging state.
+    let view = app.issue_views.get(&repo).expect("view should exist");
+    assert_eq!(view.search_query.as_deref(), Some("beta"), "search_query should be updated to new query");
+    assert!(view.search.is_none(), "search paging state should be reset for the new query");
+}
+
+#[test]
+fn stale_search_results_discarded_by_drain() {
+    use flotilla_protocol::issue_query::{IssueQuery, IssueResultPage};
+
+    use crate::app::issue_view::{IssueQueryUpdate, IssueViewState};
+
+    let mut app = stub_app();
+    let repo = app.model.repo_order[0].clone();
+
+    // Set up: user has searched for "beta" (search_query is set).
+    let mut view = IssueViewState::new();
+    view.search_query = Some("beta".into());
+    app.issue_views.insert(repo.clone(), view);
+
+    // A stale result from an earlier "alpha" search arrives.
+    app.issue_update_tx
+        .send(IssueQueryUpdate::PageFetched {
+            repo: repo.clone(),
+            params: IssueQuery { search: Some("alpha".into()) },
+            page: IssueResultPage {
+                items: vec![("stale".into(), flotilla_protocol::provider_data::Issue {
+                    title: "Stale alpha result".into(),
+                    labels: vec![],
+                    association_keys: vec![],
+                    provider_name: "gh".into(),
+                    provider_display_name: "GitHub".into(),
+                })],
+                total: Some(1),
+                has_more: false,
+            },
+        })
+        .expect("send");
+
+    // A matching result for "beta" also arrives.
+    app.issue_update_tx
+        .send(IssueQueryUpdate::PageFetched {
+            repo: repo.clone(),
+            params: IssueQuery { search: Some("beta".into()) },
+            page: IssueResultPage {
+                items: vec![("fresh".into(), flotilla_protocol::provider_data::Issue {
+                    title: "Fresh beta result".into(),
+                    labels: vec![],
+                    association_keys: vec![],
+                    provider_name: "gh".into(),
+                    provider_display_name: "GitHub".into(),
+                })],
+                total: Some(1),
+                has_more: false,
+            },
+        })
+        .expect("send");
+
+    app.drain_background_updates();
+
+    let view = app.issue_views.get(&repo).expect("view should exist");
+    let search = view.search.as_ref().expect("search state should exist from beta result");
+    assert_eq!(search.items.len(), 1, "only the matching beta result should be present");
+    assert_eq!(search.items[0].0, "fresh", "the stale alpha result should have been discarded");
+    assert_eq!(search.items[0].1.title, "Fresh beta result");
+}
+
 #[test]
 fn command_palette_esc_dismisses() {
     let mut app = stub_app();
