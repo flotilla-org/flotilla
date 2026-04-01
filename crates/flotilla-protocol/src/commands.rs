@@ -921,7 +921,7 @@ mod tests {
         let cmd = CommandAction::QueryIssues {
             repo: RepoSelector::Query("test".into()),
             params: crate::issue_query::IssueQuery::default(),
-            page: 0,
+            page: 1,
             count: 50,
         };
         assert_json_roundtrip(&cmd);
