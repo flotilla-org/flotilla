@@ -79,9 +79,9 @@ impl IssueViewState {
 /// Background update messages from spawned query tasks back to the event loop.
 pub enum IssueQueryUpdate {
     /// A page of results arrived.
-    PageFetched { repo: flotilla_protocol::RepoIdentity, params: IssueQuery, page: IssueResultPage },
+    PageFetched { repo: flotilla_protocol::RepoIdentity, params: IssueQuery, requested_page: u32, page: IssueResultPage },
     /// A query request failed.
-    QueryFailed { repo: flotilla_protocol::RepoIdentity, message: String, is_search: bool },
+    QueryFailed { repo: flotilla_protocol::RepoIdentity, params: IssueQuery, requested_page: u32, message: String },
 }
 
 #[cfg(test)]

@@ -508,63 +508,106 @@ impl App {
     }
 
     pub(crate) fn drain_background_updates(&mut self) {
-        use issue_view::{IssuePagingState, IssueQueryUpdate};
+        use issue_view::IssueQueryUpdate;
 
         while let Ok(update) = self.issue_update_rx.try_recv() {
             match update {
-                IssueQueryUpdate::PageFetched { repo, params, page } => {
-                    let is_search = params.search.is_some();
-                    let view = self.issue_views.entry(repo.clone()).or_default();
-                    let target = if is_search {
+                IssueQueryUpdate::PageFetched { repo, params, requested_page, page } => {
+                    let Some(view) = self.issue_views.get_mut(&repo) else { continue };
+                    let target = if params.search.is_some() {
                         // Discard results from a stale search — the user may
                         // have started a new search or cleared while this was
                         // in flight.
                         if view.search_query != params.search {
                             continue;
                         }
-                        if view.search.is_none() {
-                            view.search = Some(IssuePagingState::new(params.clone()));
-                        }
                         view.search.as_mut()
                     } else {
-                        if view.default.is_none() {
-                            view.default = Some(IssuePagingState::new(params.clone()));
-                        }
                         view.default.as_mut()
                     };
-                    if let Some(state) = target {
-                        state.append_page(page);
+                    let Some(state) = target else { continue };
+                    if state.params != params || state.next_page != requested_page || !state.fetch_pending {
+                        continue;
                     }
+                    state.append_page(page);
                     self.push_issue_items_to_repo_data(&repo);
                 }
-                IssueQueryUpdate::QueryFailed { repo, message, is_search } => {
-                    tracing::warn!(%message, %is_search, "issue query failed");
+                IssueQueryUpdate::QueryFailed { repo, params, requested_page, message } => {
+                    tracing::warn!(%message, requested_page, is_search = params.search.is_some(), "issue query failed");
+                    let mut restore_default_rows = false;
+                    let mut remove_default_state = false;
+                    let mut clear_search_ui = false;
+                    if let Some(view) = self.issue_views.get_mut(&repo) {
+                        let target = if params.search.is_some() {
+                            if view.search_query != params.search {
+                                continue;
+                            }
+                            view.search.as_mut()
+                        } else {
+                            view.default.as_mut()
+                        };
+                        let Some(state) = target else { continue };
+                        if state.params != params || state.next_page != requested_page || !state.fetch_pending {
+                            continue;
+                        }
+                        if requested_page == 1 && state.items.is_empty() {
+                            if params.search.is_some() {
+                                view.search = None;
+                                view.search_query = None;
+                                restore_default_rows = true;
+                                clear_search_ui = true;
+                            } else {
+                                remove_default_state = true;
+                            }
+                        } else {
+                            state.fetch_pending = false;
+                        }
+                    } else {
+                        continue;
+                    }
                     self.set_status_message(Some(message));
-                    // Clear fetch_pending so the user can retry by scrolling,
-                    // but preserve already-loaded results. Only remove the
-                    // entire view if there's no paging state at all (i.e. the
-                    // very first page failed).
-                    if is_search {
+                    if remove_default_state {
                         if let Some(view) = self.issue_views.get_mut(&repo) {
-                            match view.search.as_mut() {
-                                Some(state) => state.fetch_pending = false,
-                                None => {
-                                    view.search_query = None;
-                                    self.push_issue_items_to_repo_data(&repo);
-                                }
-                            }
+                            view.default = None;
                         }
-                    } else if let Some(view) = self.issue_views.get_mut(&repo) {
-                        match view.default.as_mut() {
-                            Some(state) => state.fetch_pending = false,
-                            None => {
-                                self.issue_views.remove(&repo);
-                            }
+                    }
+                    if clear_search_ui {
+                        if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
+                            page.active_search_query = None;
                         }
+                    }
+                    if restore_default_rows {
+                        self.push_issue_items_to_repo_data(&repo);
                     }
                 }
             }
         }
+    }
+
+    fn begin_issue_page_fetch(&mut self, repo: &RepoIdentity, params: &flotilla_protocol::issue_query::IssueQuery, page: u32) -> bool {
+        let view = self.issue_views.entry(repo.clone()).or_default();
+        let target = if params.search.is_some() {
+            if view.search_query != params.search {
+                return false;
+            }
+            &mut view.search
+        } else {
+            &mut view.default
+        };
+
+        if target.is_none() {
+            if page != 1 {
+                return false;
+            }
+            *target = Some(issue_view::IssuePagingState::new(params.clone()));
+        }
+
+        let Some(state) = target.as_mut() else { return false };
+        if state.params != *params || state.fetch_pending || state.next_page != page {
+            return false;
+        }
+        state.fetch_pending = true;
+        true
     }
 
     /// Spawn a background task to query one page of issue results.
@@ -593,35 +636,42 @@ impl App {
             };
             match daemon.execute_query(cmd, session_id).await {
                 Ok(CommandValue::IssuePage(result_page)) => {
-                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched { repo, params: params_clone, page: result_page });
+                    let _ = tx.send(issue_view::IssueQueryUpdate::PageFetched {
+                        repo,
+                        params: params_clone,
+                        requested_page: page,
+                        page: result_page,
+                    });
                 }
                 Ok(other) => {
                     let _ = tx.send(issue_view::IssueQueryUpdate::QueryFailed {
                         repo,
+                        params: params_clone,
+                        requested_page: page,
                         message: format!("unexpected query result: {other:?}"),
-                        is_search: params_clone.search.is_some(),
                     });
                 }
                 Err(e) => {
                     let _ =
-                        tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo, message: e, is_search: params_clone.search.is_some() });
+                        tx.send(issue_view::IssueQueryUpdate::QueryFailed { repo, params: params_clone, requested_page: page, message: e });
                 }
             }
         });
     }
 
     /// Fetch default issues for a repo if they haven't been fetched yet.
-    fn maybe_fetch_default_issues(&self, repo_identity: &RepoIdentity) {
-        if self.issue_views.get(repo_identity).and_then(|v| v.default.as_ref()).is_some() {
-            return;
-        }
+    fn maybe_fetch_default_issues(&mut self, repo_identity: &RepoIdentity) {
         if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        self.spawn_query_page(repo_identity.clone(), flotilla_protocol::issue_query::IssueQuery::default(), 1, 50);
+        let params = flotilla_protocol::issue_query::IssueQuery::default();
+        if !self.begin_issue_page_fetch(repo_identity, &params, 1) {
+            return;
+        }
+        self.spawn_query_page(repo_identity.clone(), params, 1, 50);
     }
 
     /// Push issue rows from `IssueViewState` into the `Shared<RepoData>` for

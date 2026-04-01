@@ -282,14 +282,19 @@ impl SplitTable {
     /// Any `WorkItems`-typed issue section from correlation is left alone.
     pub fn update_issue_section(&mut self, label: String, items: Vec<IssueRow>) {
         let prev_active_kind = self.sections.get(self.active_section).map(|(k, _)| *k);
-
-        // Remove existing AnySection::Issues section (if any).
-        self.sections.retain(|(_, s)| !matches!(s, AnySection::Issues(_)));
+        let mut old_issue_section = None;
+        let mut retained_sections = Vec::with_capacity(self.sections.len());
+        for (kind, section) in self.sections.drain(..) {
+            match section {
+                AnySection::Issues(table) => old_issue_section = Some(table),
+                other => retained_sections.push((kind, other)),
+            }
+        }
+        self.sections = retained_sections;
 
         if !items.is_empty() {
-            // Find or create an IssueRow section. It always goes at the end.
-            let columns = issue_columns_native();
-            let mut table = SectionTable::new(label, columns);
+            let mut table = old_issue_section.unwrap_or_else(|| SectionTable::new(label.clone(), issue_columns_native()));
+            table.header_label = label;
             table.update_items(items);
             self.sections.push((SectionKind::Issues, AnySection::Issues(table)));
         }
@@ -979,7 +984,7 @@ fn provider_table_widths() -> [Constraint; 3] {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{HostPath, WorkItemKind};
+    use flotilla_protocol::{provider_data::Issue, HostPath, WorkItemKind};
 
     use super::*;
 
@@ -1032,6 +1037,19 @@ mod tests {
             kind: SectionKind::Issues,
             label: "Issues".into(),
             items: ids.iter().map(|id| test_work_item(WorkItemKind::Issue, id)).collect(),
+        }
+    }
+
+    fn native_issue_row(id: &str) -> IssueRow {
+        IssueRow {
+            id: id.to_string(),
+            issue: Issue {
+                title: format!("Issue {id}"),
+                labels: vec![],
+                association_keys: vec![],
+                provider_name: "github".to_string(),
+                provider_display_name: "GitHub".to_string(),
+            },
         }
     }
 
@@ -1115,6 +1133,25 @@ mod tests {
 
         // Selection should follow item "2" to its new position.
         assert_eq!(st.selected_work_item().expect("selected").description, "Item 2");
+    }
+
+    #[test]
+    fn update_issue_section_preserves_selection_when_appending_page() {
+        let mut st = SplitTable::new();
+        st.update_issue_section("Issues".into(), vec![native_issue_row("1"), native_issue_row("2"), native_issue_row("3")]);
+
+        st.select_next();
+        assert_eq!(st.selected_row().and_then(|row| row.as_issue_row()).expect("selected issue").id, "2");
+
+        st.update_issue_section("Issues".into(), vec![
+            native_issue_row("1"),
+            native_issue_row("2"),
+            native_issue_row("3"),
+            native_issue_row("4"),
+            native_issue_row("5"),
+        ]);
+
+        assert_eq!(st.selected_row().and_then(|row| row.as_issue_row()).expect("selected issue").id, "2");
     }
 
     #[test]

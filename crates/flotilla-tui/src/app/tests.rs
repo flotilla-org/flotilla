@@ -1,7 +1,20 @@
+use std::{collections::VecDeque, path::Path, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
 use crossterm::event::KeyCode;
-use flotilla_protocol::{Change, ProvisioningTarget, WorkItemIdentity};
+use flotilla_core::{
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::{
+        discovery::test_support::{fake_discovery_with_provider_set, FakeDiscoveryProviders},
+        issue_query::{IssueQuery, IssueQueryService, IssueResultPage},
+    },
+};
+use flotilla_protocol::{provider_data::Issue, Change, ProvisioningTarget, RepoSelector, WorkItemIdentity};
 use tempfile::tempdir;
 use test_support::*;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use super::*;
 
@@ -35,6 +48,84 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
             environments: vec![],
         },
     });
+}
+
+#[derive(Clone)]
+struct QueryStep {
+    expected_page: u32,
+    gate: Option<Arc<Notify>>,
+    result: IssueResultPage,
+}
+
+struct ScriptedIssueQueryService {
+    steps: TokioMutex<VecDeque<QueryStep>>,
+    requests: TokioMutex<Vec<u32>>,
+}
+
+impl ScriptedIssueQueryService {
+    fn new(steps: Vec<QueryStep>) -> Self {
+        Self { steps: TokioMutex::new(steps.into()), requests: TokioMutex::new(Vec::new()) }
+    }
+
+    async fn requests(&self) -> Vec<u32> {
+        self.requests.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl IssueQueryService for ScriptedIssueQueryService {
+    async fn query(&self, _repo: &Path, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
+        self.requests.lock().await.push(page);
+        let step = self.steps.lock().await.pop_front().expect("unexpected issue query");
+        assert_eq!(step.expected_page, page, "unexpected page requested");
+        if let Some(gate) = step.gate {
+            gate.notified().await;
+        }
+        Ok(step.result)
+    }
+
+    async fn fetch_by_ids(&self, _repo: &Path, _ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
+        Ok(vec![])
+    }
+
+    async fn open_in_browser(&self, _repo: &Path, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn issue_row(id: usize) -> (String, Issue) {
+    (id.to_string(), Issue {
+        title: format!("Issue {id}"),
+        labels: vec![],
+        association_keys: vec![],
+        provider_name: "fake".into(),
+        provider_display_name: "Fake".into(),
+    })
+}
+
+fn issue_page(range: std::ops::RangeInclusive<usize>, has_more: bool) -> IssueResultPage {
+    IssueResultPage { items: range.map(issue_row).collect(), total: None, has_more }
+}
+
+async fn app_with_issue_query_service(service: Arc<dyn IssueQueryService>) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, App) {
+    let temp = tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_query_service(service));
+    let daemon = InProcessDaemon::new(
+        vec![repo.clone()],
+        Arc::new(ConfigStore::with_base(temp.path().join("daemon-config"))),
+        discovery,
+        HostName::local(),
+    )
+    .await;
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+
+    let daemon_handle: Arc<dyn DaemonHandle> = daemon.clone();
+    let repos = daemon_handle.list_repos().await.expect("list repos");
+    let app = App::new(daemon_handle, repos, Arc::new(ConfigStore::with_base(temp.path().join("tui-config"))), Theme::classic());
+    (temp, repo, daemon, app)
 }
 
 // -- CommandQueue --
@@ -183,6 +274,100 @@ fn apply_snapshot_updates_provider_data() {
     let snap = snapshot(&repo_path);
     app.apply_snapshot(snap);
     assert!(!app.model.repos[&repo].loading);
+}
+
+#[tokio::test]
+async fn repeated_snapshots_do_not_queue_duplicate_initial_issue_pages() {
+    let page_one_gate = Arc::new(Notify::new());
+    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+        QueryStep { expected_page: 1, gate: Some(Arc::clone(&page_one_gate)), result: issue_page(1..=50, true) },
+        QueryStep { expected_page: 1, gate: Some(Arc::clone(&page_one_gate)), result: issue_page(1..=50, true) },
+    ]));
+    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot.clone())));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(service.requests().await, vec![1], "initial issue fetch should stay in-flight instead of queueing a duplicate page 1");
+
+    page_one_gate.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    app.drain_background_updates();
+}
+
+#[tokio::test]
+async fn infinite_scroll_appends_the_next_issue_page_without_duplicates() {
+    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+        QueryStep { expected_page: 1, gate: None, result: issue_page(1..=50, true) },
+        QueryStep { expected_page: 2, gate: None, result: issue_page(51..=60, false) },
+    ]));
+    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo)).await.expect("repo snapshot");
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    app.drain_background_updates();
+
+    let repo_identity = app.model.active_repo_identity().clone();
+    let page = app.screen.repo_pages.get_mut(&repo_identity).expect("repo page");
+    page.reconcile_if_changed();
+    page.table.select_flat_index(44);
+
+    app.handle_key(key(KeyCode::Char('j')));
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    app.drain_background_updates();
+
+    let default = app.issue_views.get(&repo_identity).and_then(|view| view.default.as_ref()).expect("default issue view");
+    let ids: Vec<&str> = default.items.iter().map(|(id, _)| id.as_str()).collect();
+    let unique_ids: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(service.requests().await, vec![1, 2], "scrolling near the bottom should request exactly one next page");
+    assert_eq!(ids.len(), 60, "the first two pages should be appended together");
+    assert_eq!(unique_ids.len(), 60, "issue paging should not duplicate items");
+    assert_eq!(ids.first().copied(), Some("1"));
+    assert_eq!(ids.last().copied(), Some("60"));
+}
+
+#[test]
+fn first_page_search_failure_clears_active_search_state() {
+    use flotilla_protocol::issue_query::IssueQuery;
+
+    let mut app = stub_app();
+    let repo = app.model.active_repo_identity().clone();
+    if let Some(page) = app.screen.repo_pages.get_mut(&repo) {
+        page.active_search_query = Some("beta".into());
+    }
+
+    let view = app.issue_views.entry(repo.clone()).or_default();
+    view.search_query = Some("beta".into());
+    view.search = Some(issue_view::IssuePagingState {
+        params: IssueQuery { search: Some("beta".into()) },
+        items: vec![],
+        next_page: 1,
+        total: None,
+        has_more: true,
+        fetch_pending: true,
+    });
+
+    app.issue_update_tx
+        .send(issue_view::IssueQueryUpdate::QueryFailed {
+            repo: repo.clone(),
+            params: IssueQuery { search: Some("beta".into()) },
+            requested_page: 1,
+            message: "search failed".into(),
+        })
+        .expect("send");
+    app.drain_background_updates();
+
+    let page = app.screen.repo_pages.get(&repo).expect("repo page");
+    assert!(page.active_search_query.is_none(), "visible search state should clear after first-page failure");
+
+    let view = app.issue_views.get(&repo).expect("issue view");
+    assert!(view.search_query.is_none(), "search query bookkeeping should clear after first-page failure");
+    assert!(view.search.is_none(), "failed first page should not leave a pending search state behind");
 }
 
 #[test]
