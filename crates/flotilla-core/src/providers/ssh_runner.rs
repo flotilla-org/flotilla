@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::providers::{install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::{helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner};
 
 /// Command runner that executes commands on a remote host over SSH.
 ///
@@ -20,8 +20,8 @@ impl SshCommandRunner {
         Self { destination: destination.into(), multiplex, runner }
     }
 
-    const ENSURE_FILE_IF_ABSENT_NAME: &str = "ensure_file_if_absent.sh";
-    const ENSURE_FILE_IF_ABSENT_SCRIPT: &str = include_str!("scripts/ensure_file_if_absent.sh");
+    const FLOTILLA_HELPER_NAME: &str = "flotilla-helper";
+    const FLOTILLA_HELPER_SCRIPT: &str = include_str!("scripts/flotilla_helper.sh");
 
     fn ssh_prefix_args(&self) -> Vec<&str> {
         let mut args = vec!["-T", "-o", "BatchMode=yes"];
@@ -75,16 +75,18 @@ impl CommandRunner for SshCommandRunner {
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
         let temp_suffix = Uuid::new_v4().to_string();
+        let path_str = path.to_string_lossy().into_owned();
         let helper_path = install_managed_helper_script(
             &*self.runner,
             "ssh",
             &self.ssh_prefix_args(),
-            Self::ENSURE_FILE_IF_ABSENT_NAME,
-            Self::ENSURE_FILE_IF_ABSENT_SCRIPT,
+            Self::FLOTILLA_HELPER_NAME,
+            Self::FLOTILLA_HELPER_SCRIPT,
         )
         .await?;
+        let helper_script = helper_exec_script(&helper_path, "ensure-file-if-absent", &[&path_str, content, &temp_suffix])?;
         let mut owned_args: Vec<String> = self.ssh_prefix_args().into_iter().map(str::to_string).collect();
-        owned_args.extend([helper_path, path.to_string_lossy().into_owned(), content.to_owned(), temp_suffix]);
+        owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
         let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         self.runner.run("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Noop).await
     }
@@ -224,7 +226,10 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_file_writes_remote_file() {
-        let inner = std::sync::Arc::new(RecordingRunner::with_run_results(vec![Ok(String::new()), Ok(String::new())]));
+        let inner = std::sync::Arc::new(RecordingRunner::with_run_results(vec![
+            Ok("/remote/state/flotilla/helpers/helper-hash/flotilla-helper\n".into()),
+            Ok(String::new()),
+        ]));
         let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
 
         let content = runner.ensure_file(Path::new("/etc/flotilla/config.toml"), "key = true\n").await.expect("ensure_file");
@@ -240,18 +245,22 @@ mod tests {
         assert_eq!(install_args[3], "alice@feta.local");
         assert_eq!(install_args[4], "sh");
         assert_eq!(install_args[5], "-lc");
-        assert!(install_args[6].contains("chmod +x"));
+        assert!(install_args[6].contains("helpers/$helper_hash"));
         assert_eq!(install_args[7], "flotilla-bootstrap-install-managed-script");
-        assert_eq!(install_args[8], "/tmp/flotilla-tools/ensure_file_if_absent.sh");
+        assert_eq!(install_args[8], "flotilla-helper");
+        assert!(!install_args[9].is_empty());
 
         let args = &calls[1].1;
         assert_eq!(args[0], "-T");
         assert_eq!(args[1], "-o");
         assert_eq!(args[2], "BatchMode=yes");
         assert_eq!(args[3], "alice@feta.local");
-        assert_eq!(args[4], "/tmp/flotilla-tools/ensure_file_if_absent.sh");
-        assert_eq!(args[5], "/etc/flotilla/config.toml");
-        assert_eq!(args[6], "key = true\n");
+        assert_eq!(args[4], "sh");
+        assert_eq!(args[5], "-lc");
+        assert!(args[6].contains("PATH='/remote/state/flotilla/helpers/helper-hash':\"$PATH\""));
+        assert!(args[6].contains("exec 'flotilla-helper' 'ensure-file-if-absent'"));
+        assert!(args[6].contains("'/etc/flotilla/config.toml'"));
+        assert!(args[6].contains("'key = true\n'"));
     }
 
     #[tokio::test]
