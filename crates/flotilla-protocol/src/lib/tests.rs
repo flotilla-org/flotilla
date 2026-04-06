@@ -134,9 +134,6 @@ fn message_event_snapshot_roundtrip() {
             ("change_request".to_string(), HashMap::from([("GitHub".to_string(), false)])),
         ]),
         errors: vec![ProviderError { category: "github".to_string(), provider: String::new(), message: "rate limited".to_string() }],
-        issue_total: None,
-        issue_has_more: false,
-        issue_search_results: None,
     };
     let msg = Message::Event { event: Box::new(DaemonEvent::RepoSnapshot(Box::new(snapshot))) };
     let json = serde_json::to_string(&msg).expect("serialize");
@@ -194,9 +191,7 @@ fn snapshot_delta_event_roundtrip() {
                 }),
             },
         ],
-        issue_total: Some(100),
-        issue_has_more: true,
-        issue_search_results: None,
+        work_items: vec![],
     };
     let msg = Message::Event { event: Box::new(DaemonEvent::RepoDelta(Box::new(delta))) };
     let json = serde_json::to_string(&msg).expect("serialize");
@@ -216,9 +211,6 @@ fn snapshot_delta_event_roundtrip() {
                         op: EntryOp::Added(WorkItem { description, .. }),
                     } if *identity == WorkItemIdentity::Issue("42".into()) && description == "Bug 42"
                 )));
-                assert_eq!(d.issue_total, Some(100));
-                assert!(d.issue_has_more);
-                assert!(d.issue_search_results.is_none());
             }
             other => panic!("expected RepoDelta, got {:?}", other),
         },
@@ -334,9 +326,7 @@ fn snapshot_delta_roundtrip_preserves_repo_identity() {
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repo: Some(PathBuf::from("/tmp/repo")),
         changes: vec![],
-        issue_total: Some(12),
-        issue_has_more: true,
-        issue_search_results: None,
+        work_items: vec![],
     };
 
     let json = serde_json::to_string(&delta).expect("serialize");
@@ -365,9 +355,7 @@ fn daemon_events_and_repo_delta_allow_missing_repo_path_metadata() {
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repo: None,
         changes: vec![],
-        issue_total: None,
-        issue_has_more: false,
-        issue_search_results: None,
+        work_items: vec![],
     };
     let delta_json = serde_json::to_string(&delta).expect("serialize repo delta");
     assert!(!delta_json.contains("\"repo\""), "repo delta path should be omitted when absent: {delta_json}");

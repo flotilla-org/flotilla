@@ -479,30 +479,6 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::SetIssueViewport { repo: RepoSelector::Path(PathBuf::from("/repo")), visible_count: 25 },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::FetchMoreIssues { repo: RepoSelector::Path(PathBuf::from("/repo")), desired_count: 50 },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::SearchIssues { repo: RepoSelector::Path(PathBuf::from("/repo")), query: "bug".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ClearIssueSearch { repo: RepoSelector::Path(PathBuf::from("/repo")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
                 action: CommandAction::QueryRepoDetail { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             },
             Command {
@@ -542,7 +518,7 @@ mod tests {
                 },
             },
             Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssueFetchByIds {
@@ -551,7 +527,7 @@ mod tests {
                 },
             },
             Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssueOpenInBrowser { repo: RepoSelector::Path(PathBuf::from("/repo")), id: "42".into() },
@@ -888,30 +864,6 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::SetIssueViewport { repo: RepoSelector::Path(PathBuf::from("/tmp")), visible_count: 10 },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::FetchMoreIssues { repo: RepoSelector::Path(PathBuf::from("/tmp")), desired_count: 10 },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::SearchIssues { repo: RepoSelector::Path(PathBuf::from("/tmp")), query: "q".into() },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ClearIssueSearch { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
-            },
-            Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
                 action: CommandAction::QueryRepoDetail { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
             },
             Command {
@@ -940,7 +892,7 @@ mod tests {
                 action: CommandAction::QueryHostProviders { target_host: "desktop".into() },
             },
             Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssues {
@@ -951,13 +903,13 @@ mod tests {
                 },
             },
             Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Path(PathBuf::from("/repo")), ids: vec!["1".into()] },
             },
             Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssueOpenInBrowser { repo: RepoSelector::Path(PathBuf::from("/repo")), id: "42".into() },

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    path_context::ExecutionEnvironmentPath, qualified_path::QualifiedPath, AttachableSetId, CommandValue, NodeId,
-    PreparedTerminalCommand, ResolvedPaneCommand,
+    path_context::ExecutionEnvironmentPath, qualified_path::QualifiedPath, AttachableSetId, CommandValue, NodeId, PreparedTerminalCommand,
+    ResolvedPaneCommand,
 };
 
 /// Whether a checkout command targets an existing branch or creates a fresh one.

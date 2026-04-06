@@ -3,9 +3,10 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    host::{HostName, HostPath, RepoIdentity},
+    host::{HostPath, RepoIdentity},
     provider_data::{AttachableSetId, ProviderData},
     qualified_path::{qualified_path_or_host_path, QualifiedPath},
+    NodeId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,8 +64,8 @@ pub struct RepoSnapshot {
     pub repo_identity: RepoIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<PathBuf>,
-    /// The daemon's host identity.
-    pub host_name: HostName,
+    /// The daemon's node identity.
+    pub node_id: NodeId,
     pub work_items: Vec<WorkItem>,
     pub providers: ProviderData,
     pub provider_health: HashMap<String, HashMap<String, bool>>,
@@ -83,8 +84,8 @@ pub struct ProviderError {
 pub struct WorkItem {
     pub kind: WorkItemKind,
     pub identity: WorkItemIdentity,
-    /// Which host this item originates from.
-    pub host: HostName,
+    /// Which node this item originates from.
+    pub node_id: NodeId,
     pub branch: Option<String>,
     pub description: String,
     pub checkout: Option<CheckoutRef>,
@@ -199,11 +200,12 @@ impl<'de> Deserialize<'de> for CheckoutRef {
 mod tests {
     use super::*;
     use crate::{
-        host::HostName,
+        HostName,
         provider_data::ProviderData,
         qualified_path::{HostId, QualifiedPath},
         test_helpers::assert_json_roundtrip,
         test_support::{hp, qp},
+        NodeId,
     };
 
     #[test]
@@ -265,7 +267,7 @@ mod tests {
             seq: 0,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/empty".into() },
             repo: Some(PathBuf::from("/repos/empty")),
-            host_name: HostName::new("test-host"),
+            node_id: NodeId::new("test-node"),
             work_items: vec![],
             providers: ProviderData::default(),
             provider_health: HashMap::new(),
@@ -281,12 +283,12 @@ mod tests {
             seq: 42,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/project".into() },
             repo: Some(PathBuf::from("/repos/project")),
-            host_name: HostName::new("test-host"),
+            node_id: NodeId::new("test-node"),
             work_items: vec![
                 WorkItem {
                     kind: WorkItemKind::Checkout,
                     identity: WorkItemIdentity::Checkout(qp("/repos/project/wt")),
-                    host: HostName::new("test-host"),
+                    node_id: NodeId::new("test-node"),
                     branch: Some("feat-x".into()),
                     description: "Feature X".into(),
                     checkout: Some(CheckoutRef::from_host_path(hp("/repos/project/wt"), false)),
@@ -304,7 +306,7 @@ mod tests {
                 WorkItem {
                     kind: WorkItemKind::Session,
                     identity: WorkItemIdentity::Session("s1".into()),
-                    host: HostName::new("test-host"),
+                    node_id: NodeId::new("test-node"),
                     branch: None,
                     description: "Session one".into(),
                     checkout: None,
@@ -354,7 +356,7 @@ mod tests {
             seq: 7,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
             repo: None,
-            host_name: HostName::new("test-host"),
+            node_id: NodeId::new("test-node"),
             work_items: vec![],
             providers: ProviderData::default(),
             provider_health: HashMap::new(),
@@ -373,7 +375,7 @@ mod tests {
             WorkItem {
                 kind: WorkItemKind::Issue,
                 identity: WorkItemIdentity::Issue("GH-1".into()),
-                host: HostName::new("test-host"),
+                node_id: NodeId::new("test-node"),
                 branch: None,
                 description: "Fix bug".into(),
                 checkout: None,
@@ -391,7 +393,7 @@ mod tests {
             WorkItem {
                 kind: WorkItemKind::Checkout,
                 identity: WorkItemIdentity::Checkout(qp("/wt")),
-                host: HostName::new("test-host"),
+                node_id: NodeId::new("test-node"),
                 branch: Some("main".into()),
                 description: "Main".into(),
                 checkout: Some(CheckoutRef::from_host_path(hp("/repos/main"), true)),
@@ -427,7 +429,7 @@ mod tests {
         let json = r#"{
             "kind": "Issue",
             "identity": {"Issue": "X"},
-            "host": "test-host",
+            "node_id": "test-node",
             "branch": null,
             "description": "test",
             "checkout": null,
@@ -446,7 +448,7 @@ mod tests {
         let json = r#"{
             "kind": "Issue",
             "identity": {"Issue": "X"},
-            "host": "test-host",
+            "node_id": "test-node",
             "branch": null,
             "description": "test",
             "checkout": null,
@@ -465,7 +467,7 @@ mod tests {
         let json = r#"{
             "kind": "Issue",
             "identity": {"Issue": "X"},
-            "host": "test-host",
+            "node_id": "test-node",
             "branch": null,
             "description": "test",
             "checkout": null,
