@@ -200,7 +200,6 @@ async fn create_returns_handle() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![("GITHUB_TOKEN".into(), "ghp_secret".into())],
-        reference_repo: None,
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
         provisioned_mounts: vec![],
@@ -246,7 +245,6 @@ async fn create_preserves_reference_repo_mount_metadata() {
     let reference_repo = DaemonHostPath::new("/host/reference-repo");
     let opts = CreateOpts {
         tokens: vec![],
-        reference_repo: Some(reference_repo.clone()),
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo")],
@@ -277,7 +275,6 @@ async fn list_preserves_reference_repo_mount_metadata() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        reference_repo: Some(DaemonHostPath::new("/host/reference-repo")),
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")],
@@ -295,6 +292,28 @@ async fn list_preserves_reference_repo_mount_metadata() {
 }
 
 #[tokio::test]
+async fn list_ignores_malformed_reference_repo_mount_metadata() {
+    use flotilla_protocol::ImageId;
+
+    let runner =
+        Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("container-1\ttest-env-list\tubuntu:22.04\tnot-json\n".into())]));
+    let provider = DockerEnvironment::new(runner.clone());
+    let image = ImageId::new("ubuntu:22.04");
+    let opts = CreateOpts {
+        tokens: vec![],
+        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        working_directory: None,
+        provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo")],
+    };
+
+    provider.create(EnvironmentId::new("test-env-list-malformed"), &image, opts).await.expect("create");
+    let handles = provider.list().await.expect("list");
+
+    assert_eq!(handles.len(), 1);
+    assert!(handles[0].provisioned_mounts().is_empty(), "malformed label content should not be treated as structured mount metadata");
+}
+
+#[tokio::test]
 async fn status_returns_running() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([
@@ -305,7 +324,6 @@ async fn status_returns_running() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        reference_repo: None,
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
         provisioned_mounts: vec![],
@@ -335,7 +353,6 @@ async fn env_vars_parses_output() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        reference_repo: None,
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
         provisioned_mounts: vec![],
@@ -367,7 +384,6 @@ async fn destroy_calls_docker_rm() {
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
-        reference_repo: None,
         daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
         working_directory: None,
         provisioned_mounts: vec![],

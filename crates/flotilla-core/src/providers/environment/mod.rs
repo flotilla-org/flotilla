@@ -22,7 +22,6 @@ use super::CommandRunner;
 #[derive(Debug, Clone)]
 pub struct CreateOpts {
     pub tokens: Vec<(String, String)>,
-    pub reference_repo: Option<DaemonHostPath>,
     pub daemon_socket_path: DaemonHostPath,
     pub working_directory: Option<ExecutionEnvironmentPath>,
     pub provisioned_mounts: Vec<ProvisionedMount>,

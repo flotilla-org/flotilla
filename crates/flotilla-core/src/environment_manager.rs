@@ -41,11 +41,13 @@ pub struct ProvisionedEnvironmentState {
     pub env_bag: EnvironmentBag,
     pub display_name: Option<String>,
     pub registry: Option<Arc<ProviderRegistry>>,
+    pub owning_host_id: HostId,
     pub provisioned_mounts: Vec<ProvisionedMount>,
 }
 
 pub struct EnvironmentManager {
     local_environment_id: EnvironmentId,
+    local_host_id: HostId,
     host_runner: Arc<dyn CommandRunner>,
     managed: Mutex<HashMap<EnvironmentId, ManagedEnvironmentKind>>,
 }
@@ -78,12 +80,12 @@ impl EnvironmentManager {
             ManagedEnvironmentKind::Direct(DirectEnvironmentState {
                 runner: Arc::clone(&local_runner),
                 env_bag,
-                host_id: Some(local_host_id),
+                host_id: Some(local_host_id.clone()),
                 display_name,
             }),
         );
 
-        Self { local_environment_id, host_runner: local_runner, managed: Mutex::new(managed) }
+        Self { local_environment_id, local_host_id, host_runner: local_runner, managed: Mutex::new(managed) }
     }
 
     pub fn local_environment_id(&self) -> &EnvironmentId {
@@ -274,13 +276,7 @@ impl EnvironmentManager {
             .as_ref()
             .map(|repo| vec![ProvisionedMount::new(repo.as_path().to_path_buf(), PathBuf::from("/ref/repo"))])
             .unwrap_or_default();
-        let opts = CreateOpts {
-            tokens,
-            reference_repo,
-            daemon_socket_path: daemon_socket_path.clone(),
-            working_directory: None,
-            provisioned_mounts,
-        };
+        let opts = CreateOpts { tokens, daemon_socket_path: daemon_socket_path.clone(), working_directory: None, provisioned_mounts };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
         self.register_provisioned_environment(env_id, handle, EnvironmentBag::new(), None)
     }
@@ -341,6 +337,7 @@ impl EnvironmentManager {
                     display_name: Self::display_name_for_bag(&env_bag),
                     env_bag,
                     registry,
+                    owning_host_id: self.local_host_id.clone(),
                     provisioned_mounts: provisioned_mounts.clone(),
                 }));
             }
@@ -350,6 +347,7 @@ impl EnvironmentManager {
                     display_name: Self::display_name_for_bag(&env_bag),
                     env_bag,
                     registry,
+                    owning_host_id: self.local_host_id.clone(),
                     provisioned_mounts,
                 }));
             }
@@ -423,10 +421,7 @@ impl EnvironmentManager {
     fn host_id_for_environment(&self, env_id: &EnvironmentId) -> Option<HostId> {
         match self.managed_environment(env_id)? {
             ManagedEnvironmentKind::Direct(state) => state.host_id,
-            ManagedEnvironmentKind::Provisioned(_) => match self.managed_environment(&self.local_environment_id)? {
-                ManagedEnvironmentKind::Direct(state) => state.host_id,
-                ManagedEnvironmentKind::Provisioned(_) => None,
-            },
+            ManagedEnvironmentKind::Provisioned(state) => Some(state.owning_host_id.clone()),
         }
     }
 

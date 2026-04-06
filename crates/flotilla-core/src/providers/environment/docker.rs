@@ -82,12 +82,11 @@ impl EnvironmentProvider for DockerEnvironment {
             &env_id_env,
         ];
 
-        // Optional reference_repo mount
-        let reference_repo_mount;
-        if let Some(ref repo) = opts.reference_repo {
-            reference_repo_mount = format!("{}:/ref/repo:ro", repo);
+        let mount_specs: Vec<String> =
+            opts.provisioned_mounts.iter().map(|mount| format!("{}:{}:ro", mount.host_path, mount.environment_path)).collect();
+        for mount_spec in &mount_specs {
             args.push("-v");
-            args.push(&reference_repo_mount);
+            args.push(mount_spec);
         }
 
         // Token env vars
@@ -129,10 +128,16 @@ impl EnvironmentProvider for DockerEnvironment {
                 let container_name = parts[0].to_string();
                 let env_id = parts[1].to_string();
                 let image = parts[2].to_string();
-                let provisioned_mounts = serde_json::from_str(parts[3]).unwrap_or_default();
                 if env_id.is_empty() {
                     return None;
                 }
+                let provisioned_mounts = match serde_json::from_str(parts[3]) {
+                    Ok(mounts) => mounts,
+                    Err(err) => {
+                        tracing::warn!(container = %container_name, err = %err, raw = %parts[3], "failed to parse provisioned mount metadata; ignoring mount metadata");
+                        vec![]
+                    }
+                };
                 Some(Arc::new(DockerProvisionedEnvironment {
                     id: EnvironmentId::new(env_id),
                     container_name,

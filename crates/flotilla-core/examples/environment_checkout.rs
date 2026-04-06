@@ -61,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let opts = CreateOpts {
         tokens: vec![],
-        reference_repo: Some(reference_repo.clone()),
         daemon_socket_path: socket_path,
         working_directory: None,
         provisioned_mounts: vec![flotilla_core::providers::environment::ProvisionedMount::new(
