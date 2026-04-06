@@ -140,6 +140,10 @@ mod tests {
             None
         }
 
+        fn provisioned_mounts(&self) -> Vec<crate::providers::environment::ProvisionedMount> {
+            vec![]
+        }
+
         async fn status(&self) -> Result<flotilla_protocol::EnvironmentStatus, String> {
             Ok(self.status.clone())
         }

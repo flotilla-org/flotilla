@@ -4,7 +4,9 @@ pub use flotilla_core::merge::merge_provider_data;
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{
-        qualified_path::QualifiedPath, test_support::TestCheckout, ChangeRequest, ChangeRequestStatus, HostName, HostPath, ProviderData,
+        qualified_path::{HostId, QualifiedPath},
+        test_support::TestCheckout,
+        ChangeRequest, ChangeRequestStatus, HostName, HostPath, ProviderData,
     };
     use indexmap::IndexMap;
 
@@ -117,6 +119,22 @@ mod tests {
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.checkouts.len(), 1);
         assert_eq!(merged.checkouts[&flotilla_protocol::qualified_path::QualifiedPath::from(host_path.clone())].branch, "new-branch");
+    }
+
+    #[test]
+    fn merge_accepts_peer_checkout_owned_by_host_id() {
+        let local = ProviderData::default();
+        let remote_checkout = QualifiedPath::host(HostId::new("follower-host-id"), "/repo");
+        let remote = ProviderData {
+            checkouts: IndexMap::from([(remote_checkout.clone(), TestCheckout::new("new-branch").build())]),
+            ..Default::default()
+        };
+
+        let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
+
+        assert_eq!(merged.checkouts.len(), 1);
+        assert_eq!(merged.checkouts[&remote_checkout].branch, "new-branch");
+        assert_eq!(merged.checkouts[&remote_checkout].host_name, Some(HostName::new("desktop")));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     arg::Arg,
     issue_query::{IssueQuery, IssueResultPage},
+    qualified_path::QualifiedPath,
     query::{HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse},
     AttachableSetId, RepoIdentity,
 };
@@ -49,6 +50,8 @@ pub struct PreparedWorkspace {
     pub label: String,
     pub target_host: crate::HostName,
     pub checkout_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_key: Option<QualifiedPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachable_set_id: Option<AttachableSetId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -569,6 +572,7 @@ mod tests {
                 label: "feat-x".into(),
                 target_host: HostName::new("desktop"),
                 checkout_path: PathBuf::from("/remote/repo/feat-x"),
+                checkout_key: None,
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
                 environment_id: None,
                 container_name: None,
@@ -685,6 +689,7 @@ mod tests {
             label: "feat-x".into(),
             target_host: HostName::new("desktop"),
             checkout_path: PathBuf::from("/remote/repo/feat-x"),
+            checkout_key: None,
             attachable_set_id: Some(AttachableSetId::new("set-1")),
             environment_id: None,
             container_name: None,

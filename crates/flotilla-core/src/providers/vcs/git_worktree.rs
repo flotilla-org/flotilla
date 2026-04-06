@@ -169,6 +169,7 @@ impl GitCheckoutManager {
             last_commit: commit,
             correlation_keys,
             association_keys: issue_links,
+            host_name: None,
             environment_id: None,
         })
     }

@@ -233,6 +233,13 @@ pub mod qualified_path_or_host_path {
     use super::QualifiedPath;
     use crate::HostPath;
 
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Qualified(QualifiedPath),
+        Legacy(HostPath),
+    }
+
     // Serialization is a straight pass-through; only deserialization needs the
     // legacy HostPath fallback for migration compatibility.
     pub fn serialize<S>(path: &QualifiedPath, serializer: S) -> Result<S::Ok, S::Error>
@@ -246,16 +253,40 @@ pub mod qualified_path_or_host_path {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Qualified(QualifiedPath),
-            Legacy(HostPath),
-        }
-
         match Repr::deserialize(deserializer)? {
             Repr::Qualified(path) => Ok(path),
             Repr::Legacy(path) => Ok(QualifiedPath::from(path)),
+        }
+    }
+
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        use super::{QualifiedPath, Repr};
+
+        pub fn serialize<S>(path: &Option<QualifiedPath>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            path.serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<QualifiedPath>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            #[derive(Deserialize)]
+            #[serde(untagged)]
+            enum MaybeRepr {
+                Some(Repr),
+                None(()),
+            }
+
+            match MaybeRepr::deserialize(deserializer)? {
+                MaybeRepr::Some(Repr::Qualified(path)) => Ok(Some(path)),
+                MaybeRepr::Some(Repr::Legacy(path)) => Ok(Some(QualifiedPath::from(path))),
+                MaybeRepr::None(_) => Ok(None),
+            }
         }
     }
 }

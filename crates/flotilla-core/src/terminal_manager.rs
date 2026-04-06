@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use flotilla_protocol::{arg, AttachableId, AttachableSet, AttachableSetId, HostName, HostPath, TerminalStatus};
+use flotilla_protocol::{arg, qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, HostName, TerminalStatus};
 use tracing::warn;
 
 use crate::{
@@ -48,7 +48,7 @@ impl TerminalManager {
     }
 
     /// Returns the existing `AttachableSet` for the given checkout, or creates a new one.
-    pub fn allocate_set(&self, host: HostName, checkout_path: HostPath) -> Result<AttachableSetId, String> {
+    pub fn allocate_set(&self, host: HostName, checkout_path: QualifiedPath) -> Result<AttachableSetId, String> {
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
         let existing = store.sets_for_checkout(&checkout_path);
         if let Some(id) = existing.into_iter().next() {
@@ -254,7 +254,7 @@ impl TerminalManager {
 
     /// Removes all sets matching the given checkout paths and kills their sessions.
     /// Session kill failures are logged but do not cause the overall operation to fail.
-    pub async fn cascade_delete(&self, checkout_paths: &[HostPath]) -> Result<(), String> {
+    pub async fn cascade_delete(&self, checkout_paths: &[QualifiedPath]) -> Result<(), String> {
         let attachable_ids_to_kill = {
             let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let mut ids_to_kill = Vec::new();

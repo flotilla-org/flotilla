@@ -1,6 +1,8 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
-use flotilla_protocol::{arg, AttachableSetId, EnvironmentId, HostName, HostPath, PreparedWorkspace, ResolvedPaneCommand};
+use flotilla_protocol::{
+    arg, qualified_path::QualifiedPath, AttachableSetId, EnvironmentId, HostName, PreparedWorkspace, ResolvedPaneCommand,
+};
 use tracing::{info, warn};
 
 use super::{terminals::TerminalPreparationService, workspace_config};
@@ -56,7 +58,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
         match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
-                self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path);
+                self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path, None);
                 Ok(())
             }
             Err(err) => Err(err),
@@ -69,8 +71,13 @@ impl<'a> WorkspaceOrchestrator<'a> {
         };
 
         let scope_prefix = ws_mgr.binding_scope_prefix();
-        if let Some(ws_ref) = self.find_existing_workspace_ref(provider_name, &scope_prefix, &prepared.target_host, &prepared.checkout_path)
-        {
+        if let Some(ws_ref) = self.find_existing_workspace_ref(
+            provider_name,
+            &scope_prefix,
+            &prepared.target_host,
+            &prepared.checkout_path,
+            prepared.checkout_key.as_ref(),
+        ) {
             info!(%ws_ref, "found existing workspace via binding, selecting");
             match ws_mgr.select_workspace(&ws_ref).await {
                 Ok(()) => return Ok(()),
@@ -113,9 +120,22 @@ impl<'a> WorkspaceOrchestrator<'a> {
         match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
                 if let Some(set_id) = prepared.attachable_set_id.as_ref() {
-                    self.persist_workspace_binding_for_set(provider_name, &ws_ref, set_id, &prepared.target_host, &prepared.checkout_path);
+                    self.persist_workspace_binding_for_set(
+                        provider_name,
+                        &ws_ref,
+                        set_id,
+                        &prepared.target_host,
+                        &prepared.checkout_path,
+                        prepared.checkout_key.as_ref(),
+                    );
                 } else {
-                    self.persist_workspace_binding(provider_name, &ws_ref, &prepared.target_host, &prepared.checkout_path);
+                    self.persist_workspace_binding(
+                        provider_name,
+                        &ws_ref,
+                        &prepared.target_host,
+                        &prepared.checkout_path,
+                        prepared.checkout_key.as_ref(),
+                    );
                 }
                 Ok(())
             }
@@ -127,6 +147,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         &self,
         target_host: &HostName,
         checkout_path: &Path,
+        checkout_key: Option<&QualifiedPath>,
         environment_id: Option<&EnvironmentId>,
     ) -> Option<AttachableSetId> {
         let Ok(mut store) = self.attachable_store.lock() else {
@@ -134,7 +155,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             return None;
         };
 
-        let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
+        let checkout = checkout_key_for_store(target_host, checkout_path, checkout_key);
         let (set_id, changed) = store.ensure_terminal_set_with_change(Some(target_host.clone()), Some(checkout), environment_id.cloned());
         if changed {
             if let Err(err) = store.save() {
@@ -161,9 +182,10 @@ impl<'a> WorkspaceOrchestrator<'a> {
         scope_prefix: &str,
         target_host: &HostName,
         checkout_path: &Path,
+        checkout_key: Option<&QualifiedPath>,
     ) -> Option<String> {
         let store = self.attachable_store.lock().ok()?;
-        let checkout = HostPath::new(target_host.clone(), checkout_path.to_path_buf());
+        let checkout = checkout_key_for_store(target_host, checkout_path, checkout_key);
         let set_ids = store.sets_for_checkout(&checkout);
         for set_id in set_ids {
             if let Some(ws_ref) = store.lookup_workspace_ref_for_set("workspace_manager", provider_name, &set_id) {
@@ -175,7 +197,14 @@ impl<'a> WorkspaceOrchestrator<'a> {
         None
     }
 
-    fn persist_workspace_binding(&self, provider_name: &str, workspace_ref: &str, target_host: &HostName, checkout_path: &Path) {
+    fn persist_workspace_binding(
+        &self,
+        provider_name: &str,
+        workspace_ref: &str,
+        target_host: &HostName,
+        checkout_path: &Path,
+        checkout_key: Option<&QualifiedPath>,
+    ) {
         let Ok(mut store) = self.attachable_store.lock() else {
             warn!("attachable store lock poisoned while persisting workspace binding");
             return;
@@ -183,7 +212,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
         let (set_id, changed_set) = store.ensure_terminal_set_with_change(
             Some(target_host.clone()),
-            Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+            Some(checkout_key_for_store(target_host, checkout_path, checkout_key)),
             None,
         );
         let changed_binding = store.replace_binding(ProviderBinding {
@@ -207,6 +236,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         set_id: &AttachableSetId,
         target_host: &HostName,
         checkout_path: &Path,
+        checkout_key: Option<&QualifiedPath>,
     ) {
         let Ok(mut store) = self.attachable_store.lock() else {
             warn!("attachable store lock poisoned while persisting workspace binding");
@@ -217,7 +247,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             store.insert_set(flotilla_protocol::AttachableSet {
                 id: set_id.clone(),
                 host_affinity: Some(target_host.clone()),
-                checkout: Some(HostPath::new(target_host.clone(), checkout_path.to_path_buf())),
+                checkout: Some(checkout_key_for_store(target_host, checkout_path, checkout_key)),
                 template_identity: None,
                 environment_id: None,
                 members: Vec::new(),
@@ -236,6 +266,10 @@ impl<'a> WorkspaceOrchestrator<'a> {
             }
         }
     }
+}
+
+fn checkout_key_for_store(target_host: &HostName, checkout_path: &Path, checkout_key: Option<&QualifiedPath>) -> QualifiedPath {
+    checkout_key.cloned().unwrap_or_else(|| QualifiedPath::from_host_name(target_host, checkout_path.to_path_buf()))
 }
 
 fn workspace_attach_request_from_config(config: crate::providers::types::WorkspaceConfig) -> WorkspaceAttachRequest {

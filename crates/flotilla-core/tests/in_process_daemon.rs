@@ -290,6 +290,10 @@ impl ProvisionedEnvironment for TestProvisionedEnvironment {
         None
     }
 
+    fn provisioned_mounts(&self) -> Vec<flotilla_core::providers::environment::ProvisionedMount> {
+        vec![]
+    }
+
     async fn status(&self) -> Result<EnvironmentStatus, String> {
         Ok(EnvironmentStatus::Running)
     }
@@ -492,6 +496,7 @@ fn checkout_state_for_repo(repo: &Path, branch: &str) -> Arc<std::sync::RwLock<F
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch(branch.into())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         })
         .build()
@@ -1392,6 +1397,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("remote"), status: PeerConnectionState::Connected });
@@ -1459,47 +1465,23 @@ async fn daemon_uses_persisted_local_environment_id() {
 
 #[tokio::test]
 async fn local_direct_repo_refresh_stamps_discovered_checkout_environment_id() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = temp.path().join("repo");
-    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+    let mut rx = daemon.subscribe();
 
-    let checkout_manager = Arc::new(FakeCheckoutManager::new());
-    checkout_manager
-        .add_checkouts(vec![(repo.join("local-feature"), Checkout {
-            branch: "local-feature".into(),
-            is_main: false,
-            trunk_ahead_behind: None,
-            remote_ahead_behind: None,
-            working_tree: None,
-            last_commit: None,
-            correlation_keys: vec![CorrelationKey::Branch("local-feature".into())],
-            association_keys: vec![],
-            environment_id: None,
-        })])
-        .await;
-    let discovery =
-        fake_discovery_with_providers(Some(checkout_manager as Arc<dyn flotilla_core::providers::vcs::CheckoutManager>), None, None);
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(temp.path().join("config"))), discovery, HostName::local()).await;
-    let result = daemon
-        .discover_repo_for_environment_for_test(&repo, daemon.local_environment_id())
-        .await
-        .expect("discover repo for local direct environment");
-
-    let model = RepoModel::new(
-        repo.clone(),
-        result.registry,
-        result.repo_slug,
-        Some(daemon.local_environment_id().clone()),
-        shared_in_memory_attachable_store(),
-        flotilla_core::agents::shared_in_memory_agent_state_store(),
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("local state");
+    let local_host_id = daemon.local_host_id().expect("local host id");
+    assert!(
+        snapshot.providers.checkouts.keys().any(|path| path.host_id() == Some(&local_host_id)),
+        "local direct checkout should be published with the real host id"
     );
-
-    let snapshot = refresh_snapshot_for_model(&model).await;
-    let local_host = HostName::local();
+    assert!(
+        snapshot.providers.checkouts.keys().all(|path| path.host_name() != Some(&HostName::local())),
+        "local direct checkout should stop using hostname-qualified publication once host id is available"
+    );
     let checkout =
-        snapshot.providers.checkouts.get(&qpath(&local_host, repo.join("local-feature"))).expect("local direct checkout should be present");
+        snapshot.providers.checkouts.values().find(|checkout| checkout.branch == "main").expect("local checkout should be present");
     assert_eq!(checkout.environment_id.as_ref(), Some(daemon.local_environment_id()));
 }
 
@@ -1569,20 +1551,34 @@ hostname = "buildbox.example"
     let environment_id = EnvironmentId::new("static-ssh-6275696c64626f78");
     let result =
         daemon.discover_repo_for_environment_for_test(&repo, &environment_id).await.expect("discover repo for static ssh environment");
+    let host_id = daemon.host_id_for_environment(&environment_id);
 
     let model = RepoModel::new(
         repo.clone(),
         result.registry,
         result.repo_slug,
         Some(environment_id.clone()),
+        host_id.clone(),
         shared_in_memory_attachable_store(),
         flotilla_core::agents::shared_in_memory_agent_state_store(),
     );
 
     let snapshot = refresh_snapshot_for_model(&model).await;
-    let local_host = HostName::local();
-    let checkout =
-        snapshot.providers.checkouts.get(&qpath(&local_host, repo.join("ssh-feature"))).expect("static ssh checkout should be present");
+    let checkout = if let Some(host_id) = host_id {
+        let expected = QualifiedPath::host(host_id, repo.join("ssh-feature"));
+        let checkout = snapshot.providers.checkouts.get(&expected).expect("static ssh checkout should be host-qualified");
+        assert!(
+            !snapshot.providers.checkouts.contains_key(&qpath(&HostName::local(), repo.join("ssh-feature"))),
+            "static ssh checkout should not fall back to hostname-qualified publication when a host id is available"
+        );
+        checkout
+    } else {
+        snapshot
+            .providers
+            .checkouts
+            .get(&qpath(&HostName::local(), repo.join("ssh-feature")))
+            .expect("static ssh checkout should be present")
+    };
     assert_eq!(checkout.environment_id.as_ref(), Some(&environment_id));
 }
 
@@ -1618,16 +1614,16 @@ async fn provisioned_repo_refresh_stamps_discovered_checkout_environment_id() {
         result.registry,
         result.repo_slug,
         Some(environment_id.clone()),
+        None,
         shared_in_memory_attachable_store(),
         flotilla_core::agents::shared_in_memory_agent_state_store(),
     );
 
     let snapshot = refresh_snapshot_for_model(&model).await;
-    let local_host = HostName::local();
     let checkout = snapshot
         .providers
         .checkouts
-        .get(&qpath(&local_host, repo.join("provisioned-feature")))
+        .get(&qpath(&HostName::local(), repo.join("provisioned-feature")))
         .expect("provisioned checkout should be present");
     assert_eq!(checkout.environment_id.as_ref(), Some(&environment_id));
 }
@@ -2085,6 +2081,7 @@ async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2121,6 +2118,7 @@ async fn replay_since_includes_overlay_only_hosts() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2152,6 +2150,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2260,6 +2259,7 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2318,6 +2318,7 @@ async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2381,6 +2382,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2618,6 +2620,7 @@ async fn get_local_providers_excludes_peer_overlay_data() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2659,6 +2662,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2711,6 +2715,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         });
         pd
@@ -2762,7 +2767,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
         store.insert_set(AttachableSet {
             id: set_id.clone(),
             host_affinity: Some(remote_host.clone()),
-            checkout: Some(remote_checkout.clone()),
+            checkout: Some(remote_checkout.clone().into()),
             template_identity: None,
             environment_id: None,
             members: vec![],
@@ -2797,6 +2802,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
             CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     // The remote host projects sets matching its own checkouts, so
@@ -2805,7 +2811,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     peer_data.attachable_sets.insert(set_id.clone(), AttachableSet {
         id: set_id.clone(),
         host_affinity: Some(remote_host.clone()),
-        checkout: Some(remote_checkout.clone()),
+        checkout: Some(remote_checkout.clone().into()),
         template_identity: None,
         environment_id: None,
         members: vec![],
@@ -2826,7 +2832,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("merged state");
     let merged_set = snapshot.providers.attachable_sets.get(&set_id).expect("merged attachable set");
     assert_eq!(merged_set.host_affinity.as_ref(), Some(&remote_host));
-    assert_eq!(merged_set.checkout.as_ref(), Some(&remote_checkout));
+    assert_eq!(merged_set.checkout.as_ref(), Some(&remote_checkout.clone().into()));
 
     let set_item =
         snapshot.work_items.iter().find(|item| item.attachable_set_id.as_ref() == Some(&set_id)).expect("attachable set work item");
@@ -2858,7 +2864,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
         store.insert_set(AttachableSet {
             id: set_id.clone(),
             host_affinity: Some(remote_host.clone()),
-            checkout: Some(remote_checkout.clone()),
+            checkout: Some(remote_checkout.clone().into()),
             template_identity: None,
             environment_id: None,
             members: vec![],
@@ -2896,6 +2902,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
             CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     // The remote host projects sets matching its own checkouts, so
@@ -2904,7 +2911,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
     peer_data.attachable_sets.insert(set_id.clone(), AttachableSet {
         id: set_id.clone(),
         host_affinity: Some(remote_host.clone()),
-        checkout: Some(remote_checkout.clone()),
+        checkout: Some(remote_checkout.clone().into()),
         template_identity: None,
         environment_id: None,
         members: vec![],
@@ -3187,6 +3194,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch("feat-remote".into())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         })]),
         ..Default::default()
@@ -3695,6 +3703,7 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch("feat-branch".into())],
             association_keys: vec![AssociationKey::IssueRef("fake-issues".into(), "42".into())],
+            host_name: None,
             environment_id: None,
         })])
         .await;
@@ -3797,28 +3806,12 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch("feat-lifecycle".into()), CorrelationKey::CheckoutPath(host_path.clone().into())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         })])
         .await;
 
-    // Create an attachable store with a set anchored to the checkout.
     let attachable_store = shared_in_memory_attachable_store();
-    let set_id = {
-        let mut store = attachable_store.lock().expect("lock attachable store");
-        let set_id = store.ensure_terminal_set(Some(HostName::local()), Some(host_path.clone()));
-        store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "fake-terminals",
-            "flotilla/feat-lifecycle/shell/0",
-            TerminalPurpose { checkout: "feat-lifecycle".into(), role: "shell".into(), index: 0 },
-            "bash",
-            flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp/repo/wt-feat-lifecycle"),
-            flotilla_protocol::TerminalStatus::Running,
-        );
-        set_id
-    };
-
     let terminal_pool = Arc::new(FakeTerminalPool::new());
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new()
@@ -3834,6 +3827,28 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     let daemon = flotilla_core::in_process::InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     let mut rx = daemon.subscribe();
 
+    // Create an attachable store with a set anchored to the same normalized checkout key
+    // the daemon will publish for the local checkout.
+    let normalized_checkout = daemon
+        .local_host_id()
+        .map(|host_id| QualifiedPath::host(host_id, host_path.path.clone()))
+        .unwrap_or_else(|| host_path.clone().into());
+    let set_id = {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        let set_id = store.ensure_terminal_set(Some(HostName::local()), Some(normalized_checkout));
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "fake-terminals",
+            "flotilla/feat-lifecycle/shell/0",
+            TerminalPurpose { checkout: "feat-lifecycle".into(), role: "shell".into(), index: 0 },
+            "bash",
+            flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp/repo/wt-feat-lifecycle"),
+            flotilla_protocol::TerminalStatus::Running,
+        );
+        set_id
+    };
+
     // --- Act: initial refresh ---
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
@@ -3846,7 +3861,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
         host: None,
         provisioning_target: None,
         context_repo: None,
-        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("feat-lifecycle".into()) },
+        action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Path(host_path.path.clone()) },
     };
     let command_id = daemon.execute(command).await.expect("execute RemoveCheckout should succeed");
 
@@ -3866,12 +3881,20 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     assert!(!matches!(result, CommandValue::Error { .. }), "RemoveCheckout should succeed, got: {result:?}");
 
     // --- Assert: set removed from store ---
-    {
-        let store = attachable_store.lock().expect("lock attachable store");
-        assert!(store.registry().sets.is_empty(), "attachable set should be cascade-deleted from store");
-        assert!(store.registry().attachables.is_empty(), "attachable members should be cascade-deleted from store");
-        assert!(store.registry().bindings.is_empty(), "attachable bindings should be cascade-deleted from store");
-    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let is_empty = {
+                let store = attachable_store.lock().expect("lock attachable store");
+                store.registry().sets.is_empty() && store.registry().attachables.is_empty() && store.registry().bindings.is_empty()
+            };
+            if is_empty {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for attachable store cleanup");
 
     // --- Assert: set no longer in snapshot after refresh ---
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("post-removal refresh");

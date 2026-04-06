@@ -59,8 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a dummy socket file so the mount doesn't fail
     std::fs::write(socket_path.as_path(), "")?;
 
-    let opts =
-        CreateOpts { tokens: vec![], reference_repo: Some(reference_repo), daemon_socket_path: socket_path, working_directory: None };
+    let opts = CreateOpts {
+        tokens: vec![],
+        daemon_socket_path: socket_path,
+        working_directory: None,
+        provisioned_mounts: vec![flotilla_core::providers::environment::ProvisionedMount::new(
+            reference_repo.as_path().to_path_buf(),
+            "/ref/repo",
+        )],
+    };
     let handle = provider.create(env_id, &image, opts).await?;
     let container = handle.container_name().unwrap_or("unknown");
     println!("Container: {container}");

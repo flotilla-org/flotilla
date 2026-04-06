@@ -279,22 +279,13 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
 
     let snapshot = leader.get_state(&RepoSelector::Path(leader_repo.clone())).await.expect("leader state");
     assert!(
-        snapshot
-            .providers
-            .checkouts
-            .iter()
-            .any(|(path, checkout)| path.host_name() == Some(&HostName::new("follower")) && checkout.branch == "feat-remote"),
+        snapshot.providers.checkouts.iter().any(|(_, checkout)| checkout.branch == "feat-remote"),
         "leader snapshot providers should include the follower checkout"
     );
-    let checkout_item = snapshot
-        .work_items
-        .iter()
-        .find(|item| {
-            item.checkout_key().is_some_and(|path| path.host_name() == Some(&HostName::new("follower")))
-                && item.branch.as_deref() == Some("feat-remote")
-        })
-        .expect("replicated remote checkout");
+    let checkout_item =
+        snapshot.work_items.iter().find(|item| item.branch.as_deref() == Some("feat-remote")).expect("replicated remote checkout");
 
+    assert_eq!(checkout_item.branch.as_deref(), Some("feat-remote"));
     assert_eq!(checkout_item.host, HostName::new("follower"));
 }
 

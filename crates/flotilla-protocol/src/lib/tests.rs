@@ -505,6 +505,7 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
         label: "feat/x".into(),
         target_host: HostName::new("feta"),
         checkout_path: PathBuf::from("/repo/wt-feat-x"),
+        checkout_key: None,
         attachable_set_id: Some(AttachableSetId::new("attachable-set")),
         environment_id: None,
         container_name: None,

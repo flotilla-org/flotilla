@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    path_context::ExecutionEnvironmentPath, AttachableSetId, CommandValue, HostName, HostPath, PreparedTerminalCommand, ResolvedPaneCommand,
+    path_context::ExecutionEnvironmentPath, qualified_path::QualifiedPath, AttachableSetId, CommandValue, HostName,
+    PreparedTerminalCommand, ResolvedPaneCommand,
 };
 
 /// Whether a checkout command targets an existing branch or creates a fresh one.
@@ -57,7 +58,7 @@ pub enum StepAction {
     },
     RemoveCheckout {
         branch: String,
-        deleted_checkout_paths: Vec<HostPath>,
+        deleted_checkout_paths: Vec<QualifiedPath>,
     },
 
     // Teleport

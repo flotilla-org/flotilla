@@ -84,6 +84,7 @@ impl WtWorktree {
                 .map(|c| CommitInfo { short_sha: c.short_sha.unwrap_or_default(), message: c.message.unwrap_or_default() }),
             correlation_keys,
             association_keys: Vec::new(),
+            host_name: None,
             environment_id: None,
         })
     }

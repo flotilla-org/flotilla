@@ -487,6 +487,7 @@ impl CheckoutBuilder {
             last_commit: None,
             correlation_keys: self.correlation_keys,
             association_keys: self.association_keys,
+            host_name: None,
             environment_id: None,
         };
         self.parent.checkouts.push((path, checkout));
@@ -627,6 +628,7 @@ impl CheckoutManager for FakeCheckoutManager {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch(branch.to_string())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         };
         self.state.write().expect("FakeCheckoutManager state poisoned").checkouts.push((path.clone(), checkout.clone()));

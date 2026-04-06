@@ -25,7 +25,7 @@ impl<'a> TerminalPreparationService<'a> {
         info!(count = rendered.content.len(), "terminal manager: resolving content entries");
         let host = HostName::local();
         let checkout_path = HostPath::new(host.clone(), config.working_directory.clone().into_path_buf());
-        let set_id = match self.terminal_manager.allocate_set(host, checkout_path) {
+        let set_id = match self.terminal_manager.allocate_set(host, checkout_path.into()) {
             Ok(id) => id,
             Err(err) => {
                 warn!(err = %err, "failed to allocate terminal set");
@@ -88,7 +88,7 @@ impl<'a> TerminalPreparationService<'a> {
         if !requested_commands.is_empty() {
             let host = HostName::local();
             let hp = HostPath::new(host.clone(), checkout_path.to_path_buf());
-            let set_id = self.terminal_manager.allocate_set(host, hp)?;
+            let set_id = self.terminal_manager.allocate_set(host, hp.into())?;
             let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
 
             let mut resolved = Vec::new();

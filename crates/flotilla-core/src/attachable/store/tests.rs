@@ -1,3 +1,5 @@
+use flotilla_protocol::HostPath;
+
 use super::*;
 use crate::attachable::types::{TerminalAttachable, TerminalPurpose};
 
@@ -6,7 +8,8 @@ fn temp_base(dir: &tempfile::TempDir) -> DaemonHostPath {
 }
 
 fn contract_ensure_terminal_attachable_reuses_existing_binding(store: &mut impl AttachableStoreApi) {
-    let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    let set_id =
+        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat").into()));
 
     let first = store.ensure_terminal_attachable(
         &set_id,
@@ -47,8 +50,8 @@ fn contract_ensure_terminal_set_groups_members_by_host_and_checkout(store: &mut 
     let host = HostName::new("desktop");
     let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
 
-    let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
-    let set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone()));
+    let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone().into()));
+    let set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone().into()));
     assert_eq!(set_a, set_b);
 
     let shell = store.ensure_terminal_attachable(
@@ -78,7 +81,8 @@ fn contract_ensure_terminal_set_groups_members_by_host_and_checkout(store: &mut 
 }
 
 fn contract_ensure_terminal_attachable_uses_binding_as_primary_identity(store: &mut impl AttachableStoreApi) {
-    let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    let set_id =
+        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat").into()));
 
     let first = store.ensure_terminal_attachable(
         &set_id,
@@ -137,7 +141,7 @@ fn contract_roundtrip_preserves_stable_ids(
 ) {
     let host = HostName::new("desktop");
     let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
-    let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
+    let set_id = store.ensure_terminal_set(Some(host), Some(checkout.into()));
     let attachable_id = store.ensure_terminal_attachable(
         &set_id,
         "terminal_pool",
@@ -152,7 +156,7 @@ fn contract_roundtrip_preserves_stable_ids(
 
     let mut reloaded = reload(store.registry().clone());
     let same_set_id =
-        reloaded.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+        reloaded.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat").into()));
     let same_attachable_id = reloaded.ensure_terminal_attachable(
         &same_set_id,
         "terminal_pool",
@@ -206,7 +210,7 @@ fn registry_roundtrip_rebuilds_binding_index() {
     store.insert_set(AttachableSet {
         id: set_id.clone(),
         host_affinity: Some(HostName::new("desktop")),
-        checkout: Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")),
+        checkout: Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat").into()),
         template_identity: Some("default".into()),
         environment_id: None,
         members: vec![attachable_id.clone()],
@@ -323,7 +327,8 @@ fn provider_local_state_is_not_identity_source() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("attachables").join("registry.json");
     let mut store = AttachableStore::with_base(&temp_base(&dir));
-    let set_id = store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat")));
+    let set_id =
+        store.ensure_terminal_set(Some(HostName::new("desktop")), Some(HostPath::new(HostName::new("desktop"), "/repo/wt-feat").into()));
     let attachable_id = store.ensure_terminal_attachable(
         &set_id,
         "terminal_pool",
@@ -349,7 +354,7 @@ fn provider_local_state_is_not_identity_source() {
 fn contract_remove_set_deletes_set_and_members_and_bindings(store: &mut impl AttachableStoreApi) {
     let host = HostName::new("desktop");
     let checkout = HostPath::new(host.clone(), "/repo/wt-feat");
-    let set_id = store.ensure_terminal_set(Some(host), Some(checkout));
+    let set_id = store.ensure_terminal_set(Some(host), Some(checkout.into()));
 
     let _shell = store.ensure_terminal_attachable(
         &set_id,
@@ -422,16 +427,16 @@ fn contract_sets_for_checkout_returns_matching_sets(store: &mut impl AttachableS
     let host = HostName::new("desktop");
     let checkout_a = HostPath::new(host.clone(), "/repo/wt-feat");
     let checkout_b = HostPath::new(host.clone(), "/repo/wt-main");
-    let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout_a.clone()));
-    let _set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout_b.clone()));
-    let found = store.sets_for_checkout(&checkout_a);
+    let set_a = store.ensure_terminal_set(Some(host.clone()), Some(checkout_a.clone().into()));
+    let _set_b = store.ensure_terminal_set(Some(host.clone()), Some(checkout_b.clone().into()));
+    let found = store.sets_for_checkout(&checkout_a.into());
     assert_eq!(found.len(), 1);
     assert_eq!(found[0], set_a);
 }
 
 fn contract_sets_for_checkout_returns_empty_for_unknown(store: &mut impl AttachableStoreApi) {
     let unknown = HostPath::new(HostName::new("desktop"), "/repo/nonexistent");
-    assert!(store.sets_for_checkout(&unknown).is_empty());
+    assert!(store.sets_for_checkout(&unknown.into()).is_empty());
 }
 
 fn contract_lookup_workspace_ref_for_set(store: &mut impl AttachableStoreApi) {

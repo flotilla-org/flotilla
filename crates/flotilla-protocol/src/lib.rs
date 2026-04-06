@@ -118,6 +118,7 @@ pub enum Request {
 /// Typed daemon RPC success payloads.
 ///
 /// On the wire, the tagged enum payload is encoded under `data`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Response {

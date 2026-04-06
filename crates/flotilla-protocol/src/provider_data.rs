@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{qualified_path::QualifiedPath, EnvironmentId, HostName, HostPath};
+use crate::{
+    qualified_path::{qualified_path_or_host_path, QualifiedPath},
+    EnvironmentId, HostName,
+};
 
 /// Identity keys — safe for union-find grouping. Items sharing a
 /// CorrelationKey are the same work unit.
@@ -34,6 +37,8 @@ pub struct Checkout {
     pub last_commit: Option<CommitInfo>,
     pub correlation_keys: Vec<CorrelationKey>,
     pub association_keys: Vec<AssociationKey>,
+    #[serde(default)]
+    pub host_name: Option<HostName>,
     #[serde(default)]
     pub environment_id: Option<EnvironmentId>,
 }
@@ -303,7 +308,8 @@ pub struct AttachableSet {
     #[serde(default)]
     pub host_affinity: Option<HostName>,
     #[serde(default)]
-    pub checkout: Option<HostPath>,
+    #[serde(with = "qualified_path_or_host_path::option")]
+    pub checkout: Option<QualifiedPath>,
     #[serde(default)]
     pub template_identity: Option<String>,
     #[serde(default)]
@@ -400,6 +406,7 @@ mod tests {
                 last_commit: None,
                 correlation_keys: vec![],
                 association_keys: vec![],
+                host_name: None,
                 environment_id: None,
             },
             Checkout {
@@ -411,6 +418,7 @@ mod tests {
                 last_commit: Some(CommitInfo { short_sha: "abc".into(), message: "feat: add login".into() }),
                 correlation_keys: vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
+                host_name: None,
                 environment_id: None,
             },
         ];
@@ -562,6 +570,7 @@ mod tests {
                 last_commit: None,
                 correlation_keys: vec![CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
                 association_keys: vec![],
+                host_name: None,
                 environment_id: None,
             })]),
             ..ProviderData::default()
@@ -622,6 +631,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         });
 

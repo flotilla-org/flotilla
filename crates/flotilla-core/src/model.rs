@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use flotilla_protocol::qualified_path::HostId;
 pub use flotilla_protocol::{CategoryLabels, EnvironmentId, RepoLabels};
 
 use crate::{
@@ -87,6 +88,7 @@ impl RepoModel {
         registry: ProviderRegistry,
         repo_slug: Option<String>,
         environment_id: Option<EnvironmentId>,
+        host_id: Option<HostId>,
         attachable_store: SharedAttachableStore,
         agent_state_store: crate::agents::SharedAgentStateStore,
     ) -> Self {
@@ -98,6 +100,7 @@ impl RepoModel {
             registry.clone(),
             criteria,
             environment_id.clone(),
+            host_id,
             attachable_store,
             agent_state_store,
             Duration::from_secs(10),

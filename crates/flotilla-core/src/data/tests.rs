@@ -74,7 +74,7 @@ fn make_attachable_set(id: &str, path: &str) -> flotilla_protocol::AttachableSet
     flotilla_protocol::AttachableSet {
         id: flotilla_protocol::AttachableSetId::new(id),
         host_affinity: Some(flotilla_protocol::HostName::new("test-host")),
-        checkout: Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path))),
+        checkout: Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::new("test-host"), PathBuf::from(path)).into()),
         template_identity: None,
         environment_id: None,
         members: vec![],
@@ -195,6 +195,34 @@ fn checkout_returns_none_for_non_checkout() {
 fn checkout_key_returns_path() {
     let wi = checkout_item("/repos/proj", None, false);
     assert_eq!(wi.checkout_key(), Some(&qp("/repos/proj")));
+}
+
+#[test]
+fn host_falls_back_to_checkout_host_provenance_when_key_has_host_id() {
+    let checkout_key = flotilla_protocol::qualified_path::QualifiedPath::host(
+        flotilla_protocol::qualified_path::HostId::new("peer-host-id"),
+        "/repos/feat-remote",
+    );
+    let mut providers = ProviderData::default();
+    providers.checkouts.insert(checkout_key.clone(), Checkout {
+        branch: "feat-remote".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![CorrelationKey::Branch("feat-remote".into()), CorrelationKey::CheckoutPath(checkout_key.clone())],
+        association_keys: vec![],
+        host_name: Some(flotilla_protocol::HostName::new("follower")),
+        environment_id: None,
+    });
+
+    let grouped = crate::data::correlate(&providers).0;
+    let checkout = grouped.iter().find(|item| item.branch() == Some("feat-remote")).expect("correlated checkout");
+
+    assert_eq!(checkout.host(&flotilla_protocol::HostName::new("leader")), flotilla_protocol::HostName::new("follower"));
+    let proto = crate::convert::correlation_result_to_work_item(checkout, &[], &flotilla_protocol::HostName::new("leader"));
+    assert_eq!(proto.host, flotilla_protocol::HostName::new("follower"));
 }
 
 #[test]
@@ -843,7 +871,7 @@ fn workspace_only_joins_checkout_through_attachable_set() {
         id: set_id.clone(),
         host_affinity: Some(flotilla_protocol::HostName::new("feta")),
         checkout: Some(
-            flotilla_protocol::HostPath::try_from(&remote_checkout).expect("hostname-qualified path should convert to HostPath"),
+            flotilla_protocol::HostPath::try_from(&remote_checkout).expect("hostname-qualified path should convert to HostPath").into(),
         ),
         template_identity: None,
         environment_id: None,

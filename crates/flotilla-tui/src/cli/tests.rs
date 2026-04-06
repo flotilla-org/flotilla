@@ -484,6 +484,7 @@ mod command_result_human {
             label: "feat".into(),
             target_host: HostName::new("feta"),
             checkout_path: PathBuf::from("/tmp/wt"),
+            checkout_key: None,
             attachable_set_id: None,
             environment_id: None,
             container_name: None,

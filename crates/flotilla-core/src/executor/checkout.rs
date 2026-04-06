@@ -1,5 +1,5 @@
 pub use flotilla_protocol::CheckoutIntent;
-use flotilla_protocol::{CheckoutSelector, HostName, HostPath};
+use flotilla_protocol::{qualified_path::QualifiedPath, CheckoutSelector, HostName};
 use tracing::warn;
 
 use crate::{
@@ -9,6 +9,18 @@ use crate::{
 
 pub(super) struct CheckoutService<'a> {
     registry: &'a ProviderRegistry,
+}
+
+/// Returns whether a checkout key belongs to the executor's local provider snapshot.
+///
+/// Host-id-qualified keys are treated as local-only because executor resolution
+/// operates on the repo's unmerged local provider data (or equivalent
+/// environment-local data). Peer overlay checkouts must not reach this path;
+/// once peer routing grows a stronger owner model this predicate should narrow
+/// accordingly instead of treating all `HostId`-qualified paths as executable
+/// locally.
+pub(crate) fn checkout_is_local_owned(host_path: &QualifiedPath, local_host: &HostName) -> bool {
+    host_path.host_name() == Some(local_host) || host_path.host_id().is_some()
 }
 
 impl<'a> CheckoutService<'a> {
@@ -43,7 +55,7 @@ impl<'a> CheckoutService<'a> {
         &self,
         repo_root: &ExecutionEnvironmentPath,
         branch: &str,
-        deleted_checkout_paths: &[HostPath],
+        deleted_checkout_paths: &[QualifiedPath],
         terminal_manager: Option<&TerminalManager>,
     ) -> Result<(), String> {
         let checkout_manager =
@@ -70,7 +82,7 @@ pub(super) fn resolve_checkout_branch(
         CheckoutSelector::Path(path) => providers_data
             .checkouts
             .iter()
-            .find(|(host_path, _)| host_path.host_name() == Some(local_host) && host_path.path == *path)
+            .find(|(host_path, _)| checkout_is_local_owned(host_path, local_host) && host_path.path == *path)
             .map(|(_, checkout)| checkout.branch.clone())
             .ok_or_else(|| format!("checkout not found: {}", path.display())),
         CheckoutSelector::Query(query) => {
@@ -78,7 +90,7 @@ pub(super) fn resolve_checkout_branch(
                 .checkouts
                 .iter()
                 .filter(|(host_path, checkout)| {
-                    host_path.host_name() == Some(local_host)
+                    checkout_is_local_owned(host_path, local_host)
                         && (checkout.branch == *query
                             || checkout.branch.contains(query)
                             || host_path.path.to_string_lossy().contains(query))

@@ -64,6 +64,7 @@ impl TestCheckout {
             last_commit: None,
             correlation_keys: self.correlation_keys,
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         }
     }

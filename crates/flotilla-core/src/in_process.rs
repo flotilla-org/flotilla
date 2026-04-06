@@ -30,6 +30,7 @@ use crate::{
     daemon::DaemonHandle,
     environment_manager::EnvironmentManager,
     executor,
+    executor::checkout::checkout_is_local_owned,
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
@@ -161,6 +162,45 @@ fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla
     bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
 }
 
+fn normalize_checkout_for_environment(
+    environment_manager: &EnvironmentManager,
+    environment_id: Option<&EnvironmentId>,
+    host_name: &HostName,
+    checkout: QualifiedPath,
+) -> QualifiedPath {
+    let Some(environment_id) = environment_id else {
+        return crate::refresh::normalize_checkout_publication(checkout, None, host_name);
+    };
+
+    let environment_path = ExecutionEnvironmentPath::new(checkout.path.clone());
+    if let Some(host_path) = environment_manager.resolve_environment_path_to_host_path(environment_id, &environment_path) {
+        return host_path;
+    }
+
+    if matches!(checkout.qualifier, flotilla_protocol::qualified_path::PathQualifier::Environment(_)) {
+        return QualifiedPath::environment(environment_id.clone(), checkout.path);
+    }
+
+    let host_id = environment_manager.host_id_for_environment(environment_id);
+    crate::refresh::normalize_checkout_publication(checkout, host_id.as_ref(), host_name)
+}
+
+fn normalize_correlation_keys_for_environment(
+    environment_manager: &EnvironmentManager,
+    environment_id: Option<&EnvironmentId>,
+    host_name: &HostName,
+    keys: Vec<CorrelationKey>,
+) -> Vec<CorrelationKey> {
+    keys.into_iter()
+        .map(|key| match key {
+            CorrelationKey::CheckoutPath(path) => {
+                CorrelationKey::CheckoutPath(normalize_checkout_for_environment(environment_manager, environment_id, host_name, path))
+            }
+            other => other,
+        })
+        .collect()
+}
+
 async fn discover_repo_for_environment(
     environment_manager: &EnvironmentManager,
     discovery: &DiscoveryRuntime,
@@ -179,40 +219,51 @@ async fn discover_repo_for_environment(
     Ok(discover_providers(&host_bag, &ee_path, &discovery.repo_detectors, &discovery.factories, config, runner, env).await)
 }
 
-fn normalize_local_provider_hosts(mut providers: ProviderData, host_name: &HostName) -> ProviderData {
+fn normalize_local_provider_hosts(
+    mut providers: ProviderData,
+    environment_manager: &EnvironmentManager,
+    environment_id: Option<&EnvironmentId>,
+    host_name: &HostName,
+) -> ProviderData {
     providers.checkouts = providers
         .checkouts
         .into_iter()
         .map(|(host_path, mut checkout)| {
-            checkout.correlation_keys = normalize_correlation_keys(checkout.correlation_keys, host_name);
-            (QualifiedPath::from_host_name(host_name, host_path.path), checkout)
+            checkout.correlation_keys =
+                normalize_correlation_keys_for_environment(environment_manager, environment_id, host_name, checkout.correlation_keys);
+            checkout.host_name.get_or_insert_with(|| host_name.clone());
+            (normalize_checkout_for_environment(environment_manager, environment_id, host_name, host_path), checkout)
         })
         .collect();
 
     for change_request in providers.change_requests.values_mut() {
-        change_request.correlation_keys = normalize_correlation_keys(std::mem::take(&mut change_request.correlation_keys), host_name);
+        change_request.correlation_keys = normalize_correlation_keys_for_environment(
+            environment_manager,
+            environment_id,
+            host_name,
+            std::mem::take(&mut change_request.correlation_keys),
+        );
     }
 
     for session in providers.sessions.values_mut() {
-        session.correlation_keys = normalize_correlation_keys(std::mem::take(&mut session.correlation_keys), host_name);
+        session.correlation_keys = normalize_correlation_keys_for_environment(
+            environment_manager,
+            environment_id,
+            host_name,
+            std::mem::take(&mut session.correlation_keys),
+        );
     }
 
     for workspace in providers.workspaces.values_mut() {
-        workspace.correlation_keys = normalize_correlation_keys(std::mem::take(&mut workspace.correlation_keys), host_name);
+        workspace.correlation_keys = normalize_correlation_keys_for_environment(
+            environment_manager,
+            environment_id,
+            host_name,
+            std::mem::take(&mut workspace.correlation_keys),
+        );
     }
 
     providers
-}
-
-fn normalize_correlation_keys(keys: Vec<CorrelationKey>, host_name: &HostName) -> Vec<CorrelationKey> {
-    keys.into_iter()
-        .map(|key| match key {
-            CorrelationKey::CheckoutPath(host_path) => {
-                CorrelationKey::CheckoutPath(QualifiedPath::from_host_name(host_name, host_path.path))
-            }
-            other => other,
-        })
-        .collect()
 }
 
 fn merge_local_provider_data(base: &mut ProviderData, other: &ProviderData) {
@@ -266,8 +317,17 @@ fn build_repo_snapshot_with_peers(
     seq: u64,
     peer_overlay: Option<&[(HostName, ProviderData)]>,
 ) -> RepoSnapshot {
-    let SnapshotBuildContext { repo_identity, path, local_providers, errors, provider_health, host_name } = ctx;
-    let local_providers = normalize_local_provider_hosts(local_providers.clone(), host_name);
+    let SnapshotBuildContext {
+        repo_identity,
+        path,
+        local_providers,
+        errors,
+        provider_health,
+        host_name,
+        environment_manager,
+        environment_id,
+    } = ctx;
+    let local_providers = normalize_local_provider_hosts(local_providers.clone(), environment_manager, environment_id, host_name);
 
     // Merge peer provider data if any
     let providers = if let Some(peers) = peer_overlay {
@@ -408,7 +468,8 @@ impl InProcessDaemon {
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id =
             resolve_local_host_id(config.state_dir().as_path(), &*discovery.runner).await.expect("failed to resolve local host id");
-        let environment_manager = Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id).await);
+        let environment_manager =
+            Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
 
@@ -438,6 +499,7 @@ impl InProcessDaemon {
                 registry,
                 repo_slug,
                 Some(local_environment_id.clone()),
+                Some(local_host_id.clone()),
                 attachable_store,
                 Arc::clone(&agent_state_store),
             );
@@ -521,6 +583,14 @@ impl InProcessDaemon {
 
     pub fn local_environment_id(&self) -> &EnvironmentId {
         &self.local_environment_id
+    }
+
+    pub fn local_host_id(&self) -> Option<flotilla_protocol::qualified_path::HostId> {
+        self.environment_manager.host_id_for_environment(&self.local_environment_id)
+    }
+
+    pub fn host_id_for_environment(&self, env_id: &EnvironmentId) -> Option<flotilla_protocol::qualified_path::HostId> {
+        self.environment_manager.host_id_for_environment(env_id)
     }
 
     pub fn agent_state_store(&self) -> &crate::agents::SharedAgentStateStore {
@@ -744,7 +814,7 @@ impl InProcessDaemon {
                 &snapshot.providers
             } else {
                 snapshot_owned = build_repo_snapshot_with_peers(
-                    state.snapshot_context(&self.host_name),
+                    state.snapshot_context(&self.host_name, &self.environment_manager),
                     state.seq(),
                     peer_providers.get(state.identity()).map(|peers| peers.as_slice()),
                 );
@@ -752,7 +822,7 @@ impl InProcessDaemon {
             };
             for (host_path, checkout) in &providers.checkouts {
                 if let Some(host) = target_host {
-                    if host_path.host_name() != Some(host) {
+                    if !checkout_is_local_owned(host_path, host) {
                         continue;
                     }
                 }
@@ -818,7 +888,12 @@ impl InProcessDaemon {
         }
         // last_local_providers excludes peer overlay data; normalize so
         // outbound replication only sends this host's authoritative state.
-        let providers = normalize_local_provider_hosts(state.last_local_providers.clone(), &self.host_name);
+        let providers = normalize_local_provider_hosts(
+            state.last_local_providers.clone(),
+            &self.environment_manager,
+            state.preferred_environment_id(),
+            &self.host_name,
+        );
         Some((providers, state.local_data_version()))
     }
 
@@ -905,13 +980,22 @@ impl InProcessDaemon {
         // Correlate and build proto snapshots outside any lock
         let mut updates = Vec::new();
         for (identity, snapshots) in changed {
+            let environment_id = {
+                let repos = self.repos.read().await;
+                repos.get(&identity).and_then(|state| state.preferred_environment_id().cloned())
+            };
             let mut local_providers = ProviderData::default();
             let mut provider_health = HashMap::new();
             let mut errors = Vec::new();
             let mut initialized = false;
 
             for snapshot in &snapshots {
-                let providers = normalize_local_provider_hosts((*snapshot.providers).clone(), &self.host_name);
+                let providers = normalize_local_provider_hosts(
+                    (*snapshot.providers).clone(),
+                    &self.environment_manager,
+                    environment_id.as_ref(),
+                    &self.host_name,
+                );
                 if !initialized {
                     local_providers = providers;
                     initialized = true;
@@ -1138,8 +1222,11 @@ impl InProcessDaemon {
             return;
         };
 
-        let proto_snapshot =
-            build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq() + 1, peer_overlay.as_deref());
+        let proto_snapshot = build_repo_snapshot_with_peers(
+            state.snapshot_context(&self.host_name, &self.environment_manager),
+            state.seq() + 1,
+            peer_overlay.as_deref(),
+        );
 
         // Compute and log delta (also advances seq)
         let delta_entry = state.record_delta(
@@ -1260,6 +1347,7 @@ impl InProcessDaemon {
             registry,
             repo_slug,
             Some(self.local_environment_id.clone()),
+            Some(self.environment_manager.host_id_for_environment(&self.local_environment_id).expect("local host id must be available")),
             self.discovery.shared_attachable_store(&self.config),
             Arc::clone(&self.agent_state_store),
         );
@@ -1389,7 +1477,7 @@ impl InProcessDaemon {
         let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name),
+                state.snapshot_context(&self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             )),
@@ -1413,7 +1501,7 @@ impl InProcessDaemon {
         let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name),
+                state.snapshot_context(&self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             )),
@@ -1461,7 +1549,7 @@ impl InProcessDaemon {
         let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name),
+                state.snapshot_context(&self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             )),
@@ -1749,7 +1837,7 @@ impl InProcessDaemon {
             } else {
                 Arc::new(
                     build_repo_snapshot_with_peers(
-                        state.snapshot_context(&self.host_name),
+                        state.snapshot_context(&self.host_name, &self.environment_manager),
                         state.seq(),
                         peer_overlay.get(&identity).map(|peers| peers.as_slice()),
                     )
@@ -1944,7 +2032,11 @@ impl DaemonHandle for InProcessDaemon {
         let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
         Ok(match state.cached_snapshot() {
             Some(s) => (**s).clone(),
-            None => build_repo_snapshot_with_peers(state.snapshot_context(&self.host_name), state.seq(), peer_overlay.as_deref()),
+            None => build_repo_snapshot_with_peers(
+                state.snapshot_context(&self.host_name, &self.environment_manager),
+                state.seq(),
+                peer_overlay.as_deref(),
+            ),
         })
     }
 
@@ -2088,7 +2180,7 @@ impl DaemonHandle for InProcessDaemon {
             let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
                 Some(s) => std::borrow::Cow::Borrowed(s),
                 None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                    state.snapshot_context(&self.host_name),
+                    state.snapshot_context(&self.host_name, &self.environment_manager),
                     state.seq(),
                     peer_providers.get(identity).map(|v| v.as_slice()),
                 )),
