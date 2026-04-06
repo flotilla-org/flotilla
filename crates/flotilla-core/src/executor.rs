@@ -19,7 +19,7 @@ use flotilla_protocol::{
 use tracing::{debug, error, info};
 
 use self::{
-    checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutService},
+    checkout::{checkout_is_local_owned, resolve_checkout_branch, CheckoutIntent, CheckoutService},
     session_actions::{resolve_attach_command, ReadOnlySessionActionService, TeleportFlow, TeleportSessionActionService},
     terminals::TerminalPreparationService,
     workspace::WorkspaceOrchestrator,
@@ -61,7 +61,7 @@ impl<'a> CheckoutFlow<'a> {
             return None;
         }
         self.providers_data.checkouts.iter().find_map(|(hp, co)| {
-            if hp.host_name() == Some(self.local_host) && co.branch == self.branch {
+            if checkout_is_local_owned(hp, self.local_host) && co.branch == self.branch {
                 Some(ExecutionEnvironmentPath::new(&hp.path))
             } else {
                 None
@@ -158,8 +158,8 @@ pub async fn build_plan(
                     let deleted_paths: Vec<HostPath> = providers_data
                         .checkouts
                         .iter()
-                        .filter(|(qp, co)| co.branch == branch && qp.host_name() == Some(&target_host))
-                        .filter_map(|(qp, _)| HostPath::try_from(qp).ok())
+                        .filter(|(qp, co)| co.branch == branch && checkout_is_local_owned(qp, &target_host))
+                        .map(|(qp, _)| HostPath::new(target_host.clone(), qp.path.clone()))
                         .collect();
                     info!(%branch, ?deleted_paths, %target_host, "built remove checkout plan");
                     Ok(build_remove_checkout_plan(branch, deleted_paths, target_host))
@@ -702,6 +702,13 @@ impl StepResolver for ExecutorStepResolver {
                         .providers_data
                         .checkouts
                         .get(&host_key)
+                        .or_else(|| {
+                            self.providers_data
+                                .checkouts
+                                .iter()
+                                .find(|(hp, _)| checkout_is_local_owned(hp, &self.local_host) && hp.path == p.as_path())
+                                .map(|(_, checkout)| checkout)
+                        })
                         .map(|checkout| checkout.branch.clone())
                         .ok_or_else(|| format!("checkout not found: {}", p))?;
                     Some((p, branch))

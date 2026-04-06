@@ -1,7 +1,10 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use flotilla_protocol::test_support::{TestChangeRequest, TestCheckout, TestSession};
+use flotilla_protocol::{
+    qualified_path::{HostId, QualifiedPath},
+    test_support::{TestChangeRequest, TestCheckout, TestSession},
+};
 
 use super::*;
 use crate::{
@@ -355,6 +358,7 @@ async fn refresh_empty_registry_produces_empty_data() {
         &ProviderRegistry::new(),
         &criteria(),
         None,
+        None,
         &test_attachable_store(),
         &test_agent_state_store(),
     )
@@ -400,7 +404,7 @@ async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
 
     let mut pd = ProviderData::default();
     let errors =
-        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), None, &test_attachable_store(), &test_agent_state_store()).await;
+        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), None, None, &test_attachable_store(), &test_agent_state_store()).await;
 
     assert!(errors.is_empty());
     assert_eq!(pd.checkouts.len(), 1);
@@ -410,6 +414,37 @@ async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
     assert_eq!(pd.branches.len(), 2);
     assert_eq!(pd.branches.get("remote-only").unwrap().status, BranchStatus::Remote);
     assert_eq!(pd.branches.get("shared").unwrap().status, BranchStatus::Merged);
+}
+
+#[tokio::test]
+async fn refresh_uses_host_id_for_local_checkout_publication_when_available() {
+    let host_id = HostId::new("host-123");
+    let mut registry = ProviderRegistry::new();
+    registry.checkout_managers.insert(
+        "wt",
+        desc("wt"),
+        Arc::new(MockCheckoutManager::ok(vec![(PathBuf::from("/tmp/wt/feat-a"), TestCheckout::new("feat-a").with_branch_key().build())])),
+    );
+
+    let handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        Some(host_id.clone()),
+        test_attachable_store(),
+        test_agent_state_store(),
+        Duration::from_secs(3600),
+    );
+
+    let mut rx = handle.snapshot_rx.clone();
+    let snapshot = wait_for_snapshot(&mut rx).await;
+    let expected = QualifiedPath::host(host_id.clone(), "/tmp/wt/feat-a");
+    assert!(snapshot.providers.checkouts.contains_key(&expected));
+    assert!(
+        !snapshot.providers.checkouts.contains_key(&QualifiedPath::from_host_name(&flotilla_protocol::HostName::local(), "/tmp/wt/feat-a")),
+        "local publication should prefer the real host id when available"
+    );
 }
 
 #[test]
@@ -478,7 +513,7 @@ async fn refresh_reports_checkout_errors() {
 
     let mut pd = ProviderData::default();
     let errors =
-        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), None, &test_attachable_store(), &test_agent_state_store()).await;
+        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), None, None, &test_attachable_store(), &test_agent_state_store()).await;
 
     assert!(errors.iter().any(|e| e.category == "checkouts"));
     assert!(pd.checkouts.is_empty());
@@ -499,7 +534,7 @@ async fn refresh_collects_multiple_errors_and_preserves_successful_providers() {
 
     let mut pd = ProviderData::default();
     let errors =
-        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), None, &test_attachable_store(), &test_agent_state_store()).await;
+        refresh_providers(&mut pd, &repo_root(), &registry, &criteria(), None, None, &test_attachable_store(), &test_agent_state_store()).await;
 
     let categories: HashSet<&str> = errors.iter().map(|e| e.category).collect();
     for expected in ["PRs", "merged", "sessions", "branches", "workspaces"] {
@@ -519,6 +554,7 @@ async fn spawn_produces_initial_snapshot() {
         repo_root(),
         Arc::new(ProviderRegistry::new()),
         criteria(),
+        None,
         None,
         test_attachable_store(),
         test_agent_state_store(),
@@ -542,6 +578,7 @@ async fn spawn_with_failing_provider_sets_error_and_unhealthy_health() {
         Arc::new(registry),
         criteria(),
         None,
+        None,
         test_attachable_store(),
         test_agent_state_store(),
         Duration::from_secs(3600),
@@ -559,6 +596,7 @@ async fn trigger_refresh_produces_another_snapshot() {
         repo_root(),
         Arc::new(ProviderRegistry::new()),
         criteria(),
+        None,
         None,
         test_attachable_store(),
         test_agent_state_store(),
@@ -597,6 +635,7 @@ async fn spawn_with_mixed_provider_health_isolates_failures() {
         repo_root(),
         Arc::new(registry),
         criteria(),
+        None,
         None,
         test_attachable_store(),
         test_agent_state_store(),

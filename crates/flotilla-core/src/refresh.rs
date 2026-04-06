@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use flotilla_protocol::EnvironmentId;
+use flotilla_protocol::{
+    qualified_path::{HostId, PathQualifier, QualifiedPath},
+    CorrelationKey, EnvironmentId, HostName,
+};
 use tokio::{
     sync::{watch, Notify},
     task::JoinHandle,
@@ -48,12 +51,37 @@ pub struct RepoRefreshHandle {
     _task_handle: JoinHandle<()>,
 }
 
+pub(crate) fn normalize_checkout_publication(path: QualifiedPath, host_id: Option<&HostId>, _host_name: &HostName) -> QualifiedPath {
+    match host_id {
+        Some(host_id) => QualifiedPath::host(host_id.clone(), path.path),
+        None => match path.qualifier {
+            PathQualifier::Host(host) => QualifiedPath::host(host, path.path),
+            PathQualifier::Environment(env) => QualifiedPath::environment(env, path.path),
+            PathQualifier::HostName(host) => QualifiedPath::from_host_name(&host, path.path),
+        },
+    }
+}
+
+pub(crate) fn normalize_checkout_correlation_keys(
+    keys: Vec<CorrelationKey>,
+    host_id: Option<&HostId>,
+    host_name: &HostName,
+) -> Vec<CorrelationKey> {
+    keys.into_iter()
+        .map(|key| match key {
+            CorrelationKey::CheckoutPath(path) => CorrelationKey::CheckoutPath(normalize_checkout_publication(path, host_id, host_name)),
+            other => other,
+        })
+        .collect()
+}
+
 impl RepoRefreshHandle {
     pub fn spawn(
         repo_root: PathBuf,
         registry: Arc<ProviderRegistry>,
         criteria: RepoCriteria,
         environment_id: Option<EnvironmentId>,
+        host_id: Option<HostId>,
         attachable_store: SharedAttachableStore,
         agent_state_store: crate::agents::SharedAgentStateStore,
         interval: Duration,
@@ -79,6 +107,7 @@ impl RepoRefreshHandle {
                     &registry,
                     &criteria,
                     environment_id.as_ref(),
+                    host_id.as_ref(),
                     &attachable_store,
                     &agent_state_store,
                 )
@@ -171,6 +200,7 @@ async fn refresh_providers(
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
     environment_id: Option<&EnvironmentId>,
+    host_id: Option<&HostId>,
     attachable_store: &SharedAttachableStore,
     agent_state_store: &crate::agents::SharedAgentStateStore,
 ) -> Vec<RefreshError> {
@@ -248,25 +278,36 @@ async fn refresh_providers(
         }
     }
 
-    let local_host = flotilla_protocol::HostName::local();
+    let local_host = HostName::local();
     pd.checkouts = checkouts
         .into_iter()
         .map(|(path, mut co)| {
             if co.environment_id.is_none() {
                 co.environment_id = environment_id.cloned();
             }
-            (flotilla_protocol::qualified_path::QualifiedPath::from_host_name(&local_host, path.as_path()), co)
+            let publication = normalize_checkout_publication(QualifiedPath::from_host_name(&local_host, path.as_path()), host_id, &local_host);
+            co.correlation_keys = normalize_checkout_correlation_keys(co.correlation_keys, host_id, &local_host);
+            (publication, co)
         })
         .collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
 
     pd.change_requests = crs.into_iter().collect();
+    for change_request in pd.change_requests.values_mut() {
+        change_request.correlation_keys = normalize_checkout_correlation_keys(change_request.correlation_keys.clone(), host_id, &local_host);
+    }
     collect_errors(&mut errors, "PRs", cr_errors);
 
     pd.sessions = sessions.into_iter().collect();
+    for session in pd.sessions.values_mut() {
+        session.correlation_keys = normalize_checkout_correlation_keys(session.correlation_keys.clone(), host_id, &local_host);
+    }
     collect_errors(&mut errors, "sessions", session_errors);
 
     pd.workspaces = workspaces.into_iter().collect();
+    for workspace in pd.workspaces.values_mut() {
+        workspace.correlation_keys = normalize_checkout_correlation_keys(workspace.correlation_keys.clone(), host_id, &local_host);
+    }
     collect_errors(&mut errors, "workspaces", ws_errors);
 
     collect_errors(&mut errors, "terminals", tp_errors);
@@ -344,13 +385,12 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
     }
 
     // Set selection: project sets whose checkout matches a repo checkout
-    let checkout_paths: std::collections::HashSet<flotilla_protocol::HostPath> =
-        pd.checkouts.keys().filter_map(|path| flotilla_protocol::HostPath::try_from(path).ok()).collect();
+    let checkout_paths: std::collections::HashSet<PathBuf> = pd.checkouts.keys().map(|path| path.path.clone()).collect();
     pd.attachable_sets = store
         .registry()
         .sets
         .iter()
-        .filter(|(_, set)| set.checkout.as_ref().is_some_and(|co| checkout_paths.contains(co)))
+        .filter(|(_, set)| set.checkout.as_ref().is_some_and(|co| checkout_paths.contains(&co.path)))
         .map(|(id, set)| (id.clone(), set.clone()))
         .collect();
 

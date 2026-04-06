@@ -429,9 +429,9 @@ impl EnvironmentManager {
         path_str.starts_with('/') && path_str.split('/').all(|component| component != "." && component != "..")
     }
 
-    fn host_id_for_environment(&self, env_id: &EnvironmentId) -> Option<HostId> {
+    pub fn host_id_for_environment(&self, env_id: &EnvironmentId) -> Option<HostId> {
         match self.managed_environment(env_id)? {
-            ManagedEnvironmentKind::Direct(state) => state.host_id,
+            ManagedEnvironmentKind::Direct(state) => state.host_id.clone(),
             ManagedEnvironmentKind::Provisioned(state) => Some(state.owning_host_id.clone()),
         }
     }

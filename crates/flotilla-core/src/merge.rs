@@ -1,5 +1,7 @@
 use flotilla_protocol::{HostName, ProviderData};
 
+use crate::executor::checkout::checkout_is_local_owned;
+
 /// Merge local ProviderData with peer data from remote hosts.
 ///
 /// Host-scoped data is merged with ownership-aware rules:
@@ -21,7 +23,7 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
         //   overwrite them
         // - peer-owned host paths are only accepted from that owning peer
         for (host_path, checkout) in &peer_data.checkouts {
-            if host_path.host_name() == Some(local_host) {
+            if checkout_is_local_owned(host_path, local_host) {
                 continue;
             }
             if host_path.host_name() != Some(peer_host) {

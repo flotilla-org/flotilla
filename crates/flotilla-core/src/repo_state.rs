@@ -15,6 +15,7 @@ use flotilla_protocol::{DeltaEntry, EnvironmentId, HostName, ProviderData, Provi
 
 use crate::{
     delta,
+    environment_manager::EnvironmentManager,
     model::{provider_names_from_registry, RepoModel},
     providers::discovery::{EnvironmentBag, UnmetRequirement},
     refresh::RefreshSnapshot,
@@ -36,6 +37,8 @@ pub(crate) struct SnapshotBuildContext<'a> {
     pub(crate) errors: &'a [crate::data::RefreshError],
     pub(crate) provider_health: &'a HashMap<(&'static str, String), bool>,
     pub(crate) host_name: &'a HostName,
+    pub(crate) environment_manager: &'a EnvironmentManager,
+    pub(crate) environment_id: Option<&'a EnvironmentId>,
 }
 
 pub(crate) struct RepoRootState {
@@ -219,7 +222,7 @@ impl RepoState {
     }
 
     /// Build a [`SnapshotBuildContext`] from the current state.
-    pub(crate) fn snapshot_context<'a>(&'a self, host_name: &'a HostName) -> SnapshotBuildContext<'a> {
+    pub(crate) fn snapshot_context<'a>(&'a self, host_name: &'a HostName, environment_manager: &'a EnvironmentManager) -> SnapshotBuildContext<'a> {
         SnapshotBuildContext {
             repo_identity: self.identity.clone(),
             path: self.preferred_path(),
@@ -227,6 +230,8 @@ impl RepoState {
             errors: &self.last_snapshot.errors,
             provider_health: &self.last_snapshot.provider_health,
             host_name,
+            environment_manager,
+            environment_id: self.preferred_environment_id(),
         }
     }
 
@@ -568,6 +573,7 @@ mod tests {
                 crate::providers::registry::ProviderRegistry::new(),
                 None,
                 Some(remote_env.clone()),
+                None,
                 crate::attachable::shared_in_memory_attachable_store(),
                 crate::agents::shared_in_memory_agent_state_store(),
             ),
@@ -587,6 +593,7 @@ mod tests {
                 crate::providers::registry::ProviderRegistry::new(),
                 None,
                 Some(local_env.clone()),
+                None,
                 crate::attachable::shared_in_memory_attachable_store(),
                 crate::agents::shared_in_memory_agent_state_store(),
             ),

@@ -1,18 +1,39 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::{Arc, OnceLock}};
 
-use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, EnvironmentId, HostPath, Issue, RepoSelector};
+use async_trait::async_trait;
+use flotilla_protocol::{
+    qualified_path::{HostId, QualifiedPath},
+    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, EnvironmentId, EnvironmentStatus, HostPath, ImageId, Issue, RepoSelector,
+};
 
 use super::*;
 use crate::{
     agents::shared_in_memory_agent_state_store,
     attachable::shared_in_memory_attachable_store,
     config::ConfigStore,
+    environment_manager::EnvironmentManager,
     model::RepoModel,
     providers::discovery::{
         test_support::{fake_discovery, DiscoveryMockRunner},
         EnvironmentAssertion, EnvironmentBag,
     },
+    providers::{
+        environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
+        CommandRunner,
+    },
 };
+
+fn test_environment_manager() -> &'static EnvironmentManager {
+    static MANAGER: OnceLock<EnvironmentManager> = OnceLock::new();
+    MANAGER.get_or_init(|| {
+        EnvironmentManager::from_local_state(
+            EnvironmentId::new("test-local-env"),
+            HostId::new("test-local-host"),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+            EnvironmentBag::new(),
+        )
+    })
+}
 
 #[test]
 fn choose_event_uses_delta_for_non_initial_changes() {
@@ -72,6 +93,8 @@ fn build_repo_snapshot_basic() {
             errors: &default_snap.errors,
             provider_health: &default_snap.provider_health,
             host_name: &HostName::local(),
+            environment_manager: test_environment_manager(),
+            environment_id: None,
         },
         7,
         None,
@@ -130,6 +153,8 @@ fn build_repo_snapshot_with_peers_merges_peer_data() {
             errors: &default_snap.errors,
             provider_health: &default_snap.provider_health,
             host_name: &host_a,
+            environment_manager: test_environment_manager(),
+            environment_id: None,
         },
         1,
         Some(&peers),
@@ -192,6 +217,8 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
             errors: &default_snap.errors,
             provider_health: &default_snap.provider_health,
             host_name: &local_host,
+            environment_manager: test_environment_manager(),
+            environment_id: None,
         },
         1,
         Some(&peers),
@@ -213,6 +240,8 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
             errors: &default_snap.errors,
             provider_health: &default_snap.provider_health,
             host_name: &local_host,
+            environment_manager: test_environment_manager(),
+            environment_id: None,
         },
         2,
         Some(&peers),
@@ -286,6 +315,8 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
             errors: &default_snap.errors,
             provider_health: &default_snap.provider_health,
             host_name: &local_host,
+            environment_manager: test_environment_manager(),
+            environment_id: None,
         },
         1,
         Some(&peers),
@@ -444,6 +475,8 @@ fn snapshot_includes_linked_issues_when_populated() {
             errors: &default_snap.errors,
             provider_health: &default_snap.provider_health,
             host_name: &host,
+            environment_manager: test_environment_manager(),
+            environment_id: None,
         },
         1,
         None,
@@ -497,6 +530,7 @@ async fn get_repo_providers_uses_preferred_root_environment_host_discovery_for_n
         crate::providers::registry::ProviderRegistry::new(),
         None,
         Some(remote_environment_id.clone()),
+        None,
         shared_in_memory_attachable_store(),
         shared_in_memory_agent_state_store(),
     );
@@ -528,5 +562,98 @@ async fn get_repo_providers_uses_preferred_root_environment_host_discovery_for_n
             .iter()
             .any(|entry| entry.kind == "env_var_set" && entry.detail.get("key").map(String::as_str) == Some("LOCAL_MARKER")),
         "host discovery should not fall back to the daemon-local environment bag"
+    );
+}
+
+#[tokio::test]
+async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_checkouts() {
+    struct TestProvisionedEnvironment {
+        id: EnvironmentId,
+        image: ImageId,
+        runner: Arc<dyn CommandRunner>,
+        mounts: Vec<ProvisionedMount>,
+    }
+
+    #[async_trait]
+    impl ProvisionedEnvironment for TestProvisionedEnvironment {
+        fn id(&self) -> &EnvironmentId {
+            &self.id
+        }
+
+        fn image(&self) -> &ImageId {
+            &self.image
+        }
+
+        fn container_name(&self) -> Option<&str> {
+            None
+        }
+
+        fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+            self.mounts.clone()
+        }
+
+        async fn status(&self) -> Result<EnvironmentStatus, String> {
+            Ok(EnvironmentStatus::Running)
+        }
+
+        async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+            Ok(HashMap::new())
+        }
+
+        fn runner(&self, _host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+            Arc::clone(&self.runner)
+        }
+
+        async fn destroy(&self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let local_environment_id = EnvironmentId::new("local-env");
+    let local_host_id = HostId::new("local-host-id");
+    let environment_manager = EnvironmentManager::from_local_state(
+        local_environment_id,
+        local_host_id.clone(),
+        Arc::new(DiscoveryMockRunner::builder().build()),
+        EnvironmentBag::new(),
+    );
+
+    let environment_id = EnvironmentId::new("provisioned-env");
+    let handle: EnvironmentHandle = Arc::new(TestProvisionedEnvironment {
+        id: environment_id.clone(),
+        image: ImageId::new("image:test"),
+        runner: Arc::new(DiscoveryMockRunner::builder().build()),
+        mounts: vec![ProvisionedMount::new("/host/reference-repo", "/workspace/repo")],
+    });
+    environment_manager
+        .register_provisioned_environment(environment_id.clone(), handle, EnvironmentBag::new(), None)
+        .expect("register provisioned environment");
+
+    let checkout_path = QualifiedPath::from_host_name(&HostName::local(), "/workspace/repo/feature");
+    let mut providers = ProviderData::default();
+    providers.checkouts.insert(
+        checkout_path.clone(),
+        Checkout {
+            branch: "feature".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path.clone())],
+            association_keys: vec![],
+            environment_id: Some(environment_id.clone()),
+        },
+    );
+
+    let normalized = normalize_local_provider_hosts(providers, &environment_manager, Some(&environment_id), &HostName::local());
+    let expected = QualifiedPath::host(local_host_id, "/host/reference-repo/feature");
+    let checkout = normalized.checkouts.get(&expected).expect("mount-covered checkout should be host-qualified");
+
+    assert_eq!(checkout.environment_id.as_ref(), Some(&environment_id));
+    assert_eq!(checkout.correlation_keys, vec![CorrelationKey::CheckoutPath(expected.clone())]);
+    assert!(
+        !normalized.checkouts.contains_key(&checkout_path),
+        "environment-local publication should be replaced by the host-qualified path"
     );
 }
