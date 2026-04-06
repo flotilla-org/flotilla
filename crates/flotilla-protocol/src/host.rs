@@ -82,6 +82,7 @@ impl std::str::FromStr for HostPath {
 
 /// Serde helpers for `IndexMap<HostPath, V>` — serializes keys as `"host:path"` strings
 /// so they work as JSON object keys.
+#[allow(dead_code)] // retained for legacy HostPath compatibility during QualifiedPath migration
 pub mod host_path_map {
     use std::{fmt, marker::PhantomData};
 

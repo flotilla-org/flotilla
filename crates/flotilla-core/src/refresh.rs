@@ -255,7 +255,7 @@ async fn refresh_providers(
             if co.environment_id.is_none() {
                 co.environment_id = environment_id.cloned();
             }
-            (flotilla_protocol::HostPath::new(local_host.clone(), path.as_path()), co)
+            (flotilla_protocol::qualified_path::QualifiedPath::from_host_name(&local_host, path.as_path()), co)
         })
         .collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
@@ -344,7 +344,8 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
     }
 
     // Set selection: project sets whose checkout matches a repo checkout
-    let checkout_paths: std::collections::HashSet<&flotilla_protocol::HostPath> = pd.checkouts.keys().collect();
+    let checkout_paths: std::collections::HashSet<flotilla_protocol::HostPath> =
+        pd.checkouts.keys().filter_map(|path| flotilla_protocol::HostPath::try_from(path).ok()).collect();
     pd.attachable_sets = store
         .registry()
         .sets

@@ -225,7 +225,10 @@ pub fn snapshot_to_proto(
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{test_support::hp, CheckoutRef, HostName, HostPath, HostProviderStatus, WorkItemIdentity, WorkItemKind};
+    use flotilla_protocol::{
+        test_support::{hp, qp},
+        CheckoutRef, HostName, HostPath, HostProviderStatus, WorkItemIdentity, WorkItemKind,
+    };
 
     use super::*;
     use crate::{
@@ -344,7 +347,7 @@ mod tests {
         let proto = correlation_result_to_work_item(&item, &[], &test_host());
 
         assert_eq!(proto.kind, WorkItemKind::Checkout);
-        assert_eq!(proto.identity, WorkItemIdentity::Checkout(hp("/repos/my-project/wt-1")));
+        assert_eq!(proto.identity, WorkItemIdentity::Checkout(qp("/repos/my-project/wt-1")));
         // Checkout-anchored items derive host from HostPath
         assert_eq!(proto.host, test_host());
         assert_eq!(proto.branch.as_deref(), Some("feature-login"));

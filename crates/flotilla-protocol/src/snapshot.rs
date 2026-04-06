@@ -108,12 +108,12 @@ pub struct WorkItem {
 }
 
 impl WorkItem {
-    pub fn checkout_key(&self) -> Option<&HostPath> {
-        self.checkout.as_ref().and_then(CheckoutRef::host_path)
+    pub fn checkout_key(&self) -> Option<&QualifiedPath> {
+        self.checkout.as_ref().map(|co| &co.key)
     }
 
     pub fn qualified_checkout_key(&self) -> Option<&QualifiedPath> {
-        self.checkout.as_ref().map(|co| &co.key)
+        self.checkout_key()
     }
 }
 
@@ -130,7 +130,7 @@ pub enum WorkItemKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WorkItemIdentity {
-    Checkout(HostPath),
+    Checkout(QualifiedPath),
     AttachableSet(AttachableSetId),
     ChangeRequest(String),
     Session(String),
@@ -207,7 +207,7 @@ mod tests {
         provider_data::ProviderData,
         qualified_path::{HostId, QualifiedPath},
         test_helpers::assert_json_roundtrip,
-        test_support::hp,
+        test_support::{hp, qp},
     };
 
     #[test]
@@ -289,7 +289,7 @@ mod tests {
             work_items: vec![
                 WorkItem {
                     kind: WorkItemKind::Checkout,
-                    identity: WorkItemIdentity::Checkout(hp("/repos/project/wt")),
+                    identity: WorkItemIdentity::Checkout(qp("/repos/project/wt")),
                     host: HostName::new("test-host"),
                     branch: Some("feat-x".into()),
                     description: "Feature X".into(),
@@ -394,7 +394,7 @@ mod tests {
             },
             WorkItem {
                 kind: WorkItemKind::Checkout,
-                identity: WorkItemIdentity::Checkout(hp("/wt")),
+                identity: WorkItemIdentity::Checkout(qp("/wt")),
                 host: HostName::new("test-host"),
                 branch: Some("main".into()),
                 description: "Main".into(),
@@ -424,7 +424,7 @@ mod tests {
         let without_checkout = &cases[0];
         assert!(without_checkout.checkout_key().is_none());
         let with_checkout = &cases[1];
-        assert_eq!(with_checkout.checkout_key(), Some(&hp("/repos/main")));
+        assert_eq!(with_checkout.checkout_key(), Some(&qp("/repos/main")));
         assert_eq!(
             with_checkout.qualified_checkout_key(),
             Some(&QualifiedPath::from_host_name(&HostName::new("test-host"), "/repos/main"))
@@ -503,7 +503,7 @@ mod tests {
         }
 
         let identities = vec![
-            WorkItemIdentity::Checkout(hp("/path/to/wt")),
+            WorkItemIdentity::Checkout(qp("/path/to/wt")),
             WorkItemIdentity::AttachableSet(AttachableSetId::new("set-1")),
             WorkItemIdentity::ChangeRequest("99".into()),
             WorkItemIdentity::Session("sess-abc".into()),

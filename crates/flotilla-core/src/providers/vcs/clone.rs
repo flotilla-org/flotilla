@@ -106,7 +106,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 .unwrap_or_else(|_| entry.to_string());
 
             let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), std::path::Path::new(&dir));
-            let correlation_keys = vec![CorrelationKey::Branch(branch.clone()), CorrelationKey::CheckoutPath(host_path)];
+            let correlation_keys = vec![CorrelationKey::Branch(branch.clone()), CorrelationKey::CheckoutPath(host_path.into())];
 
             let checkout = Checkout {
                 branch,
@@ -176,7 +176,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
         }
 
         let host_path = flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), std::path::Path::new(&checkout_dir));
-        let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(host_path)];
+        let correlation_keys = vec![CorrelationKey::Branch(branch.to_string()), CorrelationKey::CheckoutPath(host_path.into())];
 
         let checkout = Checkout {
             branch: branch.to_string(),

@@ -3,14 +3,14 @@ use std::path::PathBuf;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use crate::{EnvironmentId, HostName, HostPath};
+use crate::{qualified_path::QualifiedPath, EnvironmentId, HostName, HostPath};
 
 /// Identity keys — safe for union-find grouping. Items sharing a
 /// CorrelationKey are the same work unit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CorrelationKey {
     Branch(String),
-    CheckoutPath(HostPath),
+    CheckoutPath(QualifiedPath),
     AttachableSet(AttachableSetId),
     ChangeRequestRef(String, String), // (provider_name, CR id)
     SessionRef(String, String),       // (provider_name, session_id)
@@ -339,8 +339,8 @@ pub struct Workspace {
 /// All raw provider data for a single repo, keyed for lookup.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderData {
-    #[serde(with = "crate::host::host_path_map")]
-    pub checkouts: IndexMap<HostPath, Checkout>,
+    #[serde(with = "crate::qualified_path::qualified_path_map")]
+    pub checkouts: IndexMap<QualifiedPath, Checkout>,
     pub change_requests: IndexMap<String, ChangeRequest>,
     pub issues: IndexMap<String, Issue>,
     pub sessions: IndexMap<String, CloudAgentSession>,
@@ -356,13 +356,13 @@ pub struct ProviderData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{test_helpers::assert_roundtrip, test_support::hp};
+    use crate::{test_helpers::assert_roundtrip, test_support::qp};
 
     #[test]
     fn key_types_roundtrip_all_variants() {
         let correlation_cases = vec![
             CorrelationKey::Branch("main".into()),
-            CorrelationKey::CheckoutPath(hp("/x")),
+            CorrelationKey::CheckoutPath(qp("/x")),
             CorrelationKey::AttachableSet(AttachableSetId::new("set-1")),
             CorrelationKey::ChangeRequestRef("gh".into(), "1".into()),
             CorrelationKey::SessionRef("cl".into(), "s".into()),
@@ -409,7 +409,7 @@ mod tests {
                 remote_ahead_behind: Some(AheadBehind { ahead: 0, behind: 3 }),
                 working_tree: Some(WorkingTreeStatus { staged: 1, modified: 2, untracked: 3 }),
                 last_commit: Some(CommitInfo { short_sha: "abc".into(), message: "feat: add login".into() }),
-                correlation_keys: vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(hp("/repos/proj/wt-1"))],
+                correlation_keys: vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
                 environment_id: None,
             },
@@ -508,7 +508,7 @@ mod tests {
         let workspace_cases = vec![
             Workspace {
                 name: "dev-session".into(),
-                correlation_keys: vec![CorrelationKey::CheckoutPath(hp("/repos/proj/wt-1"))],
+                correlation_keys: vec![CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
                 attachable_set_id: None,
             },
             Workspace { name: "n".into(), correlation_keys: vec![], attachable_set_id: None },
@@ -548,6 +548,26 @@ mod tests {
         assert!(pd.workspaces.is_empty());
         assert!(pd.managed_terminals.is_empty());
         assert!(pd.attachable_sets.is_empty());
+    }
+
+    #[test]
+    fn provider_data_checkouts_roundtrip_with_qualified_path_keys() {
+        let provider_data = ProviderData {
+            checkouts: IndexMap::from([(qp("/repos/proj/wt-1"), Checkout {
+                branch: "feat-x".into(),
+                is_main: false,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: vec![CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
+                association_keys: vec![],
+                environment_id: None,
+            })]),
+            ..ProviderData::default()
+        };
+
+        assert_roundtrip(&provider_data);
     }
 
     #[test]
@@ -593,7 +613,7 @@ mod tests {
             provider_name: String::new(),
             provider_display_name: String::new(),
         });
-        pd.checkouts.insert(hp("/repos/proj"), Checkout {
+        pd.checkouts.insert(qp("/repos/proj"), Checkout {
             branch: "main".into(),
             is_main: true,
             trunk_ahead_behind: None,

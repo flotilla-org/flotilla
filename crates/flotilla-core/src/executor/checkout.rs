@@ -70,7 +70,7 @@ pub(super) fn resolve_checkout_branch(
         CheckoutSelector::Path(path) => providers_data
             .checkouts
             .iter()
-            .find(|(host_path, _)| host_path.host == *local_host && host_path.path == *path)
+            .find(|(host_path, _)| host_path.host_name() == Some(local_host) && host_path.path == *path)
             .map(|(_, checkout)| checkout.branch.clone())
             .ok_or_else(|| format!("checkout not found: {}", path.display())),
         CheckoutSelector::Query(query) => {
@@ -78,7 +78,7 @@ pub(super) fn resolve_checkout_branch(
                 .checkouts
                 .iter()
                 .filter(|(host_path, checkout)| {
-                    host_path.host == *local_host
+                    host_path.host_name() == Some(local_host)
                         && (checkout.branch == *query
                             || checkout.branch.contains(query)
                             || host_path.path.to_string_lossy().contains(query))

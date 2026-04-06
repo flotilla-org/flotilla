@@ -34,16 +34,21 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
-    qualified_path::HostId, AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue,
-    CorrelationKey, DaemonEvent, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath,
-    HostProviderStatus, HostSummary, ImageId, Issue, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo,
-    ToolInventory, TopologyRoute, WorkItemKind,
+    qualified_path::{HostId, QualifiedPath},
+    AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
+    EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId,
+    Issue, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
+    WorkItemKind,
 };
 use tokio::sync::Notify;
 
 struct FixedRemoteHostDetector {
     owner: &'static str,
     repo: &'static str,
+}
+
+fn qpath(host: &HostName, path: impl Into<PathBuf>) -> QualifiedPath {
+    QualifiedPath::from_host_name(host, path.into())
 }
 
 #[async_trait]
@@ -1378,7 +1383,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
         .await;
 
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(HostPath::new(HostName::new("remote"), "/srv/remote/repo"), Checkout {
+    peer_data.checkouts.insert(HostPath::new(HostName::new("remote"), "/srv/remote/repo").into(), Checkout {
         branch: "peer-branch".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -1492,11 +1497,9 @@ async fn local_direct_repo_refresh_stamps_discovered_checkout_environment_id() {
     );
 
     let snapshot = refresh_snapshot_for_model(&model).await;
-    let checkout = snapshot
-        .providers
-        .checkouts
-        .get(&HostPath::new(HostName::local(), repo.join("local-feature")))
-        .expect("local direct checkout should be present");
+    let local_host = HostName::local();
+    let checkout =
+        snapshot.providers.checkouts.get(&qpath(&local_host, repo.join("local-feature"))).expect("local direct checkout should be present");
     assert_eq!(checkout.environment_id.as_ref(), Some(daemon.local_environment_id()));
 }
 
@@ -1577,11 +1580,9 @@ hostname = "buildbox.example"
     );
 
     let snapshot = refresh_snapshot_for_model(&model).await;
-    let checkout = snapshot
-        .providers
-        .checkouts
-        .get(&HostPath::new(HostName::local(), repo.join("ssh-feature")))
-        .expect("static ssh checkout should be present");
+    let local_host = HostName::local();
+    let checkout =
+        snapshot.providers.checkouts.get(&qpath(&local_host, repo.join("ssh-feature"))).expect("static ssh checkout should be present");
     assert_eq!(checkout.environment_id.as_ref(), Some(&environment_id));
 }
 
@@ -1622,10 +1623,11 @@ async fn provisioned_repo_refresh_stamps_discovered_checkout_environment_id() {
     );
 
     let snapshot = refresh_snapshot_for_model(&model).await;
+    let local_host = HostName::local();
     let checkout = snapshot
         .providers
         .checkouts
-        .get(&HostPath::new(HostName::local(), repo.join("provisioned-feature")))
+        .get(&qpath(&local_host, repo.join("provisioned-feature")))
         .expect("provisioned checkout should be present");
     assert_eq!(checkout.environment_id.as_ref(), Some(&environment_id));
 }
@@ -2074,7 +2076,7 @@ async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
 
     let overlay_host = HostName::new("overlay-live");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(HostPath::new(overlay_host.clone(), "/srv/overlay/repo"), Checkout {
+    peer_data.checkouts.insert(HostPath::new(overlay_host.clone(), "/srv/overlay/repo").into(), Checkout {
         branch: "overlay-branch".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2110,7 +2112,7 @@ async fn replay_since_includes_overlay_only_hosts() {
 
     let overlay_host = HostName::new("overlay-only");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(HostPath::new(overlay_host.clone(), "/srv/overlay/repo"), Checkout {
+    peer_data.checkouts.insert(HostPath::new(overlay_host.clone(), "/srv/overlay/repo").into(), Checkout {
         branch: "overlay-branch".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2141,7 +2143,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
 
     let transient_host = HostName::new("transient");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(HostPath::new(transient_host.clone(), "/srv/transient/repo"), Checkout {
+    peer_data.checkouts.insert(HostPath::new(transient_host.clone(), "/srv/transient/repo").into(), Checkout {
         branch: "transient-branch".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2249,7 +2251,7 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
     let peer_host = HostName::new("remote-peer-host");
     let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(peer_checkout_path.clone(), Checkout {
+    peer_data.checkouts.insert(peer_checkout_path.clone().into(), Checkout {
         branch: "peer-feature".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2280,15 +2282,17 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
 
     // Peer checkout must be present, attributed to its real host (not local)
     assert!(
-        snap.providers.checkouts.contains_key(&peer_checkout_path),
+        snap.providers.checkouts.contains_key(&qpath(&peer_host, PathBuf::from("/srv/remote/repo"))),
         "replay snapshot must include peer checkout under remote-peer-host, got keys: {:?}",
         snap.providers.checkouts.keys().collect::<Vec<_>>()
     );
 
     // No ghost checkout under local host
     let local_host = HostName::local();
-    let ghost = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
-    assert!(!snap.providers.checkouts.contains_key(&ghost), "replay snapshot must not re-attribute peer checkout to local host");
+    assert!(
+        !snap.providers.checkouts.contains_key(&qpath(&local_host, PathBuf::from("/srv/remote/repo"))),
+        "replay snapshot must not re-attribute peer checkout to local host"
+    );
 }
 
 /// Unknown-seq fallback should include peer checkouts with correct host attribution,
@@ -2305,7 +2309,7 @@ async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
     let peer_host = HostName::new("remote-peer-host");
     let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(peer_checkout_path.clone(), Checkout {
+    peer_data.checkouts.insert(peer_checkout_path.clone().into(), Checkout {
         branch: "peer-feature".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2335,15 +2339,17 @@ async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
 
     // Peer checkout must be present with remote host attribution
     assert!(
-        snap.providers.checkouts.contains_key(&peer_checkout_path),
+        snap.providers.checkouts.contains_key(&qpath(&peer_host, PathBuf::from("/srv/remote/repo"))),
         "unknown-seq snapshot must include peer checkout under remote-peer-host, got keys: {:?}",
         snap.providers.checkouts.keys().collect::<Vec<_>>()
     );
 
     // No ghost checkout under local host
     let local_host = HostName::local();
-    let ghost = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
-    assert!(!snap.providers.checkouts.contains_key(&ghost), "snapshot must not re-attribute peer checkout to local host");
+    assert!(
+        !snap.providers.checkouts.contains_key(&qpath(&local_host, PathBuf::from("/srv/remote/repo"))),
+        "snapshot must not re-attribute peer checkout to local host"
+    );
 }
 
 /// Delta replay path should include peer checkout changes in the replayed
@@ -2366,7 +2372,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
     let peer_host = HostName::new("delta-peer-host");
     let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/delta-peer/repo");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(peer_checkout_path.clone(), Checkout {
+    peer_data.checkouts.insert(peer_checkout_path.clone().into(), Checkout {
         branch: "delta-feature".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2421,7 +2427,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
         .expect("full replay should produce RepoSnapshot");
 
     assert!(
-        full_snap.providers.checkouts.contains_key(&peer_checkout_path),
+        full_snap.providers.checkouts.contains_key(&qpath(&peer_host, PathBuf::from("/srv/delta-peer/repo"))),
         "full snapshot must include peer checkout, confirming build_repo_snapshot_with_peers is used on replay"
     );
 }
@@ -2603,7 +2609,7 @@ async fn get_local_providers_excludes_peer_overlay_data() {
 
     let peer_checkout = HostPath::new(HostName::new("follower"), "/srv/follower/repo");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(peer_checkout.clone(), Checkout {
+    peer_data.checkouts.insert(peer_checkout.clone().into(), Checkout {
         branch: "peer-branch".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2619,7 +2625,7 @@ async fn get_local_providers_excludes_peer_overlay_data() {
 
     let (providers, _) = daemon.get_local_providers(&repo).await.expect("local providers after peer overlay");
     assert!(
-        !providers.checkouts.contains_key(&HostPath::new(HostName::local(), "/srv/follower/repo")),
+        !providers.checkouts.contains_key(&qpath(&HostName::local(), "/srv/follower/repo")),
         "peer overlay checkout should not be restamped and re-broadcast as local data"
     );
     assert!(
@@ -2644,7 +2650,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
     let peer_host = HostName::new("remote-peer-host");
     let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(peer_checkout_path.clone(), Checkout {
+    peer_data.checkouts.insert(peer_checkout_path.clone().into(), Checkout {
         branch: "peer-feature".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2671,13 +2677,15 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state after poll with peers");
 
     // The peer checkout should appear exactly once, attributed to kiwi
-    let kiwi_checkouts: Vec<_> = snapshot.providers.checkouts.keys().filter(|hp| hp.host == peer_host).collect();
+    let kiwi_checkouts: Vec<_> = snapshot.providers.checkouts.keys().filter(|hp| hp.host_name() == Some(&peer_host)).collect();
     assert_eq!(kiwi_checkouts.len(), 1, "peer checkout should appear once under kiwi");
 
     // The peer checkout must NOT appear re-attributed to the local host
     let local_host = HostName::local();
-    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
-    assert!(!snapshot.providers.checkouts.contains_key(&ghost_checkout), "peer checkout must not be re-stamped as a local checkout");
+    assert!(
+        !snapshot.providers.checkouts.contains_key(&qpath(&local_host, PathBuf::from("/srv/remote/repo"))),
+        "peer checkout must not be re-stamped as a local checkout"
+    );
 }
 
 /// After poll_snapshots stores merged data, a second set_peer_providers call
@@ -2694,7 +2702,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
     let peer_checkout_path = HostPath::new(peer_host.clone(), "/srv/remote/repo");
     let make_peer_data = |branch: &str| {
         let mut pd = ProviderData::default();
-        pd.checkouts.insert(peer_checkout_path.clone(), Checkout {
+        pd.checkouts.insert(peer_checkout_path.clone().into(), Checkout {
             branch: branch.into(),
             is_main: false,
             trunk_ahead_behind: None,
@@ -2722,13 +2730,12 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("get_state after poll + second peer update");
 
-    let peer_count = snapshot.providers.checkouts.keys().filter(|hp| hp.host == peer_host).count();
+    let peer_count = snapshot.providers.checkouts.keys().filter(|hp| hp.host_name() == Some(&peer_host)).count();
     assert_eq!(peer_count, 1, "peer should have exactly 1 checkout, got {peer_count}");
 
     let local_host = HostName::local();
-    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/srv/remote/repo"));
     assert!(
-        !snapshot.providers.checkouts.contains_key(&ghost_checkout),
+        !snapshot.providers.checkouts.contains_key(&qpath(&local_host, PathBuf::from("/srv/remote/repo"))),
         "peer path must not appear as a local checkout after poll + repeated peer updates"
     );
 }
@@ -2778,7 +2785,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
+    peer_data.checkouts.insert(remote_checkout.clone().into(), Checkout {
         branch: "attachable-correlation".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -2787,7 +2794,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
         last_commit: None,
         correlation_keys: vec![
             CorrelationKey::Branch("attachable-correlation".into()),
-            CorrelationKey::CheckoutPath(remote_checkout.clone()),
+            CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
         environment_id: None,
@@ -2877,14 +2884,17 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
+    peer_data.checkouts.insert(remote_checkout.clone().into(), Checkout {
         branch: "issue-356-watch".into(),
         is_main: false,
         trunk_ahead_behind: None,
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![CorrelationKey::Branch("issue-356-watch".into()), CorrelationKey::CheckoutPath(remote_checkout.clone())],
+        correlation_keys: vec![
+            CorrelationKey::Branch("issue-356-watch".into()),
+            CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
+        ],
         association_keys: vec![],
         environment_id: None,
     });
@@ -3168,7 +3178,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
     let peer_host = HostName::new("peer-a");
     let peer_checkout_path = PathBuf::from("/srv/peer-a/repo");
     let peers = vec![(peer_host.clone(), ProviderData {
-        checkouts: indexmap::IndexMap::from([(HostPath::new(peer_host.clone(), peer_checkout_path.clone()), Checkout {
+        checkouts: indexmap::IndexMap::from([(HostPath::new(peer_host.clone(), peer_checkout_path.clone()).into(), Checkout {
             branch: "feat-remote".into(),
             is_main: false,
             trunk_ahead_behind: None,
@@ -3785,7 +3795,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
             remote_ahead_behind: None,
             working_tree: None,
             last_commit: None,
-            correlation_keys: vec![CorrelationKey::Branch("feat-lifecycle".into()), CorrelationKey::CheckoutPath(host_path.clone())],
+            correlation_keys: vec![CorrelationKey::Branch("feat-lifecycle".into()), CorrelationKey::CheckoutPath(host_path.clone().into())],
             association_keys: vec![],
             environment_id: None,
         })])

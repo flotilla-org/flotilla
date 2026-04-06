@@ -31,13 +31,16 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
         source_column(),
         col("Path", Constraint::Fill(1), |item, ctx| {
             let text = if let Some(hp) = item.checkout_key() {
-                let is_local = ctx.my_host.is_none() || ctx.my_host == Some(&hp.host);
+                let host_name = hp.host_name();
+                let is_local = host_name.is_none() || ctx.my_host.is_none() || ctx.my_host == host_name;
                 let (repo_root, home_dir) = if is_local {
                     (ctx.repo_root.to_path_buf(), dirs::home_dir())
-                } else {
-                    let root = ctx.host_repo_roots.get(&hp.host).cloned().unwrap_or_else(|| hp.path.clone());
-                    let home = ctx.host_home_dirs.get(&hp.host).map(|p| p.to_path_buf());
+                } else if let Some(host_name) = host_name {
+                    let root = ctx.host_repo_roots.get(host_name).cloned().unwrap_or_else(|| hp.path.clone());
+                    let home = ctx.host_home_dirs.get(host_name).map(|p| p.to_path_buf());
                     (root, home)
+                } else {
+                    (hp.path.clone(), None)
                 };
                 let path_col_width = ctx.col_widths.get(2).copied().unwrap_or(40) as usize;
                 ui_helpers::shorten_path(&hp.path, &repo_root, path_col_width, home_dir.as_deref())
