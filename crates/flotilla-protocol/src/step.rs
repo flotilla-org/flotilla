@@ -141,9 +141,6 @@ pub enum StepAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<crate::ImageId>,
     },
-    DiscoverEnvironmentProviders {
-        env_id: crate::EnvironmentId,
-    },
     DestroyEnvironment {
         env_id: crate::EnvironmentId,
     },

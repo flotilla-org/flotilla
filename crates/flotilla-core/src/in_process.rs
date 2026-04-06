@@ -1562,6 +1562,7 @@ impl InProcessDaemon {
             registry,
             providers_data,
             runner: Arc::clone(&self.discovery.runner),
+            env: Arc::clone(&self.discovery.env),
             config_base,
             attachable_store,
             daemon_socket_path,
@@ -1735,6 +1736,7 @@ impl InProcessDaemon {
         // Gather what the spawned task needs — validate repo before broadcasting
         let repo = self.resolve_repo_for_command(&command).await?;
         let runner = Arc::clone(&self.discovery.runner);
+        let env = Arc::clone(&self.discovery.env);
         let event_tx = self.event_tx.clone();
         let peer_overlay = self.peer_providers.read().await.clone();
         let (repo_identity, registry, providers_data, refresh_trigger) = {
@@ -1784,6 +1786,7 @@ impl InProcessDaemon {
             let resolver_registry = Arc::clone(&registry);
             let resolver_providers_data = Arc::clone(&providers_data);
             let resolver_runner = Arc::clone(&runner);
+            let resolver_env = Arc::clone(&env);
             let resolver_config_base = config_base.clone();
             let resolver_attachable_store = attachable_store.clone();
             let resolver_local_host = local_host.clone();
@@ -1824,6 +1827,7 @@ impl InProcessDaemon {
                         registry: resolver_registry,
                         providers_data: resolver_providers_data,
                         runner: resolver_runner,
+                        env: resolver_env,
                         config_base: resolver_config_base,
                         attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_dhp.clone(),

@@ -298,7 +298,7 @@ impl ProvisionedEnvironment for TestProvisionedEnvironment {
         Ok(self.env_vars.clone())
     }
 
-    fn runner(&self, _host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+    fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner)
     }
 

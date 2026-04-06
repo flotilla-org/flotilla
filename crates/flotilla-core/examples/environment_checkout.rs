@@ -16,7 +16,7 @@ use flotilla_core::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag, FactoryRegistry},
-        environment::{docker::DockerEnvironment, CreateOpts, EnvironmentProvider},
+        environment::{docker::DockerEnvironmentProvider, CreateOpts, EnvironmentProvider},
         ChannelLabel, CommandRunner, ProcessCommandRunner,
     },
 };
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Branch: {branch}");
 
     let runner: Arc<dyn CommandRunner> = Arc::new(ProcessCommandRunner);
-    let provider = DockerEnvironment::new(runner.clone());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
 
     // 1. Resolve the reference repo (.git common dir)
     let git_common_dir = runner
@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Install git inside the container (debian:bookworm-slim doesn't have it)
     println!("\n--- Installing git in container ---");
-    let env_runner = handle.runner(runner.clone());
+    let env_runner = handle.runner();
     env_runner
         .run("sh", &["-c", "apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1"], Path::new("/"), &ChannelLabel::Noop)
         .await?;

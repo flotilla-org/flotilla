@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{DaemonHostPath, EnvironmentId, EnvironmentSpec, EnvironmentStatus, HostName, ImageSource};
 
-use super::{docker::DockerEnvironment, runner::EnvironmentRunner, CreateOpts, EnvironmentProvider};
+use super::{docker::DockerEnvironmentProvider, runner::DockerEnvironmentRunner, CreateOpts, EnvironmentProvider};
 use crate::providers::{ChannelLabel, CommandOutput, CommandRunner};
 
 /// A mock CommandRunner that records all (cmd, args, cwd) tuples passed to run/run_output.
@@ -52,7 +52,7 @@ impl CommandRunner for RecordingRunner {
 #[tokio::test]
 async fn run_wraps_with_docker_exec() {
     let inner = Arc::new(RecordingRunner::new_ok(""));
-    let env_runner = EnvironmentRunner::new("test-container".to_string(), inner.clone());
+    let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
     let label = ChannelLabel::Noop;
 
     env_runner.run("git", &["status"], Path::new("/workspace"), &label).await.ok();
@@ -68,7 +68,7 @@ async fn run_wraps_with_docker_exec() {
 #[tokio::test]
 async fn run_output_wraps_with_docker_exec() {
     let inner = Arc::new(RecordingRunner::new_ok("output"));
-    let env_runner = EnvironmentRunner::new("test-container".to_string(), inner.clone());
+    let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
     let label = ChannelLabel::Noop;
 
     env_runner.run_output("git", &["status"], Path::new("/workspace"), &label).await.ok();
@@ -84,7 +84,7 @@ async fn run_output_wraps_with_docker_exec() {
 #[tokio::test]
 async fn exists_uses_run_with_which() {
     let inner = Arc::new(RecordingRunner::new_ok(""));
-    let env_runner = EnvironmentRunner::new("test-container".to_string(), inner.clone());
+    let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
 
     let result = env_runner.exists("cleat", &[]).await;
 
@@ -100,7 +100,7 @@ async fn exists_uses_run_with_which() {
 #[tokio::test]
 async fn exists_returns_false_on_failure() {
     let inner = Arc::new(RecordingRunner::new_err("not found"));
-    let env_runner = EnvironmentRunner::new("test-container".to_string(), inner.clone());
+    let env_runner = DockerEnvironmentRunner::new("test-container".to_string(), inner.clone());
 
     let result = env_runner.exists("cleat", &[]).await;
 
@@ -149,34 +149,83 @@ impl CommandRunner for QueuedRunner {
 }
 
 // ---------------------------------------------------------------------------
-// DockerEnvironment tests
+// DockerEnvironmentProvider tests
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn ensure_image_builds_dockerfile() {
-    let runner = Arc::new(RecordingRunner::new_ok(""));
-    let provider = DockerEnvironment::new(runner.clone());
-    let spec = EnvironmentSpec { image: ImageSource::Dockerfile("/path/to/Dockerfile".into()), token_env_vars: vec![] };
-    let repo_root = std::path::Path::new("/repo");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dockerfile_path = temp.path().join("Dockerfile");
+    std::fs::write(&dockerfile_path, "FROM ubuntu:24.04\n").expect("write Dockerfile");
+    let runner = Arc::new(QueuedRunner::new([Err("missing".into()), Ok(String::new())]));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let spec = EnvironmentSpec { image: ImageSource::Dockerfile(dockerfile_path.clone()), token_env_vars: vec![] };
+    let repo_root = temp.path();
 
     let result = provider.ensure_image(&spec, repo_root).await;
 
     assert!(result.is_ok(), "ensure_image should succeed for Dockerfile source");
+    let image_id = result.unwrap();
+    assert!(image_id.as_str().starts_with("flotilla-env-"));
+    let calls = runner.calls();
+    assert_eq!(calls.len(), 2);
+    let (inspect_cmd, inspect_args, inspect_cwd) = &calls[0];
+    assert_eq!(inspect_cmd, "docker");
+    assert_eq!(inspect_args, &["image", "inspect", image_id.as_str()]);
+    assert_eq!(inspect_cwd, repo_root);
+    let (build_cmd, build_args, build_cwd) = &calls[1];
+    assert_eq!(build_cmd, "docker");
+    assert_eq!(build_args[0], "build");
+    assert_eq!(build_cwd, repo_root);
+    assert!(build_args.contains(&"-t".to_string()), "should pass -t flag");
+    assert!(build_args.contains(&"-f".to_string()), "should pass -f flag");
+    let tag_idx = build_args.iter().position(|a| a == "-t").expect("-t flag present");
+    assert_eq!(build_args[tag_idx + 1], image_id.as_str());
+    let f_idx = build_args.iter().position(|a| a == "-f").expect("-f flag present");
+    assert_eq!(build_args[f_idx + 1], dockerfile_path.to_string_lossy());
+}
+
+#[tokio::test]
+async fn ensure_image_reuses_tag_for_same_dockerfile_contents() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dockerfile_path = temp.path().join("Dockerfile");
+    std::fs::write(&dockerfile_path, "FROM ubuntu:24.04\nRUN echo hi\n").expect("write Dockerfile");
+    let spec = EnvironmentSpec { image: ImageSource::Dockerfile(dockerfile_path.clone()), token_env_vars: vec![] };
+
+    let first_runner = Arc::new(RecordingRunner::new_ok(""));
+    let first_provider = DockerEnvironmentProvider::new(first_runner);
+    let second_runner = Arc::new(RecordingRunner::new_ok(""));
+    let second_provider = DockerEnvironmentProvider::new(second_runner);
+
+    let first = first_provider.ensure_image(&spec, temp.path()).await.expect("first ensure_image");
+    let second = second_provider.ensure_image(&spec, temp.path()).await.expect("second ensure_image");
+
+    assert_eq!(first, second, "same Dockerfile contents should produce the same image tag");
+}
+
+#[tokio::test]
+async fn ensure_image_skips_build_when_tag_exists_locally() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dockerfile_path = temp.path().join("Dockerfile");
+    std::fs::write(&dockerfile_path, "FROM ubuntu:24.04\nRUN echo hi\n").expect("write Dockerfile");
+    let runner = Arc::new(RecordingRunner::new_ok("already-present"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let spec = EnvironmentSpec { image: ImageSource::Dockerfile(dockerfile_path), token_env_vars: vec![] };
+
+    let image_id = provider.ensure_image(&spec, temp.path()).await.expect("ensure_image");
+
     let calls = runner.calls();
     assert_eq!(calls.len(), 1);
-    let (cmd, args, _) = &calls[0];
+    let (cmd, args, cwd) = &calls[0];
     assert_eq!(cmd, "docker");
-    assert_eq!(args[0], "build");
-    assert!(args.contains(&"-t".to_string()), "should pass -t flag");
-    assert!(args.contains(&"-f".to_string()), "should pass -f flag");
-    let f_idx = args.iter().position(|a| a == "-f").expect("-f flag present");
-    assert_eq!(args[f_idx + 1], "/path/to/Dockerfile");
+    assert_eq!(args, &["image", "inspect", image_id.as_str()]);
+    assert_eq!(cwd, temp.path());
 }
 
 #[tokio::test]
 async fn ensure_image_pulls_registry() {
     let runner = Arc::new(RecordingRunner::new_ok(""));
-    let provider = DockerEnvironment::new(runner.clone());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
     let spec = EnvironmentSpec { image: ImageSource::Registry("ubuntu:22.04".into()), token_env_vars: vec![] };
     let repo_root = std::path::Path::new("/repo");
 
@@ -196,7 +245,7 @@ async fn ensure_image_pulls_registry() {
 async fn create_returns_handle() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironment::new(runner.clone());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![("GITHUB_TOKEN".into(), "ghp_secret".into())],
@@ -236,13 +285,34 @@ async fn create_returns_handle() {
 }
 
 #[tokio::test]
+async fn provisioned_handle_returns_its_initialized_runner() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+    let provider = DockerEnvironmentProvider::new(runner);
+    let image = ImageId::new("ubuntu:22.04");
+    let opts = CreateOpts {
+        tokens: vec![],
+        reference_repo: None,
+        daemon_socket_path: DaemonHostPath::new("/run/flotilla.sock"),
+        working_directory: None,
+    };
+
+    let handle = provider.create(EnvironmentId::new("test-env-runner"), &image, opts).await.expect("create");
+    let first_runner = handle.runner();
+    let second_runner = handle.runner();
+
+    assert!(Arc::ptr_eq(&first_runner, &second_runner), "runner should be initialized once on the handle");
+}
+
+#[tokio::test]
 async fn status_returns_running() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([
         Ok("container-id".into()), // docker run
         Ok("running".into()),      // docker inspect
     ]));
-    let provider = DockerEnvironment::new(runner.clone());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -271,7 +341,7 @@ async fn env_vars_parses_output() {
         Ok("container-id".into()),       // docker run
         Ok("FOO=bar\nBAZ=qux\n".into()), // docker exec sh -lc env
     ]));
-    let provider = DockerEnvironment::new(runner.clone());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -302,7 +372,7 @@ async fn destroy_calls_docker_rm() {
         Ok("container-id".into()), // docker run
         Ok("".into()),             // docker rm -f
     ]));
-    let provider = DockerEnvironment::new(runner.clone());
+    let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
     let opts = CreateOpts {
         tokens: vec![],
@@ -328,7 +398,7 @@ async fn destroy_calls_docker_rm() {
 // Integration tests
 // ---------------------------------------------------------------------------
 
-/// Verifies that EnvironmentRunner composes correctly with the CleatTerminalPoolFactory:
+/// Verifies that DockerEnvironmentRunner composes correctly with the CleatTerminalPoolFactory:
 /// the factory's binary probe arrives via docker exec, demonstrating the decorator
 /// pattern works end-to-end with real factory logic.
 #[tokio::test]
@@ -341,7 +411,7 @@ async fn environment_runner_supports_factory_probe() {
 
     // A runner that succeeds for any docker exec call (simulates cleat present in container)
     let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
-    let env_runner = Arc::new(EnvironmentRunner::new("test-container".to_string(), inner.clone()));
+    let env_runner = Arc::new(DockerEnvironmentRunner::new("test-container".to_string(), inner.clone()));
 
     // Build an EnvironmentBag that asserts cleat is available at the path the factory expects
     let bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"));
@@ -351,7 +421,7 @@ async fn environment_runner_supports_factory_probe() {
     let repo_root = ExecutionEnvironmentPath::new("/repo");
 
     // The factory checks env.find_binary("cleat") first — it does NOT call runner for binary detection.
-    // Passing the EnvironmentRunner as the runner proves the decorator is accepted by the factory
+    // Passing the DockerEnvironmentRunner as the runner proves the decorator is accepted by the factory
     // and that CleatTerminalPool is constructed with it, proving the composition path.
     let result = CleatTerminalPoolFactory.probe(&bag, &config, &repo_root, env_runner.clone()).await;
     assert!(result.is_ok(), "probe should succeed when cleat binary assertion is present");
@@ -361,13 +431,13 @@ async fn environment_runner_supports_factory_probe() {
     assert!(calls.is_empty(), "factory probe should not invoke runner during binary check");
 }
 
-/// Verifies that EnvironmentRunner correctly transforms command calls into docker exec form,
+/// Verifies that DockerEnvironmentRunner correctly transforms command calls into docker exec form,
 /// matching the pattern that discovery factories would issue inside a container.
 #[tokio::test]
 async fn environment_runner_transforms_commands_for_container() {
     // Simulate the exact check a discovery factory might perform: "cleat --version"
     let inner = Arc::new(RecordingRunner::new_ok("cleat 0.5.0"));
-    let env_runner = EnvironmentRunner::new("my-container".to_string(), inner.clone());
+    let env_runner = DockerEnvironmentRunner::new("my-container".to_string(), inner.clone());
     let label = ChannelLabel::Noop;
 
     // This is the kind of command a binary-check probe would issue
