@@ -54,7 +54,7 @@ pub fn checkout_item(branch: &str, path: &str, is_main: bool) -> WorkItem {
     let host_path = HostPath::new(HostName::local(), PathBuf::from(path));
     WorkItem {
         kind: WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(host_path.clone()),
+        identity: WorkItemIdentity::Checkout(host_path.clone().into()),
         host: HostName::local(),
         branch: Some(branch.into()),
         description: format!("checkout {branch}"),

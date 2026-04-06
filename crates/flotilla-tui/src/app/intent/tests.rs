@@ -726,14 +726,14 @@ fn app_with_pr_and_issues(checkout_issue_ids: &[&str]) -> App {
         provider_display_name: String::new(),
     });
     let co_path = HostPath::new(HostName::local(), PathBuf::from("/tmp/feat-x"));
-    providers.checkouts.insert(co_path.clone(), Checkout {
+    providers.checkouts.insert(co_path.clone().into(), Checkout {
         branch: "feat/x".into(),
         is_main: false,
         trunk_ahead_behind: None,
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone())],
+        correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone().into())],
         association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
         environment_id: None,
     });
@@ -784,14 +784,14 @@ fn remote_only_app_with_providers() -> App {
         provider_name: String::new(),
         provider_display_name: String::new(),
     });
-    providers.checkouts.insert(checkout_path.clone(), Checkout {
+    providers.checkouts.insert(checkout_path.clone().into(), Checkout {
         branch: "feat/x".into(),
         is_main: false,
         trunk_ahead_behind: None,
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path)],
+        correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path.into())],
         association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into()), AssociationKey::IssueRef("gh".into(), "20".into())],
         environment_id: None,
     });

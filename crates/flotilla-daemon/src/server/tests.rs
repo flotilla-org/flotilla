@@ -187,7 +187,7 @@ fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, che
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot {
             data: Box::new(ProviderData {
-                checkouts: IndexMap::from([(HostPath::new(HostName::new(host), checkout_path), checkout(branch))]),
+                checkouts: IndexMap::from([(HostPath::new(HostName::new(host), checkout_path).into(), checkout(branch))]),
                 ..Default::default()
             }),
             seq: 1,
@@ -2525,11 +2525,17 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
             synthetic.clone(),
             vec![
                 (HostName::new("peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
+                    checkouts: IndexMap::from([(
+                        HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only").into(),
+                        checkout("feature-a"),
+                    )]),
                     ..Default::default()
                 }),
                 (HostName::new("peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"), checkout("feature-b"))]),
+                    checkouts: IndexMap::from([(
+                        HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only").into(),
+                        checkout("feature-b"),
+                    )]),
                     ..Default::default()
                 }),
             ],
@@ -2569,10 +2575,18 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
     let snapshot =
         daemon.get_state(&flotilla_protocol::RepoSelector::Path(synthetic.clone())).await.expect("remote-only repo should remain");
     assert!(
-        !snapshot.providers.checkouts.contains_key(&HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only")),
+        !snapshot.providers.checkouts.contains_key(&flotilla_protocol::qualified_path::QualifiedPath::from(HostPath::new(
+            HostName::new("peer-a"),
+            "/srv/peer-a/remote-only",
+        ))),
         "restart cleanup should remove stale peer-a checkout"
     );
-    assert_eq!(snapshot.providers.checkouts[&HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only")].branch, "feature-b");
+    assert_eq!(
+        snapshot.providers.checkouts
+            [&flotilla_protocol::qualified_path::QualifiedPath::from(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only",))]
+            .branch,
+        "feature-b"
+    );
 
     let pm = peer_manager.lock().await;
     assert!(
@@ -2892,11 +2906,17 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
             synthetic.clone(),
             vec![
                 (HostName::new("peer-a"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only"), checkout("feature-a"))]),
+                    checkouts: IndexMap::from([(
+                        HostPath::new(HostName::new("peer-a"), "/srv/peer-a/remote-only").into(),
+                        checkout("feature-a"),
+                    )]),
                     ..Default::default()
                 }),
                 (HostName::new("peer-b"), ProviderData {
-                    checkouts: IndexMap::from([(HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only"), checkout("feature-b"))]),
+                    checkouts: IndexMap::from([(
+                        HostPath::new(HostName::new("peer-b"), "/srv/peer-b/remote-only").into(),
+                        checkout("feature-b"),
+                    )]),
                     ..Default::default()
                 }),
             ],
@@ -2936,10 +2956,13 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
         DaemonEvent::RepoSnapshot(snapshot) => {
             assert_eq!(snapshot.repo.as_deref(), Some(synthetic.as_path()));
             assert!(
-                !snapshot.providers.checkouts.contains_key(&stale_key),
+                !snapshot.providers.checkouts.contains_key(&flotilla_protocol::qualified_path::QualifiedPath::from(stale_key.clone())),
                 "first snapshot after disconnect should not include stale peer-a checkout"
             );
-            assert_eq!(snapshot.providers.checkouts[&remaining_key].branch, "feature-b");
+            assert_eq!(
+                snapshot.providers.checkouts[&flotilla_protocol::qualified_path::QualifiedPath::from(remaining_key.clone())].branch,
+                "feature-b"
+            );
         }
         DaemonEvent::RepoDelta(delta) => {
             assert_eq!(delta.repo.as_deref(), Some(synthetic.as_path()));
@@ -2949,7 +2972,7 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
                     flotilla_protocol::Change::Checkout {
                         key,
                         op: flotilla_protocol::EntryOp::Removed
-                    } if *key == stale_key
+                    } if *key == flotilla_protocol::qualified_path::QualifiedPath::from(stale_key.clone())
                 )),
                 "first delta after disconnect should remove stale peer-a checkout"
             );
@@ -3024,11 +3047,11 @@ async fn set_peer_providers_rejects_stale_version() {
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
 
     let fresh_peers = vec![(HostName::new("hostB"), ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo"), checkout("fresh"))]),
+        checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo").into(), checkout("fresh"))]),
         ..Default::default()
     })];
     let stale_peers = vec![(HostName::new("hostB"), ProviderData {
-        checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo"), checkout("stale"))]),
+        checkouts: IndexMap::from([(HostPath::new(HostName::new("hostB"), "/b/repo").into(), checkout("stale"))]),
         ..Default::default()
     })];
 

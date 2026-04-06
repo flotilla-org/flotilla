@@ -3,7 +3,9 @@ pub use flotilla_core::merge::merge_provider_data;
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{test_support::TestCheckout, ChangeRequest, ChangeRequestStatus, HostName, HostPath, ProviderData};
+    use flotilla_protocol::{
+        qualified_path::QualifiedPath, test_support::TestCheckout, ChangeRequest, ChangeRequestStatus, HostName, HostPath, ProviderData,
+    };
     use indexmap::IndexMap;
 
     use super::*;
@@ -11,24 +13,32 @@ mod tests {
     #[test]
     fn merge_combines_checkouts_from_multiple_hosts() {
         let local = ProviderData {
-            checkouts: IndexMap::from([(HostPath::new(HostName::new("laptop"), "/home/dev/repo"), TestCheckout::new("main").build())]),
+            checkouts: IndexMap::from([(
+                HostPath::new(HostName::new("laptop"), "/home/dev/repo").into(),
+                TestCheckout::new("main").build(),
+            )]),
             ..Default::default()
         };
         let remote = ProviderData {
-            checkouts: IndexMap::from([(HostPath::new(HostName::new("desktop"), "/home/dev/repo"), TestCheckout::new("feature").build())]),
+            checkouts: IndexMap::from([(
+                HostPath::new(HostName::new("desktop"), "/home/dev/repo").into(),
+                TestCheckout::new("feature").build(),
+            )]),
             ..Default::default()
         };
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.checkouts.len(), 2);
-        assert!(merged.checkouts.contains_key(&HostPath::new(HostName::new("laptop"), "/home/dev/repo")));
-        assert!(merged.checkouts.contains_key(&HostPath::new(HostName::new("desktop"), "/home/dev/repo")));
+        let laptop_checkout: QualifiedPath = HostPath::new(HostName::new("laptop"), "/home/dev/repo").into();
+        let desktop_checkout: QualifiedPath = HostPath::new(HostName::new("desktop"), "/home/dev/repo").into();
+        assert!(merged.checkouts.contains_key(&laptop_checkout));
+        assert!(merged.checkouts.contains_key(&desktop_checkout));
     }
 
     #[test]
     fn merge_does_not_duplicate_local_checkouts() {
         let local_host = HostName::new("laptop");
         let local = ProviderData {
-            checkouts: IndexMap::from([(HostPath::new(local_host.clone(), "/home/dev/repo"), TestCheckout::new("main").build())]),
+            checkouts: IndexMap::from([(HostPath::new(local_host.clone(), "/home/dev/repo").into(), TestCheckout::new("main").build())]),
             ..Default::default()
         };
         let merged = merge_provider_data(&local, &local_host, &[]);
@@ -57,7 +67,7 @@ mod tests {
     #[test]
     fn merge_with_empty_peers_returns_local_unchanged() {
         let mut local = ProviderData::default();
-        local.checkouts.insert(HostPath::new(HostName::new("laptop"), "/repo"), TestCheckout::new("main").build());
+        local.checkouts.insert(HostPath::new(HostName::new("laptop"), "/repo").into(), TestCheckout::new("main").build());
         local.change_requests.insert("PR-1".into(), ChangeRequest {
             title: "T".into(),
             branch: "b".into(),
@@ -76,17 +86,19 @@ mod tests {
     fn merge_local_checkout_wins_for_same_local_host_path() {
         let local_host = HostName::new("laptop");
         let host_path = HostPath::new(local_host.clone(), "/repo");
-        let local =
-            ProviderData { checkouts: IndexMap::from([(host_path.clone(), TestCheckout::new("main").build())]), ..Default::default() };
+        let local = ProviderData {
+            checkouts: IndexMap::from([(host_path.clone().into(), TestCheckout::new("main").build())]),
+            ..Default::default()
+        };
         let remote = ProviderData {
-            checkouts: IndexMap::from([(host_path.clone(), TestCheckout::new("stale-peer-view").build())]),
+            checkouts: IndexMap::from([(host_path.clone().into(), TestCheckout::new("stale-peer-view").build())]),
             ..Default::default()
         };
 
         let merged = merge_provider_data(&local, &local_host, &[(HostName::new("desktop"), &remote)]);
 
         assert_eq!(merged.checkouts.len(), 1);
-        assert_eq!(merged.checkouts[&host_path].branch, "main");
+        assert_eq!(merged.checkouts[&flotilla_protocol::qualified_path::QualifiedPath::from(host_path.clone())].branch, "main");
     }
 
     #[test]
@@ -95,16 +107,16 @@ mod tests {
         // should overwrite any stale locally cached copy of the same path.
         let host_path = HostPath::new(HostName::new("desktop"), "/repo");
         let local = ProviderData {
-            checkouts: IndexMap::from([(host_path.clone(), TestCheckout::new("old-branch").build())]),
+            checkouts: IndexMap::from([(host_path.clone().into(), TestCheckout::new("old-branch").build())]),
             ..Default::default()
         };
         let remote = ProviderData {
-            checkouts: IndexMap::from([(host_path.clone(), TestCheckout::new("new-branch").build())]),
+            checkouts: IndexMap::from([(host_path.clone().into(), TestCheckout::new("new-branch").build())]),
             ..Default::default()
         };
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
         assert_eq!(merged.checkouts.len(), 1);
-        assert_eq!(merged.checkouts[&host_path].branch, "new-branch");
+        assert_eq!(merged.checkouts[&flotilla_protocol::qualified_path::QualifiedPath::from(host_path.clone())].branch, "new-branch");
     }
 
     #[test]
@@ -112,12 +124,15 @@ mod tests {
         let local = ProviderData::default();
         let spoofed_path = HostPath::new(HostName::new("server"), "/repo");
         let remote = ProviderData {
-            checkouts: IndexMap::from([(spoofed_path.clone(), TestCheckout::new("spoofed-branch").build())]),
+            checkouts: IndexMap::from([(spoofed_path.clone().into(), TestCheckout::new("spoofed-branch").build())]),
             ..Default::default()
         };
 
         let merged = merge_provider_data(&local, &HostName::new("laptop"), &[(HostName::new("desktop"), &remote)]);
 
-        assert!(!merged.checkouts.contains_key(&spoofed_path), "peer-owned merge should reject checkout data for a third-party host path");
+        assert!(
+            !merged.checkouts.contains_key(&flotilla_protocol::qualified_path::QualifiedPath::from(spoofed_path)),
+            "peer-owned merge should reject checkout data for a third-party host path"
+        );
     }
 }

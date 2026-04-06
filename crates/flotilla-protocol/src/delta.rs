@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AttachableId, AttachableSet, AttachableSetId, ChangeRequest, Checkout, CloudAgentSession, HostPath, Issue, ManagedTerminal,
-    ProviderError, WorkItem, WorkItemIdentity, Workspace,
+    qualified_path::QualifiedPath, AttachableId, AttachableSet, AttachableSetId, ChangeRequest, Checkout, CloudAgentSession, Issue,
+    ManagedTerminal, ProviderError, WorkItem, WorkItemIdentity, Workspace,
 };
 
 /// Operation on a keyed collection entry.
@@ -37,7 +37,7 @@ pub struct Branch {
 #[allow(clippy::large_enum_variant)]
 pub enum Change {
     Checkout {
-        key: HostPath,
+        key: QualifiedPath,
         op: EntryOp<Checkout>,
     },
     ChangeRequest {
@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::{
         test_helpers::{assert_json_roundtrip, assert_roundtrip},
-        test_support::hp,
+        test_support::qp,
     };
 
     #[test]
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn change_checkout_roundtrip() {
         let change = Change::Checkout {
-            key: hp("/repos/wt-1"),
+            key: qp("/repos/wt-1"),
             op: EntryOp::Added(Checkout {
                 branch: "feat-x".into(),
                 is_main: false,

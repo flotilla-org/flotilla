@@ -409,7 +409,7 @@ fn delete_confirm_safe_to_delete() {
             uncommitted_files: vec![],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup"))),
+        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-cleanup")).into()),
         None,
     ));
     let output = harness.render_to_string();
@@ -428,7 +428,7 @@ fn delete_confirm_with_uncommitted_files() {
             uncommitted_files: vec![" M src/main.rs".into(), " M src/lib.rs".into(), "?? TODO.txt".into()],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-wip"))),
+        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-wip")).into()),
         None,
     ));
     let output = harness.render_to_string();
@@ -448,7 +448,7 @@ fn delete_confirm_with_many_uncommitted_files() {
             uncommitted_files: files,
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip"))),
+        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/tmp/my-project/feat-big-wip")).into()),
         None,
     ));
     let output = harness.render_to_string();
@@ -467,7 +467,7 @@ fn delete_confirm_remote_host() {
             uncommitted_files: vec![],
             base_detection_warning: None,
         },
-        WorkItemIdentity::Checkout(HostPath::new(HostName::new("feta"), PathBuf::from("/home/dev/my-project/feat-remote"))),
+        WorkItemIdentity::Checkout(HostPath::new(HostName::new("feta"), PathBuf::from("/home/dev/my-project/feat-remote")).into()),
         Some(HostName::new("feta")),
     ));
     let output = harness.render_to_string();
@@ -630,7 +630,7 @@ fn close_confirm_widget_renders_on_short_terminals_without_overflow() {
 #[test]
 fn delete_confirm_widget_renders_on_short_terminals_without_overflow() {
     let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(
-        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat/a"))),
+        WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat/a")).into()),
         None,
         None,
     );
@@ -691,7 +691,7 @@ fn pending_action_in_flight_shows_spinner() {
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
     // Insert an in-flight pending action for the checkout item.
-    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-login")));
+    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-login")).into());
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
         command_id: 1,
@@ -735,7 +735,7 @@ fn pending_action_failed_shows_error_icon() {
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
     // Insert a failed pending action.
-    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-broken")));
+    let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-broken")).into());
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
         command_id: 2,
@@ -797,8 +797,8 @@ fn multi_select_with_active_row_highlight() {
     let page = harness.screen.repo_pages.get_mut(&repo).expect("repo page exists");
 
     // Multi-select items 0 and 1.
-    let identity_a = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-a")));
-    let identity_b = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-b")));
+    let identity_a = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-a")).into());
+    let identity_b = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-b")).into());
     page.multi_selected.insert(identity_a);
     page.multi_selected.insert(identity_b);
 
@@ -863,7 +863,7 @@ fn remote_host_home_directory_shortening() {
 
     let main_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(main_host_path.clone()),
+        identity: WorkItemIdentity::Checkout(main_host_path.clone().into()),
         host: remote_host.clone(),
         branch: Some("main".into()),
         description: "checkout main".into(),
@@ -882,7 +882,7 @@ fn remote_host_home_directory_shortening() {
 
     let feat_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,
-        identity: WorkItemIdentity::Checkout(host_path.clone()),
+        identity: WorkItemIdentity::Checkout(host_path.clone().into()),
         host: remote_host.clone(),
         branch: Some("feat-x".into()),
         description: "checkout feat-x".into(),

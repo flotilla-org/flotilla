@@ -564,7 +564,9 @@ impl SplitTable {
                 for item in &table.items {
                     if item.is_main_checkout {
                         if let Some(co) = item.checkout_key() {
-                            host_repo_roots.insert(co.host.clone(), co.path.clone());
+                            if let Some(host_name) = co.host_name() {
+                                host_repo_roots.insert(host_name.clone(), co.path.clone());
+                            }
                         }
                     }
                 }
@@ -1014,7 +1016,7 @@ mod tests {
     fn checkout_work_item(id: &str) -> WorkItem {
         WorkItem {
             kind: WorkItemKind::Checkout,
-            identity: WorkItemIdentity::Checkout(HostPath::new(flotilla_protocol::HostName::new("localhost"), format!("/tmp/{id}"))),
+            identity: WorkItemIdentity::Checkout(HostPath::new(flotilla_protocol::HostName::new("localhost"), format!("/tmp/{id}")).into()),
             host: flotilla_protocol::HostName::new("localhost"),
             branch: Some(format!("branch-{id}")),
             description: format!("Checkout {id}"),

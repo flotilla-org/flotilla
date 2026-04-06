@@ -3,7 +3,7 @@ use flotilla_protocol::{HostName, ProviderData};
 /// Merge local ProviderData with peer data from remote hosts.
 ///
 /// Host-scoped data is merged with ownership-aware rules:
-/// - checkouts are accepted only from the host that owns the `HostPath`
+/// - hostname-qualified checkouts are accepted only from the host that owns the path
 /// - local-host checkouts are never overwritten by peer data
 /// - managed terminals are namespaced by peer host to avoid collisions
 /// - workspaces are namespaced by peer host to avoid collisions
@@ -21,10 +21,10 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
         //   overwrite them
         // - peer-owned host paths are only accepted from that owning peer
         for (host_path, checkout) in &peer_data.checkouts {
-            if &host_path.host == local_host {
+            if host_path.host_name() == Some(local_host) {
                 continue;
             }
-            if &host_path.host != peer_host {
+            if host_path.host_name() != Some(peer_host) {
                 continue;
             }
             merged.checkouts.insert(host_path.clone(), checkout.clone());

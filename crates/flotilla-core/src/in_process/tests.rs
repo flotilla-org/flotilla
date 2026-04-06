@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, EnvironmentId, Issue, RepoSelector};
+use flotilla_protocol::{AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, EnvironmentId, HostPath, Issue, RepoSelector};
 
 use super::*;
 use crate::{
@@ -108,7 +108,7 @@ fn build_repo_snapshot_with_peers_merges_peer_data() {
 
     // Create peer provider data with a checkout owned by host_b
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(flotilla_protocol::HostPath::new(host_b.clone(), PathBuf::from("/remote/repo")), Checkout {
+    peer_data.checkouts.insert(flotilla_protocol::HostPath::new(host_b.clone(), PathBuf::from("/remote/repo")).into(), Checkout {
         branch: "remote-feat".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -151,21 +151,24 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
 
     // Simulate local checkout
     let mut local_providers = ProviderData::default();
-    local_providers.checkouts.insert(flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/home/dev/repo")), Checkout {
-        branch: "main".into(),
-        is_main: true,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
-        environment_id: None,
-    });
+    local_providers.checkouts.insert(
+        flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/home/dev/repo")).into(),
+        Checkout {
+            branch: "main".into(),
+            is_main: true,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            environment_id: None,
+        },
+    );
 
     // Create peer data
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(flotilla_protocol::HostPath::new(peer_host.clone(), PathBuf::from("/srv/kiwi/repo")), Checkout {
+    peer_data.checkouts.insert(flotilla_protocol::HostPath::new(peer_host.clone(), PathBuf::from("/srv/kiwi/repo")).into(), Checkout {
         branch: "peer-feat".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -216,11 +219,11 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
     );
 
     // The peer checkout must appear exactly once under kiwi
-    let kiwi_count = second_snap.providers.checkouts.keys().filter(|hp| hp.host == peer_host).count();
+    let kiwi_count = second_snap.providers.checkouts.keys().filter(|hp| hp.host_name() == Some(&peer_host)).count();
     assert_eq!(kiwi_count, 1, "peer checkout should appear once under kiwi, got {kiwi_count}");
 
     // No ghost checkout — kiwi's path must not appear under the local host
-    let ghost = flotilla_protocol::HostPath::new(local_host.clone(), PathBuf::from("/srv/kiwi/repo"));
+    let ghost = flotilla_protocol::qualified_path::QualifiedPath::from_host_name(&local_host, PathBuf::from("/srv/kiwi/repo"));
     assert!(
         !second_snap.providers.checkouts.contains_key(&ghost),
         "peer checkout at /srv/kiwi/repo must not be re-stamped as local host checkout"
@@ -258,7 +261,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
     });
 
     let mut peer_data = ProviderData::default();
-    peer_data.checkouts.insert(remote_checkout.clone(), Checkout {
+    peer_data.checkouts.insert(remote_checkout.clone().into(), Checkout {
         branch: "attachable-correlation".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -267,7 +270,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
         last_commit: None,
         correlation_keys: vec![
             CorrelationKey::Branch("attachable-correlation".into()),
-            CorrelationKey::CheckoutPath(remote_checkout.clone()),
+            CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
         environment_id: None,
@@ -302,7 +305,10 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
     );
     assert_eq!(set_item.workspace_refs, vec!["workspace:9".to_string()]);
 
-    let ghost_checkout = HostPath::new(local_host, PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"));
+    let ghost_checkout = flotilla_protocol::qualified_path::QualifiedPath::from_host_name(
+        &local_host,
+        PathBuf::from("/home/robert/dev/flotilla.terminal-stuff"),
+    );
     assert!(
         !snapshot.providers.checkouts.contains_key(&ghost_checkout),
         "remote checkout path must not be duplicated under the local host"
@@ -336,7 +342,7 @@ fn collect_linked_issue_ids_from_change_requests() {
 #[test]
 fn collect_linked_issue_ids_from_checkouts() {
     let mut providers = ProviderData::default();
-    providers.checkouts.insert(HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")), Checkout {
+    providers.checkouts.insert(HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")).into(), Checkout {
         branch: "feat".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -366,7 +372,7 @@ fn collect_linked_issue_ids_deduplicates() {
         provider_name: "github".into(),
         provider_display_name: "GitHub".into(),
     });
-    providers.checkouts.insert(HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")), Checkout {
+    providers.checkouts.insert(HostPath::new(HostName::new("host"), PathBuf::from("/tmp/co")).into(), Checkout {
         branch: "fix".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -399,14 +405,14 @@ fn snapshot_includes_linked_issues_when_populated() {
     let checkout_path = HostPath::new(host.clone(), PathBuf::from("/tmp/repo"));
 
     let mut providers = ProviderData::default();
-    providers.checkouts.insert(checkout_path.clone(), Checkout {
+    providers.checkouts.insert(checkout_path.clone().into(), Checkout {
         branch: "fix/42".into(),
         is_main: false,
         trunk_ahead_behind: None,
         remote_ahead_behind: None,
         working_tree: None,
         last_commit: None,
-        correlation_keys: vec![CorrelationKey::Branch("fix/42".into()), CorrelationKey::CheckoutPath(checkout_path)],
+        correlation_keys: vec![CorrelationKey::Branch("fix/42".into()), CorrelationKey::CheckoutPath(checkout_path.into())],
         association_keys: vec![AssociationKey::IssueRef("github".into(), "42".into())],
         environment_id: None,
     });

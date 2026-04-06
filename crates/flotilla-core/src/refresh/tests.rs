@@ -448,17 +448,20 @@ fn project_attachable_data_populates_sets_and_ids() {
     };
 
     let mut pd = ProviderData::default();
-    pd.checkouts.insert(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")), Checkout {
-        branch: "feat".into(),
-        is_main: false,
-        trunk_ahead_behind: None,
-        remote_ahead_behind: None,
-        working_tree: None,
-        last_commit: None,
-        correlation_keys: vec![],
-        association_keys: vec![],
-        environment_id: None,
-    });
+    pd.checkouts.insert(
+        flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")).into(),
+        Checkout {
+            branch: "feat".into(),
+            is_main: false,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            correlation_keys: vec![],
+            association_keys: vec![],
+            environment_id: None,
+        },
+    );
     pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
 
     project_attachable_data(&mut pd, &registry, &attachable_store);
@@ -622,7 +625,7 @@ fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
     }
 
     let mut pd = ProviderData::default();
-    pd.checkouts.insert(checkout_a.clone(), Checkout {
+    pd.checkouts.insert(checkout_a.clone().into(), Checkout {
         branch: "feat".into(),
         is_main: false,
         trunk_ahead_behind: None,
@@ -654,7 +657,7 @@ fn project_attachable_data_set_appears_without_terminal_scan() {
     }
 
     let mut pd = ProviderData::default();
-    pd.checkouts.insert(checkout.clone(), Checkout {
+    pd.checkouts.insert(checkout.clone().into(), Checkout {
         branch: "feat".into(),
         is_main: false,
         trunk_ahead_behind: None,

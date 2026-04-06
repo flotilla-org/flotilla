@@ -494,7 +494,12 @@ fn normal_esc_clears_multi_select_second() {
     let mut app = stub_app();
     setup_table(&mut app, vec![make_work_item("a")]);
     let identity = app.model.repo_order[0].clone();
-    app.screen.repo_pages.get_mut(&identity).expect("repo page exists").multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
+    app.screen
+        .repo_pages
+        .get_mut(&identity)
+        .expect("repo page exists")
+        .multi_selected
+        .insert(WorkItemIdentity::Checkout(hp("/tmp/a").into()));
     assert!(!app.screen.repo_pages.get(&identity).expect("repo page exists").multi_selected.is_empty());
     app.handle_key(key(KeyCode::Esc));
     assert!(app.screen.repo_pages.get(&identity).expect("repo page exists").multi_selected.is_empty());
@@ -1299,8 +1304,8 @@ fn action_enter_multi_select_generates_branch_name() {
     // Multi-select both items on the RepoPage
     let identity = app.model.repo_order[0].clone();
     let page = app.screen.repo_pages.get_mut(&identity).expect("page exists");
-    page.multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
-    page.multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/b")));
+    page.multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a").into()));
+    page.multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/b").into()));
 
     app.action_enter();
 
@@ -1332,7 +1337,7 @@ fn action_enter_multi_select_without_issues_clears() {
 
     let identity = app.model.repo_order[0].clone();
     let page = app.screen.repo_pages.get_mut(&identity).expect("page exists");
-    page.multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a")));
+    page.multi_selected.insert(WorkItemIdentity::Checkout(hp("/tmp/a").into()));
 
     app.action_enter();
 

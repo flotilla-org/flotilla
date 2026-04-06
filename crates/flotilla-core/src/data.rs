@@ -116,11 +116,8 @@ impl CorrelationResult {
         }
     }
 
-    /// Returns the legacy `HostPath` checkout key when one is still available.
-    /// HostId-qualified checkout refs will return `None` until the runtime key
-    /// space is migrated in the next tranche.
-    pub fn checkout_key(&self) -> Option<&flotilla_protocol::HostPath> {
-        self.checkout().and_then(CheckoutRef::host_path)
+    pub fn checkout_key(&self) -> Option<&flotilla_protocol::qualified_path::QualifiedPath> {
+        self.checkout().map(|checkout| &checkout.key)
     }
 
     pub fn is_main_checkout(&self) -> bool {
@@ -209,7 +206,7 @@ impl CorrelationResult {
 
     /// Derive the host for this item.
     ///
-    /// For checkout-anchored items, uses the checkout's HostPath host.
+    /// For checkout-anchored items, uses the checkout's qualified-path host name when available.
     /// For all other items, falls back to the provided local host name.
     pub fn host(&self, local_host: &flotilla_protocol::HostName) -> flotilla_protocol::HostName {
         match self {
@@ -221,11 +218,7 @@ impl CorrelationResult {
     pub fn identity(&self) -> WorkItemIdentity {
         match self {
             CorrelationResult::Correlated(c) => match &c.anchor {
-                // TODO: replace this legacy HostPath dependency when
-                // WorkItemIdentity::Checkout migrates to QualifiedPath.
-                CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(
-                    co.host_path().cloned().expect("checkout-anchored correlation results must retain a legacy HostPath during migration"),
-                ),
+                CorrelatedAnchor::Checkout(co) => WorkItemIdentity::Checkout(co.key.clone()),
                 CorrelatedAnchor::AttachableSet(id) => WorkItemIdentity::AttachableSet(id.clone()),
                 CorrelatedAnchor::ChangeRequest(key) => WorkItemIdentity::ChangeRequest(key.clone()),
                 CorrelatedAnchor::Session(key) => WorkItemIdentity::Session(key.clone()),
@@ -310,8 +303,8 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
             (CorItemKind::Checkout, ProviderItemKey::Checkout(path)) => {
                 if checkout_ref.is_none() {
                     let is_main_checkout = providers.checkouts.get(path).is_some_and(|co| co.is_main);
-                    checkout_ref = Some(CheckoutRef::from_host_path(path.clone(), is_main_checkout));
-                    host = Some(path.host.clone());
+                    checkout_ref = Some(CheckoutRef::from_qualified_path(path.clone(), is_main_checkout));
+                    host = path.host_name().cloned();
                 }
             }
             (CorItemKind::AttachableSet, ProviderItemKey::AttachableSet(id)) => {
@@ -399,7 +392,9 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
     let description = pr_title.or(session_title).or(agent_title).or_else(|| branch.clone()).or(set_description).unwrap_or_default();
 
     let source = match &anchor {
-        CorrelatedAnchor::Checkout(co) => co.host_path().map(|path| path.host.to_string()),
+        CorrelatedAnchor::Checkout(co) => {
+            co.host_path().map(|path| path.host.to_string()).or_else(|| co.key.host_name().map(ToString::to_string))
+        }
         CorrelatedAnchor::AttachableSet(id) => providers.attachable_sets.get(id).and_then(|set| {
             set.checkout.as_ref().map(|co| co.host.to_string()).or_else(|| set.host_affinity.as_ref().map(ToString::to_string))
         }),
@@ -451,7 +446,7 @@ pub fn correlate(providers: &ProviderData) -> (Vec<CorrelationResult>, Vec<Corre
     for (id, set) in &providers.attachable_sets {
         let mut keys = vec![CorrelationKey::AttachableSet(id.clone())];
         if let Some(checkout) = &set.checkout {
-            keys.push(CorrelationKey::CheckoutPath(checkout.clone()));
+            keys.push(CorrelationKey::CheckoutPath(checkout.clone().into()));
         }
         items.push(CorrelatedItem {
             provider_name: "attachable_set".to_string(),
