@@ -38,6 +38,8 @@ pub struct Checkout {
     pub correlation_keys: Vec<CorrelationKey>,
     pub association_keys: Vec<AssociationKey>,
     #[serde(default)]
+    pub host_name: Option<HostName>,
+    #[serde(default)]
     pub environment_id: Option<EnvironmentId>,
 }
 
@@ -404,6 +406,7 @@ mod tests {
                 last_commit: None,
                 correlation_keys: vec![],
                 association_keys: vec![],
+                host_name: None,
                 environment_id: None,
             },
             Checkout {
@@ -415,6 +418,7 @@ mod tests {
                 last_commit: Some(CommitInfo { short_sha: "abc".into(), message: "feat: add login".into() }),
                 correlation_keys: vec![CorrelationKey::Branch("feat-x".into()), CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into())],
+                host_name: None,
                 environment_id: None,
             },
         ];
@@ -566,6 +570,7 @@ mod tests {
                 last_commit: None,
                 correlation_keys: vec![CorrelationKey::CheckoutPath(qp("/repos/proj/wt-1"))],
                 association_keys: vec![],
+                host_name: None,
                 environment_id: None,
             })]),
             ..ProviderData::default()
@@ -626,6 +631,7 @@ mod tests {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         });
 

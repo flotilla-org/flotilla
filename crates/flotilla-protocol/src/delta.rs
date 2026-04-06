@@ -131,6 +131,7 @@ mod tests {
                 last_commit: None,
                 correlation_keys: vec![],
                 association_keys: vec![],
+                host_name: None,
                 environment_id: None,
             }),
         };

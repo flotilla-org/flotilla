@@ -7,46 +7,56 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
-use super::{runner::EnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount};
+use super::{
+    runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount,
+};
 use crate::providers::{ChannelLabel, CommandRunner};
 
 /// Fixed path inside the container where the daemon socket is mounted.
 const CONTAINER_SOCKET_PATH: &str = "/run/flotilla.sock";
+/// Bump this when the short-term Dockerfile image fingerprint inputs change.
+const DOCKERFILE_IMAGE_TAG_VERSION: &str = "v1";
 
 // ---------------------------------------------------------------------------
-// DockerEnvironment
+// DockerEnvironmentProvider
 // ---------------------------------------------------------------------------
 
 /// An `EnvironmentProvider` that manages Docker containers as sandbox environments.
-pub struct DockerEnvironment {
-    runner: Arc<dyn CommandRunner>,
+pub struct DockerEnvironmentProvider {
+    inner: Arc<DockerEnvironmentProviderInner>,
 }
 
-impl DockerEnvironment {
+impl DockerEnvironmentProvider {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner }
+        Self { inner: Arc::new(DockerEnvironmentProviderInner::new(runner)) }
     }
 }
 
 #[async_trait]
-impl EnvironmentProvider for DockerEnvironment {
-    // TODO: images built from Dockerfiles accumulate as `flotilla-env-{uuid}` tags.
-    // destroy() removes the container but not the image. Phase D should add image
-    // lifecycle management (prune unused flotilla images, or reuse by content hash).
+impl EnvironmentProvider for DockerEnvironmentProvider {
+    // TODO: This fingerprints the Dockerfile contents plus the spec path only.
+    // It intentionally ignores the broader build context for now, so a version
+    // bump may be needed if that approximation proves too weak in practice.
     async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String> {
         match &spec.image {
             ImageSource::Dockerfile(path) => {
-                let tag = format!("flotilla-env-{}", Uuid::new_v4());
                 let abs_path = if path.is_relative() { repo_root.join(path) } else { path.clone() };
+                let tag = dockerfile_image_tag(path, &abs_path)?;
+                if self.inner.image_exists(&tag, repo_root).await? {
+                    return Ok(ImageId::new(tag));
+                }
                 let context_dir = abs_path.parent().unwrap_or(repo_root).to_string_lossy().into_owned();
                 let path_str = abs_path.to_string_lossy().into_owned();
-                self.runner.run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], repo_root, &ChannelLabel::Noop).await?;
+                self.inner
+                    .runner
+                    .run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], repo_root, &ChannelLabel::Noop)
+                    .await?;
                 Ok(ImageId::new(tag))
             }
             ImageSource::Registry(image) => {
-                self.runner.run("docker", &["pull", image], repo_root, &ChannelLabel::Noop).await?;
+                self.inner.runner.run("docker", &["pull", image], repo_root, &ChannelLabel::Noop).await?;
                 Ok(ImageId::new(image.clone()))
             }
         }
@@ -100,20 +110,15 @@ impl EnvironmentProvider for DockerEnvironment {
         args.push("sleep");
         args.push("infinity");
 
-        self.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Noop).await?;
+        self.inner.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Noop).await?;
 
-        Ok(Arc::new(DockerProvisionedEnvironment {
-            id,
-            container_name,
-            image: image.clone(),
-            runner: self.runner.clone(),
-            provisioned_mounts: opts.provisioned_mounts,
-        }))
+        Ok(self.inner.provisioned_environment(id, image.clone(), container_name, opts.provisioned_mounts))
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
         let format = r#"{{.Names}}\t{{.Label "flotilla.environment"}}\t{{.Image}}\t{{.Label "flotilla.provisioned_mounts"}}"#;
         let output = self
+            .inner
             .runner
             .run("docker", &["ps", "-a", "--filter", "label=flotilla.environment", "--format", format], Path::new("/"), &ChannelLabel::Noop)
             .await?;
@@ -144,16 +149,89 @@ impl EnvironmentProvider for DockerEnvironment {
                     return Err(format!("failed to parse provisioned mount metadata for container {container_name}: {err}"));
                 }
             };
-            handles.push(Arc::new(DockerProvisionedEnvironment {
-                id: EnvironmentId::new(env_id),
+            handles.push(self.inner.provisioned_environment(
+                EnvironmentId::new(env_id),
+                ImageId::new(image),
                 container_name,
-                image: ImageId::new(image),
-                runner: self.runner.clone(),
                 provisioned_mounts,
-            }) as EnvironmentHandle);
+            ));
         }
 
         Ok(handles)
+    }
+}
+
+fn dockerfile_image_tag(spec_path: &Path, abs_path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(abs_path).map_err(|err| format!("failed to read Dockerfile {}: {err}", abs_path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(DOCKERFILE_IMAGE_TAG_VERSION.as_bytes());
+    hasher.update([0]);
+    hasher.update(spec_path.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    Ok(format!("flotilla-env-{:x}", digest))
+}
+
+struct DockerEnvironmentProviderInner {
+    runner: Arc<dyn CommandRunner>,
+}
+
+impl DockerEnvironmentProviderInner {
+    fn new(runner: Arc<dyn CommandRunner>) -> Self {
+        Self { runner }
+    }
+
+    async fn image_exists(&self, tag: &str, cwd: &Path) -> Result<bool, String> {
+        match self.runner.run("docker", &["image", "inspect", tag], cwd, &ChannelLabel::Noop).await {
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn provisioned_environment(
+        self: &Arc<Self>,
+        id: EnvironmentId,
+        image: ImageId,
+        container_name: String,
+        provisioned_mounts: Vec<ProvisionedMount>,
+    ) -> EnvironmentHandle {
+        let runner = Arc::new(DockerEnvironmentRunner::new(container_name.clone(), Arc::clone(&self.runner))) as Arc<dyn CommandRunner>;
+        Arc::new(DockerProvisionedEnvironment { id, container_name, image, inner: Arc::clone(self), runner, provisioned_mounts })
+    }
+
+    async fn status(&self, container_name: &str) -> Result<EnvironmentStatus, String> {
+        let raw = self
+            .runner
+            .run("docker", &["inspect", "--format", "{{.State.Status}}", container_name], Path::new("/"), &ChannelLabel::Noop)
+            .await?;
+        let status = raw.trim();
+        Ok(match status {
+            "running" => EnvironmentStatus::Running,
+            "created" | "restarting" => EnvironmentStatus::Starting,
+            "paused" | "exited" | "dead" => EnvironmentStatus::Stopped,
+            other => EnvironmentStatus::Failed(other.to_string()),
+        })
+    }
+
+    async fn env_vars(&self, container_name: &str) -> Result<HashMap<String, String>, String> {
+        let output = self.runner.run("docker", &["exec", container_name, "sh", "-lc", "env"], Path::new("/"), &ChannelLabel::Noop).await?;
+
+        // Note: `sh -lc env` output is line-delimited. Values containing newlines
+        // (e.g. PEM certificates) will be silently truncated. Acceptable for now;
+        // a structured query (docker inspect) could provide the full picture if needed.
+        Ok(output
+            .lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                Some((key.to_string(), value.to_string()))
+            })
+            .collect())
+    }
+
+    async fn destroy(&self, container_name: &str) -> Result<(), String> {
+        self.runner.run("docker", &["rm", "-f", container_name], Path::new("/"), &ChannelLabel::Noop).await?;
+        Ok(())
     }
 }
 
@@ -166,6 +244,7 @@ pub struct DockerProvisionedEnvironment {
     id: EnvironmentId,
     container_name: String,
     image: ImageId,
+    inner: Arc<DockerEnvironmentProviderInner>,
     runner: Arc<dyn CommandRunner>,
     provisioned_mounts: Vec<ProvisionedMount>,
 }
@@ -189,43 +268,18 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
     }
 
     async fn status(&self) -> Result<EnvironmentStatus, String> {
-        let raw = self
-            .runner
-            .run("docker", &["inspect", "--format", "{{.State.Status}}", &self.container_name], Path::new("/"), &ChannelLabel::Noop)
-            .await?;
-        let status = raw.trim();
-        Ok(match status {
-            "running" => EnvironmentStatus::Running,
-            "created" | "restarting" => EnvironmentStatus::Starting,
-            "paused" | "exited" | "dead" => EnvironmentStatus::Stopped,
-            other => EnvironmentStatus::Failed(other.to_string()),
-        })
+        self.inner.status(&self.container_name).await
     }
 
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
-        let output =
-            self.runner.run("docker", &["exec", &self.container_name, "sh", "-lc", "env"], Path::new("/"), &ChannelLabel::Noop).await?;
-
-        // Note: `sh -lc env` output is line-delimited. Values containing newlines
-        // (e.g. PEM certificates) will be silently truncated. Acceptable for Phase 1;
-        // a structured query (docker inspect) could provide the full picture if needed.
-        let vars = output
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                Some((key.to_string(), value.to_string()))
-            })
-            .collect();
-
-        Ok(vars)
+        self.inner.env_vars(&self.container_name).await
     }
 
-    fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
-        Arc::new(EnvironmentRunner::new(self.container_name.clone(), host_runner))
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        Arc::clone(&self.runner)
     }
 
     async fn destroy(&self) -> Result<(), String> {
-        self.runner.run("docker", &["rm", "-f", &self.container_name], Path::new("/"), &ChannelLabel::Noop).await?;
-        Ok(())
+        self.inner.destroy(&self.container_name).await
     }
 }

@@ -11,12 +11,12 @@ use crate::providers::{
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
 /// via `docker exec`. The caller's working directory (a path inside the container)
 /// is forwarded as a `-w` flag; the host-side cwd is always `/` (irrelevant).
-pub struct EnvironmentRunner {
+pub struct DockerEnvironmentRunner {
     container_name: String,
     inner: Arc<dyn CommandRunner>,
 }
 
-impl EnvironmentRunner {
+impl DockerEnvironmentRunner {
     pub fn new(container_name: String, inner: Arc<dyn CommandRunner>) -> Self {
         Self { container_name, inner }
     }
@@ -27,7 +27,7 @@ impl EnvironmentRunner {
 }
 
 #[async_trait]
-impl CommandRunner for EnvironmentRunner {
+impl CommandRunner for DockerEnvironmentRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let cwd_str = cwd.to_string_lossy();
         let mut docker_args = vec!["exec", "-w", &cwd_str, &self.container_name, cmd];
@@ -65,14 +65,14 @@ impl CommandRunner for EnvironmentRunner {
 mod tests {
     use std::{path::Path, sync::Arc};
 
-    use super::EnvironmentRunner;
+    use super::DockerEnvironmentRunner;
     use crate::providers::{testing::MockRunner, CommandRunner};
 
     #[tokio::test]
     async fn ensure_file_delegates_via_docker_exec_sh() {
         let inner =
             Arc::new(MockRunner::new(vec![Ok("/remote/state/flotilla/helpers/helper-hash/flotilla-helper\n".into()), Ok(String::new())]));
-        let runner = EnvironmentRunner::new("my-container".into(), inner.clone());
+        let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
 
         let content = runner.ensure_file(Path::new("/app/config/shpool.toml"), "key = true\n").await.expect("ensure_file");
         assert_eq!(content, String::new());

@@ -62,6 +62,6 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount>;
     async fn status(&self) -> Result<EnvironmentStatus, String>;
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
-    fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner>;
+    fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn destroy(&self) -> Result<(), String>;
 }

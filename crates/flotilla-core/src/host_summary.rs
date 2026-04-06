@@ -123,6 +123,7 @@ mod tests {
         id: flotilla_protocol::EnvironmentId,
         image: flotilla_protocol::ImageId,
         status: flotilla_protocol::EnvironmentStatus,
+        runner: Arc<dyn CommandRunner>,
     }
 
     #[async_trait]
@@ -151,8 +152,8 @@ mod tests {
             Ok(HashMap::new())
         }
 
-        fn runner(&self, host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
-            host_runner
+        fn runner(&self) -> Arc<dyn CommandRunner> {
+            Arc::clone(&self.runner)
         }
 
         async fn destroy(&self) -> Result<(), String> {
@@ -201,6 +202,7 @@ mod tests {
             id: EnvironmentId::new("env-1"),
             image: ImageId::new("test-image:latest"),
             status: EnvironmentStatus::Running,
+            runner: Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
         });
 
         manager
@@ -250,6 +252,7 @@ mod tests {
             id: EnvironmentId::new("env-1"),
             image: ImageId::new("test-image:latest"),
             status: EnvironmentStatus::Running,
+            runner: Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
         });
         manager
             .register_provisioned_environment(EnvironmentId::new("env-1"), handle, EnvironmentBag::new(), None)

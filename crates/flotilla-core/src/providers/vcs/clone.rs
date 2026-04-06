@@ -117,6 +117,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
                 last_commit: None,
                 correlation_keys,
                 association_keys: Vec::new(),
+                host_name: None,
                 environment_id: None,
             };
 
@@ -187,6 +188,7 @@ impl super::CheckoutManager for CloneCheckoutManager {
             last_commit: None,
             correlation_keys,
             association_keys: Vec::new(),
+            host_name: None,
             environment_id: None,
         };
 

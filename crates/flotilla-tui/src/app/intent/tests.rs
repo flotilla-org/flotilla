@@ -735,6 +735,7 @@ fn app_with_pr_and_issues(checkout_issue_ids: &[&str]) -> App {
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(co_path.clone().into())],
         association_keys: checkout_issue_ids.iter().map(|id| AssociationKey::IssueRef("gh".into(), (*id).into())).collect(),
+        host_name: None,
         environment_id: None,
     });
 
@@ -793,6 +794,7 @@ fn remote_only_app_with_providers() -> App {
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path.into())],
         association_keys: vec![AssociationKey::IssueRef("gh".into(), "10".into()), AssociationKey::IssueRef("gh".into(), "20".into())],
+        host_name: None,
         environment_id: None,
     });
 

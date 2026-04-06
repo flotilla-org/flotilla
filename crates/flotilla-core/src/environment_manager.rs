@@ -6,7 +6,7 @@ use std::{
 
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    CommandValue, EnvironmentId, EnvironmentInfo, EnvironmentStatus,
+    EnvironmentId, EnvironmentInfo, EnvironmentStatus, ImageId,
 };
 
 use crate::{
@@ -18,7 +18,6 @@ use crate::{
         registry::ProviderRegistry,
         CommandRunner,
     },
-    step::StepOutcome,
 };
 
 #[derive(Clone)]
@@ -48,7 +47,6 @@ pub struct ProvisionedEnvironmentState {
 pub struct EnvironmentManager {
     local_environment_id: EnvironmentId,
     local_host_id: HostId,
-    host_runner: Arc<dyn CommandRunner>,
     managed: Mutex<HashMap<EnvironmentId, ManagedEnvironmentKind>>,
 }
 
@@ -56,9 +54,11 @@ pub struct CreateProvisionedEnvironmentRequest<'a> {
     pub env_id: EnvironmentId,
     pub provider: &'a str,
     pub registry: &'a ProviderRegistry,
+    pub image: ImageId,
+    pub tokens: Vec<(String, String)>,
+    pub config_base: &'a DaemonHostPath,
     pub daemon_socket_path: &'a DaemonHostPath,
     pub reference_repo: Option<DaemonHostPath>,
-    pub prior: &'a [StepOutcome],
 }
 
 impl EnvironmentManager {
@@ -85,7 +85,7 @@ impl EnvironmentManager {
             }),
         );
 
-        Self { local_environment_id, local_host_id, host_runner: local_runner, managed: Mutex::new(managed) }
+        Self { local_environment_id, local_host_id, managed: Mutex::new(managed) }
     }
 
     pub fn local_environment_id(&self) -> &EnvironmentId {
@@ -138,7 +138,7 @@ impl EnvironmentManager {
     pub fn environment_runner(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
         match self.managed_environment(env_id)? {
             ManagedEnvironmentKind::Direct(state) => Some(state.runner),
-            ManagedEnvironmentKind::Provisioned(state) => Some(state.handle.runner(Arc::clone(&self.host_runner))),
+            ManagedEnvironmentKind::Provisioned(state) => Some(state.handle.runner()),
         }
     }
 
@@ -246,37 +246,18 @@ impl EnvironmentManager {
     }
 
     pub async fn create_provisioned_environment(&self, request: CreateProvisionedEnvironmentRequest<'_>) -> Result<(), String> {
-        let CreateProvisionedEnvironmentRequest { env_id, provider, registry, daemon_socket_path, reference_repo, prior } = request;
-        let image = prior
-            .iter()
-            .find_map(|outcome| match outcome {
-                StepOutcome::Produced(CommandValue::ImageEnsured { image }) => Some(image.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| "image not produced by prior EnsureEnvironmentImage step".to_string())?;
-
+        let CreateProvisionedEnvironmentRequest {
+            env_id,
+            provider,
+            registry,
+            image,
+            tokens,
+            config_base,
+            daemon_socket_path,
+            reference_repo,
+        } = request;
         let (_, env_provider) =
             registry.environment_providers.get(provider).ok_or_else(|| format!("environment provider not available: {provider}"))?;
-
-        let tokens = prior
-            .iter()
-            .find_map(|outcome| match outcome {
-                StepOutcome::Produced(CommandValue::EnvironmentSpecRead { spec }) => Some(spec),
-                _ => None,
-            })
-            .map(|spec| {
-                spec.token_env_vars
-                    .iter()
-                    .filter_map(|name| match std::env::var(name) {
-                        Ok(val) => Some((name.clone(), val)),
-                        Err(_) => {
-                            tracing::warn!(env_var = %name, "token env var not set on host, skipping");
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
 
         let provisioned_mounts = reference_repo
             .as_ref()
@@ -284,27 +265,21 @@ impl EnvironmentManager {
             .unwrap_or_default();
         let opts = CreateOpts { tokens, daemon_socket_path: daemon_socket_path.clone(), working_directory: None, provisioned_mounts };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
-        self.register_provisioned_environment(env_id, handle, EnvironmentBag::new(), None)
+        let (env_bag, provider_registry) = self.probe_provisioned_environment(&env_id, &handle, config_base).await?;
+        self.register_provisioned_environment(env_id, handle, env_bag, Some(Arc::new(provider_registry)))
     }
 
-    pub async fn discover_provisioned_environment_providers(
+    pub async fn ensure_provisioned_environment_providers(
         &self,
         env_id: &EnvironmentId,
         config_base: &DaemonHostPath,
     ) -> Result<(), String> {
         let state = self.provisioned_environment(env_id)?;
-        let env_runner = state.handle.runner(Arc::clone(&self.host_runner));
-
-        let raw_env_vars = state.handle.env_vars().await?;
-        let mut bag = EnvironmentBag::new();
-        for (key, value) in &raw_env_vars {
-            bag = bag.with(EnvironmentAssertion::env_var(key, value));
+        if state.registry.is_some() {
+            return Ok(());
         }
 
-        let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
-        let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
-        let provider_registry = FactoryRegistry::default_all().probe_all(&bag, &config, &env_repo_root, env_runner).await;
-
+        let (bag, provider_registry) = self.probe_provisioned_environment(env_id, &state.handle, config_base).await?;
         self.update_provisioned_environment_discovery(env_id, &state.handle, bag, Some(Arc::new(provider_registry)));
         Ok(())
     }
@@ -420,6 +395,27 @@ impl EnvironmentManager {
         }
     }
 
+    async fn probe_provisioned_environment(
+        &self,
+        env_id: &EnvironmentId,
+        handle: &EnvironmentHandle,
+        config_base: &DaemonHostPath,
+    ) -> Result<(EnvironmentBag, ProviderRegistry), String> {
+        let env_runner = handle.runner();
+
+        let raw_env_vars = handle.env_vars().await?;
+        let mut bag = EnvironmentBag::new();
+        for (key, value) in &raw_env_vars {
+            bag = bag.with(EnvironmentAssertion::env_var(key, value));
+        }
+
+        let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
+        let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
+        let provider_registry = FactoryRegistry::default_all().probe_all(&bag, &config, &env_repo_root, env_runner).await;
+
+        Ok((bag, provider_registry))
+    }
+
     fn display_name_for_bag(env_bag: &EnvironmentBag) -> Option<String> {
         env_bag.find_env_var("DISPLAY_NAME").map(|value| value.to_owned())
     }
@@ -474,20 +470,17 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_protocol::{CommandValue, EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
+    use flotilla_protocol::{EnvironmentId, EnvironmentSpec, EnvironmentStatus, ImageId};
 
     use super::*;
-    use crate::{
-        providers::{
-            discovery::{
-                test_support::{fake_discovery, DiscoveryMockRunner},
-                EnvironmentAssertion,
-            },
-            environment::{CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
-            registry::ProviderRegistry,
-            CommandRunner,
+    use crate::providers::{
+        discovery::{
+            test_support::{fake_discovery, DiscoveryMockRunner},
+            EnvironmentAssertion,
         },
-        step::StepOutcome,
+        environment::{CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
+        registry::ProviderRegistry,
+        CommandRunner,
     };
 
     struct MockProvisionedEnvironment {
@@ -526,7 +519,7 @@ mod tests {
             self.provisioned_mounts.clone()
         }
 
-        fn runner(&self, _host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+        fn runner(&self) -> Arc<dyn CommandRunner> {
             Arc::clone(&self.runner)
         }
 
@@ -933,24 +926,21 @@ mod tests {
                 env_id: env_id.clone(),
                 provider: "docker",
                 registry: &registry,
+                image: ImageId::new("mock:image"),
+                tokens: vec![],
+                config_base: &DaemonHostPath::new("/tmp/test-config"),
                 daemon_socket_path: &DaemonHostPath::new("/tmp/flotilla.sock"),
                 reference_repo: None,
-                prior: &[
-                    StepOutcome::Produced(CommandValue::ImageEnsured { image: ImageId::new("mock:image") }),
-                    StepOutcome::Produced(CommandValue::EnvironmentSpecRead {
-                        spec: EnvironmentSpec { image: ImageSource::Registry("mock:image".into()), token_env_vars: vec![] },
-                    }),
-                ],
             })
             .await
             .expect("create provisioned environment");
 
         assert!(manager.environment_runner(&env_id).is_some());
-        assert!(manager.environment_registry(&env_id).is_none());
+        assert!(manager.environment_registry(&env_id).is_some());
     }
 
     #[tokio::test]
-    async fn discover_provisioned_environment_providers_updates_bag_and_registry() {
+    async fn ensure_provisioned_environment_providers_updates_bag_and_registry() {
         let env_id = EnvironmentId::new("env-discover-1");
         let discovery = fake_discovery(false);
         let manager = EnvironmentManager::new_local(&discovery, test_local_environment_id(), test_local_host_id()).await;
@@ -960,9 +950,9 @@ mod tests {
             .expect("register provisioned environment");
 
         manager
-            .discover_provisioned_environment_providers(&env_id, &DaemonHostPath::new("/tmp/test-config"))
+            .ensure_provisioned_environment_providers(&env_id, &DaemonHostPath::new("/tmp/test-config"))
             .await
-            .expect("discover providers");
+            .expect("ensure providers");
 
         assert_eq!(manager.environment_bag(&env_id).expect("environment bag").find_env_var("ANTHROPIC_API_KEY"), Some("test-key"));
         assert!(manager.environment_registry(&env_id).is_some());

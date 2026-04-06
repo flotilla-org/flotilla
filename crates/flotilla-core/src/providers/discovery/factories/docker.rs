@@ -9,7 +9,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        environment::{docker::DockerEnvironment, EnvironmentProvider},
+        environment::{docker::DockerEnvironmentProvider, EnvironmentProvider},
         ChannelLabel, CommandRunner,
     },
 };
@@ -34,11 +34,11 @@ impl Factory for DockerEnvironmentFactory {
     ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {
         // Check EnvironmentBag first (preferred pattern)
         if env.find_binary("docker").is_some() {
-            return Ok(Arc::new(DockerEnvironment::new(runner)));
+            return Ok(Arc::new(DockerEnvironmentProvider::new(runner)));
         }
         // Fallback: try running docker directly
         match runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Noop).await {
-            Ok(_) => Ok(Arc::new(DockerEnvironment::new(runner))),
+            Ok(_) => Ok(Arc::new(DockerEnvironmentProvider::new(runner))),
             Err(_) => Err(vec![UnmetRequirement::MissingBinary("docker".into())]),
         }
     }

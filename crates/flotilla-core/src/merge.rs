@@ -1,7 +1,5 @@
 use flotilla_protocol::{HostName, ProviderData};
 
-use crate::executor::checkout::checkout_is_local_owned;
-
 /// Merge local ProviderData with peer data from remote hosts.
 ///
 /// Host-scoped data is merged with ownership-aware rules:
@@ -21,15 +19,26 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
         // Merge checkouts by host ownership.
         // - local host paths are authoritative locally, so peer data must not
         //   overwrite them
-        // - peer-owned host paths are only accepted from that owning peer
+        // - peer-owned hostname-qualified paths are only accepted from that owning peer
+        // - peer-owned host-id-qualified paths are accepted unless a local entry already exists
         for (host_path, checkout) in &peer_data.checkouts {
-            if checkout_is_local_owned(host_path, local_host) {
+            if host_path.host_name() == Some(local_host) {
+                continue;
+            }
+            if host_path.host_id().is_some() {
+                merged.checkouts.entry(host_path.clone()).or_insert_with(|| {
+                    let mut checkout = checkout.clone();
+                    checkout.host_name.get_or_insert_with(|| peer_host.clone());
+                    checkout
+                });
                 continue;
             }
             if host_path.host_name() != Some(peer_host) {
                 continue;
             }
-            merged.checkouts.insert(host_path.clone(), checkout.clone());
+            let mut checkout = checkout.clone();
+            checkout.host_name.get_or_insert_with(|| peer_host.clone());
+            merged.checkouts.insert(host_path.clone(), checkout);
         }
 
         // Merge managed terminals with host-namespaced keys

@@ -143,6 +143,7 @@ fn build_repo_snapshot_with_peers_merges_peer_data() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -190,6 +191,7 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         },
     );
@@ -205,6 +207,7 @@ fn build_repo_snapshot_with_peers_does_not_duplicate_from_merged_base() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     let peers = vec![(peer_host.clone(), peer_data.clone())];
@@ -305,6 +308,7 @@ fn build_repo_snapshot_with_peers_preserves_remote_attachable_set_for_local_work
             CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -385,6 +389,7 @@ fn collect_linked_issue_ids_from_checkouts() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![AssociationKey::IssueRef("github".into(), "7".into())],
+        host_name: None,
         environment_id: None,
     });
 
@@ -415,6 +420,7 @@ fn collect_linked_issue_ids_deduplicates() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![AssociationKey::IssueRef("github".into(), "42".into())],
+        host_name: None,
         environment_id: None,
     });
 
@@ -448,6 +454,7 @@ fn snapshot_includes_linked_issues_when_populated() {
         last_commit: None,
         correlation_keys: vec![CorrelationKey::Branch("fix/42".into()), CorrelationKey::CheckoutPath(checkout_path.into())],
         association_keys: vec![AssociationKey::IssueRef("github".into(), "42".into())],
+        host_name: None,
         environment_id: None,
     });
     providers.change_requests.insert("PR-100".into(), ChangeRequest {
@@ -603,7 +610,7 @@ async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_chec
             Ok(HashMap::new())
         }
 
-        fn runner(&self, _host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+        fn runner(&self) -> Arc<dyn CommandRunner> {
             Arc::clone(&self.runner)
         }
 
@@ -643,6 +650,7 @@ async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_chec
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path.clone())],
         association_keys: vec![],
+        host_name: None,
         environment_id: Some(environment_id.clone()),
     });
 
@@ -674,6 +682,7 @@ async fn normalize_local_provider_hosts_preserves_host_qualified_checkout_when_p
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path.clone())],
         association_keys: vec![],
+        host_name: None,
         environment_id: Some(environment_id.clone()),
     });
 
@@ -707,6 +716,7 @@ async fn normalize_local_provider_hosts_keeps_environment_qualified_checkout_whe
         last_commit: None,
         correlation_keys: vec![CorrelationKey::CheckoutPath(checkout_path.clone())],
         association_keys: vec![],
+        host_name: None,
         environment_id: Some(environment_id.clone()),
     });
 

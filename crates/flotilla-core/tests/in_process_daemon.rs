@@ -302,7 +302,7 @@ impl ProvisionedEnvironment for TestProvisionedEnvironment {
         Ok(self.env_vars.clone())
     }
 
-    fn runner(&self, _host_runner: Arc<dyn CommandRunner>) -> Arc<dyn CommandRunner> {
+    fn runner(&self) -> Arc<dyn CommandRunner> {
         Arc::clone(&self.runner)
     }
 
@@ -496,6 +496,7 @@ fn checkout_state_for_repo(repo: &Path, branch: &str) -> Arc<std::sync::RwLock<F
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch(branch.into())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         })
         .build()
@@ -1396,6 +1397,7 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("remote"), status: PeerConnectionState::Connected });
@@ -2079,6 +2081,7 @@ async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2115,6 +2118,7 @@ async fn replay_since_includes_overlay_only_hosts() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2146,6 +2150,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2254,6 +2259,7 @@ async fn replay_since_includes_peer_checkouts_with_correct_host() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2312,6 +2318,7 @@ async fn replay_since_unknown_seq_includes_peer_checkouts_with_correct_host() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2375,6 +2382,7 @@ async fn replay_since_delta_replay_includes_peer_data() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2612,6 +2620,7 @@ async fn get_local_providers_excludes_peer_overlay_data() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2653,6 +2662,7 @@ async fn get_state_does_not_reattribute_peer_checkouts_after_poll() {
         last_commit: None,
         correlation_keys: vec![],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
 
@@ -2705,6 +2715,7 @@ async fn set_peer_providers_after_poll_does_not_duplicate_checkouts() {
             last_commit: None,
             correlation_keys: vec![],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         });
         pd
@@ -2791,6 +2802,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
             CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     // The remote host projects sets matching its own checkouts, so
@@ -2890,6 +2902,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
             CorrelationKey::CheckoutPath(remote_checkout.clone().into()),
         ],
         association_keys: vec![],
+        host_name: None,
         environment_id: None,
     });
     // The remote host projects sets matching its own checkouts, so
@@ -3181,6 +3194,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch("feat-remote".into())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         })]),
         ..Default::default()
@@ -3689,6 +3703,7 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch("feat-branch".into())],
             association_keys: vec![AssociationKey::IssueRef("fake-issues".into(), "42".into())],
+            host_name: None,
             environment_id: None,
         })])
         .await;
@@ -3791,28 +3806,12 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
             last_commit: None,
             correlation_keys: vec![CorrelationKey::Branch("feat-lifecycle".into()), CorrelationKey::CheckoutPath(host_path.clone().into())],
             association_keys: vec![],
+            host_name: None,
             environment_id: None,
         })])
         .await;
 
-    // Create an attachable store with a set anchored to the checkout.
     let attachable_store = shared_in_memory_attachable_store();
-    let set_id = {
-        let mut store = attachable_store.lock().expect("lock attachable store");
-        let set_id = store.ensure_terminal_set(Some(HostName::local()), Some(host_path.clone().into()));
-        store.ensure_terminal_attachable(
-            &set_id,
-            "terminal_pool",
-            "fake-terminals",
-            "flotilla/feat-lifecycle/shell/0",
-            TerminalPurpose { checkout: "feat-lifecycle".into(), role: "shell".into(), index: 0 },
-            "bash",
-            flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp/repo/wt-feat-lifecycle"),
-            flotilla_protocol::TerminalStatus::Running,
-        );
-        set_id
-    };
-
     let terminal_pool = Arc::new(FakeTerminalPool::new());
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new()
@@ -3827,6 +3826,28 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     let config = Arc::new(flotilla_core::config::ConfigStore::with_base(temp.path().join("config")));
     let daemon = flotilla_core::in_process::InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     let mut rx = daemon.subscribe();
+
+    // Create an attachable store with a set anchored to the same normalized checkout key
+    // the daemon will publish for the local checkout.
+    let normalized_checkout = daemon
+        .local_host_id()
+        .map(|host_id| QualifiedPath::host(host_id, host_path.path.clone()))
+        .unwrap_or_else(|| host_path.clone().into());
+    let set_id = {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        let set_id = store.ensure_terminal_set(Some(HostName::local()), Some(normalized_checkout));
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "fake-terminals",
+            "flotilla/feat-lifecycle/shell/0",
+            TerminalPurpose { checkout: "feat-lifecycle".into(), role: "shell".into(), index: 0 },
+            "bash",
+            flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp/repo/wt-feat-lifecycle"),
+            flotilla_protocol::TerminalStatus::Running,
+        );
+        set_id
+    };
 
     // --- Act: initial refresh ---
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;

@@ -304,7 +304,8 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
                 if checkout_ref.is_none() {
                     let is_main_checkout = providers.checkouts.get(path).is_some_and(|co| co.is_main);
                     checkout_ref = Some(CheckoutRef::from_qualified_path(path.clone(), is_main_checkout));
-                    host = path.host_name().cloned();
+                    host =
+                        path.host_name().cloned().or_else(|| providers.checkouts.get(path).and_then(|checkout| checkout.host_name.clone()));
                 }
             }
             (CorItemKind::AttachableSet, ProviderItemKey::AttachableSet(id)) => {
