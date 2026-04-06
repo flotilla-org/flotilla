@@ -1,74 +1,58 @@
-use flotilla_protocol::{HostName, ProviderData};
+use flotilla_protocol::{HostName, NodeId, NodeInfo, ProviderData};
 
-/// Merge local ProviderData with peer data from remote hosts.
+/// Merge local ProviderData with peer data from remote nodes.
 ///
-/// Host-scoped data is merged with ownership-aware rules:
-/// - hostname-qualified checkouts are accepted only from the host that owns the path
-/// - local-host checkouts are never overwritten by peer data
-/// - managed terminals are namespaced by peer host to avoid collisions
-/// - workspaces are namespaced by peer host to avoid collisions
-///
-/// Service-level data (change_requests, issues, sessions) comes only
-/// from the leader — followers don't poll external APIs, so there are no
-/// duplicates to reconcile. If a peer does send service-level data (e.g. the
-/// leader relaying its own data), we include it.
-pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &[(HostName, &ProviderData)]) -> ProviderData {
+/// Display labels remain in `host_name`-style fields for UI continuity, but the
+/// peer overlay itself is keyed by `NodeId` and all namespacing uses node ids.
+pub fn merge_provider_data(
+    local: &ProviderData,
+    local_display_name: &HostName,
+    _local_node_id: &NodeId,
+    peers: &[(NodeInfo, &ProviderData)],
+) -> ProviderData {
     let mut merged = local.clone();
 
-    for (peer_host, peer_data) in peers {
-        // Merge checkouts by host ownership.
-        // - local host paths are authoritative locally, so peer data must not
-        //   overwrite them
-        // - peer-owned hostname-qualified paths are only accepted from that owning peer
-        // - peer-owned host-id-qualified paths are accepted unless a local entry already exists
+    for (peer_node, peer_data) in peers {
         for (host_path, checkout) in &peer_data.checkouts {
-            if host_path.host_name() == Some(local_host) {
+            if host_path.host_name() == Some(local_display_name) {
                 continue;
             }
             if host_path.host_id().is_some() {
                 merged.checkouts.entry(host_path.clone()).or_insert_with(|| {
                     let mut checkout = checkout.clone();
-                    checkout.host_name.get_or_insert_with(|| peer_host.clone());
+                    checkout.host_name.get_or_insert_with(|| HostName::new(peer_node.display_name.clone()));
                     checkout
                 });
                 continue;
             }
-            if host_path.host_name() != Some(peer_host) {
+            if host_path.host_name().is_some_and(|host| host.as_str() != peer_node.display_name) {
                 continue;
             }
             let mut checkout = checkout.clone();
-            checkout.host_name.get_or_insert_with(|| peer_host.clone());
+            checkout.host_name.get_or_insert_with(|| HostName::new(peer_node.display_name.clone()));
             merged.checkouts.insert(host_path.clone(), checkout);
         }
 
-        // Merge managed terminals with host-namespaced keys
         for (id, terminal) in &peer_data.managed_terminals {
-            let namespaced = flotilla_protocol::AttachableId::new(format!("{}:{}", peer_host, id));
+            let namespaced = flotilla_protocol::AttachableId::new(format!("{}:{}", peer_node.node_id, id));
             merged.managed_terminals.insert(namespaced, terminal.clone());
         }
 
-        // Merge branches from peers. Followers don't run the remote-branch
-        // provider, so peer branch maps are expected to be empty.
-        // "or_insert" keeps local data if both sides have the same key.
         for (name, branch) in &peer_data.branches {
             merged.branches.entry(name.clone()).or_insert_with(|| branch.clone());
         }
 
-        // Merge workspaces from peers
         for (name, workspace) in &peer_data.workspaces {
-            let namespaced = format!("{}:{}", peer_host, name);
+            let namespaced = format!("{}:{}", peer_node.node_id, name);
             merged.workspaces.insert(namespaced, workspace.clone());
         }
 
-        // Merge attachable sets by opaque id. These ids are the canonical
-        // correlation surface, so they must not be host-namespaced.
         for (id, set) in &peer_data.attachable_sets {
-            merged.attachable_sets.entry(id.clone()).or_insert_with(|| set.clone());
+            let mut set = set.clone();
+            set.host_affinity.get_or_insert_with(|| HostName::new(peer_node.display_name.clone()));
+            merged.attachable_sets.entry(id.clone()).or_insert(set);
         }
 
-        // Service-level data (PRs, issues, sessions) comes only from leader.
-        // Followers don't poll external APIs so their maps are normally empty.
-        // Local entries stay authoritative; peer data only fills gaps.
         for (key, cr) in &peer_data.change_requests {
             merged.change_requests.entry(key.clone()).or_insert_with(|| cr.clone());
         }
@@ -77,6 +61,9 @@ pub fn merge_provider_data(local: &ProviderData, local_host: &HostName, peers: &
         }
         for (key, session) in &peer_data.sessions {
             merged.sessions.entry(key.clone()).or_insert_with(|| session.clone());
+        }
+        for (key, agent) in &peer_data.agents {
+            merged.agents.entry(key.clone()).or_insert_with(|| agent.clone());
         }
     }
 

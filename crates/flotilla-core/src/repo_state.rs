@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use flotilla_protocol::{DeltaEntry, EnvironmentId, HostName, ProviderData, ProviderError, RepoSnapshot, WorkItem};
+use flotilla_protocol::{DeltaEntry, EnvironmentId, HostName, NodeId, ProviderData, ProviderError, RepoSnapshot, WorkItem};
 
 use crate::{
     delta,
@@ -36,6 +36,7 @@ pub(crate) struct SnapshotBuildContext<'a> {
     pub(crate) local_providers: &'a ProviderData,
     pub(crate) errors: &'a [crate::data::RefreshError],
     pub(crate) provider_health: &'a HashMap<(&'static str, String), bool>,
+    pub(crate) node_id: &'a NodeId,
     pub(crate) host_name: &'a HostName,
     pub(crate) environment_manager: &'a EnvironmentManager,
     pub(crate) environment_id: Option<&'a EnvironmentId>,
@@ -224,6 +225,7 @@ impl RepoState {
     /// Build a [`SnapshotBuildContext`] from the current state.
     pub(crate) fn snapshot_context<'a>(
         &'a self,
+        node_id: &'a NodeId,
         host_name: &'a HostName,
         environment_manager: &'a EnvironmentManager,
     ) -> SnapshotBuildContext<'a> {
@@ -233,6 +235,7 @@ impl RepoState {
             local_providers: &self.last_local_providers,
             errors: &self.last_snapshot.errors,
             provider_health: &self.last_snapshot.provider_health,
+            node_id,
             host_name,
             environment_manager,
             environment_id: self.preferred_environment_id(),

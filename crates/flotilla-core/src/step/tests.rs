@@ -28,14 +28,18 @@ impl StepResolver for TestResolver {
 }
 
 fn make_step(desc: &str) -> Step {
-    Step { description: desc.to_string(), host: StepExecutionContext::Host(HostName::local()), action: StepAction::Noop }
+    Step { description: desc.to_string(), host: StepExecutionContext::Host(local_node()), action: StepAction::Noop }
 }
 
-fn remote_host() -> HostName {
-    let local = HostName::local();
-    let candidate = HostName::new("remote-step-host");
+fn local_node() -> NodeId {
+    NodeId::new("local-step-host")
+}
+
+fn remote_host() -> NodeId {
+    let local = local_node();
+    let candidate = NodeId::new("remote-step-host");
     if candidate == local {
-        HostName::new("remote-step-host-alt")
+        NodeId::new("remote-step-host-alt")
     } else {
         candidate
     }
@@ -54,7 +58,7 @@ struct TestRemoteExecutor {
 }
 
 struct TestRemoteBatch {
-    assert_host: HostName,
+    assert_host: NodeId,
     progress: Vec<RemoteStepProgressUpdate>,
     wait_for_cancel: Option<Arc<Notify>>,
     result: Result<Vec<StepOutcome>, String>,
@@ -82,7 +86,7 @@ impl RemoteStepExecutor for TestRemoteExecutor {
         progress_sink: Arc<dyn RemoteStepProgressSink>,
     ) -> Result<Vec<StepOutcome>, String> {
         let batch = self.batches.lock().await.remove(0);
-        assert_eq!(request.target_host, batch.assert_host);
+        assert_eq!(request.target_node_id, batch.assert_host);
 
         for update in batch.progress {
             progress_sink.emit(update).await;
@@ -116,7 +120,7 @@ async fn all_steps_succeed() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -143,7 +147,7 @@ async fn step_failure_stops_execution() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -164,7 +168,7 @@ async fn cancellation_before_step() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -209,7 +213,7 @@ async fn cancellation_during_running_step_returns_cancelled() {
         run_step_plan(
             plan,
             1,
-            HostName::local(),
+            local_node(),
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel2,
@@ -235,7 +239,7 @@ async fn skipped_step_continues() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -258,7 +262,7 @@ async fn completed_with_overrides_result() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -278,7 +282,7 @@ async fn empty_plan_returns_ok() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -298,7 +302,7 @@ async fn symbolic_step_action_succeeds() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -321,7 +325,7 @@ async fn produced_does_not_override_final_result() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -344,7 +348,7 @@ async fn later_failure_preserves_earlier_completed_with() {
     let result = run_step_plan(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -389,7 +393,7 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
     let result = run_step_plan_with_remote_executor(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -449,7 +453,7 @@ async fn remote_failure_stops_execution() {
     let result = run_step_plan_with_remote_executor(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -507,7 +511,7 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
     let result = run_step_plan_with_remote_executor(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -524,12 +528,12 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
         matches!(
             event,
             DaemonEvent::CommandStepUpdate {
-                host,
+                node_id,
                 step_index: 0,
                 description,
                 status: StepStatus::Failed { message },
                 ..
-            } if host == &remote_host && description == "remote" && message == "boom"
+            } if node_id == &remote_host && description == "remote" && message == "boom"
         )
     }));
 }
@@ -568,7 +572,7 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     let result = run_step_plan_with_remote_executor(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -584,7 +588,9 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     let failure_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
-            DaemonEvent::CommandStepUpdate { host, step_index, description, status, .. } => Some((host, step_index, description, status)),
+            DaemonEvent::CommandStepUpdate { node_id, step_index, description, status, .. } => {
+                Some((node_id, step_index, description, status))
+            }
             _ => None,
         })
         .filter(|(_, _, _, status)| matches!(status, StepStatus::Failed { .. }))
@@ -593,8 +599,8 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     assert_eq!(failure_events.len(), 1);
     assert!(matches!(
         &failure_events[0],
-        (host, 2, description, StepStatus::Failed { message })
-            if host == &remote_host && description == "remote-b" && message == "boom"
+        (node_id, 2, description, StepStatus::Failed { message })
+            if node_id == &remote_host && description == "remote-b" && message == "boom"
     ));
 }
 
@@ -646,7 +652,7 @@ async fn remote_error_does_not_duplicate_failed_progress() {
     let result = run_step_plan_with_remote_executor(
         plan,
         1,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -711,7 +717,7 @@ async fn remote_progress_maps_to_global_step_indices() {
     let result = run_step_plan_with_remote_executor(
         plan,
         7,
-        HostName::local(),
+        local_node(),
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
@@ -725,7 +731,7 @@ async fn remote_progress_maps_to_global_step_indices() {
 
     let remote_indices: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
         .filter_map(|event| match event {
-            DaemonEvent::CommandStepUpdate { host, step_index, .. } if host == remote_host => Some(step_index),
+            DaemonEvent::CommandStepUpdate { node_id, step_index, .. } if node_id == remote_host => Some(step_index),
             _ => None,
         })
         .collect();
@@ -740,7 +746,7 @@ async fn remote_progress_omits_repo_path_when_batch_context_missing() {
     };
     let sink = EventForwardingProgressSink {
         command_id: 9,
-        host: HostName::new("feta"),
+        host: NodeId::new("feta"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repo: None,
         step_offset: 0,
@@ -762,12 +768,12 @@ async fn remote_progress_omits_repo_path_when_batch_context_missing() {
         event,
         DaemonEvent::CommandStepUpdate {
             command_id: 9,
-            host,
+            node_id,
             repo: None,
             description,
             status: StepStatus::Started,
             ..
-        } if host == HostName::new("feta") && description == "remote"
+        } if node_id == NodeId::new("feta") && description == "remote"
     ));
 }
 
@@ -814,7 +820,7 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
         run_step_plan_with_remote_executor(
             plan,
             11,
-            HostName::local(),
+            local_node(),
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
@@ -877,7 +883,7 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
         run_step_plan_with_remote_executor(
             plan,
             12,
-            HostName::local(),
+            local_node(),
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
@@ -938,7 +944,7 @@ async fn cancellation_after_remote_cancel_timeout_returns_cancelled_without_wait
         run_step_plan_with_remote_executor(
             plan,
             13,
-            HostName::local(),
+            local_node(),
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,

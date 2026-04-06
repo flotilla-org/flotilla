@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use flotilla_protocol::{CommandValue, DaemonEvent, HostName, RepoIdentity, StepStatus};
+use flotilla_protocol::{CommandValue, DaemonEvent, NodeId, RepoIdentity, StepStatus};
 pub use flotilla_protocol::{Step, StepAction, StepExecutionContext, StepOutcome};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -25,7 +25,7 @@ pub trait StepResolver: Send + Sync {
 
 pub struct RemoteStepBatchRequest {
     pub command_id: u64,
-    pub target_host: HostName,
+    pub target_node_id: NodeId,
     pub repo_identity: RepoIdentity,
     /// Requester-local repo path used when remapping remote progress into
     /// `DaemonEvent::CommandStepUpdate` for the UI. Remote execution itself
@@ -74,7 +74,7 @@ impl RemoteStepExecutor for UnsupportedRemoteStepExecutor {
         request: RemoteStepBatchRequest,
         _progress_sink: Arc<dyn RemoteStepProgressSink>,
     ) -> Result<Vec<StepOutcome>, String> {
-        Err(format!("remote step execution is not wired for host {}", request.target_host))
+        Err(format!("remote step execution is not wired for node {}", request.target_node_id))
     }
 
     async fn cancel_active_batch(&self, _command_id: u64) -> Result<(), String> {
@@ -98,7 +98,7 @@ impl StepPlan {
 pub async fn run_step_plan(
     plan: StepPlan,
     command_id: u64,
-    local_host: HostName,
+    local_host: NodeId,
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
@@ -115,7 +115,7 @@ pub async fn run_step_plan(
 pub async fn run_step_plan_with_remote_executor(
     plan: StepPlan,
     command_id: u64,
-    local_host: HostName,
+    local_host: NodeId,
     repo_identity: RepoIdentity,
     repo: ExecutionEnvironmentPath,
     cancel: CancellationToken,
@@ -135,7 +135,7 @@ pub async fn run_step_plan_with_remote_executor(
         }
 
         let step = steps[i].clone();
-        let step_target = step.host.host_name().clone();
+        let step_target = step.host.node_id().clone();
         debug!(%command_id, %step_target, %local_host, step_index = i, desc = %step.description, "step dispatch");
 
         if step_target == local_host {
@@ -201,7 +201,7 @@ pub async fn run_step_plan_with_remote_executor(
                 let mut segment_steps = vec![step];
                 i += 1;
                 while i < step_count {
-                    if *steps[i].host.host_name() == target_host {
+                    if *steps[i].host.node_id() == target_host {
                         segment_steps.push(steps[i].clone());
                         i += 1;
                     } else {
@@ -221,7 +221,7 @@ pub async fn run_step_plan_with_remote_executor(
                 });
                 let request = RemoteStepBatchRequest {
                     command_id,
-                    target_host: target_host.clone(),
+                    target_node_id: target_host.clone(),
                     repo_identity: repo_identity.clone(),
                     repo: Some(repo.clone()),
                     step_offset: segment_start,
@@ -286,7 +286,7 @@ pub async fn run_step_plan_with_remote_executor(
 fn emit_step_update(
     event_tx: &broadcast::Sender<DaemonEvent>,
     command_id: u64,
-    host: HostName,
+    host: NodeId,
     repo_identity: RepoIdentity,
     repo: Option<std::path::PathBuf>,
     step_index: usize,
@@ -297,7 +297,7 @@ fn emit_step_update(
     debug!(%command_id, %host, step_index, step_count, %description, ?status, "emit_step_update");
     let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
         command_id,
-        host,
+        node_id: host,
         repo_identity,
         repo,
         step_index,
@@ -317,7 +317,7 @@ fn prior_result_or_error(outcomes: &[StepOutcome], error: String) -> CommandValu
 
 struct EventForwardingProgressSink {
     command_id: u64,
-    host: HostName,
+    host: NodeId,
     repo_identity: RepoIdentity,
     repo: Option<ExecutionEnvironmentPath>,
     step_offset: usize,

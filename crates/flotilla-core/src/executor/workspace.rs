@@ -71,10 +71,11 @@ impl<'a> WorkspaceOrchestrator<'a> {
         };
 
         let scope_prefix = ws_mgr.binding_scope_prefix();
+        let target_host = HostName::new(prepared.target_node_id.as_str());
         if let Some(ws_ref) = self.find_existing_workspace_ref(
             provider_name,
             &scope_prefix,
-            &prepared.target_host,
+            &target_host,
             &prepared.checkout_path,
             prepared.checkout_key.as_ref(),
         ) {
@@ -86,7 +87,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         }
 
         let attach_commands = resolve_prepared_commands_via_hop_chain(
-            &prepared.target_host,
+            &target_host,
             &prepared.checkout_path,
             &prepared.prepared_commands,
             self.config_base,
@@ -124,7 +125,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
                         provider_name,
                         &ws_ref,
                         set_id,
-                        &prepared.target_host,
+                        &target_host,
                         &prepared.checkout_path,
                         prepared.checkout_key.as_ref(),
                     );
@@ -132,7 +133,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
                     self.persist_workspace_binding(
                         provider_name,
                         &ws_ref,
-                        &prepared.target_host,
+                        &target_host,
                         &prepared.checkout_path,
                         prepared.checkout_key.as_ref(),
                     );

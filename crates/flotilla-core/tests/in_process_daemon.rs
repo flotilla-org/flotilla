@@ -37,8 +37,8 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
     EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId,
-    Issue, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute,
-    WorkItemKind,
+    Issue, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory,
+    TopologyRoute, WorkItemKind,
 };
 use tokio::sync::Notify;
 
@@ -349,7 +349,7 @@ impl Factory for EnvGatedTerminalPoolFactory {
 
 fn sample_remote_host_summary(name: &str) -> HostSummary {
     HostSummary {
-        host_name: HostName::new(name),
+        node: test_node(name),
         system: SystemInfo {
             home_dir: Some(PathBuf::from(format!("/home/{name}"))),
             os: Some("linux".into()),
@@ -361,6 +361,89 @@ fn sample_remote_host_summary(name: &str) -> HostSummary {
         inventory: ToolInventory::default(),
         providers: vec![HostProviderStatus { category: "vcs".into(), name: "Git".into(), implementation: "git".into(), healthy: true }],
         environments: vec![],
+    }
+}
+
+fn test_node(name: &str) -> NodeInfo {
+    NodeInfo::new(NodeId::new(format!("node-{name}")), name)
+}
+
+fn snapshot_host(snapshot: &flotilla_protocol::HostSnapshot) -> HostName {
+    HostName::new(snapshot.node.display_name.clone())
+}
+
+fn summary_host(summary: &HostSummary) -> HostName {
+    HostName::new(summary.node.display_name.clone())
+}
+
+trait DaemonTestCompat {
+    async fn set_configured_peer_names(&self, peers: Vec<HostName>);
+    async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>);
+    async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState);
+    async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary);
+    async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>, overlay_version: u64);
+    async fn add_virtual_repo(
+        &self,
+        identity: RepoIdentity,
+        synthetic_path: PathBuf,
+        peers: Vec<(HostName, ProviderData)>,
+        overlay_version: u64,
+    ) -> Result<(), String>;
+}
+
+impl DaemonTestCompat for Arc<InProcessDaemon> {
+    async fn set_configured_peer_names(&self, peers: Vec<HostName>) {
+        InProcessDaemon::set_configured_peers(self.as_ref(), peers.into_iter().map(|host| test_node(host.as_str())).collect()).await;
+    }
+
+    async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>) {
+        InProcessDaemon::set_peer_host_summaries(
+            self.as_ref(),
+            summaries
+                .into_iter()
+                .map(|(host, mut summary)| {
+                    summary.node = test_node(host.as_str());
+                    (summary.node.node_id.clone(), summary)
+                })
+                .collect(),
+        )
+        .await;
+    }
+
+    async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState) {
+        InProcessDaemon::publish_peer_connection_status(self.as_ref(), &test_node(host.as_str()), status).await;
+    }
+
+    async fn publish_peer_summary(&self, host: &HostName, mut summary: HostSummary) {
+        summary.node = test_node(host.as_str());
+        InProcessDaemon::publish_peer_summary(self.as_ref(), summary).await;
+    }
+
+    async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>, overlay_version: u64) {
+        InProcessDaemon::set_peer_providers(
+            self.as_ref(),
+            repo_path,
+            peers.into_iter().map(|(host, data)| (test_node(host.as_str()), data)).collect(),
+            overlay_version,
+        )
+        .await;
+    }
+
+    async fn add_virtual_repo(
+        &self,
+        identity: RepoIdentity,
+        synthetic_path: PathBuf,
+        peers: Vec<(HostName, ProviderData)>,
+        overlay_version: u64,
+    ) -> Result<(), String> {
+        InProcessDaemon::add_virtual_repo(
+            self.as_ref(),
+            identity,
+            synthetic_path,
+            peers.into_iter().map(|(host, data)| (test_node(host.as_str()), data)).collect(),
+            overlay_version,
+        )
+        .await
     }
 }
 
@@ -733,7 +816,7 @@ display_name = "Build Box"
     )
     .await;
 
-    let status = daemon.get_host_status_internal(daemon.host_name().as_str()).await.expect("host status");
+    let status = daemon.get_host_status_internal(daemon.node_id().as_str()).await.expect("host status");
     let visible = status
         .visible_environments
         .iter()
@@ -1247,9 +1330,9 @@ async fn list_hosts_includes_local_and_configured_disconnected_peers() {
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
 
-    assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
+    assert!(hosts.hosts.iter().any(|entry| entry.node.node_id == daemon.node_id().clone() && entry.is_local));
     assert!(hosts.hosts.iter().any(|entry| {
-        entry.host == HostName::new("remote")
+        entry.node == test_node("remote")
             && entry.configured
             && !entry.has_summary
             && entry.connection_status == PeerConnectionState::Disconnected
@@ -1262,12 +1345,16 @@ async fn get_host_providers_returns_local_summary_and_errors_for_unknown_remote_
 
     daemon.set_configured_peer_names(vec![HostName::new("remote")]).await;
 
-    let local_host = daemon.host_name().to_string();
+    let local_host = daemon.node_id().to_string();
     let local = daemon.get_host_providers_internal(&local_host).await.expect("local host providers should resolve");
-    assert_eq!(local.host, *daemon.host_name());
-    assert_eq!(local.summary.host_name, *daemon.host_name());
+    assert_eq!(local.node.node_id, daemon.node_id().clone());
+    assert_eq!(local.node.display_name, daemon.host_name().as_str());
+    assert_eq!(summary_host(&local.summary), *daemon.host_name());
 
-    let err = daemon.get_host_providers_internal("remote").await.expect_err("remote host without summary should error");
+    let err = daemon
+        .get_host_providers_internal(test_node("remote").node_id.as_str())
+        .await
+        .expect_err("remote host without summary should error");
     assert!(err.contains("summary"), "unexpected error: {err}");
 }
 
@@ -1320,8 +1407,8 @@ async fn local_host_queries_include_visible_environments_without_changing_summar
         )
         .expect("register provisioned environment");
 
-    let status = daemon.get_host_status_internal(daemon.host_name().as_str()).await.expect("host status");
-    let providers = daemon.get_host_providers_internal(daemon.host_name().as_str()).await.expect("host providers");
+    let status = daemon.get_host_status_internal(daemon.node_id().as_str()).await.expect("host status");
+    let providers = daemon.get_host_providers_internal(daemon.node_id().as_str()).await.expect("host providers");
 
     let status_ids: Vec<_> = status
         .visible_environments
@@ -1379,11 +1466,11 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
     daemon.set_peer_host_summaries(HashMap::from([(HostName::new("remote"), sample_remote_host_summary("remote"))])).await;
     daemon
         .set_topology_routes(vec![TopologyRoute {
-            target: HostName::new("remote"),
-            next_hop: HostName::new("relay"),
+            target: test_node("remote"),
+            next_hop: test_node("relay"),
             direct: false,
             connected: true,
-            fallbacks: vec![HostName::new("backup-relay")],
+            fallbacks: vec![test_node("backup-relay")],
         }])
         .await;
 
@@ -1400,18 +1487,18 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
         host_name: None,
         environment_id: None,
     });
-    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("remote"), status: PeerConnectionState::Connected });
+    daemon.send_event(DaemonEvent::PeerStatusChanged { node_id: test_node("remote").node_id, status: PeerConnectionState::Connected });
     daemon.set_peer_providers(&repo, vec![(HostName::new("remote"), peer_data)], 0).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    let remote = hosts.hosts.iter().find(|entry| entry.host == HostName::new("remote")).expect("remote host entry");
+    let remote = hosts.hosts.iter().find(|entry| entry.node == test_node("remote")).expect("remote host entry");
     assert_eq!(remote.repo_count, 1);
     assert!(remote.work_item_count >= 1, "remote overlay should contribute work items");
 
     let topology = daemon.get_topology().await.expect("topology");
     assert_eq!(topology.routes.len(), 1);
-    assert_eq!(topology.routes[0].target, HostName::new("remote"));
-    assert_eq!(topology.routes[0].next_hop, HostName::new("relay"));
+    assert_eq!(topology.routes[0].target, test_node("remote"));
+    assert_eq!(topology.routes[0].next_hop, test_node("relay"));
 }
 
 #[tokio::test]
@@ -1422,8 +1509,8 @@ async fn get_topology_includes_configured_but_disconnected_peers() {
     daemon.set_configured_peer_names(vec![HostName::new("connected"), HostName::new("unreachable")]).await;
     daemon
         .set_topology_routes(vec![TopologyRoute {
-            target: HostName::new("connected"),
-            next_hop: HostName::new("connected"),
+            target: test_node("connected"),
+            next_hop: test_node("connected"),
             direct: true,
             connected: true,
             fallbacks: vec![],
@@ -1435,11 +1522,11 @@ async fn get_topology_includes_configured_but_disconnected_peers() {
     // Should have entries for both peers
     assert_eq!(topology.routes.len(), 2, "should include both connected and disconnected peers");
 
-    let connected = topology.routes.iter().find(|r| r.target == HostName::new("connected")).expect("connected peer");
+    let connected = topology.routes.iter().find(|r| r.target == test_node("connected")).expect("connected peer");
     assert!(connected.connected);
     assert!(connected.direct);
 
-    let unreachable = topology.routes.iter().find(|r| r.target == HostName::new("unreachable")).expect("unreachable peer");
+    let unreachable = topology.routes.iter().find(|r| r.target == test_node("unreachable")).expect("unreachable peer");
     assert!(!unreachable.connected, "configured-but-never-connected peer should show as disconnected");
     assert!(unreachable.direct, "disconnected peer should show as direct (no relay known)");
     assert!(unreachable.fallbacks.is_empty());
@@ -1671,7 +1758,7 @@ async fn execute_broadcasts_lifecycle_events() {
     // "session not found" — no external API calls, deterministic.
     // We only care about the lifecycle events, not the command result.
     let command = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Identity(identity.clone())),
         action: CommandAction::ArchiveSession { session_id: "nonexistent-session".into() },
@@ -1689,15 +1776,15 @@ async fn execute_broadcasts_lifecycle_events() {
     let result = tokio::time::timeout(timeout, async {
         while !got_started || !got_finished {
             match rx.recv().await {
-                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo_identity, repo: ref event_repo, .. }) => {
-                    assert_eq!(host, HostName::local(), "CommandStarted host should default to local host");
+                Ok(DaemonEvent::CommandStarted { command_id: id, node_id, repo_identity, repo: ref event_repo, .. }) => {
+                    assert_eq!(node_id, *daemon.node_id(), "CommandStarted node should default to local node");
                     assert_eq!(repo_identity, identity, "CommandStarted repo identity should match executed repo");
                     assert_eq!(event_repo.as_deref(), Some(repo.as_path()), "CommandStarted repo should match executed repo");
                     started_id = Some(id);
                     got_started = true;
                 }
-                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo_identity, repo: ref event_repo, .. }) => {
-                    assert_eq!(host, HostName::local(), "CommandFinished host should default to local host");
+                Ok(DaemonEvent::CommandFinished { command_id: id, node_id, repo_identity, repo: ref event_repo, .. }) => {
+                    assert_eq!(node_id, *daemon.node_id(), "CommandFinished node should default to local node");
                     assert_eq!(repo_identity, identity, "CommandFinished repo identity should match executed repo");
                     assert_eq!(event_repo.as_deref(), Some(repo.as_path()), "CommandFinished repo should match executed repo");
                     finished_id = Some(id);
@@ -1725,7 +1812,7 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
     let mut rx = daemon.subscribe();
 
     let command = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Identity(identity.clone())),
         action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
@@ -1775,7 +1862,7 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
     }
 
     let command = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Path(repo.clone())),
         action: CommandAction::ArchiveSession { session_id: "sess-1".into() },
@@ -1826,7 +1913,7 @@ async fn generate_branch_name_can_be_cancelled_while_provider_call_is_in_flight(
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh should succeed");
 
     let command = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Path(repo.clone())),
         action: CommandAction::GenerateBranchName { issue_keys: vec!["42".into()] },
@@ -1944,7 +2031,7 @@ async fn replay_since_returns_no_host_event_when_host_cursor_is_current() {
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     daemon.set_configured_peer_names(vec![HostName::new("alpha")]).await;
-    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Connected });
+    daemon.send_event(DaemonEvent::PeerStatusChanged { node_id: test_node("alpha").node_id, status: PeerConnectionState::Connected });
     daemon.set_peer_host_summaries(HashMap::from([(HostName::new("alpha"), sample_remote_host_summary("alpha"))])).await;
 
     let events = daemon.replay_since(&HashMap::new()).await.expect("initial host replay");
@@ -1952,18 +2039,18 @@ async fn replay_since_returns_no_host_event_when_host_cursor_is_current() {
     let local_seq = events
         .iter()
         .find_map(|event| match event {
-            DaemonEvent::HostSnapshot(snap) if snap.host_name == local_host => Some(snap.seq),
+            DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == local_host => Some(snap.seq),
             _ => None,
         })
         .expect("initial replay should include local host snapshot");
 
     let events = daemon
-        .replay_since(&HashMap::from([(StreamKey::Host { host_name: local_host.clone() }, local_seq)]))
+        .replay_since(&HashMap::from([(StreamKey::Host { node_id: daemon.node_id().clone() }, local_seq)]))
         .await
         .expect("host replay with current cursor");
 
     assert!(
-        !events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == local_host)),
+        !events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == local_host)),
         "current host cursor should suppress replay for that host"
     );
 }
@@ -1976,8 +2063,8 @@ async fn replay_since_returns_only_stale_host_snapshots() {
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     daemon.set_configured_peer_names(vec![HostName::new("alpha"), HostName::new("beta")]).await;
-    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Connected });
-    daemon.send_event(DaemonEvent::PeerStatusChanged { host: HostName::new("beta"), status: PeerConnectionState::Disconnected });
+    daemon.send_event(DaemonEvent::PeerStatusChanged { node_id: test_node("alpha").node_id, status: PeerConnectionState::Connected });
+    daemon.send_event(DaemonEvent::PeerStatusChanged { node_id: test_node("beta").node_id, status: PeerConnectionState::Disconnected });
     daemon
         .set_peer_host_summaries(HashMap::from([
             (HostName::new("alpha"), sample_remote_host_summary("alpha")),
@@ -1989,7 +2076,7 @@ async fn replay_since_returns_only_stale_host_snapshots() {
     let mut host_seqs = HashMap::new();
     for event in &events {
         if let DaemonEvent::HostSnapshot(snap) = event {
-            host_seqs.insert(snap.host_name.clone(), snap.seq);
+            host_seqs.insert(snapshot_host(snap), snap.seq);
         }
     }
 
@@ -1997,16 +2084,16 @@ async fn replay_since_returns_only_stale_host_snapshots() {
     let alpha = HostName::new("alpha");
     let beta = HostName::new("beta");
     let last_seen = HashMap::from([
-        (StreamKey::Host { host_name: local_host.clone() }, *host_seqs.get(&local_host).expect("local host seq")),
-        (StreamKey::Host { host_name: alpha.clone() }, *host_seqs.get(&alpha).expect("alpha seq")),
-        (StreamKey::Host { host_name: beta.clone() }, 0),
+        (StreamKey::Host { node_id: daemon.node_id().clone() }, *host_seqs.get(&local_host).expect("local host seq")),
+        (StreamKey::Host { node_id: test_node("alpha").node_id }, *host_seqs.get(&alpha).expect("alpha seq")),
+        (StreamKey::Host { node_id: test_node("beta").node_id }, 0),
     ]);
 
     let events = daemon.replay_since(&last_seen).await.expect("host replay with mixed cursors");
     let replayed_hosts: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            DaemonEvent::HostSnapshot(snap) => Some(snap.host_name.clone()),
+            DaemonEvent::HostSnapshot(snap) => Some(snapshot_host(snap)),
             _ => None,
         })
         .collect();
@@ -2022,13 +2109,16 @@ async fn replay_since_includes_non_config_backed_known_hosts() {
     let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let peer_host = HostName::new("inbound-only");
-    daemon.send_event(DaemonEvent::PeerStatusChanged { host: peer_host.clone(), status: PeerConnectionState::Connected });
+    daemon.send_event(DaemonEvent::PeerStatusChanged {
+        node_id: test_node(peer_host.as_str()).node_id,
+        status: PeerConnectionState::Connected,
+    });
     daemon.set_peer_host_summaries(HashMap::from([(peer_host.clone(), sample_remote_host_summary("inbound-only"))])).await;
 
     let events = daemon.replay_since(&HashMap::new()).await.expect("host replay");
 
     assert!(
-        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host)),
+        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == peer_host)),
         "known non-config-backed hosts should still replay"
     );
 }
@@ -2043,7 +2133,7 @@ async fn publish_peer_summary_normalizes_host_name() {
     let peer_host = HostName::new("remote-host");
     daemon
         .publish_peer_summary(&peer_host, HostSummary {
-            host_name: HostName::new("spoofed-host"),
+            node: test_node("spoofed-host"),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
             providers: vec![],
@@ -2055,12 +2145,12 @@ async fn publish_peer_summary_normalizes_host_name() {
     let snapshot = replay
         .iter()
         .find_map(|event| match event {
-            DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host => Some(snap),
+            DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == peer_host => Some(snap),
             _ => None,
         })
         .expect("remote host snapshot");
-    assert_eq!(snapshot.host_name, peer_host);
-    assert_eq!(snapshot.summary.host_name, peer_host);
+    assert_eq!(snapshot_host(snapshot), peer_host);
+    assert_eq!(summary_host(&snapshot.summary), peer_host);
 }
 
 #[tokio::test]
@@ -2090,14 +2180,14 @@ async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
     let host_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match rx.recv().await.expect("recv") {
-                DaemonEvent::HostSnapshot(snap) if snap.host_name == overlay_host => return snap,
+                DaemonEvent::HostSnapshot(snap) if snapshot_host(&snap) == overlay_host => return snap,
                 _ => continue,
             }
         }
     })
     .await
     .expect("timeout waiting for overlay host snapshot");
-    assert_eq!(host_event.host_name, overlay_host);
+    assert_eq!(snapshot_host(&host_event), overlay_host);
 }
 
 #[tokio::test]
@@ -2127,7 +2217,7 @@ async fn replay_since_includes_overlay_only_hosts() {
 
     let events = daemon.replay_since(&HashMap::new()).await.expect("host replay");
     assert!(
-        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == overlay_host)),
+        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == overlay_host)),
         "hosts known only through remote overlay data should replay"
     );
 }
@@ -2160,7 +2250,10 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
     let _ = recv_event(&mut rx).await;
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
-    assert!(hosts.hosts.iter().any(|entry| entry.host == transient_host), "transient host should be visible while backed by state");
+    assert!(
+        hosts.hosts.iter().any(|entry| entry.node == test_node(transient_host.as_str())),
+        "transient host should be visible while backed by state"
+    );
 
     daemon.publish_peer_connection_status(&transient_host, PeerConnectionState::Disconnected).await;
     daemon.set_peer_host_summaries(HashMap::new()).await;
@@ -2168,7 +2261,7 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
     let removed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match rx.recv().await.expect("recv") {
-                DaemonEvent::HostRemoved { host, seq } if host == transient_host => return seq,
+                DaemonEvent::HostRemoved { node_id, seq } if node_id == test_node(transient_host.as_str()).node_id => return seq,
                 _ => continue,
             }
         }
@@ -2179,13 +2272,13 @@ async fn list_hosts_and_replay_drop_stale_non_configured_hosts() {
 
     let hosts = daemon.list_hosts_internal().await.expect("list hosts");
     assert!(
-        !hosts.hosts.iter().any(|entry| entry.host == transient_host),
+        !hosts.hosts.iter().any(|entry| entry.node == test_node(transient_host.as_str())),
         "stale non-configured host should be pruned once summary, connection, and overlay data are gone"
     );
 
     let replay = daemon.replay_since(&HashMap::new()).await.expect("replay_since");
     assert!(
-        !replay.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == transient_host)),
+        !replay.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == transient_host)),
         "pruned hosts should not keep replaying"
     );
 }
@@ -2200,7 +2293,7 @@ async fn clearing_summary_for_visible_host_emits_host_snapshot() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match rx.recv().await.expect("recv") {
-                DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host => return snap,
+                DaemonEvent::HostSnapshot(snap) if snapshot_host(&snap) == peer_host => return snap,
                 _ => continue,
             }
         }
@@ -2212,7 +2305,7 @@ async fn clearing_summary_for_visible_host_emits_host_snapshot() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match rx.recv().await.expect("recv") {
-                DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host && !snap.summary.providers.is_empty() => return snap,
+                DaemonEvent::HostSnapshot(snap) if snapshot_host(&snap) == peer_host && !snap.summary.providers.is_empty() => return snap,
                 _ => continue,
             }
         }
@@ -2224,7 +2317,7 @@ async fn clearing_summary_for_visible_host_emits_host_snapshot() {
     let cleared = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             match rx.recv().await.expect("recv") {
-                DaemonEvent::HostSnapshot(snap) if snap.host_name == peer_host => return snap,
+                DaemonEvent::HostSnapshot(snap) if snapshot_host(&snap) == peer_host => return snap,
                 _ => continue,
             }
         }
@@ -2446,7 +2539,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 
     let add_id = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::TrackRepoPath { path: repo.clone() },
@@ -2487,7 +2580,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
 
     let remove_id = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::UntrackRepo { repo: RepoSelector::Query("new-repo".into()) },
@@ -2836,7 +2929,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
 
     let set_item =
         snapshot.work_items.iter().find(|item| item.attachable_set_id.as_ref() == Some(&set_id)).expect("attachable set work item");
-    assert_eq!(set_item.host, remote_host);
+    assert_eq!(set_item.node_id, test_node(remote_host.as_str()).node_id);
     assert_eq!(set_item.checkout.as_ref().and_then(|checkout| checkout.host_path()), Some(&remote_checkout));
     assert_eq!(set_item.workspace_refs, vec![workspace_ref]);
 }
@@ -2930,7 +3023,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
     assert_eq!(matching_items.len(), 1, "shared attachable identity should produce one correlated work item");
     let item = matching_items[0];
     assert_eq!(item.kind, WorkItemKind::Checkout, "checkout should remain the primary anchor when present");
-    assert_eq!(item.host, remote_host);
+    assert_eq!(item.node_id, test_node(remote_host.as_str()).node_id);
     assert_eq!(item.checkout.as_ref().and_then(|checkout| checkout.host_path()), Some(&remote_checkout));
     assert_eq!(item.workspace_refs, vec![workspace_ref]);
 }
@@ -2944,7 +3037,7 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
 
     let err = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
@@ -2975,7 +3068,7 @@ async fn untrack_missing_repo_returns_error_without_started_event() {
 
     let err = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) },
@@ -3010,7 +3103,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     let mut rx = daemon.subscribe();
 
     let refresh_id = daemon
-        .execute(Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
         .await
         .expect("refresh all should return an id");
 
@@ -3034,7 +3127,7 @@ async fn remove_checkout_command_accepts_selector_queries() {
     let (_temp, repo, daemon) = daemon_for_cwd().await;
     let err = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("does-not-exist".into()) },
@@ -3054,7 +3147,7 @@ async fn fetch_checkout_status_uses_context_repo_when_checkout_path_is_absent() 
     let mut rx = daemon.subscribe();
 
     let command = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Path(repo.clone())),
         action: CommandAction::FetchCheckoutStatus { branch: "main".into(), checkout_path: None, change_request_id: None },
@@ -3084,7 +3177,7 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
 
     let branch_id = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::Checkout {
@@ -3098,7 +3191,7 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
 
     let fresh_id = daemon
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::Checkout {
@@ -3858,7 +3951,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
 
     // --- Act: remove checkout ---
     let command = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: None,
         action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Path(host_path.path.clone()) },
@@ -3937,7 +4030,7 @@ async fn two_commands_can_run_concurrently() {
 
     // --- Act: start first command (blocks inside archive_session) ---
     let archive_cmd = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Path(repo.clone())),
         action: CommandAction::ArchiveSession { session_id: "sess-1".into() },
@@ -3963,7 +4056,7 @@ async fn two_commands_can_run_concurrently() {
     // --- Act: start second command while first is still blocking ---
     // GenerateBranchName with no AI utility completes immediately with a fallback result.
     let branch_cmd = Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Path(repo.clone())),
         action: CommandAction::GenerateBranchName { issue_keys: vec![] },

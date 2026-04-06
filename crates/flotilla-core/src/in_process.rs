@@ -16,9 +16,9 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::QualifiedPath, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName,
-    HostProvidersResponse, HostStatusResponse, HostSummary, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse,
-    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
-    TopologyRoute,
+    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
+    SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -32,7 +32,7 @@ use crate::{
     executor,
     executor::checkout::checkout_is_local_owned,
     host_identity::{
-        resolve_local_environment_state_dir, resolve_local_host_id, resolve_or_create_environment_id,
+        resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
     host_registry::HostCounts,
@@ -315,7 +315,7 @@ fn merge_provider_errors(merged: &mut Vec<crate::data::RefreshError>, next: &[cr
 fn build_repo_snapshot_with_peers(
     ctx: SnapshotBuildContext<'_>,
     seq: u64,
-    peer_overlay: Option<&[(HostName, ProviderData)]>,
+    peer_overlay: Option<&[(NodeInfo, ProviderData)]>,
 ) -> RepoSnapshot {
     let SnapshotBuildContext {
         repo_identity,
@@ -324,6 +324,7 @@ fn build_repo_snapshot_with_peers(
         errors,
         provider_health,
         host_name,
+        node_id,
         environment_manager,
         environment_id,
     } = ctx;
@@ -331,8 +332,8 @@ fn build_repo_snapshot_with_peers(
 
     // Merge peer provider data if any
     let providers = if let Some(peers) = peer_overlay {
-        let peer_refs: Vec<(HostName, &ProviderData)> = peers.iter().map(|(h, d)| (h.clone(), d)).collect();
-        Arc::new(crate::merge::merge_provider_data(&local_providers, host_name, &peer_refs))
+        let peer_refs: Vec<(NodeInfo, &ProviderData)> = peers.iter().map(|(node, data)| (node.clone(), data)).collect();
+        Arc::new(crate::merge::merge_provider_data(&local_providers, host_name, node_id, &peer_refs))
     } else {
         Arc::new(local_providers)
     };
@@ -340,7 +341,7 @@ fn build_repo_snapshot_with_peers(
     let (work_items, correlation_groups) = crate::data::correlate(&providers);
     let re_snapshot =
         RefreshSnapshot { providers, work_items, correlation_groups, errors: errors.to_vec(), provider_health: provider_health.clone() };
-    snapshot_to_proto(repo_identity, path, seq, &re_snapshot, host_name)
+    snapshot_to_proto(repo_identity, path, seq, &re_snapshot, node_id, host_name, peer_overlay.unwrap_or(&[]))
 }
 
 /// Choose whether to broadcast a full snapshot or a delta.
@@ -412,6 +413,7 @@ pub struct InProcessDaemon {
     event_tx: broadcast::Sender<DaemonEvent>,
     config: Arc<ConfigStore>,
     next_command_id: AtomicU64,
+    node_id: NodeId,
     host_name: HostName,
     /// When true, only local providers (VCS, checkout manager, workspace
     /// manager, terminal pool) are registered. External providers (code
@@ -421,7 +423,7 @@ pub struct InProcessDaemon {
     /// Peer provider data overlay, keyed by repo identity.
     /// Set by the DaemonServer when peer snapshots arrive. Merged into
     /// the local snapshot during broadcast.
-    peer_providers: RwLock<HashMap<flotilla_protocol::RepoIdentity, Vec<(HostName, ProviderData)>>>,
+    peer_providers: RwLock<HashMap<flotilla_protocol::RepoIdentity, Vec<(NodeInfo, ProviderData)>>>,
     /// Last applied overlay version per repo. `set_peer_providers` rejects
     /// applies whose version is older than the stored value, preventing stale
     /// data from overwriting fresher writes.
@@ -464,6 +466,8 @@ impl InProcessDaemon {
         let mut path_identities = HashMap::new();
 
         let local_environment_state_dir = resolve_local_environment_state_dir(config.state_dir().as_path(), &*discovery.runner).await;
+        let local_node_id =
+            resolve_local_node_id(config.state_dir().as_path(), &*discovery.runner).await.expect("failed to resolve local node id");
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id =
@@ -516,6 +520,7 @@ impl InProcessDaemon {
         }
 
         let local_host_summary = crate::host_summary::build_local_host_summary(
+            &local_node_id,
             &host_name,
             &environment_manager,
             crate::host_summary::provider_statuses_from_registries(
@@ -531,12 +536,16 @@ impl InProcessDaemon {
             event_tx,
             config,
             next_command_id: AtomicU64::new(1),
+            node_id: local_node_id.clone(),
             host_name: host_name.clone(),
             follower,
             peer_providers: RwLock::new(HashMap::new()),
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
-            host_registry: crate::host_registry::HostRegistry::new(host_name.clone(), local_host_summary),
+            host_registry: crate::host_registry::HostRegistry::new(
+                NodeInfo::new(local_node_id.clone(), host_name.to_string()),
+                local_host_summary,
+            ),
             local_environment_id,
             environment_manager,
             discovery,
@@ -567,6 +576,10 @@ impl InProcessDaemon {
     /// Returns the host name for this daemon.
     pub fn host_name(&self) -> &HostName {
         &self.host_name
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
     }
 
     /// Returns the session ID for this daemon instance.
@@ -659,20 +672,20 @@ impl InProcessDaemon {
     }
 
     /// Returns the current connection status for a peer host.
-    pub async fn peer_connection_status(&self, host: &HostName) -> PeerConnectionState {
-        self.host_registry.peer_connection_status(host).await
+    pub async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
+        self.host_registry.peer_connection_status(node_id).await
     }
 
-    pub async fn set_configured_peer_names(&self, peers: Vec<HostName>) {
+    pub async fn set_configured_peers(&self, peers: Vec<NodeInfo>) {
         let remote_counts = self.remote_host_counts().await;
         self.host_registry
-            .set_configured_peer_names(peers, &remote_counts, &|e| {
+            .set_configured_peers(peers, &remote_counts, &|e| {
                 let _ = self.event_tx.send(e);
             })
             .await;
     }
 
-    pub async fn set_peer_host_summaries(&self, summaries: HashMap<HostName, HostSummary>) {
+    pub async fn set_peer_host_summaries(&self, summaries: HashMap<NodeId, HostSummary>) {
         let remote_counts = self.remote_host_counts().await;
         self.host_registry
             .set_peer_host_summaries(summaries, &remote_counts, &|e| {
@@ -681,18 +694,18 @@ impl InProcessDaemon {
             .await;
     }
 
-    pub async fn publish_peer_connection_status(&self, host: &HostName, status: PeerConnectionState) {
+    pub async fn publish_peer_connection_status(&self, node: &NodeInfo, status: PeerConnectionState) {
         let remote_counts = self.remote_host_counts().await;
         self.host_registry
-            .publish_peer_connection_status(host, status, &remote_counts, &|e| {
+            .publish_peer_connection_status(node, status, &remote_counts, &|e| {
                 let _ = self.event_tx.send(e);
             })
             .await;
     }
 
-    pub async fn publish_peer_summary(&self, host: &HostName, summary: HostSummary) {
+    pub async fn publish_peer_summary(&self, summary: HostSummary) {
         self.host_registry
-            .publish_peer_summary(host, summary, &|e| {
+            .publish_peer_summary(summary, &|e| {
                 let _ = self.event_tx.send(e);
             })
             .await;
@@ -721,13 +734,13 @@ impl InProcessDaemon {
         counts
     }
 
-    async fn remote_host_counts(&self) -> HashMap<HostName, HostCounts> {
+    async fn remote_host_counts(&self) -> HashMap<NodeId, HostCounts> {
         let peer_providers = self.peer_providers.read().await;
-        let mut counts: HashMap<HostName, HostCounts> = HashMap::new();
+        let mut counts: HashMap<NodeId, HostCounts> = HashMap::new();
 
         for peers in peer_providers.values() {
-            for (host, providers) in peers {
-                let entry = counts.entry(host.clone()).or_default();
+            for (node, providers) in peers {
+                let entry = counts.entry(node.node_id.clone()).or_default();
                 entry.repo_count += 1;
                 entry.work_item_count += crate::data::correlate(providers).0.len();
             }
@@ -814,7 +827,7 @@ impl InProcessDaemon {
                 &snapshot.providers
             } else {
                 snapshot_owned = build_repo_snapshot_with_peers(
-                    state.snapshot_context(&self.host_name, &self.environment_manager),
+                    state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                     state.seq(),
                     peer_providers.get(state.identity()).map(|peers| peers.as_slice()),
                 );
@@ -849,9 +862,7 @@ impl InProcessDaemon {
 
         match &command.action {
             CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await,
-            CommandAction::RemoveCheckout { checkout, .. } => {
-                self.resolve_checkout_selector(checkout, command.host.as_ref()).await.map(|(repo, _)| repo)
-            }
+            CommandAction::RemoveCheckout { checkout, .. } => self.resolve_checkout_selector(checkout, None).await.map(|(repo, _)| repo),
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
             CommandAction::FetchCheckoutStatus { .. }
             | CommandAction::OpenChangeRequest { .. }
@@ -901,10 +912,11 @@ impl InProcessDaemon {
     ///
     /// Called by the DaemonServer when PeerManager receives updated peer data.
     /// The peer data is merged into the local snapshot during the next broadcast.
-    pub async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(HostName, ProviderData)>, overlay_version: u64) {
+    pub async fn set_peer_providers(&self, repo_path: &Path, peers: Vec<(NodeInfo, ProviderData)>, overlay_version: u64) {
         let Some(identity) = self.tracked_repo_identity_for_path(repo_path).await else {
             return;
         };
+        let peer_nodes: Vec<NodeInfo> = peers.iter().map(|(node, _)| node.clone()).collect();
         {
             let mut versions = self.peer_overlay_versions.write().await;
             let stored = versions.entry(identity.clone()).or_insert(0);
@@ -921,6 +933,22 @@ impl InProcessDaemon {
                 pp.insert(identity.clone(), peers);
             }
         }
+        for node in &peer_nodes {
+            self.host_registry
+                .publish_peer_summary(
+                    HostSummary {
+                        node: node.clone(),
+                        system: SystemInfo::default(),
+                        inventory: ToolInventory::default(),
+                        providers: vec![],
+                        environments: vec![],
+                    },
+                    &|e| {
+                        let _ = self.event_tx.send(e);
+                    },
+                )
+                .await;
+        }
         let remote_counts = self.remote_host_counts().await;
         self.host_registry
             .sync_host_membership(&remote_counts, &|e| {
@@ -932,7 +960,7 @@ impl InProcessDaemon {
 
     /// Test accessor: return the current peer providers for a given repo identity.
     #[cfg(feature = "test-support")]
-    pub async fn peer_providers_for_test(&self, identity: &flotilla_protocol::RepoIdentity) -> Vec<(HostName, ProviderData)> {
+    pub async fn peer_providers_for_test(&self, identity: &flotilla_protocol::RepoIdentity) -> Vec<(NodeInfo, ProviderData)> {
         self.peer_providers.read().await.get(identity).cloned().unwrap_or_default()
     }
 
@@ -1009,8 +1037,8 @@ impl InProcessDaemon {
             let last_local_providers = local_providers.clone();
             // Merge peer provider data if any
             let providers = if let Some(peers) = peer_overlay.get(&identity) {
-                let peer_refs: Vec<(HostName, &ProviderData)> = peers.iter().map(|(h, d)| (h.clone(), d)).collect();
-                Arc::new(crate::merge::merge_provider_data(&local_providers, &self.host_name, &peer_refs))
+                let peer_refs: Vec<(NodeInfo, &ProviderData)> = peers.iter().map(|(node, data)| (node.clone(), data)).collect();
+                Arc::new(crate::merge::merge_provider_data(&local_providers, &self.host_name, &self.node_id, &peer_refs))
             } else {
                 Arc::new(local_providers)
             };
@@ -1032,8 +1060,15 @@ impl InProcessDaemon {
             state.preferred_root_mut().model.data.provider_health = re_snapshot.provider_health.clone();
             state.preferred_root_mut().model.data.loading = false;
 
-            let mut proto_snapshot =
-                snapshot_to_proto(state.identity().clone(), state.preferred_path(), state.seq() + 1, &re_snapshot, &self.host_name);
+            let mut proto_snapshot = snapshot_to_proto(
+                state.identity().clone(),
+                state.preferred_path(),
+                state.seq() + 1,
+                &re_snapshot,
+                &self.node_id,
+                &self.host_name,
+                peer_overlay.get(&identity).map(Vec::as_slice).unwrap_or(&[]),
+            );
             proto_snapshot.provider_health = crate::convert::health_to_proto(&state.preferred_root().model.data.provider_health);
 
             // Compute and log delta (also advances seq)
@@ -1144,7 +1179,7 @@ impl InProcessDaemon {
         &self,
         identity: flotilla_protocol::RepoIdentity,
         synthetic_path: PathBuf,
-        peers: Vec<(HostName, ProviderData)>,
+        peers: Vec<(NodeInfo, ProviderData)>,
         overlay_version: u64,
     ) -> Result<(), String> {
         // Check if already tracked
@@ -1223,7 +1258,7 @@ impl InProcessDaemon {
         };
 
         let proto_snapshot = build_repo_snapshot_with_peers(
-            state.snapshot_context(&self.host_name, &self.environment_manager),
+            state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
             state.seq() + 1,
             peer_overlay.as_deref(),
         );
@@ -1477,7 +1512,7 @@ impl InProcessDaemon {
         let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name, &self.environment_manager),
+                state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             )),
@@ -1501,7 +1536,7 @@ impl InProcessDaemon {
         let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name, &self.environment_manager),
+                state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             )),
@@ -1549,7 +1584,7 @@ impl InProcessDaemon {
         let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
             Some(s) => std::borrow::Cow::Borrowed(s),
             None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name, &self.environment_manager),
+                state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             )),
@@ -1573,7 +1608,7 @@ impl InProcessDaemon {
         let local_counts = self.local_host_counts().await;
         let remote_counts = self.remote_host_counts().await;
         let mut response = self.host_registry.get_host_status(host, local_counts, &remote_counts).await?;
-        if host == self.host_name.as_str() {
+        if host == self.host_name.as_str() || host == self.node_id.as_str() {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)
@@ -1583,7 +1618,7 @@ impl InProcessDaemon {
         let _ = self.refresh_local_host_summary().await;
         let remote_counts = self.remote_host_counts().await;
         let mut response = self.host_registry.get_host_providers(host, &remote_counts).await?;
-        if host == self.host_name.as_str() {
+        if host == self.host_name.as_str() || host == self.node_id.as_str() {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)
@@ -1591,6 +1626,7 @@ impl InProcessDaemon {
 
     async fn refresh_local_host_summary(&self) -> HostSummary {
         let summary = crate::host_summary::build_local_host_summary(
+            &self.node_id,
             &self.host_name,
             &self.environment_manager,
             crate::host_summary::provider_statuses_from_registries(
@@ -1654,11 +1690,12 @@ impl InProcessDaemon {
             config_base,
             attachable_store,
             daemon_socket_path,
+            local_node_id: self.node_id.clone(),
             local_host: self.host_name.clone(),
             environment_manager: Arc::clone(&self.environment_manager),
         };
 
-        let result = execute_local_remote_step_batch(self.host_name.clone(), request, progress_sink, cancel, &resolver).await;
+        let result = execute_local_remote_step_batch(self.node_id.clone(), request, progress_sink, cancel, &resolver).await;
         refresh_trigger.notify_one();
         result
     }
@@ -1669,13 +1706,13 @@ impl InProcessDaemon {
         remote_executor: Arc<dyn RemoteStepExecutor>,
         allow_remote_host: bool,
     ) -> Result<u64, String> {
-        let command_host = command.host.clone().unwrap_or_else(|| self.host_name.clone());
+        let command_node_id = command.node_id.clone().unwrap_or_else(|| self.node_id.clone());
         debug!(
-            %command_host, local_host = %self.host_name, %allow_remote_host,
+            %command_node_id, local_node = %self.node_id, %allow_remote_host,
             desc = %command.description(), "execute_impl"
         );
-        if !allow_remote_host && command_host != self.host_name {
-            return Err(format!("remote command routing not implemented yet for host {command_host}"));
+        if !allow_remote_host && command_node_id != self.node_id {
+            return Err(format!("remote command routing not implemented yet for node {command_node_id}"));
         }
 
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
@@ -1686,7 +1723,7 @@ impl InProcessDaemon {
             let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
                 repo: None,
                 description: command.description().to_string(),
@@ -1694,7 +1731,7 @@ impl InProcessDaemon {
             let result = flotilla_protocol::CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
                 repo: None,
                 result,
@@ -1716,7 +1753,7 @@ impl InProcessDaemon {
             let description = command.description().to_string();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: Some(repo_path.clone()),
                 description,
@@ -1736,7 +1773,7 @@ impl InProcessDaemon {
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity,
                 repo: Some(repo_path),
                 result,
@@ -1750,7 +1787,7 @@ impl InProcessDaemon {
             let repo_identity = self.detect_repo_identity(path).await;
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: Some(repo_path.clone()),
                 description,
@@ -1761,7 +1798,7 @@ impl InProcessDaemon {
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
                 repo: Some(repo_path),
                 result,
@@ -1776,7 +1813,7 @@ impl InProcessDaemon {
                 self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: Some(repo_path.clone()),
                 description,
@@ -1787,7 +1824,7 @@ impl InProcessDaemon {
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity,
                 repo: Some(repo_path),
                 result,
@@ -1802,7 +1839,7 @@ impl InProcessDaemon {
                 self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
                 repo: Some(repo_path.clone()),
                 description,
@@ -1813,7 +1850,7 @@ impl InProcessDaemon {
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
-                host: self.host_name.clone(),
+                node_id: self.node_id.clone(),
                 repo_identity,
                 repo: Some(repo_path),
                 result,
@@ -1837,7 +1874,7 @@ impl InProcessDaemon {
             } else {
                 Arc::new(
                     build_repo_snapshot_with_peers(
-                        state.snapshot_context(&self.host_name, &self.environment_manager),
+                        state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                         state.seq(),
                         peer_overlay.get(&identity).map(|peers| peers.as_slice()),
                     )
@@ -1860,13 +1897,14 @@ impl InProcessDaemon {
 
         let _ = self.event_tx.send(DaemonEvent::CommandStarted {
             command_id: id,
-            host: command_host.clone(),
+            node_id: command_node_id.clone(),
             repo_identity: repo_identity.clone(),
             repo: Some(repo_path.clone()),
             description,
         });
 
         let local_host = self.host_name.clone();
+        let local_node_id = self.node_id.clone();
         let attachable_store = self.discovery.shared_attachable_store(&self.config);
         let daemon_socket_path = self.daemon_socket_path.read().await.clone();
         let environment_manager = Arc::clone(&self.environment_manager);
@@ -1890,6 +1928,7 @@ impl InProcessDaemon {
                 config_base,
                 attachable_store,
                 daemon_socket_dhp.clone(),
+                local_node_id.clone(),
                 local_host,
             )
             .await;
@@ -1903,7 +1942,7 @@ impl InProcessDaemon {
                     refresh_trigger.notify_one();
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
-                        host: command_host.clone(),
+                        node_id: command_node_id.clone(),
                         repo_identity: repo_identity.clone(),
                         repo: Some(repo_path),
                         result,
@@ -1919,13 +1958,14 @@ impl InProcessDaemon {
                         config_base: resolver_config_base,
                         attachable_store: resolver_attachable_store,
                         daemon_socket_path: daemon_socket_dhp.clone(),
+                        local_node_id: local_node_id.clone(),
                         local_host: resolver_local_host.clone(),
                         environment_manager: Arc::clone(&environment_manager),
                     };
                     let result = run_step_plan_with_remote_executor(
                         step_plan,
                         id,
-                        resolver_local_host,
+                        local_node_id,
                         repo_identity.clone(),
                         ExecutionEnvironmentPath::new(&repo_path),
                         token,
@@ -1939,7 +1979,7 @@ impl InProcessDaemon {
                     guard.remove(&id);
                     let _ = event_tx.send(DaemonEvent::CommandFinished {
                         command_id: id,
-                        host: command_host,
+                        node_id: command_node_id,
                         repo_identity,
                         repo: Some(repo_path),
                         result,
@@ -1953,7 +1993,7 @@ impl InProcessDaemon {
 }
 
 async fn execute_local_remote_step_batch(
-    local_host: HostName,
+    local_host: NodeId,
     request: RemoteStepBatchRequest,
     progress_sink: Arc<dyn RemoteStepProgressSink>,
     cancel: CancellationToken,
@@ -1963,8 +2003,8 @@ async fn execute_local_remote_step_batch(
     let step_count = request.steps.len();
 
     for (index, step) in request.steps.into_iter().enumerate() {
-        if *step.host.host_name() != local_host {
-            return Err(format!("remote step {} targets {:?}, expected remote host {}", index, step.host, local_host));
+        if step.host.node_id() != &local_host {
+            return Err(format!("remote step {} targets {:?}, expected remote node {}", index, step.host, local_host));
         }
         if cancel.is_cancelled() {
             return Err("cancelled".into());
@@ -2033,7 +2073,7 @@ impl DaemonHandle for InProcessDaemon {
         Ok(match state.cached_snapshot() {
             Some(s) => (**s).clone(),
             None => build_repo_snapshot_with_peers(
-                state.snapshot_context(&self.host_name, &self.environment_manager),
+                state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                 state.seq(),
                 peer_overlay.as_deref(),
             ),
@@ -2083,11 +2123,11 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::HostList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
-            CommandAction::QueryHostStatus { target_host } => match self.get_host_status_internal(target_host).await {
+            CommandAction::QueryHostStatus { target_node_id } => match self.get_host_status_internal(target_node_id.as_str()).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::HostStatus(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
-            CommandAction::QueryHostProviders { target_host } => match self.get_host_providers_internal(target_host).await {
+            CommandAction::QueryHostProviders { target_node_id } => match self.get_host_providers_internal(target_node_id.as_str()).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::HostProviders(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
@@ -2180,7 +2220,7 @@ impl DaemonHandle for InProcessDaemon {
             let snapshot: std::borrow::Cow<'_, RepoSnapshot> = match state.cached_snapshot() {
                 Some(s) => std::borrow::Cow::Borrowed(s),
                 None => std::borrow::Cow::Owned(build_repo_snapshot_with_peers(
-                    state.snapshot_context(&self.host_name, &self.environment_manager),
+                    state.snapshot_context(&self.node_id, &self.host_name, &self.environment_manager),
                     state.seq(),
                     peer_providers.get(identity).map(|v| v.as_slice()),
                 )),

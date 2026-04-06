@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use flotilla_protocol::{qualified_path::HostId, EnvironmentId};
+use flotilla_protocol::{qualified_path::HostId, EnvironmentId, NodeId};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -97,6 +97,13 @@ pub async fn resolve_local_host_id(base_state_dir: &Path, runner: &dyn CommandRu
     resolve_or_create_host_id(&state_dir)
 }
 
+/// Resolve or create a persisted local mesh node id in the machine-scoped
+/// local state directory.
+pub async fn resolve_local_node_id(base_state_dir: &Path, runner: &dyn CommandRunner) -> Result<NodeId, String> {
+    let state_dir = resolve_local_environment_state_dir(base_state_dir, runner).await;
+    resolve_or_create_node_id(&state_dir)
+}
+
 /// Resolve an existing `HostId` from `<state_dir>/host-id`, or generate and
 /// persist a new one atomically.
 ///
@@ -148,6 +155,53 @@ pub fn resolve_or_create_host_id(state_dir: &Path) -> Result<HostId, String> {
         return Err("host-id file exists but is empty".to_owned());
     }
     Ok(HostId::new(trimmed))
+}
+
+/// Resolve or create a persisted mesh node id in `<state_dir>/node-id`.
+pub fn resolve_or_create_node_id(state_dir: &Path) -> Result<NodeId, String> {
+    let target = state_dir.join("node-id");
+
+    if let Ok(content) = fs::read_to_string(&target) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Ok(NodeId::new(trimmed));
+        }
+    }
+
+    fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir {}: {e}", state_dir.display()))?;
+    let new_id = Uuid::new_v4().to_string();
+
+    for _ in 0..8 {
+        let temp = state_dir.join(format!(".node-id.{}", Uuid::new_v4()));
+        match fs::write(&temp, format!("{new_id}\n")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to write temp node-id: {e}")),
+        }
+
+        let link_result = fs::hard_link(&temp, &target);
+        let _ = fs::remove_file(&temp);
+
+        match link_result {
+            Ok(()) => return Ok(NodeId::new(new_id)),
+            Err(_) if target.exists() => {
+                let content = fs::read_to_string(&target).map_err(|e| format!("failed to read node-id after link race: {e}"))?;
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    return Err("node-id file exists but is empty".to_owned());
+                }
+                return Ok(NodeId::new(trimmed));
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let content = fs::read_to_string(&target).map_err(|e| format!("failed to read node-id after retries: {e}"))?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("node-id file exists but is empty".to_owned());
+    }
+    Ok(NodeId::new(trimmed))
 }
 
 /// Resolve an existing direct-environment id from `<state_dir>/environment-id`,

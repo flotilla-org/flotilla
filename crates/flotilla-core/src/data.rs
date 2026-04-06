@@ -661,14 +661,14 @@ pub fn group_work_items_split(
         }
     }
 
-    // Checkouts -- group by host, then main first within host, then proximity, then path
+    // Checkouts -- group by node, then main first within node, then proximity, then path
     checkout_items.sort_by_cached_key(|item| {
-        let host_name = item.host.to_string();
+        let node_id = item.node_id.to_string();
         let main_tier = u8::from(!item.is_main_checkout);
         let key = item.checkout_key();
         let proximity_tier = key.map(|p| checkout_sort_tier(&p.path, repo_root)).unwrap_or(1);
         let path_key = key.map(|p| p.path.to_path_buf());
-        (host_name, main_tier, proximity_tier, path_key)
+        (node_id, main_tier, proximity_tier, path_key)
     });
 
     // AttachableSets -- sorted by description

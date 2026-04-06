@@ -6,8 +6,8 @@
 use std::{collections::HashMap, path::Path};
 
 use flotilla_protocol::{
-    DiscoveryEntry, DiscoveryFact, HostName, HostProviderStatus, ProviderError, RepoIdentity, RepoSnapshot, ToolInventory,
-    UnmetRequirementInfo, WorkItem,
+    DiscoveryEntry, DiscoveryFact, HostName, HostProviderStatus, NodeId, NodeInfo, ProviderData, ProviderError, RepoIdentity, RepoSnapshot,
+    ToolInventory, UnmetRequirementInfo, WorkItem,
 };
 
 use crate::{
@@ -62,10 +62,17 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
     DiscoveryEntry { kind: kind.into(), detail }
 }
 
-pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[CorrelatedGroup], host_name: &HostName) -> WorkItem {
+pub fn correlation_result_to_work_item(
+    item: &CorrelationResult,
+    groups: &[CorrelatedGroup],
+    local_node_id: &NodeId,
+    display_to_node: &HashMap<String, NodeId>,
+    local_display_name: &HostName,
+) -> WorkItem {
     let kind = item.kind();
     let identity = item.identity();
-    let host = item.host(host_name);
+    let host = item.host(local_display_name);
+    let node_id = display_to_node.get(host.as_str()).cloned().unwrap_or_else(|| local_node_id.clone());
 
     let checkout = item.checkout().cloned();
 
@@ -74,7 +81,7 @@ pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[Corre
     WorkItem {
         kind,
         identity,
-        host,
+        node_id,
         branch: item.branch().map(|s| s.to_string()),
         description: item.description().to_string(),
         checkout,
@@ -203,17 +210,23 @@ pub fn snapshot_to_proto(
     repo: &Path,
     seq: u64,
     refresh: &RefreshSnapshot,
+    node_id: &NodeId,
     host_name: &HostName,
+    peer_overlay: &[(NodeInfo, ProviderData)],
 ) -> RepoSnapshot {
+    let mut display_to_node = HashMap::from([(host_name.to_string(), node_id.clone())]);
+    for (node, _) in peer_overlay {
+        display_to_node.insert(node.display_name.clone(), node.node_id.clone());
+    }
     RepoSnapshot {
         seq,
         repo_identity,
         repo: Some(repo.to_path_buf()),
-        host_name: host_name.clone(),
+        node_id: node_id.clone(),
         work_items: refresh
             .work_items
             .iter()
-            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups, host_name))
+            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups, node_id, &display_to_node, host_name))
             .collect(),
         providers: (*refresh.providers).clone(),
         provider_health: health_to_proto(&refresh.provider_health),
