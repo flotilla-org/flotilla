@@ -341,8 +341,8 @@ mod tests {
             RepoWorkResponse,
         },
         test_helpers::assert_json_roundtrip,
-        AttachableSetId, HostEnvironment, HostName, HostProviderStatus, HostSummary, PeerConnectionState, RepoIdentity, SystemInfo,
-        ToolInventory,
+        AttachableSetId, HostEnvironment, HostName, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity,
+        SystemInfo, ToolInventory,
     };
 
     fn repo_identity() -> RepoIdentity {
@@ -615,7 +615,7 @@ mod tests {
             })),
             CommandValue::HostList(Box::new(HostListResponse {
                 hosts: vec![HostListEntry {
-                    host: HostName::new("desktop"),
+                    node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                     is_local: true,
                     configured: true,
                     connection_status: PeerConnectionState::Connected,
@@ -625,12 +625,12 @@ mod tests {
                 }],
             })),
             CommandValue::HostStatus(Box::new(HostStatusResponse {
-                host: HostName::new("desktop"),
+                node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                 is_local: true,
                 configured: true,
                 connection_status: PeerConnectionState::Connected,
                 summary: Some(HostSummary {
-                    host_name: HostName::new("desktop"),
+                    node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                     system: SystemInfo {
                         home_dir: Some("/home/dev".into()),
                         os: Some("linux".into()),
@@ -653,12 +653,12 @@ mod tests {
                 work_item_count: 3,
             })),
             CommandValue::HostProviders(Box::new(HostProvidersResponse {
-                host: HostName::new("desktop"),
+                node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                 is_local: true,
                 configured: true,
                 connection_status: PeerConnectionState::Connected,
                 summary: HostSummary {
-                    host_name: HostName::new("desktop"),
+                    node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                     system: SystemInfo::default(),
                     inventory: ToolInventory::default(),
                     providers: vec![],

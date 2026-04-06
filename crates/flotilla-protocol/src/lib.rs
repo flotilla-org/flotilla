@@ -21,11 +21,20 @@ pub mod test_support;
 
 pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
 pub use host::{HostName, HostPath, RepoIdentity};
-pub use host_summary::{DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, SystemInfo, ToolInventory};
+pub use host_summary::{
+    DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,
+};
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
+
+/// Stable mesh identity for a daemon node.
+///
+/// This is the routing key for peer discovery, vector clocks, replay cursors,
+/// and event attribution. `HostName` remains only for display metadata and
+/// legacy execution/path contexts that are not mesh identity.
+pub type NodeId = qualified_path::HostId;
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -87,7 +96,7 @@ pub enum StreamKey {
     #[serde(rename = "repo")]
     Repo { identity: RepoIdentity },
     #[serde(rename = "host")]
-    Host { host_name: HostName },
+    Host { node_id: NodeId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +165,8 @@ pub enum Message {
     #[serde(rename = "hello")]
     Hello {
         protocol_version: u32,
-        host_name: HostName,
+        node_id: NodeId,
+        display_name: String,
         #[serde(default = "uuid::Uuid::nil")]
         session_id: uuid::Uuid,
         #[serde(default)]
@@ -202,7 +212,7 @@ pub enum DaemonEvent {
     #[serde(rename = "command_started")]
     CommandStarted {
         command_id: u64,
-        host: HostName,
+        node_id: NodeId,
         repo_identity: RepoIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<std::path::PathBuf>,
@@ -211,7 +221,7 @@ pub enum DaemonEvent {
     #[serde(rename = "command_finished")]
     CommandFinished {
         command_id: u64,
-        host: HostName,
+        node_id: NodeId,
         repo_identity: RepoIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<std::path::PathBuf>,
@@ -220,7 +230,7 @@ pub enum DaemonEvent {
     #[serde(rename = "command_step_update")]
     CommandStepUpdate {
         command_id: u64,
-        host: HostName,
+        node_id: NodeId,
         repo_identity: RepoIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo: Option<std::path::PathBuf>,
@@ -229,16 +239,16 @@ pub enum DaemonEvent {
         description: String,
         status: commands::StepStatus,
     },
-    /// A peer host's connection status changed.
+    /// A peer node's connection status changed.
     #[serde(rename = "peer_status")]
-    PeerStatusChanged { host: HostName, status: PeerConnectionState },
-    /// Full host snapshot — sent on initial connect/replay and when
-    /// a host's summary or connection status changes.
+    PeerStatusChanged { node_id: NodeId, status: PeerConnectionState },
+    /// Full node snapshot — sent on initial connect/replay and when
+    /// a node's summary or connection status changes.
     #[serde(rename = "host_snapshot")]
     HostSnapshot(Box<HostSnapshot>),
-    /// Host stream tombstone — sent when a previously visible host disappears.
+    /// Node stream tombstone — sent when a previously visible node disappears.
     #[serde(rename = "host_removed")]
-    HostRemoved { host: HostName, seq: u64 },
+    HostRemoved { node_id: NodeId, seq: u64 },
 }
 
 /// Peer connection state as seen by the TUI.

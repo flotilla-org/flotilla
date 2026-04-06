@@ -20,15 +20,15 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::{HostName, Message, Request};
+    use crate::{Message, Request};
 
     #[tokio::test]
     async fn write_message_line_produces_valid_json_line() {
         let msg = Message::Hello {
             protocol_version: 1,
-            host_name: HostName::new("test"),
+            node_id: crate::NodeId::new("test"),
+            display_name: "test".into(),
             session_id: uuid::Uuid::nil(),
-            connection_role: None,
             environment_id: None,
         };
         let mut buf = Vec::new();
@@ -39,9 +39,10 @@ mod tests {
         let trimmed = output.trim_end();
         let parsed: Message = serde_json::from_str(trimmed).expect("should be valid JSON");
         match parsed {
-            Message::Hello { protocol_version, host_name, .. } => {
+            Message::Hello { protocol_version, node_id, display_name, .. } => {
                 assert_eq!(protocol_version, 1);
-                assert_eq!(host_name, HostName::new("test"));
+                assert_eq!(node_id, crate::NodeId::new("test"));
+                assert_eq!(display_name, "test");
             }
             other => panic!("expected Hello, got {other:?}"),
         }

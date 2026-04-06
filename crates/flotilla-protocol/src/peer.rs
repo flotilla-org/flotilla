@@ -2,29 +2,29 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostName, HostSummary, RepoIdentity, Step, StepOutcome, StepStatus};
+use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostSummary, NodeId, RepoIdentity, Step, StepOutcome, StepStatus};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
-/// Each entry maps a host name to a monotonically increasing counter.
-/// A host increments its own entry when originating a message. Relay
+/// Each entry maps a node identity to a monotonically increasing counter.
+/// A node increments its own entry when originating a message. Relay
 /// nodes increment their own entry before forwarding. A message whose
 /// clock is dominated by (≤ in every entry) the receiver's last-seen
 /// clock is a duplicate and can be dropped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VectorClock(pub BTreeMap<HostName, u64>);
+pub struct VectorClock(pub BTreeMap<NodeId, u64>);
 
 impl VectorClock {
-    /// Increment the entry for `host`, returning the new value.
-    pub fn tick(&mut self, host: &HostName) -> u64 {
-        let entry = self.0.entry(host.clone()).or_insert(0);
+    /// Increment the entry for `node_id`, returning the new value.
+    pub fn tick(&mut self, node_id: &NodeId) -> u64 {
+        let entry = self.0.entry(node_id.clone()).or_insert(0);
         *entry += 1;
         *entry
     }
 
-    /// Get the counter for a specific host, defaulting to 0.
-    pub fn get(&self, host: &HostName) -> u64 {
-        self.0.get(host).copied().unwrap_or(0)
+    /// Get the counter for a specific node, defaulting to 0.
+    pub fn get(&self, node_id: &NodeId) -> u64 {
+        self.0.get(node_id).copied().unwrap_or(0)
     }
 
     /// Returns true if `self` is dominated by `other` — every entry in
@@ -32,8 +32,8 @@ impl VectorClock {
     /// message represented by `self` has already been seen.
     pub fn dominated_by(&self, other: &VectorClock) -> bool {
         // All keys in self must be ≤ their counterpart in other
-        for (host, &val) in &self.0 {
-            if val > other.get(host) {
+        for (node_id, &val) in &self.0 {
+            if val > other.get(node_id) {
                 return false;
             }
         }
@@ -42,8 +42,8 @@ impl VectorClock {
 
     /// Merge `other` into `self`, taking the max of each entry.
     pub fn merge(&mut self, other: &VectorClock) {
-        for (host, &val) in &other.0 {
-            let entry = self.0.entry(host.clone()).or_insert(0);
+        for (node_id, &val) in &other.0 {
+            let entry = self.0.entry(node_id.clone()).or_insert(0);
             *entry = (*entry).max(val);
         }
     }
@@ -52,7 +52,7 @@ impl VectorClock {
 /// Message exchanged between peer daemons for multi-host data replication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDataMessage {
-    pub origin_host: HostName,
+    pub origin_node_id: NodeId,
     pub repo_identity: RepoIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_repo_root: Option<PathBuf>,
@@ -85,16 +85,16 @@ pub enum GoodbyeReason {
 pub enum RoutedPeerMessage {
     RequestResync {
         request_id: u64,
-        requester_host: HostName,
-        target_host: HostName,
+        requester_node_id: NodeId,
+        target_node_id: NodeId,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
         since_seq: u64,
     },
     ResyncSnapshot {
         request_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,8 +105,8 @@ pub enum RoutedPeerMessage {
     },
     CommandRequest {
         request_id: u64,
-        requester_host: HostName,
-        target_host: HostName,
+        requester_node_id: NodeId,
+        target_node_id: NodeId,
         remaining_hops: u8,
         command: Box<crate::Command>,
         /// Session ID of the originating client, for cursor ownership on the target.
@@ -115,36 +115,36 @@ pub enum RoutedPeerMessage {
     },
     CommandCancelRequest {
         cancel_id: u64,
-        requester_host: HostName,
-        target_host: HostName,
+        requester_node_id: NodeId,
+        target_node_id: NodeId,
         remaining_hops: u8,
         command_request_id: u64,
     },
     CommandEvent {
         request_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         event: Box<CommandPeerEvent>,
     },
     CommandResponse {
         request_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         result: Box<crate::CommandValue>,
     },
     CommandCancelResponse {
         cancel_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         error: Option<String>,
     },
     RemoteStepRequest {
         request_id: u64,
-        requester_host: HostName,
-        target_host: HostName,
+        requester_node_id: NodeId,
+        target_node_id: NodeId,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
         /// Global step index of the first step in this batch on the requester.
@@ -159,8 +159,8 @@ pub enum RoutedPeerMessage {
     },
     RemoteStepEvent {
         request_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         batch_step_index: usize,
         batch_step_count: usize,
@@ -169,22 +169,22 @@ pub enum RoutedPeerMessage {
     },
     RemoteStepResponse {
         request_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         outcomes: Vec<StepOutcome>,
     },
     RemoteStepCancelRequest {
         cancel_id: u64,
-        requester_host: HostName,
-        target_host: HostName,
+        requester_node_id: NodeId,
+        target_node_id: NodeId,
         remaining_hops: u8,
         remote_step_request_id: u64,
     },
     RemoteStepCancelResponse {
         cancel_id: u64,
-        requester_host: HostName,
-        responder_host: HostName,
+        requester_node_id: NodeId,
+        responder_node_id: NodeId,
         remaining_hops: u8,
         error: Option<String>,
     },
@@ -235,13 +235,13 @@ pub enum PeerDataKind {
 mod tests {
     use super::*;
     use crate::{
-        Command, CommandAction, CommandValue, HostEnvironment, HostProviderStatus, HostSummary, RepoSelector, StepAction,
+        Command, CommandAction, CommandValue, HostEnvironment, HostName, HostProviderStatus, HostSummary, NodeId, RepoSelector, StepAction,
         StepExecutionContext, SystemInfo, ToolInventory,
     };
 
     fn sample_host_summary() -> HostSummary {
         HostSummary {
-            host_name: HostName::new("desktop"),
+            node: crate::NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             system: SystemInfo {
                 home_dir: Some(PathBuf::from("/home/dev")),
                 os: Some("linux".into()),
@@ -259,22 +259,22 @@ mod tests {
     #[test]
     fn vector_clock_tick_increments() {
         let mut clock = VectorClock::default();
-        assert_eq!(clock.tick(&HostName::new("a")), 1);
-        assert_eq!(clock.tick(&HostName::new("a")), 2);
-        assert_eq!(clock.tick(&HostName::new("b")), 1);
-        assert_eq!(clock.get(&HostName::new("a")), 2);
-        assert_eq!(clock.get(&HostName::new("b")), 1);
-        assert_eq!(clock.get(&HostName::new("c")), 0);
+        assert_eq!(clock.tick(&NodeId::new("a")), 1);
+        assert_eq!(clock.tick(&NodeId::new("a")), 2);
+        assert_eq!(clock.tick(&NodeId::new("b")), 1);
+        assert_eq!(clock.get(&NodeId::new("a")), 2);
+        assert_eq!(clock.get(&NodeId::new("b")), 1);
+        assert_eq!(clock.get(&NodeId::new("c")), 0);
     }
 
     #[test]
     fn vector_clock_dominated_by() {
         let mut a = VectorClock::default();
-        a.tick(&HostName::new("x")); // {x: 1}
+        a.tick(&NodeId::new("x")); // {x: 1}
 
         let mut b = VectorClock::default();
-        b.tick(&HostName::new("x")); // {x: 1}
-        b.tick(&HostName::new("x")); // {x: 2}
+        b.tick(&NodeId::new("x")); // {x: 1}
+        b.tick(&NodeId::new("x")); // {x: 2}
 
         assert!(a.dominated_by(&b), "a{{x:1}} should be dominated by b{{x:2}}");
         assert!(!b.dominated_by(&a), "b{{x:2}} should not be dominated by a{{x:1}}");
@@ -288,10 +288,10 @@ mod tests {
     #[test]
     fn vector_clock_dominated_by_with_different_keys() {
         let mut a = VectorClock::default();
-        a.tick(&HostName::new("x")); // {x: 1}
+        a.tick(&NodeId::new("x")); // {x: 1}
 
         let mut b = VectorClock::default();
-        b.tick(&HostName::new("y")); // {y: 1}
+        b.tick(&NodeId::new("y")); // {y: 1}
 
         // a has x:1 but b has x:0 → not dominated
         assert!(!a.dominated_by(&b));
@@ -302,22 +302,22 @@ mod tests {
     #[test]
     fn vector_clock_merge_takes_max() {
         let mut a = VectorClock::default();
-        a.tick(&HostName::new("x")); // {x: 1}
-        a.tick(&HostName::new("x")); // {x: 2}
+        a.tick(&NodeId::new("x")); // {x: 1}
+        a.tick(&NodeId::new("x")); // {x: 2}
 
         let mut b = VectorClock::default();
-        b.tick(&HostName::new("x")); // {x: 1}
-        b.tick(&HostName::new("y")); // {y: 1}
+        b.tick(&NodeId::new("x")); // {x: 1}
+        b.tick(&NodeId::new("y")); // {y: 1}
 
         a.merge(&b);
-        assert_eq!(a.get(&HostName::new("x")), 2); // max(2, 1)
-        assert_eq!(a.get(&HostName::new("y")), 1); // max(0, 1)
+        assert_eq!(a.get(&NodeId::new("x")), 2); // max(2, 1)
+        assert_eq!(a.get(&NodeId::new("y")), 1); // max(0, 1)
     }
 
     #[test]
     fn vector_clock_serde_default() {
         // Deserializing a message without a clock field should give default
-        let json = r#"{"origin_host":"desktop","repo_identity":{"authority":"github.com","path":"owner/repo"},"kind":{"type":"request_resync","since_seq":0}}"#;
+        let json = r#"{"origin_node_id":"desktop","repo_identity":{"authority":"github.com","path":"owner/repo"},"kind":{"type":"request_resync","since_seq":0}}"#;
         let msg: PeerDataMessage = serde_json::from_str(json).expect("deserialize without clock");
         assert!(msg.clock.0.is_empty(), "default clock should be empty");
         assert_eq!(msg.host_repo_root, None);
@@ -326,15 +326,17 @@ mod tests {
     #[test]
     fn peer_data_message_snapshot_roundtrip() {
         let msg = PeerDataMessage {
-            origin_host: HostName::new("desktop"),
+            origin_node_id: NodeId::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             host_repo_root: Some(PathBuf::from("/home/dev/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
         };
+        let json_value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(json_value["origin_node_id"], "desktop");
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.origin_host, msg.origin_host);
+        assert_eq!(back.origin_node_id, msg.origin_node_id);
         assert_eq!(back.repo_identity, msg.repo_identity);
         assert_eq!(back.host_repo_root, msg.host_repo_root);
     }
@@ -342,7 +344,7 @@ mod tests {
     #[test]
     fn peer_data_message_snapshot_roundtrip_without_host_repo_root() {
         let msg = PeerDataMessage {
-            origin_host: HostName::new("desktop"),
+            origin_node_id: NodeId::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             host_repo_root: None,
             clock: VectorClock::default(),
@@ -357,7 +359,7 @@ mod tests {
     #[test]
     fn peer_data_message_request_resync() {
         let msg = PeerDataMessage {
-            origin_host: HostName::new("cloud"),
+            origin_node_id: NodeId::new("cloud"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             host_repo_root: Some(PathBuf::from("/opt/repo")),
             clock: VectorClock::default(),
@@ -401,7 +403,7 @@ mod tests {
         use crate::delta::{Branch, BranchStatus, EntryOp};
 
         let msg = PeerDataMessage {
-            origin_host: HostName::new("laptop"),
+            origin_node_id: NodeId::new("laptop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             host_repo_root: Some(PathBuf::from("/home/dev/repo")),
             clock: VectorClock::default(),
@@ -427,8 +429,8 @@ mod tests {
     fn routed_command_request_roundtrip() {
         let msg = RoutedPeerMessage::CommandRequest {
             request_id: 42,
-            requester_host: HostName::new("workstation"),
-            target_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            target_node_id: NodeId::new("feta"),
             remaining_hops: 7,
             command: Box::new(Command {
                 host: Some(HostName::new("feta")),
@@ -438,13 +440,16 @@ mod tests {
             }),
             session_id: None,
         };
+        let json_value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(json_value["requester_node_id"], "workstation");
+        assert_eq!(json_value["target_node_id"], "feta");
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandRequest { request_id, requester_host, target_host, remaining_hops, .. } => {
+            RoutedPeerMessage::CommandRequest { request_id, requester_node_id, target_node_id, remaining_hops, .. } => {
                 assert_eq!(request_id, 42);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(target_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 7);
             }
             other => panic!("expected CommandRequest, got {:?}", other),
@@ -455,18 +460,18 @@ mod tests {
     fn routed_command_response_roundtrip() {
         let msg = RoutedPeerMessage::CommandResponse {
             request_id: 42,
-            requester_host: HostName::new("workstation"),
-            responder_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            responder_node_id: NodeId::new("feta"),
             remaining_hops: 7,
             result: Box::new(CommandValue::RepoTracked { path: PathBuf::from("/srv/repo"), resolved_from: None }),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandResponse { request_id, requester_host, responder_host, remaining_hops, result } => {
+            RoutedPeerMessage::CommandResponse { request_id, requester_node_id, responder_node_id, remaining_hops, result } => {
                 assert_eq!(request_id, 42);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 7);
                 assert!(matches!(*result, CommandValue::RepoTracked { .. }));
             }
@@ -478,18 +483,24 @@ mod tests {
     fn routed_command_cancel_request_roundtrip() {
         let msg = RoutedPeerMessage::CommandCancelRequest {
             cancel_id: 7,
-            requester_host: HostName::new("workstation"),
-            target_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            target_node_id: NodeId::new("feta"),
             remaining_hops: 4,
             command_request_id: 42,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandCancelRequest { cancel_id, requester_host, target_host, remaining_hops, command_request_id } => {
+            RoutedPeerMessage::CommandCancelRequest {
+                cancel_id,
+                requester_node_id,
+                target_node_id,
+                remaining_hops,
+                command_request_id,
+            } => {
                 assert_eq!(cancel_id, 7);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(target_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 4);
                 assert_eq!(command_request_id, 42);
             }
@@ -501,8 +512,8 @@ mod tests {
     fn routed_command_event_roundtrip() {
         let msg = RoutedPeerMessage::CommandEvent {
             request_id: 9,
-            requester_host: HostName::new("workstation"),
-            responder_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            responder_node_id: NodeId::new("feta"),
             remaining_hops: 5,
             event: Box::new(CommandPeerEvent::StepUpdate {
                 repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
@@ -516,10 +527,10 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandEvent { request_id, requester_host, responder_host, remaining_hops, event } => {
+            RoutedPeerMessage::CommandEvent { request_id, requester_node_id, responder_node_id, remaining_hops, event } => {
                 assert_eq!(request_id, 9);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 5);
                 assert_eq!(*event, CommandPeerEvent::StepUpdate {
                     repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
@@ -538,18 +549,18 @@ mod tests {
     fn routed_command_cancel_response_roundtrip() {
         let msg = RoutedPeerMessage::CommandCancelResponse {
             cancel_id: 7,
-            requester_host: HostName::new("workstation"),
-            responder_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            responder_node_id: NodeId::new("feta"),
             remaining_hops: 4,
             error: Some("command not found".into()),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::CommandCancelResponse { cancel_id, requester_host, responder_host, remaining_hops, error } => {
+            RoutedPeerMessage::CommandCancelResponse { cancel_id, requester_node_id, responder_node_id, remaining_hops, error } => {
                 assert_eq!(cancel_id, 7);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 4);
                 assert_eq!(error.as_deref(), Some("command not found"));
             }
@@ -561,8 +572,8 @@ mod tests {
     fn routed_remote_step_request_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepRequest {
             request_id: 43,
-            requester_host: HostName::new("workstation"),
-            target_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            target_node_id: NodeId::new("feta"),
             remaining_hops: 6,
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             step_offset: 2,
@@ -575,22 +586,25 @@ mod tests {
                 },
             }],
         };
+        let json_value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(json_value["requester_node_id"], "workstation");
+        assert_eq!(json_value["target_node_id"], "feta");
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(!json.contains("\"repo_path\""), "remote step request should not serialize repo root path: {json}");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
             RoutedPeerMessage::RemoteStepRequest {
                 request_id,
-                requester_host,
-                target_host,
+                requester_node_id,
+                target_node_id,
                 remaining_hops,
                 repo_identity,
                 step_offset,
                 steps,
             } => {
                 assert_eq!(request_id, 43);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(target_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 6);
                 assert_eq!(repo_identity, RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() });
                 assert_eq!(step_offset, 2);
@@ -604,8 +618,8 @@ mod tests {
     fn routed_remote_step_event_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepEvent {
             request_id: 43,
-            requester_host: HostName::new("workstation"),
-            responder_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            responder_node_id: NodeId::new("feta"),
             remaining_hops: 6,
             batch_step_index: 0,
             batch_step_count: 1,
@@ -617,8 +631,8 @@ mod tests {
         match back {
             RoutedPeerMessage::RemoteStepEvent {
                 request_id,
-                requester_host,
-                responder_host,
+                requester_node_id,
+                responder_node_id,
                 remaining_hops,
                 batch_step_index,
                 batch_step_count,
@@ -626,8 +640,8 @@ mod tests {
                 status,
             } => {
                 assert_eq!(request_id, 43);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 6);
                 assert_eq!(batch_step_index, 0);
                 assert_eq!(batch_step_count, 1);
@@ -642,18 +656,18 @@ mod tests {
     fn routed_remote_step_response_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepResponse {
             request_id: 43,
-            requester_host: HostName::new("workstation"),
-            responder_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            responder_node_id: NodeId::new("feta"),
             remaining_hops: 6,
             outcomes: vec![StepOutcome::Completed, StepOutcome::Produced(CommandValue::Ok)],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::RemoteStepResponse { request_id, requester_host, responder_host, remaining_hops, outcomes } => {
+            RoutedPeerMessage::RemoteStepResponse { request_id, requester_node_id, responder_node_id, remaining_hops, outcomes } => {
                 assert_eq!(request_id, 43);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 6);
                 assert_eq!(outcomes, vec![StepOutcome::Completed, StepOutcome::Produced(CommandValue::Ok)]);
             }
@@ -665,8 +679,8 @@ mod tests {
     fn routed_remote_step_cancel_request_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepCancelRequest {
             cancel_id: 7,
-            requester_host: HostName::new("workstation"),
-            target_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            target_node_id: NodeId::new("feta"),
             remaining_hops: 6,
             remote_step_request_id: 43,
         };
@@ -675,14 +689,14 @@ mod tests {
         match back {
             RoutedPeerMessage::RemoteStepCancelRequest {
                 cancel_id,
-                requester_host,
-                target_host,
+                requester_node_id,
+                target_node_id,
                 remaining_hops,
                 remote_step_request_id,
             } => {
                 assert_eq!(cancel_id, 7);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(target_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(target_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 6);
                 assert_eq!(remote_step_request_id, 43);
             }
@@ -694,18 +708,18 @@ mod tests {
     fn routed_remote_step_cancel_response_roundtrip() {
         let msg = RoutedPeerMessage::RemoteStepCancelResponse {
             cancel_id: 7,
-            requester_host: HostName::new("workstation"),
-            responder_host: HostName::new("feta"),
+            requester_node_id: NodeId::new("workstation"),
+            responder_node_id: NodeId::new("feta"),
             remaining_hops: 6,
             error: Some("remote step not found".into()),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");
         match back {
-            RoutedPeerMessage::RemoteStepCancelResponse { cancel_id, requester_host, responder_host, remaining_hops, error } => {
+            RoutedPeerMessage::RemoteStepCancelResponse { cancel_id, requester_node_id, responder_node_id, remaining_hops, error } => {
                 assert_eq!(cancel_id, 7);
-                assert_eq!(requester_host, HostName::new("workstation"));
-                assert_eq!(responder_host, HostName::new("feta"));
+                assert_eq!(requester_node_id, NodeId::new("workstation"));
+                assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 6);
                 assert_eq!(error.as_deref(), Some("remote step not found"));
             }

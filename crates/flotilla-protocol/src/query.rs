@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::{ProviderError, WorkItem},
-    EnvironmentInfo, HostName, HostSummary, PeerConnectionState,
+    EnvironmentInfo, HostSummary, NodeInfo, PeerConnectionState,
 };
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
@@ -89,7 +89,7 @@ pub struct HostListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostListEntry {
-    pub host: HostName,
+    pub node: NodeInfo,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
@@ -103,7 +103,7 @@ pub struct HostListEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatusResponse {
-    pub host: HostName,
+    pub node: NodeInfo,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
@@ -118,7 +118,7 @@ pub struct HostStatusResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProvidersResponse {
-    pub host: HostName,
+    pub node: NodeInfo,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
     pub configured: bool,
@@ -130,18 +130,18 @@ pub struct HostProvidersResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopologyResponse {
-    pub local_host: HostName,
+    pub local_node: NodeInfo,
     pub routes: Vec<TopologyRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopologyRoute {
-    pub target: HostName,
-    pub next_hop: HostName,
+    pub target: NodeInfo,
+    pub next_hop: NodeInfo,
     pub direct: bool,
     pub connected: bool,
     #[serde(default)]
-    pub fallbacks: Vec<HostName>,
+    pub fallbacks: Vec<NodeInfo>,
 }
 
 #[cfg(test)]
@@ -152,8 +152,8 @@ mod tests {
         HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
     };
     use crate::{
-        test_helpers::assert_roundtrip, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostProviderStatus,
-        HostSummary, ImageId, PeerConnectionState, SystemInfo, ToolInventory,
+        test_helpers::assert_roundtrip, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostProviderStatus,
+        HostSummary, ImageId, NodeId, NodeInfo, PeerConnectionState, SystemInfo, ToolInventory,
     };
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
 
     fn sample_host_summary() -> HostSummary {
         HostSummary {
-            host_name: HostName::new("desktop"),
+            node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             system: SystemInfo {
                 home_dir: Some("/home/dev".into()),
                 os: Some("linux".into()),
@@ -216,7 +216,7 @@ mod tests {
     fn host_list_response_roundtrips_without_summary_data() {
         let response = HostListResponse {
             hosts: vec![HostListEntry {
-                host: HostName::new("remote"),
+                node: NodeInfo::new(NodeId::new("remote"), "Remote"),
                 is_local: false,
                 configured: true,
                 connection_status: PeerConnectionState::Disconnected,
@@ -226,13 +226,16 @@ mod tests {
             }],
         };
 
+        let json = serde_json::to_value(&response).expect("serialize host list");
+        assert_eq!(json["hosts"][0]["node"]["node_id"], "remote");
+        assert_eq!(json["hosts"][0]["node"]["display_name"], "Remote");
         assert_roundtrip(&response);
     }
 
     #[test]
     fn host_status_response_roundtrips_with_summary() {
         let response = HostStatusResponse {
-            host: HostName::new("desktop"),
+            node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             is_local: true,
             configured: true,
             connection_status: PeerConnectionState::Connected,
@@ -242,13 +245,16 @@ mod tests {
             work_item_count: 5,
         };
 
+        let json = serde_json::to_value(&response).expect("serialize host status");
+        assert_eq!(json["node"]["node_id"], "desktop");
+        assert_eq!(json["summary"]["node"]["display_name"], "Desktop");
         assert_roundtrip(&response);
     }
 
     #[test]
     fn host_providers_response_roundtrips_summary() {
         let response = HostProvidersResponse {
-            host: HostName::new("desktop"),
+            node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             is_local: true,
             configured: true,
             connection_status: PeerConnectionState::Connected,
@@ -262,7 +268,7 @@ mod tests {
     #[test]
     fn host_status_response_defaults_missing_visible_environments() {
         let mut value = serde_json::to_value(HostStatusResponse {
-            host: HostName::new("desktop"),
+            node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             is_local: true,
             configured: true,
             connection_status: PeerConnectionState::Connected,
@@ -281,13 +287,13 @@ mod tests {
     #[test]
     fn topology_response_roundtrips_fallbacks() {
         let response = TopologyResponse {
-            local_host: HostName::new("desktop"),
+            local_node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             routes: vec![TopologyRoute {
-                target: HostName::new("worker"),
-                next_hop: HostName::new("relay"),
+                target: NodeInfo::new(NodeId::new("worker"), "Worker"),
+                next_hop: NodeInfo::new(NodeId::new("relay"), "Relay"),
                 direct: false,
                 connected: true,
-                fallbacks: vec![HostName::new("backup-relay")],
+                fallbacks: vec![NodeInfo::new(NodeId::new("backup-relay"), "Backup Relay")],
             }],
         };
 
