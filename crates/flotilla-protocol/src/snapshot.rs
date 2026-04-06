@@ -111,10 +111,6 @@ impl WorkItem {
     pub fn checkout_key(&self) -> Option<&QualifiedPath> {
         self.checkout.as_ref().map(|co| &co.key)
     }
-
-    pub fn qualified_checkout_key(&self) -> Option<&QualifiedPath> {
-        self.checkout_key()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -418,17 +414,13 @@ mod tests {
             assert_eq!(decoded.kind, case.kind);
             assert_eq!(decoded.identity, case.identity);
             assert_eq!(decoded.checkout_key(), case.checkout_key());
-            assert_eq!(decoded.qualified_checkout_key(), case.qualified_checkout_key());
         }
 
         let without_checkout = &cases[0];
         assert!(without_checkout.checkout_key().is_none());
         let with_checkout = &cases[1];
         assert_eq!(with_checkout.checkout_key(), Some(&qp("/repos/main")));
-        assert_eq!(
-            with_checkout.qualified_checkout_key(),
-            Some(&QualifiedPath::from_host_name(&HostName::new("test-host"), "/repos/main"))
-        );
+        assert_eq!(with_checkout.checkout_key(), Some(&QualifiedPath::from_host_name(&HostName::new("test-host"), "/repos/main")));
     }
 
     #[test]

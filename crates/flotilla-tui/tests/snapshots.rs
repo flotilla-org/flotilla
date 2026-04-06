@@ -39,7 +39,7 @@ fn single_repo_empty_table() {
 fn single_repo_with_items() {
     let mut providers = ProviderData::default();
     let (path, checkout) = make_checkout("feat-login", "/test/my-project/feat-login", false);
-    providers.checkouts.insert(path.into(), checkout);
+    providers.checkouts.insert(path, checkout);
     let (id, cr) = make_change_request("42", "Add login page", "feat-login");
     providers.change_requests.insert(id, cr);
     let (id, issue) = make_issue("10", "Users need authentication");
@@ -212,7 +212,7 @@ fn status_bar_does_not_show_keys_toggle_ribbon() {
 fn selected_item_preview() {
     let mut providers = ProviderData::default();
     let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
-    providers.checkouts.insert(path.into(), checkout);
+    providers.checkouts.insert(path, checkout);
     let (id, cr) = make_change_request("99", "Build analytics dashboard", "feat-dashboard");
     providers.change_requests.insert(id, cr);
 
@@ -230,7 +230,7 @@ fn selected_item_preview() {
 fn selected_item_preview_below() {
     let mut providers = ProviderData::default();
     let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
-    providers.checkouts.insert(path.into(), checkout);
+    providers.checkouts.insert(path, checkout);
     let (id, cr) = make_change_request("99", "Build analytics dashboard", "feat-dashboard");
     providers.change_requests.insert(id, cr);
 
@@ -252,7 +252,7 @@ fn selected_item_preview_below() {
 fn zoom_layout_uses_full_content_area() {
     let mut providers = ProviderData::default();
     let (path, checkout) = make_checkout("feat-dashboard", "/test/my-project/feat-dashboard", false);
-    providers.checkouts.insert(path.into(), checkout);
+    providers.checkouts.insert(path, checkout);
 
     let items = vec![make_work_item_checkout("feat-dashboard", "/test/my-project/feat-dashboard")];
 
@@ -520,7 +520,7 @@ fn theme_switching_changes_output() {
 
     let mut providers = ProviderData::default();
     let (path, checkout) = make_checkout("feat-login", "/test/my-project/feat-login", false);
-    providers.checkouts.insert(path.into(), checkout);
+    providers.checkouts.insert(path, checkout);
     let items = vec![make_work_item_checkout("feat-login", "/test/my-project/feat-login")];
 
     let mut classic_harness =
