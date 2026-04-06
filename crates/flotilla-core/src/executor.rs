@@ -38,6 +38,33 @@ use crate::{
     terminal_manager::TerminalManager,
 };
 
+fn display_host_for_checkout_path(providers_data: &ProviderData, checkout_path: &Path, local_host: &HostName) -> Option<HostName> {
+    providers_data.checkouts.iter().find_map(|(qualified_path, checkout)| {
+        if qualified_path.path != checkout_path {
+            return None;
+        }
+        if checkout_is_local_owned(qualified_path, local_host) {
+            return Some(local_host.clone());
+        }
+        qualified_path.host_name().cloned().or_else(|| checkout.host_name.clone())
+    })
+}
+
+fn workspace_label_for_host(
+    label: &str,
+    target_node_id: &NodeId,
+    local_node_id: &NodeId,
+    target_display_host: Option<&HostName>,
+) -> String {
+    if target_node_id == local_node_id {
+        label.to_string()
+    } else if let Some(display_host) = target_display_host {
+        format!("{label}@{display_host}")
+    } else {
+        label.to_string()
+    }
+}
+
 #[derive(Clone)]
 pub struct RepoExecutionContext {
     pub identity: flotilla_protocol::RepoIdentity,
@@ -114,15 +141,30 @@ pub async fn build_plan(
     let Command { node_id, provisioning_target, action, .. } = cmd;
     let target_node_id = node_id.unwrap_or_else(|| local_node_id.clone());
     let checkout_host = StepExecutionContext::Host(target_node_id.clone());
+    let target_display_host = provisioning_target.as_ref().map(|target| target.host().clone());
 
     match action {
         CommandAction::Checkout { target, issue_ids, .. } => {
             match provisioning_target {
                 Some(flotilla_protocol::ProvisioningTarget::NewEnvironment { provider, .. }) => {
-                    return Ok(build_environment_checkout_plan(provider, target, issue_ids, target_node_id, local_node_id));
+                    return Ok(build_environment_checkout_plan(
+                        provider,
+                        target,
+                        issue_ids,
+                        target_node_id,
+                        local_node_id,
+                        target_display_host,
+                    ));
                 }
                 Some(flotilla_protocol::ProvisioningTarget::ExistingEnvironment { env_id, .. }) => {
-                    return Ok(build_existing_environment_checkout_plan(env_id, target, issue_ids, target_node_id, local_node_id));
+                    return Ok(build_existing_environment_checkout_plan(
+                        env_id,
+                        target,
+                        issue_ids,
+                        target_node_id,
+                        local_node_id,
+                        target_display_host,
+                    ));
                 }
                 Some(flotilla_protocol::ProvisioningTarget::Host { .. }) | None => {
                     // Fall through to standard checkout
@@ -132,7 +174,16 @@ pub async fn build_plan(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            Ok(build_create_checkout_plan(branch, create_branch, intent, issue_ids, checkout_host, local_node_id, local_host))
+            Ok(build_create_checkout_plan(
+                branch,
+                create_branch,
+                intent,
+                issue_ids,
+                checkout_host,
+                local_node_id,
+                local_host,
+                target_display_host,
+            ))
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
@@ -181,7 +232,12 @@ pub async fn build_plan(
         CommandAction::GenerateBranchName { issue_keys } => Ok(build_generate_branch_name_plan(issue_keys, local_node_id.clone())),
 
         CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => Ok(build_create_workspace_plan(
-            workspace_label_for_host(&label, &checkout_host, &local_host),
+            workspace_label_for_host(
+                &label,
+                &target_node_id,
+                &local_node_id,
+                display_host_for_checkout_path(&providers_data, &checkout_path, &local_host).as_ref(),
+            ),
             Some(ExecutionEnvironmentPath::new(checkout_path)),
             checkout_host,
             local_node_id.clone(),
@@ -282,6 +338,7 @@ fn build_create_checkout_plan(
     checkout_host: StepExecutionContext,
     local_node_id: NodeId,
     local_host: HostName,
+    target_display_host: Option<HostName>,
 ) -> StepPlan {
     let mut steps = Vec::new();
     let workspace_host = checkout_host.clone();
@@ -300,7 +357,8 @@ fn build_create_checkout_plan(
         });
     }
 
-    let workspace_label = workspace_label_for_host(&branch, &workspace_host, &local_host);
+    let workspace_label =
+        workspace_label_for_host(&branch, workspace_host.node_id(), &local_node_id, target_display_host.as_ref().or(Some(&local_host)));
     steps.extend(build_create_workspace_plan(workspace_label, None, workspace_host, local_node_id).steps);
 
     StepPlan::new(steps)
@@ -321,6 +379,7 @@ fn build_environment_checkout_plan(
     issue_ids: Vec<(String, String)>,
     target_node_id: NodeId,
     local_node_id: NodeId,
+    target_display_host: Option<HostName>,
 ) -> StepPlan {
     let (branch, create_branch, intent) = match target {
         CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
@@ -358,7 +417,7 @@ fn build_environment_checkout_plan(
         });
     }
 
-    let workspace_label = if target_node_id == local_node_id { branch.clone() } else { format!("{branch}@{target_node_id}") };
+    let workspace_label = workspace_label_for_host(&branch, &target_node_id, &local_node_id, target_display_host.as_ref());
 
     steps.push(Step {
         description: format!("Prepare workspace for {workspace_label}"),
@@ -388,13 +447,14 @@ fn build_existing_environment_checkout_plan(
     issue_ids: Vec<(String, String)>,
     target_node_id: NodeId,
     local_node_id: NodeId,
+    target_display_host: Option<HostName>,
 ) -> StepPlan {
     let (branch, create_branch, intent) = match target {
         CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
         CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
     };
     let env_context = StepExecutionContext::Environment(target_node_id.clone(), env_id.clone());
-    let workspace_label = if target_node_id == local_node_id { branch.clone() } else { format!("{branch}@{target_node_id}") };
+    let workspace_label = workspace_label_for_host(&branch, &target_node_id, &local_node_id, target_display_host.as_ref());
 
     let mut steps = vec![Step {
         description: format!("Create checkout for branch {branch}"),
@@ -442,14 +502,6 @@ fn build_create_workspace_plan(
             action: StepAction::AttachWorkspace,
         },
     ])
-}
-
-fn workspace_label_for_host(label: &str, host: &StepExecutionContext, local_host: &HostName) -> String {
-    if host.node_id().as_str() == local_host.as_str() {
-        label.to_string()
-    } else {
-        format!("{label}@{}", host.node_id())
-    }
 }
 
 /// Build a step plan for `TeleportSession`.
@@ -804,10 +856,17 @@ impl StepResolver for ExecutorStepResolver {
                     &self.local_host,
                     tm.as_ref(),
                 );
+                let label_host = attachable_set_id.as_ref().and_then(|set_id| {
+                    self.attachable_store.lock().ok().and_then(|store| {
+                        store.registry().sets.get(set_id).and_then(|set| {
+                            set.checkout.as_ref().and_then(|checkout| checkout.host_name().cloned()).or_else(|| set.host_affinity.clone())
+                        })
+                    })
+                });
                 workspace_orchestrator
                     .attach_prepared_workspace(
                         &PreparedWorkspace {
-                            label: format!("{branch}@{target_node_id}"),
+                            label: workspace_label_for_host(&branch, &target_node_id, &self.local_node_id, label_host.as_ref()),
                             target_node_id,
                             checkout_path: checkout_path.into_path_buf(),
                             checkout_key: None,

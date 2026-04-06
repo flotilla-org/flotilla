@@ -6,7 +6,7 @@
 use std::{collections::HashMap, path::Path};
 
 use flotilla_protocol::{
-    DiscoveryEntry, DiscoveryFact, HostName, HostProviderStatus, NodeId, NodeInfo, ProviderData, ProviderError, RepoIdentity, RepoSnapshot,
+    DiscoveryEntry, DiscoveryFact, HostProviderStatus, NodeId, NodeInfo, ProviderData, ProviderError, RepoIdentity, RepoSnapshot,
     ToolInventory, UnmetRequirementInfo, WorkItem,
 };
 
@@ -62,18 +62,9 @@ pub fn assertion_to_discovery_entry(assertion: &EnvironmentAssertion) -> Discove
     DiscoveryEntry { kind: kind.into(), detail }
 }
 
-pub fn correlation_result_to_work_item(
-    item: &CorrelationResult,
-    groups: &[CorrelatedGroup],
-    local_node_id: &NodeId,
-    display_to_node: &HashMap<String, NodeId>,
-    local_display_name: &HostName,
-) -> WorkItem {
+pub fn correlation_result_to_work_item(item: &CorrelationResult, groups: &[CorrelatedGroup], node_id: NodeId) -> WorkItem {
     let kind = item.kind();
     let identity = item.identity();
-    let host = item.host(local_display_name);
-    let node_id = display_to_node.get(host.as_str()).cloned().unwrap_or_else(|| local_node_id.clone());
-
     let checkout = item.checkout().cloned();
 
     let debug_group = item.correlation_group_idx().and_then(|idx| groups.get(idx)).map(format_debug_group).unwrap_or_default();
@@ -96,6 +87,80 @@ pub fn correlation_result_to_work_item(
         attachable_set_id: item.attachable_set_id().cloned(),
         agent_keys: item.agent_keys().to_vec(),
     }
+}
+
+fn work_item_matches_provider(item: &CorrelationResult, providers: &ProviderData) -> bool {
+    let has_mesh_anchor = item.checkout().is_some() || item.attachable_set_id().is_some() || !item.terminal_ids().is_empty();
+
+    if let Some(checkout) = item.checkout() {
+        if providers.checkouts.contains_key(&checkout.key) {
+            return true;
+        }
+    }
+    if let Some(set_id) = item.attachable_set_id() {
+        if providers.attachable_sets.contains_key(set_id) {
+            return true;
+        }
+    }
+    if let Some(change_request_key) = item.change_request_key() {
+        if providers.change_requests.contains_key(change_request_key) {
+            return true;
+        }
+    }
+    if let Some(session_key) = item.session_key() {
+        if providers.sessions.contains_key(session_key) {
+            return true;
+        }
+    }
+    if item.workspace_refs().iter().any(|ws_ref| providers.workspaces.contains_key(ws_ref)) {
+        return true;
+    }
+    if item.terminal_ids().iter().any(|terminal_id| providers.managed_terminals.contains_key(terminal_id)) {
+        return true;
+    }
+    if item.agent_keys().iter().any(|agent_key| providers.agents.contains_key(agent_key)) {
+        return true;
+    }
+    if !has_mesh_anchor && item.workspace_refs().iter().any(|ws_ref| providers.workspaces.contains_key(ws_ref)) {
+        return true;
+    }
+
+    match item {
+        CorrelationResult::Standalone(crate::data::StandaloneResult::Issue { key, .. }) => providers.issues.contains_key(key),
+        CorrelationResult::Standalone(crate::data::StandaloneResult::RemoteBranch { branch }) => providers.branches.contains_key(branch),
+        CorrelationResult::Correlated(_) => false,
+    }
+}
+
+fn resolve_work_item_node_id(
+    item: &CorrelationResult,
+    local_providers: &ProviderData,
+    peer_overlay: &[(NodeInfo, ProviderData)],
+    local_node_id: &NodeId,
+) -> NodeId {
+    let has_mesh_anchor = item.checkout().is_some() || item.attachable_set_id().is_some() || !item.terminal_ids().is_empty();
+
+    if has_mesh_anchor {
+        for (node, providers) in peer_overlay {
+            if work_item_matches_provider(item, providers) {
+                return node.node_id.clone();
+            }
+        }
+        if work_item_matches_provider(item, local_providers) {
+            return local_node_id.clone();
+        }
+    } else {
+        if work_item_matches_provider(item, local_providers) {
+            return local_node_id.clone();
+        }
+        for (node, providers) in peer_overlay {
+            if work_item_matches_provider(item, providers) {
+                return node.node_id.clone();
+            }
+        }
+    }
+
+    local_node_id.clone()
 }
 
 fn format_debug_group(group: &CorrelatedGroup) -> Vec<String> {
@@ -210,14 +275,10 @@ pub fn snapshot_to_proto(
     repo: &Path,
     seq: u64,
     refresh: &RefreshSnapshot,
+    local_providers: &ProviderData,
     node_id: &NodeId,
-    host_name: &HostName,
     peer_overlay: &[(NodeInfo, ProviderData)],
 ) -> RepoSnapshot {
-    let mut display_to_node = HashMap::from([(host_name.to_string(), node_id.clone())]);
-    for (node, _) in peer_overlay {
-        display_to_node.insert(node.display_name.clone(), node.node_id.clone());
-    }
     RepoSnapshot {
         seq,
         repo_identity,
@@ -226,7 +287,13 @@ pub fn snapshot_to_proto(
         work_items: refresh
             .work_items
             .iter()
-            .map(|item| correlation_result_to_work_item(item, &refresh.correlation_groups, node_id, &display_to_node, host_name))
+            .map(|item| {
+                correlation_result_to_work_item(
+                    item,
+                    &refresh.correlation_groups,
+                    resolve_work_item_node_id(item, local_providers, peer_overlay, node_id),
+                )
+            })
             .collect(),
         providers: (*refresh.providers).clone(),
         provider_health: health_to_proto(&refresh.provider_health),

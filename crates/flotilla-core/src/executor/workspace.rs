@@ -71,7 +71,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         };
 
         let scope_prefix = ws_mgr.binding_scope_prefix();
-        let target_host = HostName::new(prepared.target_node_id.as_str());
+        let target_host = self.resolve_prepared_workspace_display_host(prepared)?;
         if let Some(ws_ref) = self.find_existing_workspace_ref(
             provider_name,
             &scope_prefix,
@@ -142,6 +142,34 @@ impl<'a> WorkspaceOrchestrator<'a> {
             }
             Err(err) => Err(err),
         }
+    }
+
+    fn resolve_prepared_workspace_display_host(&self, prepared: &PreparedWorkspace) -> Result<HostName, String> {
+        if let Some(checkout_key) = prepared.checkout_key.as_ref() {
+            if let Some(host) = checkout_key.host_name() {
+                return Ok(host.clone());
+            }
+            if checkout_key.host_id().is_some() || checkout_key.environment_id().is_some() {
+                return Ok(self.local_host.clone());
+            }
+        }
+
+        let store =
+            self.attachable_store.lock().map_err(|_| "attachable store lock poisoned while resolving workspace host".to_string())?;
+        if let Some(set_id) = prepared.attachable_set_id.as_ref() {
+            if let Some(set) = store.registry().sets.get(set_id) {
+                if let Some(host) =
+                    set.checkout.as_ref().and_then(|checkout| checkout.host_name().cloned()).or_else(|| set.host_affinity.clone())
+                {
+                    return Ok(host);
+                }
+                if set.checkout.as_ref().and_then(|checkout| checkout.host_id()).is_some() || set.environment_id.is_some() {
+                    return Ok(self.local_host.clone());
+                }
+            }
+        }
+
+        Err(format!("workspace target display host unavailable for node {}", prepared.target_node_id))
     }
 
     pub(super) fn ensure_attachable_set_for_checkout(

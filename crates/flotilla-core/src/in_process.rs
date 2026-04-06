@@ -335,13 +335,13 @@ fn build_repo_snapshot_with_peers(
         let peer_refs: Vec<(NodeInfo, &ProviderData)> = peers.iter().map(|(node, data)| (node.clone(), data)).collect();
         Arc::new(crate::merge::merge_provider_data(&local_providers, host_name, node_id, &peer_refs))
     } else {
-        Arc::new(local_providers)
+        Arc::new(local_providers.clone())
     };
 
     let (work_items, correlation_groups) = crate::data::correlate(&providers);
     let re_snapshot =
         RefreshSnapshot { providers, work_items, correlation_groups, errors: errors.to_vec(), provider_health: provider_health.clone() };
-    snapshot_to_proto(repo_identity, path, seq, &re_snapshot, node_id, host_name, peer_overlay.unwrap_or(&[]))
+    snapshot_to_proto(repo_identity, path, seq, &re_snapshot, &local_providers, node_id, peer_overlay.unwrap_or(&[]))
 }
 
 /// Choose whether to broadcast a full snapshot or a delta.
@@ -1065,8 +1065,8 @@ impl InProcessDaemon {
                 state.preferred_path(),
                 state.seq() + 1,
                 &re_snapshot,
+                &last_local_providers,
                 &self.node_id,
-                &self.host_name,
                 peer_overlay.get(&identity).map(Vec::as_slice).unwrap_or(&[]),
             );
             proto_snapshot.provider_health = crate::convert::health_to_proto(&state.preferred_root().model.data.provider_health);
