@@ -11,6 +11,14 @@ pub(super) struct CheckoutService<'a> {
     registry: &'a ProviderRegistry,
 }
 
+/// Returns whether a checkout key belongs to the executor's local provider snapshot.
+///
+/// Host-id-qualified keys are treated as local-only because executor resolution
+/// operates on the repo's unmerged local provider data (or equivalent
+/// environment-local data). Peer overlay checkouts must not reach this path;
+/// once peer routing grows a stronger owner model this predicate should narrow
+/// accordingly instead of treating all `HostId`-qualified paths as executable
+/// locally.
 pub(crate) fn checkout_is_local_owned(host_path: &QualifiedPath, local_host: &HostName) -> bool {
     host_path.host_name() == Some(local_host) || host_path.host_id().is_some()
 }

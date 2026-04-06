@@ -421,8 +421,14 @@ impl EnvironmentManager {
     }
 
     fn is_clean_absolute_path(path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        path_str.starts_with('/') && path_str.split('/').all(|component| component != "." && component != "..")
+        use std::path::Component;
+
+        let raw = path.as_os_str().to_string_lossy();
+        path.is_absolute()
+            && raw
+                .strip_prefix('/')
+                .is_some_and(|suffix| suffix.split('/').all(|component| !component.is_empty() && component != "." && component != ".."))
+            && path.components().all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
     }
 
     pub fn host_id_for_environment(&self, env_id: &EnvironmentId) -> Option<HostId> {
