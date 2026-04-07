@@ -31,7 +31,7 @@ impl CrNoun {
         match self.verb {
             CrVerb::Open => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::OpenChangeRequest { id: self.subject },
@@ -41,7 +41,7 @@ impl CrNoun {
             }),
             CrVerb::Close => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::CloseChangeRequest { id: self.subject },
@@ -51,7 +51,7 @@ impl CrNoun {
             }),
             CrVerb::LinkIssues { issue_ids } => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::LinkIssuesToChangeRequest { change_request_id: self.subject, issue_ids },
@@ -101,7 +101,7 @@ mod tests {
         let resolved = parse(&["cr", "42", "open"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::OpenChangeRequest { id: "42".into() }
@@ -116,7 +116,7 @@ mod tests {
         let resolved = parse(&["cr", "42", "close"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::CloseChangeRequest { id: "42".into() }
@@ -131,7 +131,7 @@ mod tests {
         let resolved = parse(&["cr", "42", "link-issues", "1", "5", "7"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::LinkIssuesToChangeRequest {
@@ -151,7 +151,7 @@ mod tests {
         let resolved = parse(&["pr", "42", "open"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::OpenChangeRequest { id: "42".into() }

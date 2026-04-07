@@ -50,7 +50,7 @@ impl CheckoutNoun {
                 // SENTINEL: repo is empty — dispatch must fill it from --repo or FLOTILLA_REPO.
                 Ok(Resolved::NeedsContext {
                     command: Command {
-                        host: None,
+                        node_id: None,
                         provisioning_target: None,
                         context_repo: None,
                         action: CommandAction::Checkout { repo: RepoSelector::Query("".into()), target, issue_ids: vec![] },
@@ -61,7 +61,7 @@ impl CheckoutNoun {
             }
             (Some(subject), Some(CheckoutVerb::Remove)) => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query(subject) },
@@ -72,7 +72,7 @@ impl CheckoutNoun {
             (None, Some(CheckoutVerb::Remove)) => Err("remove requires a checkout subject".into()),
             (Some(subject), Some(CheckoutVerb::Status { checkout_path, cr_id })) => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::FetchCheckoutStatus { branch: subject, checkout_path, change_request_id: cr_id },
@@ -139,7 +139,7 @@ mod tests {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -158,7 +158,7 @@ mod tests {
         let resolved = parse(&["checkout", "create", "--branch", "feat-x", "--fresh"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::Checkout {
@@ -177,7 +177,7 @@ mod tests {
         let resolved = parse(&["checkout", "my-feature", "remove"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::RemoveCheckout { checkout: CheckoutSelector::Query("my-feature".into()) },
@@ -192,7 +192,7 @@ mod tests {
         let resolved = parse(&["checkout", "my-feature", "status"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus { branch: "my-feature".into(), checkout_path: None, change_request_id: None },
@@ -207,7 +207,7 @@ mod tests {
         let resolved = parse(&["checkout", "my-feature", "status", "--checkout-path", "/tmp/wt", "--cr-id", "42"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus {

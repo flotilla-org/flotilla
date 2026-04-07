@@ -41,7 +41,7 @@ mod tests {
         let resolved = parse_host_command(&["host", "feta", "cr", "42", "open"]).unwrap();
         match &resolved {
             Resolved::NeedsContext { command, .. } => {
-                assert!(command.host.is_some());
+                assert!(command.node_id.is_some());
             }
             _ => panic!("expected NeedsContext"),
         }

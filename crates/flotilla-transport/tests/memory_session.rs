@@ -1,4 +1,4 @@
-use flotilla_protocol::{HostName, Message, Request};
+use flotilla_protocol::{Message, NodeId, Request};
 use flotilla_transport::{memory::memory_session_pair, message::message_session_pair};
 
 #[tokio::test]
@@ -32,16 +32,16 @@ async fn message_session_pair_transfers_protocol_messages() {
     right
         .write(Message::Hello {
             protocol_version: 4,
-            host_name: HostName::new("remote"),
+            node_id: NodeId::new("remote"),
+            display_name: "remote".into(),
             session_id: Default::default(),
             connection_role: None,
-            environment_id: None,
         })
         .await
         .expect("write hello");
 
     assert!(matches!(
         left.read().await.expect("read hello"),
-        Some(Message::Hello { ref host_name, .. }) if host_name == &HostName::new("remote")
+        Some(Message::Hello { ref node_id, ref display_name, .. }) if node_id == &NodeId::new("remote") && display_name == "remote"
     ));
 }

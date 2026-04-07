@@ -32,7 +32,7 @@ impl IssueNoun {
         match (self.subject, self.verb) {
             (Some(subject), Some(IssueVerb::Open)) => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::OpenIssue { id: subject },
@@ -45,7 +45,7 @@ impl IssueNoun {
                 let issue_keys = subject.split(',').map(|s| s.trim().to_string()).collect();
                 Ok(Resolved::NeedsContext {
                     command: Command {
-                        host: None,
+                        node_id: None,
                         provisioning_target: None,
                         context_repo: None,
                         action: CommandAction::GenerateBranchName { issue_keys },
@@ -57,7 +57,7 @@ impl IssueNoun {
             (None, Some(IssueVerb::SuggestBranch)) => Err("suggest-branch requires an issue subject".into()),
             (_, Some(IssueVerb::Search { query })) => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     // SENTINEL: repo is empty — dispatch must fill it from --repo or FLOTILLA_REPO.
@@ -119,7 +119,7 @@ mod tests {
         let resolved = parse(&["issue", "1", "open"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::OpenIssue { id: "1".into() }
@@ -134,7 +134,7 @@ mod tests {
         let resolved = parse(&["issue", "1,5,7", "suggest-branch"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::GenerateBranchName { issue_keys: vec!["1".into(), "5".into(), "7".into()] },
@@ -149,7 +149,7 @@ mod tests {
         let resolved = parse(&["issue", "search", "my", "query"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssues {

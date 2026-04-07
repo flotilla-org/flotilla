@@ -1,4 +1,4 @@
-use flotilla_protocol::{Command, HostName};
+use flotilla_protocol::{Command, NodeId};
 
 /// How a command's repo context should be filled by the dispatch environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +35,10 @@ pub enum Resolved {
 
 impl Resolved {
     /// Set the target host on a resolved command.
-    pub fn set_host(&mut self, host: String) {
+    pub fn set_node_id(&mut self, node_id: String) {
         match self {
-            Resolved::Ready(cmd) => cmd.host = Some(HostName::new(&host)),
-            Resolved::NeedsContext { command, .. } => command.host = Some(HostName::new(&host)),
+            Resolved::Ready(cmd) => cmd.node_id = Some(NodeId::new(&node_id)),
+            Resolved::NeedsContext { command, .. } => command.node_id = Some(NodeId::new(&node_id)),
         }
     }
 }

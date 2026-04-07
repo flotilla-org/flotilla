@@ -27,7 +27,7 @@ impl WorkspaceNoun {
         match self.verb {
             WorkspaceVerb::Select => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::SelectWorkspace { ws_ref: self.subject },
@@ -70,7 +70,7 @@ mod tests {
         let resolved = parse(&["workspace", "feat-ws", "select"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::SelectWorkspace { ws_ref: "feat-ws".into() }

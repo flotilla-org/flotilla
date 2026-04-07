@@ -36,7 +36,7 @@ impl AgentNoun {
         match self.verb {
             AgentVerb::Teleport { branch, checkout } => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::TeleportSession { session_id: self.subject, branch, checkout_key: checkout },
@@ -46,7 +46,7 @@ impl AgentNoun {
             }),
             AgentVerb::Archive => Ok(Resolved::NeedsContext {
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::ArchiveSession { session_id: self.subject },
@@ -100,7 +100,7 @@ mod tests {
         let resolved = parse(&["agent", "claude-1", "teleport"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::TeleportSession { session_id: "claude-1".into(), branch: None, checkout_key: None },
@@ -115,7 +115,7 @@ mod tests {
         let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::TeleportSession { session_id: "claude-1".into(), branch: Some("feat".into()), checkout_key: None },
@@ -130,7 +130,7 @@ mod tests {
         let resolved = parse(&["agent", "claude-1", "teleport", "--branch", "feat", "--checkout", "/tmp/wt"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::TeleportSession {
@@ -149,7 +149,7 @@ mod tests {
         let resolved = parse(&["agent", "claude-1", "archive"]).resolve().unwrap();
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ArchiveSession { session_id: "claude-1".into() }
