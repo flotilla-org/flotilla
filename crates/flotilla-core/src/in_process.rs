@@ -15,10 +15,11 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    qualified_path::QualifiedPath, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName,
-    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
-    SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    qualified_path::{HostId, QualifiedPath},
+    Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
+    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, SystemInfo, ToolInventory,
+    TopologyResponse, TopologyRoute,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -935,10 +936,15 @@ impl InProcessDaemon {
             }
         }
         for node in &peer_nodes {
+            let environment_id = self
+                .host_registry
+                .environment_id_for_node(&node.node_id)
+                .await
+                .unwrap_or_else(|| EnvironmentId::host(HostId::new(node.display_name.as_str())));
             self.host_registry
                 .publish_peer_summary(
                     HostSummary {
-                        environment_id: EnvironmentId::new(node.node_id.as_str()),
+                        environment_id,
                         node: node.clone(),
                         system: SystemInfo::default(),
                         inventory: ToolInventory::default(),
@@ -2130,10 +2136,12 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::HostStatus(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
-            CommandAction::QueryHostProviders { target_environment_id } => match self.get_host_providers_internal(target_environment_id).await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::HostProviders(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
+            CommandAction::QueryHostProviders { target_environment_id } => {
+                match self.get_host_providers_internal(target_environment_id).await {
+                    Ok(v) => Ok(flotilla_protocol::CommandValue::HostProviders(Box::new(v))),
+                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                }
+            }
             CommandAction::QueryIssues { repo, params, page, count } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
                 let service = self.get_issue_query_service(&repo_path).await?;

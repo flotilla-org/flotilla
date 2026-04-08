@@ -2175,6 +2175,24 @@ async fn publish_peer_summary_normalizes_host_name() {
 }
 
 #[tokio::test]
+async fn set_peer_providers_reuses_existing_peer_host_environment_identity() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
+
+    let peer_host = HostName::new("remote-host");
+    let canonical_summary = sample_remote_host_summary("remote-host");
+    let expected_environment_id = canonical_summary.environment_id.clone();
+
+    daemon.publish_peer_summary(&peer_host, canonical_summary).await;
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), ProviderData::default())], 0).await;
+
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
+    let peer_entry = hosts.hosts.iter().find(|entry| entry.node == test_node(peer_host.as_str())).expect("peer entry");
+
+    assert_eq!(peer_entry.environment_id, expected_environment_id);
+    assert!(peer_entry.environment_id.is_host());
+}
+
+#[tokio::test]
 async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
     let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     let mut rx = daemon.subscribe();

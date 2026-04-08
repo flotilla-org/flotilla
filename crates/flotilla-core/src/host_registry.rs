@@ -76,12 +76,7 @@ impl HostRegistry {
 
         let mut node_environments = self.node_environments.write().await;
         let mut hosts = self.hosts.write().await;
-        let state = ensure_host_state(
-            &mut hosts,
-            &mut node_environments,
-            &self.local_node,
-            summary.environment_id.clone(),
-        );
+        let state = ensure_host_state(&mut hosts, &mut node_environments, &self.local_node, summary.environment_id.clone());
         if state.summary.as_ref() != Some(&summary) {
             state.summary = Some(summary);
             state.seq += 1;
@@ -103,25 +98,43 @@ impl HostRegistry {
     pub(crate) async fn list_hosts(&self, local_counts: HostCounts, remote_counts: &HashMap<NodeId, HostCounts>) -> HostListResponse {
         let configured = self.configured_peers.read().await.clone();
         let (statuses, summaries) = self.active_host_maps().await;
-        let host_states = self.active_host_states().await;
-
-        let hosts = known_nodes(&self.local_node.node_id, &configured, &statuses, &summaries, remote_counts)
-            .into_iter()
-            .map(|node_id| {
-                build_host_list_entry(
-                    &node_id,
-                    &self.local_node,
-                    &configured,
-                    &statuses,
-                    &summaries,
-                    &host_states,
-                    local_counts,
-                    remote_counts,
-                )
-            })
+        let hosts = self.hosts.read().await;
+        let mut host_entries: Vec<_> = hosts
+            .iter()
+            .filter(|(_, state)| !state.removed)
+            .map(|(_, state)| build_host_list_entry_from_state(&self.local_node, &configured, local_counts, remote_counts, state))
             .collect();
 
-        HostListResponse { hosts }
+        let active_node_ids: HashSet<_> = host_entries.iter().map(|entry| entry.node.node_id.clone()).collect();
+        host_entries.extend(
+            known_nodes(&self.local_node.node_id, &configured, &statuses, &summaries, remote_counts)
+                .into_iter()
+                .filter(|node_id| !active_node_ids.contains(node_id))
+                .map(|node_id| {
+                    build_host_list_entry(
+                        &node_id,
+                        &self.local_node,
+                        &configured,
+                        &statuses,
+                        &summaries,
+                        &HashMap::new(),
+                        local_counts,
+                        remote_counts,
+                    )
+                }),
+        );
+        host_entries.sort_by(|a, b| {
+            b.is_local
+                .cmp(&a.is_local)
+                .then_with(|| a.node.node_id.cmp(&b.node.node_id))
+                .then_with(|| a.environment_id.cmp(&b.environment_id))
+        });
+
+        HostListResponse { hosts: host_entries }
+    }
+
+    pub(crate) async fn environment_id_for_node(&self, node_id: &NodeId) -> Option<EnvironmentId> {
+        self.node_environments.read().await.get(node_id).cloned()
     }
 
     pub(crate) async fn get_host_status(
@@ -156,10 +169,7 @@ impl HostRegistry {
         let (statuses, summaries) = self.active_host_maps().await;
         let hosts = self.hosts.read().await;
         let state = hosts.get(environment_id).ok_or_else(|| format!("host not found: {environment_id}"))?;
-        let summary = state
-            .summary
-            .clone()
-            .ok_or_else(|| format!("no summary available for host: {environment_id}"))?;
+        let summary = state.summary.clone().ok_or_else(|| format!("no summary available for host: {environment_id}"))?;
 
         Ok(build_host_providers(environment_id, &state.node_id, &self.local_node, &configured, &statuses, &summaries, summary))
     }
@@ -185,7 +195,12 @@ impl HostRegistry {
                     events.push(DaemonEvent::HostRemoved { environment_id, seq: state.seq });
                 }
             } else {
-                events.push(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.local_node, &configured, &environment_id, state))));
+                events.push(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(
+                    &self.local_node,
+                    &configured,
+                    &environment_id,
+                    state,
+                ))));
             }
         }
         events
@@ -195,18 +210,9 @@ impl HostRegistry {
         let hosts = self.hosts.read().await;
         let active: HashMap<_, _> = hosts.iter().filter(|(_, state)| !state.removed).map(|(h, s)| (h.clone(), s.clone())).collect();
         let statuses = active.iter().map(|(_, state)| (state.node_id.clone(), state.connection_status.clone())).collect();
-        let summaries = active.iter().filter_map(|(_, state)| state.summary.clone().map(|summary| (state.node_id.clone(), summary))).collect();
+        let summaries =
+            active.iter().filter_map(|(_, state)| state.summary.clone().map(|summary| (state.node_id.clone(), summary))).collect();
         (statuses, summaries)
-    }
-
-    async fn active_host_states(&self) -> HashMap<NodeId, HostState> {
-        self.hosts
-            .read()
-            .await
-            .iter()
-            .filter(|(_, state)| !state.removed)
-            .map(|(_, state)| (state.node_id.clone(), state.clone()))
-            .collect()
     }
 
     pub(crate) async fn sync_host_membership(&self, remote_counts: &HashMap<NodeId, HostCounts>, emit: &impl Fn(DaemonEvent)) {
@@ -228,7 +234,12 @@ impl HostRegistry {
                             removed: false,
                         });
                         node_environments.insert(node_id.clone(), environment_id.clone());
-                        emit(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.local_node, &configured, &environment_id, state))));
+                        emit(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(
+                            &self.local_node,
+                            &configured,
+                            &environment_id,
+                            state,
+                        ))));
                     }
                     Entry::Occupied(mut entry) => {
                         let state = entry.get_mut();
@@ -237,7 +248,12 @@ impl HostRegistry {
                             state.removed = false;
                             state.seq += 1;
                             node_environments.insert(node_id.clone(), environment_id.clone());
-                            emit(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(&self.local_node, &configured, &environment_id, state))));
+                            emit(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(
+                                &self.local_node,
+                                &configured,
+                                &environment_id,
+                                state,
+                            ))));
                         }
                     }
                 }
@@ -331,7 +347,9 @@ impl HostRegistry {
             for (node_id, mut summary) in summaries {
                 summary.node.node_id = node_id.clone();
                 let node = summary.node.clone();
-                if let Some(snapshot) = update_host_summary(&self.local_node, &configured, &mut node_environments, &mut hosts, &node, summary) {
+                if let Some(snapshot) =
+                    update_host_summary(&self.local_node, &configured, &mut node_environments, &mut hosts, &node, summary)
+                {
                     emit(DaemonEvent::HostSnapshot(Box::new(snapshot)));
                 }
             }
@@ -416,7 +434,7 @@ fn ensure_host_state<'a>(
 ) -> &'a mut HostState {
     let node_id = node.node_id.clone();
     if let Some(previous_environment_id) = node_environments.insert(node_id.clone(), environment_id.clone()) {
-        if previous_environment_id != environment_id {
+        if previous_environment_id != environment_id && previous_environment_id == fallback_host_environment_id(&node_id) {
             hosts.remove(&previous_environment_id);
         }
     }
@@ -452,7 +470,12 @@ fn node_info_for(
     NodeInfo::new(node_id.clone(), node_id.as_str())
 }
 
-fn build_host_snapshot(local_node: &NodeInfo, configured: &HashMap<NodeId, String>, _environment_id: &EnvironmentId, state: &HostState) -> HostSnapshot {
+fn build_host_snapshot(
+    local_node: &NodeInfo,
+    configured: &HashMap<NodeId, String>,
+    _environment_id: &EnvironmentId,
+    state: &HostState,
+) -> HostSnapshot {
     debug_assert!(!state.removed, "removed hosts should not be materialized as snapshots");
     let node = state
         .summary
@@ -625,6 +648,33 @@ fn build_host_list_entry(
     }
 }
 
+fn build_host_list_entry_from_state(
+    local_node: &NodeInfo,
+    configured: &HashMap<NodeId, String>,
+    local_counts: HostCounts,
+    remote_counts: &HashMap<NodeId, HostCounts>,
+    state: &HostState,
+) -> HostListEntry {
+    let is_local = state.node_id == local_node.node_id;
+    let counts = if is_local { local_counts } else { remote_counts.get(&state.node_id).copied().unwrap_or_default() };
+    let node = state
+        .summary
+        .as_ref()
+        .map(|summary| summary.node.clone())
+        .unwrap_or_else(|| node_info_for(&state.node_id, configured, None, Some(local_node)));
+
+    HostListEntry {
+        environment_id: state.environment_id.clone(),
+        node,
+        is_local,
+        configured: !is_local && configured.contains_key(&state.node_id),
+        connection_status: state.connection_status.clone(),
+        has_summary: state.summary.is_some(),
+        repo_count: counts.repo_count,
+        work_item_count: counts.work_item_count,
+    }
+}
+
 struct HostStatusContext<'a> {
     local_node: &'a NodeInfo,
     configured: &'a HashMap<NodeId, String>,
@@ -634,7 +684,12 @@ struct HostStatusContext<'a> {
     remote_counts: &'a HashMap<NodeId, HostCounts>,
 }
 
-fn build_host_status(environment_id: &EnvironmentId, node_id: &NodeId, summary: Option<HostSummary>, ctx: HostStatusContext<'_>) -> HostStatusResponse {
+fn build_host_status(
+    environment_id: &EnvironmentId,
+    node_id: &NodeId,
+    summary: Option<HostSummary>,
+    ctx: HostStatusContext<'_>,
+) -> HostStatusResponse {
     let is_local = node_id == &ctx.local_node.node_id;
     let counts = if is_local { ctx.local_counts } else { ctx.remote_counts.get(node_id).copied().unwrap_or_default() };
 
@@ -746,7 +801,10 @@ mod tests {
             .any(|event| matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.node.node_id == peer_node().node_id)));
 
         let replay = registry
-            .replay_host_events(&HashMap::from([(StreamKey::Host { environment_id: EnvironmentId::host(HostId::new("peer-node-host")) }, 2)]))
+            .replay_host_events(&HashMap::from([(
+                StreamKey::Host { environment_id: EnvironmentId::host(HostId::new("peer-node-host")) },
+                2,
+            )]))
             .await;
         assert!(!replay
             .iter()
@@ -810,5 +868,50 @@ mod tests {
 
         assert_eq!(peer.environment_id, EnvironmentId::host(HostId::new("peer-node")));
         assert!(peer.environment_id.is_host());
+    }
+
+    #[tokio::test]
+    async fn host_list_retains_multiple_environments_for_the_same_node() {
+        let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
+        let peer = peer_node();
+
+        let first_summary = HostSummary {
+            environment_id: EnvironmentId::host(HostId::new("peer-node-host-a")),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+        let second_summary = HostSummary {
+            environment_id: EnvironmentId::host(HostId::new("peer-node-host-b")),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+
+        registry.publish_peer_summary(first_summary.clone(), &|_| {}).await;
+        registry.publish_peer_summary(second_summary.clone(), &|_| {}).await;
+
+        let hosts = registry.list_hosts(HostCounts::default(), &HashMap::new()).await;
+        let peer_entries: Vec<_> = hosts.hosts.iter().filter(|entry| entry.node.node_id == peer.node_id).collect();
+
+        assert_eq!(peer_entries.len(), 2, "a single node should be able to expose multiple host environments");
+        assert!(peer_entries.iter().any(|entry| entry.environment_id == first_summary.environment_id));
+        assert!(peer_entries.iter().any(|entry| entry.environment_id == second_summary.environment_id));
+
+        let status_a = registry
+            .get_host_status(&first_summary.environment_id, HostCounts::default(), &HashMap::new())
+            .await
+            .expect("status for first environment");
+        let status_b = registry
+            .get_host_status(&second_summary.environment_id, HostCounts::default(), &HashMap::new())
+            .await
+            .expect("status for second environment");
+
+        assert_eq!(status_a.environment_id, first_summary.environment_id);
+        assert_eq!(status_b.environment_id, second_summary.environment_id);
     }
 }
