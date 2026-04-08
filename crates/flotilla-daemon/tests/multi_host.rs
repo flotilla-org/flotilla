@@ -42,10 +42,10 @@ fn qpath(host: &HostName, path: impl Into<PathBuf>) -> QualifiedPath {
 fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
     let mut clock = VectorClock::default();
     for _ in 0..seq {
-        clock.tick(&NodeId::new(origin));
+        clock.tick(&node(origin));
     }
     PeerDataMessage {
-        origin_node_id: NodeId::new(origin),
+        origin_node_id: node(origin),
         repo_identity: test_repo(),
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
@@ -54,7 +54,7 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
 }
 
 fn node(name: &str) -> NodeId {
-    NodeId::new(name)
+    NodeId::new(format!("node-{name}"))
 }
 
 fn node_info(name: &str) -> NodeInfo {
@@ -190,7 +190,16 @@ async fn peer_manager_to_merge_end_to_end() {
     let peers: Vec<(NodeInfo, &ProviderData)> = peer_data
         .iter()
         .flat_map(|(node_id, repos)| {
-            repos.values().map(move |state| (NodeInfo::new(node_id.clone(), node_id.to_string()), &state.provider_data))
+            repos.values().map(move |state| {
+                let display_name = state
+                    .provider_data
+                    .checkouts
+                    .keys()
+                    .find_map(|path| path.host_name())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| node_id.to_string());
+                (NodeInfo::new(node_id.clone(), display_name), &state.provider_data)
+            })
         })
         .collect();
 
@@ -375,13 +384,15 @@ async fn host_summary_round_trip_between_connected_peers() {
     follower_mgr.add_configured_target(ConfigLabel("leader".into()), HostName::new("leader"), None, Box::new(follower_transport));
 
     let mut leader_receivers = leader_mgr.connect_all().await;
-    let _follower_receivers = follower_mgr.connect_all().await;
+    let mut follower_receivers = follower_mgr.connect_all().await;
     let leader_connection = leader_receivers.pop().expect("leader receiver");
+    let follower_connection = follower_receivers.pop().expect("follower receiver");
     let generation = leader_connection.generation;
     let mut leader_rx = leader_connection.inbound_rx;
 
+    let sent_summary = follower_daemon.local_host_summary().await;
     follower_mgr
-        .send_to(&node("leader"), PeerWireMessage::HostSummary(follower_daemon.local_host_summary().await))
+        .send_to(&follower_connection.node.node_id, PeerWireMessage::HostSummary(sent_summary.clone()))
         .await
         .expect("send host summary");
 
@@ -394,19 +405,18 @@ async fn host_summary_round_trip_between_connected_peers() {
         .handle_inbound(flotilla_daemon::peer::InboundPeerEnvelope {
             msg: inbound,
             connection_generation: generation,
-            connection_peer: node("follower"),
+            connection_peer: leader_connection.node.node_id.clone(),
         })
         .await;
 
     assert_eq!(result, HandleResult::Ignored);
-    let expected = follower_daemon.local_host_summary().await;
-    let stored = leader_mgr.get_peer_host_summaries().get(&expected.environment_id).expect("leader stored follower summary");
-    assert_eq!(stored.node.node_id, node("follower"));
-    let mut expected = expected;
-    expected.node.node_id = node("follower");
+    let stored = leader_mgr.get_peer_host_summaries().get(&sent_summary.environment_id).expect("leader stored follower summary");
+    assert_eq!(stored.node.node_id, leader_connection.node.node_id);
+    let mut expected = sent_summary;
+    expected.node.node_id = leader_connection.node.node_id.clone();
     assert_eq!(stored, &expected);
 
-    let plan = leader_mgr.disconnect_peer(&node("follower"), generation);
+    let plan = leader_mgr.disconnect_peer(&leader_connection.node.node_id, generation);
     assert!(plan.was_active, "disconnect should clear active peer state");
     assert!(
         !leader_mgr.get_peer_host_summaries().contains_key(&expected.environment_id),

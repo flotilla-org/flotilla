@@ -5,6 +5,10 @@ use flotilla_protocol::{
     HostName, HostPath, NodeId, NodeInfo,
 };
 
+fn node(name: &str) -> NodeId {
+    NodeId::new(format!("node-{name}"))
+}
+
 fn health(entries: &[(&str, &str, bool)]) -> HashMap<String, HashMap<String, bool>> {
     let mut map: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for (cat, name, ok) in entries {
@@ -17,7 +21,7 @@ fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -
     WorkItem {
         kind,
         identity: WorkItemIdentity::Checkout(HostPath::new(HostName::new("test"), PathBuf::from("/tmp/wt")).into()),
-        node_id: NodeId::new("test"),
+        node_id: node("test"),
         branch: branch.map(String::from),
         description: description.to_string(),
         checkout: None,
@@ -72,7 +76,7 @@ mod status_human {
         HostSummary {
             environment_id: EnvironmentId::host(HostId::new(format!("{name}-env"))),
             host_name: Some(HostName::new(name)),
-            node: NodeInfo::new(NodeId::new(name), name),
+            node: NodeInfo::new(node(name), name),
             system: SystemInfo {
                 home_dir: Some("/home/dev".into()),
                 os: Some("linux".into()),

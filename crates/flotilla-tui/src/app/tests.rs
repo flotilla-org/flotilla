@@ -21,18 +21,25 @@ use tokio::sync::{Mutex as TokioMutex, Notify};
 
 use super::*;
 
-fn insert_local_host(model: &mut TuiModel, name: &str) {
-    let host_name = HostName::new(name);
-    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-local-env")));
+fn insert_host(
+    model: &mut TuiModel,
+    host_name: &str,
+    environment_id: EnvironmentId,
+    node_id: NodeId,
+    display_name: &str,
+    is_local: bool,
+    status: PeerStatus,
+) {
+    let host_name = HostName::new(host_name);
     model.hosts.insert(environment_id.clone(), TuiHostState {
         environment_id: environment_id.clone(),
         host_name: host_name.clone(),
-        is_local: true,
-        status: PeerStatus::Connected,
+        is_local,
+        status,
         summary: HostSummary {
             environment_id,
             host_name: Some(host_name.clone()),
-            node: NodeInfo::new(NodeId::new(name), name),
+            node: NodeInfo::new(node_id, display_name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -41,24 +48,15 @@ fn insert_local_host(model: &mut TuiModel, name: &str) {
     });
 }
 
-fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
+fn insert_local_host(model: &mut TuiModel, name: &str) {
     let host_name = HostName::new(name);
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-local-env")));
+    insert_host(model, host_name.as_str(), environment_id, NodeId::new(format!("node-{name}-local")), name, true, PeerStatus::Connected);
+}
+
+fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
     let environment_id = EnvironmentId::host(HostId::new(format!("{name}-peer-env")));
-    model.hosts.insert(environment_id.clone(), TuiHostState {
-        environment_id: environment_id.clone(),
-        host_name: host_name.clone(),
-        is_local: false,
-        status,
-        summary: HostSummary {
-            environment_id,
-            host_name: Some(host_name.clone()),
-            node: NodeInfo::new(NodeId::new(name), name),
-            system: flotilla_protocol::SystemInfo::default(),
-            inventory: flotilla_protocol::ToolInventory::default(),
-            providers: vec![],
-            environments: vec![],
-        },
-    });
+    insert_host(model, name, environment_id, NodeId::new(format!("node-{name}-peer")), name, false, status);
 }
 
 #[derive(Clone)]
@@ -773,8 +771,9 @@ fn peer_disconnect_clears_selected_target_host() {
     let mut app = stub_app();
     app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("alpha") };
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
+    let peer_node_id = app.model.resolve_host(&HostName::new("alpha")).expect("alpha host").summary.node.node_id.clone();
 
-    app.handle_daemon_event(DaemonEvent::PeerStatusChanged { node_id: NodeId::new("alpha"), status: PeerConnectionState::Disconnected });
+    app.handle_daemon_event(DaemonEvent::PeerStatusChanged { node_id: peer_node_id, status: PeerConnectionState::Disconnected });
 
     assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     assert_eq!(app.model.resolve_host(&HostName::new("alpha")).unwrap().status, PeerStatus::Disconnected);
@@ -1143,6 +1142,71 @@ fn local_and_remote_duplicate_host_names_are_ambiguous() {
     let err = app.validate_provisioning_target(&target).expect_err("duplicate host names should be rejected");
 
     assert!(err.contains("ambiguous host: desktop"), "unexpected error: {err}");
+}
+
+#[test]
+fn host_target_resolution_is_equivalent_for_many_nodes_and_shared_node_topologies() {
+    let beta_environment_id = EnvironmentId::host(HostId::new("beta-host"));
+
+    let mut many_nodes = stub_app();
+    insert_host(
+        &mut many_nodes.model,
+        "alpha",
+        EnvironmentId::host(HostId::new("alpha-host")),
+        NodeId::new("node-alpha"),
+        "Alpha",
+        false,
+        PeerStatus::Connected,
+    );
+    insert_host(&mut many_nodes.model, "beta", beta_environment_id.clone(), NodeId::new("node-beta"), "Beta", false, PeerStatus::Connected);
+    insert_host(
+        &mut many_nodes.model,
+        "gamma",
+        EnvironmentId::host(HostId::new("gamma-host")),
+        NodeId::new("node-gamma"),
+        "Gamma",
+        false,
+        PeerStatus::Connected,
+    );
+
+    let mut shared_node = stub_app();
+    let shared_node_id = NodeId::new("node-hub");
+    insert_host(
+        &mut shared_node.model,
+        "alpha",
+        EnvironmentId::host(HostId::new("alpha-host")),
+        shared_node_id.clone(),
+        "Hub",
+        false,
+        PeerStatus::Connected,
+    );
+    insert_host(&mut shared_node.model, "beta", beta_environment_id.clone(), shared_node_id.clone(), "Hub", false, PeerStatus::Connected);
+    insert_host(
+        &mut shared_node.model,
+        "gamma",
+        EnvironmentId::host(HostId::new("gamma-host")),
+        shared_node_id.clone(),
+        "Hub",
+        false,
+        PeerStatus::Connected,
+    );
+
+    let many_nodes_host = many_nodes.model.resolve_host(&HostName::new("beta")).expect("resolve beta in many-nodes topology");
+    let shared_node_host = shared_node.model.resolve_host(&HostName::new("beta")).expect("resolve beta in shared-node topology");
+
+    assert_eq!(many_nodes_host.environment_id, beta_environment_id);
+    assert_eq!(shared_node_host.environment_id, beta_environment_id);
+    assert_ne!(many_nodes_host.summary.node.node_id, shared_node_host.summary.node.node_id);
+
+    let (many_nodes_target_node, many_nodes_target) =
+        many_nodes.model.resolve_environment_target(&beta_environment_id).expect("many-nodes environment target");
+    let (shared_node_target_node, shared_node_target) =
+        shared_node.model.resolve_environment_target(&beta_environment_id).expect("shared-node environment target");
+
+    assert_eq!(many_nodes_target, ProvisioningTarget::Host { host: HostName::new("beta") });
+    assert_eq!(shared_node_target, ProvisioningTarget::Host { host: HostName::new("beta") });
+    assert_eq!(many_nodes_target_node, NodeId::new("node-beta"));
+    assert_eq!(shared_node_target_node, shared_node_id);
 }
 
 #[test]

@@ -869,7 +869,7 @@ fn remote_host_home_directory_shortening() {
     let main_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,
         identity: WorkItemIdentity::Checkout(main_host_path.clone().into()),
-        node_id: NodeId::new(remote_host.as_str()),
+        node_id: NodeId::new(format!("node-{}", remote_host.as_str())),
         branch: Some("main".into()),
         description: "checkout main".into(),
         checkout: Some(CheckoutRef::from_host_path(main_host_path, true)),
@@ -888,7 +888,7 @@ fn remote_host_home_directory_shortening() {
     let feat_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,
         identity: WorkItemIdentity::Checkout(host_path.clone().into()),
-        node_id: NodeId::new(remote_host.as_str()),
+        node_id: NodeId::new(format!("node-{}", remote_host.as_str())),
         branch: Some("feat-x".into()),
         description: "checkout feat-x".into(),
         checkout: Some(CheckoutRef::from_host_path(host_path, false)),
@@ -919,7 +919,7 @@ fn remote_host_home_directory_shortening() {
         summary: HostSummary {
             environment_id: local_environment_id,
             host_name: Some(HostName::new("local")),
-            node: NodeInfo::new(NodeId::new("local"), "local"),
+            node: NodeInfo::new(NodeId::new("node-local"), "local"),
             system: SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -937,7 +937,7 @@ fn remote_host_home_directory_shortening() {
         summary: HostSummary {
             environment_id: remote_environment_id,
             host_name: Some(remote_host.clone()),
-            node: NodeInfo::new(NodeId::new(remote_host.as_str()), remote_host.as_str()),
+            node: NodeInfo::new(NodeId::new(format!("node-{}", remote_host.as_str())), remote_host.as_str()),
             system: SystemInfo { home_dir: Some(PathBuf::from("/home/alice")), ..SystemInfo::default() },
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],

@@ -21,6 +21,10 @@ use flotilla_daemon::{
 use flotilla_protocol::{GoodbyeReason, HostName, NodeId, PeerWireMessage, RepoSelector};
 use tokio::sync::{Mutex, Notify};
 
+fn test_node_id(name: &str) -> NodeId {
+    NodeId::new(format!("node-{name}"))
+}
+
 /// Peer sender that captures messages and signals a `Notify` on each send,
 /// allowing tests to wait deterministically instead of sleeping.
 struct NotifyPeerSender {
@@ -69,7 +73,7 @@ async fn peer_connect_triggers_local_state_send() {
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
     let host_a = HostName::new("host-a");
     let _host_b = HostName::new("host-b");
-    let node_b = NodeId::new("host-b");
+    let node_b = test_node_id("host-b");
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
     let node_a = daemon.node_id().clone();
@@ -110,7 +114,7 @@ async fn peer_reconnect_resends_local_state() {
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
     let host_a = HostName::new("host-a");
     let _host_b = HostName::new("host-b");
-    let node_b = NodeId::new("host-b");
+    let node_b = test_node_id("host-b");
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
     let node_a = daemon.node_id().clone();

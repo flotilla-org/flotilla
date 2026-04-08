@@ -1265,16 +1265,12 @@ async fn disconnect_peer_returns_remove_repo_for_remote_only_with_no_remaining_p
 #[tokio::test]
 async fn disconnect_peer_clears_configured_peer_visibility_for_that_node() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
-    let generation = accepted_generation(mgr.activate_connection(
-        NodeId::new("peer"),
-        MockPeerSender::discard(),
-        ConnectionMeta {
-            direction: ConnectionDirection::Outbound,
-            config_label: Some(ConfigLabel("configured-peer".into())),
-            expected_peer: Some(NodeId::new("peer")),
-            config_backed: true,
-        },
-    ));
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("peer"), MockPeerSender::discard(), ConnectionMeta {
+        direction: ConnectionDirection::Outbound,
+        config_label: Some(ConfigLabel("configured-peer".into())),
+        expected_peer: Some(NodeId::new("peer")),
+        config_backed: true,
+    }));
 
     assert_eq!(mgr.configured_peers().len(), 1);
     assert_eq!(mgr.configured_peers()[0].node_id, NodeId::new("peer"));

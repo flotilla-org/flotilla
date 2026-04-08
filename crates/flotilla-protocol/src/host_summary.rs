@@ -112,7 +112,7 @@ mod tests {
         let summary = HostSummary {
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
             host_name: Some(HostName::new("desktop")),
-            node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
+            node: NodeInfo::new(NodeId::new("node-desktop"), "Desktop"),
             system: SystemInfo {
                 home_dir: Some(PathBuf::from("/home/dev")),
                 os: Some("linux".into()),
@@ -141,7 +141,7 @@ mod tests {
 
         let json = serde_json::to_value(&summary).expect("serialize host summary");
         assert_eq!(json["environment_id"], "host:desktop-host");
-        assert_eq!(json["node"]["node_id"], "desktop");
+        assert_eq!(json["node"]["node_id"], "node-desktop");
         assert_eq!(json["node"]["display_name"], "Desktop");
         assert_roundtrip(&summary);
     }
@@ -151,13 +151,13 @@ mod tests {
         let snapshot = HostSnapshot {
             seq: 1,
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
-            node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
+            node: NodeInfo::new(NodeId::new("node-desktop"), "Desktop"),
             is_local: true,
             connection_status: crate::PeerConnectionState::Connected,
             summary: HostSummary {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
                 host_name: Some(HostName::new("desktop")),
-                node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
+                node: NodeInfo::new(NodeId::new("node-desktop"), "Desktop"),
                 system: SystemInfo {
                     home_dir: Some(PathBuf::from("/home/dev")),
                     os: Some("linux".into()),
@@ -173,7 +173,7 @@ mod tests {
         };
         let json = serde_json::to_value(&snapshot).expect("serialize host snapshot");
         assert_eq!(json["environment_id"], "host:desktop-host");
-        assert_eq!(json["node"]["node_id"], "desktop");
+        assert_eq!(json["node"]["node_id"], "node-desktop");
         assert_eq!(json["summary"]["node"]["display_name"], "Desktop");
         assert_roundtrip(&snapshot);
     }
