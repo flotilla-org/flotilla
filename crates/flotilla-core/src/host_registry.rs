@@ -78,6 +78,7 @@ impl HostRegistry {
         let mut node_environments = self.node_environments.write().await;
         let mut hosts = self.hosts.write().await;
         let state = ensure_host_state(&mut hosts, &mut node_environments, &self.local_node, summary.environment_id.clone());
+        node_environments.insert(self.local_node.node_id.clone(), summary.environment_id.clone());
         if state.summary.as_ref() != Some(&summary) {
             state.summary = Some(summary);
             state.seq += 1;
@@ -340,12 +341,7 @@ impl HostRegistry {
                 if let Ok(mut hosts) = self.hosts.try_write() {
                     if let Ok(mut node_environments) = self.node_environments.try_write() {
                         if let Ok(mut pending_node_statuses) = self.pending_node_statuses.try_write() {
-                            let current_environment_id = node_environments.get(&snap.node.node_id).cloned();
-                            let stale = current_environment_id
-                                .as_ref()
-                                .and_then(|environment_id| hosts.get(environment_id))
-                                .is_some_and(|state| state.seq > snap.seq);
-                            if stale {
+                            if hosts.get(&snap.environment_id).is_some_and(|state| state.seq > snap.seq) {
                                 return;
                             }
 
@@ -366,16 +362,17 @@ impl HostRegistry {
                 if let Ok(mut hosts) = self.hosts.try_write() {
                     if let Some(state) = hosts.get_mut(environment_id) {
                         if state.seq <= *seq {
+                            let node_id = state.node_id.clone();
                             if let Ok(mut pending_node_statuses) = self.pending_node_statuses.try_write() {
-                                pending_node_statuses.remove(&state.node_id);
-                            }
-                            if let Ok(mut node_environments) = self.node_environments.try_write() {
-                                node_environments.remove(&state.node_id);
+                                pending_node_statuses.remove(&node_id);
                             }
                             state.connection_status = PeerConnectionState::Disconnected;
                             state.summary = None;
                             state.seq = *seq;
                             state.removed = true;
+                            if let Ok(mut node_environments) = self.node_environments.try_write() {
+                                reassign_node_environment_if_needed(&hosts, &mut node_environments, &node_id, environment_id);
+                            }
                         }
                     }
                 }
@@ -403,7 +400,12 @@ fn ensure_host_state<'a>(
     environment_id: EnvironmentId,
 ) -> &'a mut HostState {
     let node_id = node.node_id.clone();
-    node_environments.insert(node_id.clone(), environment_id.clone());
+    let should_update_mapping = node_environments.get(&node_id).cloned().is_none_or(|current_environment_id| {
+        current_environment_id == environment_id || hosts.get(&current_environment_id).is_none_or(|state| state.removed)
+    });
+    if should_update_mapping {
+        node_environments.insert(node_id.clone(), environment_id.clone());
+    }
 
     let state = hosts.entry(environment_id.clone()).or_insert_with(|| HostState {
         node_id: node_id.clone(),
@@ -574,6 +576,26 @@ fn mark_host_removed(hosts: &mut HashMap<EnvironmentId, HostState>, environment_
     state.removed = true;
     state.seq += 1;
     Some(state.seq)
+}
+
+fn reassign_node_environment_if_needed(
+    hosts: &HashMap<EnvironmentId, HostState>,
+    node_environments: &mut HashMap<NodeId, EnvironmentId>,
+    node_id: &NodeId,
+    removed_environment_id: &EnvironmentId,
+) {
+    if node_environments.get(node_id).is_some_and(|current_environment_id| current_environment_id != removed_environment_id) {
+        return;
+    }
+
+    let replacement =
+        hosts.values().filter(|state| !state.removed && state.node_id == *node_id).map(|state| state.environment_id.clone()).min();
+
+    if let Some(environment_id) = replacement {
+        node_environments.insert(node_id.clone(), environment_id);
+    } else {
+        node_environments.remove(node_id);
+    }
 }
 
 struct HostStatusContext<'a> {
@@ -903,7 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_host_snapshot_does_not_repoint_canonical_environment_mapping() {
+    async fn stale_host_snapshot_from_another_environment_does_not_repoint_canonical_mapping_even_with_higher_seq() {
         let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
         let peer = peer_node();
         let current_environment_id = EnvironmentId::host(HostId::new("peer-node-host-a"));
@@ -926,7 +948,7 @@ mod tests {
         assert_eq!(registry.environment_id_for_node(&peer.node_id).await, Some(current_environment_id.clone()));
 
         let stale_snapshot = HostSnapshot {
-            seq: 1,
+            seq: 9,
             environment_id: stale_environment_id.clone(),
             node: peer.clone(),
             is_local: false,
@@ -946,7 +968,49 @@ mod tests {
         assert_eq!(
             registry.environment_id_for_node(&peer.node_id).await,
             Some(current_environment_id),
-            "stale snapshots must not move the canonical node-to-environment mapping"
+            "cross-environment snapshots must not move the canonical node-to-environment mapping based on seq alone"
         );
+    }
+
+    #[tokio::test]
+    async fn removing_one_environment_keeps_another_live_environment_reachable() {
+        let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
+        let peer = peer_node();
+        let first_environment_id = EnvironmentId::host(HostId::new("peer-node-host-a"));
+        let second_environment_id = EnvironmentId::host(HostId::new("peer-node-host-b"));
+
+        let first_summary = HostSummary {
+            environment_id: first_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+        let second_summary = HostSummary {
+            environment_id: second_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+
+        registry.publish_peer_summary(first_summary, &|_| {}).await;
+        registry.publish_peer_summary(second_summary, &|_| {}).await;
+
+        registry.apply_event(&DaemonEvent::HostRemoved { environment_id: first_environment_id.clone(), seq: 2 });
+
+        assert_eq!(
+            registry.environment_id_for_node(&peer.node_id).await,
+            Some(second_environment_id.clone()),
+            "removing one environment should leave another live environment addressable"
+        );
+
+        let status = registry
+            .get_host_status(&second_environment_id, HostCounts::default(), &HashMap::new())
+            .await
+            .expect("status for remaining environment");
+        assert_eq!(status.environment_id, second_environment_id);
     }
 }
