@@ -30,7 +30,7 @@ use crate::{
     daemon::DaemonHandle,
     environment_manager::EnvironmentManager,
     executor,
-    executor::checkout::checkout_is_local_owned,
+    executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
@@ -867,7 +867,7 @@ impl InProcessDaemon {
     async fn resolve_checkout_selector(
         &self,
         selector: &flotilla_protocol::CheckoutSelector,
-        target_host: Option<&HostName>,
+        scope: &CheckoutResolutionScope,
     ) -> Result<(PathBuf, String), String> {
         let peer_providers = self.peer_providers.read().await;
         let repos = self.repos.read().await;
@@ -885,10 +885,8 @@ impl InProcessDaemon {
                 &snapshot_owned.providers
             };
             for (host_path, checkout) in &providers.checkouts {
-                if let Some(host) = target_host {
-                    if !checkout_is_local_owned(host_path, host) {
-                        continue;
-                    }
+                if !checkout_matches_scope(host_path, checkout, &self.host_name, scope) {
+                    continue;
                 }
                 let matched = match selector {
                     flotilla_protocol::CheckoutSelector::Path(path) => host_path.path == *path,
@@ -911,9 +909,21 @@ impl InProcessDaemon {
     async fn resolve_repo_for_command(&self, command: &Command) -> Result<PathBuf, String> {
         use flotilla_protocol::CommandAction;
 
+        let checkout_scope = match (&command.provisioning_target, command.node_id.as_ref()) {
+            (Some(flotilla_protocol::ProvisioningTarget::Host { host }), _) => CheckoutResolutionScope::Host(host.clone()),
+            (_, Some(node_id)) if *node_id != self.node_id => CheckoutResolutionScope::RemoteAny,
+            _ => CheckoutResolutionScope::Any,
+        };
+
         match &command.action {
             CommandAction::Checkout { repo, .. } => self.resolve_repo_selector(repo).await,
-            CommandAction::RemoveCheckout { checkout, .. } => self.resolve_checkout_selector(checkout, None).await.map(|(repo, _)| repo),
+            CommandAction::RemoveCheckout { checkout, .. } => {
+                if let Some(selector) = command.context_repo.as_ref() {
+                    self.resolve_repo_selector(selector).await
+                } else {
+                    self.resolve_checkout_selector(checkout, &checkout_scope).await.map(|(repo, _)| repo)
+                }
+            }
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
             CommandAction::FetchCheckoutStatus { .. }
             | CommandAction::OpenChangeRequest { .. }

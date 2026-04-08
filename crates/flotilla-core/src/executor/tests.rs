@@ -5,7 +5,7 @@ use std::{
 
 use super::{
     build_plan,
-    checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutService},
+    checkout::{resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     session_actions::resolve_attach_command,
     workspace_config, workspace_label_for_host, ExecutorStepResolver, RepoExecutionContext,
 };
@@ -1189,7 +1189,9 @@ async fn remove_checkout_resolves_for_remote_host() {
     )
     .await;
 
-    assert!(matches!(plan, Err(CommandValue::Error { .. })), "remote-only query should not resolve without a local-owned checkout");
+    let plan = plan.expect("remote host target should resolve remote-owned checkout");
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
 }
 
 #[tokio::test]
@@ -1218,6 +1220,55 @@ async fn remove_checkout_disambiguates_by_target_host() {
     let plan = plan.expect("build_plan should resolve the targeted checkout");
     assert_eq!(plan.steps.len(), 1);
     assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+    match &plan.steps[0].action {
+        StepAction::RemoveCheckout { deleted_checkout_paths, .. } => {
+            assert_eq!(deleted_checkout_paths.len(), 1);
+            assert_eq!(deleted_checkout_paths[0].path, PathBuf::from("/repo/wt-feat"));
+            assert_eq!(deleted_checkout_paths[0].host_name(), Some(&HostName::new("remote-box")));
+        }
+        other => panic!("expected RemoveCheckout step, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remove_checkout_remote_node_ignores_local_duplicate_branch() {
+    let local = hp("/repo/wt-feat-local");
+    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat-remote"));
+    let mut data = empty_data();
+    data.checkouts.insert(local.into(), TestCheckout::new("feat").build());
+    let mut remote_checkout = TestCheckout::new("feat").build();
+    remote_checkout.host_name = Some(HostName::new("remote-box"));
+    data.checkouts.insert(remote.into(), remote_checkout);
+
+    let config_base = config_base();
+    let plan = build_plan(
+        Command {
+            node_id: Some(NodeId::new("remote-box")),
+            provisioning_target: None,
+            context_repo: Some(RepoSelector::Identity(repo_identity())),
+            action: remove_checkout_action("feat"),
+        },
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(empty_registry()),
+        Arc::new(data),
+        config_base.clone(),
+        test_attachable_store(&config_base),
+        None,
+        local_node_id(),
+        local_host(),
+    )
+    .await
+    .expect("build_plan should resolve remote checkout without considering local duplicate");
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+    match &plan.steps[0].action {
+        StepAction::RemoveCheckout { deleted_checkout_paths, .. } => {
+            assert_eq!(deleted_checkout_paths.len(), 1);
+            assert_eq!(deleted_checkout_paths[0].path, PathBuf::from("/repo/wt-feat-remote"));
+        }
+        other => panic!("expected RemoveCheckout step, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2834,7 +2885,12 @@ fn resolve_checkout_branch_path_found() {
     data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat-branch").build());
     let local_host = HostName::local();
 
-    let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/repo/wt-feat")), &data, &local_host);
+    let result = resolve_checkout_branch(
+        &CheckoutSelector::Path(PathBuf::from("/repo/wt-feat")),
+        &data,
+        &local_host,
+        &CheckoutResolutionScope::Local,
+    );
 
     assert_eq!(result.expect("path lookup should succeed"), "feat-branch");
 }
@@ -2844,7 +2900,12 @@ fn resolve_checkout_branch_path_not_found() {
     let data = empty_data();
     let local_host = HostName::local();
 
-    let result = resolve_checkout_branch(&CheckoutSelector::Path(PathBuf::from("/nonexistent")), &data, &local_host);
+    let result = resolve_checkout_branch(
+        &CheckoutSelector::Path(PathBuf::from("/nonexistent")),
+        &data,
+        &local_host,
+        &CheckoutResolutionScope::Local,
+    );
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("checkout not found"));
@@ -2856,7 +2917,8 @@ fn resolve_checkout_branch_query_exact_match() {
     data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat-login").build());
     let local_host = HostName::local();
 
-    let result = resolve_checkout_branch(&CheckoutSelector::Query("feat-login".to_string()), &data, &local_host);
+    let result =
+        resolve_checkout_branch(&CheckoutSelector::Query("feat-login".to_string()), &data, &local_host, &CheckoutResolutionScope::Local);
 
     assert_eq!(result.expect("exact query should match"), "feat-login");
 }
@@ -2867,7 +2929,8 @@ fn resolve_checkout_branch_query_substring_match() {
     data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat-login-page").build());
     let local_host = HostName::local();
 
-    let result = resolve_checkout_branch(&CheckoutSelector::Query("login".to_string()), &data, &local_host);
+    let result =
+        resolve_checkout_branch(&CheckoutSelector::Query("login".to_string()), &data, &local_host, &CheckoutResolutionScope::Local);
 
     assert_eq!(result.expect("substring query should match"), "feat-login-page");
 }
@@ -2878,7 +2941,8 @@ fn resolve_checkout_branch_query_not_found() {
     data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat-login").build());
     let local_host = HostName::local();
 
-    let result = resolve_checkout_branch(&CheckoutSelector::Query("nonexistent".to_string()), &data, &local_host);
+    let result =
+        resolve_checkout_branch(&CheckoutSelector::Query("nonexistent".to_string()), &data, &local_host, &CheckoutResolutionScope::Local);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("checkout not found"));
@@ -2891,10 +2955,49 @@ fn resolve_checkout_branch_query_ambiguous() {
     data.checkouts.insert(hp("/repo/wt-feat-b").into(), TestCheckout::new("feat-b").build());
     let local_host = HostName::local();
 
-    let result = resolve_checkout_branch(&CheckoutSelector::Query("feat".to_string()), &data, &local_host);
+    let result = resolve_checkout_branch(&CheckoutSelector::Query("feat".to_string()), &data, &local_host, &CheckoutResolutionScope::Local);
 
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("ambiguous"));
+}
+
+#[test]
+fn resolve_checkout_branch_remote_any_ignores_local_matches() {
+    let mut data = empty_data();
+    data.checkouts.insert(hp("/repo/wt-feat-local").into(), TestCheckout::new("feat").build());
+    let remote = HostPath::new(HostName::new("remote-box"), PathBuf::from("/repo/wt-feat-remote"));
+    let mut remote_checkout = TestCheckout::new("feat").build();
+    remote_checkout.host_name = Some(HostName::new("remote-box"));
+    data.checkouts.insert(remote.into(), remote_checkout);
+    let local_host = HostName::local();
+
+    let result =
+        resolve_checkout_branch(&CheckoutSelector::Query("feat".to_string()), &data, &local_host, &CheckoutResolutionScope::RemoteAny);
+
+    assert_eq!(result.expect("remote scope should ignore local match"), "feat");
+}
+
+#[test]
+fn resolve_checkout_branch_host_scope_matches_remote_host_name() {
+    let mut data = empty_data();
+    let remote_a = HostPath::new(HostName::new("alpha"), PathBuf::from("/repo/wt-feat-a"));
+    let mut remote_a_checkout = TestCheckout::new("feat").build();
+    remote_a_checkout.host_name = Some(HostName::new("alpha"));
+    data.checkouts.insert(remote_a.into(), remote_a_checkout);
+    let remote_b = HostPath::new(HostName::new("beta"), PathBuf::from("/repo/wt-feat-b"));
+    let mut remote_b_checkout = TestCheckout::new("feat").build();
+    remote_b_checkout.host_name = Some(HostName::new("beta"));
+    data.checkouts.insert(remote_b.into(), remote_b_checkout);
+    let local_host = HostName::local();
+
+    let result = resolve_checkout_branch(
+        &CheckoutSelector::Query("feat".to_string()),
+        &data,
+        &local_host,
+        &CheckoutResolutionScope::Host(HostName::new("beta")),
+    );
+
+    assert_eq!(result.expect("host scope should resolve targeted remote host"), "feat");
 }
 
 // -----------------------------------------------------------------------

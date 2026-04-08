@@ -436,7 +436,21 @@ async fn resolve_environment_target(
                 uuid::Uuid::new_v4(),
             )
             .await
-            .map_err(|e| color_eyre::eyre::eyre!(e))?;
+            .map_err(|e| color_eyre::eyre::eyre!(e));
+
+        let status = match status {
+            Ok(status) => status,
+            Err(err) => {
+                info!(
+                    host = %entry.host_name,
+                    environment_id = %entry.environment_id,
+                    node_id = %entry.node.node_id,
+                    error = %err,
+                    "skipping host while resolving environment target"
+                );
+                continue;
+            }
+        };
 
         let CommandValue::HostStatus(response) = status else {
             return Err(color_eyre::eyre::eyre!("unexpected host status response while resolving environment"));

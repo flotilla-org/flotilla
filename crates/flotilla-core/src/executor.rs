@@ -20,7 +20,7 @@ use flotilla_protocol::{
 use tracing::{debug, error, info};
 
 use self::{
-    checkout::{checkout_is_local_owned, resolve_checkout_branch, CheckoutIntent, CheckoutService},
+    checkout::{checkout_is_local_owned, resolve_checkout_branch, CheckoutIntent, CheckoutResolutionScope, CheckoutService},
     session_actions::{resolve_attach_command, ReadOnlySessionActionService, TeleportFlow, TeleportSessionActionService},
     terminals::TerminalPreparationService,
     workspace::WorkspaceOrchestrator,
@@ -199,17 +199,26 @@ pub async fn build_plan(
         }
 
         CommandAction::RemoveCheckout { checkout } => {
+            let checkout_scope = if target_node_id == local_node_id {
+                CheckoutResolutionScope::Local
+            } else if let Some(target_host) = target_display_host.as_ref() {
+                CheckoutResolutionScope::Host(target_host.clone())
+            } else {
+                CheckoutResolutionScope::RemoteAny
+            };
             debug!(
                 ?checkout, %target_node_id, %local_host,
                 checkout_hosts = ?providers_data.checkouts.keys().map(|qp| (qp.host_name(), &qp.path)).collect::<Vec<_>>(),
                 "resolving checkout for removal"
             );
-            match resolve_checkout_branch(&checkout, &providers_data, &local_host) {
+            match resolve_checkout_branch(&checkout, &providers_data, &local_host, &checkout_scope) {
                 Ok(branch) => {
                     let deleted_paths: Vec<QualifiedPath> = providers_data
                         .checkouts
                         .iter()
-                        .filter(|(qp, co)| co.branch == branch && checkout_is_local_owned(qp, &local_host))
+                        .filter(|(qp, co)| {
+                            co.branch == branch && self::checkout::checkout_matches_scope(qp, co, &local_host, &checkout_scope)
+                        })
                         .map(|(qp, _)| qp.clone())
                         .collect();
                     info!(%branch, ?deleted_paths, %target_node_id, "built remove checkout plan");

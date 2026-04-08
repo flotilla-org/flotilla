@@ -28,6 +28,7 @@ pub struct DeleteConfirmWidget {
 
 impl DeleteConfirmWidget {
     pub fn new(identity: WorkItemIdentity, remote_node_id: Option<NodeId>, checkout_path: Option<PathBuf>) -> Self {
+        let checkout_path = if remote_node_id.is_some() { None } else { checkout_path };
         Self { info: None, loading: true, identity, remote_node_id, checkout_path }
     }
 
@@ -356,6 +357,35 @@ mod tests {
         match cmd {
             Command { action: CommandAction::RemoveCheckout { checkout, .. }, .. } => {
                 assert_eq!(checkout, CheckoutSelector::Path(PathBuf::from("/tmp/feat-x")));
+            }
+            other => panic!("expected RemoveCheckout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_confirm_remote_node_uses_query_selector_even_with_checkout_path() {
+        let node_id = NodeId::new("node-sha256:remote");
+        let mut widget =
+            DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), Some(node_id.clone()), Some(PathBuf::from("/tmp/feat-x")));
+        widget.update_info(CheckoutStatus {
+            branch: "feat/x".into(),
+            change_request_status: None,
+            merge_commit_sha: None,
+            unpushed_commits: vec![],
+            has_uncommitted: false,
+            uncommitted_files: vec![],
+            base_detection_warning: None,
+        });
+        let mut harness = TestWidgetHarness::new();
+        let mut ctx = harness.ctx();
+
+        widget.handle_action(Action::Confirm, &mut ctx);
+
+        let (cmd, _) = harness.commands.take_next().expect("expected command");
+        match cmd {
+            Command { action: CommandAction::RemoveCheckout { checkout, .. }, node_id: actual_node_id, .. } => {
+                assert_eq!(actual_node_id, Some(node_id));
+                assert_eq!(checkout, CheckoutSelector::Query("feat/x".into()));
             }
             other => panic!("expected RemoveCheckout, got {:?}", other),
         }

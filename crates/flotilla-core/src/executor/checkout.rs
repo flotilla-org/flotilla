@@ -1,5 +1,5 @@
 pub use flotilla_protocol::CheckoutIntent;
-use flotilla_protocol::{qualified_path::QualifiedPath, CheckoutSelector, HostName};
+use flotilla_protocol::{provider_data::Checkout, qualified_path::QualifiedPath, CheckoutSelector, HostName};
 use tracing::warn;
 
 use crate::{
@@ -21,6 +21,35 @@ pub(super) struct CheckoutService<'a> {
 /// locally.
 pub(crate) fn checkout_is_local_owned(host_path: &QualifiedPath, local_host: &HostName) -> bool {
     host_path.host_name() == Some(local_host) || host_path.host_id().is_some()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckoutResolutionScope {
+    Any,
+    Local,
+    Host(HostName),
+    RemoteAny,
+}
+
+pub(crate) fn checkout_matches_scope(
+    checkout_path: &QualifiedPath,
+    checkout: &Checkout,
+    local_host: &HostName,
+    scope: &CheckoutResolutionScope,
+) -> bool {
+    let effective_host_name = checkout.host_name.as_ref().or_else(|| checkout_path.host_name());
+    match scope {
+        CheckoutResolutionScope::Any => true,
+        CheckoutResolutionScope::Local => match effective_host_name {
+            Some(host_name) => host_name == local_host,
+            None => checkout_is_local_owned(checkout_path, local_host),
+        },
+        CheckoutResolutionScope::RemoteAny => match effective_host_name {
+            Some(host_name) => host_name != local_host,
+            None => !checkout_is_local_owned(checkout_path, local_host),
+        },
+        CheckoutResolutionScope::Host(target_host) => effective_host_name == Some(target_host),
+    }
 }
 
 impl<'a> CheckoutService<'a> {
@@ -77,12 +106,13 @@ pub(super) fn resolve_checkout_branch(
     selector: &CheckoutSelector,
     providers_data: &ProviderData,
     local_host: &HostName,
+    scope: &CheckoutResolutionScope,
 ) -> Result<String, String> {
     match selector {
         CheckoutSelector::Path(path) => providers_data
             .checkouts
             .iter()
-            .find(|(host_path, _)| checkout_is_local_owned(host_path, local_host) && host_path.path == *path)
+            .find(|(host_path, checkout)| checkout_matches_scope(host_path, checkout, local_host, scope) && host_path.path == *path)
             .map(|(_, checkout)| checkout.branch.clone())
             .ok_or_else(|| format!("checkout not found: {}", path.display())),
         CheckoutSelector::Query(query) => {
@@ -90,7 +120,7 @@ pub(super) fn resolve_checkout_branch(
                 .checkouts
                 .iter()
                 .filter(|(host_path, checkout)| {
-                    checkout_is_local_owned(host_path, local_host)
+                    checkout_matches_scope(host_path, checkout, local_host, scope)
                         && (checkout.branch == *query
                             || checkout.branch.contains(query)
                             || host_path.path.to_string_lossy().contains(query))
