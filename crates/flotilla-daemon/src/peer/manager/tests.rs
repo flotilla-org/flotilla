@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use flotilla_protocol::{qualified_path::HostId, EnvironmentId, NodeId, NodeInfo, StepAction, StepExecutionContext};
+use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, NodeId, NodeInfo, StepAction, StepExecutionContext};
 
 use super::*;
 use crate::peer::{
@@ -29,6 +29,7 @@ fn snapshot_msg(origin: &str, seq: u64) -> PeerDataMessage {
 fn sample_host_summary_for(name: &str) -> flotilla_protocol::HostSummary {
     flotilla_protocol::HostSummary {
         environment_id: EnvironmentId::host(HostId::new(format!("{name}-host"))),
+        host_name: Some(HostName::new(name)),
         node: NodeInfo::new(NodeId::new(name), name),
         system: flotilla_protocol::SystemInfo {
             home_dir: Some(PathBuf::from("/home/dev")),
@@ -265,11 +266,8 @@ async fn host_summary_handle_inbound_stores_for_connection_peer() {
         .await;
 
     assert_eq!(result, HandleResult::Ignored);
-    let stored = mgr
-        .get_peer_host_summaries()
-        .values()
-        .find(|summary| summary.node.node_id == connection_peer)
-        .expect("stored host summary");
+    let stored =
+        mgr.get_peer_host_summaries().values().find(|summary| summary.node.node_id == connection_peer).expect("stored host summary");
     assert_eq!(stored.node.node_id, connection_peer);
 }
 

@@ -21,8 +21,9 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData, ProviderError,
-    ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
+    Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
+    WorkItemIdentity,
 };
 pub use intent::Intent;
 use tokio::sync::mpsc;
@@ -78,6 +79,7 @@ impl From<PeerConnectionState> for PeerStatus {
 /// Combined host state for display in the TUI.
 #[derive(Debug, Clone)]
 pub struct TuiHostState {
+    pub environment_id: EnvironmentId,
     pub host_name: HostName,
     pub is_local: bool,
     pub status: PeerStatus,
@@ -128,8 +130,8 @@ pub struct TuiModel {
     /// Key: (repo_identity, provider_category, provider_name)
     pub provider_statuses: HashMap<(RepoIdentity, String, String), ProviderStatus>,
     pub status_message: Option<String>,
-    /// All known hosts — local + peers — indexed by hostname.
-    pub hosts: HashMap<HostName, TuiHostState>,
+    /// All known host environments indexed by canonical environment identity.
+    pub hosts: HashMap<EnvironmentId, TuiHostState>,
 }
 
 impl TuiModel {
@@ -198,8 +200,42 @@ impl TuiModel {
         self.hosts.values().find(|h| h.is_local).map(|h| &h.summary.node.node_id)
     }
 
+    pub fn host_matches<'a>(&'a self, host: &HostName) -> Vec<&'a TuiHostState> {
+        self.hosts.values().filter(|entry| &entry.host_name == host).collect()
+    }
+
+    pub fn resolve_host(&self, host: &HostName) -> Result<&TuiHostState, String> {
+        let matches = self.host_matches(host);
+        match matches.as_slice() {
+            [] => Err(format!("unknown host: {host}")),
+            [entry] => Ok(entry),
+            _ => {
+                let mut ids: Vec<_> = matches.iter().map(|entry| entry.environment_id.canonical_string()).collect();
+                ids.sort();
+                Err(format!("ambiguous host: {host} ({})", ids.join(", ")))
+            }
+        }
+    }
+
     pub fn node_id_for_host(&self, host: &HostName) -> Option<&NodeId> {
-        self.hosts.get(host).map(|entry| &entry.summary.node.node_id)
+        self.resolve_host(host).ok().map(|entry| &entry.summary.node.node_id)
+    }
+
+    pub fn resolve_environment_target(&self, environment_id: &EnvironmentId) -> Result<(NodeId, ProvisioningTarget), String> {
+        if let Some(host) = self.hosts.get(environment_id) {
+            return Ok((host.summary.node.node_id.clone(), ProvisioningTarget::Host { host: host.host_name.clone() }));
+        }
+
+        for host in self.hosts.values() {
+            if host.summary.environments.iter().any(|environment| environment.environment_id() == environment_id) {
+                return Ok((host.summary.node.node_id.clone(), ProvisioningTarget::ExistingEnvironment {
+                    host: host.host_name.clone(),
+                    env_id: environment_id.clone(),
+                }));
+            }
+        }
+
+        Err(format!("unknown environment: {environment_id}"))
     }
 
     pub fn host_for_node_id(&self, node_id: &NodeId) -> Option<&HostName> {
@@ -213,7 +249,7 @@ impl TuiModel {
     }
 
     pub fn home_dir_for_host(&self, host: &HostName) -> Option<&std::path::Path> {
-        self.hosts.get(host).and_then(|h| h.summary.system.home_dir.as_deref())
+        self.resolve_host(host).ok().and_then(|h| h.summary.system.home_dir.as_deref())
     }
 }
 
@@ -421,15 +457,14 @@ impl App {
     fn validate_provisioning_target(&self, target: &ProvisioningTarget) -> Result<(), String> {
         let host = target.host();
         let is_local = self.model.my_host().is_some_and(|h| h == host);
-        let host_known = is_local || self.model.hosts.contains_key(host);
-        if !host_known {
-            return Err(format!("unknown host: {host}"));
+        if !is_local {
+            self.model.resolve_host(host)?;
         }
         if let ProvisioningTarget::NewEnvironment { provider, .. } = target {
-            let has_provider =
-                self.model.hosts.get(host).is_some_and(|h| {
-                    h.summary.providers.iter().any(|p| p.category == "environment_provider" && p.implementation == *provider)
-                });
+            let has_provider = self
+                .model
+                .resolve_host(host)
+                .is_ok_and(|h| h.summary.providers.iter().any(|p| p.category == "environment_provider" && p.implementation == *provider));
             if !has_provider {
                 return Err(format!("no {provider} environment provider on {host}"));
             }
@@ -440,7 +475,7 @@ impl App {
     pub fn targeted_command(&self, action: CommandAction) -> Command {
         let target = &self.ui.provisioning_target;
         Command {
-            node_id: self.model.node_id_for_host(target.host()).cloned().or_else(|| Some(NodeId::new(target.host().as_str()))),
+            node_id: self.model.node_id_for_host(target.host()).cloned(),
             provisioning_target: Some(target.clone()),
             context_repo: None,
             action,
@@ -450,7 +485,7 @@ impl App {
     pub fn targeted_repo_command(&self, action: CommandAction) -> Command {
         let target = &self.ui.provisioning_target;
         Command {
-            node_id: self.model.node_id_for_host(target.host()).cloned().or_else(|| Some(NodeId::new(target.host().as_str()))),
+            node_id: self.model.node_id_for_host(target.host()).cloned(),
             provisioning_target: Some(target.clone()),
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
@@ -1000,7 +1035,7 @@ impl App {
                 let peer_status = PeerStatus::from(status);
                 let clear_target = matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected)
                     && self.model.node_id_for_host(self.ui.provisioning_target.host()).is_some_and(|target| *target == node_id);
-                if let Some(entry) = self.model.hosts.values_mut().find(|entry| entry.summary.node.node_id == node_id) {
+                for entry in self.model.hosts.values_mut().filter(|entry| entry.summary.node.node_id == node_id) {
                     entry.status = peer_status;
                 }
                 if clear_target {
@@ -1009,16 +1044,26 @@ impl App {
             }
             DaemonEvent::HostSnapshot(snap) => {
                 let status = PeerStatus::from(snap.connection_status);
-                self.model.hosts.insert(HostName::new(&snap.node.display_name), TuiHostState {
-                    host_name: HostName::new(&snap.node.display_name),
+                let environment_id = snap.environment_id.clone();
+                let host_name = self
+                    .model
+                    .hosts
+                    .get(&environment_id)
+                    .map(|entry| entry.host_name.clone())
+                    .or_else(|| snap.summary.host_name.clone())
+                    .unwrap_or_else(|| HostName::new(&snap.node.display_name));
+                self.model.hosts.insert(environment_id.clone(), TuiHostState {
+                    environment_id,
+                    host_name,
                     is_local: snap.is_local,
                     status,
                     summary: snap.summary,
                 });
             }
-            DaemonEvent::HostRemoved { node_id, .. } => {
-                let clear_target = self.model.node_id_for_host(self.ui.provisioning_target.host()).is_some_and(|target| *target == node_id);
-                self.model.hosts.retain(|_, host| host.summary.node.node_id != node_id);
+            DaemonEvent::HostRemoved { environment_id, .. } => {
+                let clear_target =
+                    self.model.resolve_host(self.ui.provisioning_target.host()).is_ok_and(|target| target.environment_id == environment_id);
+                self.model.hosts.remove(&environment_id);
                 if clear_target {
                     self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }

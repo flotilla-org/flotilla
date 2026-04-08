@@ -394,6 +394,7 @@ fn daemon_event_host_snapshot_roundtrip() {
         connection_status: PeerConnectionState::Connected,
         summary: HostSummary {
             environment_id: EnvironmentId::host(qualified_path::HostId::new("desktop-host")),
+            host_name: Some(HostName::new("desktop")),
             node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -414,7 +415,10 @@ fn daemon_event_host_removed_roundtrip() {
 
 #[test]
 fn replay_cursor_with_stream_key_host_roundtrip() {
-    let cursor = ReplayCursor { stream: StreamKey::Host { environment_id: EnvironmentId::host(qualified_path::HostId::new("laptop-host")) }, seq: 42 };
+    let cursor = ReplayCursor {
+        stream: StreamKey::Host { environment_id: EnvironmentId::host(qualified_path::HostId::new("laptop-host")) },
+        seq: 42,
+    };
     test_helpers::assert_roundtrip(&cursor);
 }
 

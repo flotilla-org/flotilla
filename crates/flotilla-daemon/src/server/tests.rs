@@ -20,10 +20,10 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
-    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId,
-    NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, RepoIdentity,
-    RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus,
-    StreamKey, VectorClock, PROTOCOL_VERSION,
+    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId, NodeInfo,
+    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, RepoIdentity, RepoSelector,
+    Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey,
+    VectorClock, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
@@ -452,6 +452,7 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
         let mut pm = peer_manager.lock().await;
         pm.store_host_summary(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host")),
+            host_name: Some(HostName::new("remote")),
             node: node_info("remote"),
             system: flotilla_protocol::SystemInfo {
                 home_dir: Some(PathBuf::from("/home/remote")),
@@ -487,22 +488,18 @@ async fn sync_peer_query_state_preserves_multiple_host_summaries_for_one_node() 
         let mut pm = peer_manager.lock().await;
         pm.store_host_summary(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host-a")),
+            host_name: Some(HostName::new("remote-a")),
             node: node_info("remote"),
-            system: flotilla_protocol::SystemInfo {
-                home_dir: Some(PathBuf::from("/home/remote-a")),
-                ..Default::default()
-            },
+            system: flotilla_protocol::SystemInfo { home_dir: Some(PathBuf::from("/home/remote-a")), ..Default::default() },
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
             environments: vec![],
         });
         pm.store_host_summary(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host-b")),
+            host_name: Some(HostName::new("remote-b")),
             node: node_info("remote"),
-            system: flotilla_protocol::SystemInfo {
-                home_dir: Some(PathBuf::from("/home/remote-b")),
-                ..Default::default()
-            },
+            system: flotilla_protocol::SystemInfo { home_dir: Some(PathBuf::from("/home/remote-b")), ..Default::default() },
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
             environments: vec![],
@@ -1978,7 +1975,7 @@ async fn take_peer_data_rx_returns_some_once() {
 }
 
 #[tokio::test]
-async fn daemon_server_replays_configured_hosts_as_disconnected() {
+async fn daemon_server_does_not_replay_configured_peers_without_host_environment_identity() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
     std::fs::create_dir_all(&base).expect("create config directory");
@@ -1995,21 +1992,17 @@ async fn daemon_server_replays_configured_hosts_as_disconnected() {
         .expect("create daemon server");
 
     let events = server.daemon.replay_since(&HashMap::new()).await.expect("replay events");
-    let mut statuses: Vec<(NodeId, PeerConnectionState)> = events
+    let statuses: Vec<(NodeId, PeerConnectionState)> = events
         .into_iter()
         .filter_map(|event| match event {
             DaemonEvent::HostSnapshot(snap) => Some((snap.node.node_id.clone(), snap.connection_status.clone())),
             _ => None,
         })
         .collect();
-    // Filter out the local host entry — we only care about configured peers
-    statuses.retain(|(host, _)| host != server.daemon.node_id());
-    statuses.sort_by(|a, b| a.0.cmp(&b.0));
-
-    assert_eq!(statuses, vec![
-        (NodeId::new("feta"), PeerConnectionState::Disconnected),
-        (NodeId::new("udder"), PeerConnectionState::Disconnected),
-    ]);
+    assert!(
+        statuses.into_iter().all(|(node_id, _)| node_id == *server.daemon.node_id()),
+        "configured peers without host identities should not materialize as host snapshots"
+    );
 }
 
 fn test_peer_msg(host: &str) -> PeerDataMessage {
@@ -2036,7 +2029,6 @@ fn host_seq_for(events: &[DaemonEvent], host_name: &NodeId) -> Option<u64> {
 async fn handle_client_forwards_peer_data_and_registers_peer() {
     let (_tmp, daemon) = empty_daemon().await;
     let expected_local_host = daemon.node_id().clone();
-    let daemon_events = daemon.subscribe();
     let (peer_data_tx, mut peer_data_rx) = mpsc::channel(16);
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2092,23 +2084,6 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
         other => panic!("expected hello response, got {other:?}"),
     }
 
-    let mut daemon_events = daemon_events;
-
-    // Wait for the PeerStatusChanged(Connected) event, draining any HostSnapshot events
-    let connected_event = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match daemon_events.recv().await.expect("recv") {
-                DaemonEvent::PeerStatusChanged { node_id, status } => break (node_id, status),
-                DaemonEvent::HostSnapshot(_) => continue,
-                other => panic!("expected peer status or host snapshot event, got {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for peer status");
-    assert_eq!(connected_event.0, NodeId::new("remote-host"));
-    assert_eq!(connected_event.1, PeerConnectionState::Connected);
-
     // Send a peer message from the client side
     let peer_msg = test_peer_msg("remote-host");
     let wire_msg = Message::Peer(Box::new(PeerWireMessage::Data(peer_msg.clone())));
@@ -2137,20 +2112,6 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
     drop(writer);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
-    // Wait for the PeerStatusChanged(Disconnected) event, draining any HostSnapshot events
-    let disconnected_event = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match daemon_events.recv().await.expect("recv") {
-                DaemonEvent::PeerStatusChanged { node_id, status } => break (node_id, status),
-                DaemonEvent::HostSnapshot(_) => continue,
-                other => panic!("expected peer disconnect or host snapshot event, got {other:?}"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for peer disconnect");
-    assert_eq!(disconnected_event.0, NodeId::new("remote-host"));
-    assert_eq!(disconnected_event.1, PeerConnectionState::Disconnected);
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "peer disconnect should release idle-shutdown accounting");
 
     let pm = peer_manager.lock().await;
@@ -2165,6 +2126,7 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
 
     let summary = HostSummary {
         environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host")),
+        host_name: Some(HostName::new("remote-host")),
         node: node_info("remote-host"),
         system: Default::default(),
         inventory: Default::default(),
@@ -2197,10 +2159,10 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
     }
     sync_peer_query_state(&peer_manager, &daemon).await;
 
-    let replay =
-        daemon.replay_since(&HashMap::from([(StreamKey::Host { environment_id: summary_environment_id }, host_seq)]))
-            .await
-            .expect("replay_since");
+    let replay = daemon
+        .replay_since(&HashMap::from([(StreamKey::Host { environment_id: summary_environment_id }, host_seq)]))
+        .await
+        .expect("replay_since");
     assert!(host_seq_for(&replay, &remote_host).is_none(), "duplicate host summary should not advance the host cursor");
 }
 
@@ -2530,6 +2492,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
         );
         pm.store_host_summary(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("peer-a-host")),
+            host_name: Some(HostName::new("peer-a")),
             node: node_info("peer-a"),
             system: flotilla_protocol::SystemInfo {
                 home_dir: None,
@@ -2621,9 +2584,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
         "restart cleanup should clear stale cached repo data for the restarted peer"
     );
     assert!(
-        !pm.get_peer_host_summaries()
-            .values()
-            .any(|summary| summary.node.node_id == NodeId::new("peer-a")),
+        !pm.get_peer_host_summaries().values().any(|summary| summary.node.node_id == NodeId::new("peer-a")),
         "restart cleanup should clear stale host summary for the restarted peer"
     );
 }

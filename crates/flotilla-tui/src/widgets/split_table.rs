@@ -577,7 +577,7 @@ impl SplitTable {
         let host_home_dirs: HashMap<HostName, std::path::PathBuf> = model
             .hosts
             .iter()
-            .filter_map(|(host, state)| state.summary.system.home_dir.as_ref().map(|d| (host.clone(), d.clone())))
+            .filter_map(|(_, state)| state.summary.system.home_dir.as_ref().map(|d| (state.host_name.clone(), d.clone())))
             .collect();
 
         let providers = model.active_opt().map(|r| r.providers.as_ref());

@@ -1,4 +1,4 @@
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,13 @@ impl EnvironmentId {
         match self {
             Self::Host(host_id) => host_id.as_str(),
             Self::Provisioned(id) => id,
+        }
+    }
+
+    pub fn canonical_string(&self) -> String {
+        match self {
+            Self::Host(host_id) => format!("host:{host_id}"),
+            Self::Provisioned(id) => format!("prov:{id}"),
         }
     }
 
@@ -89,6 +96,10 @@ impl EnvironmentId {
             Ok(Self::Provisioned(component.to_string()))
         }
     }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        raw.parse()
+    }
 }
 
 impl fmt::Display for EnvironmentId {
@@ -119,6 +130,23 @@ impl<'de> Deserialize<'de> for EnvironmentId {
             return Ok(Self::Provisioned(id.to_string()));
         }
         Ok(Self::Provisioned(raw))
+    }
+}
+
+impl FromStr for EnvironmentId {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if let Some(host_id) = raw.strip_prefix("host:") {
+            if host_id.is_empty() {
+                return Err("host environment id must not be empty".into());
+            }
+            return Ok(Self::Host(HostId::new(host_id)));
+        }
+        if let Some(id) = raw.strip_prefix("prov:") {
+            return Ok(Self::Provisioned(id.to_string()));
+        }
+        Ok(Self::Provisioned(raw.to_string()))
     }
 }
 
@@ -262,6 +290,12 @@ impl EnvironmentInfo {
             Self::Direct { id, .. } | Self::Provisioned { id, .. } => id,
         }
     }
+
+    pub fn display_name(&self) -> Option<&str> {
+        match self {
+            Self::Direct { display_name, .. } | Self::Provisioned { display_name, .. } => display_name.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +435,19 @@ token_env_vars: []
         let id = EnvironmentId::new("prov:foo");
 
         assert_roundtrip(&id);
+    }
+
+    #[test]
+    fn environment_id_parse_recovers_host_variant_from_canonical_string() {
+        assert_eq!(
+            EnvironmentId::parse("host:desktop-host").expect("parse host environment id"),
+            EnvironmentId::host(HostId::new("desktop-host"))
+        );
+    }
+
+    #[test]
+    fn environment_id_parse_recovers_provisioned_variant_from_canonical_string() {
+        assert_eq!(EnvironmentId::parse("prov:builder-1").expect("parse provisioned environment id"), EnvironmentId::new("builder-1"));
     }
 
     #[test]

@@ -228,11 +228,7 @@ impl EnvironmentManager {
             match state {
                 ManagedEnvironmentKind::Direct(state) => {
                     environments.push(EnvironmentInfo::Direct {
-                        id: state
-                            .host_id
-                            .as_ref()
-                            .map(|host_id| EnvironmentId::host(host_id.clone()))
-                            .unwrap_or(env_id),
+                        id: state.host_id.as_ref().map(|host_id| EnvironmentId::host(host_id.clone())).unwrap_or(env_id),
                         host_id: state.host_id.clone(),
                         display_name: state.display_name.clone(),
                         status: EnvironmentStatus::Running,
@@ -778,7 +774,7 @@ mod tests {
     #[test]
     fn direct_environment_serialization_omits_image_metadata() {
         let info = EnvironmentInfo::Direct {
-            id: EnvironmentId::new("direct-env"),
+            id: EnvironmentId::host(HostId::new("direct-host-id")),
             host_id: Some(HostId::new("direct-host-id")),
             display_name: Some("ssh-dev".to_string()),
             status: EnvironmentStatus::Running,
@@ -788,7 +784,7 @@ mod tests {
         let obj = json.as_object().expect("direct environment should serialize as a JSON object");
 
         assert_eq!(obj.get("kind").and_then(|value| value.as_str()), Some("direct"));
-        assert_eq!(obj.get("id").and_then(|value| value.as_str()), Some("direct-env"));
+        assert_eq!(obj.get("id").and_then(|value| value.as_str()), Some("host:direct-host-id"));
         assert_eq!(obj.get("host_id").and_then(|value| value.as_str()), Some("direct-host-id"));
         assert!(obj.get("image").is_none(), "direct environments must not publish image metadata");
     }

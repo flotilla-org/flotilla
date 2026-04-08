@@ -243,6 +243,7 @@ mod tests {
     fn sample_host_summary() -> HostSummary {
         HostSummary {
             environment_id: crate::EnvironmentId::host(crate::qualified_path::HostId::new("desktop-host")),
+            host_name: Some(crate::HostName::new("desktop")),
             node: crate::NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             system: SystemInfo {
                 home_dir: Some(PathBuf::from("/home/dev")),

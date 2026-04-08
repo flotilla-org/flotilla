@@ -295,6 +295,7 @@ impl App {
 
                     match crate::widgets::command_palette::tui_dispatch(
                         resolved,
+                        &self.model,
                         Some(item),
                         is_config,
                         active_repo,

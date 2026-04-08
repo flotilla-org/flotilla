@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::{ProviderError, WorkItem},
-    EnvironmentInfo, HostSummary, NodeInfo, PeerConnectionState,
+    EnvironmentInfo, HostName, HostSummary, NodeInfo, PeerConnectionState,
 };
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
@@ -90,6 +90,7 @@ pub struct HostListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostListEntry {
     pub environment_id: crate::EnvironmentId,
+    pub host_name: HostName,
     pub node: NodeInfo,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
@@ -105,6 +106,7 @@ pub struct HostListEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatusResponse {
     pub environment_id: crate::EnvironmentId,
+    pub host_name: HostName,
     pub node: NodeInfo,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
@@ -121,6 +123,7 @@ pub struct HostStatusResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostProvidersResponse {
     pub environment_id: crate::EnvironmentId,
+    pub host_name: HostName,
     pub node: NodeInfo,
     pub is_local: bool,
     /// `true` only for non-local hosts that appear in `hosts.toml`.
@@ -156,7 +159,7 @@ mod tests {
     };
     use crate::{
         qualified_path::HostId, test_helpers::assert_roundtrip, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment,
-        HostProviderStatus, HostSummary, ImageId, NodeId, NodeInfo, PeerConnectionState, SystemInfo, ToolInventory,
+        HostName, HostProviderStatus, HostSummary, ImageId, NodeId, NodeInfo, PeerConnectionState, SystemInfo, ToolInventory,
     };
 
     #[test]
@@ -184,6 +187,7 @@ mod tests {
     fn sample_host_summary() -> HostSummary {
         HostSummary {
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+            host_name: Some(HostName::new("desktop")),
             node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             system: SystemInfo {
                 home_dir: Some("/home/dev".into()),
@@ -221,6 +225,7 @@ mod tests {
         let response = HostListResponse {
             hosts: vec![HostListEntry {
                 environment_id: EnvironmentId::host(HostId::new("remote-laptop-host")),
+                host_name: HostName::new("remote-laptop"),
                 node: NodeInfo::new(NodeId::new("node-remote-1"), "Remote Laptop"),
                 is_local: false,
                 configured: true,
@@ -242,6 +247,7 @@ mod tests {
     fn host_status_response_roundtrips_with_summary() {
         let response = HostStatusResponse {
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+            host_name: HostName::new("desktop"),
             node: NodeInfo::new(NodeId::new("node-desktop-1"), "Desktop Workstation"),
             is_local: true,
             configured: true,
@@ -263,6 +269,7 @@ mod tests {
     fn host_providers_response_roundtrips_summary() {
         let response = HostProvidersResponse {
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+            host_name: HostName::new("desktop"),
             node: NodeInfo::new(NodeId::new("node-desktop-1"), "Desktop Workstation"),
             is_local: true,
             configured: true,
@@ -280,6 +287,7 @@ mod tests {
     fn host_status_response_defaults_missing_visible_environments() {
         let mut value = serde_json::to_value(HostStatusResponse {
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+            host_name: HostName::new("desktop"),
             node: NodeInfo::new(NodeId::new("node-desktop-1"), "Desktop Workstation"),
             is_local: true,
             configured: true,

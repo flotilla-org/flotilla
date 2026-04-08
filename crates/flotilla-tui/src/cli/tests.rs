@@ -36,9 +36,9 @@ fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -
 
 mod status_human {
     use flotilla_protocol::{
-        EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse, HostProviderStatus,
-        HostProvidersResponse, HostStatusResponse, HostSummary, ImageId, PeerConnectionState, RepoSummary, StatusResponse, SystemInfo,
-        ToolInventory, TopologyResponse, TopologyRoute,
+        qualified_path::HostId, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse,
+        HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, ImageId, PeerConnectionState, RepoSummary,
+        StatusResponse, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
     };
 
     use super::*;
@@ -70,6 +70,8 @@ mod status_human {
 
     fn sample_host_summary(name: &str) -> HostSummary {
         HostSummary {
+            environment_id: EnvironmentId::host(HostId::new(format!("{name}-env"))),
+            host_name: Some(HostName::new(name)),
             node: NodeInfo::new(NodeId::new(name), name),
             system: SystemInfo {
                 home_dir: Some("/home/dev".into()),
@@ -107,6 +109,8 @@ mod status_human {
         let response = HostListResponse {
             hosts: vec![
                 HostListEntry {
+                    environment_id: EnvironmentId::host(HostId::new("local-env")),
+                    host_name: HostName::new("local"),
                     node: NodeInfo::new(NodeId::new("local"), "local"),
                     is_local: true,
                     configured: false,
@@ -116,6 +120,8 @@ mod status_human {
                     work_item_count: 5,
                 },
                 HostListEntry {
+                    environment_id: EnvironmentId::host(HostId::new("remote-env")),
+                    host_name: HostName::new("remote"),
                     node: NodeInfo::new(NodeId::new("remote"), "remote"),
                     is_local: false,
                     configured: true,
@@ -136,6 +142,8 @@ mod status_human {
     #[test]
     fn host_status_shows_summary_and_counts() {
         let response = HostStatusResponse {
+            environment_id: EnvironmentId::host(HostId::new("local-env")),
+            host_name: HostName::new("local"),
             node: NodeInfo::new(NodeId::new("local"), "local"),
             is_local: true,
             configured: false,
@@ -158,6 +166,8 @@ mod status_human {
     #[test]
     fn host_providers_shows_inventory_and_provider_rows() {
         let response = HostProvidersResponse {
+            environment_id: EnvironmentId::host(HostId::new("local-env")),
+            host_name: HostName::new("local"),
             node: NodeInfo::new(NodeId::new("local"), "local"),
             is_local: true,
             configured: false,

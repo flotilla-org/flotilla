@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use flotilla_protocol::{
-    CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, HostName, HostPath, NodeId, NodeInfo,
-    ProvisioningTarget, RepoLabels, RepoSelector,
+    qualified_path::HostId, CategoryLabels, ChangeRequest, ChangeRequestStatus, Checkout, CheckoutRef, CorrelationKey, EnvironmentId,
+    HostName, HostPath, NodeId, NodeInfo, ProvisioningTarget, RepoLabels, RepoSelector,
 };
 
 use super::*;
@@ -15,12 +15,36 @@ use crate::app::{
 
 fn insert_local_host(model: &mut super::super::TuiModel, name: &str) {
     let host_name = HostName::new(name);
-    model.hosts.insert(host_name.clone(), TuiHostState {
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
         host_name: host_name.clone(),
         is_local: true,
         status: PeerStatus::Connected,
         summary: flotilla_protocol::HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
             node: NodeInfo::new(NodeId::new(name), name),
+            system: flotilla_protocol::SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+}
+
+fn insert_remote_host(model: &mut super::super::TuiModel, host_name: &str, node_id: &str) {
+    let host_name = HostName::new(host_name);
+    let environment_id = EnvironmentId::host(HostId::new(format!("{node_id}-env")));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
+        host_name: host_name.clone(),
+        is_local: false,
+        status: PeerStatus::Connected,
+        summary: flotilla_protocol::HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
+            node: NodeInfo::new(NodeId::new(node_id), host_name.to_string()),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -495,6 +519,7 @@ fn resolve_create_worktree_and_workspace_pr_item() {
 #[test]
 fn resolve_create_worktree_and_workspace_uses_selected_target_host() {
     let mut app = stub_app();
+    insert_remote_host(&mut app.model, "remote-a", "remote-a");
     app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("remote-a") };
     let item = remote_branch_item("feat/remote");
 

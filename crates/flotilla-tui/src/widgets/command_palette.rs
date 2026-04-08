@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use flotilla_commands::{HostResolution, RepoContext, Resolved};
+use flotilla_commands::{resolved::HostQueryKind, HostResolution, RepoContext, Resolved};
 use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector, WorkItem};
 use ratatui::{
     layout::Rect,
@@ -185,6 +185,7 @@ impl CommandPaletteWidget {
         let active_repo = ctx.model.active_repo_identity_opt().cloned();
         match tui_dispatch(
             resolved,
+            ctx.model,
             self.source_item.as_ref(),
             *ctx.is_config,
             active_repo.as_ref(),
@@ -359,8 +360,10 @@ fn item_execution_host(item: &WorkItem, my_node_id: &Option<NodeId>) -> Option<N
 }
 
 /// Dispatch a resolved command with ambient context from the TUI environment.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn tui_dispatch(
     resolved: Resolved,
+    model: &TuiModel,
     item: Option<&WorkItem>,
     is_config: bool,
     active_repo: Option<&RepoIdentity>,
@@ -369,6 +372,19 @@ pub(crate) fn tui_dispatch(
     active_repo_is_remote_only: bool,
 ) -> Result<Command, String> {
     match resolved {
+        Resolved::HostQuery { subject, kind } => {
+            let host = model.resolve_host(&subject)?;
+            let action = match kind {
+                HostQueryKind::Status => CommandAction::QueryHostStatus { target_environment_id: host.environment_id.clone() },
+                HostQueryKind::Providers => CommandAction::QueryHostProviders { target_environment_id: host.environment_id.clone() },
+            };
+            Ok(Command {
+                node_id: Some(host.summary.node.node_id.clone()),
+                provisioning_target: Some(ProvisioningTarget::Host { host: subject }),
+                context_repo: None,
+                action,
+            })
+        }
         Resolved::Ready(cmd) => Ok(cmd),
         Resolved::NeedsContext { mut command, repo, host } => {
             // Repo context from active tab
@@ -379,6 +395,7 @@ pub(crate) fn tui_dispatch(
             };
 
             match repo {
+                RepoContext::None => {}
                 RepoContext::Required => {
                     let repo_sel = tab_repo.ok_or_else(|| "no active repo — switch to a repo tab first".to_string())?;
                     command.context_repo = Some(repo_sel.clone());
@@ -398,8 +415,24 @@ pub(crate) fn tui_dispatch(
                 match host {
                     HostResolution::Local => {}
                     HostResolution::ProvisioningTarget => {
-                        command.node_id = Some(NodeId::new(provisioning_target.host().as_str()));
+                        match model.resolve_host(provisioning_target.host()) {
+                            Ok(resolved_host) => {
+                                command.node_id = Some(resolved_host.summary.node.node_id.clone());
+                            }
+                            Err(_) if provisioning_target.host() == &flotilla_protocol::HostName::local() => {}
+                            Err(err) => return Err(err),
+                        }
                         command.provisioning_target = Some(provisioning_target.clone());
+                    }
+                    HostResolution::Explicit(host) => {
+                        let resolved_host = model.resolve_host(&host)?;
+                        command.node_id = Some(resolved_host.summary.node.node_id.clone());
+                        command.provisioning_target = Some(ProvisioningTarget::Host { host });
+                    }
+                    HostResolution::ExplicitEnvironment(environment_id) => {
+                        let (node_id, target) = model.resolve_environment_target(&environment_id)?;
+                        command.node_id = Some(node_id);
+                        command.provisioning_target = Some(target);
                     }
                     HostResolution::SubjectHost => {
                         command.node_id = item.and_then(|i| item_execution_host(i, my_node_id));
@@ -930,7 +963,8 @@ mod tests {
     fn dispatch_ready_passes_through() {
         let cmd = Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let result = tui_dispatch(Resolved::Ready(cmd), None, false, None, &local_target, &None, false);
+        let model = TuiModel::from_repo_info(vec![]);
+        let result = tui_dispatch(Resolved::Ready(cmd), &model, None, false, None, &local_target, &None, false);
         assert!(result.is_ok());
     }
 
@@ -949,7 +983,8 @@ mod tests {
         };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let result = tui_dispatch(resolved, None, true, None, &local_target, &None, false);
+        let model = TuiModel::from_repo_info(vec![]);
+        let result = tui_dispatch(resolved, &model, None, true, None, &local_target, &None, false);
         assert!(result.is_err());
     }
 
@@ -969,7 +1004,8 @@ mod tests {
         let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::Local };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &local_target, &None, false).unwrap();
+        let model = TuiModel::from_repo_info(vec![]);
+        let result = tui_dispatch(resolved, &model, None, false, Some(&repo_id), &local_target, &None, false).unwrap();
         assert!(result.context_repo.is_some());
         match &result.action {
             CommandAction::Checkout { repo, .. } => assert_ne!(*repo, RepoSelector::Query("".into())),
@@ -989,7 +1025,8 @@ mod tests {
         };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let result = tui_dispatch(resolved, None, false, Some(&repo_id), &local_target, &None, false).expect("should succeed");
+        let model = TuiModel::from_repo_info(vec![]);
+        let result = tui_dispatch(resolved, &model, None, false, Some(&repo_id), &local_target, &None, false).expect("should succeed");
         assert_eq!(result.node_id, Some(NodeId::new("feta")));
     }
 
@@ -1024,7 +1061,9 @@ mod tests {
         // ProviderHost on a remote-only repo should derive host from the item
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
-        let result = tui_dispatch(resolved, Some(&item), false, Some(&repo_id), &local_target, &my_node_id, true).expect("should succeed");
+        let model = TuiModel::from_repo_info(vec![]);
+        let result =
+            tui_dispatch(resolved, &model, Some(&item), false, Some(&repo_id), &local_target, &my_node_id, true).expect("should succeed");
         assert_eq!(result.node_id, Some(NodeId::new("remote-peer")));
     }
 }

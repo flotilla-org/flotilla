@@ -24,11 +24,11 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
 /                            <ENT> RUN  <ESC> CLOSE  <TAB> FILL                                   ◫ auto   @local
-  repo       Manage repositories
-  checkout   Manage checkouts
-  cr         Code review
-  pr         Code review
-  issue      Issues
-  agent      Cloud agents
-  workspace  Workspaces
-  host       Manage and route to hosts
+  repo         Manage repositories
+  environment  Manage environments
+  env          Manage environments
+  checkout     Manage checkouts
+  cr           Code review
+  pr           Code review
+  issue        Issues
+  agent        Cloud agents

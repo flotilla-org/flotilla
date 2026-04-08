@@ -516,11 +516,15 @@ mod tests {
 
         // Set up the local host so the widget can detect remote items
         let local_host = HostName::new("local-host");
-        harness.model.hosts.insert(local_host.clone(), crate::app::TuiHostState {
+        let environment_id = flotilla_protocol::EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("local-host-env"));
+        harness.model.hosts.insert(environment_id.clone(), crate::app::TuiHostState {
+            environment_id: environment_id.clone(),
             host_name: local_host,
             is_local: true,
             status: crate::app::PeerStatus::Connected,
             summary: flotilla_protocol::HostSummary {
+                environment_id,
+                host_name: Some(HostName::new("local-host")),
                 node: flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("local-host"), "local-host"),
                 system: flotilla_protocol::SystemInfo::default(),
                 inventory: flotilla_protocol::ToolInventory::default(),

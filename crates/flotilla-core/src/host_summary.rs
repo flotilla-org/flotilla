@@ -23,6 +23,7 @@ pub async fn build_local_host_summary(
 
     HostSummary {
         environment_id,
+        host_name: Some(host_name.clone()),
         node: NodeInfo::new(node_id.clone(), host_name.to_string()),
         system: collect_system_info(env),
         inventory: inventory_from_bag(&host_bag),

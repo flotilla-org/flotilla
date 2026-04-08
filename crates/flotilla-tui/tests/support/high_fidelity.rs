@@ -142,7 +142,7 @@ impl HighFidelityHarness {
         };
         harness
             .wait_for(Duration::from_secs(5), "host snapshots to initialize", |h| {
-                h.app.model.my_host().is_some() && h.app.model.hosts.contains_key(&HostName::new("follower"))
+                h.app.model.my_host().is_some() && h.app.model.resolve_host(&HostName::new("follower")).is_ok()
             })
             .await?;
         Ok(harness)
@@ -315,7 +315,7 @@ impl HighFidelityHarness {
             DaemonEvent::RepoDelta(delta) => format!("repo_delta repo={} seq={}", fmt_optional_path(delta.repo.as_deref()), delta.seq),
             DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
             DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
-            DaemonEvent::HostRemoved { node_id, .. } => format!("host_removed {node_id}"),
+            DaemonEvent::HostRemoved { environment_id, .. } => format!("host_removed {environment_id}"),
         };
         self.recent_events.push(summary);
         if self.recent_events.len() > 20 {
@@ -417,7 +417,7 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         }
         DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
         DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),
-        DaemonEvent::HostRemoved { node_id, .. } => format!("{source}: host_removed {node_id}"),
+        DaemonEvent::HostRemoved { environment_id, .. } => format!("{source}: host_removed {environment_id}"),
     };
     recent.push(summary);
     if recent.len() > 20 {

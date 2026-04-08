@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod checkout;
 pub mod cr;
+pub mod environment;
 pub mod host;
 pub mod issue;
 pub mod repo;

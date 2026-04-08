@@ -3,7 +3,10 @@ use std::fmt;
 use clap::Subcommand;
 
 use crate::{
-    commands::{agent::AgentNoun, checkout::CheckoutNoun, cr::CrNoun, issue::IssueNoun, repo::RepoNoun, workspace::WorkspaceNoun},
+    commands::{
+        agent::AgentNoun, checkout::CheckoutNoun, cr::CrNoun, environment::EnvironmentNoun, issue::IssueNoun, repo::RepoNoun,
+        workspace::WorkspaceNoun,
+    },
     Resolved,
 };
 
@@ -12,6 +15,7 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum NounCommand {
     Repo(RepoNoun),
+    Environment(EnvironmentNoun),
     Checkout(CheckoutNoun),
     Cr(CrNoun),
     Issue(IssueNoun),
@@ -24,6 +28,7 @@ impl NounCommand {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self {
             NounCommand::Repo(noun) => noun.resolve(),
+            NounCommand::Environment(noun) => noun.resolve(),
             NounCommand::Checkout(noun) => noun.resolve(),
             NounCommand::Cr(noun) => noun.resolve(),
             NounCommand::Issue(noun) => noun.resolve(),
@@ -37,6 +42,7 @@ impl fmt::Display for NounCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NounCommand::Repo(noun) => write!(f, "{noun}"),
+            NounCommand::Environment(noun) => write!(f, "{noun}"),
             NounCommand::Checkout(noun) => write!(f, "{noun}"),
             NounCommand::Cr(noun) => write!(f, "{noun}"),
             NounCommand::Issue(noun) => write!(f, "{noun}"),

@@ -19,7 +19,7 @@ pub fn parse_host_command(tokens: &[&str]) -> Result<Resolved, String> {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::CommandAction;
+    use flotilla_protocol::{CommandAction, HostName};
 
     use super::*;
 
@@ -40,8 +40,9 @@ mod tests {
     fn parse_host_routed_command() {
         let resolved = parse_host_command(&["host", "feta", "cr", "42", "open"]).unwrap();
         match &resolved {
-            Resolved::NeedsContext { command, .. } => {
-                assert!(command.node_id.is_some());
+            Resolved::NeedsContext { command, host, .. } => {
+                assert!(command.node_id.is_none());
+                assert!(matches!(host, crate::resolved::HostResolution::Explicit(explicit) if explicit == &HostName::new("feta")));
             }
             _ => panic!("expected NeedsContext"),
         }

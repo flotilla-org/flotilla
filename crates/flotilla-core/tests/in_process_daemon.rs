@@ -350,6 +350,7 @@ impl Factory for EnvGatedTerminalPoolFactory {
 fn sample_remote_host_summary(name: &str) -> HostSummary {
     HostSummary {
         environment_id: EnvironmentId::host(HostId::new(format!("{name}-host"))),
+        host_name: Some(HostName::new(name)),
         node: test_node(name),
         system: SystemInfo {
             home_dir: Some(PathBuf::from(format!("/home/{name}"))),
@@ -1350,15 +1351,13 @@ async fn get_host_providers_returns_local_summary_and_unmapped_remote_host_is_ab
     assert_eq!(local.node.display_name, daemon.host_name().as_str());
     assert_eq!(summary_host(&local.summary), *daemon.host_name());
 
-    assert!(
-        !daemon
-            .list_hosts_internal()
-            .await
-            .expect("list hosts")
-            .hosts
-            .into_iter()
-            .any(|entry| entry.node.node_id == test_node("remote").node_id)
-    );
+    assert!(!daemon
+        .list_hosts_internal()
+        .await
+        .expect("list hosts")
+        .hosts
+        .into_iter()
+        .any(|entry| entry.node.node_id == test_node("remote").node_id));
 }
 
 #[tokio::test]
@@ -2145,6 +2144,7 @@ async fn publish_peer_summary_normalizes_host_name() {
     daemon
         .publish_peer_summary(&peer_host, HostSummary {
             environment_id: EnvironmentId::host(HostId::new("remote-host-host")),
+            host_name: Some(peer_host.clone()),
             node: test_node("spoofed-host"),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),

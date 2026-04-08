@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use flotilla_protocol::{
-    DaemonEvent, EnvironmentId, HostListEntry, HostListResponse, HostProvidersResponse, HostSnapshot, HostStatusResponse, HostSummary,
-    NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    DaemonEvent, EnvironmentId, HostListEntry, HostListResponse, HostName, HostProvidersResponse, HostSnapshot, HostStatusResponse,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::RwLock;
 
@@ -194,15 +194,8 @@ impl HostRegistry {
             let Some(state) = hosts.get(&environment_id) else {
                 continue;
             };
-            if should_present_host_state(
-                &self.local_node,
-                &configured,
-                &node_connectivity,
-                counts,
-                &environment_id,
-                &state.node_id,
-                state,
-            ) {
+            if should_present_host_state(&self.local_node, &configured, &node_connectivity, counts, &environment_id, &state.node_id, state)
+            {
                 continue;
             }
             let environment_id = state.environment_id.clone();
@@ -250,15 +243,7 @@ impl HostRegistry {
             let mut node_environments = self.node_environments.write().await;
             let mut hosts = self.hosts.write().await;
             let node = summary.node.clone();
-            update_host_summary(
-                &self.local_node,
-                &configured,
-                &node_connectivity,
-                &mut node_environments,
-                &mut hosts,
-                &node,
-                summary,
-            )
+            update_host_summary(&self.local_node, &configured, &node_connectivity, &mut node_environments, &mut hosts, &node, summary)
         };
         if let Some(snapshot) = snapshot {
             emit(DaemonEvent::HostSnapshot(Box::new(snapshot)));
@@ -299,7 +284,8 @@ impl HostRegistry {
                     continue;
                 }
                 if !summaries.contains_key(&environment_id) {
-                    if let Some(snapshot) = clear_host_summary(&self.local_node, &configured, &node_connectivity, &mut hosts, &environment_id)
+                    if let Some(snapshot) =
+                        clear_host_summary(&self.local_node, &configured, &node_connectivity, &mut hosts, &environment_id)
                     {
                         emit(DaemonEvent::HostSnapshot(Box::new(snapshot)));
                     }
@@ -380,6 +366,7 @@ impl HostRegistry {
 fn default_host_summary(node: &NodeInfo, environment_id: &EnvironmentId) -> HostSummary {
     HostSummary {
         environment_id: environment_id.clone(),
+        host_name: Some(HostName::new(node.display_name.clone())),
         node: node.clone(),
         system: SystemInfo::default(),
         inventory: ToolInventory::default(),
@@ -629,9 +616,12 @@ fn build_host_status(
         .as_ref()
         .map(|summary| summary.node.clone())
         .unwrap_or_else(|| node_info_for(&state.node_id, ctx.configured, None, Some(ctx.local_node)));
+    let host_name =
+        summary.as_ref().and_then(|summary| summary.host_name.clone()).unwrap_or_else(|| HostName::new(node.display_name.clone()));
 
     HostStatusResponse {
         environment_id: environment_id.clone(),
+        host_name,
         node,
         is_local,
         configured: !is_local && ctx.configured.contains_key(&state.node_id),
@@ -658,9 +648,12 @@ fn build_host_list_entry_from_state(
         .as_ref()
         .map(|summary| summary.node.clone())
         .unwrap_or_else(|| node_info_for(&state.node_id, configured, None, Some(local_node)));
+    let host_name =
+        state.summary.as_ref().and_then(|summary| summary.host_name.clone()).unwrap_or_else(|| HostName::new(node.display_name.clone()));
 
     HostListEntry {
         environment_id: state.environment_id.clone(),
+        host_name,
         node,
         is_local,
         configured: !is_local && configured.contains_key(&state.node_id),
@@ -681,6 +674,7 @@ fn build_host_providers(
 ) -> HostProvidersResponse {
     HostProvidersResponse {
         environment_id: environment_id.clone(),
+        host_name: summary.host_name.clone().unwrap_or_else(|| HostName::new(summary.node.display_name.clone())),
         node: summary.node.clone(),
         is_local: state.node_id == local_node.node_id,
         configured: state.node_id != local_node.node_id && configured.contains_key(&state.node_id),
@@ -724,8 +718,8 @@ mod tests {
     use std::{cell::RefCell, collections::HashMap};
 
     use flotilla_protocol::{
-        DaemonEvent, EnvironmentId, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory,
-        qualified_path::HostId,
+        qualified_path::HostId, DaemonEvent, EnvironmentId, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState,
+        StreamKey, SystemInfo, ToolInventory,
     };
 
     use super::{HostCounts, HostRegistry};
@@ -741,6 +735,7 @@ mod tests {
     fn minimal_summary(node: &NodeInfo) -> HostSummary {
         HostSummary {
             environment_id: EnvironmentId::host(HostId::new(format!("{}-host", node.node_id))),
+            host_name: Some(HostName::new(node.display_name.clone())),
             node: node.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -766,9 +761,9 @@ mod tests {
         registry.publish_peer_summary(minimal_summary(&peer_node()), &|_| {}).await;
 
         let replay = registry.replay_host_events(&HashMap::new()).await;
-        assert!(
-            replay.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.node.node_id == peer_node().node_id))
-        );
+        assert!(replay
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.node.node_id == peer_node().node_id)));
 
         let replay = registry
             .replay_host_events(&HashMap::from([(
@@ -776,23 +771,15 @@ mod tests {
                 2,
             )]))
             .await;
-        assert!(
-            !replay
-                .iter()
-                .any(|event| matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.node.node_id == peer_node().node_id))
-        );
+        assert!(!replay
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.node.node_id == peer_node().node_id)));
     }
 
     #[tokio::test]
     async fn configured_peers_without_environment_mapping_do_not_create_host_entries() {
         let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
-        registry
-            .set_configured_peers(
-                vec![NodeInfo::new(NodeId::new("peer-node"), "Build Box")],
-                &HashMap::new(),
-                &|_| {},
-            )
-            .await;
+        registry.set_configured_peers(vec![NodeInfo::new(NodeId::new("peer-node"), "Build Box")], &HashMap::new(), &|_| {}).await;
 
         let hosts = registry.list_hosts(&HashMap::new()).await;
         assert!(hosts.hosts.iter().all(|entry| entry.node.node_id != peer_node().node_id));
@@ -804,6 +791,7 @@ mod tests {
         let peer = NodeInfo::new(NodeId::new("peer-node-42"), "Build Box");
         let real_summary = HostSummary {
             environment_id: EnvironmentId::host(HostId::new("peer-node-42-host")),
+            host_name: Some(HostName::new("build-box")),
             node: peer.clone(),
             system: SystemInfo { os: Some("linux".into()), arch: Some("x86_64".into()), ..SystemInfo::default() },
             inventory: ToolInventory::default(),
@@ -835,6 +823,7 @@ mod tests {
 
         let real_summary = HostSummary {
             environment_id: first_environment_id.clone(),
+            host_name: Some(HostName::new("build-box-a")),
             node: peer.clone(),
             system: SystemInfo { os: Some("linux".into()), arch: Some("x86_64".into()), ..SystemInfo::default() },
             inventory: ToolInventory::default(),
@@ -848,6 +837,7 @@ mod tests {
         };
         let placeholder_summary = HostSummary {
             environment_id: second_environment_id.clone(),
+            host_name: Some(HostName::new("build-box-b")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -858,10 +848,7 @@ mod tests {
         registry.publish_peer_summary(real_summary, &|_| {}).await;
         registry.publish_peer_summary(placeholder_summary.clone(), &|_| {}).await;
 
-        let status = registry
-            .get_host_status(&second_environment_id, &HashMap::new())
-            .await
-            .expect("status for second environment");
+        let status = registry.get_host_status(&second_environment_id, &HashMap::new()).await.expect("status for second environment");
 
         assert_eq!(status.environment_id, second_environment_id);
         assert_eq!(status.summary.expect("placeholder summary should be visible").environment_id, placeholder_summary.environment_id);
@@ -895,6 +882,7 @@ mod tests {
         let second_environment_id = EnvironmentId::host(HostId::new("peer-node-host-b"));
         let first_summary = HostSummary {
             environment_id: first_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-a")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -903,6 +891,7 @@ mod tests {
         };
         let second_summary = HostSummary {
             environment_id: second_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-b")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -962,6 +951,7 @@ mod tests {
 
         let first_summary = HostSummary {
             environment_id: EnvironmentId::host(HostId::new("peer-node-host-a")),
+            host_name: Some(HostName::new("peer-host-a")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -970,6 +960,7 @@ mod tests {
         };
         let second_summary = HostSummary {
             environment_id: EnvironmentId::host(HostId::new("peer-node-host-b")),
+            host_name: Some(HostName::new("peer-host-b")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -987,14 +978,10 @@ mod tests {
         assert!(peer_entries.iter().any(|entry| entry.environment_id == first_summary.environment_id));
         assert!(peer_entries.iter().any(|entry| entry.environment_id == second_summary.environment_id));
 
-        let status_a = registry
-            .get_host_status(&first_summary.environment_id, &HashMap::new())
-            .await
-            .expect("status for first environment");
-        let status_b = registry
-            .get_host_status(&second_summary.environment_id, &HashMap::new())
-            .await
-            .expect("status for second environment");
+        let status_a =
+            registry.get_host_status(&first_summary.environment_id, &HashMap::new()).await.expect("status for first environment");
+        let status_b =
+            registry.get_host_status(&second_summary.environment_id, &HashMap::new()).await.expect("status for second environment");
 
         assert_eq!(status_a.environment_id, first_summary.environment_id);
         assert_eq!(status_b.environment_id, second_summary.environment_id);
@@ -1008,29 +995,35 @@ mod tests {
         let second_environment_id = EnvironmentId::host(HostId::new("peer-node-host-b"));
 
         registry
-            .publish_peer_summary(HostSummary {
-                environment_id: first_environment_id.clone(),
-                node: peer.clone(),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            }, &|_| {})
+            .publish_peer_summary(
+                HostSummary {
+                    environment_id: first_environment_id.clone(),
+                    host_name: Some(HostName::new("peer-host-a")),
+                    node: peer.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+                &|_| {},
+            )
             .await;
         registry
-            .publish_peer_summary(HostSummary {
-                environment_id: second_environment_id.clone(),
-                node: peer.clone(),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            }, &|_| {})
+            .publish_peer_summary(
+                HostSummary {
+                    environment_id: second_environment_id.clone(),
+                    host_name: Some(HostName::new("peer-host-b")),
+                    node: peer.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+                &|_| {},
+            )
             .await;
 
-        registry
-            .publish_peer_connection_status(&peer, PeerConnectionState::Connected, &HashMap::new(), &|_| {})
-            .await;
+        registry.publish_peer_connection_status(&peer, PeerConnectionState::Connected, &HashMap::new(), &|_| {}).await;
 
         let first_status = registry.get_host_status(&first_environment_id, &HashMap::new()).await.expect("first host status");
         let second_status = registry.get_host_status(&second_environment_id, &HashMap::new()).await.expect("second host status");
@@ -1045,14 +1038,18 @@ mod tests {
         let environment_id = EnvironmentId::host(HostId::new("peer-node-host-a"));
 
         registry
-            .publish_peer_summary(HostSummary {
-                environment_id: environment_id.clone(),
-                node: peer.clone(),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            }, &|_| {})
+            .publish_peer_summary(
+                HostSummary {
+                    environment_id: environment_id.clone(),
+                    host_name: Some(HostName::new("peer-host-a")),
+                    node: peer.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+                &|_| {},
+            )
             .await;
 
         let events = RefCell::new(Vec::new());
@@ -1083,24 +1080,32 @@ mod tests {
         let second_environment_id = EnvironmentId::host(HostId::new("peer-node-host-b"));
 
         registry
-            .publish_peer_summary(HostSummary {
-                environment_id: first_environment_id.clone(),
-                node: peer.clone(),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            }, &|_| {})
+            .publish_peer_summary(
+                HostSummary {
+                    environment_id: first_environment_id.clone(),
+                    host_name: Some(HostName::new("peer-host-a")),
+                    node: peer.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+                &|_| {},
+            )
             .await;
         registry
-            .publish_peer_summary(HostSummary {
-                environment_id: second_environment_id.clone(),
-                node: peer.clone(),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            }, &|_| {})
+            .publish_peer_summary(
+                HostSummary {
+                    environment_id: second_environment_id.clone(),
+                    host_name: Some(HostName::new("peer-host-b")),
+                    node: peer.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+                &|_| {},
+            )
             .await;
 
         let counts = HashMap::from([
@@ -1122,14 +1127,18 @@ mod tests {
         let environment_id = EnvironmentId::host(HostId::new("peer-node-host-a"));
 
         registry
-            .publish_peer_summary(HostSummary {
-                environment_id: environment_id.clone(),
-                node: peer.clone(),
-                system: SystemInfo::default(),
-                inventory: ToolInventory::default(),
-                providers: vec![],
-                environments: vec![],
-            }, &|_| {})
+            .publish_peer_summary(
+                HostSummary {
+                    environment_id: environment_id.clone(),
+                    host_name: Some(HostName::new("peer-host-a")),
+                    node: peer.clone(),
+                    system: SystemInfo::default(),
+                    inventory: ToolInventory::default(),
+                    providers: vec![],
+                    environments: vec![],
+                },
+                &|_| {},
+            )
             .await;
         registry.apply_event(&DaemonEvent::PeerStatusChanged { node_id: peer.node_id.clone(), status: PeerConnectionState::Connected });
 
@@ -1141,6 +1150,7 @@ mod tests {
             connection_status: PeerConnectionState::Disconnected,
             summary: HostSummary {
                 environment_id: environment_id.clone(),
+                host_name: Some(HostName::new("peer-host-a")),
                 node: peer.clone(),
                 system: SystemInfo::default(),
                 inventory: ToolInventory::default(),
@@ -1163,6 +1173,7 @@ mod tests {
 
         let current_summary = HostSummary {
             environment_id: current_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-a")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -1185,6 +1196,7 @@ mod tests {
             connection_status: PeerConnectionState::Disconnected,
             summary: HostSummary {
                 environment_id: stale_environment_id.clone(),
+                host_name: Some(HostName::new("peer-host-b")),
                 node: peer.clone(),
                 system: SystemInfo::default(),
                 inventory: ToolInventory::default(),
@@ -1211,6 +1223,7 @@ mod tests {
 
         let first_summary = HostSummary {
             environment_id: first_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-a")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -1219,6 +1232,7 @@ mod tests {
         };
         let second_summary = HostSummary {
             environment_id: second_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-b")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -1237,10 +1251,7 @@ mod tests {
             "removing one environment should leave another live environment addressable"
         );
 
-        let status = registry
-            .get_host_status(&second_environment_id, &HashMap::new())
-            .await
-            .expect("status for remaining environment");
+        let status = registry.get_host_status(&second_environment_id, &HashMap::new()).await.expect("status for remaining environment");
         assert_eq!(status.environment_id, second_environment_id);
     }
 
@@ -1254,6 +1265,7 @@ mod tests {
 
         let canonical_summary = HostSummary {
             environment_id: canonical_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-a")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -1262,6 +1274,7 @@ mod tests {
         };
         let older_remaining_summary = HostSummary {
             environment_id: older_remaining_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-b")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -1270,6 +1283,7 @@ mod tests {
         };
         let newer_remaining_summary = HostSummary {
             environment_id: newer_remaining_environment_id.clone(),
+            host_name: Some(HostName::new("peer-host-c")),
             node: peer.clone(),
             system: SystemInfo::default(),
             inventory: ToolInventory::default(),
@@ -1286,10 +1300,7 @@ mod tests {
         registry.publish_peer_summary(older_remaining_summary, &|_| {}).await;
         registry.publish_peer_summary(newer_remaining_summary.clone(), &|_| {}).await;
 
-        registry.apply_event(&DaemonEvent::HostRemoved {
-            environment_id: canonical_environment_id.clone(),
-            seq: 2,
-        });
+        registry.apply_event(&DaemonEvent::HostRemoved { environment_id: canonical_environment_id.clone(), seq: 2 });
 
         assert_eq!(
             registry.environment_id_for_node(&peer.node_id).await,
@@ -1297,10 +1308,8 @@ mod tests {
             "the canonical mapping should follow the most recently updated remaining environment"
         );
 
-        let status = registry
-            .get_host_status(&newer_remaining_environment_id, &HashMap::new())
-            .await
-            .expect("status for remaining environment");
+        let status =
+            registry.get_host_status(&newer_remaining_environment_id, &HashMap::new()).await.expect("status for remaining environment");
         assert_eq!(status.environment_id, newer_remaining_environment_id);
         assert!(status.summary.is_some());
     }

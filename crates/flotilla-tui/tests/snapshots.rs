@@ -3,8 +3,8 @@ mod support;
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    CheckoutRef, HostName, HostPath, HostSummary, NodeId, NodeInfo, ProviderData, RepoIdentity, SessionStatus, SystemInfo, WorkItem,
-    WorkItemIdentity,
+    qualified_path::HostId, CheckoutRef, EnvironmentId, HostName, HostPath, HostSummary, NodeId, NodeInfo, ProviderData, RepoIdentity,
+    SessionStatus, SystemInfo, WorkItem, WorkItemIdentity,
 };
 use flotilla_tui::app::{
     ui_state::{PendingAction, PendingStatus},
@@ -910,11 +910,15 @@ fn remote_host_home_directory_shortening() {
 
     // Add local host so the model can distinguish local vs remote.
     let local_host = HostName::new("local");
-    harness.model.hosts.insert(local_host.clone(), TuiHostState {
+    let local_environment_id = EnvironmentId::host(HostId::new("local-env"));
+    harness.model.hosts.insert(local_environment_id.clone(), TuiHostState {
+        environment_id: local_environment_id.clone(),
         host_name: local_host,
         is_local: true,
         status: PeerStatus::Connected,
         summary: HostSummary {
+            environment_id: local_environment_id,
+            host_name: Some(HostName::new("local")),
             node: NodeInfo::new(NodeId::new("local"), "local"),
             system: SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
@@ -924,11 +928,15 @@ fn remote_host_home_directory_shortening() {
     });
 
     // Add remote host info with home_dir set.
-    harness.model.hosts.insert(remote_host.clone(), TuiHostState {
+    let remote_environment_id = EnvironmentId::host(HostId::new(format!("{}-env", remote_host.as_str())));
+    harness.model.hosts.insert(remote_environment_id.clone(), TuiHostState {
+        environment_id: remote_environment_id.clone(),
         host_name: remote_host.clone(),
         is_local: false,
         status: PeerStatus::Connected,
         summary: HostSummary {
+            environment_id: remote_environment_id,
+            host_name: Some(remote_host.clone()),
             node: NodeInfo::new(NodeId::new(remote_host.as_str()), remote_host.as_str()),
             system: SystemInfo { home_dir: Some(PathBuf::from("/home/alice")), ..SystemInfo::default() },
             inventory: flotilla_protocol::ToolInventory::default(),

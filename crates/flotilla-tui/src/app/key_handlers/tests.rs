@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, NodeId, NodeInfo, ProvisioningTarget, WorkItemIdentity,
+    qualified_path::HostId, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, EnvironmentId, HostName, HostPath, NodeId, NodeInfo,
+    ProvisioningTarget, WorkItemIdentity,
 };
 use ratatui::layout::Rect;
 
@@ -50,11 +51,15 @@ fn active_search_query(app: &App) -> Option<&str> {
 
 fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
     let host_name = HostName::new(name);
-    model.hosts.insert(host_name.clone(), TuiHostState {
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
         host_name: host_name.clone(),
         is_local: false,
         status: PeerStatus::Connected,
         summary: flotilla_protocol::HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
             node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),

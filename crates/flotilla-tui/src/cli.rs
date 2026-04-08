@@ -124,9 +124,10 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Node", "Local", "Configured", "Status", "Summary", "Repos", "Work"]);
+    table.set_header(vec!["Host", "Node", "Local", "Configured", "Status", "Summary", "Repos", "Work"]);
     for host in &response.hosts {
         table.add_row(vec![
+            Cell::new(host.host_name.as_str()),
             Cell::new(node_label(&host.node)),
             Cell::new(if host.is_local { "yes" } else { "no" }),
             Cell::new(if host.configured { "yes" } else { "no" }),
@@ -141,6 +142,7 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
 
 fn format_host_status_human(response: &HostStatusResponse) -> String {
     let mut out = String::new();
+    out.push_str(&format!("Host: {}\n", response.host_name));
     out.push_str(&format!("Node: {}\n", node_label(&response.node)));
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
@@ -170,6 +172,7 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
 
 fn format_host_providers_human(response: &HostProvidersResponse) -> String {
     let mut out = String::new();
+    out.push_str(&format!("Host: {}\n", response.host_name));
     out.push_str(&format!("Node: {}\n", node_label(&response.node)));
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
@@ -368,8 +371,8 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             };
             format!("[host]     {}: {} (seq {})", node_label(&snap.node), state, snap.seq)
         }
-        DaemonEvent::HostRemoved { node_id, seq } => {
-            format!("[host]     {node_id}: removed (seq {seq})")
+        DaemonEvent::HostRemoved { environment_id, seq } => {
+            format!("[host]     {environment_id}: removed (seq {seq})")
         }
     }
 }
@@ -379,8 +382,8 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
     match event {
         DaemonEvent::RepoSnapshot(snap) => Some((StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq)),
         DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
-        DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { node_id: snap.node.node_id.clone() }, snap.seq)),
-        DaemonEvent::HostRemoved { node_id, seq } => Some((StreamKey::Host { node_id: node_id.clone() }, *seq)),
+        DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq)),
+        DaemonEvent::HostRemoved { environment_id, seq } => Some((StreamKey::Host { environment_id: environment_id.clone() }, *seq)),
         _ => None,
     }
 }

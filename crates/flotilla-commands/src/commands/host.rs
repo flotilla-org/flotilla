@@ -1,9 +1,13 @@
 use std::{ffi::OsString, fmt};
 
 use clap::{Parser, Subcommand};
-use flotilla_protocol::{qualified_path::HostId, Command, CommandAction, EnvironmentId, NodeId, RepoSelector};
+use flotilla_protocol::{Command, CommandAction, HostName, RepoSelector};
 
-use crate::{noun::NounCommand, Refinable, Resolved};
+use crate::{
+    noun::NounCommand,
+    resolved::{HostQueryKind, HostResolution, RepoContext},
+    Refinable, Resolved,
+};
 
 // ---------------------------------------------------------------------------
 // Partial types (what clap parses into)
@@ -98,38 +102,30 @@ impl HostNoun {
             })),
             HostVerb::Status => {
                 let host = self.subject.ok_or("status requires a host name")?;
-                Ok(Resolved::Ready(Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::QueryHostStatus { target_environment_id: EnvironmentId::host(HostId::new(host)) },
-                }))
+                Ok(Resolved::HostQuery { subject: HostName::new(host), kind: HostQueryKind::Status })
             }
             HostVerb::Providers => {
                 let host = self.subject.ok_or("providers requires a host name")?;
-                Ok(Resolved::Ready(Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::QueryHostProviders { target_environment_id: EnvironmentId::host(HostId::new(host)) },
-                }))
+                Ok(Resolved::HostQuery { subject: HostName::new(host), kind: HostQueryKind::Providers })
             }
             HostVerb::Refresh { repo } => {
-                let host = self.subject.ok_or("refresh requires a host name")?;
+                let host = HostName::new(self.subject.ok_or("refresh requires a host name")?);
                 let resolved_repo = repo.map(RepoSelector::Query);
-                let mut cmd = Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::Refresh { repo: resolved_repo },
-                };
-                cmd.node_id = Some(NodeId::new(host));
-                Ok(Resolved::Ready(cmd))
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: Some(flotilla_protocol::ProvisioningTarget::Host { host: host.clone() }),
+                        context_repo: None,
+                        action: CommandAction::Refresh { repo: resolved_repo },
+                    },
+                    repo: RepoContext::None,
+                    host: HostResolution::Explicit(host),
+                })
             }
             HostVerb::Route(inner) => {
-                let host = self.subject.ok_or("routing requires a host name")?;
+                let host = HostName::new(self.subject.ok_or("routing requires a host name")?);
                 let mut resolved = inner.resolve()?;
-                resolved.set_node_id(host);
+                resolved.set_explicit_host(host);
                 Ok(resolved)
             }
         }
@@ -175,10 +171,13 @@ impl fmt::Display for HostNounPartial {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{qualified_path::HostId, Command, CommandAction, EnvironmentId, NodeId, RepoSelector};
+    use flotilla_protocol::{Command, CommandAction, HostName, ProvisioningTarget, RepoSelector};
 
     use super::HostNounPartial;
-    use crate::{Refinable, Resolved};
+    use crate::{
+        resolved::{HostQueryKind, HostResolution, RepoContext},
+        Refinable, Resolved,
+    };
 
     fn parse_and_resolve(args: &[&str]) -> Resolved {
         let partial = HostNounPartial::try_parse_from(args).expect("should parse");
@@ -200,34 +199,36 @@ mod tests {
 
     #[test]
     fn host_status() {
-        assert_eq!(
-            parse_and_resolve(&["host", "alpha", "status"]),
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostStatus { target_environment_id: EnvironmentId::host(HostId::new("alpha")) },
-            })
-        );
+        assert_eq!(parse_and_resolve(&["host", "alpha", "status"]), Resolved::HostQuery {
+            subject: HostName::new("alpha"),
+            kind: HostQueryKind::Status
+        });
     }
 
     #[test]
     fn host_providers() {
-        assert_eq!(
-            parse_and_resolve(&["host", "alpha", "providers"]),
-            Resolved::Ready(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::QueryHostProviders { target_environment_id: EnvironmentId::host(HostId::new("alpha")) },
-            })
-        );
+        assert_eq!(parse_and_resolve(&["host", "alpha", "providers"]), Resolved::HostQuery {
+            subject: HostName::new("alpha"),
+            kind: HostQueryKind::Providers
+        });
     }
 
     #[test]
     fn host_refresh_bare() {
         let resolved = parse_and_resolve(&["host", "alpha", "refresh"]);
-        assert!(matches!(resolved, Resolved::Ready(Command { action: CommandAction::Refresh { repo: None }, .. })));
+        assert!(matches!(
+            resolved,
+            Resolved::NeedsContext {
+                command: Command {
+                    node_id: None,
+                    provisioning_target: Some(ProvisioningTarget::Host { ref host }),
+                    context_repo: None,
+                    action: CommandAction::Refresh { repo: None },
+                },
+                repo: RepoContext::None,
+                host: HostResolution::Explicit(ref explicit),
+            } if host == &HostName::new("alpha") && explicit == &HostName::new("alpha")
+        ));
     }
 
     #[test]
@@ -235,8 +236,16 @@ mod tests {
         let resolved = parse_and_resolve(&["host", "alpha", "refresh", "my-repo"]);
         assert!(matches!(
             resolved,
-            Resolved::Ready(cmd) if cmd.node_id.is_some()
-                && matches!(cmd.action, CommandAction::Refresh { repo: Some(RepoSelector::Query(ref q)) } if q == "my-repo")
+            Resolved::NeedsContext {
+                command: Command {
+                    node_id: None,
+                    provisioning_target: Some(ProvisioningTarget::Host { ref host }),
+                    action: CommandAction::Refresh { repo: Some(RepoSelector::Query(ref q)) },
+                    ..
+                },
+                host: HostResolution::Explicit(ref explicit),
+                ..
+            } if host == &HostName::new("alpha") && explicit == &HostName::new("alpha") && q == "my-repo"
         ));
     }
 
@@ -245,8 +254,12 @@ mod tests {
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "checkout", "main"]);
         assert!(matches!(
             resolved,
-            Resolved::Ready(cmd) if cmd.node_id.as_ref().map(|node| node.as_str()) == Some("feta")
-                && matches!(cmd.action, CommandAction::Checkout { .. })
+            Resolved::NeedsContext {
+                ref command,
+                host: HostResolution::Explicit(ref host),
+                ..
+            } if command.node_id.is_none() && host == &HostName::new("feta")
+                && matches!(command.action, CommandAction::Checkout { .. })
         ));
     }
 
@@ -255,7 +268,8 @@ mod tests {
         let resolved = parse_and_resolve(&["host", "alpha", "checkout", "my-feature", "remove"]);
         assert!(matches!(
             resolved,
-            Resolved::NeedsContext { ref command, .. } if command.node_id.is_some()
+            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
+                && host == &HostName::new("alpha")
                 && matches!(command.action, CommandAction::RemoveCheckout { .. })
         ));
     }
@@ -295,12 +309,13 @@ mod tests {
 
     #[test]
     fn host_routed_repo_query_becomes_host_targeted() {
-        // `host feta repo myslug providers` should NOT silently drop the host
+        // `host feta repo myslug providers` should preserve the host as unresolved routing context.
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "providers"]);
         assert!(matches!(
             resolved,
-            Resolved::Ready(ref cmd) if cmd.node_id == Some(NodeId::new("feta"))
-                && matches!(cmd.action, CommandAction::QueryRepoProviders { ref repo } if *repo == RepoSelector::Query("myslug".into()))
+            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
+                && host == &HostName::new("feta")
+                && matches!(command.action, CommandAction::QueryRepoProviders { ref repo } if *repo == RepoSelector::Query("myslug".into()))
         ));
     }
 
@@ -309,8 +324,9 @@ mod tests {
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug"]);
         assert!(matches!(
             resolved,
-            Resolved::Ready(ref cmd) if cmd.node_id == Some(NodeId::new("feta"))
-                && matches!(cmd.action, CommandAction::QueryRepoDetail { ref repo } if *repo == RepoSelector::Query("myslug".into()))
+            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
+                && host == &HostName::new("feta")
+                && matches!(command.action, CommandAction::QueryRepoDetail { ref repo } if *repo == RepoSelector::Query("myslug".into()))
         ));
     }
 
@@ -319,8 +335,9 @@ mod tests {
         let resolved = parse_and_resolve(&["host", "feta", "repo", "myslug", "work"]);
         assert!(matches!(
             resolved,
-            Resolved::Ready(ref cmd) if cmd.node_id == Some(NodeId::new("feta"))
-                && matches!(cmd.action, CommandAction::QueryRepoWork { ref repo } if *repo == RepoSelector::Query("myslug".into()))
+            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. } if command.node_id.is_none()
+                && host == &HostName::new("feta")
+                && matches!(command.action, CommandAction::QueryRepoWork { ref repo } if *repo == RepoSelector::Query("myslug".into()))
         ));
     }
 
@@ -329,6 +346,10 @@ mod tests {
         // `host alpha pr 42 open` should work via the pr alias on NounCommand::Cr
         let partial = HostNounPartial::try_parse_from(["host", "alpha", "pr", "42", "open"]).expect("should parse");
         let resolved = partial.refine().expect("should refine").resolve().expect("should resolve");
-        assert!(matches!(resolved, Resolved::NeedsContext { ref command, .. } if command.node_id.is_some()));
+        assert!(matches!(
+            resolved,
+            Resolved::NeedsContext { ref command, host: HostResolution::Explicit(ref host), .. }
+                if command.node_id.is_none() && host == &HostName::new("alpha")
+        ));
     }
 }

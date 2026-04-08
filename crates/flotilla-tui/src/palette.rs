@@ -416,7 +416,23 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel) -> Vec<Palet
                 })
                 .collect()
         }
-        "host" => model.hosts.keys().map(|h| (h.to_string(), String::new())).collect(),
+        "host" => model.hosts.values().map(|h| (h.host_name.to_string(), String::new())).collect(),
+        "environment" => {
+            let mut items: Vec<(String, String)> =
+                model.hosts.values().map(|host| (host.environment_id.canonical_string(), host.host_name.to_string())).collect();
+            for host in model.hosts.values() {
+                for environment in &host.summary.environments {
+                    let description = environment
+                        .display_name()
+                        .map(|name| format!("{} on {}", name, host.host_name))
+                        .unwrap_or_else(|| format!("on {}", host.host_name));
+                    items.push((environment.environment_id().canonical_string(), description));
+                }
+            }
+            items.sort();
+            items.dedup_by(|left, right| left.0 == right.0);
+            items
+        }
         _ => vec![],
     };
 
@@ -680,8 +696,14 @@ mod tests {
     #[test]
     fn parse_palette_input_host_routed() {
         let result = parse_palette_input("host feta cr #42 open").expect("should parse");
-        assert!(matches!(result, PaletteParseResult::Resolved(Resolved::NeedsContext { ref command, .. })
-                if command.node_id.is_some()));
+        assert!(matches!(
+            result,
+            PaletteParseResult::Resolved(Resolved::NeedsContext {
+                host: flotilla_commands::resolved::HostResolution::Explicit(ref host),
+                ref command,
+                ..
+            }) if host == &HostName::new("feta") && command.node_id.is_none()
+        ));
     }
 
     #[test]
@@ -699,7 +721,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, HostName, NodeId, NodeInfo, ProviderData, RepoLabels};
+    use flotilla_protocol::{
+        qualified_path::HostId, ChangeRequest, ChangeRequestStatus, EnvironmentId, HostName, NodeId, NodeInfo, ProviderData, RepoLabels,
+    };
 
     use crate::app::test_builders::repo_info;
 
@@ -739,6 +763,8 @@ mod tests {
 
     fn stub_host_summary(name: &str) -> flotilla_protocol::HostSummary {
         flotilla_protocol::HostSummary {
+            environment_id: EnvironmentId::host(HostId::new(format!("{name}-env"))),
+            host_name: Some(HostName::new(name)),
             node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
@@ -749,13 +775,15 @@ mod tests {
 
     fn model_with_hosts() -> TuiModel {
         let mut model = empty_model();
-        model.hosts.insert(HostName::new("feta"), crate::app::TuiHostState {
+        model.hosts.insert(EnvironmentId::host(HostId::new("feta-env")), crate::app::TuiHostState {
+            environment_id: EnvironmentId::host(HostId::new("feta-env")),
             host_name: HostName::new("feta"),
             is_local: false,
             status: crate::app::PeerStatus::Connected,
             summary: stub_host_summary("feta"),
         });
-        model.hosts.insert(HostName::new("brie"), crate::app::TuiHostState {
+        model.hosts.insert(EnvironmentId::host(HostId::new("brie-env")), crate::app::TuiHostState {
+            environment_id: EnvironmentId::host(HostId::new("brie-env")),
             host_name: HostName::new("brie"),
             is_local: false,
             status: crate::app::PeerStatus::Connected,
@@ -838,6 +866,16 @@ mod tests {
     }
 
     #[test]
+    fn environment_typed_shows_host_and_nested_environment_ids() {
+        let model = model_with_rich_hosts();
+        let completions = palette_completions("environment ", &model, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"host:feta-env"), "expected host environment id in {values:?}");
+        assert!(values.contains(&"host:brie-env"), "expected host environment id in {values:?}");
+        assert!(values.contains(&"prov:env-abc123"), "expected nested environment id in {values:?}");
+    }
+
+    #[test]
     fn pr_alias_appears_in_root_completions() {
         let model = empty_model();
         let completions = palette_completions("pr", &model, true);
@@ -880,7 +918,8 @@ mod tests {
             image: ImageId::new("image-1"),
             status: EnvironmentStatus::Running,
         });
-        model.hosts.insert(HostName::new("feta"), crate::app::TuiHostState {
+        model.hosts.insert(EnvironmentId::host(HostId::new("feta-env")), crate::app::TuiHostState {
+            environment_id: EnvironmentId::host(HostId::new("feta-env")),
             host_name: HostName::new("feta"),
             is_local: false,
             status: crate::app::PeerStatus::Connected,
@@ -888,7 +927,8 @@ mod tests {
         });
 
         // Host "brie": bare host, no environment providers or environments.
-        model.hosts.insert(HostName::new("brie"), crate::app::TuiHostState {
+        model.hosts.insert(EnvironmentId::host(HostId::new("brie-env")), crate::app::TuiHostState {
+            environment_id: EnvironmentId::host(HostId::new("brie-env")),
             host_name: HostName::new("brie"),
             is_local: false,
             status: crate::app::PeerStatus::Connected,

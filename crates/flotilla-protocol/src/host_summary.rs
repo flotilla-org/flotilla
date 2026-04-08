@@ -2,10 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EnvironmentId, EnvironmentInfo, NodeId};
-
 #[cfg(test)]
 use crate::qualified_path::HostId;
+use crate::{EnvironmentId, EnvironmentInfo, HostName, NodeId};
 
 /// Mesh identity plus the human-readable label that should be shown in the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +22,8 @@ impl NodeInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSummary {
     pub environment_id: EnvironmentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<HostName>,
     pub node: NodeInfo,
     pub system: SystemInfo,
     #[serde(default)]
@@ -110,6 +111,7 @@ mod tests {
     fn host_summary_roundtrips_with_direct_and_provisioned_environments() {
         let summary = HostSummary {
             environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+            host_name: Some(HostName::new("desktop")),
             node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
             system: SystemInfo {
                 home_dir: Some(PathBuf::from("/home/dev")),
@@ -154,6 +156,7 @@ mod tests {
             connection_status: crate::PeerConnectionState::Connected,
             summary: HostSummary {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                host_name: Some(HostName::new("desktop")),
                 node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                 system: SystemInfo {
                     home_dir: Some(PathBuf::from("/home/dev")),

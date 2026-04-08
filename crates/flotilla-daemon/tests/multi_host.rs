@@ -394,10 +394,7 @@ async fn host_summary_round_trip_between_connected_peers() {
 
     assert_eq!(result, HandleResult::Ignored);
     let expected = follower_daemon.local_host_summary().await;
-    let stored = leader_mgr
-        .get_peer_host_summaries()
-        .get(&expected.environment_id)
-        .expect("leader stored follower summary");
+    let stored = leader_mgr.get_peer_host_summaries().get(&expected.environment_id).expect("leader stored follower summary");
     assert_eq!(stored.node.node_id, node("follower"));
     let mut expected = expected;
     expected.node.node_id = node("follower");

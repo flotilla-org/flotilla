@@ -9,7 +9,6 @@ use crate::{
     query::{HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse},
     AttachableSetId, RepoIdentity,
 };
-
 #[cfg(test)]
 use crate::{qualified_path::HostId, EnvironmentId};
 
@@ -622,6 +621,7 @@ mod tests {
             CommandValue::HostList(Box::new(HostListResponse {
                 hosts: vec![HostListEntry {
                     environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                    host_name: crate::HostName::new("desktop"),
                     node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                     is_local: true,
                     configured: true,
@@ -633,12 +633,14 @@ mod tests {
             })),
             CommandValue::HostStatus(Box::new(HostStatusResponse {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                host_name: crate::HostName::new("desktop"),
                 node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                 is_local: true,
                 configured: true,
                 connection_status: PeerConnectionState::Connected,
                 summary: Some(HostSummary {
                     environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                    host_name: Some(crate::HostName::new("desktop")),
                     node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                     system: SystemInfo {
                         home_dir: Some("/home/dev".into()),
@@ -663,12 +665,14 @@ mod tests {
             })),
             CommandValue::HostProviders(Box::new(HostProvidersResponse {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                host_name: crate::HostName::new("desktop"),
                 node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                 is_local: true,
                 configured: true,
                 connection_status: PeerConnectionState::Connected,
                 summary: HostSummary {
                     environment_id: EnvironmentId::host(HostId::new("desktop-host")),
+                    host_name: Some(crate::HostName::new("desktop")),
                     node: NodeInfo::new(NodeId::new("desktop"), "Desktop"),
                     system: SystemInfo::default(),
                     inventory: ToolInventory::default(),

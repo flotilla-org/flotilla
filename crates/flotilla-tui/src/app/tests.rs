@@ -11,7 +11,10 @@ use flotilla_core::{
         issue_query::{IssueQuery, IssueQueryService, IssueResultPage},
     },
 };
-use flotilla_protocol::{provider_data::Issue, Change, NodeId, NodeInfo, ProvisioningTarget, RepoSelector, WorkItemIdentity};
+use flotilla_protocol::{
+    provider_data::Issue, qualified_path::HostId, Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId,
+    NodeInfo, ProvisioningTarget, RepoSelector, WorkItemIdentity,
+};
 use tempfile::tempdir;
 use test_support::*;
 use tokio::sync::{Mutex as TokioMutex, Notify};
@@ -20,11 +23,15 @@ use super::*;
 
 fn insert_local_host(model: &mut TuiModel, name: &str) {
     let host_name = HostName::new(name);
-    model.hosts.insert(host_name.clone(), TuiHostState {
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
         host_name: host_name.clone(),
         is_local: true,
         status: PeerStatus::Connected,
         summary: HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
             node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
@@ -36,11 +43,15 @@ fn insert_local_host(model: &mut TuiModel, name: &str) {
 
 fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
     let host_name = HostName::new(name);
-    model.hosts.insert(host_name.clone(), TuiHostState {
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
         host_name: host_name.clone(),
         is_local: false,
         status,
         summary: HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
             node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
@@ -766,7 +777,7 @@ fn peer_disconnect_clears_selected_target_host() {
     app.handle_daemon_event(DaemonEvent::PeerStatusChanged { node_id: NodeId::new("alpha"), status: PeerConnectionState::Disconnected });
 
     assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
-    assert_eq!(app.model.hosts.get(&HostName::new("alpha")).unwrap().status, PeerStatus::Disconnected);
+    assert_eq!(app.model.resolve_host(&HostName::new("alpha")).unwrap().status, PeerStatus::Disconnected);
 }
 
 #[test]
@@ -775,10 +786,11 @@ fn host_removed_event_deletes_host_and_clears_selected_target_host() {
     app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("alpha") };
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
 
-    app.handle_daemon_event(DaemonEvent::HostRemoved { node_id: NodeId::new("alpha"), seq: 2 });
+    let environment_id = app.model.resolve_host(&HostName::new("alpha")).unwrap().environment_id.clone();
+    app.handle_daemon_event(DaemonEvent::HostRemoved { environment_id, seq: 2 });
 
     assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
-    assert!(!app.model.hosts.contains_key(&HostName::new("alpha")));
+    assert!(app.model.resolve_host(&HostName::new("alpha")).is_err());
 }
 
 // -- Convenience accessors --
@@ -1043,10 +1055,13 @@ fn host_snapshot_event_populates_hosts_map() {
     let mut app = stub_app();
     app.handle_daemon_event(DaemonEvent::HostSnapshot(Box::new(flotilla_protocol::HostSnapshot {
         seq: 1,
+        environment_id: EnvironmentId::host(HostId::new("desktop-env")),
         node: NodeInfo::new(NodeId::new("desktop"), "desktop"),
         is_local: true,
         connection_status: PeerConnectionState::Connected,
         summary: HostSummary {
+            environment_id: EnvironmentId::host(HostId::new("desktop-env")),
+            host_name: Some(HostName::new("desktop")),
             node: NodeInfo::new(NodeId::new("desktop"), "desktop"),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
@@ -1055,7 +1070,7 @@ fn host_snapshot_event_populates_hosts_map() {
         },
     })));
     assert_eq!(app.model.my_host(), Some(&HostName::new("desktop")));
-    assert!(app.model.hosts.get(&HostName::new("desktop")).unwrap().is_local);
+    assert!(app.model.resolve_host(&HostName::new("desktop")).unwrap().is_local);
 }
 
 #[test]
@@ -1071,4 +1086,95 @@ fn peer_host_names_returns_sorted_non_local() {
     insert_peer_host(&mut app.model, "beta", PeerStatus::Connected);
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
     assert_eq!(app.model.peer_host_names(), vec![HostName::new("alpha"), HostName::new("beta")]);
+}
+
+#[test]
+fn duplicate_host_names_do_not_collide_and_resolve_as_ambiguous() {
+    let mut app = stub_app();
+
+    let first_env = EnvironmentId::host(HostId::new("desktop-a"));
+    let second_env = EnvironmentId::host(HostId::new("desktop-b"));
+
+    app.model.hosts.insert(first_env.clone(), TuiHostState {
+        environment_id: first_env.clone(),
+        host_name: HostName::new("desktop"),
+        is_local: false,
+        status: PeerStatus::Connected,
+        summary: HostSummary {
+            environment_id: first_env.clone(),
+            host_name: Some(HostName::new("desktop")),
+            node: NodeInfo::new(NodeId::new("node-a"), "Desktop"),
+            system: flotilla_protocol::SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+    app.model.hosts.insert(second_env.clone(), TuiHostState {
+        environment_id: second_env.clone(),
+        host_name: HostName::new("desktop"),
+        is_local: false,
+        status: PeerStatus::Connected,
+        summary: HostSummary {
+            environment_id: second_env.clone(),
+            host_name: Some(HostName::new("desktop")),
+            node: NodeInfo::new(NodeId::new("node-b"), "Desktop"),
+            system: flotilla_protocol::SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+
+    assert_eq!(app.model.hosts.len(), 2);
+    let err = app.model.resolve_host(&HostName::new("desktop")).expect_err("duplicate host names should be ambiguous");
+    assert!(err.contains("ambiguous host: desktop"), "unexpected error: {err}");
+    assert!(err.contains("desktop-a"), "unexpected error: {err}");
+    assert!(err.contains("desktop-b"), "unexpected error: {err}");
+}
+
+#[test]
+fn resolve_environment_target_accepts_host_environment_identity_directly() {
+    let mut app = stub_app();
+    insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
+
+    let host = app.model.resolve_host(&HostName::new("alpha")).expect("host");
+    let expected_environment_id = host.environment_id.clone();
+    let expected_node_id = host.summary.node.node_id.clone();
+
+    let (node_id, target) = app.model.resolve_environment_target(&expected_environment_id).expect("resolve target");
+    assert_eq!(node_id, expected_node_id);
+    assert_eq!(target, ProvisioningTarget::Host { host: HostName::new("alpha") });
+}
+
+#[test]
+fn resolve_environment_target_accepts_non_host_environment_identity_directly() {
+    let mut app = stub_app();
+    let host_name = HostName::new("alpha");
+    let environment_id = EnvironmentId::host(HostId::new("alpha-env"));
+    let nested_env = EnvironmentId::new("builder-1");
+    app.model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
+        host_name: host_name.clone(),
+        is_local: false,
+        status: PeerStatus::Connected,
+        summary: HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
+            node: NodeInfo::new(NodeId::new("node-alpha"), "Desktop"),
+            system: flotilla_protocol::SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![EnvironmentInfo::Provisioned {
+                id: nested_env.clone(),
+                display_name: Some("builder".into()),
+                image: ImageId::new("ubuntu:24.04"),
+                status: EnvironmentStatus::Running,
+            }],
+        },
+    });
+
+    let (node_id, target) = app.model.resolve_environment_target(&nested_env).expect("resolve target");
+    assert_eq!(node_id, NodeId::new("node-alpha"));
+    assert_eq!(target, ProvisioningTarget::ExistingEnvironment { host: host_name, env_id: nested_env });
 }
