@@ -1263,6 +1263,29 @@ async fn disconnect_peer_returns_remove_repo_for_remote_only_with_no_remaining_p
 }
 
 #[tokio::test]
+async fn disconnect_peer_clears_configured_peer_visibility_for_that_node() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let generation = accepted_generation(mgr.activate_connection(
+        NodeId::new("peer"),
+        MockPeerSender::discard(),
+        ConnectionMeta {
+            direction: ConnectionDirection::Outbound,
+            config_label: Some(ConfigLabel("configured-peer".into())),
+            expected_peer: Some(NodeId::new("peer")),
+            config_backed: true,
+        },
+    ));
+
+    assert_eq!(mgr.configured_peers().len(), 1);
+    assert_eq!(mgr.configured_peers()[0].node_id, NodeId::new("peer"));
+
+    let plan = mgr.disconnect_peer(&NodeId::new("peer"), generation);
+
+    assert!(plan.was_active);
+    assert!(mgr.configured_peers().is_empty(), "configured-peer visibility should be cleared after disconnect");
+}
+
+#[tokio::test]
 async fn get_sender_if_current_returns_sender_for_matching_generation() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
     let sent = Arc::new(Mutex::new(Vec::new()));

@@ -1630,6 +1630,7 @@ impl PeerManager {
         self.active_connections.remove(name);
         self.generations.remove(name);
         self.displaced_senders.retain(|(host, _), _| host != name);
+        self.transport_peers.retain(|_, node_id| node_id != name);
         self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
         self.command_reverse_paths.retain(|_, hop| hop.next_hop != *name);
         self.pending_resync_requests.retain(|key, _| key.target_node_id != *name);
