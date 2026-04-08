@@ -2,12 +2,12 @@ use std::{sync::Arc, time::Duration};
 
 use flotilla_client::SocketDaemon;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::HostName;
+use flotilla_protocol::{HostName, NodeInfo};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use super::{build_remote_command_router, handle_client_session, spawn_peer_networking_runtime};
 use crate::{
-    peer::{channel_transport::channel_transport_pair, PeerManager},
+    peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
     server::PeerConnectedNotice,
 };
 
@@ -39,7 +39,10 @@ pub async fn spawn_in_memory_request_topology(
     let leader_peer_manager = Arc::new(Mutex::new(PeerManager::new(leader.node_id().clone())));
     let follower_peer_manager = Arc::new(Mutex::new(PeerManager::new(follower.node_id().clone())));
 
-    let (leader_transport, follower_transport) = channel_transport_pair(leader_host.clone(), follower_host.clone());
+    let (leader_transport, follower_transport) = channel_transport_pair_with_nodes(
+        NodeInfo::new(leader.node_id().clone(), leader_host.to_string()),
+        NodeInfo::new(follower.node_id().clone(), follower_host.to_string()),
+    );
     {
         let mut pm = leader_peer_manager.lock().await;
         pm.add_configured_target(
@@ -106,7 +109,10 @@ pub async fn spawn_in_memory_request_topology_stateful(
     let leader_peer_manager = Arc::new(Mutex::new(PeerManager::new(leader.node_id().clone())));
     let follower_peer_manager = Arc::new(Mutex::new(PeerManager::new(follower.node_id().clone())));
 
-    let (leader_transport, follower_transport) = channel_transport_pair(leader_host.clone(), follower_host.clone());
+    let (leader_transport, follower_transport) = channel_transport_pair_with_nodes(
+        NodeInfo::new(leader.node_id().clone(), leader_host.to_string()),
+        NodeInfo::new(follower.node_id().clone(), follower_host.to_string()),
+    );
     {
         let mut pm = leader_peer_manager.lock().await;
         pm.add_configured_target(

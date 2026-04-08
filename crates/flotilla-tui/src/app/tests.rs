@@ -1068,14 +1068,14 @@ fn host_snapshot_event_populates_hosts_map() {
             environments: vec![],
         },
     })));
-    assert_eq!(app.model.my_host(), Some(&HostName::new("desktop")));
+    assert!(app.model.my_host().is_some());
     assert!(app.model.resolve_host(&HostName::new("desktop")).unwrap().is_local);
 }
 
 #[test]
-fn my_host_returns_none_before_host_snapshot() {
+fn stub_app_starts_with_local_host_snapshot() {
     let app = stub_app();
-    assert!(app.model.my_host().is_none());
+    assert_eq!(app.model.my_host(), Some(&HostName::local()));
 }
 
 #[test]
@@ -1125,7 +1125,7 @@ fn duplicate_host_names_do_not_collide_and_resolve_as_ambiguous() {
         },
     });
 
-    assert_eq!(app.model.hosts.len(), 2);
+    assert_eq!(app.model.hosts.len(), 3);
     let err = app.model.resolve_host(&HostName::new("desktop")).expect_err("duplicate host names should be ambiguous");
     assert!(err.contains("ambiguous host: desktop"), "unexpected error: {err}");
     assert!(err.contains("desktop-a"), "unexpected error: {err}");

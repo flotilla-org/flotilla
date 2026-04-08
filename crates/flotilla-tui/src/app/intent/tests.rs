@@ -1090,7 +1090,7 @@ fn requires_local_host_false_for_non_filesystem_intents() {
 #[test]
 fn allowed_for_host_local_item_with_known_host() {
     let item = checkout_item("feat/x", "/tmp/feat-x", false);
-    let my_node_id = Some(NodeId::new(HostName::local().as_str()));
+    let my_node_id = Some(item.node_id.clone());
     // Local item, local host -> all intents allowed
     for intent in Intent::all_in_menu_order() {
         assert!(intent.is_allowed_for_host(&item, &my_node_id), "{intent:?} should be allowed for local item");
@@ -1101,7 +1101,7 @@ fn allowed_for_host_local_item_with_known_host() {
 fn allowed_for_host_remote_item_blocks_filesystem_intents() {
     let mut item = checkout_item("feat/x", "/tmp/feat-x", false);
     item.node_id = NodeId::new("remote-host");
-    let my_node_id = Some(NodeId::new(HostName::local().as_str()));
+    let my_node_id = Some(NodeId::new("node-local-test"));
 
     // Local-only filesystem intents should be blocked
     assert!(!Intent::SwitchToWorkspace.is_allowed_for_host(&item, &my_node_id));
@@ -1141,7 +1141,7 @@ fn remote_item_action_menu_excludes_local_only_intents() {
     item.issue_keys = vec!["7".into()];
     item.workspace_refs = vec!["ws-1".into()];
 
-    let my_node_id = Some(NodeId::new(HostName::local().as_str()));
+    let my_node_id = Some(NodeId::new("node-local-test"));
 
     let available: Vec<_> =
         Intent::all_in_menu_order().iter().filter(|i| i.is_available(&item) && i.is_allowed_for_host(&item, &my_node_id)).collect();

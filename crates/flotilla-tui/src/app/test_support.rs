@@ -10,15 +10,16 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, data::SectionLabels};
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostName, NodeId, ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels,
-    RepoSnapshot, StatusResponse, StreamKey, TopologyResponse, WorkItem,
+    qualified_path::HostId, Change, Command, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo, ProviderData,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot, StatusResponse, StreamKey, TopologyResponse,
+    WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
 
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
 pub(crate) use super::test_builders::*;
-use super::{App, CommandQueue, DirEntry, InFlightCommand, TuiModel};
+use super::{App, CommandQueue, DirEntry, InFlightCommand, TuiHostState, TuiModel};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
 pub(crate) struct StubDaemon {
@@ -26,6 +27,30 @@ pub(crate) struct StubDaemon {
 }
 
 static STUB_APP_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn local_node_id() -> NodeId {
+    NodeId::new("node-local-test")
+}
+
+fn insert_stub_local_host(model: &mut TuiModel) {
+    let host_name = HostName::local();
+    let environment_id = EnvironmentId::host(HostId::new("local-test-host"));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
+        host_name: host_name.clone(),
+        is_local: true,
+        status: super::PeerStatus::Connected,
+        summary: HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
+            node: NodeInfo::new(local_node_id(), host_name.as_str()),
+            system: flotilla_protocol::SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+}
 
 impl StubDaemon {
     pub(crate) fn new() -> Self {
@@ -95,7 +120,7 @@ pub(crate) fn snapshot(repo: &Path) -> RepoSnapshot {
         seq: 1,
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },
         repo: Some(repo.to_path_buf()),
-        node_id: NodeId::new(flotilla_protocol::HostName::local().as_str()),
+        node_id: local_node_id(),
         work_items: vec![],
         providers: ProviderData::default(),
         provider_health: HashMap::new(),
@@ -166,7 +191,9 @@ fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
     let config_base = std::env::temp_dir().join(format!("flotilla-test-{config_id}"));
     let _ = std::fs::remove_dir_all(&config_base);
     let config = Arc::new(ConfigStore::with_base(config_base));
-    App::new(daemon, repos_info, config, crate::theme::Theme::classic())
+    let mut app = App::new(daemon, repos_info, config, crate::theme::Theme::classic());
+    insert_stub_local_host(&mut app.model);
+    app
 }
 
 /// Test harness that owns the state needed to construct a `WidgetContext`.
