@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use flotilla_protocol::{StepAction, StepExecutionContext};
+use flotilla_protocol::{NodeId, NodeInfo, StepAction, StepExecutionContext};
 
 use super::*;
 use crate::peer::{
@@ -15,10 +15,10 @@ fn test_repo() -> RepoIdentity {
 fn snapshot_msg(origin: &str, seq: u64) -> PeerDataMessage {
     let mut clock = VectorClock::default();
     for _ in 0..seq {
-        clock.tick(&HostName::new(origin));
+        clock.tick(&NodeId::new(origin));
     }
     PeerDataMessage {
-        origin_host: HostName::new(origin),
+        origin_node_id: NodeId::new(origin),
         repo_identity: test_repo(),
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
@@ -28,7 +28,7 @@ fn snapshot_msg(origin: &str, seq: u64) -> PeerDataMessage {
 
 fn sample_host_summary_for(name: &str) -> flotilla_protocol::HostSummary {
     flotilla_protocol::HostSummary {
-        host_name: HostName::new(name),
+        node: NodeInfo::new(NodeId::new(name), name),
         system: flotilla_protocol::SystemInfo {
             home_dir: Some(PathBuf::from("/home/dev")),
             os: Some("linux".into()),
@@ -54,14 +54,14 @@ fn accepted_generation(result: ActivationResult) -> u64 {
 
 #[tokio::test]
 async fn handle_snapshot_stores_data() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let msg = snapshot_msg("remote", 1);
 
     let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
     assert_eq!(result, HandleResult::Updated(test_repo()));
 
     let peer_data = mgr.get_peer_data();
-    let remote_host = HostName::new("remote");
+    let remote_host = NodeId::new("remote");
     assert!(peer_data.contains_key(&remote_host));
     let repo_state = &peer_data[&remote_host][&test_repo()];
     assert_eq!(repo_state.seq, 1);
@@ -70,7 +70,7 @@ async fn handle_snapshot_stores_data() {
 
 #[tokio::test]
 async fn handle_snapshot_updates_existing_data() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     // First snapshot
     let msg1 = snapshot_msg("remote", 1);
@@ -82,15 +82,15 @@ async fn handle_snapshot_updates_existing_data() {
     assert_eq!(result, HandleResult::Updated(test_repo()));
 
     let peer_data = mgr.get_peer_data();
-    let repo_state = &peer_data[&HostName::new("remote")][&test_repo()];
+    let repo_state = &peer_data[&NodeId::new("remote")][&test_repo()];
     assert_eq!(repo_state.seq, 5);
 }
 
 #[tokio::test]
 async fn handle_snapshot_without_host_repo_root_stores_none() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let msg = PeerDataMessage {
-        origin_host: HostName::new("remote"),
+        origin_node_id: NodeId::new("remote"),
         repo_identity: test_repo(),
         host_repo_root: None,
         clock: VectorClock::default(),
@@ -101,16 +101,16 @@ async fn handle_snapshot_without_host_repo_root_stores_none() {
     assert_eq!(result, HandleResult::Updated(test_repo()));
 
     let peer_data = mgr.get_peer_data();
-    let repo_state = &peer_data[&HostName::new("remote")][&test_repo()];
+    let repo_state = &peer_data[&NodeId::new("remote")][&test_repo()];
     assert_eq!(repo_state.host_repo_root, None);
 }
 
 #[tokio::test]
 async fn legacy_direct_request_resync_is_ignored() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     let msg = PeerDataMessage {
-        origin_host: HostName::new("remote"),
+        origin_node_id: NodeId::new("remote"),
         repo_identity: test_repo(),
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
@@ -128,10 +128,10 @@ async fn handle_delta_returns_needs_resync() {
         Change,
     };
 
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     let msg = PeerDataMessage {
-        origin_host: HostName::new("remote"),
+        origin_node_id: NodeId::new("remote"),
         repo_identity: test_repo(),
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
@@ -143,12 +143,12 @@ async fn handle_delta_returns_needs_resync() {
     };
 
     let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
-    assert_eq!(result, HandleResult::NeedsResync { from: HostName::new("remote"), repo: test_repo() });
+    assert_eq!(result, HandleResult::NeedsResync { from: NodeId::new("remote"), repo: test_repo() });
 }
 
 #[tokio::test]
 async fn handle_ignores_messages_from_self() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let msg = snapshot_msg("local", 1);
 
     let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
@@ -158,7 +158,7 @@ async fn handle_ignores_messages_from_self() {
 
 #[tokio::test]
 async fn relay_sends_to_all_except_origin() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     let (transport_a, sent_a) = MockTransport::with_sender();
     let (transport_b, sent_b) = MockTransport::with_sender();
@@ -167,15 +167,15 @@ async fn relay_sends_to_all_except_origin() {
     let sender_b = transport_b.sender().expect("sender");
     let sender_c = transport_c.sender().expect("sender");
 
-    mgr.add_peer(HostName::new("peer-a"), Box::new(transport_a));
-    mgr.add_peer(HostName::new("peer-b"), Box::new(transport_b));
-    mgr.add_peer(HostName::new("peer-c"), Box::new(transport_c));
-    mgr.register_sender(HostName::new("peer-a"), sender_a);
-    mgr.register_sender(HostName::new("peer-b"), sender_b);
-    mgr.register_sender(HostName::new("peer-c"), sender_c);
+    mgr.add_peer(NodeId::new("peer-a"), Box::new(transport_a));
+    mgr.add_peer(NodeId::new("peer-b"), Box::new(transport_b));
+    mgr.add_peer(NodeId::new("peer-c"), Box::new(transport_c));
+    mgr.register_sender(NodeId::new("peer-a"), sender_a);
+    mgr.register_sender(NodeId::new("peer-b"), sender_b);
+    mgr.register_sender(NodeId::new("peer-c"), sender_c);
 
     let msg = snapshot_msg("peer-a", 1);
-    mgr.relay(&HostName::new("peer-a"), &msg).await;
+    mgr.relay(&NodeId::new("peer-a"), &msg).await;
 
     // peer-a is origin, so it should NOT receive the relay
     assert!(sent_a.lock().expect("lock").is_empty());
@@ -186,15 +186,15 @@ async fn relay_sends_to_all_except_origin() {
 
 #[tokio::test]
 async fn relay_does_not_send_to_self() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     let (transport, sent) = MockTransport::with_sender();
     let sender = transport.sender().expect("sender");
-    mgr.add_peer(HostName::new("local"), Box::new(transport));
-    mgr.register_sender(HostName::new("local"), sender);
+    mgr.add_peer(NodeId::new("local"), Box::new(transport));
+    mgr.register_sender(NodeId::new("local"), sender);
 
     let msg = snapshot_msg("remote", 1);
-    mgr.relay(&HostName::new("remote"), &msg).await;
+    mgr.relay(&NodeId::new("remote"), &msg).await;
 
     // Should not send to self even if registered as a peer
     assert!(sent.lock().expect("lock").is_empty());
@@ -206,27 +206,27 @@ async fn relay_skips_peers_already_in_clock() {
     // F1 sends a message that leader relays to F2 (stamping leader into clock).
     // If F2 then tried to relay, it should NOT send back to leader
     // because leader is already in the clock.
-    let mut mgr = PeerManager::new(HostName::new("F2"));
+    let mut mgr = PeerManager::new(NodeId::new("F2"));
 
     let (transport_leader, sent_leader) = MockTransport::with_sender();
     let sender_leader = transport_leader.sender().expect("sender");
-    mgr.add_peer(HostName::new("leader"), Box::new(transport_leader));
-    mgr.register_sender(HostName::new("leader"), sender_leader);
+    mgr.add_peer(NodeId::new("leader"), Box::new(transport_leader));
+    mgr.register_sender(NodeId::new("leader"), sender_leader);
 
     // Simulate a message that was relayed through leader:
     // origin=F1, clock={F1:1, leader:1}
     let mut clock = VectorClock::default();
-    clock.tick(&HostName::new("F1"));
-    clock.tick(&HostName::new("leader"));
+    clock.tick(&NodeId::new("F1"));
+    clock.tick(&NodeId::new("leader"));
     let msg = PeerDataMessage {
-        origin_host: HostName::new("F1"),
+        origin_node_id: NodeId::new("F1"),
         repo_identity: test_repo(),
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
     };
 
-    mgr.relay(&HostName::new("F1"), &msg).await;
+    mgr.relay(&NodeId::new("F1"), &msg).await;
 
     // Leader is already in the clock, so relay should skip it
     assert!(sent_leader.lock().expect("lock").is_empty(), "should not relay back to a peer already in the clock");
@@ -234,7 +234,7 @@ async fn relay_skips_peers_already_in_clock() {
 
 #[tokio::test]
 async fn get_peer_data_returns_stored_data() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     // Initially empty
     assert!(mgr.get_peer_data().is_empty());
@@ -245,14 +245,14 @@ async fn get_peer_data_returns_stored_data() {
 
     let data = mgr.get_peer_data();
     assert_eq!(data.len(), 2);
-    assert!(data.contains_key(&HostName::new("desktop")));
-    assert!(data.contains_key(&HostName::new("server")));
+    assert!(data.contains_key(&NodeId::new("desktop")));
+    assert!(data.contains_key(&NodeId::new("server")));
 }
 
 #[tokio::test]
 async fn host_summary_handle_inbound_stores_for_connection_peer() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let connection_peer = HostName::new("remote");
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let connection_peer = NodeId::new("remote");
     let generation = ensure_test_connection_generation(&mut mgr, &connection_peer, MockPeerSender::discard);
 
     let result = mgr
@@ -265,38 +265,38 @@ async fn host_summary_handle_inbound_stores_for_connection_peer() {
 
     assert_eq!(result, HandleResult::Ignored);
     let stored = mgr.get_peer_host_summaries().get(&connection_peer).expect("stored host summary");
-    assert_eq!(stored.host_name, connection_peer);
+    assert_eq!(stored.node.node_id, connection_peer);
 }
 
 #[test]
 fn remove_peer_data_clears_host_summary() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     mgr.store_host_summary(sample_host_summary_for("remote"));
 
-    mgr.remove_peer_data(&HostName::new("remote"));
+    mgr.remove_peer_data(&NodeId::new("remote"));
 
     assert!(mgr.get_peer_host_summaries().is_empty());
 }
 
 #[test]
 fn clear_peer_data_for_restart_clears_host_summary() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     mgr.store_host_summary(sample_host_summary_for("remote"));
 
-    mgr.clear_peer_data_for_restart(&HostName::new("remote"));
+    mgr.clear_peer_data_for_restart(&NodeId::new("remote"));
 
     assert!(mgr.get_peer_host_summaries().is_empty());
 }
 
 #[tokio::test]
 async fn routed_remote_step_request_for_local_host_surfaces_identity_and_steps() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let connection_peer = HostName::new("relay");
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let connection_peer = NodeId::new("relay");
     let generation = ensure_test_connection_generation(&mut mgr, &connection_peer, MockPeerSender::discard);
     let repo_identity = test_repo();
     let steps = vec![Step {
         description: "Prepare terminal".into(),
-        host: StepExecutionContext::Host(HostName::new("local")),
+        host: StepExecutionContext::Host(NodeId::new("local")),
         action: StepAction::PrepareTerminalForCheckout {
             checkout_path: flotilla_protocol::ExecutionEnvironmentPath::new("/repo"),
             commands: vec![],
@@ -307,8 +307,8 @@ async fn routed_remote_step_request_for_local_host_surfaces_identity_and_steps()
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::RemoteStepRequest {
                 request_id: 77,
-                requester_host: HostName::new("workstation"),
-                target_host: HostName::new("local"),
+                requester_node_id: NodeId::new("workstation"),
+                target_node_id: NodeId::new("local"),
                 remaining_hops: 4,
                 repo_identity: repo_identity.clone(),
                 step_offset: 3,
@@ -322,14 +322,14 @@ async fn routed_remote_step_request_for_local_host_surfaces_identity_and_steps()
     match result {
         HandleResult::RemoteStepRequested {
             request_id,
-            requester_host,
+            requester_node_id,
             reply_via,
             repo_identity: received_identity,
             step_offset,
             steps: received_steps,
         } => {
             assert_eq!(request_id, 77);
-            assert_eq!(requester_host, HostName::new("workstation"));
+            assert_eq!(requester_node_id, NodeId::new("workstation"));
             assert_eq!(reply_via, connection_peer);
             assert_eq!(received_identity, repo_identity);
             assert_eq!(step_offset, 3);
@@ -341,36 +341,36 @@ async fn routed_remote_step_request_for_local_host_surfaces_identity_and_steps()
 
 #[tokio::test]
 async fn connect_all_connects_peers() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     let transport = MockTransport::new();
     // Start disconnected
     let mut transport = transport;
     transport.status = PeerConnectionStatus::Disconnected;
 
-    mgr.add_peer(HostName::new("peer"), Box::new(transport));
+    mgr.add_peer(NodeId::new("peer"), Box::new(transport));
     mgr.connect_all().await;
 
     // After connect_all, the mock transport's connect() sets status to Connected
-    let peer_transport = mgr.peers.get(&HostName::new("peer")).expect("peer exists");
+    let peer_transport = mgr.peers.get(&NodeId::new("peer")).expect("peer exists");
     assert_eq!(peer_transport.status(), PeerConnectionStatus::Connected);
 }
 
 #[tokio::test]
 async fn disconnect_all_disconnects_peers() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     let transport = MockTransport::new();
-    mgr.add_peer(HostName::new("peer"), Box::new(transport));
+    mgr.add_peer(NodeId::new("peer"), Box::new(transport));
     mgr.disconnect_all().await;
 
-    let peer_transport = mgr.peers.get(&HostName::new("peer")).expect("peer exists");
+    let peer_transport = mgr.peers.get(&NodeId::new("peer")).expect("peer exists");
     assert_eq!(peer_transport.status(), PeerConnectionStatus::Disconnected);
 }
 
 #[test]
 fn synthetic_repo_path_format() {
-    let host = HostName::new("desktop");
+    let host = NodeId::new("desktop");
     let repo_path = std::path::Path::new("/home/dev/repo");
     let path = super::synthetic_repo_path(&host, &test_repo(), Some(repo_path));
     assert_eq!(path, PathBuf::from("<remote>/desktop/home/dev/repo"));
@@ -379,20 +379,20 @@ fn synthetic_repo_path_format() {
 #[test]
 fn synthetic_repo_path_different_hosts_produce_different_paths() {
     let repo_path = std::path::Path::new("/home/dev/repo");
-    let path_a = super::synthetic_repo_path(&HostName::new("host-a"), &test_repo(), Some(repo_path));
-    let path_b = super::synthetic_repo_path(&HostName::new("host-b"), &test_repo(), Some(repo_path));
+    let path_a = super::synthetic_repo_path(&NodeId::new("host-a"), &test_repo(), Some(repo_path));
+    let path_b = super::synthetic_repo_path(&NodeId::new("host-b"), &test_repo(), Some(repo_path));
     assert_ne!(path_a, path_b);
 }
 
 #[test]
 fn synthetic_repo_path_falls_back_to_repo_identity_without_host_root() {
-    let path = super::synthetic_repo_path(&HostName::new("desktop"), &test_repo(), None);
+    let path = super::synthetic_repo_path(&NodeId::new("desktop"), &test_repo(), None);
     assert_eq!(path, PathBuf::from("<remote>/desktop/github.com/owner/repo"));
 }
 
 #[test]
 fn register_and_query_remote_repos() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let repo = test_repo();
     let synthetic = PathBuf::from("<remote>/desktop/home/dev/repo");
 
@@ -408,31 +408,31 @@ fn register_and_query_remote_repos() {
 
 #[tokio::test]
 async fn send_to_reaches_registered_sender() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
-    mgr.register_sender(HostName::new("peer"), sender);
+    mgr.register_sender(NodeId::new("peer"), sender);
 
-    mgr.send_to(&HostName::new("peer"), PeerWireMessage::Data(snapshot_msg("local", 1))).await.expect("send succeeds");
+    mgr.send_to(&NodeId::new("peer"), PeerWireMessage::Data(snapshot_msg("local", 1))).await.expect("send succeeds");
 
     assert_eq!(sent.lock().expect("lock").len(), 1);
 }
 
 #[tokio::test]
 async fn activate_connection_rejects_same_direction_duplicate_sender() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let first_sent = Arc::new(Mutex::new(Vec::new()));
     let second_sent = Arc::new(Mutex::new(Vec::new()));
     let first_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&first_sent) });
     let second_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&second_sent) });
 
-    let gen1 = accepted_generation(mgr.activate_connection(HostName::new("peer"), first_sender, ConnectionMeta {
+    let gen1 = accepted_generation(mgr.activate_connection(NodeId::new("peer"), first_sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
         config_backed: false,
     }));
-    let second = mgr.activate_connection(HostName::new("peer"), second_sender, ConnectionMeta {
+    let second = mgr.activate_connection(NodeId::new("peer"), second_sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -441,7 +441,7 @@ async fn activate_connection_rejects_same_direction_duplicate_sender() {
 
     assert_eq!(gen1, 1);
     assert_eq!(second, ActivationResult::Rejected { reason: GoodbyeReason::Superseded });
-    mgr.send_to(&HostName::new("peer"), PeerWireMessage::Data(snapshot_msg("local", 1))).await.expect("send succeeds");
+    mgr.send_to(&NodeId::new("peer"), PeerWireMessage::Data(snapshot_msg("local", 1))).await.expect("send succeeds");
 
     assert_eq!(first_sent.lock().expect("lock").len(), 1);
     assert!(second_sent.lock().expect("lock").is_empty());
@@ -449,19 +449,19 @@ async fn activate_connection_rejects_same_direction_duplicate_sender() {
 
 #[tokio::test]
 async fn configured_outbound_beats_unsolicited_inbound() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let outbound_sent = Arc::new(Mutex::new(Vec::new()));
     let inbound_sent = Arc::new(Mutex::new(Vec::new()));
     let outbound_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&outbound_sent) });
     let inbound_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&inbound_sent) });
 
-    let _ = accepted_generation(mgr.activate_connection(HostName::new("peer"), outbound_sender, ConnectionMeta {
+    let _ = accepted_generation(mgr.activate_connection(NodeId::new("peer"), outbound_sender, ConnectionMeta {
         direction: ConnectionDirection::Outbound,
         config_label: Some(ConfigLabel("peer".into())),
-        expected_peer: Some(HostName::new("peer")),
+        expected_peer: Some(NodeId::new("peer")),
         config_backed: true,
     }));
-    let duplicate = mgr.activate_connection(HostName::new("peer"), inbound_sender, ConnectionMeta {
+    let duplicate = mgr.activate_connection(NodeId::new("peer"), inbound_sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -469,7 +469,7 @@ async fn configured_outbound_beats_unsolicited_inbound() {
     });
     assert_eq!(duplicate, ActivationResult::Rejected { reason: GoodbyeReason::Superseded });
 
-    mgr.send_to(&HostName::new("peer"), PeerWireMessage::Data(snapshot_msg("local", 1))).await.expect("send succeeds");
+    mgr.send_to(&NodeId::new("peer"), PeerWireMessage::Data(snapshot_msg("local", 1))).await.expect("send succeeds");
 
     assert_eq!(outbound_sent.lock().expect("lock").len(), 1);
     assert!(inbound_sent.lock().expect("lock").is_empty());
@@ -477,22 +477,22 @@ async fn configured_outbound_beats_unsolicited_inbound() {
 
 #[tokio::test]
 async fn displaced_connection_can_be_retired_after_replacement() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let first_sent = Arc::new(Mutex::new(Vec::new()));
     let second_sent = Arc::new(Mutex::new(Vec::new()));
     let first_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&first_sent) });
     let second_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&second_sent) });
 
-    let first_generation = accepted_generation(mgr.activate_connection(HostName::new("peer"), first_sender, ConnectionMeta {
+    let first_generation = accepted_generation(mgr.activate_connection(NodeId::new("peer"), first_sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
         config_backed: false,
     }));
-    let replacement = mgr.activate_connection(HostName::new("peer"), second_sender, ConnectionMeta {
+    let replacement = mgr.activate_connection(NodeId::new("peer"), second_sender, ConnectionMeta {
         direction: ConnectionDirection::Outbound,
         config_label: Some(ConfigLabel("peer".into())),
-        expected_peer: Some(HostName::new("peer")),
+        expected_peer: Some(NodeId::new("peer")),
         config_backed: true,
     });
 
@@ -505,7 +505,7 @@ async fn displaced_connection_can_be_retired_after_replacement() {
     };
     assert_eq!(displaced_generation, first_generation);
 
-    let displaced = mgr.take_displaced_sender(&HostName::new("peer"), displaced_generation).expect("displaced sender should be tracked");
+    let displaced = mgr.take_displaced_sender(&NodeId::new("peer"), displaced_generation).expect("displaced sender should be tracked");
     displaced.retire(GoodbyeReason::Superseded).await.expect("retire displaced sender");
 
     let sent = first_sent.lock().expect("lock");
@@ -519,8 +519,8 @@ async fn displaced_connection_can_be_retired_after_replacement() {
 
 #[tokio::test]
 async fn stale_generation_inbound_message_is_dropped() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let generation = accepted_generation(mgr.activate_connection(HostName::new("peer"), MockPeerSender::discard(), ConnectionMeta {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("peer"), MockPeerSender::discard(), ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -528,10 +528,10 @@ async fn stale_generation_inbound_message_is_dropped() {
     }));
     assert_eq!(generation, 1);
     let replacement_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("peer"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("peer"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Outbound,
             config_label: None,
-            expected_peer: Some(HostName::new("peer")),
+            expected_peer: Some(NodeId::new("peer")),
             config_backed: true,
         }));
     assert_eq!(replacement_generation, 2);
@@ -540,7 +540,7 @@ async fn stale_generation_inbound_message_is_dropped() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(snapshot_msg("peer", 1)),
             connection_generation: generation,
-            connection_peer: HostName::new("peer"),
+            connection_peer: NodeId::new("peer"),
         })
         .await;
 
@@ -550,23 +550,23 @@ async fn stale_generation_inbound_message_is_dropped() {
 
 #[tokio::test]
 async fn send_to_uses_route_primary_when_no_direct_sender() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let sent = Arc::new(Mutex::new(Vec::new()));
     let via_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
-    mgr.register_sender(HostName::new("relay"), via_sender);
-    mgr.generations.insert(HostName::new("relay"), 1);
-    mgr.routes.insert(HostName::new("target"), RouteState {
-        primary: RouteHop { next_hop: HostName::new("relay"), next_hop_generation: 1, learned_epoch: 1 },
+    mgr.register_sender(NodeId::new("relay"), via_sender);
+    mgr.generations.insert(NodeId::new("relay"), 1);
+    mgr.routes.insert(NodeId::new("target"), RouteState {
+        primary: RouteHop { next_hop: NodeId::new("relay"), next_hop_generation: 1, learned_epoch: 1 },
         fallbacks: Vec::new(),
         candidates: Vec::new(),
     });
 
     mgr.send_to(
-        &HostName::new("target"),
+        &NodeId::new("target"),
         PeerWireMessage::Routed(RoutedPeerMessage::RequestResync {
             request_id: 1,
-            requester_host: HostName::new("local"),
-            target_host: HostName::new("target"),
+            requester_node_id: NodeId::new("local"),
+            target_node_id: NodeId::new("target"),
             remaining_hops: 3,
             repo_identity: test_repo(),
             since_seq: 0,
@@ -580,9 +580,9 @@ async fn send_to_uses_route_primary_when_no_direct_sender() {
 
 #[tokio::test]
 async fn send_to_returns_error_when_no_direct_sender_or_route() {
-    let mgr = PeerManager::new(HostName::new("local"));
+    let mgr = PeerManager::new(NodeId::new("local"));
     let err = mgr
-        .send_to(&HostName::new("missing"), PeerWireMessage::Data(snapshot_msg("local", 1)))
+        .send_to(&NodeId::new("missing"), PeerWireMessage::Data(snapshot_msg("local", 1)))
         .await
         .expect_err("missing route should error");
     assert!(err.contains("unknown peer"));
@@ -590,33 +590,33 @@ async fn send_to_returns_error_when_no_direct_sender_or_route() {
 
 #[tokio::test]
 async fn configured_peer_names_include_all_configured_peers() {
-    let mut mgr = PeerManager::new(HostName::new("m"));
-    mgr.add_peer(HostName::new("z"), Box::new(MockTransport::new()));
-    mgr.add_peer(HostName::new("a"), Box::new(MockTransport::new()));
+    let mut mgr = PeerManager::new(NodeId::new("m"));
+    mgr.add_peer(NodeId::new("z"), Box::new(MockTransport::new()));
+    mgr.add_peer(NodeId::new("a"), Box::new(MockTransport::new()));
 
-    let mut configured = mgr.configured_peer_names();
-    configured.sort();
+    let mut configured = mgr.configured_peers();
+    configured.sort_by(|a, b| a.node_id.cmp(&b.node_id));
 
-    assert_eq!(configured, vec![HostName::new("a"), HostName::new("z")]);
+    assert_eq!(configured, vec![NodeInfo::new(NodeId::new("a"), "a"), NodeInfo::new(NodeId::new("z"), "z")]);
 }
 
 #[tokio::test]
 async fn reconnect_peer_allows_configured_peer_regardless_of_host_order() {
-    let mut mgr = PeerManager::new(HostName::new("z"));
-    mgr.add_peer(HostName::new("a"), Box::new(MockTransport::new()));
+    let mut mgr = PeerManager::new(NodeId::new("z"));
+    mgr.add_peer(NodeId::new("a"), Box::new(MockTransport::new()));
 
-    let (generation, _rx) = mgr.reconnect_peer(&HostName::new("a")).await.expect("reconnect should succeed for configured peer");
+    let (generation, _rx) = mgr.reconnect_peer(&NodeId::new("a")).await.expect("reconnect should succeed for configured peer");
 
     assert_eq!(generation, 0);
 }
 
 #[tokio::test]
 async fn reconnect_peer_retires_displaced_connection() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let displaced_sent = Arc::new(Mutex::new(Vec::new()));
     let displaced_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&displaced_sent) });
 
-    let _ = accepted_generation(mgr.activate_connection(HostName::new("peer"), displaced_sender, ConnectionMeta {
+    let _ = accepted_generation(mgr.activate_connection(NodeId::new("peer"), displaced_sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -624,9 +624,9 @@ async fn reconnect_peer_retires_displaced_connection() {
     }));
 
     let (transport, _new_sent) = MockTransport::with_sender();
-    mgr.add_peer(HostName::new("peer"), Box::new(transport));
+    mgr.add_peer(NodeId::new("peer"), Box::new(transport));
 
-    let _ = mgr.reconnect_peer(&HostName::new("peer")).await.expect("reconnect should succeed");
+    let _ = mgr.reconnect_peer(&NodeId::new("peer")).await.expect("reconnect should succeed");
 
     let sent = displaced_sent.lock().expect("lock");
     assert_eq!(sent.len(), 1);
@@ -638,8 +638,8 @@ async fn reconnect_peer_retires_displaced_connection() {
 
 #[tokio::test]
 async fn late_resync_snapshot_is_dropped_without_pending_request() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let generation = accepted_generation(mgr.activate_connection(HostName::new("relay"), MockPeerSender::discard(), ConnectionMeta {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("relay"), MockPeerSender::discard(), ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -650,8 +650,8 @@ async fn late_resync_snapshot_is_dropped_without_pending_request() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
                 request_id: 1,
-                requester_host: HostName::new("local"),
-                responder_host: HostName::new("target"),
+                requester_node_id: NodeId::new("local"),
+                responder_node_id: NodeId::new("target"),
                 remaining_hops: 3,
                 repo_identity: test_repo(),
                 host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -660,7 +660,7 @@ async fn late_resync_snapshot_is_dropped_without_pending_request() {
                 data: Box::new(ProviderData::default()),
             }),
             connection_generation: generation,
-            connection_peer: HostName::new("relay"),
+            connection_peer: NodeId::new("relay"),
         })
         .await;
 
@@ -670,34 +670,34 @@ async fn late_resync_snapshot_is_dropped_without_pending_request() {
 
 #[tokio::test]
 async fn goodbye_superseded_suppresses_reconnect_for_peer() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let generation = accepted_generation(mgr.activate_connection(HostName::new("peer"), MockPeerSender::discard(), ConnectionMeta {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("peer"), MockPeerSender::discard(), ConnectionMeta {
         direction: ConnectionDirection::Outbound,
         config_label: Some(ConfigLabel("peer".into())),
-        expected_peer: Some(HostName::new("peer")),
+        expected_peer: Some(NodeId::new("peer")),
         config_backed: true,
     }));
-    mgr.add_peer(HostName::new("peer"), Box::new(MockTransport::new()));
+    mgr.add_peer(NodeId::new("peer"), Box::new(MockTransport::new()));
 
     let result = mgr
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Goodbye { reason: GoodbyeReason::Superseded },
             connection_generation: generation,
-            connection_peer: HostName::new("peer"),
+            connection_peer: NodeId::new("peer"),
         })
         .await;
 
-    assert_eq!(result, HandleResult::ReconnectSuppressed { peer: HostName::new("peer") });
-    let err = mgr.reconnect_peer(&HostName::new("peer")).await.expect_err("reconnect should be suppressed");
+    assert_eq!(result, HandleResult::ReconnectSuppressed { peer: NodeId::new("peer") });
+    let err = mgr.reconnect_peer(&NodeId::new("peer")).await.expect_err("reconnect should be suppressed");
     assert!(err.contains("suppressed"));
 }
 
 #[tokio::test]
 async fn routed_request_resync_is_dropped_when_hop_budget_exhausted() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
-    let generation = accepted_generation(mgr.activate_connection(HostName::new("relay"), sender, ConnectionMeta {
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("relay"), sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -708,14 +708,14 @@ async fn routed_request_resync_is_dropped_when_hop_budget_exhausted() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::RequestResync {
                 request_id: 1,
-                requester_host: HostName::new("requester"),
-                target_host: HostName::new("target"),
+                requester_node_id: NodeId::new("requester"),
+                target_node_id: NodeId::new("target"),
                 remaining_hops: 0,
                 repo_identity: test_repo(),
                 since_seq: 0,
             }),
             connection_generation: generation,
-            connection_peer: HostName::new("relay"),
+            connection_peer: NodeId::new("relay"),
         })
         .await;
 
@@ -725,8 +725,8 @@ async fn routed_request_resync_is_dropped_when_hop_budget_exhausted() {
 
 #[tokio::test]
 async fn routed_request_resync_to_local_preserves_request_id() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let generation = accepted_generation(mgr.activate_connection(HostName::new("relay"), MockPeerSender::discard(), ConnectionMeta {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("relay"), MockPeerSender::discard(), ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -737,21 +737,21 @@ async fn routed_request_resync_to_local_preserves_request_id() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::RequestResync {
                 request_id: 41,
-                requester_host: HostName::new("requester"),
-                target_host: HostName::new("local"),
+                requester_node_id: NodeId::new("requester"),
+                target_node_id: NodeId::new("local"),
                 remaining_hops: 3,
                 repo_identity: test_repo(),
                 since_seq: 7,
             }),
             connection_generation: generation,
-            connection_peer: HostName::new("relay"),
+            connection_peer: NodeId::new("relay"),
         })
         .await;
 
     assert_eq!(result, HandleResult::ResyncRequested {
         request_id: 41,
-        requester_host: HostName::new("requester"),
-        reply_via: HostName::new("relay"),
+        requester_node_id: NodeId::new("requester"),
+        reply_via: NodeId::new("relay"),
         repo: test_repo(),
         since_seq: 7,
     });
@@ -759,56 +759,55 @@ async fn routed_request_resync_to_local_preserves_request_id() {
 
 #[tokio::test]
 async fn disconnect_peer_keeps_snapshot_stale_when_fallback_exists() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let direct_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("target"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("target"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Outbound,
             config_label: None,
-            expected_peer: Some(HostName::new("target")),
+            expected_peer: Some(NodeId::new("target")),
             config_backed: true,
         }));
-    let relay_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay"), MockPeerSender::discard(), ConnectionMeta {
-            direction: ConnectionDirection::Outbound,
-            config_label: None,
-            expected_peer: Some(HostName::new("relay")),
-            config_backed: true,
-        }));
+    let relay_generation = accepted_generation(mgr.activate_connection(NodeId::new("relay"), MockPeerSender::discard(), ConnectionMeta {
+        direction: ConnectionDirection::Outbound,
+        config_label: None,
+        expected_peer: Some(NodeId::new("relay")),
+        config_backed: true,
+    }));
     let _ = mgr
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(snapshot_msg("target", 1)),
             connection_generation: direct_generation,
-            connection_peer: HostName::new("target"),
+            connection_peer: NodeId::new("target"),
         })
         .await;
 
-    mgr.routes.get_mut(&HostName::new("target")).expect("route exists").fallbacks.push(RouteHop {
-        next_hop: HostName::new("relay"),
+    mgr.routes.get_mut(&NodeId::new("target")).expect("route exists").fallbacks.push(RouteHop {
+        next_hop: NodeId::new("relay"),
         next_hop_generation: relay_generation,
         learned_epoch: 10,
     });
 
-    let plan = mgr.disconnect_peer(&HostName::new("target"), direct_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("target"), direct_generation);
 
     assert_eq!(plan.affected_repos, vec![test_repo()]);
     assert_eq!(plan.resync_requests.len(), 1);
-    let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    let state = &mgr.get_peer_data()[&NodeId::new("target")][&test_repo()];
     assert!(state.stale, "snapshot should be retained as stale");
-    assert_eq!(mgr.routes[&HostName::new("target")].primary.next_hop, HostName::new("relay"));
+    assert_eq!(mgr.routes[&NodeId::new("target")].primary.next_hop, NodeId::new("relay"));
 }
 
 #[tokio::test]
 async fn accepted_snapshot_refreshes_route_primary_to_live_hop() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let relay_a_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
             config_backed: false,
         }));
     let relay_b_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
@@ -819,53 +818,52 @@ async fn accepted_snapshot_refreshes_route_primary_to_live_hop() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(snapshot_msg("target", 1)),
             connection_generation: relay_a_generation,
-            connection_peer: HostName::new("relay-a"),
+            connection_peer: NodeId::new("relay-a"),
         })
         .await;
     let _ = mgr
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(snapshot_msg("target", 2)),
             connection_generation: relay_b_generation,
-            connection_peer: HostName::new("relay-b"),
+            connection_peer: NodeId::new("relay-b"),
         })
         .await;
 
-    assert_eq!(mgr.routes[&HostName::new("target")].primary.next_hop, HostName::new("relay-b"));
-    assert_eq!(mgr.routes[&HostName::new("target")].fallbacks[0].next_hop, HostName::new("relay-a"));
+    assert_eq!(mgr.routes[&NodeId::new("target")].primary.next_hop, NodeId::new("relay-b"));
+    assert_eq!(mgr.routes[&NodeId::new("target")].fallbacks[0].next_hop, NodeId::new("relay-a"));
 }
 
 #[tokio::test]
 async fn disconnect_peer_keeps_unrelated_pending_resync_requests() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let _ = accepted_generation(mgr.activate_connection(HostName::new("target"), MockPeerSender::discard(), ConnectionMeta {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let _ = accepted_generation(mgr.activate_connection(NodeId::new("target"), MockPeerSender::discard(), ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
         config_backed: false,
     }));
-    let other_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("other"), MockPeerSender::discard(), ConnectionMeta {
-            direction: ConnectionDirection::Inbound,
-            config_label: None,
-            expected_peer: None,
-            config_backed: false,
-        }));
+    let other_generation = accepted_generation(mgr.activate_connection(NodeId::new("other"), MockPeerSender::discard(), ConnectionMeta {
+        direction: ConnectionDirection::Inbound,
+        config_label: None,
+        expected_peer: None,
+        config_backed: false,
+    }));
 
-    let kept_request_id = mgr.note_pending_resync_request(HostName::new("target"), test_repo());
-    let dropped_request_id = mgr.note_pending_resync_request(HostName::new("other"), test_repo());
+    let kept_request_id = mgr.note_pending_resync_request(NodeId::new("target"), test_repo());
+    let dropped_request_id = mgr.note_pending_resync_request(NodeId::new("other"), test_repo());
 
-    let _ = mgr.disconnect_peer(&HostName::new("other"), other_generation);
+    let _ = mgr.disconnect_peer(&NodeId::new("other"), other_generation);
 
     let kept_key = ReversePathKey {
         request_id: kept_request_id,
-        requester_host: HostName::new("local"),
-        target_host: HostName::new("target"),
+        requester_node_id: NodeId::new("local"),
+        target_node_id: NodeId::new("target"),
         repo_identity: test_repo(),
     };
     let dropped_key = ReversePathKey {
         request_id: dropped_request_id,
-        requester_host: HostName::new("local"),
-        target_host: HostName::new("other"),
+        requester_node_id: NodeId::new("local"),
+        target_node_id: NodeId::new("other"),
         repo_identity: test_repo(),
     };
 
@@ -875,8 +873,8 @@ async fn disconnect_peer_keeps_unrelated_pending_resync_requests() {
 
 #[tokio::test]
 async fn disconnect_peer_reports_stale_generation_as_inactive() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let stale_generation = accepted_generation(mgr.activate_connection(HostName::new("peer"), MockPeerSender::discard(), ConnectionMeta {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let stale_generation = accepted_generation(mgr.activate_connection(NodeId::new("peer"), MockPeerSender::discard(), ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
@@ -884,31 +882,31 @@ async fn disconnect_peer_reports_stale_generation_as_inactive() {
     }));
 
     let _current_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("peer"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("peer"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Outbound,
             config_label: None,
-            expected_peer: Some(HostName::new("peer")),
+            expected_peer: Some(NodeId::new("peer")),
             config_backed: true,
         }));
 
-    let plan = mgr.disconnect_peer(&HostName::new("peer"), stale_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("peer"), stale_generation);
 
     assert!(!plan.was_active);
-    assert!(mgr.current_generation(&HostName::new("peer")).is_some());
+    assert!(mgr.current_generation(&NodeId::new("peer")).is_some());
 }
 
 #[tokio::test]
 async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let relay_a_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
             config_backed: false,
         }));
     let relay_b_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
@@ -920,16 +918,16 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(baseline.clone()),
             connection_generation: relay_a_generation,
-            connection_peer: HostName::new("relay-a"),
+            connection_peer: NodeId::new("relay-a"),
         })
         .await;
-    mgr.routes.get_mut(&HostName::new("target")).expect("route exists").fallbacks.push(RouteHop {
-        next_hop: HostName::new("relay-b"),
+    mgr.routes.get_mut(&NodeId::new("target")).expect("route exists").fallbacks.push(RouteHop {
+        next_hop: NodeId::new("relay-b"),
         next_hop_generation: relay_b_generation,
         learned_epoch: 10,
     });
 
-    let plan = mgr.disconnect_peer(&HostName::new("relay-a"), relay_a_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("relay-a"), relay_a_generation);
     let request_id = match &plan.resync_requests[0] {
         RoutedPeerMessage::RequestResync { request_id, .. } => *request_id,
         other => panic!("expected request_resync, got {:?}", other),
@@ -939,8 +937,8 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
                 request_id,
-                requester_host: HostName::new("local"),
-                responder_host: HostName::new("target"),
+                requester_node_id: NodeId::new("local"),
+                responder_node_id: NodeId::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
                 host_repo_root: baseline.host_repo_root.clone(),
@@ -949,28 +947,28 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
                 data: Box::new(ProviderData::default()),
             }),
             connection_generation: relay_b_generation,
-            connection_peer: HostName::new("relay-b"),
+            connection_peer: NodeId::new("relay-b"),
         })
         .await;
 
     assert_eq!(result, HandleResult::Updated(test_repo()));
-    let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    let state = &mgr.get_peer_data()[&NodeId::new("target")][&test_repo()];
     assert!(!state.stale);
-    assert_eq!(state.via_peer, HostName::new("relay-b"));
+    assert_eq!(state.via_peer, NodeId::new("relay-b"));
 }
 
 #[tokio::test]
 async fn failover_resync_accepts_snapshot_without_host_repo_root() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let relay_a_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
             config_backed: false,
         }));
     let relay_b_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
@@ -983,16 +981,16 @@ async fn failover_resync_accepts_snapshot_without_host_repo_root() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(baseline.clone()),
             connection_generation: relay_a_generation,
-            connection_peer: HostName::new("relay-a"),
+            connection_peer: NodeId::new("relay-a"),
         })
         .await;
-    mgr.routes.get_mut(&HostName::new("target")).expect("route exists").fallbacks.push(RouteHop {
-        next_hop: HostName::new("relay-b"),
+    mgr.routes.get_mut(&NodeId::new("target")).expect("route exists").fallbacks.push(RouteHop {
+        next_hop: NodeId::new("relay-b"),
         next_hop_generation: relay_b_generation,
         learned_epoch: 10,
     });
 
-    let plan = mgr.disconnect_peer(&HostName::new("relay-a"), relay_a_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("relay-a"), relay_a_generation);
     let request_id = match &plan.resync_requests[0] {
         RoutedPeerMessage::RequestResync { request_id, .. } => *request_id,
         other => panic!("expected request_resync, got {:?}", other),
@@ -1002,8 +1000,8 @@ async fn failover_resync_accepts_snapshot_without_host_repo_root() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
                 request_id,
-                requester_host: HostName::new("local"),
-                responder_host: HostName::new("target"),
+                requester_node_id: NodeId::new("local"),
+                responder_node_id: NodeId::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
                 host_repo_root: None,
@@ -1012,36 +1010,36 @@ async fn failover_resync_accepts_snapshot_without_host_repo_root() {
                 data: Box::new(ProviderData::default()),
             }),
             connection_generation: relay_b_generation,
-            connection_peer: HostName::new("relay-b"),
+            connection_peer: NodeId::new("relay-b"),
         })
         .await;
 
     assert_eq!(result, HandleResult::Updated(test_repo()));
-    let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    let state = &mgr.get_peer_data()[&NodeId::new("target")][&test_repo()];
     assert_eq!(state.host_repo_root, None);
     assert!(!state.stale);
-    assert_eq!(state.via_peer, HostName::new("relay-b"));
+    assert_eq!(state.via_peer, NodeId::new("relay-b"));
 }
 
 #[tokio::test]
 async fn consecutive_failovers_reissue_resync_for_stale_snapshot() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let relay_a_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
             config_backed: false,
         }));
     let relay_b_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
             config_backed: false,
         }));
     let relay_c_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay-c"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-c"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Inbound,
             config_label: None,
             expected_peer: None,
@@ -1053,67 +1051,66 @@ async fn consecutive_failovers_reissue_resync_for_stale_snapshot() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(baseline.clone()),
             connection_generation: relay_a_generation,
-            connection_peer: HostName::new("relay-a"),
+            connection_peer: NodeId::new("relay-a"),
         })
         .await;
 
-    mgr.routes.get_mut(&HostName::new("target")).expect("route exists").fallbacks =
-        vec![RouteHop { next_hop: HostName::new("relay-b"), next_hop_generation: relay_b_generation, learned_epoch: 10 }, RouteHop {
-            next_hop: HostName::new("relay-c"),
+    mgr.routes.get_mut(&NodeId::new("target")).expect("route exists").fallbacks =
+        vec![RouteHop { next_hop: NodeId::new("relay-b"), next_hop_generation: relay_b_generation, learned_epoch: 10 }, RouteHop {
+            next_hop: NodeId::new("relay-c"),
             next_hop_generation: relay_c_generation,
             learned_epoch: 20,
         }];
 
-    let first_plan = mgr.disconnect_peer(&HostName::new("relay-a"), relay_a_generation);
+    let first_plan = mgr.disconnect_peer(&NodeId::new("relay-a"), relay_a_generation);
     assert_eq!(first_plan.resync_requests.len(), 1);
-    let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    let state = &mgr.get_peer_data()[&NodeId::new("target")][&test_repo()];
     assert!(state.stale);
 
-    let second_plan = mgr.disconnect_peer(&HostName::new("relay-c"), relay_c_generation);
+    let second_plan = mgr.disconnect_peer(&NodeId::new("relay-c"), relay_c_generation);
 
     assert_eq!(second_plan.resync_requests.len(), 1);
     match &second_plan.resync_requests[0] {
-        RoutedPeerMessage::RequestResync { target_host, .. } => {
-            assert_eq!(target_host, &HostName::new("target"));
+        RoutedPeerMessage::RequestResync { target_node_id, .. } => {
+            assert_eq!(target_node_id, &NodeId::new("target"));
         }
         other => panic!("expected request_resync, got {:?}", other),
     }
-    assert_eq!(mgr.routes[&HostName::new("target")].primary.next_hop, HostName::new("relay-b"));
+    assert_eq!(mgr.routes[&NodeId::new("target")].primary.next_hop, NodeId::new("relay-b"));
 }
 
 #[tokio::test]
 async fn failover_resync_clears_stale_and_rebinds_provenance() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let direct_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("target"), MockPeerSender::discard(), ConnectionMeta {
+        accepted_generation(mgr.activate_connection(NodeId::new("target"), MockPeerSender::discard(), ConnectionMeta {
             direction: ConnectionDirection::Outbound,
             config_label: None,
-            expected_peer: Some(HostName::new("target")),
+            expected_peer: Some(NodeId::new("target")),
             config_backed: true,
         }));
-    let relay_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay"), MockPeerSender::discard(), ConnectionMeta {
-            direction: ConnectionDirection::Outbound,
-            config_label: None,
-            expected_peer: Some(HostName::new("relay")),
-            config_backed: true,
-        }));
+    let relay_generation = accepted_generation(mgr.activate_connection(NodeId::new("relay"), MockPeerSender::discard(), ConnectionMeta {
+        direction: ConnectionDirection::Outbound,
+        config_label: None,
+        expected_peer: Some(NodeId::new("relay")),
+        config_backed: true,
+    }));
     let baseline = snapshot_msg("target", 1);
     let _ = mgr
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(baseline.clone()),
             connection_generation: direct_generation,
-            connection_peer: HostName::new("target"),
+            connection_peer: NodeId::new("target"),
         })
         .await;
 
-    mgr.routes.get_mut(&HostName::new("target")).expect("route exists").fallbacks.push(RouteHop {
-        next_hop: HostName::new("relay"),
+    mgr.routes.get_mut(&NodeId::new("target")).expect("route exists").fallbacks.push(RouteHop {
+        next_hop: NodeId::new("relay"),
         next_hop_generation: relay_generation,
         learned_epoch: 10,
     });
 
-    let plan = mgr.disconnect_peer(&HostName::new("target"), direct_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("target"), direct_generation);
     let request = match &plan.resync_requests[0] {
         RoutedPeerMessage::RequestResync { request_id, .. } => *request_id,
         other => panic!("expected request_resync, got {:?}", other),
@@ -1123,8 +1120,8 @@ async fn failover_resync_clears_stale_and_rebinds_provenance() {
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Routed(RoutedPeerMessage::ResyncSnapshot {
                 request_id: request,
-                requester_host: HostName::new("local"),
-                responder_host: HostName::new("target"),
+                requester_node_id: NodeId::new("local"),
+                responder_node_id: NodeId::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
                 host_repo_root: baseline.host_repo_root.clone(),
@@ -1133,44 +1130,43 @@ async fn failover_resync_clears_stale_and_rebinds_provenance() {
                 data: Box::new(ProviderData::default()),
             }),
             connection_generation: relay_generation,
-            connection_peer: HostName::new("relay"),
+            connection_peer: NodeId::new("relay"),
         })
         .await;
 
     assert_eq!(result, HandleResult::Updated(test_repo()));
-    let state = &mgr.get_peer_data()[&HostName::new("target")][&test_repo()];
+    let state = &mgr.get_peer_data()[&NodeId::new("target")][&test_repo()];
     assert!(!state.stale, "failover resync should clear stale");
-    assert_eq!(state.via_peer, HostName::new("relay"));
+    assert_eq!(state.via_peer, NodeId::new("relay"));
     assert_eq!(state.via_generation, relay_generation);
 }
 
 #[tokio::test]
 async fn expired_resync_request_removes_stale_snapshot() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
-    let relay_generation =
-        accepted_generation(mgr.activate_connection(HostName::new("relay"), MockPeerSender::discard(), ConnectionMeta {
-            direction: ConnectionDirection::Inbound,
-            config_label: None,
-            expected_peer: None,
-            config_backed: false,
-        }));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let relay_generation = accepted_generation(mgr.activate_connection(NodeId::new("relay"), MockPeerSender::discard(), ConnectionMeta {
+        direction: ConnectionDirection::Inbound,
+        config_label: None,
+        expected_peer: None,
+        config_backed: false,
+    }));
 
     let _ = mgr
         .handle_inbound(InboundPeerEnvelope {
             msg: PeerWireMessage::Data(snapshot_msg("target", 1)),
             connection_generation: relay_generation,
-            connection_peer: HostName::new("relay"),
+            connection_peer: NodeId::new("relay"),
         })
         .await;
 
-    let state = mgr.peer_data.get_mut(&HostName::new("target")).and_then(|repos| repos.get_mut(&test_repo())).expect("repo state");
+    let state = mgr.peer_data.get_mut(&NodeId::new("target")).and_then(|repos| repos.get_mut(&test_repo())).expect("repo state");
     state.stale = true;
 
     mgr.pending_resync_requests.insert(
         ReversePathKey {
             request_id: 7,
-            requester_host: HostName::new("local"),
-            target_host: HostName::new("target"),
+            requester_node_id: NodeId::new("local"),
+            target_node_id: NodeId::new("target"),
             repo_identity: test_repo(),
         },
         PendingResyncRequest { deadline_at: Instant::now() - Duration::from_secs(1) },
@@ -1180,19 +1176,19 @@ async fn expired_resync_request_removes_stale_snapshot() {
 
     assert_eq!(affected, vec![test_repo()]);
     assert!(!mgr.pending_resync_requests.iter().any(|(key, _)| key.request_id == 7));
-    assert!(!mgr.peer_data.get(&HostName::new("target")).is_some_and(|repos| repos.contains_key(&test_repo())));
+    assert!(!mgr.peer_data.get(&NodeId::new("target")).is_some_and(|repos| repos.contains_key(&test_repo())));
 }
 
 #[tokio::test]
 async fn disconnect_peer_returns_overlay_updates_for_remaining_peers() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     handle_test_peer_data(&mut mgr, snapshot_msg("desktop", 1), MockPeerSender::discard).await;
     handle_test_peer_data(&mut mgr, snapshot_msg("laptop", 1), MockPeerSender::discard).await;
 
-    let desktop_generation = mgr.current_generation(&HostName::new("desktop")).expect("desktop connected");
+    let desktop_generation = mgr.current_generation(&NodeId::new("desktop")).expect("desktop connected");
 
-    let plan = mgr.disconnect_peer(&HostName::new("desktop"), desktop_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("desktop"), desktop_generation);
 
     assert!(plan.was_active);
     assert_eq!(plan.overlay_updates.len(), 1);
@@ -1200,7 +1196,7 @@ async fn disconnect_peer_returns_overlay_updates_for_remaining_peers() {
         OverlayUpdate::SetProviders { identity, peers, overlay_version } => {
             assert_eq!(identity, &test_repo());
             assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].0, HostName::new("laptop"));
+            assert_eq!(peers[0].0.node_id, NodeId::new("laptop"));
             assert!(*overlay_version > 0, "overlay_version should be bumped on disconnect");
         }
         other => panic!("expected SetProviders, got {:?}", other),
@@ -1209,16 +1205,16 @@ async fn disconnect_peer_returns_overlay_updates_for_remaining_peers() {
 
 #[tokio::test]
 async fn disconnect_peer_returns_remove_repo_for_remote_only_with_no_remaining_peers() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
 
     handle_test_peer_data(&mut mgr, snapshot_msg("desktop", 1), MockPeerSender::discard).await;
 
-    let desktop_generation = mgr.current_generation(&HostName::new("desktop")).expect("desktop connected");
+    let desktop_generation = mgr.current_generation(&NodeId::new("desktop")).expect("desktop connected");
 
     let synthetic_path = PathBuf::from("/virtual/github.com/owner/repo");
     mgr.register_remote_repo(test_repo(), synthetic_path.clone());
 
-    let plan = mgr.disconnect_peer(&HostName::new("desktop"), desktop_generation);
+    let plan = mgr.disconnect_peer(&NodeId::new("desktop"), desktop_generation);
 
     assert!(plan.was_active);
     assert_eq!(plan.overlay_updates.len(), 1);
@@ -1234,17 +1230,17 @@ async fn disconnect_peer_returns_remove_repo_for_remote_only_with_no_remaining_p
 
 #[tokio::test]
 async fn get_sender_if_current_returns_sender_for_matching_generation() {
-    let mut mgr = PeerManager::new(HostName::new("local"));
+    let mut mgr = PeerManager::new(NodeId::new("local"));
     let sent = Arc::new(Mutex::new(Vec::new()));
     let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
-    let generation = accepted_generation(mgr.activate_connection(HostName::new("peer"), sender, ConnectionMeta {
+    let generation = accepted_generation(mgr.activate_connection(NodeId::new("peer"), sender, ConnectionMeta {
         direction: ConnectionDirection::Inbound,
         config_label: None,
         expected_peer: None,
         config_backed: false,
     }));
 
-    assert!(mgr.get_sender_if_current(&HostName::new("peer"), generation).is_some());
-    assert!(mgr.get_sender_if_current(&HostName::new("peer"), generation + 1).is_none());
-    assert!(mgr.get_sender_if_current(&HostName::new("unknown"), 1).is_none());
+    assert!(mgr.get_sender_if_current(&NodeId::new("peer"), generation).is_some());
+    assert!(mgr.get_sender_if_current(&NodeId::new("peer"), generation + 1).is_none());
+    assert!(mgr.get_sender_if_current(&NodeId::new("unknown"), 1).is_none());
 }

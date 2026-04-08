@@ -83,14 +83,14 @@ impl InteractiveWidget for CloseConfirmWidget {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{CommandAction, HostName, RepoSelector, WorkItemIdentity};
+    use flotilla_protocol::{CommandAction, NodeId, RepoSelector, WorkItemIdentity};
 
     use super::*;
     use crate::app::test_support::TestWidgetHarness;
 
     fn make_widget() -> CloseConfirmWidget {
         CloseConfirmWidget::new("PR-1".into(), "Fix all the things".into(), WorkItemIdentity::ChangeRequest("PR-1".into()), Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
@@ -131,7 +131,7 @@ mod tests {
     fn close_confirm_attaches_pending_context() {
         let identity = WorkItemIdentity::ChangeRequest("PR-42".into());
         let mut widget = CloseConfirmWidget::new("PR-42".into(), "test".into(), identity.clone(), Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::CloseChangeRequest { id: "PR-42".into() },
@@ -150,7 +150,7 @@ mod tests {
     fn close_confirm_preserves_resolved_remote_command() {
         let mut harness = TestWidgetHarness::new();
         let expected = Command {
-            host: Some(HostName::new("remote-host")),
+            node_id: Some(NodeId::new("remote-host")),
             provisioning_target: None,
             context_repo: Some(RepoSelector::Identity(harness.model.active_repo_identity().clone())),
             action: CommandAction::CloseChangeRequest { id: "PR-1".into() },

@@ -49,6 +49,8 @@ pub struct ResolvedPaneCommand {
 pub struct PreparedWorkspace {
     pub label: String,
     pub target_node_id: crate::NodeId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_host: Option<crate::HostName>,
     pub checkout_path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkout_key: Option<QualifiedPath>,
@@ -571,6 +573,7 @@ mod tests {
             CommandValue::PreparedWorkspace(PreparedWorkspace {
                 label: "feat-x".into(),
                 target_node_id: NodeId::new("desktop"),
+                display_host: Some(crate::HostName::new("desktop")),
                 checkout_path: PathBuf::from("/remote/repo/feat-x"),
                 checkout_key: None,
                 attachable_set_id: Some(AttachableSetId::new("set-1")),
@@ -688,6 +691,7 @@ mod tests {
         let prepared = PreparedWorkspace {
             label: "feat-x".into(),
             target_node_id: NodeId::new("desktop"),
+            display_host: Some(crate::HostName::new("desktop")),
             checkout_path: PathBuf::from("/remote/repo/feat-x"),
             checkout_key: None,
             attachable_set_id: Some(AttachableSetId::new("set-1")),

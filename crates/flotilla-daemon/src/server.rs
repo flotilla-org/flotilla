@@ -21,7 +21,7 @@ use std::{
 use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
-use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, HostName, Message, PROTOCOL_VERSION};
+use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, HostName, Message, NodeId, PROTOCOL_VERSION};
 use flotilla_transport::message::{unix_message_session, MessageSession};
 use tokio::{
     net::UnixListener,
@@ -47,7 +47,7 @@ use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, Peer
 /// integration tests can construct notices to drive the outbound task.
 #[cfg_attr(feature = "test-support", visibility::make(pub))]
 pub(crate) struct PeerConnectedNotice {
-    pub peer: HostName,
+    pub peer: NodeId,
     pub generation: u64,
 }
 
@@ -67,27 +67,28 @@ fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc
 
 fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Result<Arc<Mutex<PeerManager>>, String> {
     let host_name = daemon.host_name().clone();
+    let local_node_id = daemon.node_id().clone();
     let hosts_config = config.load_hosts()?;
 
     let peer_count = hosts_config.hosts.len();
-    let mut peer_manager = PeerManager::new(host_name.clone());
+    let mut peer_manager = PeerManager::new(local_node_id.clone());
     for (name, host_config) in hosts_config.hosts {
-        let peer_host = HostName::new(&host_config.expected_host_name);
-        if peer_host == host_name {
+        let peer_node_id = NodeId::new(&host_config.expected_host_name);
+        if peer_node_id.as_str() == host_name.as_str() {
             warn!(
                 host = %host_name,
                 "peer config uses same name as local host — messages will be ignored"
             );
         }
         match SshTransport::new(
-            host_name.clone(),
+            local_node_id.clone(),
             ConfigLabel(name.clone()),
             host_config,
             daemon.session_id(),
             config.state_dir().as_path(),
         ) {
             Ok(transport) => {
-                peer_manager.add_peer(peer_host, Box::new(transport));
+                peer_manager.add_peer(peer_node_id, Box::new(transport));
             }
             Err(e) => {
                 warn!(host = %name, err = %e, "skipping peer with invalid host name");
@@ -449,27 +450,10 @@ async fn handle_client_session(
                 .run(Arc::clone(&session), id, request)
                 .await;
         }
-        Message::Hello { protocol_version, host_name, session_id, connection_role, environment_id } => {
-            // Verify environment identity when connected on a per-environment socket.
-            if let Some(expected) = &environment_context {
-                if let Some(claimed) = &environment_id {
-                    if expected != claimed {
-                        warn!(
-                            %expected,
-                            %claimed,
-                            "environment_id mismatch on per-environment socket — dropping connection"
-                        );
-                        return;
-                    }
-                } else {
-                    // Per-environment sockets are new infrastructure — all clients connecting to
-                    // them should send environment_id. Fail-closed: reject unidentified connections.
-                    warn!(
-                        %expected,
-                        "connection on per-environment socket without environment_id — dropping"
-                    );
-                    return;
-                }
+        Message::Hello { protocol_version, node_id, display_name: _, session_id, connection_role } => {
+            if environment_context.is_some() {
+                warn!("peer/client hello on per-environment socket is unsupported");
+                return;
             }
 
             if connection_role == Some(ConnectionRole::Client) {
@@ -478,10 +462,10 @@ async fn handle_client_session(
                 if session
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
-                        host_name: daemon.host_name().clone(),
+                        node_id: daemon.node_id().clone(),
+                        display_name: daemon.host_name().to_string(),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
-                        environment_id: None,
                     })
                     .await
                     .is_err()
@@ -494,7 +478,7 @@ async fn handle_client_session(
             } else {
                 // Peer path (ConnectionRole::Peer or None) — existing behavior.
                 PeerConnection::new(daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify)
-                    .run(session, protocol_version, host_name, session_id)
+                    .run(session, protocol_version, node_id, session_id)
                     .await;
             }
         }

@@ -17,6 +17,7 @@ use flotilla_core::{
     },
     refresh::RepoRefreshHandle,
 };
+use flotilla_protocol::NodeId;
 
 #[tokio::main]
 async fn main() {
@@ -108,7 +109,9 @@ async fn main() {
     let work_items: Vec<_> = snapshot
         .work_items
         .iter()
-        .map(|item| correlation_result_to_work_item(item, &snapshot.correlation_groups, &flotilla_core::HostName::local()))
+        .map(|item| {
+            correlation_result_to_work_item(item, &snapshot.correlation_groups, NodeId::new(flotilla_core::HostName::local().as_str()))
+        })
         .collect();
     let sections = data::group_work_items_split(&work_items, &snapshot.providers, &section_labels, &repo_root);
     for section in &sections {

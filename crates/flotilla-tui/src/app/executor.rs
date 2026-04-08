@@ -147,7 +147,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{arg::Arg, CheckoutStatus, HostName, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity};
+    use flotilla_protocol::{arg::Arg, CheckoutStatus, NodeId, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity};
 
     use super::*;
     use crate::app::{test_support::stub_app, ui_state::BranchInputKind};
@@ -159,7 +159,7 @@ mod tests {
         handle_result(
             CommandValue::TerminalPrepared {
                 repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
-                target_host: HostName::new("remote-a"),
+                target_node_id: NodeId::new("remote-a"),
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/feat-x"),
                 attachable_set_id: Some(flotilla_protocol::AttachableSetId::new("set-1")),
@@ -179,7 +179,7 @@ mod tests {
         handle_result(
             CommandValue::TerminalPrepared {
                 repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/repo-0".into() },
-                target_host: HostName::new("remote-a"),
+                target_node_id: NodeId::new("remote-a"),
                 branch: "feat-x".into(),
                 checkout_path: PathBuf::from("/remote/feat-x"),
                 attachable_set_id: None,

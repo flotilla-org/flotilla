@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    Command, CommandAction, CommandPeerEvent, CommandValue, GoodbyeReason, HostName, PeerDataKind, PeerDataMessage, PeerWireMessage,
+    Command, CommandAction, CommandPeerEvent, CommandValue, GoodbyeReason, NodeId, PeerDataKind, PeerDataMessage, PeerWireMessage,
     ProviderData, RepoIdentity, RepoSelector, RoutedPeerMessage, StepStatus, VectorClock,
 };
 
@@ -11,14 +11,18 @@ fn test_repo() -> RepoIdentity {
     RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() }
 }
 
-/// Create a snapshot message with the origin host's clock pre-ticked to `seq`.
+fn node(name: &str) -> NodeId {
+    NodeId::new(name)
+}
+
+/// Create a snapshot message with the origin node's clock pre-ticked to `seq`.
 fn snapshot_msg(origin: &str, repo: &RepoIdentity, seq: u64) -> PeerDataMessage {
     let mut clock = VectorClock::default();
     for _ in 0..seq {
-        clock.tick(&HostName::new(origin));
+        clock.tick(&node(origin));
     }
     PeerDataMessage {
-        origin_host: HostName::new(origin),
+        origin_node_id: node(origin),
         repo_identity: repo.clone(),
         host_repo_root: Some(PathBuf::from("/repo")),
         clock,
@@ -28,7 +32,7 @@ fn snapshot_msg(origin: &str, repo: &RepoIdentity, seq: u64) -> PeerDataMessage 
 
 /// Helper: check if a peer's manager has stored data from a given origin for a repo.
 fn has_peer_data(net: &TestNetwork, peer_idx: usize, origin: &str, repo: &RepoIdentity) -> bool {
-    net.manager(peer_idx).get_peer_data().get(&HostName::new(origin)).and_then(|repos| repos.get(repo)).is_some()
+    net.manager(peer_idx).get_peer_data().get(&node(origin)).and_then(|repos| repos.get(repo)).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +103,7 @@ async fn vector_clock_dedup_drops_duplicate() {
     net.settle().await;
 
     let peer_data = net.manager(b).get_peer_data();
-    let state = peer_data.get(&HostName::new("host-a")).and_then(|repos| repos.get(&repo)).expect("should have data");
+    let state = peer_data.get(&node("host-a")).and_then(|repos| repos.get(&repo)).expect("should have data");
     assert_eq!(state.seq, 2, "seq should be 2 — duplicate seq 1 was dropped, seq 2 was accepted");
 }
 
@@ -112,7 +116,7 @@ async fn goodbye_flow_through_channel() {
     net.start().await;
 
     // Get A's sender for B and retire it (sends Goodbye)
-    let sender = net.manager(a).resolve_sender(&HostName::new("host-b")).expect("sender");
+    let sender = net.manager(a).resolve_sender(&node("host-b")).expect("sender");
     sender.retire(GoodbyeReason::Superseded).await.expect("retire should succeed");
 
     // Process B to receive the Goodbye
@@ -202,11 +206,11 @@ async fn routed_command_request_reaches_target_through_relay() {
 
     let request = RoutedPeerMessage::CommandRequest {
         request_id: 42,
-        requester_host: HostName::new("host-a"),
-        target_host: HostName::new("host-c"),
+        requester_node_id: node("host-a"),
+        target_node_id: node("host-c"),
         remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
         command: Box::new(Command {
-            host: Some(HostName::new("host-c")),
+            node_id: Some(node("host-c")),
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
@@ -214,7 +218,7 @@ async fn routed_command_request_reaches_target_through_relay() {
         session_id: None,
     };
 
-    net.manager(a).send_to(&HostName::new("host-c"), PeerWireMessage::Routed(request)).await.expect("send command request");
+    net.manager(a).send_to(&node("host-c"), PeerWireMessage::Routed(request)).await.expect("send command request");
 
     let b_results = net.process_peer_with_results(b).await;
     assert!(b_results.iter().all(|result| matches!(result, HandleResult::Ignored)));
@@ -222,12 +226,12 @@ async fn routed_command_request_reaches_target_through_relay() {
     let c_results = net.process_peer_with_results(c).await;
     assert!(matches!(
         c_results.as_slice(),
-        [HandleResult::CommandRequested { request_id: 42, requester_host, reply_via, command, .. }]
-            if requester_host == &HostName::new("host-a")
-                && reply_via == &HostName::new("host-b")
+        [HandleResult::CommandRequested { request_id: 42, requester_node_id, reply_via, command, .. }]
+            if requester_node_id == &node("host-a")
+                && reply_via == &node("host-b")
                 && *command
                     == Command {
-                        host: Some(HostName::new("host-c")),
+                        node_id: Some(node("host-c")),
                         provisioning_target: None,
                         context_repo: None,
                         action: CommandAction::Refresh { repo: Some(RepoSelector::Query("owner/repo".into())) },
@@ -251,14 +255,14 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
 
     net.manager(a)
         .send_to(
-            &HostName::new("host-c"),
+            &node("host-c"),
             PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
                 request_id: 77,
-                requester_host: HostName::new("host-a"),
-                target_host: HostName::new("host-c"),
+                requester_node_id: node("host-a"),
+                target_node_id: node("host-c"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 command: Box::new(Command {
-                    host: Some(HostName::new("host-c")),
+                    node_id: Some(node("host-c")),
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::Refresh { repo: None },
@@ -273,11 +277,11 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
 
     net.manager(c)
         .send_to(
-            &HostName::new("host-b"),
+            &node("host-b"),
             PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent {
                 request_id: 77,
-                requester_host: HostName::new("host-a"),
-                responder_host: HostName::new("host-c"),
+                requester_node_id: node("host-a"),
+                responder_node_id: node("host-c"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 event: Box::new(CommandPeerEvent::StepUpdate {
                     repo_identity: test_repo(),
@@ -295,8 +299,8 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
     let a_event_results = net.process_peer_with_results(a).await;
     assert!(matches!(
         a_event_results.as_slice(),
-        [HandleResult::CommandEventReceived { request_id: 77, responder_host, event }]
-            if responder_host == &HostName::new("host-c")
+        [HandleResult::CommandEventReceived { request_id: 77, responder_node_id, event }]
+            if responder_node_id == &node("host-c")
                 && *event
                     == CommandPeerEvent::StepUpdate {
                         repo_identity: test_repo(),
@@ -310,11 +314,11 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
 
     net.manager(c)
         .send_to(
-            &HostName::new("host-b"),
+            &node("host-b"),
             PeerWireMessage::Routed(RoutedPeerMessage::CommandResponse {
                 request_id: 77,
-                requester_host: HostName::new("host-a"),
-                responder_host: HostName::new("host-c"),
+                requester_node_id: node("host-a"),
+                responder_node_id: node("host-c"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 result: Box::new(CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")] }),
             }),
@@ -325,8 +329,8 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
     let a_response_results = net.process_peer_with_results(a).await;
     assert!(matches!(
         a_response_results.as_slice(),
-        [HandleResult::CommandResponseReceived { request_id: 77, responder_host, result }]
-            if responder_host == &HostName::new("host-c")
+        [HandleResult::CommandResponseReceived { request_id: 77, responder_node_id, result }]
+            if responder_node_id == &node("host-c")
                 && *result == CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")] }
     ));
 }
@@ -342,14 +346,14 @@ async fn routed_command_returns_clear_error_for_unknown_target() {
     let err = net
         .manager(a)
         .send_to(
-            &HostName::new("host-z"),
+            &node("host-z"),
             PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest {
                 request_id: 1,
-                requester_host: HostName::new("host-a"),
-                target_host: HostName::new("host-z"),
+                requester_node_id: node("host-a"),
+                target_node_id: node("host-z"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                 command: Box::new(Command {
-                    host: Some(HostName::new("host-z")),
+                    node_id: Some(node("host-z")),
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::Refresh { repo: None },

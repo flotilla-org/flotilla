@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use flotilla_protocol::{
     snapshot::{WorkItem, WorkItemIdentity, WorkItemKind},
-    HostName, HostPath,
+    HostName, HostPath, NodeId, NodeInfo,
 };
 
 fn health(entries: &[(&str, &str, bool)]) -> HashMap<String, HashMap<String, bool>> {
@@ -17,7 +17,7 @@ fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -
     WorkItem {
         kind,
         identity: WorkItemIdentity::Checkout(HostPath::new(HostName::new("test"), PathBuf::from("/tmp/wt")).into()),
-        host: HostName::new("test"),
+        node_id: NodeId::new("test"),
         branch: branch.map(String::from),
         description: description.to_string(),
         checkout: None,
@@ -36,7 +36,7 @@ fn make_work_item(kind: WorkItemKind, branch: Option<&str>, description: &str) -
 
 mod status_human {
     use flotilla_protocol::{
-        EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse, HostName, HostProviderStatus,
+        EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse, HostProviderStatus,
         HostProvidersResponse, HostStatusResponse, HostSummary, ImageId, PeerConnectionState, RepoSummary, StatusResponse, SystemInfo,
         ToolInventory, TopologyResponse, TopologyRoute,
     };
@@ -70,7 +70,7 @@ mod status_human {
 
     fn sample_host_summary(name: &str) -> HostSummary {
         HostSummary {
-            host_name: HostName::new(name),
+            node: NodeInfo::new(NodeId::new(name), name),
             system: SystemInfo {
                 home_dir: Some("/home/dev".into()),
                 os: Some("linux".into()),
@@ -107,7 +107,7 @@ mod status_human {
         let response = HostListResponse {
             hosts: vec![
                 HostListEntry {
-                    host: HostName::new("local"),
+                    node: NodeInfo::new(NodeId::new("local"), "local"),
                     is_local: true,
                     configured: false,
                     connection_status: PeerConnectionState::Connected,
@@ -116,7 +116,7 @@ mod status_human {
                     work_item_count: 5,
                 },
                 HostListEntry {
-                    host: HostName::new("remote"),
+                    node: NodeInfo::new(NodeId::new("remote"), "remote"),
                     is_local: false,
                     configured: true,
                     connection_status: PeerConnectionState::Disconnected,
@@ -136,7 +136,7 @@ mod status_human {
     #[test]
     fn host_status_shows_summary_and_counts() {
         let response = HostStatusResponse {
-            host: HostName::new("local"),
+            node: NodeInfo::new(NodeId::new("local"), "local"),
             is_local: true,
             configured: false,
             connection_status: PeerConnectionState::Connected,
@@ -147,7 +147,7 @@ mod status_human {
         };
 
         let output = format_host_status_human(&response);
-        assert!(output.contains("Host: local"));
+        assert!(output.contains("Node: local"));
         assert!(output.contains("Repositories: 2"));
         assert!(output.contains("linux"));
         assert!(output.contains("Visible Environments:"));
@@ -158,7 +158,7 @@ mod status_human {
     #[test]
     fn host_providers_shows_inventory_and_provider_rows() {
         let response = HostProvidersResponse {
-            host: HostName::new("local"),
+            node: NodeInfo::new(NodeId::new("local"), "local"),
             is_local: true,
             configured: false,
             connection_status: PeerConnectionState::Connected,
@@ -177,13 +177,13 @@ mod status_human {
     #[test]
     fn topology_shows_route_rows() {
         let response = TopologyResponse {
-            local_host: HostName::new("local"),
+            local_node: NodeInfo::new(NodeId::new("local"), "local"),
             routes: vec![TopologyRoute {
-                target: HostName::new("remote"),
-                next_hop: HostName::new("relay"),
+                target: NodeInfo::new(NodeId::new("remote"), "remote"),
+                next_hop: NodeInfo::new(NodeId::new("relay"), "relay"),
                 direct: false,
                 connected: true,
-                fallbacks: vec![HostName::new("backup")],
+                fallbacks: vec![NodeInfo::new(NodeId::new("backup"), "backup")],
             }],
         };
 
@@ -197,7 +197,7 @@ mod status_human {
 mod watch_human {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostName, PeerConnectionState, RepoDelta, RepoSnapshot};
+    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostName, NodeId, PeerConnectionState, RepoDelta, RepoSnapshot};
 
     use crate::cli::format_event_human;
 
@@ -210,14 +210,14 @@ mod watch_human {
             seq,
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.into() },
             repo: Some(PathBuf::from(repo)),
-            host_name: HostName::new("test"),
+            node_id: NodeId::new("test"),
             work_items: (0..work_item_count)
                 .map(|i| WorkItem {
                     kind: WorkItemKind::Checkout,
                     identity: WorkItemIdentity::Checkout(
                         flotilla_protocol::HostPath::new(HostName::new("test"), PathBuf::from(format!("/tmp/wt{i}"))).into(),
                     ),
-                    host: HostName::new("test"),
+                    node_id: NodeId::new("test"),
                     branch: None,
                     description: String::new(),
                     checkout: None,
@@ -297,7 +297,7 @@ mod watch_human {
     fn command_started() {
         let event = DaemonEvent::CommandStarted {
             command_id: 1,
-            host: HostName::local(),
+            node_id: NodeId::new(HostName::local().as_str()),
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
             repo: Some(PathBuf::from("/tmp/my-repo")),
             description: "Refreshing...".into(),
@@ -312,7 +312,7 @@ mod watch_human {
     fn command_finished_ok() {
         let event = DaemonEvent::CommandFinished {
             command_id: 1,
-            host: HostName::local(),
+            node_id: NodeId::new(HostName::local().as_str()),
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
             repo: Some(PathBuf::from("/tmp/my-repo")),
             result: CommandValue::Ok,
@@ -327,7 +327,7 @@ mod watch_human {
     fn command_finished_error() {
         let event = DaemonEvent::CommandFinished {
             command_id: 1,
-            host: HostName::local(),
+            node_id: NodeId::new(HostName::local().as_str()),
             repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/my-repo".into() },
             repo: Some(PathBuf::from("/tmp/my-repo")),
             result: CommandValue::Error { message: "boom".into() },
@@ -345,7 +345,7 @@ mod watch_human {
             (PeerConnectionState::Reconnecting, "reconnecting"),
             (PeerConnectionState::Rejected { reason: "protocol mismatch".to_string() }, "rejected"),
         ] {
-            let event = DaemonEvent::PeerStatusChanged { host: HostName::new("host-2"), status: state };
+            let event = DaemonEvent::PeerStatusChanged { node_id: NodeId::new("host-2"), status: state };
             let line = format_event_human(&event);
             assert!(line.contains("[peer]"), "should have peer tag for {expected}");
             assert!(line.contains("host-2"), "should show host name for {expected}");
@@ -359,7 +359,7 @@ mod command_result_human {
 
     use flotilla_protocol::{
         commands::{CheckoutStatus, CommandValue},
-        HostName, PreparedWorkspace,
+        HostName, NodeId, PreparedWorkspace,
     };
 
     use crate::cli::format_command_result;
@@ -482,7 +482,8 @@ mod command_result_human {
     fn prepared_workspace_is_internal_step_result() {
         let result = CommandValue::PreparedWorkspace(PreparedWorkspace {
             label: "feat".into(),
-            target_host: HostName::new("feta"),
+            target_node_id: NodeId::new("feta"),
+            display_host: Some(HostName::new("feta")),
             checkout_path: PathBuf::from("/tmp/wt"),
             checkout_key: None,
             attachable_set_id: None,
@@ -783,7 +784,7 @@ mod repo_name_fn {
 mod query_event_formatting {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostListResponse, HostName, RepoIdentity};
+    use flotilla_protocol::{commands::CommandValue, DaemonEvent, HostListResponse, HostName, NodeId, RepoIdentity};
 
     use crate::cli::format_event_human;
 
@@ -794,7 +795,7 @@ mod query_event_formatting {
     fn query_started(description: &str) -> DaemonEvent {
         DaemonEvent::CommandStarted {
             command_id: 1,
-            host: HostName::local(),
+            node_id: NodeId::new(HostName::local().as_str()),
             repo_identity: test_identity(),
             repo: None,
             description: description.to_string(),
@@ -802,7 +803,13 @@ mod query_event_formatting {
     }
 
     fn query_finished(result: CommandValue) -> DaemonEvent {
-        DaemonEvent::CommandFinished { command_id: 1, host: HostName::local(), repo_identity: test_identity(), repo: None, result }
+        DaemonEvent::CommandFinished {
+            command_id: 1,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: test_identity(),
+            repo: None,
+            result,
+        }
     }
 
     #[test]
@@ -816,7 +823,7 @@ mod query_event_formatting {
     fn started_event_with_repo_shows_command_prefix() {
         let event = DaemonEvent::CommandStarted {
             command_id: 1,
-            host: HostName::local(),
+            node_id: NodeId::new(HostName::local().as_str()),
             repo_identity: test_identity(),
             repo: Some(PathBuf::from("/tmp/myrepo")),
             description: "checkout".to_string(),
@@ -844,7 +851,7 @@ mod query_event_formatting {
     fn finished_non_query_shows_command_prefix() {
         let event = DaemonEvent::CommandFinished {
             command_id: 1,
-            host: HostName::local(),
+            node_id: NodeId::new(HostName::local().as_str()),
             repo_identity: test_identity(),
             repo: Some(PathBuf::from("/tmp/myrepo")),
             result: CommandValue::Ok,

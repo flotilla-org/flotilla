@@ -322,13 +322,13 @@ pub fn channel_transport_pair(local_name: HostName, remote_name: HostName) -> (C
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{PeerDataKind, PeerDataMessage, ProviderData, RepoIdentity, VectorClock};
+    use flotilla_protocol::{NodeId, PeerDataKind, PeerDataMessage, ProviderData, RepoIdentity, VectorClock};
 
     use super::*;
 
     fn test_snapshot_msg(origin: &str, seq: u64) -> PeerWireMessage {
         PeerWireMessage::Data(PeerDataMessage {
-            origin_host: HostName::new(origin),
+            origin_node_id: NodeId::new(origin),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             host_repo_root: Some(PathBuf::from("/repo")),
             clock: VectorClock::default(),
@@ -420,8 +420,8 @@ mod tests {
         sender_a.send(test_snapshot_msg("alpha", 1)).await.expect("A send");
         let msg = rx_b.recv().await.expect("B should receive message from A");
         match msg {
-            PeerWireMessage::Data(PeerDataMessage { origin_host, kind: PeerDataKind::Snapshot { seq, .. }, .. }) => {
-                assert_eq!(origin_host, HostName::new("alpha"));
+            PeerWireMessage::Data(PeerDataMessage { origin_node_id, kind: PeerDataKind::Snapshot { seq, .. }, .. }) => {
+                assert_eq!(origin_node_id, NodeId::new("alpha"));
                 assert_eq!(seq, 1);
             }
             other => panic!("unexpected message: {other:?}"),
@@ -431,8 +431,8 @@ mod tests {
         sender_b.send(test_snapshot_msg("beta", 2)).await.expect("B send");
         let msg = rx_a.recv().await.expect("A should receive message from B");
         match msg {
-            PeerWireMessage::Data(PeerDataMessage { origin_host, kind: PeerDataKind::Snapshot { seq, .. }, .. }) => {
-                assert_eq!(origin_host, HostName::new("beta"));
+            PeerWireMessage::Data(PeerDataMessage { origin_node_id, kind: PeerDataKind::Snapshot { seq, .. }, .. }) => {
+                assert_eq!(origin_node_id, NodeId::new("beta"));
                 assert_eq!(seq, 2);
             }
             other => panic!("unexpected message: {other:?}"),

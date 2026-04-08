@@ -191,6 +191,7 @@ pub enum RoutedPeerMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum CommandPeerEvent {
     Started {

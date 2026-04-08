@@ -986,7 +986,7 @@ fn provider_table_widths() -> [Constraint; 3] {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{provider_data::Issue, HostPath, WorkItemKind};
+    use flotilla_protocol::{provider_data::Issue, HostPath, NodeId, WorkItemKind};
 
     use super::*;
 
@@ -996,7 +996,7 @@ mod tests {
         WorkItem {
             kind: kind.clone(),
             identity: WorkItemIdentity::Issue(id.into()),
-            host: flotilla_protocol::HostName::new("localhost"),
+            node_id: NodeId::new("localhost"),
             branch: None,
             description: format!("Item {id}"),
             checkout: None,
@@ -1017,7 +1017,7 @@ mod tests {
         WorkItem {
             kind: WorkItemKind::Checkout,
             identity: WorkItemIdentity::Checkout(HostPath::new(flotilla_protocol::HostName::new("localhost"), format!("/tmp/{id}")).into()),
-            host: flotilla_protocol::HostName::new("localhost"),
+            node_id: NodeId::new("localhost"),
             branch: Some(format!("branch-{id}")),
             description: format!("Checkout {id}"),
             checkout: None,

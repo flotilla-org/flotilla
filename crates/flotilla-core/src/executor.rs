@@ -174,16 +174,11 @@ pub async fn build_plan(
                 CheckoutTarget::Branch(branch) => (branch, false, CheckoutIntent::ExistingBranch),
                 CheckoutTarget::FreshBranch(branch) => (branch, true, CheckoutIntent::FreshBranch),
             };
-            Ok(build_create_checkout_plan(
-                branch,
-                create_branch,
-                intent,
-                issue_ids,
-                checkout_host,
+            Ok(build_create_checkout_plan(branch, create_branch, intent, issue_ids, checkout_host, CheckoutDisplayContext {
                 local_node_id,
                 local_host,
                 target_display_host,
-            ))
+            }))
         }
 
         CommandAction::TeleportSession { session_id, branch, checkout_key } => {
@@ -218,7 +213,7 @@ pub async fn build_plan(
                         .map(|(qp, _)| qp.clone())
                         .collect();
                     info!(%branch, ?deleted_paths, %target_node_id, "built remove checkout plan");
-                    Ok(build_remove_checkout_plan(branch, deleted_paths, local_node_id))
+                    Ok(build_remove_checkout_plan(branch, deleted_paths, target_node_id))
                 }
                 Err(message) => {
                     error!(%message, %target_node_id, %local_host, "checkout resolution failed");
@@ -227,9 +222,9 @@ pub async fn build_plan(
             }
         }
 
-        CommandAction::ArchiveSession { session_id } => Ok(build_archive_session_plan(session_id, local_node_id.clone())),
+        CommandAction::ArchiveSession { session_id } => Ok(build_archive_session_plan(session_id, target_node_id.clone())),
 
-        CommandAction::GenerateBranchName { issue_keys } => Ok(build_generate_branch_name_plan(issue_keys, local_node_id.clone())),
+        CommandAction::GenerateBranchName { issue_keys } => Ok(build_generate_branch_name_plan(issue_keys, target_node_id.clone())),
 
         CommandAction::CreateWorkspaceForCheckout { checkout_path, label } => Ok(build_create_workspace_plan(
             workspace_label_for_host(
@@ -271,7 +266,7 @@ pub async fn build_plan(
 
         CommandAction::FetchCheckoutStatus { branch, checkout_path, change_request_id } => Ok(StepPlan::new(vec![Step {
             description: format!("Fetch checkout status for {branch}"),
-            host: StepExecutionContext::Host(local_node_id.clone()),
+            host: StepExecutionContext::Host(target_node_id.clone()),
             action: StepAction::FetchCheckoutStatus {
                 branch,
                 checkout_path: checkout_path.map(ExecutionEnvironmentPath::new),
@@ -281,25 +276,25 @@ pub async fn build_plan(
 
         CommandAction::OpenChangeRequest { id } => Ok(StepPlan::new(vec![Step {
             description: format!("Open change request {id}"),
-            host: StepExecutionContext::Host(local_node_id.clone()),
+            host: StepExecutionContext::Host(target_node_id.clone()),
             action: StepAction::OpenChangeRequest { id },
         }])),
 
         CommandAction::CloseChangeRequest { id } => Ok(StepPlan::new(vec![Step {
             description: format!("Close change request {id}"),
-            host: StepExecutionContext::Host(local_node_id.clone()),
+            host: StepExecutionContext::Host(target_node_id.clone()),
             action: StepAction::CloseChangeRequest { id },
         }])),
 
         CommandAction::OpenIssue { id } => Ok(StepPlan::new(vec![Step {
             description: format!("Open issue {id}"),
-            host: StepExecutionContext::Host(local_node_id.clone()),
+            host: StepExecutionContext::Host(target_node_id.clone()),
             action: StepAction::OpenIssue { id },
         }])),
 
         CommandAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => Ok(StepPlan::new(vec![Step {
             description: format!("Link issues to change request {change_request_id}"),
-            host: StepExecutionContext::Host(local_node_id),
+            host: StepExecutionContext::Host(target_node_id),
             action: StepAction::LinkIssuesToChangeRequest { change_request_id, issue_ids },
         }])),
 
@@ -330,15 +325,19 @@ pub async fn build_plan(
 ///
 /// All steps are symbolic — the `ExecutorStepResolver` provides infrastructure
 /// (registry, providers_data, runner, local_host) at execution time.
+struct CheckoutDisplayContext {
+    local_node_id: NodeId,
+    local_host: HostName,
+    target_display_host: Option<HostName>,
+}
+
 fn build_create_checkout_plan(
     branch: String,
     create_branch: bool,
     intent: CheckoutIntent,
     issue_ids: Vec<(String, String)>,
     checkout_host: StepExecutionContext,
-    local_node_id: NodeId,
-    local_host: HostName,
-    target_display_host: Option<HostName>,
+    display: CheckoutDisplayContext,
 ) -> StepPlan {
     let mut steps = Vec::new();
     let workspace_host = checkout_host.clone();
@@ -357,9 +356,13 @@ fn build_create_checkout_plan(
         });
     }
 
-    let workspace_label =
-        workspace_label_for_host(&branch, workspace_host.node_id(), &local_node_id, target_display_host.as_ref().or(Some(&local_host)));
-    steps.extend(build_create_workspace_plan(workspace_label, None, workspace_host, local_node_id).steps);
+    let workspace_label = workspace_label_for_host(
+        &branch,
+        workspace_host.node_id(),
+        &display.local_node_id,
+        display.target_display_host.as_ref().or(Some(&display.local_host)),
+    );
+    steps.extend(build_create_workspace_plan(workspace_label, None, workspace_host, display.local_node_id).steps);
 
     StepPlan::new(steps)
 }
@@ -422,7 +425,7 @@ fn build_environment_checkout_plan(
     steps.push(Step {
         description: format!("Prepare workspace for {workspace_label}"),
         host: env_context,
-        action: StepAction::PrepareWorkspace { checkout_path: None, label: workspace_label },
+        action: StepAction::PrepareWorkspace { checkout_path: None, label: workspace_label, display_host: target_display_host },
     });
 
     steps.push(Step {
@@ -473,7 +476,7 @@ fn build_existing_environment_checkout_plan(
     steps.push(Step {
         description: format!("Prepare workspace for {workspace_label}"),
         host: env_context,
-        action: StepAction::PrepareWorkspace { checkout_path: None, label: workspace_label },
+        action: StepAction::PrepareWorkspace { checkout_path: None, label: workspace_label, display_host: target_display_host },
     });
     steps.push(Step {
         description: "Attach workspace".to_string(),
@@ -494,7 +497,7 @@ fn build_create_workspace_plan(
         Step {
             description: format!("Prepare workspace for {label}"),
             host: checkout_host,
-            action: StepAction::PrepareWorkspace { checkout_path, label },
+            action: StepAction::PrepareWorkspace { checkout_path, label, display_host: None },
         },
         Step {
             description: "Attach workspace".to_string(),
@@ -740,7 +743,7 @@ impl StepResolver for ExecutorStepResolver {
                 let session_actions = ReadOnlySessionActionService::new(self.registry.as_ref(), self.providers_data.as_ref());
                 Ok(StepOutcome::CompletedWith(session_actions.generate_branch_name_result(&issue_keys).await))
             }
-            StepAction::PrepareWorkspace { checkout_path: explicit_path, label } => {
+            StepAction::PrepareWorkspace { checkout_path: explicit_path, label, display_host } => {
                 let prepared_checkout: Option<(ExecutionEnvironmentPath, String, Option<QualifiedPath>)> = if let Some(p) = explicit_path {
                     let host_key =
                         flotilla_protocol::qualified_path::QualifiedPath::from_host_name(&self.local_host, p.as_path().to_path_buf());
@@ -809,6 +812,7 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
                     label,
                     target_node_id: self.local_node_id.clone(),
+                    display_host,
                     checkout_path: checkout_path.into_path_buf(),
                     checkout_key,
                     attachable_set_id,
@@ -868,6 +872,7 @@ impl StepResolver for ExecutorStepResolver {
                         &PreparedWorkspace {
                             label: workspace_label_for_host(&branch, &target_node_id, &self.local_node_id, label_host.as_ref()),
                             target_node_id,
+                            display_host: label_host,
                             checkout_path: checkout_path.into_path_buf(),
                             checkout_key: None,
                             attachable_set_id,

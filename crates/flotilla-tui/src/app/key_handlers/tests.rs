@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{
-    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, ProvisioningTarget, WorkItemIdentity,
+    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, HostName, HostPath, NodeId, NodeInfo, ProvisioningTarget, WorkItemIdentity,
 };
 use ratatui::layout::Rect;
 
@@ -55,7 +55,7 @@ fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
         is_local: false,
         status: PeerStatus::Connected,
         summary: flotilla_protocol::HostSummary {
-            host_name,
+            node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -247,7 +247,7 @@ fn question_mark_in_other_modes_does_not_toggle() {
     let entries = vec![crate::widgets::action_menu::MenuEntry {
         intent: Intent::OpenChangeRequest,
         command: Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::OpenChangeRequest { id: "1".into() },
@@ -397,7 +397,7 @@ fn brackets_do_not_switch_tabs_from_action_menu() {
     let entries = vec![crate::widgets::action_menu::MenuEntry {
         intent: Intent::OpenChangeRequest,
         command: Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::OpenChangeRequest { id: "1".into() },
@@ -768,7 +768,7 @@ fn push_action_menu_widget(app: &mut App) {
         crate::widgets::action_menu::MenuEntry {
             intent: Intent::CreateWorkspace,
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/a".into(), label: "feat/a".into() },
@@ -777,7 +777,7 @@ fn push_action_menu_widget(app: &mut App) {
         crate::widgets::action_menu::MenuEntry {
             intent: Intent::RemoveCheckout,
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::FetchCheckoutStatus {
@@ -1045,9 +1045,9 @@ fn delete_confirm_attaches_pending_context() {
 #[test]
 fn delete_confirm_routes_to_remote_host_when_set() {
     let mut app = stub_app();
-    let hostname = HostName::new("feta");
+    let node_id = NodeId::new("feta");
     let mut widget =
-        crate::widgets::delete_confirm::DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), Some(hostname.clone()), None);
+        crate::widgets::delete_confirm::DeleteConfirmWidget::new(WorkItemIdentity::Session("test".into()), Some(node_id.clone()), None);
     widget.update_info(CheckoutStatus {
         branch: "feat/x".into(),
         change_request_status: None,
@@ -1060,7 +1060,7 @@ fn delete_confirm_routes_to_remote_host_when_set() {
     app.screen.modal_stack.push(Box::new(widget));
     app.handle_key(key(KeyCode::Char('y')));
     let (cmd, _) = app.proto_commands.take_next().expect("command");
-    assert_eq!(cmd.host, Some(hostname));
+    assert_eq!(cmd.node_id, Some(node_id));
     assert!(matches!(cmd.action, CommandAction::RemoveCheckout { .. }));
 }
 
@@ -1246,7 +1246,7 @@ fn menu_enter_swaps_to_delete_confirm_widget() {
     let entries = vec![crate::widgets::action_menu::MenuEntry {
         intent: Intent::RemoveCheckout,
         command: Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::FetchCheckoutStatus {
@@ -1459,7 +1459,7 @@ fn close_confirm_attaches_pending_context() {
     let item = make_work_item("a");
     // Push CloseConfirmWidget onto the widget stack
     let widget = crate::widgets::close_confirm::CloseConfirmWidget::new("PR-1".into(), "test".into(), item.identity.clone(), Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: None,
         action: CommandAction::CloseChangeRequest { id: "PR-1".into() },
@@ -1476,7 +1476,7 @@ fn close_confirm_attaches_pending_context() {
 fn close_confirm_preserves_resolved_remote_command() {
     let mut app = stub_app();
     let expected = Command {
-        host: Some(HostName::new("remote-host")),
+        node_id: Some(NodeId::new("remote-host")),
         provisioning_target: None,
         context_repo: Some(flotilla_protocol::RepoSelector::Identity(app.model.active_repo_identity().clone())),
         action: CommandAction::CloseChangeRequest { id: "PR-1".into() },

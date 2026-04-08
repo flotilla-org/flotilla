@@ -504,6 +504,7 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
     let prepared = PreparedWorkspace {
         label: "feat/x".into(),
         target_node_id: NodeId::new("feta"),
+        display_host: Some(HostName::new("feta")),
         checkout_path: PathBuf::from("/repo/wt-feat-x"),
         checkout_key: None,
         attachable_set_id: Some(AttachableSetId::new("attachable-set")),
@@ -519,6 +520,7 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
         action: StepAction::PrepareWorkspace {
             checkout_path: Some(ExecutionEnvironmentPath::new("/repo/wt-feat-x")),
             label: "feat/x".into(),
+            display_host: Some(HostName::new("feta")),
         },
     };
     test_helpers::assert_roundtrip(&prepare);

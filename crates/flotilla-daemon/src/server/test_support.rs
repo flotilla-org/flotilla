@@ -36,17 +36,17 @@ pub async fn spawn_in_memory_request_topology(
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
 
-    let leader_peer_manager = Arc::new(Mutex::new(PeerManager::new(leader_host.clone())));
-    let follower_peer_manager = Arc::new(Mutex::new(PeerManager::new(follower_host.clone())));
+    let leader_peer_manager = Arc::new(Mutex::new(PeerManager::new(leader.node_id().clone())));
+    let follower_peer_manager = Arc::new(Mutex::new(PeerManager::new(follower.node_id().clone())));
 
     let (leader_transport, follower_transport) = channel_transport_pair(leader_host.clone(), follower_host.clone());
     {
         let mut pm = leader_peer_manager.lock().await;
-        pm.add_peer(follower_host.clone(), Box::new(leader_transport));
+        pm.add_peer(follower.node_id().clone(), Box::new(leader_transport));
     }
     {
         let mut pm = follower_peer_manager.lock().await;
-        pm.add_peer(leader_host.clone(), Box::new(follower_transport));
+        pm.add_peer(leader.node_id().clone(), Box::new(follower_transport));
     }
 
     let (leader_peer_data_tx, leader_peer_data_rx) = mpsc::channel(256);
@@ -98,17 +98,17 @@ pub async fn spawn_in_memory_request_topology_stateful(
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
 
-    let leader_peer_manager = Arc::new(Mutex::new(PeerManager::new(leader_host.clone())));
-    let follower_peer_manager = Arc::new(Mutex::new(PeerManager::new(follower_host.clone())));
+    let leader_peer_manager = Arc::new(Mutex::new(PeerManager::new(leader.node_id().clone())));
+    let follower_peer_manager = Arc::new(Mutex::new(PeerManager::new(follower.node_id().clone())));
 
     let (leader_transport, follower_transport) = channel_transport_pair(leader_host.clone(), follower_host.clone());
     {
         let mut pm = leader_peer_manager.lock().await;
-        pm.add_peer(follower_host.clone(), Box::new(leader_transport));
+        pm.add_peer(follower.node_id().clone(), Box::new(leader_transport));
     }
     {
         let mut pm = follower_peer_manager.lock().await;
-        pm.add_peer(leader_host.clone(), Box::new(follower_transport));
+        pm.add_peer(leader.node_id().clone(), Box::new(follower_transport));
     }
 
     let (leader_peer_data_tx, leader_peer_data_rx) = mpsc::channel(256);
@@ -170,8 +170,10 @@ pub async fn spawn_in_memory_request_topology_stateful(
         loop {
             let leader_topology = leader.get_topology().await.map_err(|e| e.to_string())?;
             let follower_topology = follower.get_topology().await.map_err(|e| e.to_string())?;
-            let leader_ready = leader_topology.routes.iter().any(|route| route.target == follower_host && route.connected);
-            let follower_ready = follower_topology.routes.iter().any(|route| route.target == leader_host && route.connected);
+            let leader_ready =
+                leader_topology.routes.iter().any(|route| route.target.node_id == follower.node_id().clone() && route.connected);
+            let follower_ready =
+                follower_topology.routes.iter().any(|route| route.target.node_id == leader.node_id().clone() && route.connected);
             if leader_ready && follower_ready {
                 return Ok::<(), String>(());
             }
@@ -239,8 +241,10 @@ async fn spawn_topology_with_client(
         loop {
             let leader_topology = leader.get_topology().await.map_err(|e| e.to_string())?;
             let follower_topology = follower.get_topology().await.map_err(|e| e.to_string())?;
-            let leader_ready = leader_topology.routes.iter().any(|route| route.target == follower_host && route.connected);
-            let follower_ready = follower_topology.routes.iter().any(|route| route.target == leader_host && route.connected);
+            let leader_ready =
+                leader_topology.routes.iter().any(|route| route.target.node_id == follower.node_id().clone() && route.connected);
+            let follower_ready =
+                follower_topology.routes.iter().any(|route| route.target.node_id == leader.node_id().clone() && route.connected);
             if leader_ready && follower_ready {
                 return Ok::<(), String>(());
             }

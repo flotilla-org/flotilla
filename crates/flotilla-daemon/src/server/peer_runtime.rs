@@ -7,7 +7,9 @@ use std::{
 use flotilla_core::{
     daemon::DaemonHandle, in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest,
 };
-use flotilla_protocol::{DaemonEvent, HostName, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RoutedPeerMessage};
+use flotilla_protocol::{
+    DaemonEvent, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RoutedPeerMessage,
+};
 use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -25,47 +27,47 @@ enum PostHandleAction {
     Updated {
         updated_repo_id: RepoIdentity,
         overlay_version: u64,
-        peers: Vec<(HostName, flotilla_protocol::ProviderData)>,
+        peers: Vec<(NodeInfo, flotilla_protocol::ProviderData)>,
     },
     ResyncRequested {
         request_id: u64,
-        requester_host: HostName,
-        reply_via: HostName,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
         reply_sender: Result<Arc<dyn PeerSender>, String>,
         repo: RepoIdentity,
-        local_host: HostName,
+        local_node_id: NodeId,
     },
     NeedsResync {
-        from: HostName,
+        from: NodeId,
         sender: Result<Arc<dyn PeerSender>, String>,
         request_id: u64,
-        local_host: HostName,
+        local_node_id: NodeId,
         repo: RepoIdentity,
     },
     ReconnectSuppressed {
-        peer: HostName,
+        peer: NodeId,
     },
     CommandRequested {
         request_id: u64,
-        requester_host: HostName,
-        reply_via: HostName,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
         command: flotilla_protocol::Command,
         session_id: Option<uuid::Uuid>,
     },
     CommandCancelRequested {
         cancel_id: u64,
-        requester_host: HostName,
-        reply_via: HostName,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
         command_request_id: u64,
     },
     CommandEventReceived {
         request_id: u64,
-        responder_host: HostName,
+        responder_node_id: NodeId,
         event: flotilla_protocol::CommandPeerEvent,
     },
     CommandResponseReceived {
         request_id: u64,
-        responder_host: HostName,
+        responder_node_id: NodeId,
         result: flotilla_protocol::CommandValue,
     },
     CommandCancelResponseReceived {
@@ -74,15 +76,15 @@ enum PostHandleAction {
     },
     RemoteStepRequested {
         request_id: u64,
-        requester_host: HostName,
-        reply_via: HostName,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
         repo_identity: RepoIdentity,
         step_offset: usize,
         steps: Vec<flotilla_protocol::Step>,
     },
     RemoteStepEventReceived {
         request_id: u64,
-        responder_host: HostName,
+        responder_node_id: NodeId,
         batch_step_index: usize,
         batch_step_count: usize,
         description: String,
@@ -90,13 +92,13 @@ enum PostHandleAction {
     },
     RemoteStepResponseReceived {
         request_id: u64,
-        responder_host: HostName,
+        responder_node_id: NodeId,
         outcomes: Vec<flotilla_protocol::StepOutcome>,
     },
     RemoteStepCancelRequested {
         cancel_id: u64,
-        requester_host: HostName,
-        reply_via: HostName,
+        requester_node_id: NodeId,
+        reply_via: NodeId,
         remote_step_request_id: u64,
     },
     RemoteStepCancelResponseReceived {
@@ -141,27 +143,30 @@ impl PeerRuntime {
         let inbound_handle = tokio::spawn(async move {
             if let Some(mut rx) = peer_data_rx {
                 let mut resync_sweep = tokio::time::interval(Duration::from_secs(5));
-                let mut initial_rx_map: HashMap<HostName, (u64, mpsc::Receiver<PeerWireMessage>)> = HashMap::new();
-                let peer_names = {
+                let mut initial_rx_map: HashMap<NodeId, (u64, mpsc::Receiver<PeerWireMessage>)> = HashMap::new();
+                let configured_peers = {
                     let mut pm = peer_manager_task.lock().await;
-                    let names = pm.configured_peer_names();
+                    let peers = pm.configured_peers();
                     for (name, generation, rx) in pm.connect_all().await {
                         initial_rx_map.insert(name, (generation, rx));
                     }
-                    names
+                    peers
                 };
 
-                for name in &peer_names {
-                    peer_daemon.publish_peer_connection_status(name, PeerConnectionState::Connecting).await;
+                for node in &configured_peers {
+                    peer_daemon.publish_peer_connection_status(node, PeerConnectionState::Connecting).await;
                 }
-                for name in &peer_names {
-                    let status =
-                        if initial_rx_map.contains_key(name) { PeerConnectionState::Connected } else { PeerConnectionState::Disconnected };
-                    peer_daemon.publish_peer_connection_status(name, status).await;
+                for node in &configured_peers {
+                    let status = if initial_rx_map.contains_key(&node.node_id) {
+                        PeerConnectionState::Connected
+                    } else {
+                        PeerConnectionState::Disconnected
+                    };
+                    peer_daemon.publish_peer_connection_status(node, status).await;
                 }
                 sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
 
-                for peer_name in peer_names {
+                for peer_name in configured_peers.into_iter().map(|node| node.node_id) {
                     let tx = peer_data_tx_for_ssh.clone();
                     let pm = Arc::clone(&peer_manager_task);
                     let daemon_for_cleanup = Arc::clone(&peer_daemon);
@@ -199,7 +204,12 @@ impl PeerRuntime {
                             let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
                             remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                             if plan.was_active {
-                                daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected).await;
+                                daemon_for_cleanup
+                                    .publish_peer_connection_status(
+                                        &NodeInfo::new(peer_name.clone(), peer_name.to_string()),
+                                        PeerConnectionState::Disconnected,
+                                    )
+                                    .await;
                             }
                         }
 
@@ -214,7 +224,12 @@ impl PeerRuntime {
                                 attempt = 1;
                                 continue;
                             }
-                            daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Reconnecting).await;
+                            daemon_for_cleanup
+                                .publish_peer_connection_status(
+                                    &NodeInfo::new(peer_name.clone(), peer_name.to_string()),
+                                    PeerConnectionState::Reconnecting,
+                                )
+                                .await;
                             let delay = SshTransport::backoff_delay(attempt);
                             info!(peer = %peer_name, %attempt, delay_secs = delay.as_secs(), "reconnecting after backoff");
                             tokio::time::sleep(delay).await;
@@ -230,7 +245,12 @@ impl PeerRuntime {
                                     last_known_session_id =
                                         handle_remote_restart_if_needed(&pm, &daemon_for_cleanup, &peer_name, last_known_session_id).await;
                                     sync_peer_query_state(&pm, &daemon_for_cleanup).await;
-                                    daemon_for_cleanup.publish_peer_connection_status(&peer_name, PeerConnectionState::Connected).await;
+                                    daemon_for_cleanup
+                                        .publish_peer_connection_status(
+                                            &NodeInfo::new(peer_name.clone(), peer_name.to_string()),
+                                            PeerConnectionState::Connected,
+                                        )
+                                        .await;
                                     let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
                                     attempt = 1;
                                     let sender = {
@@ -255,7 +275,10 @@ impl PeerRuntime {
                                     remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                                     if plan.was_active {
                                         daemon_for_cleanup
-                                            .publish_peer_connection_status(&peer_name, PeerConnectionState::Disconnected)
+                                            .publish_peer_connection_status(
+                                                &NodeInfo::new(peer_name.clone(), peer_name.to_string()),
+                                                PeerConnectionState::Disconnected,
+                                            )
                                             .await;
                                     }
                                 }
@@ -274,11 +297,11 @@ impl PeerRuntime {
                         maybe_env = rx.recv() => {
                             let Some(env) = maybe_env else { break };
                             let (origin, host_repo_root) = match &env.msg {
-                                PeerWireMessage::Data(msg) => (msg.origin_host.clone(), msg.host_repo_root.clone()),
+                                PeerWireMessage::Data(msg) => (msg.origin_node_id.clone(), msg.host_repo_root.clone()),
                                 PeerWireMessage::HostSummary(_) => (env.connection_peer.clone(), None),
                                 PeerWireMessage::Routed(
-                                    flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { responder_host, host_repo_root, .. },
-                                ) => (responder_host.clone(), host_repo_root.clone()),
+                                    flotilla_protocol::RoutedPeerMessage::ResyncSnapshot { responder_node_id, host_repo_root, .. },
+                                ) => (responder_node_id.clone(), host_repo_root.clone()),
                                 PeerWireMessage::Routed(_) => (env.connection_peer.clone(), None),
                                 PeerWireMessage::Goodbye { .. } | PeerWireMessage::Ping { .. } | PeerWireMessage::Pong { .. } => {
                                     (env.connection_peer.clone(), None)
@@ -290,7 +313,7 @@ impl PeerRuntime {
                             }
 
                             if let PeerWireMessage::HostSummary(summary) = &env.msg {
-                                peer_daemon.publish_peer_summary(&origin, summary.clone()).await;
+                                peer_daemon.publish_peer_summary(summary.clone()).await;
                             }
 
                             let (post_handle_action, pending_sends) = {
@@ -298,59 +321,60 @@ impl PeerRuntime {
                                 let post_handle_action = match pm.handle_inbound(env).await {
                                     HandleResult::Updated(updated_repo_id) => {
                                         let overlay_version = pm.overlay_version();
-                                        let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
+                                        let peers: Vec<(NodeInfo, flotilla_protocol::ProviderData)> = pm
                                             .get_peer_data()
                                             .iter()
-                                            .filter_map(|(host, repos)| {
-                                                repos.get(&updated_repo_id).map(|state| (host.clone(), state.provider_data.clone()))
+                                            .filter_map(|(node_id, repos)| {
+                                                repos.get(&updated_repo_id)
+                                                    .map(|state| (NodeInfo::new(node_id.clone(), node_id.to_string()), state.provider_data.clone()))
                                             })
                                             .collect();
                                         PostHandleAction::Updated { updated_repo_id, overlay_version, peers }
                                     }
-                                    HandleResult::ResyncRequested { request_id, requester_host, reply_via, repo, since_seq: _ } => {
-                                        let local_host = pm.local_host().clone();
+                                    HandleResult::ResyncRequested { request_id, requester_node_id, reply_via, repo, since_seq: _ } => {
+                                        let local_node_id = pm.local_node_id().clone();
                                         let reply_sender = pm.resolve_sender(&reply_via);
                                         PostHandleAction::ResyncRequested {
                                             request_id,
-                                            requester_host,
+                                            requester_node_id,
                                             reply_via,
                                             reply_sender,
                                             repo,
-                                            local_host,
+                                            local_node_id,
                                         }
                                     }
                                     HandleResult::NeedsResync { from, repo } => {
-                                        let local_host = pm.local_host().clone();
+                                        let local_node_id = pm.local_node_id().clone();
                                         let request_id = pm.note_pending_resync_request(from.clone(), repo.clone());
                                         let sender = pm.resolve_sender(&from);
-                                        PostHandleAction::NeedsResync { from, sender, request_id, local_host, repo }
+                                        PostHandleAction::NeedsResync { from, sender, request_id, local_node_id, repo }
                                     }
                                     HandleResult::ReconnectSuppressed { peer } => PostHandleAction::ReconnectSuppressed { peer },
-                                    HandleResult::CommandRequested { request_id, requester_host, reply_via, command, session_id } => {
-                                        PostHandleAction::CommandRequested { request_id, requester_host, reply_via, command, session_id }
+                                    HandleResult::CommandRequested { request_id, requester_node_id, reply_via, command, session_id } => {
+                                        PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, session_id }
                                     }
-                                    HandleResult::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id } => {
-                                        PostHandleAction::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id }
+                                    HandleResult::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
+                                        PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id }
                                     }
-                                    HandleResult::CommandEventReceived { request_id, responder_host, event } => {
-                                        PostHandleAction::CommandEventReceived { request_id, responder_host, event }
+                                    HandleResult::CommandEventReceived { request_id, responder_node_id, event } => {
+                                        PostHandleAction::CommandEventReceived { request_id, responder_node_id, event }
                                     }
-                                    HandleResult::CommandResponseReceived { request_id, responder_host, result } => {
-                                        PostHandleAction::CommandResponseReceived { request_id, responder_host, result }
+                                    HandleResult::CommandResponseReceived { request_id, responder_node_id, result } => {
+                                        PostHandleAction::CommandResponseReceived { request_id, responder_node_id, result }
                                     }
-                                    HandleResult::CommandCancelResponseReceived { cancel_id, responder_host: _, error } => {
+                                    HandleResult::CommandCancelResponseReceived { cancel_id, responder_node_id: _, error } => {
                                         PostHandleAction::CommandCancelResponseReceived { cancel_id, error }
                                     }
                                     HandleResult::RemoteStepRequested {
                                         request_id,
-                                        requester_host,
+                                        requester_node_id,
                                         reply_via,
                                         repo_identity,
                                         step_offset,
                                         steps,
                                     } => PostHandleAction::RemoteStepRequested {
                                         request_id,
-                                        requester_host,
+                                        requester_node_id,
                                         reply_via,
                                         repo_identity,
                                         step_offset,
@@ -358,34 +382,34 @@ impl PeerRuntime {
                                     },
                                     HandleResult::RemoteStepEventReceived {
                                         request_id,
-                                        responder_host,
+                                        responder_node_id,
                                         batch_step_index,
                                         batch_step_count,
                                         description,
                                         status,
                                     } => PostHandleAction::RemoteStepEventReceived {
                                         request_id,
-                                        responder_host,
+                                        responder_node_id,
                                         batch_step_index,
                                         batch_step_count,
                                         description,
                                         status,
                                     },
-                                    HandleResult::RemoteStepResponseReceived { request_id, responder_host, outcomes } => {
-                                        PostHandleAction::RemoteStepResponseReceived { request_id, responder_host, outcomes }
+                                    HandleResult::RemoteStepResponseReceived { request_id, responder_node_id, outcomes } => {
+                                        PostHandleAction::RemoteStepResponseReceived { request_id, responder_node_id, outcomes }
                                     }
                                     HandleResult::RemoteStepCancelRequested {
                                         cancel_id,
-                                        requester_host,
+                                        requester_node_id,
                                         reply_via,
                                         remote_step_request_id,
                                     } => PostHandleAction::RemoteStepCancelRequested {
                                         cancel_id,
-                                        requester_host,
+                                        requester_node_id,
                                         reply_via,
                                         remote_step_request_id,
                                     },
-                                    HandleResult::RemoteStepCancelResponseReceived { cancel_id, responder_host: _, error } => {
+                                    HandleResult::RemoteStepCancelResponseReceived { cancel_id, responder_node_id: _, error } => {
                                         PostHandleAction::RemoteStepCancelResponseReceived { cancel_id, error }
                                     }
                                     HandleResult::Ignored => PostHandleAction::Ignored,
@@ -412,18 +436,25 @@ impl PeerRuntime {
                                         }
                                     }
                                 }
-                                PostHandleAction::ResyncRequested { request_id, requester_host, reply_via, reply_sender, repo, local_host } => {
+                                PostHandleAction::ResyncRequested {
+                                    request_id,
+                                    requester_node_id,
+                                    reply_via,
+                                    reply_sender,
+                                    repo,
+                                    local_node_id,
+                                } => {
                                     if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(&repo).await {
                                         if let Some((local_providers, seq)) = peer_daemon.get_local_providers(&local_path).await {
-                                            reply_clock.tick(&local_host);
+                                            reply_clock.tick(&local_node_id);
                                             let response_clock = reply_clock.clone();
                                             match reply_sender {
                                                 Ok(sender) => {
                                                     if let Err(e) = sender
                                                         .send(PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::ResyncSnapshot {
                                                             request_id,
-                                                            requester_host,
-                                                            responder_host: local_host,
+                                                            requester_node_id,
+                                                            responder_node_id: local_node_id,
                                                             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                                                             repo_identity: repo,
                                                             host_repo_root: Some(local_path),
@@ -441,13 +472,13 @@ impl PeerRuntime {
                                         }
                                     }
                                 }
-                                PostHandleAction::NeedsResync { from, sender, request_id, local_host, repo } => match sender {
+                                PostHandleAction::NeedsResync { from, sender, request_id, local_node_id, repo } => match sender {
                                     Ok(sender) => {
                                         if let Err(e) = sender
                                             .send(PeerWireMessage::Routed(flotilla_protocol::RoutedPeerMessage::RequestResync {
                                                 request_id,
-                                                requester_host: local_host,
-                                                target_host: from.clone(),
+                                                requester_node_id: local_node_id,
+                                                target_node_id: from.clone(),
                                                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                                                 repo_identity: repo,
                                                 since_seq: 0,
@@ -462,27 +493,27 @@ impl PeerRuntime {
                                 PostHandleAction::ReconnectSuppressed { peer } => {
                                     info!(peer = %peer, "peer requested reconnect suppression");
                                 }
-                                PostHandleAction::CommandRequested { request_id, requester_host, reply_via, command, session_id } => {
+                                PostHandleAction::CommandRequested { request_id, requester_node_id, reply_via, command, session_id } => {
                                     remote_command_router_task
-                                        .spawn_forwarded_command(request_id, requester_host, reply_via, command, session_id)
+                                        .spawn_forwarded_command(request_id, requester_node_id, reply_via, command, session_id)
                                         .await;
                                 }
-                                PostHandleAction::CommandCancelRequested { cancel_id, requester_host, reply_via, command_request_id } => {
+                                PostHandleAction::CommandCancelRequested { cancel_id, requester_node_id, reply_via, command_request_id } => {
                                     remote_command_router_task
-                                        .spawn_forwarded_cancel(cancel_id, requester_host, reply_via, command_request_id);
+                                        .spawn_forwarded_cancel(cancel_id, requester_node_id, reply_via, command_request_id);
                                 }
-                                PostHandleAction::CommandEventReceived { request_id, responder_host, event } => {
-                                    remote_command_router_task.emit_remote_command_event(request_id, responder_host, event).await;
+                                PostHandleAction::CommandEventReceived { request_id, responder_node_id, event } => {
+                                    remote_command_router_task.emit_remote_command_event(request_id, responder_node_id, event).await;
                                 }
-                                PostHandleAction::CommandResponseReceived { request_id, responder_host, result } => {
-                                    remote_command_router_task.complete_remote_command(request_id, responder_host, result).await;
+                                PostHandleAction::CommandResponseReceived { request_id, responder_node_id, result } => {
+                                    remote_command_router_task.complete_remote_command(request_id, responder_node_id, result).await;
                                 }
                                 PostHandleAction::CommandCancelResponseReceived { cancel_id, error } => {
                                     remote_command_router_task.complete_remote_cancel(cancel_id, error).await;
                                 }
                                 PostHandleAction::RemoteStepRequested {
                                     request_id,
-                                    requester_host,
+                                    requester_node_id,
                                     reply_via,
                                     repo_identity,
                                     step_offset,
@@ -498,11 +529,11 @@ impl PeerRuntime {
                                     remote_command_router_task
                                         .spawn_forwarded_remote_step_batch(
                                             request_id,
-                                            requester_host,
+                                            requester_node_id,
                                             reply_via,
                                             RemoteStepBatchRequest {
                                                 command_id: request_id,
-                                                target_host: peer_daemon.host_name().clone(),
+                                                target_node_id: peer_daemon.node_id().clone(),
                                                 repo_identity,
                                                 repo: local_event_repo,
                                                 step_offset,
@@ -513,7 +544,7 @@ impl PeerRuntime {
                                 }
                                 PostHandleAction::RemoteStepEventReceived {
                                     request_id,
-                                    responder_host,
+                                    responder_node_id,
                                     batch_step_index,
                                     batch_step_count,
                                     description,
@@ -522,7 +553,7 @@ impl PeerRuntime {
                                     remote_command_router_task
                                         .emit_remote_step_event(
                                             request_id,
-                                            responder_host,
+                                            responder_node_id,
                                             batch_step_index,
                                             batch_step_count,
                                             description,
@@ -530,18 +561,18 @@ impl PeerRuntime {
                                         )
                                         .await;
                                 }
-                                PostHandleAction::RemoteStepResponseReceived { request_id, responder_host, outcomes } => {
-                                    remote_command_router_task.complete_remote_step(request_id, responder_host, outcomes).await;
+                                PostHandleAction::RemoteStepResponseReceived { request_id, responder_node_id, outcomes } => {
+                                    remote_command_router_task.complete_remote_step(request_id, responder_node_id, outcomes).await;
                                 }
                                 PostHandleAction::RemoteStepCancelRequested {
                                     cancel_id,
-                                    requester_host,
+                                    requester_node_id,
                                     reply_via,
                                     remote_step_request_id,
                                 } => {
                                     remote_command_router_task.spawn_forwarded_remote_step_cancel(
                                         cancel_id,
-                                        requester_host,
+                                        requester_node_id,
                                         reply_via,
                                         remote_step_request_id,
                                     );
@@ -572,7 +603,7 @@ impl PeerRuntime {
         tokio::spawn(async move {
             let mut event_rx = outbound_daemon.subscribe();
             let mut outbound_clock = flotilla_protocol::VectorClock::default();
-            let host_name = outbound_daemon.host_name().clone();
+            let node_id = outbound_daemon.node_id().clone();
             let mut last_sent_versions: std::collections::HashMap<RepoIdentity, u64> = std::collections::HashMap::new();
 
             loop {
@@ -583,7 +614,7 @@ impl PeerRuntime {
                         send_local_to_peer(
                             &outbound_daemon,
                             &outbound_peer_manager,
-                            &host_name,
+                            &node_id,
                             &mut outbound_clock,
                             &notice.peer,
                             notice.generation,
@@ -614,7 +645,7 @@ impl PeerRuntime {
                             let sent = send_local_to_peers(
                                 &outbound_daemon,
                                 &outbound_peer_manager,
-                                &host_name,
+                                &node_id,
                                 &mut outbound_clock,
                                 &repo_path,
                                 local_providers,
@@ -637,7 +668,7 @@ impl PeerRuntime {
 pub(super) async fn handle_remote_restart_if_needed(
     peer_manager: &Arc<Mutex<PeerManager>>,
     daemon: &Arc<InProcessDaemon>,
-    peer_name: &HostName,
+    peer_name: &NodeId,
     last_known_session_id: Option<uuid::Uuid>,
 ) -> Option<uuid::Uuid> {
     let current_session_id = {
@@ -662,7 +693,7 @@ pub(super) async fn handle_remote_restart_if_needed(
     current_session_id
 }
 
-pub(super) async fn relay_peer_data(peer_manager: &Arc<Mutex<PeerManager>>, origin: &HostName, msg: &PeerDataMessage) {
+pub(super) async fn relay_peer_data(peer_manager: &Arc<Mutex<PeerManager>>, origin: &NodeId, msg: &PeerDataMessage) {
     let relay_targets = {
         let pm = peer_manager.lock().await;
         pm.prepare_relay(origin, msg)
@@ -701,7 +732,9 @@ pub(super) async fn rebuild_peer_overlays(
                 let peers = pm
                     .get_peer_data()
                     .iter()
-                    .filter_map(|(host, repos)| repos.get(&repo_id).map(|state| (host.clone(), state.provider_data.clone())))
+                    .filter_map(|(node_id, repos)| {
+                        repos.get(&repo_id).map(|state| (NodeInfo::new(node_id.clone(), node_id.to_string()), state.provider_data.clone()))
+                    })
                     .collect();
                 (peers, v)
             };
@@ -710,10 +743,12 @@ pub(super) async fn rebuild_peer_overlays(
             let mut pm = peer_manager.lock().await;
             if pm.has_peer_data_for(&repo_id) {
                 let overlay_version = pm.overlay_version();
-                let peers: Vec<(HostName, flotilla_protocol::ProviderData)> = pm
+                let peers: Vec<(NodeInfo, flotilla_protocol::ProviderData)> = pm
                     .get_peer_data()
                     .iter()
-                    .filter_map(|(host, repos)| repos.get(&repo_id).map(|state| (host.clone(), state.provider_data.clone())))
+                    .filter_map(|(node_id, repos)| {
+                        repos.get(&repo_id).map(|state| (NodeInfo::new(node_id.clone(), node_id.to_string()), state.provider_data.clone()))
+                    })
                     .collect();
 
                 if let Some(synthetic_path) = pm.known_remote_repos().get(&repo_id).cloned() {
@@ -742,18 +777,18 @@ pub(super) async fn rebuild_peer_overlays(
 pub(super) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManager>>, requests: Vec<RoutedPeerMessage>) {
     for request in requests {
         let target = match &request {
-            RoutedPeerMessage::RequestResync { target_host, .. } => target_host.clone(),
-            RoutedPeerMessage::ResyncSnapshot { requester_host, .. } => requester_host.clone(),
-            RoutedPeerMessage::CommandRequest { target_host, .. } => target_host.clone(),
-            RoutedPeerMessage::CommandCancelRequest { target_host, .. } => target_host.clone(),
-            RoutedPeerMessage::CommandEvent { requester_host, .. } => requester_host.clone(),
-            RoutedPeerMessage::CommandResponse { requester_host, .. } => requester_host.clone(),
-            RoutedPeerMessage::CommandCancelResponse { requester_host, .. } => requester_host.clone(),
-            RoutedPeerMessage::RemoteStepRequest { target_host, .. } => target_host.clone(),
-            RoutedPeerMessage::RemoteStepEvent { requester_host, .. } => requester_host.clone(),
-            RoutedPeerMessage::RemoteStepResponse { requester_host, .. } => requester_host.clone(),
-            RoutedPeerMessage::RemoteStepCancelRequest { target_host, .. } => target_host.clone(),
-            RoutedPeerMessage::RemoteStepCancelResponse { requester_host, .. } => requester_host.clone(),
+            RoutedPeerMessage::RequestResync { target_node_id, .. } => target_node_id.clone(),
+            RoutedPeerMessage::ResyncSnapshot { requester_node_id, .. } => requester_node_id.clone(),
+            RoutedPeerMessage::CommandRequest { target_node_id, .. } => target_node_id.clone(),
+            RoutedPeerMessage::CommandCancelRequest { target_node_id, .. } => target_node_id.clone(),
+            RoutedPeerMessage::CommandEvent { requester_node_id, .. } => requester_node_id.clone(),
+            RoutedPeerMessage::CommandResponse { requester_node_id, .. } => requester_node_id.clone(),
+            RoutedPeerMessage::CommandCancelResponse { requester_node_id, .. } => requester_node_id.clone(),
+            RoutedPeerMessage::RemoteStepRequest { target_node_id, .. } => target_node_id.clone(),
+            RoutedPeerMessage::RemoteStepEvent { requester_node_id, .. } => requester_node_id.clone(),
+            RoutedPeerMessage::RemoteStepResponse { requester_node_id, .. } => requester_node_id.clone(),
+            RoutedPeerMessage::RemoteStepCancelRequest { target_node_id, .. } => target_node_id.clone(),
+            RoutedPeerMessage::RemoteStepCancelResponse { requester_node_id, .. } => requester_node_id.clone(),
         };
         let sender = {
             let pm = peer_manager.lock().await;
@@ -775,7 +810,7 @@ pub(super) async fn dispatch_resync_requests(peer_manager: &Arc<Mutex<PeerManage
 pub(super) async fn disconnect_peer_and_rebuild(
     peer_manager: &Arc<Mutex<PeerManager>>,
     daemon: &Arc<InProcessDaemon>,
-    peer_name: &HostName,
+    peer_name: &NodeId,
     generation: u64,
 ) -> crate::peer::DisconnectPlan {
     let mut plan = {
@@ -822,7 +857,7 @@ pub(super) async fn disconnect_peer_and_rebuild(
 pub(super) async fn send_local_to_peers(
     daemon: &Arc<InProcessDaemon>,
     peer_manager: &Arc<Mutex<PeerManager>>,
-    host_name: &HostName,
+    node_id: &NodeId,
     clock: &mut flotilla_protocol::VectorClock,
     repo_path: &std::path::Path,
     local_providers: flotilla_protocol::ProviderData,
@@ -832,9 +867,9 @@ pub(super) async fn send_local_to_peers(
         return false;
     };
 
-    clock.tick(host_name);
+    clock.tick(node_id);
     let msg = PeerDataMessage {
-        origin_host: host_name.clone(),
+        origin_node_id: node_id.clone(),
         repo_identity: identity,
         host_repo_root: Some(repo_path.to_path_buf()),
         clock: clock.clone(),
@@ -867,9 +902,9 @@ pub(super) fn should_send_local_version(
 pub(super) async fn send_local_to_peer(
     daemon: &Arc<InProcessDaemon>,
     peer_manager: &Arc<Mutex<PeerManager>>,
-    host_name: &HostName,
+    node_id: &NodeId,
     clock: &mut flotilla_protocol::VectorClock,
-    peer: &HostName,
+    peer: &NodeId,
     generation: u64,
 ) -> bool {
     let repo_paths = daemon.tracked_repo_paths().await;
@@ -901,9 +936,9 @@ pub(super) async fn send_local_to_peer(
             continue;
         };
 
-        clock.tick(host_name);
+        clock.tick(node_id);
         let msg = PeerDataMessage {
-            origin_host: host_name.clone(),
+            origin_node_id: node_id.clone(),
             repo_identity: identity,
             host_repo_root: Some(repo_path.clone()),
             clock: clock.clone(),
@@ -922,7 +957,7 @@ pub(super) async fn send_local_to_peer(
 async fn forward_with_keepalive(
     tx: &mpsc::Sender<InboundPeerEnvelope>,
     inbound_rx: &mut mpsc::Receiver<PeerWireMessage>,
-    peer_name: &HostName,
+    peer_name: &NodeId,
     generation: u64,
     sender: Arc<dyn PeerSender>,
 ) -> ForwardResult {
@@ -932,7 +967,7 @@ async fn forward_with_keepalive(
 pub(super) async fn forward_with_keepalive_for_test(
     tx: &mpsc::Sender<InboundPeerEnvelope>,
     inbound_rx: &mut mpsc::Receiver<PeerWireMessage>,
-    peer_name: &HostName,
+    peer_name: &NodeId,
     generation: u64,
     sender: Arc<dyn PeerSender>,
     ping_interval_duration: Duration,

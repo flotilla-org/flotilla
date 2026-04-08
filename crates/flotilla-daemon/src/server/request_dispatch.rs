@@ -63,7 +63,7 @@ impl<'a> RequestDispatcher<'a> {
 
             Request::Refresh { repo } => {
                 let command = Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) },
@@ -76,7 +76,7 @@ impl<'a> RequestDispatcher<'a> {
 
             Request::AddRepo { path } => {
                 let command =
-                    Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
+                    Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::TrackRepoPath { path } };
                 match self.daemon.execute(command).await {
                     Ok(_) => Message::ok_response(id, Response::AddRepo),
                     Err(e) => Message::error_response(id, e),
@@ -85,7 +85,7 @@ impl<'a> RequestDispatcher<'a> {
 
             Request::RemoveRepo { path } => {
                 let command = Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::UntrackRepo { repo: RepoSelector::Path(path) },

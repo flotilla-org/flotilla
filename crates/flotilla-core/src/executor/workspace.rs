@@ -145,6 +145,10 @@ impl<'a> WorkspaceOrchestrator<'a> {
     }
 
     fn resolve_prepared_workspace_display_host(&self, prepared: &PreparedWorkspace) -> Result<HostName, String> {
+        if let Some(display_host) = prepared.display_host.as_ref() {
+            return Ok(display_host.clone());
+        }
+
         if let Some(checkout_key) = prepared.checkout_key.as_ref() {
             if let Some(host) = checkout_key.host_name() {
                 return Ok(host.clone());

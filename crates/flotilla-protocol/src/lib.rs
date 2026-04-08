@@ -210,6 +210,7 @@ impl Message {
 
 /// Events pushed from daemon to subscribed clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "kind")]
 pub enum DaemonEvent {
     /// Full snapshot — sent on initial connect, after seq gaps, or when delta

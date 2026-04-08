@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use crossterm::event::KeyEvent;
-use flotilla_protocol::{CheckoutTarget, Command, CommandAction, RepoSelector};
+use flotilla_protocol::{CheckoutTarget, Command, CommandAction, NodeId, RepoSelector};
 use ratatui::{layout::Rect, style::Style, text::Line, widgets::Paragraph, Frame};
 use tui_input::{backend::crossterm::EventHandler as InputEventHandler, Input};
 
@@ -50,7 +50,12 @@ impl InteractiveWidget for BranchInputWidget {
                 if !branch.is_empty() {
                     let repo_identity = ctx.repo_order[ctx.active_repo].clone();
                     let cmd = Command {
-                        host: Some(ctx.provisioning_target.host().clone()),
+                        node_id: Some(
+                            ctx.model
+                                .node_id_for_host(ctx.provisioning_target.host())
+                                .cloned()
+                                .unwrap_or_else(|| NodeId::new(ctx.provisioning_target.host().as_str())),
+                        ),
                         provisioning_target: Some(ctx.provisioning_target.clone()),
                         context_repo: None,
                         action: CommandAction::Checkout {

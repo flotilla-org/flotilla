@@ -4,8 +4,8 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandValue, DaemonEvent, EnvironmentInfo, EnvironmentStatus, HostProvidersResponse,
-    HostStatusResponse, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey,
-    TopologyResponse,
+    HostStatusResponse, NodeInfo, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse,
+    StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -113,6 +113,10 @@ fn format_visible_environments_human(environments: &[EnvironmentInfo]) -> String
     format!("Visible Environments:\n{table}\n")
 }
 
+fn node_label(node: &NodeInfo) -> &str {
+    &node.display_name
+}
+
 fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> String {
     if response.hosts.is_empty() {
         return "No hosts known.\n".into();
@@ -120,10 +124,10 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Host", "Local", "Configured", "Status", "Summary", "Repos", "Work"]);
+    table.set_header(vec!["Node", "Local", "Configured", "Status", "Summary", "Repos", "Work"]);
     for host in &response.hosts {
         table.add_row(vec![
-            Cell::new(host.host.as_str()),
+            Cell::new(node_label(&host.node)),
             Cell::new(if host.is_local { "yes" } else { "no" }),
             Cell::new(if host.configured { "yes" } else { "no" }),
             Cell::new(format_connection_status(&host.connection_status)),
@@ -137,7 +141,7 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
 
 fn format_host_status_human(response: &HostStatusResponse) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Host: {}\n", response.host));
+    out.push_str(&format!("Node: {}\n", node_label(&response.node)));
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
     out.push_str(&format!("Repositories: {}\n", response.repo_count));
@@ -166,7 +170,7 @@ fn format_host_status_human(response: &HostStatusResponse) -> String {
 
 fn format_host_providers_human(response: &HostProvidersResponse) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Host: {}\n", response.host));
+    out.push_str(&format!("Node: {}\n", node_label(&response.node)));
     out.push_str(&format!("Status: {}\n", format_connection_status(&response.connection_status)));
     out.push_str(&format!("Configured: {}\n", if response.configured { "yes" } else { "no" }));
 
@@ -207,7 +211,7 @@ fn format_host_providers_human(response: &HostProvidersResponse) -> String {
 
 fn format_topology_human(response: &TopologyResponse) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Local Host: {}\n", response.local_host));
+    out.push_str(&format!("Local Node: {}\n", node_label(&response.local_node)));
     if response.routes.is_empty() {
         out.push_str("No routes.\n");
         return out;
@@ -220,11 +224,11 @@ fn format_topology_human(response: &TopologyResponse) -> String {
         let fallbacks = if route.fallbacks.is_empty() {
             "-".to_string()
         } else {
-            route.fallbacks.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            route.fallbacks.iter().map(node_label).collect::<Vec<_>>().join(", ")
         };
         table.add_row(vec![
-            Cell::new(route.target.as_str()),
-            Cell::new(route.next_hop.as_str()),
+            Cell::new(node_label(&route.target)),
+            Cell::new(node_label(&route.next_hop)),
             Cell::new(if route.direct { "yes" } else { "no" }),
             Cell::new(if route.connected { "yes" } else { "no" }),
             Cell::new(fallbacks),
@@ -259,7 +263,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
         CommandValue::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
         CommandValue::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
-        CommandValue::TerminalPrepared { branch, target_host, .. } => format!("terminal prepared: {branch} on {target_host}"),
+        CommandValue::TerminalPrepared { branch, target_node_id, .. } => format!("terminal prepared: {branch} on {target_node_id}"),
         CommandValue::BranchNameGenerated { name, .. } => format!("branch name: {name}"),
         CommandValue::CheckoutStatus(status) => {
             let mut parts = vec![format!("checkout status: {}", status.branch)];
@@ -344,7 +348,7 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
         DaemonEvent::CommandStepUpdate { repo_identity, repo, description, step_index, step_count, .. } => {
             format!("[step]     {}: {} ({}/{})", repo_label(repo.as_deref(), repo_identity), description, step_index + 1, step_count)
         }
-        DaemonEvent::PeerStatusChanged { host, status } => {
+        DaemonEvent::PeerStatusChanged { node_id, status } => {
             let state = match status {
                 PeerConnectionState::Connected => "connected".to_string(),
                 PeerConnectionState::Disconnected => "disconnected".to_string(),
@@ -352,7 +356,7 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 PeerConnectionState::Reconnecting => "reconnecting".to_string(),
                 PeerConnectionState::Rejected { reason } => format!("rejected: {reason}"),
             };
-            format!("[peer]     {host}: {state}")
+            format!("[peer]     {node_id}: {state}")
         }
         DaemonEvent::HostSnapshot(snap) => {
             let state = match &snap.connection_status {
@@ -362,10 +366,10 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 PeerConnectionState::Reconnecting => "reconnecting",
                 PeerConnectionState::Rejected { .. } => "rejected",
             };
-            format!("[host]     {}: {} (seq {})", snap.host_name, state, snap.seq)
+            format!("[host]     {}: {} (seq {})", node_label(&snap.node), state, snap.seq)
         }
-        DaemonEvent::HostRemoved { host, seq } => {
-            format!("[host]     {host}: removed (seq {seq})")
+        DaemonEvent::HostRemoved { node_id, seq } => {
+            format!("[host]     {node_id}: removed (seq {seq})")
         }
     }
 }
@@ -375,8 +379,8 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
     match event {
         DaemonEvent::RepoSnapshot(snap) => Some((StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq)),
         DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
-        DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { host_name: snap.host_name.clone() }, snap.seq)),
-        DaemonEvent::HostRemoved { host, seq } => Some((StreamKey::Host { host_name: host.clone() }, *seq)),
+        DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { node_id: snap.node.node_id.clone() }, snap.seq)),
+        DaemonEvent::HostRemoved { node_id, seq } => Some((StreamKey::Host { node_id: node_id.clone() }, *seq)),
         _ => None,
     }
 }

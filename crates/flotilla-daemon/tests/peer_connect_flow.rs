@@ -18,7 +18,7 @@ use flotilla_daemon::{
     peer::{test_support::ensure_test_connection_generation, PeerManager, PeerSender},
     server::PeerConnectedNotice,
 };
-use flotilla_protocol::{GoodbyeReason, HostName, PeerWireMessage, RepoSelector};
+use flotilla_protocol::{GoodbyeReason, HostName, NodeId, PeerWireMessage, RepoSelector};
 use tokio::sync::{Mutex, Notify};
 
 /// Peer sender that captures messages and signals a `Notify` on each send,
@@ -68,34 +68,36 @@ async fn peer_connect_triggers_local_state_send() {
     init_git_repo(&repo_path);
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
     let host_a = HostName::new("host-a");
-    let host_b = HostName::new("host-b");
+    let _host_b = HostName::new("host-b");
+    let node_b = NodeId::new("host-b");
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
+    let node_a = daemon.node_id().clone();
     daemon.refresh(&RepoSelector::Path(repo_path.clone())).await.expect("refresh");
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let notify = Arc::new(Notify::new());
     let sender: Arc<dyn PeerSender> = Arc::new(NotifyPeerSender { sent: Arc::clone(&sent), notify: Arc::clone(&notify) });
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(host_a.clone())));
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(node_a.clone())));
     let generation = {
         let mut pm = peer_manager.lock().await;
-        ensure_test_connection_generation(&mut pm, &host_b, || Arc::clone(&sender))
+        ensure_test_connection_generation(&mut pm, &node_b, || Arc::clone(&sender))
     };
 
     let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
-    peer_connected_tx.send(PeerConnectedNotice { peer: host_b.clone(), generation }).expect("send notice");
+    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation }).expect("send notice");
 
     // Expect at least 2 messages: HostSummary + Data for the repo
     wait_for_messages(&sent, &notify, 2).await;
 
     let messages = sent.lock().expect("lock");
     assert!(
-        messages.iter().any(|m| matches!(m, PeerWireMessage::HostSummary(s) if s.host_name == host_a)),
+        messages.iter().any(|m| matches!(m, PeerWireMessage::HostSummary(s) if s.node.node_id == node_a)),
         "peer should receive HostSummary from host-a, got: {messages:?}"
     );
     assert!(
-        messages.iter().any(|m| matches!(m, PeerWireMessage::Data(d) if d.origin_host == host_a)),
+        messages.iter().any(|m| matches!(m, PeerWireMessage::Data(d) if d.origin_node_id == node_a)),
         "peer should receive repo data from host-a, got: {messages:?}"
     );
 }
@@ -107,24 +109,26 @@ async fn peer_reconnect_resends_local_state() {
     init_git_repo(&repo_path);
     let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
     let host_a = HostName::new("host-a");
-    let host_b = HostName::new("host-b");
+    let _host_b = HostName::new("host-b");
+    let node_b = NodeId::new("host-b");
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
+    let node_a = daemon.node_id().clone();
     daemon.refresh(&RepoSelector::Path(repo_path.clone())).await.expect("refresh");
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let notify = Arc::new(Notify::new());
     let sender: Arc<dyn PeerSender> = Arc::new(NotifyPeerSender { sent: Arc::clone(&sent), notify: Arc::clone(&notify) });
-    let peer_manager = Arc::new(Mutex::new(PeerManager::new(host_a.clone())));
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(node_a.clone())));
     let gen1 = {
         let mut pm = peer_manager.lock().await;
-        ensure_test_connection_generation(&mut pm, &host_b, || Arc::clone(&sender))
+        ensure_test_connection_generation(&mut pm, &node_b, || Arc::clone(&sender))
     };
 
     let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
     // First connection
-    peer_connected_tx.send(PeerConnectedNotice { peer: host_b.clone(), generation: gen1 }).expect("send notice 1");
+    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation: gen1 }).expect("send notice 1");
     wait_for_messages(&sent, &notify, 2).await;
 
     let first_count = sent.lock().expect("lock").len();
@@ -133,12 +137,12 @@ async fn peer_reconnect_resends_local_state() {
     // Disconnect + reconnect
     let gen2 = {
         let mut pm = peer_manager.lock().await;
-        pm.disconnect_peer(&host_b, gen1);
-        ensure_test_connection_generation(&mut pm, &host_b, || Arc::clone(&sender))
+        pm.disconnect_peer(&node_b, gen1);
+        ensure_test_connection_generation(&mut pm, &node_b, || Arc::clone(&sender))
     };
 
     // Second connection — expect at least first_count + 2 more messages
-    peer_connected_tx.send(PeerConnectedNotice { peer: host_b.clone(), generation: gen2 }).expect("send notice 2");
+    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation: gen2 }).expect("send notice 2");
     wait_for_messages(&sent, &notify, first_count + 2).await;
 
     let total_count = sent.lock().expect("lock").len();

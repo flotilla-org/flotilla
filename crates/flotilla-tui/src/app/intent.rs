@@ -8,7 +8,7 @@ use flotilla_commands::{
     },
     NounCommand,
 };
-use flotilla_protocol::{CheckoutTarget, Command, CommandAction, HostName, RepoLabels, WorkItem, WorkItemKind};
+use flotilla_protocol::{CheckoutTarget, Command, CommandAction, NodeId, RepoLabels, WorkItem, WorkItemKind};
 
 use super::App;
 
@@ -75,15 +75,15 @@ impl Intent {
 
     /// Whether this intent is allowed given the item's host provenance.
     ///
-    /// Remote items (where `item.host != my_host`) cannot use intents that
-    /// require local filesystem access. If `my_host` is `None`, all items
+    /// Remote items (where `item.node_id != my_node_id`) cannot use intents that
+    /// require local filesystem access. If `my_node_id` is `None`, all items
     /// are treated as local (pre-multi-host compatibility).
-    pub fn is_allowed_for_host(&self, item: &WorkItem, my_host: &Option<HostName>) -> bool {
+    pub fn is_allowed_for_host(&self, item: &WorkItem, my_node_id: &Option<NodeId>) -> bool {
         if !self.requires_local_host() {
             return true;
         }
-        match my_host {
-            Some(host) => item.host == *host,
+        match my_node_id {
+            Some(node_id) => item.node_id == *node_id,
             None => true,
         }
     }

@@ -681,7 +681,7 @@ mod tests {
     fn parse_palette_input_host_routed() {
         let result = parse_palette_input("host feta cr #42 open").expect("should parse");
         assert!(matches!(result, PaletteParseResult::Resolved(Resolved::NeedsContext { ref command, .. })
-                if command.host.is_some()));
+                if command.node_id.is_some()));
     }
 
     #[test]
@@ -699,7 +699,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, HostName, ProviderData, RepoLabels};
+    use flotilla_protocol::{ChangeRequest, ChangeRequestStatus, HostName, NodeId, NodeInfo, ProviderData, RepoLabels};
 
     use crate::app::test_builders::repo_info;
 
@@ -739,7 +739,7 @@ mod tests {
 
     fn stub_host_summary(name: &str) -> flotilla_protocol::HostSummary {
         flotilla_protocol::HostSummary {
-            host_name: HostName::new(name),
+            node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],

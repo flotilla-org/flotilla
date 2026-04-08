@@ -2,12 +2,12 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector, StreamKey};
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, RepoSelector, StreamKey};
 use tokio::time::Instant;
 
 /// Execute a query command via execute_query and return the result directly.
 async fn run_query(daemon: &dyn DaemonHandle, action: CommandAction) -> CommandValue {
-    let command = Command { host: None, provisioning_target: None, context_repo: None, action };
+    let command = Command { node_id: None, provisioning_target: None, context_repo: None, action };
     daemon.execute_query(command, uuid::Uuid::nil()).await.expect("execute_query")
 }
 
@@ -79,7 +79,7 @@ async fn socket_roundtrip() {
     // refresh — should succeed (triggers a re-scan)
     client
         .execute(Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) },
@@ -106,19 +106,26 @@ async fn socket_roundtrip() {
     assert!(repo_events.is_empty(), "should have no repo events when up to date, got {} events", repo_events.len());
 
     let host_replay = client.replay_since(&HashMap::new()).await.expect("replay_since");
-    let local_host_seq = host_replay
+    let local_node_id = host_replay
         .iter()
         .find_map(|event| match event {
-            DaemonEvent::HostSnapshot(snap) if snap.host_name == HostName::local() => Some(snap.seq),
+            DaemonEvent::HostSnapshot(snap) if snap.is_local => Some(snap.node.node_id.clone()),
             _ => None,
         })
         .expect("expected local host snapshot");
+    let local_host_seq = host_replay
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::HostSnapshot(snap) if snap.node.node_id == local_node_id => Some(snap.seq),
+            _ => None,
+        })
+        .expect("expected local host snapshot seq");
     let replay = client
-        .replay_since(&HashMap::from([(StreamKey::Host { host_name: HostName::local() }, local_host_seq)]))
+        .replay_since(&HashMap::from([(StreamKey::Host { node_id: local_node_id.clone() }, local_host_seq)]))
         .await
         .expect("replay_since");
     let host_events: Vec<_> =
-        replay.iter().filter(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.host_name == HostName::local())).collect();
+        replay.iter().filter(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snap.node.node_id == local_node_id)).collect();
     assert!(host_events.is_empty(), "should have no host events when the local host cursor is current");
 
     // replay_since with bogus seq — should return full snapshot
@@ -233,28 +240,26 @@ async fn query_commands_roundtrip() {
 
     // Test host query commands via execute_query()
     let hosts_result = run_query(&*client, CommandAction::QueryHostList {}).await;
-    match hosts_result {
+    let local_node_id = match hosts_result {
         CommandValue::HostList(hosts) => {
-            assert!(hosts.hosts.iter().any(|entry| entry.host == HostName::local() && entry.is_local));
+            hosts.hosts.iter().find(|entry| entry.is_local).map(|entry| entry.node.node_id.clone()).expect("expected local host entry")
         }
         other => panic!("expected HostList, got {other:?}"),
-    }
-
-    let local_host = HostName::local().to_string();
-    let host_status_result = run_query(&*client, CommandAction::QueryHostStatus { target_host: local_host.clone() }).await;
+    };
+    let host_status_result = run_query(&*client, CommandAction::QueryHostStatus { target_node_id: local_node_id.clone() }).await;
     match host_status_result {
         CommandValue::HostStatus(status) => assert!(status.is_local, "local host query should resolve to local host"),
         other => panic!("expected HostStatus, got {other:?}"),
     }
 
-    let host_providers_result = run_query(&*client, CommandAction::QueryHostProviders { target_host: local_host }).await;
+    let host_providers_result = run_query(&*client, CommandAction::QueryHostProviders { target_node_id: local_node_id.clone() }).await;
     match host_providers_result {
-        CommandValue::HostProviders(providers) => assert_eq!(providers.summary.host_name, HostName::local()),
+        CommandValue::HostProviders(providers) => assert_eq!(providers.summary.node.node_id, local_node_id),
         other => panic!("expected HostProviders, got {other:?}"),
     }
 
     let topology = client.get_topology().await.expect("get_topology");
-    assert_eq!(topology.local_host, HostName::local());
+    assert_eq!(topology.local_node.node_id, local_node_id);
 
     // Test slug resolution error for nonexistent repo
     let err_result = run_query(&*client, CommandAction::QueryRepoDetail { repo: RepoSelector::Query("nonexistent".to_string()) }).await;
@@ -324,8 +329,14 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
     }
 
     let mut rx = client.subscribe();
+    let local_node_id = match run_query(&*client, CommandAction::QueryHostList {}).await {
+        CommandValue::HostList(hosts) => {
+            hosts.hosts.iter().find(|entry| entry.is_local).map(|entry| entry.node.node_id.clone()).expect("expected local host entry")
+        }
+        other => panic!("expected HostList, got {other:?}"),
+    };
     let command_id = client
-        .execute(Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
+        .execute(Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } })
         .await
         .expect("execute refresh all");
 
@@ -333,14 +344,14 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
         let mut started = None;
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::CommandStarted { command_id: id, host, repo: event_repo, description, .. }) if id == command_id => {
-                    assert_eq!(host, flotilla_protocol::HostName::local());
+                Ok(DaemonEvent::CommandStarted { command_id: id, node_id, repo: event_repo, description, .. }) if id == command_id => {
+                    assert_eq!(node_id, local_node_id);
                     assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                     assert_eq!(description, "Refreshing...");
                     started = Some(id);
                 }
-                Ok(DaemonEvent::CommandFinished { command_id: id, host, repo: event_repo, result, .. }) if id == command_id => {
-                    assert_eq!(host, flotilla_protocol::HostName::local());
+                Ok(DaemonEvent::CommandFinished { command_id: id, node_id, repo: event_repo, result, .. }) if id == command_id => {
+                    assert_eq!(node_id, local_node_id);
                     assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
                     break (started, Some((id, result)));
                 }

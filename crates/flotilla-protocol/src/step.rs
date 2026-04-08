@@ -94,6 +94,8 @@ pub enum StepAction {
     PrepareWorkspace {
         checkout_path: Option<ExecutionEnvironmentPath>,
         label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_host: Option<crate::HostName>,
     },
     AttachWorkspace,
     SelectWorkspace {

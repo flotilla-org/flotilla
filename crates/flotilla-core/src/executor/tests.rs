@@ -1215,9 +1215,40 @@ async fn remove_checkout_disambiguates_by_target_host() {
     )
     .await;
 
-    let plan = plan.expect("build_plan should resolve the local-owned checkout");
+    let plan = plan.expect("build_plan should resolve the targeted checkout");
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(local_node_id()));
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
+}
+
+#[tokio::test]
+async fn fetch_checkout_status_targets_remote_node_when_command_is_remote() {
+    let registry = empty_registry();
+    let config_base = config_base();
+    let plan = build_plan(
+        Command {
+            node_id: Some(NodeId::new("remote-box")),
+            provisioning_target: None,
+            context_repo: Some(RepoSelector::Identity(repo_identity())),
+            action: CommandAction::FetchCheckoutStatus {
+                branch: "feat".to_string(),
+                checkout_path: Some(PathBuf::from("/repo/wt")),
+                change_request_id: None,
+            },
+        },
+        RepoExecutionContext { identity: repo_identity(), root: repo_root() },
+        Arc::new(registry),
+        Arc::new(empty_data()),
+        config_base.clone(),
+        test_attachable_store(&config_base),
+        None,
+        local_node_id(),
+        local_host(),
+    )
+    .await
+    .expect("build_plan should succeed");
+
+    assert_eq!(plan.steps.len(), 1);
+    assert_eq!(plan.steps[0].host, StepExecutionContext::Host(NodeId::new("remote-box")));
 }
 
 // -----------------------------------------------------------------------
@@ -2057,7 +2088,7 @@ async fn build_plan_remote_checkout_with_issue_links_suffixes_workspace_label_an
     assert_eq!(plan.steps[1].host, StepExecutionContext::Host(node_id("feta-node")));
     assert!(matches!(
         plan.steps[2].action,
-        StepAction::PrepareWorkspace { ref checkout_path, ref label }
+        StepAction::PrepareWorkspace { ref checkout_path, ref label, .. }
             if checkout_path.is_none() && label == "feat-x@Build Box"
     ));
     assert_eq!(plan.steps[2].host, StepExecutionContext::Host(node_id("feta-node")));
@@ -2194,7 +2225,7 @@ async fn build_plan_create_workspace_for_checkout_uses_prepare_and_attach_steps_
     assert_eq!(plan.steps[0].host, StepExecutionContext::Host(local_node_id()));
     assert!(matches!(
         plan.steps[0].action,
-        StepAction::PrepareWorkspace { ref checkout_path, ref label }
+        StepAction::PrepareWorkspace { ref checkout_path, ref label, .. }
             if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat"
     ));
     assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local_node_id()));
@@ -2227,7 +2258,7 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
     assert_eq!(plan.steps[0].host, StepExecutionContext::Host(node_id("feta")));
     assert!(matches!(
         plan.steps[0].action,
-            StepAction::PrepareWorkspace { ref checkout_path, ref label }
+            StepAction::PrepareWorkspace { ref checkout_path, ref label, .. }
             if checkout_path == &Some(ExecutionEnvironmentPath::new(path.clone())) && label == "feat@feta"
     ));
     assert_eq!(plan.steps[1].host, StepExecutionContext::Host(local));
@@ -3063,13 +3094,14 @@ async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() 
 
     let prior =
         vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
-    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
+    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: None };
     let context = StepExecutionContext::Host(local_node_id());
     let outcome = resolver.resolve("create workspace", &context, action, &prior).await;
     match outcome {
         Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
             assert_eq!(prepared.label, "feat");
             assert_eq!(prepared.target_node_id, local_node_id());
+            assert_eq!(prepared.display_host, None);
             assert_eq!(prepared.checkout_path, PathBuf::from("/repo/wt-feat"));
             assert!(!prepared.prepared_commands.is_empty(), "default workspace template should produce commands");
         }
@@ -3094,7 +3126,7 @@ async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() 
         environment_manager: empty_environment_manager().await,
     };
 
-    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
+    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: None };
     let context = StepExecutionContext::Host(local_node_id());
     let outcome = resolver.resolve("create workspace", &context, action, &[]).await;
     assert!(matches!(outcome, Ok(StepOutcome::Skipped)), "should skip when no prior CheckoutCreated outcome: {outcome:?}");
@@ -3422,12 +3454,13 @@ async fn executor_step_resolver_prepare_workspace_uses_manager_container_name_fo
         branch: "feat".into(),
         path: PathBuf::from("/workspace/wt-feat"),
     })];
-    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None };
+    let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: Some(HostName::new("feta")) };
     let context = StepExecutionContext::Environment(local_node_id(), env_id.clone());
     let outcome = resolver.resolve("prepare workspace", &context, action, &prior).await;
 
     match outcome {
         Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
+            assert_eq!(prepared.display_host, Some(HostName::new("feta")));
             assert_eq!(prepared.environment_id, Some(env_id));
             assert_eq!(prepared.container_name.as_deref(), Some("mock-container"));
         }

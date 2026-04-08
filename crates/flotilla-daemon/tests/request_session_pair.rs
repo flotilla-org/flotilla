@@ -55,6 +55,7 @@ async fn in_memory_request_client_routes_remote_command_result() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     let topology = spawn_in_memory_request_topology(leader, follower).await.expect("spawn in-memory topology");
+    let follower_node_id = topology.follower.node_id().clone();
 
     // Query commands return a directed QueryResult response instead of
     // broadcasting via CommandFinished, so use execute_query.
@@ -62,10 +63,10 @@ async fn in_memory_request_client_routes_remote_command_result() {
         .client
         .execute_query(
             Command {
-                host: Some(HostName::new("follower")),
+                node_id: Some(follower_node_id.clone()),
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryHostStatus { target_host: "follower".into() },
+                action: CommandAction::QueryHostStatus { target_node_id: follower_node_id.clone() },
             },
             uuid::Uuid::nil(),
         )
@@ -74,7 +75,7 @@ async fn in_memory_request_client_routes_remote_command_result() {
 
     match result {
         CommandValue::HostStatus(status) => {
-            assert_eq!(status.host, HostName::new("follower"));
+            assert_eq!(status.node.node_id, follower_node_id);
             // The query targets host "follower", so it must be forwarded
             // to the follower daemon and executed there — where it is local.
             assert!(status.is_local, "follower should appear as local from its own perspective");
@@ -101,12 +102,13 @@ async fn remote_issue_query_returns_results() {
     let leader = empty_daemon_named("leader").await;
 
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let follower_node_id = topology.follower.node_id().clone();
 
     let result = topology
         .client
         .execute_query(
             Command {
-                host: Some(HostName::new("follower")),
+                node_id: Some(follower_node_id),
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssues {

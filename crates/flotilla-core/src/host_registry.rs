@@ -110,7 +110,14 @@ impl HostRegistry {
         let summary =
             if resolved == self.local_node.node_id { Some(self.local_host_summary().await) } else { summaries.get(&resolved).cloned() };
 
-        Ok(build_host_status(&resolved, &self.local_node, &configured, &statuses, &summaries, summary, local_counts, remote_counts))
+        Ok(build_host_status(&resolved, summary, HostStatusContext {
+            local_node: &self.local_node,
+            configured: &configured,
+            statuses: &statuses,
+            summaries: &summaries,
+            local_counts,
+            remote_counts,
+        }))
     }
 
     pub(crate) async fn get_host_providers(
@@ -541,24 +548,24 @@ fn build_host_list_entry(
     }
 }
 
-fn build_host_status(
-    node_id: &NodeId,
-    local_node: &NodeInfo,
-    configured: &HashMap<NodeId, String>,
-    statuses: &HashMap<NodeId, PeerConnectionState>,
-    summaries: &HashMap<NodeId, HostSummary>,
-    summary: Option<HostSummary>,
+struct HostStatusContext<'a> {
+    local_node: &'a NodeInfo,
+    configured: &'a HashMap<NodeId, String>,
+    statuses: &'a HashMap<NodeId, PeerConnectionState>,
+    summaries: &'a HashMap<NodeId, HostSummary>,
     local_counts: HostCounts,
-    remote_counts: &HashMap<NodeId, HostCounts>,
-) -> HostStatusResponse {
-    let is_local = node_id == &local_node.node_id;
-    let counts = if is_local { local_counts } else { remote_counts.get(node_id).copied().unwrap_or_default() };
+    remote_counts: &'a HashMap<NodeId, HostCounts>,
+}
+
+fn build_host_status(node_id: &NodeId, summary: Option<HostSummary>, ctx: HostStatusContext<'_>) -> HostStatusResponse {
+    let is_local = node_id == &ctx.local_node.node_id;
+    let counts = if is_local { ctx.local_counts } else { ctx.remote_counts.get(node_id).copied().unwrap_or_default() };
 
     HostStatusResponse {
-        node: node_info_for(node_id, configured, Some(summaries), Some(local_node)),
+        node: node_info_for(node_id, ctx.configured, Some(ctx.summaries), Some(ctx.local_node)),
         is_local,
-        configured: !is_local && configured.contains_key(node_id),
-        connection_status: connection_status(node_id, &local_node.node_id, statuses),
+        configured: !is_local && ctx.configured.contains_key(node_id),
+        connection_status: connection_status(node_id, &ctx.local_node.node_id, ctx.statuses),
         summary,
         visible_environments: vec![],
         repo_count: counts.repo_count,

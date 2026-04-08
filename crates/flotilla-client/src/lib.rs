@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -11,11 +11,11 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, ConnectionRole, DaemonEvent, Message, NodeId, PROTOCOL_VERSION, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot, Request,
-    Response, ResponseResult, StatusResponse, StreamKey, TopologyResponse,
+    Command, ConnectionRole, DaemonEvent, Message, NodeId, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot, Request, Response,
+    ResponseResult, StatusResponse, StreamKey, TopologyResponse, PROTOCOL_VERSION,
 };
-use flotilla_transport::message::{MessageSession, connect_unix_message_session};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use flotilla_transport::message::{connect_unix_message_session, MessageSession};
+use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap

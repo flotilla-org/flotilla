@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use flotilla_protocol::{NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot};
-use flotilla_transport::message::{MessageSession, message_session_pair};
+use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,

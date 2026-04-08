@@ -95,7 +95,7 @@ impl FilePickerWidget {
             let path = PathBuf::from(format!("{}{}", base, entry.name));
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
             let cmd = Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::TrackRepoPath { path: canonical },

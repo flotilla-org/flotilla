@@ -3,7 +3,8 @@ mod support;
 use std::path::PathBuf;
 
 use flotilla_protocol::{
-    CheckoutRef, HostName, HostPath, HostSummary, ProviderData, RepoIdentity, SessionStatus, SystemInfo, WorkItem, WorkItemIdentity,
+    CheckoutRef, HostName, HostPath, HostSummary, NodeId, NodeInfo, ProviderData, RepoIdentity, SessionStatus, SystemInfo, WorkItem,
+    WorkItemIdentity,
 };
 use flotilla_tui::app::{
     ui_state::{PendingAction, PendingStatus},
@@ -98,7 +99,7 @@ fn action_menu() {
         flotilla_tui::widgets::action_menu::MenuEntry {
             intent: Intent::CreateWorkspace,
             command: flotilla_protocol::Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: flotilla_protocol::CommandAction::CreateWorkspaceForCheckout {
@@ -110,7 +111,7 @@ fn action_menu() {
         flotilla_tui::widgets::action_menu::MenuEntry {
             intent: Intent::OpenChangeRequest,
             command: flotilla_protocol::Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: flotilla_protocol::CommandAction::OpenChangeRequest { id: "1".into() },
@@ -119,7 +120,7 @@ fn action_menu() {
         flotilla_tui::widgets::action_menu::MenuEntry {
             intent: Intent::RemoveCheckout,
             command: flotilla_protocol::Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: flotilla_protocol::CommandAction::FetchCheckoutStatus {
@@ -392,7 +393,11 @@ fn delete_confirm_widget(
     identity: WorkItemIdentity,
     remote_host: Option<HostName>,
 ) -> Box<dyn flotilla_tui::widgets::InteractiveWidget> {
-    let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(identity, remote_host, None);
+    let mut widget = flotilla_tui::widgets::delete_confirm::DeleteConfirmWidget::new(
+        identity,
+        remote_host.as_ref().map(|host| NodeId::new(host.as_str())),
+        None,
+    );
     widget.update_info(info);
     Box::new(widget)
 }
@@ -586,7 +591,7 @@ fn action_menu_widget_renders_on_short_terminals_without_overflow() {
     let entries = vec![flotilla_tui::widgets::action_menu::MenuEntry {
         intent: Intent::CreateWorkspace,
         command: flotilla_protocol::Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: flotilla_protocol::CommandAction::CreateWorkspaceForCheckout {
@@ -611,7 +616,7 @@ fn branch_input_widget_renders_on_short_terminals_without_overflow() {
 #[test]
 fn close_confirm_widget_renders_on_short_terminals_without_overflow() {
     let command = flotilla_protocol::Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: None,
         action: flotilla_protocol::CommandAction::CloseChangeRequest { id: "42".into() },
@@ -864,7 +869,7 @@ fn remote_host_home_directory_shortening() {
     let main_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,
         identity: WorkItemIdentity::Checkout(main_host_path.clone().into()),
-        host: remote_host.clone(),
+        node_id: NodeId::new(remote_host.as_str()),
         branch: Some("main".into()),
         description: "checkout main".into(),
         checkout: Some(CheckoutRef::from_host_path(main_host_path, true)),
@@ -883,7 +888,7 @@ fn remote_host_home_directory_shortening() {
     let feat_item = WorkItem {
         kind: flotilla_protocol::WorkItemKind::Checkout,
         identity: WorkItemIdentity::Checkout(host_path.clone().into()),
-        host: remote_host.clone(),
+        node_id: NodeId::new(remote_host.as_str()),
         branch: Some("feat-x".into()),
         description: "checkout feat-x".into(),
         checkout: Some(CheckoutRef::from_host_path(host_path, false)),
@@ -910,7 +915,7 @@ fn remote_host_home_directory_shortening() {
         is_local: true,
         status: PeerStatus::Connected,
         summary: HostSummary {
-            host_name: HostName::new("local"),
+            node: NodeInfo::new(NodeId::new("local"), "local"),
             system: SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -924,7 +929,7 @@ fn remote_host_home_directory_shortening() {
         is_local: false,
         status: PeerStatus::Connected,
         summary: HostSummary {
-            host_name: remote_host,
+            node: NodeInfo::new(NodeId::new(remote_host.as_str()), remote_host.as_str()),
             system: SystemInfo { home_dir: Some(PathBuf::from("/home/alice")), ..SystemInfo::default() },
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],

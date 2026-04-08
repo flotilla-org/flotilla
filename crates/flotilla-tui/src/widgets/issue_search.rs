@@ -43,7 +43,7 @@ impl InteractiveWidget for IssueSearchWidget {
                         return Outcome::Finished;
                     };
                     let cmd = Command {
-                        host: None,
+                        node_id: None,
                         provisioning_target: None,
                         context_repo: None,
                         action: CommandAction::QueryIssues {

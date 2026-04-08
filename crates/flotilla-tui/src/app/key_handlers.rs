@@ -205,9 +205,9 @@ impl App {
 
         match selected {
             OwnedSelectedRow::WorkItem(ref item) => {
-                let my_host = self.model.my_host().cloned();
+                let my_node_id = self.model.my_node_id().cloned();
                 for &intent in Intent::enter_priority() {
-                    if intent.is_available(item) && intent.is_allowed_for_host(item, &my_host) {
+                    if intent.is_available(item) && intent.is_allowed_for_host(item, &my_node_id) {
                         self.resolve_and_push(intent, item);
                         return;
                     }
@@ -266,8 +266,8 @@ impl App {
         let Some(item) = self.selected_work_item().cloned() else {
             return;
         };
-        let my_host = self.model.my_host().cloned();
-        if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_host) {
+        let my_node_id = self.model.my_node_id().cloned();
+        if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_node_id) {
             self.resolve_and_push(intent, &item);
         }
     }
@@ -275,9 +275,9 @@ impl App {
     fn resolve_and_push(&mut self, intent: Intent, item: &WorkItem) {
         // Safety net: block filesystem operations on remote items even if
         // the caller somehow bypassed the menu/availability filter.
-        let my_host = self.model.my_host().cloned();
-        if !intent.is_allowed_for_host(item, &my_host) {
-            tracing::warn!(?intent, host = %item.host, "blocked intent on remote item");
+        let my_node_id = self.model.my_node_id().cloned();
+        if !intent.is_allowed_for_host(item, &my_node_id) {
+            tracing::warn!(?intent, node_id = %item.node_id, "blocked intent on remote item");
             self.model.status_message = Some("Cannot perform this action on a remote item".to_string());
             return;
         }
@@ -299,7 +299,7 @@ impl App {
                         is_config,
                         active_repo,
                         &provisioning_target,
-                        &my_host,
+                        &my_node_id,
                         remote_only,
                     ) {
                         Ok(cmd) => {
@@ -393,12 +393,12 @@ impl App {
             return;
         };
 
-        let my_host = self.model.my_host().cloned();
+        let my_node_id = self.model.my_node_id().cloned();
         let entries: Vec<crate::widgets::action_menu::MenuEntry> = Intent::all_in_menu_order()
             .iter()
             .copied()
             .filter_map(|intent| {
-                if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_host) {
+                if intent.is_available(&item) && intent.is_allowed_for_host(&item, &my_node_id) {
                     intent.resolve(&item, self).map(|command| crate::widgets::action_menu::MenuEntry { intent, command })
                 } else {
                     None

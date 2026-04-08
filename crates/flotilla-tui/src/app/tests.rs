@@ -11,7 +11,7 @@ use flotilla_core::{
         issue_query::{IssueQuery, IssueQueryService, IssueResultPage},
     },
 };
-use flotilla_protocol::{provider_data::Issue, Change, ProvisioningTarget, RepoSelector, WorkItemIdentity};
+use flotilla_protocol::{provider_data::Issue, Change, NodeId, NodeInfo, ProvisioningTarget, RepoSelector, WorkItemIdentity};
 use tempfile::tempdir;
 use test_support::*;
 use tokio::sync::{Mutex as TokioMutex, Notify};
@@ -25,7 +25,7 @@ fn insert_local_host(model: &mut TuiModel, name: &str) {
         is_local: true,
         status: PeerStatus::Connected,
         summary: HostSummary {
-            host_name,
+            node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -41,7 +41,7 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
         is_local: false,
         status,
         summary: HostSummary {
-            host_name,
+            node: NodeInfo::new(NodeId::new(name), name),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],
@@ -133,9 +133,9 @@ async fn app_with_issue_query_service(service: Arc<dyn IssueQueryService>) -> (t
 #[test]
 fn command_queue_push_and_take_fifo() {
     let mut q = CommandQueue::default();
-    q.push(Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
+    q.push(Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
     q.push(Command {
-        host: None,
+        node_id: None,
         provisioning_target: None,
         context_repo: Some(RepoSelector::Path(PathBuf::from("/repo"))),
         action: CommandAction::OpenChangeRequest { id: "1".into() },
@@ -720,7 +720,7 @@ fn handle_daemon_event_command_started_tracked() {
 
     app.handle_daemon_event(DaemonEvent::CommandStarted {
         command_id: 99,
-        host: HostName::local(),
+        node_id: NodeId::new(HostName::local().as_str()),
         repo_identity: app.model.active_repo_identity().clone(),
         repo: Some(repo.clone()),
         description: "test cmd".into(),
@@ -744,7 +744,7 @@ fn step_failure_surfaces_error_in_status_message() {
 
     app.handle_daemon_event(DaemonEvent::CommandStepUpdate {
         command_id: 42,
-        host: HostName::local(),
+        node_id: NodeId::new(HostName::local().as_str()),
         repo_identity,
         repo: Some(repo_path),
         step_index: 0,
@@ -763,7 +763,7 @@ fn peer_disconnect_clears_selected_target_host() {
     app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("alpha") };
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
 
-    app.handle_daemon_event(DaemonEvent::PeerStatusChanged { host: HostName::new("alpha"), status: PeerConnectionState::Disconnected });
+    app.handle_daemon_event(DaemonEvent::PeerStatusChanged { node_id: NodeId::new("alpha"), status: PeerConnectionState::Disconnected });
 
     assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     assert_eq!(app.model.hosts.get(&HostName::new("alpha")).unwrap().status, PeerStatus::Disconnected);
@@ -775,7 +775,7 @@ fn host_removed_event_deletes_host_and_clears_selected_target_host() {
     app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("alpha") };
     insert_peer_host(&mut app.model, "alpha", PeerStatus::Connected);
 
-    app.handle_daemon_event(DaemonEvent::HostRemoved { host: HostName::new("alpha"), seq: 2 });
+    app.handle_daemon_event(DaemonEvent::HostRemoved { node_id: NodeId::new("alpha"), seq: 2 });
 
     assert_eq!(app.ui.provisioning_target, ProvisioningTarget::Host { host: HostName::local() });
     assert!(!app.model.hosts.contains_key(&HostName::new("alpha")));
@@ -805,7 +805,12 @@ fn push_close_confirm_widget(app: &mut App, id: &str) {
         id.into(),
         "Test PR".into(),
         WorkItemIdentity::Session("test".into()),
-        Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::CloseChangeRequest { id: id.into() } },
+        Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CloseChangeRequest { id: id.into() },
+        },
     );
     app.screen.modal_stack.push(Box::new(widget));
 }
@@ -861,7 +866,7 @@ fn command_queue_push_with_context() {
         repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
     };
     q.push_with_context(
-        Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } },
+        Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } },
         Some(ctx),
     );
     let (cmd, ctx) = q.take_next().expect("should have one entry");
@@ -873,7 +878,7 @@ fn command_queue_push_with_context() {
 #[test]
 fn command_queue_push_without_context() {
     let mut q = CommandQueue::default();
-    q.push(Command { host: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
+    q.push(Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } });
     let (_, ctx) = q.take_next().expect("should have one entry");
     assert!(ctx.is_none());
 }
@@ -898,7 +903,7 @@ fn command_finished_ok_clears_pending_action() {
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
-        host: HostName::local(),
+        node_id: NodeId::new(HostName::local().as_str()),
         repo_identity: repo.clone(),
         repo: Some(repo_path),
         result: CommandValue::Ok,
@@ -925,7 +930,7 @@ fn command_finished_error_transitions_to_failed() {
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
-        host: HostName::local(),
+        node_id: NodeId::new(HostName::local().as_str()),
         repo_identity: repo.clone(),
         repo: Some(repo_path),
         result: CommandValue::Error { message: "boom".into() },
@@ -953,7 +958,7 @@ fn command_finished_cancelled_clears_pending_action() {
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
-        host: HostName::local(),
+        node_id: NodeId::new(HostName::local().as_str()),
         repo_identity: repo.clone(),
         repo: Some(repo_path),
         result: CommandValue::Cancelled,
@@ -981,7 +986,7 @@ fn orphaned_command_finished_harmlessly_ignored() {
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
-        host: HostName::local(),
+        node_id: NodeId::new(HostName::local().as_str()),
         repo_identity: repo.clone(),
         repo: Some(repo_path),
         result: CommandValue::Ok,
@@ -1002,7 +1007,7 @@ fn local_checkout_created_does_not_queue_workspace() {
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
-        host: HostName::new("my-desktop"),
+        node_id: NodeId::new("my-desktop"),
         repo_identity,
         repo: Some(repo_path),
         result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/tmp/repo/wt-feat") },
@@ -1022,7 +1027,7 @@ fn remote_checkout_created_does_not_queue_workspace() {
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
         command_id: 42,
-        host: HostName::new("remote-a"),
+        node_id: NodeId::new("remote-a"),
         repo_identity,
         repo: Some(repo_path),
         result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/remote/wt-feat") },
@@ -1038,11 +1043,11 @@ fn host_snapshot_event_populates_hosts_map() {
     let mut app = stub_app();
     app.handle_daemon_event(DaemonEvent::HostSnapshot(Box::new(flotilla_protocol::HostSnapshot {
         seq: 1,
-        host_name: HostName::new("desktop"),
+        node: NodeInfo::new(NodeId::new("desktop"), "desktop"),
         is_local: true,
         connection_status: PeerConnectionState::Connected,
         summary: HostSummary {
-            host_name: HostName::new("desktop"),
+            node: NodeInfo::new(NodeId::new("desktop"), "desktop"),
             system: flotilla_protocol::SystemInfo::default(),
             inventory: flotilla_protocol::ToolInventory::default(),
             providers: vec![],

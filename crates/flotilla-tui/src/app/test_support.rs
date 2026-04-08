@@ -10,8 +10,8 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, data::SectionLabels};
 use flotilla_protocol::{
-    Change, Command, DaemonEvent, HostName, ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot,
-    StatusResponse, StreamKey, TopologyResponse, WorkItem,
+    Change, Command, DaemonEvent, HostName, NodeId, ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels,
+    RepoSnapshot, StatusResponse, StreamKey, TopologyResponse, WorkItem,
 };
 use tokio::sync::broadcast;
 use tui_input::Input;
@@ -95,7 +95,7 @@ pub(crate) fn snapshot(repo: &Path) -> RepoSnapshot {
         seq: 1,
         repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: repo.display().to_string() },
         repo: Some(repo.to_path_buf()),
-        host_name: flotilla_protocol::HostName::local(),
+        node_id: NodeId::new(flotilla_protocol::HostName::local().as_str()),
         work_items: vec![],
         providers: ProviderData::default(),
         provider_health: HashMap::new(),
@@ -181,6 +181,7 @@ pub(crate) struct TestWidgetHarness {
     pub commands: CommandQueue,
     pub provisioning_target: ProvisioningTarget,
     pub my_host: Option<HostName>,
+    pub my_node_id: Option<NodeId>,
     pub is_config: bool,
     pub active_repo_is_remote_only: bool,
 }
@@ -196,6 +197,7 @@ impl TestWidgetHarness {
             commands: app.proto_commands,
             provisioning_target: app.ui.provisioning_target.clone(),
             my_host: None,
+            my_node_id: None,
             is_config: false,
             active_repo_is_remote_only: false,
         }
@@ -209,6 +211,7 @@ impl TestWidgetHarness {
             in_flight: &self.in_flight,
             provisioning_target: &self.provisioning_target,
             my_host: self.my_host.clone(),
+            my_node_id: self.my_node_id.clone(),
             active_repo: self.model.active_repo,
             repo_order: &self.model.repo_order,
             commands: &mut self.commands,

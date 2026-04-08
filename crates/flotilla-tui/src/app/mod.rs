@@ -21,7 +21,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, PeerConnectionState, ProviderData, ProviderError,
+    Command, CommandAction, CommandValue, DaemonEvent, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData, ProviderError,
     ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem, WorkItemIdentity,
 };
 pub use intent::Intent;
@@ -192,6 +192,18 @@ impl TuiModel {
 
     pub fn my_host(&self) -> Option<&HostName> {
         self.hosts.values().find(|h| h.is_local).map(|h| &h.host_name)
+    }
+
+    pub fn my_node_id(&self) -> Option<&NodeId> {
+        self.hosts.values().find(|h| h.is_local).map(|h| &h.summary.node.node_id)
+    }
+
+    pub fn node_id_for_host(&self, host: &HostName) -> Option<&NodeId> {
+        self.hosts.get(host).map(|entry| &entry.summary.node.node_id)
+    }
+
+    pub fn host_for_node_id(&self, node_id: &NodeId) -> Option<&HostName> {
+        self.hosts.values().find(|entry| entry.summary.node.node_id == *node_id).map(|entry| &entry.host_name)
     }
 
     pub fn peer_host_names(&self) -> Vec<HostName> {
@@ -388,12 +400,12 @@ impl App {
     }
 
     pub fn command(&self, action: CommandAction) -> Command {
-        Command { host: None, provisioning_target: None, context_repo: None, action }
+        Command { node_id: None, provisioning_target: None, context_repo: None, action }
     }
 
     pub fn repo_command(&self, action: CommandAction) -> Command {
         Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
@@ -401,7 +413,7 @@ impl App {
     }
 
     pub fn repo_command_for_identity(&self, repo_identity: RepoIdentity, action: CommandAction) -> Command {
-        Command { host: None, provisioning_target: None, context_repo: Some(RepoSelector::Identity(repo_identity)), action }
+        Command { node_id: None, provisioning_target: None, context_repo: Some(RepoSelector::Identity(repo_identity)), action }
     }
 
     /// Check that a provisioning target refers to a known host and (for NewEnvironment)
@@ -427,13 +439,18 @@ impl App {
 
     pub fn targeted_command(&self, action: CommandAction) -> Command {
         let target = &self.ui.provisioning_target;
-        Command { host: Some(target.host().clone()), provisioning_target: Some(target.clone()), context_repo: None, action }
+        Command {
+            node_id: self.model.node_id_for_host(target.host()).cloned().or_else(|| Some(NodeId::new(target.host().as_str()))),
+            provisioning_target: Some(target.clone()),
+            context_repo: None,
+            action,
+        }
     }
 
     pub fn targeted_repo_command(&self, action: CommandAction) -> Command {
         let target = &self.ui.provisioning_target;
         Command {
-            host: Some(target.host().clone()),
+            node_id: self.model.node_id_for_host(target.host()).cloned().or_else(|| Some(NodeId::new(target.host().as_str()))),
             provisioning_target: Some(target.clone()),
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
@@ -441,12 +458,12 @@ impl App {
     }
 
     pub fn item_host_command(&self, action: CommandAction, item: &WorkItem) -> Command {
-        Command { host: self.item_execution_host(item), provisioning_target: None, context_repo: None, action }
+        Command { node_id: self.item_execution_host(item), provisioning_target: None, context_repo: None, action }
     }
 
     pub fn item_host_repo_command(&self, action: CommandAction, item: &WorkItem) -> Command {
         Command {
-            host: self.item_execution_host(item),
+            node_id: self.item_execution_host(item),
             provisioning_target: None,
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,
@@ -471,9 +488,9 @@ impl App {
         flotilla_core::template::resolve_template_commands(self.model.active_repo_root(), self.config.base_path().as_path())
     }
 
-    fn item_execution_host(&self, item: &WorkItem) -> Option<HostName> {
-        match self.model.my_host() {
-            Some(my_host) if item.host != *my_host => Some(item.host.clone()),
+    fn item_execution_host(&self, item: &WorkItem) -> Option<NodeId> {
+        match self.model.my_node_id() {
+            Some(my_node_id) if item.node_id != *my_node_id => Some(item.node_id.clone()),
             _ => None,
         }
     }
@@ -624,7 +641,7 @@ impl App {
         let params_clone = params.clone();
         tokio::spawn(async move {
             let cmd = Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::QueryIssues {
@@ -704,6 +721,7 @@ impl App {
 
     pub fn build_widget_context(&mut self) -> crate::widgets::WidgetContext<'_> {
         let my_host = self.model.my_host().cloned();
+        let my_node_id = self.model.my_node_id().cloned();
         let active_repo_is_remote_only = self.active_repo_is_remote_only();
         crate::widgets::WidgetContext {
             model: &self.model,
@@ -712,6 +730,7 @@ impl App {
             in_flight: &self.in_flight,
             provisioning_target: &self.ui.provisioning_target,
             my_host,
+            my_node_id,
             active_repo: self.model.active_repo,
             repo_order: &self.model.repo_order,
             commands: &mut self.proto_commands,
@@ -913,14 +932,14 @@ impl App {
             DaemonEvent::RepoDelta(delta) => self.apply_delta(*delta),
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
-            DaemonEvent::CommandStarted { command_id, host, repo_identity, repo, description, .. } => {
-                tracing::info!(%command_id, %host, %description, repo = %repo_identity.path, "command started");
+            DaemonEvent::CommandStarted { command_id, node_id, repo_identity, repo, description, .. } => {
+                tracing::info!(%command_id, %node_id, %description, repo = %repo_identity.path, "command started");
                 let repo = repo
                     .or_else(|| self.model.repos.get(&repo_identity).map(|rm| rm.path.clone()))
                     .unwrap_or_else(|| TuiModel::display_path(&repo_identity, None));
                 self.in_flight.insert(command_id, InFlightCommand { repo_identity, repo, description });
             }
-            DaemonEvent::CommandFinished { command_id, host: _, repo_identity: _, repo: _, result, .. } => {
+            DaemonEvent::CommandFinished { command_id, node_id: _, repo_identity: _, repo: _, result, .. } => {
                 if let Some(cmd) = self.in_flight.remove(&command_id) {
                     let error_message = match &result {
                         CommandValue::Error { message } => {
@@ -956,32 +975,32 @@ impl App {
                     }
                 }
             }
-            DaemonEvent::CommandStepUpdate { command_id, description, step_index, step_count, status, host, .. } => {
+            DaemonEvent::CommandStepUpdate { command_id, description, step_index, step_count, status, node_id, .. } => {
                 if let Some(cmd) = self.in_flight.get_mut(&command_id) {
                     let step_label = format!("{}/{}", step_index + 1, step_count);
                     match status {
                         StepStatus::Started => {
-                            tracing::info!(%command_id, %host, step = %step_label, %description, "step started");
+                            tracing::info!(%command_id, %node_id, step = %step_label, %description, "step started");
                             cmd.description = format!("{} ({})", description, step_label);
                         }
                         StepStatus::Skipped => {
-                            tracing::info!(%command_id, %host, step = %step_label, %description, "step skipped");
+                            tracing::info!(%command_id, %node_id, step = %step_label, %description, "step skipped");
                         }
                         StepStatus::Succeeded => {
-                            tracing::info!(%command_id, %host, step = %step_label, %description, "step succeeded");
+                            tracing::info!(%command_id, %node_id, step = %step_label, %description, "step succeeded");
                         }
                         StepStatus::Failed { ref message } => {
-                            tracing::warn!(%command_id, %host, step = %step_label, %description, error = %message, "step failed");
+                            tracing::warn!(%command_id, %node_id, step = %step_label, %description, error = %message, "step failed");
                             self.set_status_message(Some(format!("{description}: {message}")));
                         }
                     }
                 }
             }
-            DaemonEvent::PeerStatusChanged { host, status } => {
+            DaemonEvent::PeerStatusChanged { node_id, status } => {
                 let peer_status = PeerStatus::from(status);
-                let clear_target =
-                    matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected) && self.ui.provisioning_target.host() == &host;
-                if let Some(entry) = self.model.hosts.get_mut(&host) {
+                let clear_target = matches!(peer_status, PeerStatus::Disconnected | PeerStatus::Rejected)
+                    && self.model.node_id_for_host(self.ui.provisioning_target.host()).is_some_and(|target| *target == node_id);
+                if let Some(entry) = self.model.hosts.values_mut().find(|entry| entry.summary.node.node_id == node_id) {
                     entry.status = peer_status;
                 }
                 if clear_target {
@@ -990,16 +1009,16 @@ impl App {
             }
             DaemonEvent::HostSnapshot(snap) => {
                 let status = PeerStatus::from(snap.connection_status);
-                self.model.hosts.insert(snap.host_name.clone(), TuiHostState {
-                    host_name: snap.host_name,
+                self.model.hosts.insert(HostName::new(&snap.node.display_name), TuiHostState {
+                    host_name: HostName::new(&snap.node.display_name),
                     is_local: snap.is_local,
                     status,
                     summary: snap.summary,
                 });
             }
-            DaemonEvent::HostRemoved { host, .. } => {
-                let clear_target = self.ui.provisioning_target.host() == &host;
-                self.model.hosts.remove(&host);
+            DaemonEvent::HostRemoved { node_id, .. } => {
+                let clear_target = self.model.node_id_for_host(self.ui.provisioning_target.host()).is_some_and(|target| *target == node_id);
+                self.model.hosts.retain(|_, host| host.summary.node.node_id != node_id);
                 if clear_target {
                     self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }

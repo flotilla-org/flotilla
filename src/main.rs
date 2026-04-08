@@ -291,7 +291,7 @@ async fn run_tui(cli: Cli) -> Result<()> {
             let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
             if let Err(e) = daemon
                 .execute(flotilla_protocol::Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: flotilla_protocol::CommandAction::TrackRepoPath { path: canonical.clone() },

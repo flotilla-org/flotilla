@@ -49,12 +49,12 @@ impl ActionMenuWidget {
 
         match entry.intent {
             Intent::RemoveCheckout => {
-                let remote_host = match ctx.model.my_host() {
-                    Some(my_host) if self.item.host != *my_host => Some(self.item.host.clone()),
+                let remote_node_id = match ctx.model.my_node_id() {
+                    Some(my_node_id) if self.item.node_id != *my_node_id => Some(self.item.node_id.clone()),
                     _ => None,
                 };
                 let checkout_path = self.item.checkout_key().map(|hp| hp.path.clone());
-                let widget = DeleteConfirmWidget::new(self.item.identity.clone(), remote_host, checkout_path);
+                let widget = DeleteConfirmWidget::new(self.item.identity.clone(), remote_node_id, checkout_path);
                 let pending_ctx =
                     PendingActionContext { identity: self.item.identity.clone(), description: entry.intent.label(labels), repo_identity };
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));
@@ -184,7 +184,7 @@ mod tests {
     fn make_checkout_entry() -> (WorkItem, Vec<MenuEntry>) {
         let item = checkout_item("feat/a", "/tmp/a", false);
         let command = Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::FetchCheckoutStatus {
@@ -200,7 +200,7 @@ mod tests {
     fn make_simple_entry(intent: Intent) -> (WorkItem, Vec<MenuEntry>) {
         let item = checkout_item("feat/b", "/tmp/b", false);
         let command = Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/b".into(), label: "feat/b".into() },
@@ -223,7 +223,7 @@ mod tests {
             MenuEntry {
                 intent: Intent::CreateWorkspace,
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/a".into(), label: "feat/a".into() },
@@ -232,7 +232,7 @@ mod tests {
             MenuEntry {
                 intent: Intent::RemoveCheckout,
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::FetchCheckoutStatus {
@@ -258,7 +258,7 @@ mod tests {
         let entries = vec![MenuEntry {
             intent: Intent::CreateWorkspace,
             command: Command {
-                host: None,
+                node_id: None,
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/a".into(), label: "feat/a".into() },
@@ -280,7 +280,7 @@ mod tests {
             MenuEntry {
                 intent: Intent::CreateWorkspace,
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/a".into(), label: "feat/a".into() },
@@ -289,7 +289,7 @@ mod tests {
             MenuEntry {
                 intent: Intent::RemoveCheckout,
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::FetchCheckoutStatus {
@@ -366,7 +366,7 @@ mod tests {
     fn confirm_close_change_request_swaps_to_close_confirm_widget() {
         let item = pr_item("42");
         let command = Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::CloseChangeRequest { id: "42".into() },
@@ -387,7 +387,7 @@ mod tests {
         let mut item = checkout_item("feat/c", "/tmp/c", false);
         item.issue_keys = vec!["123".into()];
         let command = Command {
-            host: None,
+            node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::GenerateBranchName { issue_keys: vec!["123".into()] },
@@ -440,7 +440,7 @@ mod tests {
             MenuEntry {
                 intent: Intent::CreateWorkspace,
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::CreateWorkspaceForCheckout { checkout_path: "/tmp/a".into(), label: "feat/a".into() },
@@ -449,7 +449,7 @@ mod tests {
             MenuEntry {
                 intent: Intent::RemoveCheckout,
                 command: Command {
-                    host: None,
+                    node_id: None,
                     provisioning_target: None,
                     context_repo: None,
                     action: CommandAction::FetchCheckoutStatus {
@@ -498,11 +498,10 @@ mod tests {
     #[test]
     fn remove_checkout_remote_item_sets_remote_host() {
         let mut item = checkout_item("feat/r", "/tmp/r", false);
-        let remote = HostName::new("remote-host");
-        item.host = remote.clone();
+        item.node_id = flotilla_protocol::NodeId::new("remote-host");
 
         let command = Command {
-            host: Some(remote.clone()),
+            node_id: Some(flotilla_protocol::NodeId::new("remote-host")),
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::FetchCheckoutStatus {
@@ -522,7 +521,7 @@ mod tests {
             is_local: true,
             status: crate::app::PeerStatus::Connected,
             summary: flotilla_protocol::HostSummary {
-                host_name: HostName::new("local-host"),
+                node: flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("local-host"), "local-host"),
                 system: flotilla_protocol::SystemInfo::default(),
                 inventory: flotilla_protocol::ToolInventory::default(),
                 providers: vec![],
@@ -535,7 +534,7 @@ mod tests {
         match outcome {
             Outcome::Swap(mut swapped) => {
                 let dcw = swapped.as_any_mut().downcast_ref::<super::DeleteConfirmWidget>().expect("expected DeleteConfirmWidget");
-                assert_eq!(dcw.remote_host.as_ref(), Some(&HostName::new("remote-host")));
+                assert_eq!(dcw.remote_node_id.as_ref(), Some(&flotilla_protocol::NodeId::new("remote-host")));
             }
             other => panic!("expected Swap, got {:?}", std::mem::discriminant(&other)),
         }

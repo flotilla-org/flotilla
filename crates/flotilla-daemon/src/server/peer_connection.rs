@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use flotilla_core::in_process::InProcessDaemon;
-use flotilla_protocol::{GoodbyeReason, HostName, Message, PeerConnectionState, PeerWireMessage, PROTOCOL_VERSION};
+use flotilla_protocol::{GoodbyeReason, Message, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, PROTOCOL_VERSION};
 use flotilla_transport::message::MessageSession;
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{error, info, warn};
@@ -38,10 +38,10 @@ impl PeerConnection {
         Self { daemon, shutdown_rx, peer_data_tx, peer_manager, peer_connected_tx, client_count, client_notify }
     }
 
-    pub(super) async fn run(mut self, session: Arc<MessageSession>, protocol_version: u32, host_name: HostName, session_id: uuid::Uuid) {
+    pub(super) async fn run(mut self, session: Arc<MessageSession>, protocol_version: u32, node_id: NodeId, session_id: uuid::Uuid) {
         if protocol_version != PROTOCOL_VERSION {
             warn!(
-                peer = %host_name,
+                peer = %node_id,
                 expected = PROTOCOL_VERSION,
                 got = protocol_version,
                 "peer protocol version mismatch"
@@ -52,10 +52,10 @@ impl PeerConnection {
         if session
             .write(Message::Hello {
                 protocol_version: PROTOCOL_VERSION,
-                host_name: self.daemon.host_name().clone(),
+                node_id: self.daemon.node_id().clone(),
+                display_name: self.daemon.host_name().to_string(),
                 session_id: self.daemon.session_id(),
                 connection_role: None,
-                environment_id: None,
             })
             .await
             .is_err()
@@ -75,10 +75,11 @@ impl PeerConnection {
             }
         });
 
+        let peer_node = NodeInfo::new(node_id.clone(), node_id.to_string());
         let (generation, displaced_generation) = {
             let mut pm = self.peer_manager.lock().await;
             match pm.activate_connection_with_session(
-                host_name.clone(),
+                node_id.clone(),
                 Arc::new(SocketPeerSender { tx: tokio::sync::Mutex::new(Some(outbound_tx.clone())) }),
                 ConnectionMeta { direction: ConnectionDirection::Inbound, config_label: None, expected_peer: None, config_backed: false },
                 remote_session_id,
@@ -94,19 +95,19 @@ impl PeerConnection {
         if let Some(displaced_generation) = displaced_generation {
             let displaced = {
                 let mut pm = self.peer_manager.lock().await;
-                pm.take_displaced_sender(&host_name, displaced_generation)
+                pm.take_displaced_sender(&node_id, displaced_generation)
             };
             if let Some(displaced) = displaced {
                 let _ = displaced.retire(GoodbyeReason::Superseded).await;
             }
         }
         let count = self.client_count.fetch_add(1, Ordering::SeqCst) + 1;
-        info!(peer = %host_name, %count, "peer connected");
+        info!(peer = %node_id, %count, "peer connected");
         self.client_notify.notify_one();
 
         sync_peer_query_state(&self.peer_manager, &self.daemon).await;
-        self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Connected).await;
-        let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: host_name.clone(), generation });
+        self.daemon.publish_peer_connection_status(&peer_node, PeerConnectionState::Connected).await;
+        let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: node_id.clone(), generation });
 
         loop {
             tokio::select! {
@@ -118,20 +119,20 @@ impl PeerConnection {
                                     if let Err(e) = self.peer_data_tx.send(InboundPeerEnvelope {
                                         msg: *peer_msg,
                                         connection_generation: generation,
-                                        connection_peer: host_name.clone(),
+                                        connection_peer: node_id.clone(),
                                     }).await {
-                                        warn!(peer = %host_name, err = %e, "failed to forward inbound peer message");
+                                        warn!(peer = %node_id, err = %e, "failed to forward inbound peer message");
                                         break;
                                     }
                                 }
                                 other => {
-                                    warn!(peer = %host_name, msg = ?other, "unexpected message type from peer");
+                                    warn!(peer = %node_id, msg = ?other, "unexpected message type from peer");
                                     break;
                                 }
                             }
                         }
                         Err(e) => {
-                            error!(peer = %host_name, err = %e, "error reading from peer");
+                            error!(peer = %node_id, err = %e, "error reading from peer");
                             break;
                         }
                         Ok(None) => break,
@@ -145,13 +146,13 @@ impl PeerConnection {
             }
         }
 
-        let plan = disconnect_peer_and_rebuild(&self.peer_manager, &self.daemon, &host_name, generation).await;
+        let plan = disconnect_peer_and_rebuild(&self.peer_manager, &self.daemon, &node_id, generation).await;
         if plan.was_active {
-            self.daemon.publish_peer_connection_status(&host_name, PeerConnectionState::Disconnected).await;
+            self.daemon.publish_peer_connection_status(&peer_node, PeerConnectionState::Disconnected).await;
         }
         relay_task.abort();
         let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
-        info!(peer = %host_name, %count, "peer disconnected");
+        info!(peer = %node_id, %count, "peer disconnected");
         self.client_notify.notify_one();
     }
 }

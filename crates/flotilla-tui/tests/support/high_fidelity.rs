@@ -112,7 +112,7 @@ impl HighFidelityHarness {
         let topology = spawn_in_memory_request_topology(Arc::clone(&leader), Arc::clone(&follower)).await?;
 
         leader.refresh(&RepoSelector::Path(leader_repo)).await.map_err(|e| format!("refresh leader: {e}"))?;
-        follower.refresh(&RepoSelector::Path(follower_repo)).await.map_err(|e| format!("refresh follower: {e}"))?;
+        follower.refresh(&RepoSelector::Path(follower_repo.clone())).await.map_err(|e| format!("refresh follower: {e}"))?;
 
         let daemon: Arc<dyn DaemonHandle> = topology.client.clone();
         let daemon_rx = daemon.subscribe();
@@ -183,10 +183,10 @@ impl HighFidelityHarness {
 
     pub async fn confirm_delete(&mut self) -> Result<(), String> {
         if let Some(widget) = self.app.screen.modal_stack.last().and_then(|widget| widget.as_any().downcast_ref::<DeleteConfirmWidget>()) {
-            if widget.remote_host.is_none() {
-                let selected_host = self.app.selected_work_item().map(|item| item.host.clone());
+            if widget.remote_node_id.is_none() {
+                let selected_node_id = self.app.selected_work_item().map(|item| item.node_id.clone());
                 return Err(format!(
-                    "delete confirmation resolved no remote host; my_host={:?}, selected_host={selected_host:?}",
+                    "delete confirmation resolved no remote node; my_host={:?}, selected_node_id={selected_node_id:?}",
                     self.app.model.my_host()
                 ));
             }
@@ -203,9 +203,9 @@ impl HighFidelityHarness {
         self.drain_events()?;
 
         if dispatched == 0 {
-            let selected_host = self.app.selected_work_item().map(|item| item.host.clone());
+            let selected_node_id = self.app.selected_work_item().map(|item| item.node_id.clone());
             return Err(format!(
-                "delete confirmation queued no command; my_host={:?}, selected_host={selected_host:?}, status={:?}",
+                "delete confirmation queued no command; my_host={:?}, selected_node_id={selected_node_id:?}, status={:?}",
                 self.app.model.my_host(),
                 self.app.model.status_message
             ));
@@ -295,24 +295,27 @@ impl HighFidelityHarness {
 
     fn record_event(&mut self, event: &DaemonEvent) {
         let summary = match event {
-            DaemonEvent::CommandStarted { command_id, host, description, .. } => {
-                format!("started id={command_id} host={host} desc={description}")
+            DaemonEvent::CommandStarted { command_id, node_id, description, .. } => {
+                format!("started id={command_id} node_id={node_id} desc={description}")
             }
-            DaemonEvent::CommandFinished { command_id, host, result, .. } => {
-                format!("finished id={command_id} host={host} result={result:?}")
+            DaemonEvent::CommandFinished { command_id, node_id, result, .. } => {
+                format!("finished id={command_id} node_id={node_id} result={result:?}")
             }
-            DaemonEvent::CommandStepUpdate { command_id, host, description, status, .. } => {
-                format!("step id={command_id} host={host} desc={description} status={status:?}")
+            DaemonEvent::CommandStepUpdate { command_id, node_id, description, status, .. } => {
+                format!("step id={command_id} node_id={node_id} desc={description} status={status:?}")
             }
             DaemonEvent::HostSnapshot(snap) => {
-                format!("host_snapshot host={} local={} status={:?}", snap.host_name, snap.is_local, snap.connection_status)
+                format!(
+                    "host_snapshot node_id={} display={} local={} status={:?}",
+                    snap.node.node_id, snap.node.display_name, snap.is_local, snap.connection_status
+                )
             }
-            DaemonEvent::PeerStatusChanged { host, status } => format!("peer_status host={host} status={status:?}"),
+            DaemonEvent::PeerStatusChanged { node_id, status } => format!("peer_status node_id={node_id} status={status:?}"),
             DaemonEvent::RepoSnapshot(snap) => format!("repo_snapshot repo={} seq={}", fmt_optional_path(snap.repo.as_deref()), snap.seq),
             DaemonEvent::RepoDelta(delta) => format!("repo_delta repo={} seq={}", fmt_optional_path(delta.repo.as_deref()), delta.seq),
             DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
             DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
-            DaemonEvent::HostRemoved { host, .. } => format!("host_removed {host}"),
+            DaemonEvent::HostRemoved { node_id, .. } => format!("host_removed {node_id}"),
         };
         self.recent_events.push(summary);
         if self.recent_events.len() > 20 {
@@ -388,20 +391,23 @@ fn fmt_optional_path(path: Option<&std::path::Path>) -> String {
 
 fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEvent) {
     let summary = match event {
-        DaemonEvent::CommandStarted { command_id, host, description, .. } => {
-            format!("{source}: started id={command_id} host={host} desc={description}")
+        DaemonEvent::CommandStarted { command_id, node_id, description, .. } => {
+            format!("{source}: started id={command_id} node_id={node_id} desc={description}")
         }
-        DaemonEvent::CommandFinished { command_id, host, result, .. } => {
-            format!("{source}: finished id={command_id} host={host} result={result:?}")
+        DaemonEvent::CommandFinished { command_id, node_id, result, .. } => {
+            format!("{source}: finished id={command_id} node_id={node_id} result={result:?}")
         }
-        DaemonEvent::CommandStepUpdate { command_id, host, description, status, .. } => {
-            format!("{source}: step id={command_id} host={host} desc={description} status={status:?}")
+        DaemonEvent::CommandStepUpdate { command_id, node_id, description, status, .. } => {
+            format!("{source}: step id={command_id} node_id={node_id} desc={description} status={status:?}")
         }
         DaemonEvent::HostSnapshot(snap) => {
-            format!("{source}: host_snapshot host={} local={} status={:?}", snap.host_name, snap.is_local, snap.connection_status)
+            format!(
+                "{source}: host_snapshot node_id={} display={} local={} status={:?}",
+                snap.node.node_id, snap.node.display_name, snap.is_local, snap.connection_status
+            )
         }
-        DaemonEvent::PeerStatusChanged { host, status } => {
-            format!("{source}: peer_status host={host} status={status:?}")
+        DaemonEvent::PeerStatusChanged { node_id, status } => {
+            format!("{source}: peer_status node_id={node_id} status={status:?}")
         }
         DaemonEvent::RepoSnapshot(snap) => {
             format!("{source}: repo_snapshot repo={} seq={}", fmt_optional_path(snap.repo.as_deref()), snap.seq)
@@ -411,7 +417,7 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         }
         DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
         DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),
-        DaemonEvent::HostRemoved { host, .. } => format!("{source}: host_removed {host}"),
+        DaemonEvent::HostRemoved { node_id, .. } => format!("{source}: host_removed {node_id}"),
     };
     recent.push(summary);
     if recent.len() > 20 {

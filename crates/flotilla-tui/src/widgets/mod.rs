@@ -21,7 +21,7 @@ use std::{any::Any, collections::HashMap};
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use flotilla_core::config::ConfigStore;
-use flotilla_protocol::{HostName, ProvisioningTarget, RepoIdentity};
+use flotilla_protocol::{HostName, NodeId, ProvisioningTarget, RepoIdentity};
 use ratatui::{layout::Rect, Frame};
 
 use crate::{
@@ -102,6 +102,7 @@ pub struct WidgetContext<'a> {
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
     pub provisioning_target: &'a ProvisioningTarget,
     pub my_host: Option<HostName>,
+    pub my_node_id: Option<NodeId>,
     pub active_repo: usize,
     pub repo_order: &'a [RepoIdentity],
     pub commands: &'a mut CommandQueue,

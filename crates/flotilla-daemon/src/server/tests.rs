@@ -515,7 +515,7 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
     assert_eq!(sent.len(), 1);
     match &sent[0] {
         PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_node_id, target_node_id, command, .. }) => {
-            assert_eq!(requester_node_id, &node("local"));
+            assert_eq!(requester_node_id, daemon.node_id());
             assert_eq!(target_node_id, &node("feta"));
             assert_eq!(command.as_ref(), &Command {
                 node_id: Some(node("feta")),
@@ -716,7 +716,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
 
     match routed {
         RoutedPeerMessage::RemoteStepRequest { requester_node_id, target_node_id, repo_identity: identity, step_offset, steps, .. } => {
-            assert_eq!(requester_node_id, node("local"));
+            assert_eq!(requester_node_id, *daemon.node_id());
             assert_eq!(target_node_id, NodeId::new("feta"));
             assert_eq!(identity, repo_identity);
             assert_eq!(step_offset, 0);
@@ -952,6 +952,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
             StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
                 label: "feat-workspace-local@feta".into(),
                 target_node_id: NodeId::new("feta"),
+                display_host: Some(HostName::new("feta")),
                 checkout_path: PathBuf::from("/srv/feta/repo/wt-feat-workspace-local"),
                 checkout_key: None,
                 attachable_set_id: None,
@@ -963,43 +964,38 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
         ])
         .await;
 
-    let mut saw_remote_checkout_step = false;
-    let mut saw_remote_prepare_step = false;
-    let workspace_event = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await.expect("broadcast channel should stay open") {
-                DaemonEvent::CommandStepUpdate { command_id: id, node_id, description, status, .. } if id == command_id => {
-                    if description == "Create checkout for branch feat-workspace-local" && status == StepStatus::Started {
-                        saw_remote_checkout_step = true;
+    let (saw_remote_checkout_step, saw_remote_prepare_step, saw_local_attach_step, finished) =
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut saw_remote_checkout_step = false;
+            let mut saw_remote_prepare_step = false;
+            let mut saw_local_attach_step = false;
+            loop {
+                match rx.recv().await.expect("broadcast channel should stay open") {
+                    DaemonEvent::CommandStepUpdate { command_id: id, node_id, description, status, .. } if id == command_id => {
+                        if description == "Create checkout for branch feat-workspace-local" && status == StepStatus::Started {
+                            saw_remote_checkout_step = true;
+                        }
+                        if description == "Prepare workspace for feat-workspace-local@feta" && status == StepStatus::Started {
+                            saw_remote_prepare_step = true;
+                        }
+                        if description == "Attach workspace" && matches!(status, StepStatus::Started | StepStatus::Succeeded) {
+                            assert_eq!(node_id, *daemon.node_id());
+                            saw_local_attach_step = true;
+                        }
                     }
-                    if description == "Prepare workspace for feat-workspace-local@feta" && status == StepStatus::Started {
-                        saw_remote_prepare_step = true;
+                    DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => {
+                        return (saw_remote_checkout_step, saw_remote_prepare_step, saw_local_attach_step, result);
                     }
-                    if description == "Attach workspace" && status == StepStatus::Succeeded {
-                        return node_id;
-                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-    })
-    .await
-    .expect("timeout waiting for local workspace step");
+        })
+        .await
+        .expect("timeout waiting for command completion");
 
     assert!(saw_remote_checkout_step, "expected remote checkout progress before local attach");
     assert!(saw_remote_prepare_step, "expected remote workspace preparation before local attach");
-    assert_eq!(workspace_event, node("local"));
-
-    let finished = tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await.expect("broadcast channel should stay open") {
-                DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => return result,
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for command completion");
+    assert!(saw_local_attach_step, "expected a local attach workspace step");
 
     assert_eq!(finished, CommandValue::CheckoutCreated {
         branch: "feat-workspace-local".into(),
@@ -2757,7 +2753,7 @@ async fn handle_client_relays_outbound_peer_messages() {
 
     {
         let pm = peer_manager.lock().await;
-        pm.send_to(&NodeId::new("relay-target"), PeerWireMessage::Data(test_peer_msg("other-host"))).await.expect("send relay");
+        pm.send_to(&NodeId::new("remote-host"), PeerWireMessage::Data(test_peer_msg("other-host"))).await.expect("send relay");
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
