@@ -74,16 +74,18 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
     let mut peer_manager = PeerManager::new(local_node_id.clone());
     for (name, host_config) in hosts_config.hosts {
         let expected_host_name = HostName::new(&host_config.expected_host_name);
+        let expected_node_id = host_config.expected_node_id.clone();
         match SshTransport::new(
             local_node_id.clone(),
             host_name.to_string(),
             ConfigLabel(name.clone()),
             host_config,
+            expected_node_id.clone(),
             daemon.session_id(),
             config.state_dir().as_path(),
         ) {
             Ok(transport) => {
-                peer_manager.add_configured_target(ConfigLabel(name), expected_host_name, Box::new(transport));
+                peer_manager.add_configured_target(ConfigLabel(name), expected_host_name, expected_node_id, Box::new(transport));
             }
             Err(e) => {
                 warn!(host = %name, err = %e, "skipping peer with invalid host name");

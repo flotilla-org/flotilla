@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+use flotilla_protocol::NodeId;
 use serde::{Deserialize, Serialize};
 
 use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -222,6 +223,8 @@ pub struct HostsConfig {
 pub struct RemoteHostConfig {
     pub hostname: String,
     pub expected_host_name: String,
+    #[serde(default)]
+    pub expected_node_id: Option<NodeId>,
     pub user: Option<String>,
     pub daemon_socket: String,
     pub ssh_multiplex: Option<bool>,
@@ -239,6 +242,8 @@ struct RawHostsConfig {
 struct RawRemoteHostConfig {
     hostname: String,
     expected_host_name: Option<String>,
+    #[serde(default)]
+    expected_node_id: Option<NodeId>,
     user: Option<String>,
     daemon_socket: String,
     ssh_multiplex: Option<bool>,
@@ -259,6 +264,7 @@ impl<'de> Deserialize<'de> for HostsConfig {
                 (label, RemoteHostConfig {
                     hostname: host.hostname,
                     expected_host_name,
+                    expected_node_id: host.expected_node_id,
                     user: host.user,
                     daemon_socket: host.daemon_socket,
                     ssh_multiplex: host.ssh_multiplex,

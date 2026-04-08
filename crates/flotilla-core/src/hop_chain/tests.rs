@@ -113,6 +113,7 @@ fn test_hosts_config() -> HostsConfig {
     hosts.insert("feta".into(), RemoteHostConfig {
         hostname: "feta.local".into(),
         expected_host_name: "feta".into(),
+        expected_node_id: None,
         user: Some("alice".into()),
         daemon_socket: "/tmp/flotilla.sock".into(),
         ssh_multiplex: None,
@@ -120,6 +121,7 @@ fn test_hosts_config() -> HostsConfig {
     hosts.insert("gouda".into(), RemoteHostConfig {
         hostname: "gouda.example.com".into(),
         expected_host_name: "gouda".into(),
+        expected_node_id: None,
         user: None,
         daemon_socket: "/tmp/flotilla.sock".into(),
         ssh_multiplex: Some(false),

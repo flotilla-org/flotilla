@@ -42,11 +42,16 @@ pub async fn spawn_in_memory_request_topology(
     let (leader_transport, follower_transport) = channel_transport_pair(leader_host.clone(), follower_host.clone());
     {
         let mut pm = leader_peer_manager.lock().await;
-        pm.add_configured_target(flotilla_protocol::ConfigLabel("follower".into()), follower_host.clone(), Box::new(leader_transport));
+        pm.add_configured_target(
+            flotilla_protocol::ConfigLabel("follower".into()),
+            follower_host.clone(),
+            None,
+            Box::new(leader_transport),
+        );
     }
     {
         let mut pm = follower_peer_manager.lock().await;
-        pm.add_configured_target(flotilla_protocol::ConfigLabel("leader".into()), leader_host.clone(), Box::new(follower_transport));
+        pm.add_configured_target(flotilla_protocol::ConfigLabel("leader".into()), leader_host.clone(), None, Box::new(follower_transport));
     }
 
     let (leader_peer_data_tx, leader_peer_data_rx) = mpsc::channel(256);
@@ -104,11 +109,16 @@ pub async fn spawn_in_memory_request_topology_stateful(
     let (leader_transport, follower_transport) = channel_transport_pair(leader_host.clone(), follower_host.clone());
     {
         let mut pm = leader_peer_manager.lock().await;
-        pm.add_configured_target(flotilla_protocol::ConfigLabel("follower".into()), follower_host.clone(), Box::new(leader_transport));
+        pm.add_configured_target(
+            flotilla_protocol::ConfigLabel("follower".into()),
+            follower_host.clone(),
+            None,
+            Box::new(leader_transport),
+        );
     }
     {
         let mut pm = follower_peer_manager.lock().await;
-        pm.add_configured_target(flotilla_protocol::ConfigLabel("leader".into()), leader_host.clone(), Box::new(follower_transport));
+        pm.add_configured_target(flotilla_protocol::ConfigLabel("leader".into()), leader_host.clone(), None, Box::new(follower_transport));
     }
 
     let (leader_peer_data_tx, leader_peer_data_rx) = mpsc::channel(256);

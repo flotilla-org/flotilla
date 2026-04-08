@@ -55,7 +55,7 @@ fn accepted_generation(result: ActivationResult) -> u64 {
 }
 
 fn add_configured_transport(mgr: &mut PeerManager, label: &str, expected_host_name: &str, transport: MockTransport) {
-    mgr.add_configured_target(ConfigLabel(label.into()), HostName::new(expected_host_name), Box::new(transport));
+    mgr.add_configured_target(ConfigLabel(label.into()), HostName::new(expected_host_name), None, Box::new(transport));
 }
 
 fn remote_node(node_id: &str, display_name: &str) -> NodeInfo {
@@ -627,8 +627,8 @@ async fn configured_targets_are_stored_separately_from_established_peers() {
     let established = mgr.configured_peers();
 
     assert_eq!(configured, vec![
-        ConfiguredPeerTargetInfo { label: ConfigLabel("a".into()), expected_host_name: HostName::new("a-host") },
-        ConfiguredPeerTargetInfo { label: ConfigLabel("z".into()), expected_host_name: HostName::new("z-host") },
+        ConfiguredPeerTargetInfo { label: ConfigLabel("a".into()), expected_host_name: HostName::new("a-host"), expected_node_id: None },
+        ConfiguredPeerTargetInfo { label: ConfigLabel("z".into()), expected_host_name: HostName::new("z-host"), expected_node_id: None },
     ]);
     assert!(established.is_empty(), "configured targets should not look established before handshake");
 }

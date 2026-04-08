@@ -167,6 +167,7 @@ pub struct PendingPeerSend {
 
 struct ConfiguredPeerTarget {
     expected_host_name: HostName,
+    expected_node_id: Option<NodeId>,
     transport: Box<dyn PeerTransport>,
 }
 
@@ -174,6 +175,7 @@ struct ConfiguredPeerTarget {
 pub struct ConfiguredPeerTargetInfo {
     pub label: ConfigLabel,
     pub expected_host_name: HostName,
+    pub expected_node_id: Option<NodeId>,
 }
 
 #[derive(Debug)]
@@ -342,9 +344,15 @@ impl PeerManager {
     }
 
     /// Register a configured outbound connection target.
-    pub fn add_configured_target(&mut self, label: ConfigLabel, expected_host_name: HostName, transport: Box<dyn PeerTransport>) {
-        info!(target = %label.0, expected_host = %expected_host_name, "registered configured peer target");
-        self.configured_targets.insert(label, ConfiguredPeerTarget { expected_host_name, transport });
+    pub fn add_configured_target(
+        &mut self,
+        label: ConfigLabel,
+        expected_host_name: HostName,
+        expected_node_id: Option<NodeId>,
+        transport: Box<dyn PeerTransport>,
+    ) {
+        info!(target = %label.0, expected_host = %expected_host_name, expected_node_id = ?expected_node_id, "registered configured peer target");
+        self.configured_targets.insert(label, ConfiguredPeerTarget { expected_host_name, expected_node_id, transport });
     }
 
     /// Register or replace a sender for a connected peer.
@@ -1433,7 +1441,11 @@ impl PeerManager {
         let mut targets: Vec<_> = self
             .configured_targets
             .iter()
-            .map(|(label, target)| ConfiguredPeerTargetInfo { label: label.clone(), expected_host_name: target.expected_host_name.clone() })
+            .map(|(label, target)| ConfiguredPeerTargetInfo {
+                label: label.clone(),
+                expected_host_name: target.expected_host_name.clone(),
+                expected_node_id: target.expected_node_id.clone(),
+            })
             .collect();
         targets.sort_by(|a, b| a.label.0.cmp(&b.label.0));
         targets

@@ -81,11 +81,13 @@ impl TestNetwork {
         self.peers[a].manager.add_configured_target(
             ConfigLabel(format!("to-{}", name_b)),
             HostName::new(name_b.as_str()),
+            None,
             Box::new(transport_a),
         );
         self.peers[b].manager.add_configured_target(
             ConfigLabel(format!("to-{}", name_a)),
             HostName::new(name_a.as_str()),
+            None,
             Box::new(transport_b),
         );
     }

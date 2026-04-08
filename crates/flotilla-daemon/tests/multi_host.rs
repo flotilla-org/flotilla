@@ -62,7 +62,7 @@ fn node_info(name: &str) -> NodeInfo {
 }
 
 fn add_configured_transport(mgr: &mut PeerManager, label: &str, expected_host_name: &str, transport: MockTransport) {
-    mgr.add_configured_target(ConfigLabel(label.into()), HostName::new(expected_host_name), Box::new(transport));
+    mgr.add_configured_target(ConfigLabel(label.into()), HostName::new(expected_host_name), None, Box::new(transport));
 }
 
 async fn wait_for_local_checkout(daemon: &Arc<InProcessDaemon>, repo: &std::path::Path, branch: &str) -> ProviderData {
@@ -371,8 +371,8 @@ async fn host_summary_round_trip_between_connected_peers() {
     let (leader_transport, follower_transport) = channel_transport_pair(HostName::new("leader"), HostName::new("follower"));
     let mut leader_mgr = PeerManager::new(node("leader"));
     let mut follower_mgr = PeerManager::new(node("follower"));
-    leader_mgr.add_configured_target(ConfigLabel("follower".into()), HostName::new("follower"), Box::new(leader_transport));
-    follower_mgr.add_configured_target(ConfigLabel("leader".into()), HostName::new("leader"), Box::new(follower_transport));
+    leader_mgr.add_configured_target(ConfigLabel("follower".into()), HostName::new("follower"), None, Box::new(leader_transport));
+    follower_mgr.add_configured_target(ConfigLabel("leader".into()), HostName::new("leader"), None, Box::new(follower_transport));
 
     let mut leader_receivers = leader_mgr.connect_all().await;
     let _follower_receivers = follower_mgr.connect_all().await;
