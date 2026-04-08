@@ -10,13 +10,13 @@ use std::{
 };
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use flotilla_protocol::{qualified_path::HostId, EnvironmentId, NodeId};
+use flotilla_protocol::{EnvironmentId, NodeId, qualified_path::HostId};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::providers::{discovery::EnvVars, ChannelLabel, CommandRunner};
+use crate::providers::{ChannelLabel, CommandRunner, discovery::EnvVars};
 
 /// Resolve a machine-scoped state directory under `base_state_dir`.
 ///
@@ -47,11 +47,7 @@ pub async fn machine_scoped_state_dir(
 fn read_etc_machine_id() -> Option<String> {
     let content = fs::read_to_string("/etc/machine-id").ok()?;
     let trimmed = content.trim().to_owned();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
 /// Query macOS `IOPlatformUUID` via the injected `CommandRunner`.
@@ -189,6 +185,56 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, String> {
     Ok(SigningKey::from_bytes(&secret))
 }
 
+fn read_verifying_key(path: &Path) -> Result<VerifyingKey, String> {
+    let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let verifying_array: [u8; 32] =
+        bytes.try_into().map_err(|_| format!("invalid node public key length in {}: expected 32 bytes", path.display()))?;
+    VerifyingKey::from_bytes(&verifying_array).map_err(|e| format!("invalid node public key in {}: {e}", path.display()))
+}
+
+fn persist_public_key(path: &Path, verifying: &VerifyingKey) -> Result<(), String> {
+    if let Ok(existing) = read_verifying_key(path) {
+        if existing != *verifying {
+            return Err(format!("node keypair mismatch in {}", path.parent().unwrap_or(path).display()));
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("failed to create state dir {}: {e}", parent.display()))?;
+    }
+
+    for _ in 0..8 {
+        let temp = path.parent().unwrap_or_else(|| Path::new(".")).join(format!(".node.pub.{}", Uuid::new_v4()));
+        match fs::write(&temp, verifying.to_bytes()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("failed to write temp node.pub: {e}")),
+        }
+
+        let link_result = fs::hard_link(&temp, path);
+        let _ = fs::remove_file(&temp);
+
+        match link_result {
+            Ok(()) => return Ok(()),
+            Err(_) if path.exists() => {
+                let existing = read_verifying_key(path)?;
+                if existing == *verifying {
+                    return Ok(());
+                }
+                return Err(format!("node keypair mismatch in {}", path.parent().unwrap_or(path).display()));
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let existing = read_verifying_key(path)?;
+    if existing != *verifying {
+        return Err(format!("node keypair mismatch in {}", path.parent().unwrap_or(path).display()));
+    }
+    Ok(())
+}
+
 fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey), String> {
     fs::create_dir_all(state_dir).map_err(|e| format!("failed to create state dir {}: {e}", state_dir.display()))?;
 
@@ -248,10 +294,8 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
     let signing = read_signing_key(&state_dir.join("node.key"))?;
     let key_path = state_dir.join("node.key");
     set_restrictive_permissions(&key_path)?;
-    let verifying_bytes = fs::read(state_dir.join("node.pub")).map_err(|e| format!("failed to read node.pub after retries: {e}"))?;
-    let verifying_array: [u8; 32] =
-        verifying_bytes.try_into().map_err(|_| "invalid node public key length after retries: expected 32 bytes".to_owned())?;
-    let verifying = VerifyingKey::from_bytes(&verifying_array).map_err(|e| format!("invalid node public key after retries: {e}"))?;
+    let verifying = signing.verifying_key();
+    persist_public_key(&state_dir.join("node.pub"), &verifying)?;
     Ok((signing, verifying))
 }
 
@@ -279,18 +323,23 @@ pub fn resolve_or_create_node_id(state_dir: &Path) -> Result<NodeId, String> {
     let key_path = state_dir.join("node.key");
     let pub_path = state_dir.join("node.pub");
 
-    if key_path.exists() && pub_path.exists() {
+    if key_path.exists() {
         let signing = read_signing_key(&key_path)?;
-        let verifying_bytes = fs::read(&pub_path).map_err(|e| format!("failed to read {}: {e}", pub_path.display()))?;
-        let verifying_array: [u8; 32] = verifying_bytes
-            .try_into()
-            .map_err(|_| format!("invalid node public key length in {}: expected 32 bytes", pub_path.display()))?;
-        let verifying =
-            VerifyingKey::from_bytes(&verifying_array).map_err(|e| format!("invalid node public key in {}: {e}", pub_path.display()))?;
-        if signing.verifying_key() != verifying {
-            return Err(format!("node keypair mismatch in {}", state_dir.display()));
+        let verifying = signing.verifying_key();
+        set_restrictive_permissions(&key_path)?;
+        if pub_path.exists() {
+            let persisted = read_verifying_key(&pub_path)?;
+            if persisted != verifying {
+                return Err(format!("node keypair mismatch in {}", state_dir.display()));
+            }
+            return Ok(node_id_from_public_key(&persisted));
         }
+        persist_public_key(&pub_path, &verifying)?;
         return Ok(node_id_from_public_key(&verifying));
+    }
+
+    if pub_path.exists() {
+        return Err(format!("node private key missing for existing public key in {}", state_dir.display()));
     }
 
     let (_signing, verifying) = write_new_node_keypair(state_dir)?;
@@ -439,7 +488,7 @@ async fn resolve_or_create_remote_environment_id_at(runner: &dyn CommandRunner, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{discovery::test_support::TestEnvVars, ProcessCommandRunner};
+    use crate::providers::{ProcessCommandRunner, discovery::test_support::TestEnvVars};
 
     #[test]
     fn generates_and_persists_host_id() {
@@ -540,6 +589,22 @@ mod tests {
         let pub_bytes = fs::read(dir.path().join("node.pub")).unwrap();
         let pub_array: [u8; 32] = pub_bytes.try_into().unwrap();
         let public_key = VerifyingKey::from_bytes(&pub_array).unwrap();
+        assert_eq!(node_id, node_id_from_public_key(&public_key));
+    }
+
+    #[test]
+    fn resolve_or_create_node_id_recovers_missing_public_key_from_private_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(dir.path().join("node.key"), signing.to_bytes()).unwrap();
+
+        let node_id = resolve_or_create_node_id(dir.path()).unwrap();
+
+        let pub_bytes = fs::read(dir.path().join("node.pub")).unwrap();
+        let pub_array: [u8; 32] = pub_bytes.try_into().unwrap();
+        let public_key = VerifyingKey::from_bytes(&pub_array).unwrap();
+        assert_eq!(public_key, signing.verifying_key());
         assert_eq!(node_id, node_id_from_public_key(&public_key));
     }
 
