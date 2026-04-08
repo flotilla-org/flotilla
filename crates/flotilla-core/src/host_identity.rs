@@ -205,12 +205,10 @@ fn read_or_repair_persisted_node_keypair(key_path: &Path, pub_path: &Path) -> Re
 
 fn persist_public_key(path: &Path, verifying: &VerifyingKey) -> Result<(), String> {
     if let Ok(existing) = read_verifying_key(path) {
-        if existing != *verifying {
-            let _ = fs::remove_file(path);
-        }
         if existing == *verifying {
             return Ok(());
         }
+        let _ = fs::remove_file(path);
     }
 
     if let Some(parent) = path.parent() {
@@ -260,15 +258,7 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
         let key_temp = state_dir.join(format!(".node.key.{}", Uuid::new_v4()));
         let pub_temp = state_dir.join(format!(".node.pub.{}", Uuid::new_v4()));
 
-        match fs::write(&key_temp, signing.to_bytes()) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("failed to write temp node.key: {e}")),
-        }
-        if let Err(err) = set_restrictive_permissions(&key_temp) {
-            let _ = fs::remove_file(&key_temp);
-            return Err(err);
-        }
+        write_private_key_temp(&key_temp, &signing.to_bytes())?;
 
         match fs::write(&pub_temp, verifying.to_bytes()) {
             Ok(()) => {}
@@ -299,6 +289,29 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
     let verifying = signing.verifying_key();
     persist_public_key(&state_dir.join("node.pub"), &verifying)?;
     Ok((signing, verifying))
+}
+
+fn write_private_key_temp(path: &Path, bytes: &[u8; 32]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("failed to write temp node.key: {e}"))?;
+        file.write_all(bytes).map_err(|e| format!("failed to write temp node.key: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, bytes).map_err(|e| format!("failed to write temp node.key: {e}"))?;
+        set_restrictive_permissions(path)?;
+        Ok(())
+    }
 }
 
 fn set_restrictive_permissions(path: &Path) -> Result<(), String> {
