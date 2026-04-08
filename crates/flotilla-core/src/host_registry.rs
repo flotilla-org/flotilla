@@ -498,8 +498,8 @@ fn update_host_summary(
     summary: HostSummary,
 ) -> Option<HostSnapshot> {
     let current_environment_id = node_environments.get(&node.node_id).cloned();
-    if let Some(current_environment_id) = current_environment_id {
-        if let Some(state) = hosts.get(&current_environment_id) {
+    if current_environment_id.as_ref().is_some_and(|current| *current == summary.environment_id) {
+        if let Some(state) = current_environment_id.as_ref().and_then(|current| hosts.get(current)) {
             let pending_status = pending_node_statuses.get(&node.node_id).cloned();
             if summary_is_overlay_placeholder(&summary)
                 && state.summary.as_ref().is_some_and(|existing| !summary_is_overlay_placeholder(existing))
@@ -588,8 +588,11 @@ fn reassign_node_environment_if_needed(
         return;
     }
 
-    let replacement =
-        hosts.values().filter(|state| !state.removed && state.node_id == *node_id).map(|state| state.environment_id.clone()).min();
+    let replacement = hosts
+        .values()
+        .filter(|state| !state.removed && state.node_id == *node_id)
+        .max_by(|left, right| left.seq.cmp(&right.seq).then_with(|| left.environment_id.cmp(&right.environment_id)))
+        .map(|state| state.environment_id.clone());
 
     if let Some(environment_id) = replacement {
         node_environments.insert(node_id.clone(), environment_id);
@@ -799,6 +802,57 @@ mod tests {
         assert_eq!(summary.node.display_name, "Build Box");
         assert_eq!(summary.providers, real_summary.providers);
         assert_eq!(summary.system, real_summary.system);
+    }
+
+    #[tokio::test]
+    async fn overlay_placeholder_for_second_environment_on_same_node_is_not_dropped() {
+        let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
+        let peer = NodeInfo::new(NodeId::new("peer-node-43"), "Build Box");
+        let first_environment_id = EnvironmentId::host(HostId::new("peer-node-43-host-a"));
+        let second_environment_id = EnvironmentId::host(HostId::new("peer-node-43-host-b"));
+
+        let real_summary = HostSummary {
+            environment_id: first_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo { os: Some("linux".into()), arch: Some("x86_64".into()), ..SystemInfo::default() },
+            inventory: ToolInventory::default(),
+            providers: vec![flotilla_protocol::HostProviderStatus {
+                category: "workspace".into(),
+                name: "cmux".into(),
+                implementation: "cmux".into(),
+                healthy: true,
+            }],
+            environments: vec![],
+        };
+        let placeholder_summary = HostSummary {
+            environment_id: second_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+
+        registry.publish_peer_summary(real_summary, &|_| {}).await;
+        registry.publish_peer_summary(placeholder_summary.clone(), &|_| {}).await;
+
+        let status = registry
+            .get_host_status(&second_environment_id, HostCounts::default(), &HashMap::new())
+            .await
+            .expect("status for second environment");
+
+        assert_eq!(status.environment_id, second_environment_id);
+        assert_eq!(status.summary.expect("placeholder summary should be visible").environment_id, placeholder_summary.environment_id);
+
+        let hosts = registry.list_hosts(HostCounts::default(), &HashMap::new()).await;
+        assert!(
+            hosts.hosts.iter().any(|entry| entry.environment_id == first_environment_id),
+            "the first live environment should remain visible"
+        );
+        assert!(
+            hosts.hosts.iter().any(|entry| entry.environment_id == second_environment_id),
+            "the second live environment should be visible even with a placeholder summary"
+        );
     }
 
     #[tokio::test]
@@ -1012,5 +1066,66 @@ mod tests {
             .await
             .expect("status for remaining environment");
         assert_eq!(status.environment_id, second_environment_id);
+    }
+
+    #[tokio::test]
+    async fn removing_the_canonical_environment_reassigns_to_the_most_recent_remaining_environment() {
+        let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
+        let peer = peer_node();
+        let canonical_environment_id = EnvironmentId::host(HostId::new("peer-node-host-a"));
+        let older_remaining_environment_id = EnvironmentId::host(HostId::new("peer-node-host-b"));
+        let newer_remaining_environment_id = EnvironmentId::host(HostId::new("peer-node-host-c"));
+
+        let canonical_summary = HostSummary {
+            environment_id: canonical_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+        let older_remaining_summary = HostSummary {
+            environment_id: older_remaining_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        };
+        let newer_remaining_summary = HostSummary {
+            environment_id: newer_remaining_environment_id.clone(),
+            node: peer.clone(),
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: vec![flotilla_protocol::HostProviderStatus {
+                category: "workspace".into(),
+                name: "cmux".into(),
+                implementation: "cmux".into(),
+                healthy: true,
+            }],
+            environments: vec![],
+        };
+
+        registry.publish_peer_summary(canonical_summary, &|_| {}).await;
+        registry.publish_peer_summary(older_remaining_summary, &|_| {}).await;
+        registry.publish_peer_summary(newer_remaining_summary.clone(), &|_| {}).await;
+
+        registry.apply_event(&DaemonEvent::HostRemoved {
+            environment_id: canonical_environment_id.clone(),
+            seq: 2,
+        });
+
+        assert_eq!(
+            registry.environment_id_for_node(&peer.node_id).await,
+            Some(newer_remaining_environment_id.clone()),
+            "the canonical mapping should follow the most recently updated remaining environment"
+        );
+
+        let status = registry
+            .get_host_status(&newer_remaining_environment_id, HostCounts::default(), &HashMap::new())
+            .await
+            .expect("status for remaining environment");
+        assert_eq!(status.environment_id, newer_remaining_environment_id);
+        assert!(status.summary.is_some());
     }
 }
