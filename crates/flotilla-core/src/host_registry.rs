@@ -1,9 +1,8 @@
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::HashMap;
 
 use flotilla_protocol::{
-    qualified_path::HostId, DaemonEvent, EnvironmentId, HostListEntry, HostListResponse, HostProvidersResponse, HostSnapshot,
-    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse,
-    TopologyRoute,
+    DaemonEvent, EnvironmentId, HostListEntry, HostListResponse, HostProvidersResponse, HostSnapshot, HostStatusResponse, HostSummary,
+    NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use tokio::sync::RwLock;
 
@@ -87,9 +86,9 @@ impl HostRegistry {
     pub(crate) async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         let node_environments = self.node_environments.read().await;
         let hosts = self.hosts.read().await;
-        let environment_id = node_environments.get(node_id).cloned().unwrap_or_else(|| fallback_host_environment_id(node_id));
-        hosts
-            .get(&environment_id)
+        node_environments
+            .get(node_id)
+            .and_then(|environment_id| hosts.get(environment_id))
             .filter(|state| !state.removed)
             .map(|state| state.connection_status.clone())
             .unwrap_or(PeerConnectionState::Disconnected)
@@ -97,32 +96,12 @@ impl HostRegistry {
 
     pub(crate) async fn list_hosts(&self, local_counts: HostCounts, remote_counts: &HashMap<NodeId, HostCounts>) -> HostListResponse {
         let configured = self.configured_peers.read().await.clone();
-        let (statuses, summaries) = self.active_host_maps().await;
         let hosts = self.hosts.read().await;
         let mut host_entries: Vec<_> = hosts
             .iter()
             .filter(|(_, state)| !state.removed)
             .map(|(_, state)| build_host_list_entry_from_state(&self.local_node, &configured, local_counts, remote_counts, state))
             .collect();
-
-        let active_node_ids: HashSet<_> = host_entries.iter().map(|entry| entry.node.node_id.clone()).collect();
-        host_entries.extend(
-            known_nodes(&self.local_node.node_id, &configured, &statuses, &summaries, remote_counts)
-                .into_iter()
-                .filter(|node_id| !active_node_ids.contains(node_id))
-                .map(|node_id| {
-                    build_host_list_entry(
-                        &node_id,
-                        &self.local_node,
-                        &configured,
-                        &statuses,
-                        &summaries,
-                        &HashMap::new(),
-                        local_counts,
-                        remote_counts,
-                    )
-                }),
-        );
         host_entries.sort_by(|a, b| {
             b.is_local
                 .cmp(&a.is_local)
@@ -144,17 +123,13 @@ impl HostRegistry {
         remote_counts: &HashMap<NodeId, HostCounts>,
     ) -> Result<HostStatusResponse, String> {
         let configured = self.configured_peers.read().await.clone();
-        let (statuses, summaries) = self.active_host_maps().await;
         let hosts = self.hosts.read().await;
         let state = hosts.get(environment_id).ok_or_else(|| format!("host not found: {environment_id}"))?;
         let summary = state.summary.clone();
-        let resolved_node = state.node_id.clone();
 
-        Ok(build_host_status(environment_id, &resolved_node, summary, HostStatusContext {
+        Ok(build_host_status(environment_id, state, summary, HostStatusContext {
             local_node: &self.local_node,
             configured: &configured,
-            statuses: &statuses,
-            summaries: &summaries,
             local_counts,
             remote_counts,
         }))
@@ -166,12 +141,11 @@ impl HostRegistry {
         _remote_counts: &HashMap<NodeId, HostCounts>,
     ) -> Result<HostProvidersResponse, String> {
         let configured = self.configured_peers.read().await.clone();
-        let (statuses, summaries) = self.active_host_maps().await;
         let hosts = self.hosts.read().await;
         let state = hosts.get(environment_id).ok_or_else(|| format!("host not found: {environment_id}"))?;
         let summary = state.summary.clone().ok_or_else(|| format!("no summary available for host: {environment_id}"))?;
 
-        Ok(build_host_providers(environment_id, &state.node_id, &self.local_node, &configured, &statuses, &summaries, summary))
+        Ok(build_host_providers(environment_id, state, &self.local_node, &configured, summary))
     }
 
     pub(crate) async fn get_topology(&self) -> TopologyResponse {
@@ -206,59 +180,9 @@ impl HostRegistry {
         events
     }
 
-    async fn active_host_maps(&self) -> (HashMap<NodeId, PeerConnectionState>, HashMap<NodeId, HostSummary>) {
-        let hosts = self.hosts.read().await;
-        let active: HashMap<_, _> = hosts.iter().filter(|(_, state)| !state.removed).map(|(h, s)| (h.clone(), s.clone())).collect();
-        let statuses = active.iter().map(|(_, state)| (state.node_id.clone(), state.connection_status.clone())).collect();
-        let summaries =
-            active.iter().filter_map(|(_, state)| state.summary.clone().map(|summary| (state.node_id.clone(), summary))).collect();
-        (statuses, summaries)
-    }
-
     pub(crate) async fn sync_host_membership(&self, remote_counts: &HashMap<NodeId, HostCounts>, emit: &impl Fn(DaemonEvent)) {
         let configured = self.configured_peers.read().await.clone();
-        let mut node_environments = self.node_environments.write().await;
         let mut hosts = self.hosts.write().await;
-
-        for node_id in configured.keys().chain(remote_counts.keys()) {
-            if node_id != &self.local_node.node_id {
-                let environment_id = current_host_environment_id_for_node(node_id, &node_environments);
-                match hosts.entry(environment_id.clone()) {
-                    Entry::Vacant(entry) => {
-                        let state = entry.insert(HostState {
-                            node_id: node_id.clone(),
-                            environment_id: environment_id.clone(),
-                            connection_status: PeerConnectionState::Disconnected,
-                            summary: None,
-                            seq: 1,
-                            removed: false,
-                        });
-                        node_environments.insert(node_id.clone(), environment_id.clone());
-                        emit(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(
-                            &self.local_node,
-                            &configured,
-                            &environment_id,
-                            state,
-                        ))));
-                    }
-                    Entry::Occupied(mut entry) => {
-                        let state = entry.get_mut();
-                        state.node_id = node_id.clone();
-                        if state.removed {
-                            state.removed = false;
-                            state.seq += 1;
-                            node_environments.insert(node_id.clone(), environment_id.clone());
-                            emit(DaemonEvent::HostSnapshot(Box::new(build_host_snapshot(
-                                &self.local_node,
-                                &configured,
-                                &environment_id,
-                                state,
-                            ))));
-                        }
-                    }
-                }
-            }
-        }
 
         let environment_ids: Vec<_> = hosts.keys().cloned().collect();
         for environment_id in environment_ids {
@@ -418,14 +342,6 @@ fn default_host_summary(node: &NodeInfo, environment_id: &EnvironmentId) -> Host
     }
 }
 
-fn fallback_host_environment_id(node_id: &NodeId) -> EnvironmentId {
-    EnvironmentId::host(HostId::new(node_id.as_str()))
-}
-
-fn current_host_environment_id_for_node(node_id: &NodeId, node_environments: &HashMap<NodeId, EnvironmentId>) -> EnvironmentId {
-    node_environments.get(node_id).cloned().unwrap_or_else(|| fallback_host_environment_id(node_id))
-}
-
 fn ensure_host_state<'a>(
     hosts: &'a mut HashMap<EnvironmentId, HostState>,
     node_environments: &mut HashMap<NodeId, EnvironmentId>,
@@ -433,11 +349,7 @@ fn ensure_host_state<'a>(
     environment_id: EnvironmentId,
 ) -> &'a mut HostState {
     let node_id = node.node_id.clone();
-    if let Some(previous_environment_id) = node_environments.insert(node_id.clone(), environment_id.clone()) {
-        if previous_environment_id != environment_id && previous_environment_id == fallback_host_environment_id(&node_id) {
-            hosts.remove(&previous_environment_id);
-        }
-    }
+    node_environments.insert(node_id.clone(), environment_id.clone());
 
     let state = hosts.entry(environment_id.clone()).or_insert_with(|| HostState {
         node_id: node_id.clone(),
@@ -500,7 +412,7 @@ fn update_host_status(
     node: &NodeInfo,
     status: PeerConnectionState,
 ) -> Option<HostSnapshot> {
-    let environment_id = current_host_environment_id_for_node(&node.node_id, node_environments);
+    let environment_id = node_environments.get(&node.node_id)?.clone();
     let state = ensure_host_state(hosts, node_environments, node, environment_id);
     if !state.removed && state.connection_status == status {
         return None;
@@ -588,61 +500,34 @@ fn mark_host_removed(hosts: &mut HashMap<EnvironmentId, HostState>, environment_
     Some(state.seq)
 }
 
-fn known_nodes(
-    local_node_id: &NodeId,
-    configured: &HashMap<NodeId, String>,
-    statuses: &HashMap<NodeId, PeerConnectionState>,
-    summaries: &HashMap<NodeId, HostSummary>,
-    remote_counts: &HashMap<NodeId, HostCounts>,
-) -> Vec<NodeId> {
-    let mut nodes = HashSet::from([local_node_id.clone()]);
-    nodes.extend(configured.keys().cloned());
-    nodes.extend(statuses.keys().cloned());
-    nodes.extend(summaries.keys().cloned());
-    nodes.extend(remote_counts.keys().cloned());
-
-    let mut nodes: Vec<_> = nodes.into_iter().collect();
-    nodes.sort_by(|a, b| {
-        let a_local = a == local_node_id;
-        let b_local = b == local_node_id;
-        b_local.cmp(&a_local).then_with(|| a.cmp(b))
-    });
-    nodes
-}
-
-fn connection_status(node_id: &NodeId, local_node_id: &NodeId, statuses: &HashMap<NodeId, PeerConnectionState>) -> PeerConnectionState {
-    if node_id == local_node_id {
-        PeerConnectionState::Connected
-    } else {
-        statuses.get(node_id).cloned().unwrap_or(PeerConnectionState::Disconnected)
-    }
-}
-
-fn build_host_list_entry(
-    node_id: &NodeId,
-    local_node: &NodeInfo,
-    configured: &HashMap<NodeId, String>,
-    statuses: &HashMap<NodeId, PeerConnectionState>,
-    summaries: &HashMap<NodeId, HostSummary>,
-    host_states: &HashMap<NodeId, HostState>,
+struct HostStatusContext<'a> {
+    local_node: &'a NodeInfo,
+    configured: &'a HashMap<NodeId, String>,
     local_counts: HostCounts,
-    remote_counts: &HashMap<NodeId, HostCounts>,
-) -> HostListEntry {
-    let is_local = node_id == &local_node.node_id;
-    let counts = if is_local { local_counts } else { remote_counts.get(node_id).copied().unwrap_or_default() };
-    let environment_id = host_states
-        .get(node_id)
-        .map(|state| state.environment_id.clone())
-        .or_else(|| summaries.get(node_id).map(|summary| summary.environment_id.clone()))
-        .unwrap_or_else(|| fallback_host_environment_id(node_id));
+    remote_counts: &'a HashMap<NodeId, HostCounts>,
+}
 
-    HostListEntry {
-        environment_id,
-        node: node_info_for(node_id, configured, Some(summaries), Some(local_node)),
+fn build_host_status(
+    environment_id: &EnvironmentId,
+    state: &HostState,
+    summary: Option<HostSummary>,
+    ctx: HostStatusContext<'_>,
+) -> HostStatusResponse {
+    let is_local = state.node_id == ctx.local_node.node_id;
+    let counts = if is_local { ctx.local_counts } else { ctx.remote_counts.get(&state.node_id).copied().unwrap_or_default() };
+    let node = summary
+        .as_ref()
+        .map(|summary| summary.node.clone())
+        .unwrap_or_else(|| node_info_for(&state.node_id, ctx.configured, None, Some(ctx.local_node)));
+
+    HostStatusResponse {
+        environment_id: environment_id.clone(),
+        node,
         is_local,
-        configured: !is_local && configured.contains_key(node_id),
-        connection_status: connection_status(node_id, &local_node.node_id, statuses),
-        has_summary: is_local || summaries.contains_key(node_id),
+        configured: !is_local && ctx.configured.contains_key(&state.node_id),
+        connection_status: state.connection_status.clone(),
+        summary,
+        visible_environments: vec![],
         repo_count: counts.repo_count,
         work_item_count: counts.work_item_count,
     }
@@ -675,52 +560,19 @@ fn build_host_list_entry_from_state(
     }
 }
 
-struct HostStatusContext<'a> {
-    local_node: &'a NodeInfo,
-    configured: &'a HashMap<NodeId, String>,
-    statuses: &'a HashMap<NodeId, PeerConnectionState>,
-    summaries: &'a HashMap<NodeId, HostSummary>,
-    local_counts: HostCounts,
-    remote_counts: &'a HashMap<NodeId, HostCounts>,
-}
-
-fn build_host_status(
-    environment_id: &EnvironmentId,
-    node_id: &NodeId,
-    summary: Option<HostSummary>,
-    ctx: HostStatusContext<'_>,
-) -> HostStatusResponse {
-    let is_local = node_id == &ctx.local_node.node_id;
-    let counts = if is_local { ctx.local_counts } else { ctx.remote_counts.get(node_id).copied().unwrap_or_default() };
-
-    HostStatusResponse {
-        environment_id: environment_id.clone(),
-        node: node_info_for(node_id, ctx.configured, Some(ctx.summaries), Some(ctx.local_node)),
-        is_local,
-        configured: !is_local && ctx.configured.contains_key(node_id),
-        connection_status: connection_status(node_id, &ctx.local_node.node_id, ctx.statuses),
-        summary,
-        visible_environments: vec![],
-        repo_count: counts.repo_count,
-        work_item_count: counts.work_item_count,
-    }
-}
-
 fn build_host_providers(
     environment_id: &EnvironmentId,
-    node_id: &NodeId,
+    state: &HostState,
     local_node: &NodeInfo,
     configured: &HashMap<NodeId, String>,
-    statuses: &HashMap<NodeId, PeerConnectionState>,
-    summaries: &HashMap<NodeId, HostSummary>,
     summary: HostSummary,
 ) -> HostProvidersResponse {
     HostProvidersResponse {
         environment_id: environment_id.clone(),
-        node: node_info_for(node_id, configured, Some(summaries), Some(local_node)),
-        is_local: node_id == &local_node.node_id,
-        configured: node_id != &local_node.node_id && configured.contains_key(node_id),
-        connection_status: connection_status(node_id, &local_node.node_id, statuses),
+        node: summary.node.clone(),
+        is_local: state.node_id == local_node.node_id,
+        configured: state.node_id != local_node.node_id && configured.contains_key(&state.node_id),
+        connection_status: state.connection_status.clone(),
         summary,
         visible_environments: vec![],
     }
@@ -774,20 +626,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_peer_connection_status_emits_node_keyed_events() {
+    async fn publish_peer_connection_status_without_environment_mapping_does_not_synthesize_host_snapshot() {
         let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
         let events = RefCell::new(Vec::new());
         let emit = |event| events.borrow_mut().push(event);
 
         registry.publish_peer_connection_status(&peer_node(), PeerConnectionState::Connected, &HashMap::new(), &emit).await;
 
-        assert!(events.borrow().iter().any(|event| {
-            matches!(event, DaemonEvent::PeerStatusChanged { node_id, status } if *node_id == peer_node().node_id && *status == PeerConnectionState::Connected)
-        }));
-        assert!(events
-            .borrow()
-            .iter()
-            .any(|event| { matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.node.node_id == peer_node().node_id) }));
+        assert!(events.borrow().is_empty(), "peer status without a canonical environment id should not emit host state");
     }
 
     #[tokio::test]
@@ -812,7 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_peers_keep_display_names_separate_from_identity() {
+    async fn configured_peers_without_environment_mapping_do_not_create_host_entries() {
         let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
         registry
             .set_configured_peers(
@@ -823,9 +669,7 @@ mod tests {
             .await;
 
         let hosts = registry.list_hosts(HostCounts::default(), &HashMap::new()).await;
-        let peer = hosts.hosts.into_iter().find(|entry| entry.node.node_id == peer_node().node_id).expect("peer entry");
-        assert_eq!(peer.node.display_name, "Build Box");
-        assert_eq!(peer.node.node_id, peer_node().node_id);
+        assert!(hosts.hosts.iter().all(|entry| entry.node.node_id != peer_node().node_id));
     }
 
     #[tokio::test]
@@ -858,16 +702,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_entries_without_summary_use_host_environment_identity() {
+    async fn host_entries_are_not_synthesized_from_node_identity_without_environment_mapping() {
         let registry = HostRegistry::new(local_node(), minimal_summary(&local_node()));
 
         registry.publish_peer_connection_status(&peer_node(), PeerConnectionState::Connected, &HashMap::new(), &|_| {}).await;
 
         let hosts = registry.list_hosts(HostCounts::default(), &HashMap::new()).await;
-        let peer = hosts.hosts.into_iter().find(|entry| entry.node.node_id == peer_node().node_id).expect("peer entry");
-
-        assert_eq!(peer.environment_id, EnvironmentId::host(HostId::new("peer-node")));
-        assert!(peer.environment_id.is_host());
+        assert!(hosts.hosts.iter().all(|entry| entry.node.node_id != peer_node().node_id));
     }
 
     #[tokio::test]

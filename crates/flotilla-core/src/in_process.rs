@@ -7,21 +7,20 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    qualified_path::{HostId, QualifiedPath},
     Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse,
     HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
     RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey, SystemInfo, ToolInventory,
-    TopologyResponse, TopologyRoute,
+    TopologyResponse, TopologyRoute, qualified_path::QualifiedPath,
 };
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -37,17 +36,17 @@ use crate::{
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
     host_registry::HostCounts,
-    model::{provider_names_from_registry, repo_name, RepoModel},
+    model::{RepoModel, provider_names_from_registry, repo_name},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        discovery::{discover_providers, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag},
-        ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
+        discovery::{DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, discover_providers, run_host_detectors},
+        ssh_runner::SshCommandRunner,
     },
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     step::{
-        run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
+        RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver, run_step_plan_with_remote_executor,
     },
 };
 
@@ -794,11 +793,7 @@ impl InProcessDaemon {
         match selector {
             flotilla_protocol::RepoSelector::Path(path) => {
                 let identities = self.path_identities.read().await;
-                if identities.contains_key(path) {
-                    Ok(path.clone())
-                } else {
-                    Err(format!("repo not tracked: {}", path.display()))
-                }
+                if identities.contains_key(path) { Ok(path.clone()) } else { Err(format!("repo not tracked: {}", path.display())) }
             }
             flotilla_protocol::RepoSelector::Query(query) => {
                 let repos = self.repos.read().await;
@@ -936,11 +931,9 @@ impl InProcessDaemon {
             }
         }
         for node in &peer_nodes {
-            let environment_id = self
-                .host_registry
-                .environment_id_for_node(&node.node_id)
-                .await
-                .unwrap_or_else(|| EnvironmentId::host(HostId::new(node.display_name.as_str())));
+            let Some(environment_id) = self.host_registry.environment_id_for_node(&node.node_id).await else {
+                continue;
+            };
             self.host_registry
                 .publish_peer_summary(
                     HostSummary {
@@ -1328,7 +1321,7 @@ impl InProcessDaemon {
     async fn normalize_repo_path(&self, path: &Path) -> (PathBuf, Option<PathBuf>) {
         use crate::{
             path_context::ExecutionEnvironmentPath,
-            providers::vcs::{git::GitVcs, Vcs},
+            providers::vcs::{Vcs, git::GitVcs},
         };
 
         let vcs = GitVcs::new(self.discovery.runner.clone());

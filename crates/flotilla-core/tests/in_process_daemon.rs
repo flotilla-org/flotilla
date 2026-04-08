@@ -2193,11 +2193,22 @@ async fn set_peer_providers_reuses_existing_peer_host_environment_identity() {
 }
 
 #[tokio::test]
-async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
-    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
-    let mut rx = daemon.subscribe();
+async fn set_peer_providers_without_environment_mapping_does_not_synthesize_host_identity() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
 
-    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
+    let peer_host = HostName::new("remote-host");
+    daemon.set_peer_providers(&repo, vec![(peer_host.clone(), ProviderData::default())], 0).await;
+
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
+    assert!(
+        hosts.hosts.iter().all(|entry| entry.node.display_name != peer_host.as_str()),
+        "peer host should not be materialized without a canonical environment id"
+    );
+}
+
+#[tokio::test]
+async fn set_peer_providers_without_environment_mapping_does_not_emit_host_snapshot() {
+    let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
 
     let overlay_host = HostName::new("overlay-live");
     let mut peer_data = ProviderData::default();
@@ -2216,25 +2227,22 @@ async fn set_peer_providers_emits_host_snapshot_for_overlay_only_host() {
 
     daemon.set_peer_providers(&repo, vec![(overlay_host.clone(), peer_data)], 0).await;
 
-    let host_event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match rx.recv().await.expect("recv") {
-                DaemonEvent::HostSnapshot(snap) if snapshot_host(&snap) == overlay_host => return snap,
-                _ => continue,
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for overlay host snapshot");
-    assert_eq!(snapshot_host(&host_event), overlay_host);
+    let hosts = daemon.list_hosts_internal().await.expect("list hosts");
+    assert!(
+        hosts.hosts.iter().all(|entry| entry.node.display_name != overlay_host.as_str()),
+        "overlay-only peer data should not synthesize host identity"
+    );
+
+    let events = daemon.replay_since(&HashMap::new()).await.expect("host replay");
+    assert!(
+        !events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == overlay_host)),
+        "overlay-only peer data should not replay as a host snapshot without canonical environment identity"
+    );
 }
 
 #[tokio::test]
-async fn replay_since_includes_overlay_only_hosts() {
+async fn replay_since_does_not_invent_overlay_only_host_state() {
     let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
-    let mut rx = daemon.subscribe();
-
-    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut rx).await;
 
     let overlay_host = HostName::new("overlay-only");
     let mut peer_data = ProviderData::default();
@@ -2252,12 +2260,11 @@ async fn replay_since_includes_overlay_only_hosts() {
     });
 
     daemon.set_peer_providers(&repo, vec![(overlay_host.clone(), peer_data)], 0).await;
-    let _ = recv_event(&mut rx).await;
 
     let events = daemon.replay_since(&HashMap::new()).await.expect("host replay");
     assert!(
-        events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == overlay_host)),
-        "hosts known only through remote overlay data should replay"
+        !events.iter().any(|event| matches!(event, DaemonEvent::HostSnapshot(snap) if snapshot_host(snap) == overlay_host)),
+        "hosts known only through remote overlay data should not replay without a canonical environment identity"
     );
 }
 
