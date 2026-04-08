@@ -88,22 +88,34 @@ fn machine_scoped_state_dir_or_base(base_state_dir: &Path, resolved: Result<Path
 ///
 /// This prefers a machine-scoped subdirectory, but falls back to the provided
 /// base state directory if machine identity probing fails.
-pub async fn resolve_local_environment_state_dir(base_state_dir: &Path, runner: &dyn CommandRunner) -> PathBuf {
-    let resolved = machine_scoped_state_dir(base_state_dir, None, runner).await;
+pub async fn resolve_local_environment_state_dir(
+    base_state_dir: &Path,
+    config_machine_id: Option<&str>,
+    runner: &dyn CommandRunner,
+) -> PathBuf {
+    let resolved = machine_scoped_state_dir(base_state_dir, config_machine_id, runner).await;
     machine_scoped_state_dir_or_base(base_state_dir, resolved)
 }
 
 /// Resolve or create a persisted local host id in the machine-scoped local
 /// state directory.
-pub async fn resolve_local_host_id(base_state_dir: &Path, runner: &dyn CommandRunner) -> Result<HostId, String> {
-    let state_dir = resolve_local_environment_state_dir(base_state_dir, runner).await;
+pub async fn resolve_local_host_id(
+    base_state_dir: &Path,
+    config_machine_id: Option<&str>,
+    runner: &dyn CommandRunner,
+) -> Result<HostId, String> {
+    let state_dir = resolve_local_environment_state_dir(base_state_dir, config_machine_id, runner).await;
     resolve_or_create_host_id(&state_dir)
 }
 
 /// Resolve or create a persisted local mesh node id in the machine-scoped
 /// local identity directory.
-pub async fn resolve_local_node_id(base_config_dir: &Path, runner: &dyn CommandRunner) -> Result<NodeId, String> {
-    let identity_dir = machine_scoped_state_dir(&base_config_dir.join("identity"), None, runner).await?;
+pub async fn resolve_local_node_id(
+    base_config_dir: &Path,
+    config_machine_id: Option<&str>,
+    runner: &dyn CommandRunner,
+) -> Result<NodeId, String> {
+    let identity_dir = machine_scoped_state_dir(&base_config_dir.join("identity"), config_machine_id, runner).await?;
     resolve_or_create_node_id(&identity_dir)
 }
 
@@ -194,6 +206,10 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("failed to write temp node.key: {e}")),
         }
+        if let Err(err) = set_restrictive_permissions(&key_temp) {
+            let _ = fs::remove_file(&key_temp);
+            return Err(err);
+        }
 
         match fs::write(&pub_temp, verifying.to_bytes()) {
             Ok(()) => {}
@@ -217,6 +233,7 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
         }
 
         if key_path.exists() && pub_path.exists() {
+            set_restrictive_permissions(&key_path)?;
             let signing = read_signing_key(&key_path)?;
             let verifying_bytes = fs::read(&pub_path).map_err(|e| format!("failed to read {}: {e}", pub_path.display()))?;
             let verifying_array: [u8; 32] = verifying_bytes
@@ -229,11 +246,32 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
     }
 
     let signing = read_signing_key(&state_dir.join("node.key"))?;
+    let key_path = state_dir.join("node.key");
+    set_restrictive_permissions(&key_path)?;
     let verifying_bytes = fs::read(state_dir.join("node.pub")).map_err(|e| format!("failed to read node.pub after retries: {e}"))?;
     let verifying_array: [u8; 32] =
         verifying_bytes.try_into().map_err(|_| "invalid node public key length after retries: expected 32 bytes".to_owned())?;
     let verifying = VerifyingKey::from_bytes(&verifying_array).map_err(|e| format!("invalid node public key after retries: {e}"))?;
     Ok((signing, verifying))
+}
+
+fn set_restrictive_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(path).map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions).map_err(|e| format!("failed to set permissions on {}: {e}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 /// Resolve or create a persisted mesh node id in `<state_dir>/node.{key,pub}`.
@@ -461,8 +499,8 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build();
 
-        let first = resolve_local_host_id(base.path(), &runner).await.expect("resolve local host id");
-        let second = resolve_local_host_id(base.path(), &runner).await.expect("resolve local host id again");
+        let first = resolve_local_host_id(base.path(), None, &runner).await.expect("resolve local host id");
+        let second = resolve_local_host_id(base.path(), None, &runner).await.expect("resolve local host id again");
 
         assert_eq!(first, second);
         assert!(!first.as_str().is_empty());
@@ -639,8 +677,8 @@ mod tests {
             .on_run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Ok("\"IOPlatformUUID\" = \"machine-uuid\"\n".into()))
             .build();
 
-        let node_id_1 = resolve_local_node_id(base.path(), &machine_runner).await.unwrap();
-        let node_id_2 = resolve_local_node_id(base.path(), &machine_runner).await.unwrap();
+        let node_id_1 = resolve_local_node_id(base.path(), None, &machine_runner).await.unwrap();
+        let node_id_2 = resolve_local_node_id(base.path(), None, &machine_runner).await.unwrap();
 
         assert_eq!(node_id_1, node_id_2);
         let identity_dir = machine_scoped_state_dir(&base.path().join("identity"), None, &machine_runner).await.unwrap();
@@ -653,8 +691,33 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build();
         if read_etc_machine_id().is_none() {
-            let err = resolve_local_node_id(base.path(), &runner).await.unwrap_err();
+            let err = resolve_local_node_id(base.path(), None, &runner).await.unwrap_err();
             assert!(err.contains("Cannot determine machine identity"));
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_local_node_id_uses_config_machine_id_override() {
+        let base = tempfile::tempdir().unwrap();
+        let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build();
+
+        let node_id_1 = resolve_local_node_id(base.path(), Some("override-machine"), &runner).await.unwrap();
+        let node_id_2 = resolve_local_node_id(base.path(), Some("override-machine"), &runner).await.unwrap();
+
+        assert_eq!(node_id_1, node_id_2);
+        let identity_dir = base.path().join("identity/override-machine");
+        assert!(identity_dir.join("node.key").exists());
+        assert!(identity_dir.join("node.pub").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_key_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let _ = resolve_or_create_node_id(dir.path()).unwrap();
+        let mode = fs::metadata(dir.path().join("node.key")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

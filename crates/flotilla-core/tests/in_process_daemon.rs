@@ -551,7 +551,7 @@ async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &s
     let config_dir = temp.path().join("config");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     let discovery = fake_discovery(false);
-    let machine_state_dir = flotilla_core::host_identity::resolve_local_environment_state_dir(&config_dir, &*discovery.runner).await;
+    let machine_state_dir = flotilla_core::host_identity::resolve_local_environment_state_dir(&config_dir, None, &*discovery.runner).await;
     std::fs::create_dir_all(&machine_state_dir).expect("create machine-scoped state dir");
     std::fs::write(machine_state_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
     let config = Arc::new(ConfigStore::with_base(config_dir));
@@ -1552,6 +1552,30 @@ async fn daemon_uses_persisted_local_environment_id() {
     )
     .await;
     assert_eq!(restarted.local_environment_id().as_str(), "test-local-environment-id");
+}
+
+#[tokio::test]
+async fn daemon_uses_config_machine_id_for_local_node_identity_storage() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"override-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(config_dir.clone())), fake_discovery(false), HostName::local())
+            .await;
+
+    assert!(
+        config_dir.join("identity/override-machine/node.key").exists(),
+        "daemon should use configured machine id for node identity storage"
+    );
+    assert!(
+        config_dir.join("identity/override-machine/node.pub").exists(),
+        "daemon should persist the public key alongside the private key"
+    );
+    assert_eq!(daemon.node_id().as_str().len(), 32);
 }
 
 #[tokio::test]

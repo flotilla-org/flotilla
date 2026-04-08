@@ -285,6 +285,8 @@ impl HostsConfig {
 pub struct DaemonConfig {
     #[serde(default)]
     pub follower: bool,
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub host_name: Option<String>,
     #[serde(default)]
     pub environments: BTreeMap<String, StaticEnvironmentConfig>,

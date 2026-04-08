@@ -502,13 +502,18 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
 
-        let local_environment_state_dir = resolve_local_environment_state_dir(config.state_dir().as_path(), &*discovery.runner).await;
-        let local_node_id =
-            resolve_local_node_id(config.base_path().as_path(), &*discovery.runner).await.expect("failed to resolve local node id");
+        let daemon_config = config.load_daemon_config().expect("failed to load daemon config");
+        let config_machine_id = daemon_config.machine_id.as_deref();
+        let local_environment_state_dir =
+            resolve_local_environment_state_dir(config.state_dir().as_path(), config_machine_id, &*discovery.runner).await;
+        let local_node_id = resolve_local_node_id(config.base_path().as_path(), config_machine_id, &*discovery.runner)
+            .await
+            .expect("failed to resolve local node id");
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
-        let local_host_id =
-            resolve_local_host_id(config.state_dir().as_path(), &*discovery.runner).await.expect("failed to resolve local host id");
+        let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
+            .await
+            .expect("failed to resolve local host id");
         let environment_manager =
             Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;

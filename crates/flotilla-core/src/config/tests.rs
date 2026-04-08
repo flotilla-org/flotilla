@@ -370,10 +370,12 @@ daemon_socket = "/run/user/1000/flotilla/daemon.sock"
 fn parse_daemon_config_follower() {
     let toml = r#"
 follower = true
+machine_id = "my-machine"
 host_name = "my-desktop"
 "#;
     let config: DaemonConfig = toml::from_str(toml).unwrap();
     assert!(config.follower);
+    assert_eq!(config.machine_id, Some("my-machine".into()));
     assert_eq!(config.host_name, Some("my-desktop".into()));
     assert!(config.environments.is_empty());
 }
@@ -382,6 +384,7 @@ host_name = "my-desktop"
 fn parse_daemon_config_defaults() {
     let config: DaemonConfig = toml::from_str("").unwrap();
     assert!(!config.follower);
+    assert_eq!(config.machine_id, None);
     assert_eq!(config.host_name, None);
     assert!(config.environments.is_empty());
 }
@@ -469,10 +472,11 @@ fn load_daemon_config_missing_file_returns_default() {
 fn load_daemon_config_from_file() {
     let dir = tempdir().unwrap();
     let base = dir.path();
-    std::fs::write(base.join("daemon.toml"), "follower = true\nhost_name = \"my-host\"\n").unwrap();
+    std::fs::write(base.join("daemon.toml"), "follower = true\nmachine_id = \"my-machine\"\nhost_name = \"my-host\"\n").unwrap();
     let store = ConfigStore::with_base(base);
     let config = store.load_daemon_config().unwrap();
     assert!(config.follower);
+    assert_eq!(config.machine_id, Some("my-machine".into()));
     assert_eq!(config.host_name, Some("my-host".into()));
 }
 
