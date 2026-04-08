@@ -192,22 +192,21 @@ fn read_verifying_key(path: &Path) -> Result<VerifyingKey, String> {
     VerifyingKey::from_bytes(&verifying_array).map_err(|e| format!("invalid node public key in {}: {e}", path.display()))
 }
 
-fn read_persisted_node_keypair(key_path: &Path, pub_path: &Path) -> Result<(SigningKey, VerifyingKey), String> {
+fn read_or_repair_persisted_node_keypair(key_path: &Path, pub_path: &Path) -> Result<(SigningKey, VerifyingKey), String> {
     let signing = read_signing_key(key_path)?;
     let verifying = signing.verifying_key();
-    let persisted = read_verifying_key(pub_path)?;
-    if persisted != verifying {
-        return Err(format!("node keypair mismatch in {}", key_path.parent().unwrap_or(key_path).display()));
-    }
-    Ok((signing, persisted))
+    persist_public_key(pub_path, &verifying)?;
+    Ok((signing, verifying))
 }
 
 fn persist_public_key(path: &Path, verifying: &VerifyingKey) -> Result<(), String> {
     if let Ok(existing) = read_verifying_key(path) {
         if existing != *verifying {
-            return Err(format!("node keypair mismatch in {}", path.parent().unwrap_or(path).display()));
+            let _ = fs::remove_file(path);
         }
-        return Ok(());
+        if existing == *verifying {
+            return Ok(());
+        }
     }
 
     if let Some(parent) = path.parent() {
@@ -232,7 +231,7 @@ fn persist_public_key(path: &Path, verifying: &VerifyingKey) -> Result<(), Strin
                 if existing == *verifying {
                     return Ok(());
                 }
-                return Err(format!("node keypair mismatch in {}", path.parent().unwrap_or(path).display()));
+                continue;
             }
             Err(_) => continue,
         }
@@ -286,7 +285,7 @@ fn write_new_node_keypair(state_dir: &Path) -> Result<(SigningKey, VerifyingKey)
 
         if key_path.exists() && pub_path.exists() {
             set_restrictive_permissions(&key_path)?;
-            return read_persisted_node_keypair(&key_path, &pub_path);
+            return read_or_repair_persisted_node_keypair(&key_path, &pub_path);
         }
     }
 
@@ -325,7 +324,7 @@ pub fn resolve_or_create_node_id(state_dir: &Path) -> Result<NodeId, String> {
     if key_path.exists() {
         set_restrictive_permissions(&key_path)?;
         if pub_path.exists() {
-            let (_signing, persisted) = read_persisted_node_keypair(&key_path, &pub_path)?;
+            let (_signing, persisted) = read_or_repair_persisted_node_keypair(&key_path, &pub_path)?;
             return Ok(node_id_from_public_key(&persisted));
         }
         let signing = read_signing_key(&key_path)?;
@@ -605,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_or_create_node_id_rejects_mismatched_persisted_keypair() {
+    fn resolve_or_create_node_id_recovers_mismatched_persisted_keypair() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path()).unwrap();
 
@@ -614,8 +613,13 @@ mod tests {
         fs::write(dir.path().join("node.key"), signing.to_bytes()).unwrap();
         fs::write(dir.path().join("node.pub"), other_signing.verifying_key().to_bytes()).unwrap();
 
-        let err = resolve_or_create_node_id(dir.path()).unwrap_err();
-        assert!(err.contains("node keypair mismatch"), "unexpected error: {err}");
+        let node_id = resolve_or_create_node_id(dir.path()).unwrap();
+
+        let pub_bytes = fs::read(dir.path().join("node.pub")).unwrap();
+        let pub_array: [u8; 32] = pub_bytes.try_into().unwrap();
+        let public_key = VerifyingKey::from_bytes(&pub_array).unwrap();
+        assert_eq!(public_key, signing.verifying_key());
+        assert_eq!(node_id, node_id_from_public_key(&public_key));
     }
 
     #[test]
