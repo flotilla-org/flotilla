@@ -456,10 +456,7 @@ impl App {
     /// an advertised environment provider. Returns `Err(message)` for display if invalid.
     fn validate_provisioning_target(&self, target: &ProvisioningTarget) -> Result<(), String> {
         let host = target.host();
-        let is_local = self.model.my_host().is_some_and(|h| h == host);
-        if !is_local {
-            self.model.resolve_host(host)?;
-        }
+        self.model.resolve_host(host)?;
         if let ProvisioningTarget::NewEnvironment { provider, .. } = target {
             let has_provider = self
                 .model
@@ -474,18 +471,29 @@ impl App {
 
     pub fn targeted_command(&self, action: CommandAction) -> Command {
         let target = &self.ui.provisioning_target;
-        Command {
-            node_id: self.model.node_id_for_host(target.host()).cloned(),
-            provisioning_target: Some(target.clone()),
-            context_repo: None,
-            action,
-        }
+        let node_id = self
+            .model
+            .resolve_host(target.host())
+            .expect("validated provisioning target should resolve to a unique host")
+            .summary
+            .node
+            .node_id
+            .clone();
+        Command { node_id: Some(node_id), provisioning_target: Some(target.clone()), context_repo: None, action }
     }
 
     pub fn targeted_repo_command(&self, action: CommandAction) -> Command {
         let target = &self.ui.provisioning_target;
+        let node_id = self
+            .model
+            .resolve_host(target.host())
+            .expect("validated provisioning target should resolve to a unique host")
+            .summary
+            .node
+            .node_id
+            .clone();
         Command {
-            node_id: self.model.node_id_for_host(target.host()).cloned(),
+            node_id: Some(node_id),
             provisioning_target: Some(target.clone()),
             context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
             action,

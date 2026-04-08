@@ -23,7 +23,7 @@ use super::*;
 
 fn insert_local_host(model: &mut TuiModel, name: &str) {
     let host_name = HostName::new(name);
-    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-local-env")));
     model.hosts.insert(environment_id.clone(), TuiHostState {
         environment_id: environment_id.clone(),
         host_name: host_name.clone(),
@@ -43,7 +43,7 @@ fn insert_local_host(model: &mut TuiModel, name: &str) {
 
 fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
     let host_name = HostName::new(name);
-    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-env")));
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-peer-env")));
     model.hosts.insert(environment_id.clone(), TuiHostState {
         environment_id: environment_id.clone(),
         host_name: host_name.clone(),
@@ -1131,6 +1131,18 @@ fn duplicate_host_names_do_not_collide_and_resolve_as_ambiguous() {
     assert!(err.contains("ambiguous host: desktop"), "unexpected error: {err}");
     assert!(err.contains("desktop-a"), "unexpected error: {err}");
     assert!(err.contains("desktop-b"), "unexpected error: {err}");
+}
+
+#[test]
+fn local_and_remote_duplicate_host_names_are_ambiguous() {
+    let mut app = stub_app();
+    insert_local_host(&mut app.model, "desktop");
+    insert_peer_host(&mut app.model, "desktop", PeerStatus::Connected);
+
+    let target = ProvisioningTarget::Host { host: HostName::new("desktop") };
+    let err = app.validate_provisioning_target(&target).expect_err("duplicate host names should be rejected");
+
+    assert!(err.contains("ambiguous host: desktop"), "unexpected error: {err}");
 }
 
 #[test]

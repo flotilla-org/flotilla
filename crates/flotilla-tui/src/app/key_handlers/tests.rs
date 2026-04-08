@@ -69,6 +69,26 @@ fn insert_peer_host(model: &mut crate::app::TuiModel, name: &str) {
     });
 }
 
+fn insert_local_host(model: &mut crate::app::TuiModel, name: &str) {
+    let host_name = HostName::new(name);
+    let environment_id = EnvironmentId::host(HostId::new(format!("{name}-local-env")));
+    model.hosts.insert(environment_id.clone(), TuiHostState {
+        environment_id: environment_id.clone(),
+        host_name: host_name.clone(),
+        is_local: true,
+        status: PeerStatus::Connected,
+        summary: flotilla_protocol::HostSummary {
+            environment_id,
+            host_name: Some(host_name.clone()),
+            node: NodeInfo::new(NodeId::new(format!("{name}-local")), name),
+            system: flotilla_protocol::SystemInfo::default(),
+            inventory: flotilla_protocol::ToolInventory::default(),
+            providers: vec![],
+            environments: vec![],
+        },
+    });
+}
+
 fn make_work_item(id: &str) -> flotilla_protocol::WorkItem {
     checkout_item(&format!("feat/{id}"), &format!("/tmp/{id}"), false)
 }
@@ -878,6 +898,22 @@ fn branch_input_enter_empty_does_not_create() {
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     assert!(app.proto_commands.take_next().is_none());
+}
+
+#[test]
+fn branch_input_ambiguous_host_reports_status_instead_of_queuing_command() {
+    let mut app = stub_app();
+    insert_local_host(&mut app.model, "desktop");
+    insert_peer_host(&mut app.model, "desktop");
+    app.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::new("desktop") };
+    push_branch_input_widget_with_text(&mut app, "feature/test");
+
+    app.handle_key(key(KeyCode::Enter));
+
+    assert!(app.proto_commands.take_next().is_none());
+    assert_eq!(app.screen.modal_stack.len(), 0, "expected ambiguous target to dismiss the modal");
+    let message = app.model.status_message.as_deref().expect("ambiguity should set a status message");
+    assert!(message.contains("ambiguous host: desktop"), "unexpected message: {message}");
 }
 
 #[test]

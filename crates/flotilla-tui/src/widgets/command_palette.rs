@@ -415,13 +415,8 @@ pub(crate) fn tui_dispatch(
                 match host {
                     HostResolution::Local => {}
                     HostResolution::ProvisioningTarget => {
-                        match model.resolve_host(provisioning_target.host()) {
-                            Ok(resolved_host) => {
-                                command.node_id = Some(resolved_host.summary.node.node_id.clone());
-                            }
-                            Err(_) if provisioning_target.host() == &flotilla_protocol::HostName::local() => {}
-                            Err(err) => return Err(err),
-                        }
+                        let resolved_host = model.resolve_host(provisioning_target.host())?;
+                        command.node_id = Some(resolved_host.summary.node.node_id.clone());
                         command.provisioning_target = Some(provisioning_target.clone());
                     }
                     HostResolution::Explicit(host) => {
@@ -583,10 +578,16 @@ impl InteractiveWidget for CommandPaletteWidget {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use flotilla_protocol::{Command, CommandAction, HostName, NodeId, ProvisioningTarget, WorkItemIdentity, WorkItemKind};
+    use flotilla_protocol::{
+        qualified_path::HostId, CheckoutTarget, Command, CommandAction, EnvironmentId, HostName, HostSummary, NodeId, NodeInfo,
+        ProvisioningTarget, RepoIdentity, RepoSelector, SystemInfo, ToolInventory, WorkItemIdentity, WorkItemKind,
+    };
 
     use super::*;
-    use crate::app::test_support::{bare_item, checkout_item, session_item, TestWidgetHarness};
+    use crate::app::{
+        test_support::{bare_item, checkout_item, session_item, TestWidgetHarness},
+        PeerStatus, TuiHostState,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -986,6 +987,63 @@ mod tests {
         let model = TuiModel::from_repo_info(vec![]);
         let result = tui_dispatch(resolved, &model, None, true, None, &local_target, &None, false);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dispatch_provisioning_target_duplicate_host_names_remain_ambiguous() {
+        let repo_id = RepoIdentity { authority: "github.com".into(), path: "org/repo".into() };
+        let mut model = TuiModel::from_repo_info(vec![]);
+        let host_name = HostName::new("desktop");
+        let local_environment_id = EnvironmentId::host(HostId::new("desktop-local"));
+        let remote_environment_id = EnvironmentId::host(HostId::new("desktop-remote"));
+
+        model.hosts.insert(local_environment_id.clone(), TuiHostState {
+            environment_id: local_environment_id.clone(),
+            host_name: host_name.clone(),
+            is_local: true,
+            status: PeerStatus::Connected,
+            summary: HostSummary {
+                environment_id: local_environment_id,
+                host_name: Some(host_name.clone()),
+                node: NodeInfo::new(NodeId::new("desktop-local-node"), "Desktop Local"),
+                system: SystemInfo::default(),
+                inventory: ToolInventory::default(),
+                providers: vec![],
+                environments: vec![],
+            },
+        });
+        model.hosts.insert(remote_environment_id.clone(), TuiHostState {
+            environment_id: remote_environment_id.clone(),
+            host_name: host_name.clone(),
+            is_local: false,
+            status: PeerStatus::Connected,
+            summary: HostSummary {
+                environment_id: remote_environment_id,
+                host_name: Some(host_name.clone()),
+                node: NodeInfo::new(NodeId::new("desktop-remote-node"), "Desktop Remote"),
+                system: SystemInfo::default(),
+                inventory: ToolInventory::default(),
+                providers: vec![],
+                environments: vec![],
+            },
+        });
+
+        let cmd = Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::Checkout {
+                repo: RepoSelector::Identity(repo_id.clone()),
+                target: CheckoutTarget::FreshBranch("feature/test".into()),
+                issue_ids: vec![],
+            },
+        };
+        let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
+        let local_target = ProvisioningTarget::Host { host: host_name.clone() };
+        let result = tui_dispatch(resolved, &model, None, false, Some(&repo_id), &local_target, &None, false);
+
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("ambiguous host: desktop"));
     }
 
     #[test]

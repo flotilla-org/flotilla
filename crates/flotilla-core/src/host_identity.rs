@@ -10,13 +10,13 @@ use std::{
 };
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use flotilla_protocol::{EnvironmentId, NodeId, qualified_path::HostId};
+use flotilla_protocol::{qualified_path::HostId, EnvironmentId, NodeId};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::providers::{ChannelLabel, CommandRunner, discovery::EnvVars};
+use crate::providers::{discovery::EnvVars, ChannelLabel, CommandRunner};
 
 /// Resolve a machine-scoped state directory under `base_state_dir`.
 ///
@@ -47,7 +47,11 @@ pub async fn machine_scoped_state_dir(
 fn read_etc_machine_id() -> Option<String> {
     let content = fs::read_to_string("/etc/machine-id").ok()?;
     let trimmed = content.trim().to_owned();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Query macOS `IOPlatformUUID` via the injected `CommandRunner`.
@@ -483,7 +487,7 @@ async fn resolve_or_create_remote_environment_id_at(runner: &dyn CommandRunner, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{ProcessCommandRunner, discovery::test_support::TestEnvVars};
+    use crate::providers::{discovery::test_support::TestEnvVars, ProcessCommandRunner};
 
     #[test]
     fn generates_and_persists_host_id() {

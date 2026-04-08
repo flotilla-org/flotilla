@@ -12,6 +12,7 @@ use crate::{
     keymap::Action,
     shimmer::shimmer_spans,
     ui_helpers,
+    widgets::AppAction,
 };
 
 pub struct BranchInputWidget {
@@ -49,8 +50,12 @@ impl InteractiveWidget for BranchInputWidget {
                 let issue_ids = std::mem::take(&mut self.pending_issue_ids);
                 if !branch.is_empty() {
                     let repo_identity = ctx.repo_order[ctx.active_repo].clone();
+                    let Ok(host) = ctx.model.resolve_host(ctx.provisioning_target.host()) else {
+                        ctx.app_actions.push(AppAction::ShowStatus(format!("ambiguous host: {}", ctx.provisioning_target.host())));
+                        return Outcome::Finished;
+                    };
                     let cmd = Command {
-                        node_id: ctx.model.node_id_for_host(ctx.provisioning_target.host()).cloned(),
+                        node_id: Some(host.summary.node.node_id.clone()),
                         provisioning_target: Some(ctx.provisioning_target.clone()),
                         context_repo: None,
                         action: CommandAction::Checkout {
