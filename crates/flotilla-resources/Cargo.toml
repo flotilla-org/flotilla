@@ -1,0 +1,20 @@
+[package]
+name = "flotilla-resources"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "query", "rustls", "stream"] }
+serde_yml = "0.0.12"
+base64 = "0.22"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

@@ -4,6 +4,7 @@ members = [
     "crates/flotilla-commands",
     "crates/flotilla-core",
     "crates/flotilla-protocol",
+    "crates/flotilla-resources",
     "crates/flotilla-transport",
     "crates/flotilla-daemon",
     "crates/flotilla-tui",

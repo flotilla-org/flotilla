@@ -107,10 +107,6 @@ impl ResourceBackend {
     /// Typed resolver — T: Resource provides API coordinates and serde types.
     /// This is the normal path for controllers.
     pub fn using<T: Resource>(&self, namespace: &str) -> TypedResolver<T>;
-
-    /// Dynamic resolver — caller supplies API coordinates, gets raw Value.
-    /// Escape hatch for resources whose Rust type isn't known at compile time.
-    pub fn paths(&self, paths: &ApiPaths, namespace: &str) -> DynamicResolver;
 }
 ```
 
@@ -151,10 +147,6 @@ struct ResourceList<T: Resource> {
 ```
 
 The standard controller pattern is: `list()` to get current state + collection resourceVersion, then `watch(WatchStart::FromVersion(v))` to receive all changes from that point forward. No gap, no missed updates.
-
-### DynamicResolver (deferred)
-
-The escape hatch for operating on resources without a compile-time Rust type. Will be a separate type from `TypedResolver`, operating on `serde_json::Value`. The `paths()` method on `ResourceBackend` is reserved for this. The exact API shape — including how it handles the input/output split, namespace, and resourceVersion contracts — will be designed when a concrete use case arises. No stage 1 deliverable.
 
 ### Notes on Resolver API
 
@@ -293,7 +285,7 @@ crates/flotilla-resources/
 ├── src/
 │   ├── lib.rs              -- re-exports
 │   ├── resource.rs          -- Resource trait, ApiPaths, ResourceObject, ObjectMeta, InputMeta
-│   ├── backend.rs           -- ResourceBackend enum, TypedResolver, DynamicResolver
+│   ├── backend.rs           -- ResourceBackend enum, TypedResolver
 │   ├── error.rs             -- ResourceError
 │   ├── watch.rs             -- WatchEvent, WatchStart, ResourceList
 │   ├── http/
@@ -351,9 +343,9 @@ kube-rs is a heavy dependency with opinions about async runtime. The resource AP
 
 CRD diffs are readable. Macro-generated CRD output is opaque. k8s CRD specs have `x-kubernetes-*` annotations and structural schema requirements that fight macro generation. Hand-written YAML is debuggable with `kubectl apply --dry-run`.
 
-### Typed over dynamic
+### Typed-first API
 
-The primary path is fully generic (`T: Resource`). Controllers know their types at compile time and get full serde type safety. The `DynamicResolver` escape hatch to `Value` exists as a separate type — it doesn't pollute the typed API.
+The stage 1 API is fully generic (`T: Resource`). Controllers know their types at compile time and get full serde type safety. A dynamic escape hatch can be designed later if a concrete use case appears, but it is intentionally out of scope for this stage.
 
 ### Separate spec/status update paths
 
