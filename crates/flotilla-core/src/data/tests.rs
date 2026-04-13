@@ -226,6 +226,32 @@ fn host_falls_back_to_checkout_host_provenance_when_key_has_host_id() {
 }
 
 #[test]
+fn checkout_source_falls_back_to_provider_host_for_environment_qualified_paths() {
+    let checkout_key = flotilla_protocol::qualified_path::QualifiedPath::environment(
+        flotilla_protocol::EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("peer-host-id")),
+        "/repos/feat-remote",
+    );
+    let mut providers = ProviderData::default();
+    providers.checkouts.insert(checkout_key.clone(), Checkout {
+        branch: "feat-remote".into(),
+        is_main: false,
+        trunk_ahead_behind: None,
+        remote_ahead_behind: None,
+        working_tree: None,
+        last_commit: None,
+        correlation_keys: vec![CorrelationKey::Branch("feat-remote".into()), CorrelationKey::CheckoutPath(checkout_key.clone())],
+        association_keys: vec![],
+        host_name: Some(flotilla_protocol::HostName::new("follower")),
+        environment_id: checkout_key.environment_id().cloned(),
+    });
+
+    let grouped = crate::data::correlate(&providers).0;
+    let checkout = grouped.iter().find(|item| item.branch() == Some("feat-remote")).expect("correlated checkout");
+
+    assert_eq!(checkout.source(), Some("follower"));
+}
+
+#[test]
 fn is_main_checkout_true() {
     let wi = checkout_item("/repos/main", Some("main"), true);
     assert!(wi.is_main_checkout());

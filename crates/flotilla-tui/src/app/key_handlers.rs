@@ -229,24 +229,19 @@ impl App {
         let multi_selected = page.multi_selected.clone();
         let mut all_issue_keys: Vec<String> = Vec::new();
 
-        // Collect issues from multi-selected items
-        for item in page.table.all_items() {
-            if multi_selected.contains(&item.identity) {
-                all_issue_keys.extend(item.issue_keys.iter().cloned());
+        for selected in &multi_selected {
+            if let Some(issue_keys) = page.table.issue_keys_for_identity(selected) {
+                all_issue_keys.extend(issue_keys);
             }
         }
 
         // Also include current selection if not already in multi_selected
-        match self.selected_row_cloned() {
-            Some(OwnedSelectedRow::WorkItem(ref item)) => {
-                if !multi_selected.contains(&item.identity) {
-                    all_issue_keys.extend(item.issue_keys.iter().cloned());
+        if let Some(selected_identity) = page.table.selected_identity() {
+            if !multi_selected.contains(&selected_identity) {
+                if let Some(issue_keys) = page.table.issue_keys_for_identity(&selected_identity) {
+                    all_issue_keys.extend(issue_keys);
                 }
             }
-            Some(OwnedSelectedRow::IssueRow(row)) => {
-                all_issue_keys.push(row.id);
-            }
-            None => {}
         }
 
         all_issue_keys.sort();
@@ -262,8 +257,11 @@ impl App {
     }
 
     fn dispatch_if_available(&mut self, intent: Intent) {
-        // dispatch only applies to WorkItem rows (intents operate on WorkItem)
-        let Some(item) = self.selected_work_item().cloned() else {
+        let Some(item) = (match self.selected_row_cloned() {
+            Some(OwnedSelectedRow::WorkItem(item)) => Some(*item),
+            Some(OwnedSelectedRow::IssueRow(row)) => Some(self.work_item_for_issue_row(&row)),
+            None => None,
+        }) else {
             return;
         };
         let my_node_id = self.model.my_node_id().cloned();
@@ -388,9 +386,11 @@ impl App {
     }
 
     pub(super) fn open_action_menu(&mut self) {
-        // Action menu only applies to WorkItem rows; IssueRows have no
-        // Intent-based actions beyond the built-in Enter behaviour.
-        let Some(item) = self.selected_work_item().cloned() else {
+        let Some(item) = (match self.selected_row_cloned() {
+            Some(OwnedSelectedRow::WorkItem(item)) => Some(*item),
+            Some(OwnedSelectedRow::IssueRow(row)) => Some(self.work_item_for_issue_row(&row)),
+            None => None,
+        }) else {
             return;
         };
 

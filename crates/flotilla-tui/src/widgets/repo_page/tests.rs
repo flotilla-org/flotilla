@@ -1,4 +1,4 @@
-use flotilla_protocol::{CloudAgentSession, ProviderData, RepoLabels, SessionStatus, WorkItemIdentity};
+use flotilla_protocol::{provider_data::Issue, CloudAgentSession, ProviderData, RepoLabels, SessionStatus, WorkItemIdentity};
 
 use super::*;
 use crate::app::test_support::{issue_item, session_item, TestWidgetHarness};
@@ -17,6 +17,33 @@ fn test_repo_data(items: Vec<WorkItem>) -> Shared<RepoData> {
         work_items: items,
         issue_rows: Vec::new(),
         issue_section_label: String::new(),
+        loading: false,
+    })
+}
+
+fn native_issue_row(id: &str) -> IssueRow {
+    IssueRow {
+        id: id.to_string(),
+        issue: Issue {
+            title: format!("Issue {id}"),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        },
+    }
+}
+
+fn test_repo_data_with_issue_rows(issue_rows: Vec<IssueRow>) -> Shared<RepoData> {
+    Shared::new(RepoData {
+        path: PathBuf::from("/tmp/test-repo"),
+        providers: Arc::new(ProviderData::default()),
+        labels: RepoLabels::default(),
+        provider_names: HashMap::new(),
+        provider_health: HashMap::new(),
+        work_items: Vec::new(),
+        issue_rows,
+        issue_section_label: "Issues".into(),
         loading: false,
     })
 }
@@ -98,6 +125,23 @@ fn reconcile_prunes_stale_multi_select() {
 
     // Remove item 3 from the data.
     data.mutate(|d| d.work_items.retain(|i| i.identity != WorkItemIdentity::Issue("3".into())));
+
+    page.reconcile_if_changed();
+    assert_eq!(page.multi_selected.len(), 1);
+    assert!(page.multi_selected.contains(&WorkItemIdentity::Issue("1".into())));
+    assert!(!page.multi_selected.contains(&WorkItemIdentity::Issue("3".into())));
+}
+
+#[test]
+fn reconcile_prunes_stale_native_issue_row_multi_select() {
+    let data = test_repo_data_with_issue_rows(vec![native_issue_row("1"), native_issue_row("2"), native_issue_row("3")]);
+    let mut page = RepoPage::new(test_repo_identity(), data.clone(), RepoViewLayout::Auto);
+    page.reconcile_if_changed();
+
+    page.multi_selected.insert(WorkItemIdentity::Issue("1".into()));
+    page.multi_selected.insert(WorkItemIdentity::Issue("3".into()));
+
+    data.mutate(|d| d.issue_rows.retain(|row| row.id != "3"));
 
     page.reconcile_if_changed();
     assert_eq!(page.multi_selected.len(), 1);
@@ -356,11 +400,45 @@ fn toggle_multi_select_adds_and_removes() {
     assert!(page.multi_selected.is_empty());
 }
 
+#[test]
+fn toggle_multi_select_adds_and_removes_native_issue_rows() {
+    let data = test_repo_data_with_issue_rows(vec![native_issue_row("1"), native_issue_row("2")]);
+    let mut page = RepoPage::new(test_repo_identity(), data, RepoViewLayout::Auto);
+    page.reconcile_if_changed();
+    let mut harness = TestWidgetHarness::new();
+
+    {
+        let mut ctx = harness.ctx();
+        page.handle_action(Action::ToggleMultiSelect, &mut ctx);
+    }
+    assert!(page.multi_selected.contains(&WorkItemIdentity::Issue("1".into())));
+
+    {
+        let mut ctx = harness.ctx();
+        page.handle_action(Action::ToggleMultiSelect, &mut ctx);
+    }
+    assert!(page.multi_selected.is_empty());
+}
+
 // ── select_all ──
 
 #[test]
 fn select_all_selects_all_items() {
     let mut page = page_with_items(vec![issue_item("1"), issue_item("2"), issue_item("3")]);
+
+    page.select_all();
+
+    assert_eq!(page.multi_selected.len(), 3);
+    assert!(page.multi_selected.contains(&WorkItemIdentity::Issue("1".into())));
+    assert!(page.multi_selected.contains(&WorkItemIdentity::Issue("2".into())));
+    assert!(page.multi_selected.contains(&WorkItemIdentity::Issue("3".into())));
+}
+
+#[test]
+fn select_all_selects_native_issue_rows() {
+    let data = test_repo_data_with_issue_rows(vec![native_issue_row("1"), native_issue_row("2"), native_issue_row("3")]);
+    let mut page = RepoPage::new(test_repo_identity(), data, RepoViewLayout::Auto);
+    page.reconcile_if_changed();
 
     page.select_all();
 

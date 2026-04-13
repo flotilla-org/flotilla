@@ -526,6 +526,27 @@ impl App {
         }
     }
 
+    pub(super) fn work_item_for_issue_row(&self, row: &IssueRow) -> WorkItem {
+        WorkItem {
+            kind: flotilla_protocol::WorkItemKind::Issue,
+            identity: WorkItemIdentity::Issue(row.id.clone()),
+            node_id: self.model.my_node_id().cloned().unwrap_or_else(|| NodeId::new("issue-row")),
+            branch: None,
+            description: row.issue.title.clone(),
+            checkout: None,
+            change_request_key: None,
+            session_key: None,
+            issue_keys: vec![row.id.clone()],
+            workspace_refs: vec![],
+            is_main_checkout: false,
+            debug_group: vec![],
+            source: (!row.issue.provider_display_name.is_empty()).then(|| row.issue.provider_display_name.clone()),
+            terminal_keys: vec![],
+            attachable_set_id: None,
+            agent_keys: vec![],
+        }
+    }
+
     pub fn repo_path_for_identity(&self, identity: &RepoIdentity) -> Option<PathBuf> {
         self.model.repos.get(identity).map(|repo| repo.path.clone())
     }

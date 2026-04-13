@@ -1,5 +1,5 @@
 use flotilla_core::data::SectionKind;
-use flotilla_protocol::WorkItem;
+use flotilla_protocol::{HostName, WorkItem};
 use ratatui::{layout::Constraint, style::Style, text::Span};
 
 use super::section_table::{ColumnDef, IssueRow, RenderCtx};
@@ -31,11 +31,17 @@ fn checkout_columns() -> Vec<ColumnDef<WorkItem>> {
         source_column(),
         col("Path", Constraint::Fill(1), |item, ctx| {
             let text = if let Some(hp) = item.checkout_key() {
-                let host_name = hp.host_name();
-                let is_local = host_name.is_none() || ctx.my_host.is_none() || ctx.my_host == host_name;
+                let display_host = item
+                    .checkout
+                    .as_ref()
+                    .and_then(|checkout| checkout.host_path())
+                    .map(|path| path.host.clone())
+                    .or_else(|| item.source.as_ref().map(HostName::new))
+                    .or_else(|| hp.host_name().cloned());
+                let is_local = display_host.as_ref().is_none_or(|host| ctx.my_host.is_none() || ctx.my_host == Some(host));
                 let (repo_root, home_dir) = if is_local {
                     (ctx.repo_root.to_path_buf(), dirs::home_dir())
-                } else if let Some(host_name) = host_name {
+                } else if let Some(host_name) = display_host.as_ref() {
                     let root = ctx.host_repo_roots.get(host_name).cloned().unwrap_or_else(|| hp.path.clone());
                     let home = ctx.host_home_dirs.get(host_name).map(|p| p.to_path_buf());
                     (root, home)

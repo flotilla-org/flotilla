@@ -485,9 +485,45 @@ impl SplitTable {
     }
 
     /// Convenience: identity of the currently selected item. Returns `None`
-    /// for `IssueRow` selections (they have no `WorkItemIdentity`).
+    /// when nothing is selected.
     pub fn selected_identity(&self) -> Option<WorkItemIdentity> {
-        self.selected_work_item().map(|item| item.identity.clone())
+        match self.selected_row()? {
+            SelectedRow::WorkItem(item) => Some(item.identity.clone()),
+            SelectedRow::Issue(row) => Some(WorkItemIdentity::Issue(row.id.clone())),
+        }
+    }
+
+    /// Iterate all selectable identities across all sections.
+    pub fn all_identities(&self) -> impl Iterator<Item = WorkItemIdentity> + '_ {
+        self.sections.iter().flat_map(|(_, section)| match section {
+            AnySection::WorkItems(t) => t.items.iter().map(|item| item.identity.clone()).collect::<Vec<_>>(),
+            AnySection::Issues(t) => t.items.iter().map(|row| WorkItemIdentity::Issue(row.id.clone())).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Issue keys associated with the given identity, whether it comes from a
+    /// work-item-backed row or a native issue row.
+    pub fn issue_keys_for_identity(&self, identity: &WorkItemIdentity) -> Option<Vec<String>> {
+        match identity {
+            WorkItemIdentity::Issue(issue_id) => {
+                for (_, section) in &self.sections {
+                    match section {
+                        AnySection::Issues(t) => {
+                            if t.items.iter().any(|row| &row.id == issue_id) {
+                                return Some(vec![issue_id.clone()]);
+                            }
+                        }
+                        AnySection::WorkItems(t) => {
+                            if let Some(item) = t.items.iter().find(|item| &item.identity == identity) {
+                                return Some(item.issue_keys.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            _ => self.all_items().find(|item| &item.identity == identity).map(|item| item.issue_keys.clone()),
+        }
     }
 
     /// Total number of items across all sections (both `WorkItem` and `IssueRow`).
@@ -563,10 +599,14 @@ impl SplitTable {
             if let AnySection::WorkItems(table) = section {
                 for item in &table.items {
                     if item.is_main_checkout {
-                        if let Some(co) = item.checkout_key() {
-                            if let Some(host_name) = co.host_name() {
-                                host_repo_roots.insert(host_name.clone(), co.path.clone());
+                        if let Some(checkout) = item.checkout.as_ref() {
+                            if let Some(host_path) = checkout.host_path() {
+                                host_repo_roots.insert(host_path.host.clone(), host_path.path.clone());
+                                continue;
                             }
+                        }
+                        if let (Some(source), Some(co)) = (item.source.as_ref(), item.checkout_key()) {
+                            host_repo_roots.insert(HostName::new(source), co.path.clone());
                         }
                     }
                 }
@@ -682,7 +722,19 @@ impl SplitTable {
                                 prev_source: prev_source.as_deref(),
                             };
 
-                            render_generic_data_row(frame, item, &table.columns, &render_ctx, is_selected, y, area.x, area.width, theme);
+                            let is_multi_selected = multi_selected.contains(&WorkItemIdentity::Issue(item.id.clone()));
+                            render_generic_data_row(
+                                frame,
+                                item,
+                                &table.columns,
+                                &render_ctx,
+                                is_selected,
+                                is_multi_selected,
+                                y,
+                                area.x,
+                                area.width,
+                                theme,
+                            );
                         }
                         prev_source = Some(item.issue.provider_display_name.clone());
                         flat_row += 1;
@@ -895,7 +947,7 @@ fn render_column_headers_generic<T>(columns: &[ColumnDef<T>], col_widths: &[u16]
     frame.render_widget(line, area);
 }
 
-/// Render a single data row for any `ColumnDef<T>` section (no pending/multi-select support).
+/// Render a single data row for any `ColumnDef<T>` section.
 #[allow(clippy::too_many_arguments)]
 fn render_generic_data_row<T>(
     frame: &mut Frame,
@@ -903,6 +955,7 @@ fn render_generic_data_row<T>(
     columns: &[ColumnDef<T>],
     ctx: &RenderCtx,
     is_selected: bool,
+    is_multi_selected: bool,
     y: u16,
     area_x: u16,
     area_width: u16,
@@ -930,6 +983,14 @@ fn render_generic_data_row<T>(
     let line = Line::from(spans);
     frame.render_widget(line, Rect::new(area_x, y, area_width, 1));
 
+    if is_multi_selected {
+        let buf = frame.buffer_mut();
+        for cx in area_x..area_x + area_width {
+            if let Some(cell) = buf.cell_mut(Position::new(cx, y)) {
+                cell.set_bg(theme.multi_select_bg);
+            }
+        }
+    }
     if is_selected {
         let buf = frame.buffer_mut();
         for cx in area_x..area_x + area_width {

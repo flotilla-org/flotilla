@@ -742,14 +742,16 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::ArchiveSession { session_id } => {
-                let session_actions = ReadOnlySessionActionService::new(self.registry.as_ref(), self.providers_data.as_ref());
+                let session_actions =
+                    ReadOnlySessionActionService::new(&self.repo.root, self.registry.as_ref(), self.providers_data.as_ref());
                 match session_actions.archive_session_result(&session_id).await {
                     CommandValue::Error { message } => Err(message),
                     result => Ok(StepOutcome::CompletedWith(result)),
                 }
             }
             StepAction::GenerateBranchName { issue_keys } => {
-                let session_actions = ReadOnlySessionActionService::new(self.registry.as_ref(), self.providers_data.as_ref());
+                let session_actions =
+                    ReadOnlySessionActionService::new(&effective_repo_root, effective_registry.as_ref(), effective_providers_data.as_ref());
                 Ok(StepOutcome::CompletedWith(session_actions.generate_branch_name_result(&issue_keys).await))
             }
             StepAction::PrepareWorkspace { checkout_path: explicit_path, label, display_host } => {

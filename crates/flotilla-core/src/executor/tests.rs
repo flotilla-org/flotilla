@@ -208,7 +208,20 @@ impl ChangeRequestTracker for MockChangeRequestTracker {
 }
 
 /// A mock IssueProvider provider.
-struct MockIssueProvider;
+struct MockIssueProvider {
+    fetched_by_id: tokio::sync::Mutex<Vec<Vec<String>>>,
+    fetched_issues: Vec<(String, Issue)>,
+}
+
+impl MockIssueProvider {
+    fn empty() -> Self {
+        Self { fetched_by_id: tokio::sync::Mutex::new(Vec::new()), fetched_issues: Vec::new() }
+    }
+
+    fn with_fetched_issues(fetched_issues: Vec<(String, Issue)>) -> Self {
+        Self { fetched_by_id: tokio::sync::Mutex::new(Vec::new()), fetched_issues }
+    }
+}
 
 #[async_trait]
 impl IssueProvider for MockIssueProvider {
@@ -217,6 +230,11 @@ impl IssueProvider for MockIssueProvider {
     }
     async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn fetch_issues_by_id(&self, _repo_root: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
+        self.fetched_by_id.lock().await.push(ids.to_vec());
+        Ok(self.fetched_issues.iter().filter(|(id, _)| ids.iter().any(|requested| requested == id)).cloned().collect())
     }
 }
 
@@ -1487,7 +1505,7 @@ async fn open_issue_no_provider() {
 #[tokio::test]
 async fn open_issue_with_provider() {
     let mut registry = empty_registry();
-    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider));
+    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider::empty()));
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(CommandAction::OpenIssue { id: "10".to_string() }, registry, empty_data(), runner).await;
@@ -1640,7 +1658,7 @@ async fn archive_session_agent_fails() {
 async fn generate_branch_name_ai_success() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
-    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider));
+    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider::empty()));
     let mut data = empty_data();
     data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
     let runner = runner_ok();
@@ -1685,7 +1703,7 @@ async fn generate_branch_name_no_ai_provider_uses_fallback() {
 async fn generate_branch_name_multiple_issues() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/login-and-signup")));
-    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider));
+    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider::empty()));
     let mut data = empty_data();
     data.issues.insert("1".to_string(), TestIssue::new("Login feature").build());
     data.issues.insert("2".to_string(), TestIssue::new("Signup feature").build());
@@ -1703,7 +1721,33 @@ async fn generate_branch_name_multiple_issues() {
 }
 
 #[tokio::test]
-async fn generate_branch_name_unknown_issue_key() {
+async fn generate_branch_name_fetches_missing_issue_details() {
+    let mut registry = empty_registry();
+    registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/from-fetched-issue")));
+    let fetched_issue = Issue {
+        title: "Fix login redirect".to_string(),
+        labels: vec!["bug".to_string(), "auth".to_string()],
+        association_keys: vec![],
+        provider_name: "github".to_string(),
+        provider_display_name: "GitHub".to_string(),
+    };
+    registry.issue_trackers.insert(
+        "github",
+        desc("github"),
+        Arc::new(MockIssueProvider::with_fetched_issues(vec![("42".to_string(), fetched_issue)])),
+    );
+    let data = empty_data();
+    let runner = runner_ok();
+
+    let result =
+        run_build_plan_to_completion(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, registry, data, runner)
+            .await;
+
+    assert_branch_name_generated(result, "feat/from-fetched-issue", &[("github", "42")]);
+}
+
+#[tokio::test]
+async fn generate_branch_name_unknown_issue_key_uses_requested_ids() {
     let registry = empty_registry();
     let data = empty_data();
     let runner = runner_ok();
@@ -1716,8 +1760,7 @@ async fn generate_branch_name_unknown_issue_key() {
     )
     .await;
 
-    // No issues found, so empty fallback
-    assert_branch_name_generated(result, "", &[]);
+    assert_branch_name_generated(result, "issue-nonexistent", &[("issues", "nonexistent")]);
 }
 
 // -----------------------------------------------------------------------

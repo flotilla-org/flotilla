@@ -25,6 +25,33 @@ fn hp(path: &str) -> HostPath {
     HostPath::new(HostName::local(), PathBuf::from(path))
 }
 
+fn native_issue_row(id: &str) -> crate::widgets::section_table::IssueRow {
+    crate::widgets::section_table::IssueRow {
+        id: id.to_string(),
+        issue: flotilla_protocol::provider_data::Issue {
+            title: format!("Issue {id}"),
+            labels: vec![],
+            association_keys: vec![],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        },
+    }
+}
+
+fn setup_native_issue_rows(app: &mut App, issue_ids: &[&str]) {
+    let repo_key = app.model.repo_order[app.model.active_repo].clone();
+    if let Some(handle) = app.repo_data.get(&repo_key) {
+        handle.mutate(|d| {
+            d.work_items.clear();
+            d.issue_rows = issue_ids.iter().map(|id| native_issue_row(id)).collect();
+            d.issue_section_label = "Issues".into();
+        });
+    }
+    if let Some(page) = app.screen.repo_pages.get_mut(&repo_key) {
+        page.reconcile_if_changed();
+    }
+}
+
 /// Read the active RepoPage's selected flat index.
 fn active_selection(app: &App) -> Option<usize> {
     let identity = &app.model.repo_order[app.model.active_repo];
@@ -1388,6 +1415,56 @@ fn action_enter_multi_select_without_issues_clears() {
     let identity = app.model.repo_order[0].clone();
     let page = app.screen.repo_pages.get(&identity).expect("page exists");
     assert!(page.multi_selected.is_empty());
+}
+
+#[test]
+fn action_enter_multi_select_generates_branch_name_for_native_issue_rows() {
+    let mut app = stub_app();
+    setup_native_issue_rows(&mut app, &["ISSUE-1", "ISSUE-2"]);
+
+    let identity = app.model.repo_order[0].clone();
+    let page = app.screen.repo_pages.get_mut(&identity).expect("page exists");
+    page.multi_selected.insert(WorkItemIdentity::Issue("ISSUE-1".into()));
+    page.multi_selected.insert(WorkItemIdentity::Issue("ISSUE-2".into()));
+
+    app.action_enter();
+
+    assert_eq!(app.screen.modal_stack.len(), 1);
+    assert_eq!(
+        app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+        KeyBindingMode::from(BindingModeId::BranchInput)
+    );
+    let (cmd, _) = app.proto_commands.take_next().expect("expected command");
+    match cmd {
+        Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
+            assert_eq!(issue_keys, vec!["ISSUE-1".to_string(), "ISSUE-2".to_string()]);
+        }
+        other => panic!("expected GenerateBranchName, got {:?}", other),
+    }
+
+    let page = app.screen.repo_pages.get(&identity).expect("page exists");
+    assert!(page.multi_selected.is_empty());
+}
+
+#[test]
+fn dispatch_generate_branch_name_from_native_issue_row() {
+    let mut app = stub_app();
+    setup_native_issue_rows(&mut app, &["ISSUE-1"]);
+
+    app.dispatch_if_available(Intent::GenerateBranchName);
+
+    assert_eq!(app.screen.modal_stack.len(), 1);
+    assert_eq!(
+        app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
+        KeyBindingMode::from(BindingModeId::BranchInput)
+    );
+    let (cmd, _) = app.proto_commands.take_next().expect("expected command");
+    match cmd {
+        Command { action: CommandAction::GenerateBranchName { issue_keys }, .. } => {
+            assert_eq!(issue_keys, vec!["ISSUE-1".to_string()]);
+        }
+        other => panic!("expected GenerateBranchName, got {:?}", other),
+    }
 }
 
 // ── delete_confirm_y_with_no_info ────────────────────────────────

@@ -1,6 +1,6 @@
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
-use flotilla_protocol::{CommandValue, HostName};
+use flotilla_protocol::{provider_data::Issue, CommandValue, HostName};
 use tracing::{info, warn};
 
 use super::WorkspaceOrchestrator;
@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub(super) struct ReadOnlySessionActionService<'a> {
+    repo_root: &'a ExecutionEnvironmentPath,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
 }
@@ -36,8 +37,8 @@ pub(super) struct TeleportFlow<'a> {
 }
 
 impl<'a> ReadOnlySessionActionService<'a> {
-    pub(super) fn new(registry: &'a ProviderRegistry, providers_data: &'a ProviderData) -> Self {
-        Self { registry, providers_data }
+    pub(super) fn new(repo_root: &'a ExecutionEnvironmentPath, registry: &'a ProviderRegistry, providers_data: &'a ProviderData) -> Self {
+        Self { repo_root, registry, providers_data }
     }
 
     pub(super) async fn archive_session_result(&self, session_id: &str) -> CommandValue {
@@ -61,20 +62,25 @@ impl<'a> ReadOnlySessionActionService<'a> {
     }
 
     pub(super) async fn generate_branch_name_result(&self, issue_keys: &[String]) -> CommandValue {
-        let issues: Vec<(String, String)> = issue_keys
+        let issues = self.resolve_branch_name_issues(issue_keys).await;
+
+        let issue_id_pairs: Vec<(String, String)> = issue_keys
             .iter()
-            .filter_map(|key| self.providers_data.issues.get(key.as_str()).map(|issue| (key.clone(), issue.title.clone())))
+            .map(|id| {
+                let provider = issues
+                    .iter()
+                    .find(|(issue_id, _)| issue_id == id)
+                    .map(|(_, issue)| self.provider_name_for_issue(issue))
+                    .unwrap_or_else(|| self.default_issue_provider_name());
+                (provider, id.clone())
+            })
             .collect();
 
-        let issue_id_pairs: Vec<(String, String)> = {
-            let provider =
-                self.registry.issue_trackers.preferred_name().map(|name| name.to_string()).unwrap_or_else(|| "issues".to_string());
-            issues.iter().map(|(id, _title)| (provider.clone(), id.clone())).collect()
-        };
-
-        info!(issue_count = issue_keys.len(), "generating branch name");
-        let branch_result = if let Some(ai) = self.registry.ai_utilities.preferred() {
-            let context: Vec<String> = issues.iter().map(|(id, title)| format!("{} #{}", title, id)).collect();
+        info!(requested_issue_count = issue_keys.len(), resolved_issue_count = issues.len(), "generating branch name");
+        let branch_result = if issues.is_empty() {
+            None
+        } else if let Some(ai) = self.registry.ai_utilities.preferred() {
+            let context: Vec<String> = issues.iter().map(|(id, issue)| self.format_branch_issue_context(id, issue)).collect();
             let prompt_text = if context.len() == 1 { context[0].clone() } else { context.join("; ") };
             Some(ai.generate_branch_name(&prompt_text).await)
         } else {
@@ -88,16 +94,65 @@ impl<'a> ReadOnlySessionActionService<'a> {
             }
             Some(Err(error)) => {
                 warn!(%error, "using fallback branch name after AI failure");
-                let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
+                let fallback: Vec<String> = issue_keys.iter().map(|id| format!("issue-{id}")).collect();
                 let name = fallback.join("-");
                 CommandValue::BranchNameGenerated { name, issue_ids: issue_id_pairs }
             }
             None => {
-                warn!("using fallback branch name without AI provider");
-                let fallback: Vec<String> = issues.iter().map(|(id, _)| format!("issue-{}", id)).collect();
+                if issues.is_empty() {
+                    warn!("using fallback branch name without resolved issue context");
+                } else {
+                    warn!("using fallback branch name without AI provider");
+                }
+                let fallback: Vec<String> = issue_keys.iter().map(|id| format!("issue-{id}")).collect();
                 let name = fallback.join("-");
                 CommandValue::BranchNameGenerated { name, issue_ids: issue_id_pairs }
             }
+        }
+    }
+
+    async fn resolve_branch_name_issues(&self, issue_keys: &[String]) -> Vec<(String, Issue)> {
+        let mut resolved: HashMap<String, Issue> = issue_keys
+            .iter()
+            .filter_map(|key| self.providers_data.issues.get(key.as_str()).cloned().map(|issue| (key.clone(), issue)))
+            .collect();
+
+        let missing: Vec<String> = issue_keys.iter().filter(|key| !resolved.contains_key(key.as_str())).cloned().collect();
+        if !missing.is_empty() {
+            if let Some(tracker) = self.registry.issue_trackers.preferred() {
+                match tracker.fetch_issues_by_id(self.repo_root.as_path(), &missing).await {
+                    Ok(fetched) => {
+                        for (id, issue) in fetched {
+                            resolved.entry(id).or_insert(issue);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, missing_issue_count = missing.len(), "failed to fetch missing issues for branch naming");
+                    }
+                }
+            }
+        }
+
+        issue_keys.iter().filter_map(|key| resolved.get(key.as_str()).cloned().map(|issue| (key.clone(), issue))).collect()
+    }
+
+    fn format_branch_issue_context(&self, id: &str, issue: &Issue) -> String {
+        if issue.labels.is_empty() {
+            format!("{} #{}", issue.title, id)
+        } else {
+            format!("{} #{} [{}]", issue.title, id, issue.labels.join(", "))
+        }
+    }
+
+    fn default_issue_provider_name(&self) -> String {
+        self.registry.issue_trackers.preferred_name().map(|name| name.to_string()).unwrap_or_else(|| "issues".to_string())
+    }
+
+    fn provider_name_for_issue(&self, issue: &Issue) -> String {
+        if issue.provider_name.is_empty() {
+            self.default_issue_provider_name()
+        } else {
+            issue.provider_name.clone()
         }
     }
 }
@@ -115,7 +170,7 @@ impl<'a> TeleportSessionActionService<'a> {
         terminal_manager: Option<&'a TerminalManager>,
     ) -> Self {
         Self {
-            read_only: ReadOnlySessionActionService::new(registry, providers_data),
+            read_only: ReadOnlySessionActionService::new(repo_root, registry, providers_data),
             repo_root,
             config_base,
             attachable_store,

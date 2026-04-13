@@ -393,9 +393,11 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
     let description = pr_title.or(session_title).or(agent_title).or_else(|| branch.clone()).or(set_description).unwrap_or_default();
 
     let source = match &anchor {
-        CorrelatedAnchor::Checkout(co) => {
-            co.host_path().map(|path| path.host.to_string()).or_else(|| co.key.host_name().map(ToString::to_string))
-        }
+        CorrelatedAnchor::Checkout(co) => co
+            .host_path()
+            .map(|path| path.host.to_string())
+            .or_else(|| co.key.host_name().map(ToString::to_string))
+            .or_else(|| host.as_ref().map(ToString::to_string)),
         CorrelatedAnchor::AttachableSet(id) => providers.attachable_sets.get(id).and_then(|set| {
             set.checkout
                 .as_ref()

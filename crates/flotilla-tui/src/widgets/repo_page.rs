@@ -182,7 +182,7 @@ impl RepoPage {
         // Query-driven issues go into a native IssueRow section.
         self.table.update_issue_section(data.issue_section_label.clone(), data.issue_rows.clone());
 
-        let current_identities: HashSet<WorkItemIdentity> = self.table.all_items().map(|item| item.identity.clone()).collect();
+        let current_identities: HashSet<WorkItemIdentity> = self.table.all_identities().collect();
         self.multi_selected.retain(|id| current_identities.contains(id));
         self.pending_actions.retain(|id, _| current_identities.contains(id));
     }
@@ -264,9 +264,7 @@ impl RepoPage {
     }
 
     fn toggle_multi_select(&mut self) {
-        // Multi-select only applies to WorkItem rows (which have identities).
-        if let Some(item) = self.table.selected_work_item() {
-            let identity = item.identity.clone();
+        if let Some(identity) = self.table.selected_identity() {
             if !self.multi_selected.remove(&identity) {
                 self.multi_selected.insert(identity);
             }
@@ -274,8 +272,8 @@ impl RepoPage {
     }
 
     pub fn select_all(&mut self) {
-        for item in self.table.all_items() {
-            self.multi_selected.insert(item.identity.clone());
+        for identity in self.table.all_identities() {
+            self.multi_selected.insert(identity);
         }
     }
 }
