@@ -1763,6 +1763,24 @@ async fn generate_branch_name_unknown_issue_key_uses_requested_ids() {
     assert_branch_name_generated(result, "issue-nonexistent", &[("issues", "nonexistent")]);
 }
 
+#[tokio::test]
+async fn generate_branch_name_unknown_issue_key_still_uses_ai_context() {
+    let mut registry = empty_registry();
+    registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/from-placeholder")));
+    let data = empty_data();
+    let runner = runner_ok();
+
+    let result = run_build_plan_to_completion(
+        CommandAction::GenerateBranchName { issue_keys: vec!["nonexistent".to_string()] },
+        registry,
+        data,
+        runner,
+    )
+    .await;
+
+    assert_branch_name_generated(result, "feat/from-placeholder", &[("issues", "nonexistent")]);
+}
+
 // -----------------------------------------------------------------------
 // Tests: TeleportSession
 // -----------------------------------------------------------------------

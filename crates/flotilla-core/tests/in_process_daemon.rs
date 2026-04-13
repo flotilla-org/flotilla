@@ -496,7 +496,7 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
     (temp, repo, daemon)
 }
@@ -505,7 +505,7 @@ async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
     (temp, repo, daemon)
 }
@@ -514,9 +514,15 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     (temp, repo, daemon)
+}
+
+fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
 }
 
 fn static_ssh_test_discovery(runner: Arc<dyn CommandRunner>) -> DiscoveryRuntime {
@@ -1908,7 +1914,7 @@ async fn archive_session_can_be_cancelled_while_provider_call_is_in_flight() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let agent = Arc::new(SlowCloudAgent::new());
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, slow_cloud_agent_discovery(Arc::clone(&agent)), HostName::local()).await;
     let mut rx = daemon.subscribe();
@@ -1970,7 +1976,7 @@ async fn generate_branch_name_can_be_cancelled_while_provider_call_is_in_flight(
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let utility = Arc::new(SlowAiUtility::new());
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, slow_ai_discovery(Arc::clone(&utility)), HostName::local()).await;
     let mut rx = daemon.subscribe();

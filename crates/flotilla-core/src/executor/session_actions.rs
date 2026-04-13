@@ -77,10 +77,17 @@ impl<'a> ReadOnlySessionActionService<'a> {
             .collect();
 
         info!(requested_issue_count = issue_keys.len(), resolved_issue_count = issues.len(), "generating branch name");
-        let branch_result = if issues.is_empty() {
-            None
-        } else if let Some(ai) = self.registry.ai_utilities.preferred() {
-            let context: Vec<String> = issues.iter().map(|(id, issue)| self.format_branch_issue_context(id, issue)).collect();
+        let branch_result = if let Some(ai) = self.registry.ai_utilities.preferred() {
+            let context: Vec<String> = issue_keys
+                .iter()
+                .map(|id| {
+                    issues
+                        .iter()
+                        .find(|(issue_id, _)| issue_id == id)
+                        .map(|(_, issue)| self.format_branch_issue_context(id, issue))
+                        .unwrap_or_else(|| format!("issue {id}"))
+                })
+                .collect();
             let prompt_text = if context.len() == 1 { context[0].clone() } else { context.join("; ") };
             Some(ai.generate_branch_name(&prompt_text).await)
         } else {
@@ -99,10 +106,10 @@ impl<'a> ReadOnlySessionActionService<'a> {
                 CommandValue::BranchNameGenerated { name, issue_ids: issue_id_pairs }
             }
             None => {
-                if issues.is_empty() {
-                    warn!("using fallback branch name without resolved issue context");
-                } else {
+                if !issues.is_empty() {
                     warn!("using fallback branch name without AI provider");
+                } else {
+                    warn!("using fallback branch name without resolved issue context");
                 }
                 let fallback: Vec<String> = issue_keys.iter().map(|id| format!("issue-{id}")).collect();
                 let name = fallback.join("-");
@@ -123,7 +130,7 @@ impl<'a> ReadOnlySessionActionService<'a> {
                 match tracker.fetch_issues_by_id(self.repo_root.as_path(), &missing).await {
                     Ok(fetched) => {
                         for (id, issue) in fetched {
-                            resolved.entry(id).or_insert(issue);
+                            resolved.insert(id, issue);
                         }
                     }
                     Err(error) => {

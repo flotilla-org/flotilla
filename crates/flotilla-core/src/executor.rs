@@ -743,7 +743,7 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::ArchiveSession { session_id } => {
                 let session_actions =
-                    ReadOnlySessionActionService::new(&self.repo.root, self.registry.as_ref(), self.providers_data.as_ref());
+                    ReadOnlySessionActionService::new(&effective_repo_root, effective_registry.as_ref(), effective_providers_data.as_ref());
                 match session_actions.archive_session_result(&session_id).await {
                     CommandValue::Error { message } => Err(message),
                     result => Ok(StepOutcome::CompletedWith(result)),
