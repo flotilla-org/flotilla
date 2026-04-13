@@ -30,13 +30,15 @@ struct ApiPaths {
 A Rust type representing a k8s-style resource. Carries its own API coordinates and associated spec/status types:
 
 ```rust
-trait Resource: Serialize + DeserializeOwned + Send + Sync + 'static {
+trait Resource: Send + Sync + 'static {
     type Spec: Serialize + DeserializeOwned + Send + Sync;
     type Status: Serialize + DeserializeOwned + Send + Sync;
 
     const API_PATHS: ApiPaths;
 }
 ```
+
+`Resource` itself has no serde bounds — it is a marker type that associates API coordinates with spec/status types. Only `Spec` and `Status` are serialized.
 
 ### ResourceObject
 
@@ -66,6 +68,8 @@ struct ObjectMeta {
 ```
 
 Fields included: name, namespace, resourceVersion (optimistic concurrency), labels (selection/filtering), annotations (arbitrary metadata), creationTimestamp (display/debugging).
+
+**Namespace on input objects is ignored.** The resolver's namespace is the source of truth for all operations. On create/update, the backend disregards `metadata.namespace` and uses the resolver's bound namespace. On returned objects, `metadata.namespace` is set by the backend to the resolver's namespace. This avoids contradictions between the resolver and the object.
 
 Fields deferred: generation/observedGeneration, finalizers, ownerReferences.
 
@@ -107,7 +111,7 @@ Namespace is a parameter when creating a resolver, not a field on the backend or
 The primary API for controllers. Fully typed — serde conversions happen at this layer:
 
 ```rust
-struct TypedResolver<T: Resource> { /* backend ref + namespace + PhantomData<T> */ }
+struct TypedResolver<T: Resource> { /* owned clone of backend handle + owned String namespace + PhantomData<T> */ }
 
 impl<T: Resource> TypedResolver<T> {
     async fn get(&self, name: &str) -> Result<ResourceObject<T>, ResourceError>;
@@ -141,7 +145,7 @@ The standard controller pattern is: `list()` to get current state + collection r
 The escape hatch for operating on resources without a compile-time Rust type. Separate type from `TypedResolver` — no pretending that `Value` is a `Resource`:
 
 ```rust
-struct DynamicResolver { /* backend ref + namespace + ApiPaths */ }
+struct DynamicResolver { /* owned clone of backend handle + owned String namespace + ApiPaths */ }
 
 impl DynamicResolver {
     async fn get(&self, name: &str) -> Result<serde_json::Value, ResourceError>;
