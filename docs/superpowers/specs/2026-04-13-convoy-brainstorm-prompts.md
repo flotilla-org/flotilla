@@ -219,3 +219,29 @@ Convoy data feeds into the TUI through the normal provider data / snapshot path.
 **Dependencies:** All previous brainstorms (3-6) should be solid before migrating.
 
 **Starting point:** Read `crates/flotilla-core/src/attachable/` (full module), `crates/flotilla-core/src/providers/correlation.rs`.
+
+---
+
+## Deferred Items
+
+Things deliberately pushed out of earlier stages. Each stage's spec should restate the relevant ones, but the master list lives here so nothing falls through.
+
+### From Stage 2 (WorkflowTemplate)
+
+- **Loops / retry edges** — review → fix → review cycles. A new edge kind beyond `depends_on` is likely needed. See the WorkflowTemplate spec for details.
+- **Conditional edges** — approval gates ("proceed only if reviewer approves").
+- **User tasks** — a task whose "process" is a human action (confirm a generated branch name, approve a spec). Could be a new `ProcessSource` variant or a task-level `user_prompt:`.
+- **Named artifacts / data flow** — a task produces a value, downstream tasks consume it. Motivating example: a one-shot haiku call generates a branch name, downstream tasks use `{branch}`. Today's branch-name-generation-plus-confirmation flow is the concrete case to design around.
+- **Agent lifetime across tasks** — resume/session continuity. `implement → review → fix` wants the same coding agent, not a fresh one. Runtime semantics are unclear (same-process send-keys vs session resume vs fresh-but-context-aware), so schema shape is deferred. The `ProcessSource` enum is kept extensible so an `AgentRef { agent, resume, prompt }` variant can slot in later alongside workflow-level `agents:` declarations.
+- **One-shot agent processes** — non-long-running agents that produce a value. The haiku branch-namer is the canonical case. Distinct from long-running agent processes that stay up for interaction.
+- **Multi-valued / richer inputs** — starting a workflow from N issues (each with number, title, body, URL), not just a scalar string. Also: default values, richer types. Deferred because the real shape is typed/structured, not just `Vec<String>`.
+- **Non-terminal content** — port-forwarding for dev servers, HTTP probes, background services. Process definitions are terminal-only in v1.
+- **GitOps sync** — templates authored in project VCS, synced into the cluster by a controller (Argo CD / Flux style). Relevant when templates live in repos rather than being applied manually.
+
+### From Stage 3 (Convoy resource + controller)
+
+*(To be filled in when Stage 3 is designed.)*
+
+### From Stage 4 (Task provisioning / policy)
+
+*(To be filled in when Stage 4 is designed.)*
