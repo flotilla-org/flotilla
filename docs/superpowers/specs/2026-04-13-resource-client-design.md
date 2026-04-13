@@ -134,7 +134,7 @@ impl<T: Resource> TypedResolver<T> {
     async fn delete(&self, name: &str) -> Result<(), ResourceError>;
     async fn watch(
         &self,
-        params: &WatchParams,
+        start: WatchStart,
     ) -> Result<impl Stream<Item = Result<WatchEvent<T>, ResourceError>>, ResourceError>;
 }
 ```
@@ -150,7 +150,7 @@ struct ResourceList<T: Resource> {
 }
 ```
 
-The standard controller pattern is: `list()` to get current state + collection resourceVersion, then `watch(&WatchParams { resource_version: Some(v) })` to receive all changes from that point forward. No gap, no missed updates.
+The standard controller pattern is: `list()` to get current state + collection resourceVersion, then `watch(WatchStart::FromVersion(v))` to receive all changes from that point forward. No gap, no missed updates.
 
 ### DynamicResolver
 
@@ -168,7 +168,7 @@ impl DynamicResolver {
     async fn delete(&self, name: &str) -> Result<(), ResourceError>;
     async fn watch(
         &self,
-        params: &WatchParams,
+        start: WatchStart,
     ) -> Result<BoxStream<'static, Result<DynWatchEvent, ResourceError>>, ResourceError>;
 }
 ```
@@ -179,22 +179,23 @@ impl DynamicResolver {
 - `update` takes `InputMeta` + `resource_version` + spec. The resourceVersion is a required `&str` — not optional, can't forget it. Stale version returns `ResourceError::Conflict`.
 - `update_status` takes `InputMeta` + `resource_version` + status. Same concurrency semantics as `update`. Separate method because spec and status are written by different actors (user writes spec, controller writes status). Mirrors k8s's `/status` subresource.
 - Labels and annotations on `InputMeta` are full-replace — the complete maps are sent on every update. Optimistic concurrency via resourceVersion prevents silent overwrites.
-- `watch` takes `WatchParams` and returns a stream. Outer `Result` for connection failure, inner `Result` per event for parse/stream errors.
+- `watch` takes a `WatchStart` enum and returns a stream. Outer `Result` for connection failure, inner `Result` per event for parse/stream errors.
 
 ## Watch, Params, and Error Types
 
-### WatchParams
+### WatchStart
 
 ```rust
-struct WatchParams {
-    pub resource_version: Option<String>,
+enum WatchStart {
+    /// Deliver future events only. No replay of current state.
+    Now,
+    /// Resume from a specific version, delivering all events since that point.
+    /// Used with the collection resourceVersion from `list()` for race-free list-then-watch.
+    FromVersion(String),
+    // Future: StateOfWorld — synthetic replay of current state as Added events,
+    // then transition to live events (newer k8s `SendInitialEvents` semantics).
 }
 ```
-
-- `resource_version: None` — deliver future events only. No replay of current state.
-- `resource_version: Some(v)` — resume from version `v`, delivering all events since that point. Used with the collection resourceVersion from `list()` for race-free list-then-watch.
-
-`WatchParams` is a struct rather than a bare `Option` so that additional start-point modes (e.g. state-of-world replay, as in newer k8s `SendInitialEvents`) can be added later without changing method signatures.
 
 ### WatchEvent
 
@@ -311,7 +312,7 @@ crates/flotilla-resources/
 │   ├── resource.rs          -- Resource trait, ApiPaths, ResourceObject, ObjectMeta, InputMeta
 │   ├── backend.rs           -- ResourceBackend enum, TypedResolver, DynamicResolver
 │   ├── error.rs             -- ResourceError
-│   ├── watch.rs             -- WatchEvent, WatchParams, ResourceList
+│   ├── watch.rs             -- WatchEvent, WatchStart, ResourceList
 │   ├── http/
 │   │   ├── mod.rs           -- HttpBackend
 │   │   ├── kubeconfig.rs    -- ~/.kube/config parsing, client cert auth
