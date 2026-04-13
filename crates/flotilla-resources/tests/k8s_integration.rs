@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 
 struct ConvoyResource;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConvoySpec {
     template: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ConvoyStatus {
     phase: String,
 }

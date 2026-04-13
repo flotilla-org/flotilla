@@ -7,7 +7,6 @@ pub use bootstrap::{ensure_crd, ensure_namespace};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{stream, Stream, StreamExt};
-pub use kubeconfig::Kubeconfig;
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -51,35 +50,35 @@ impl HttpBackend {
         url
     }
 
-    async fn decode_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ResourceError> {
+    async fn decode_response<T: DeserializeOwned>(response: reqwest::Response, resource_name: Option<&str>) -> Result<T, ResourceError> {
         let status = response.status();
         let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read response body: {err}")))?;
         if !status.is_success() {
-            return Err(map_status_error(status, &bytes));
+            return Err(map_status_error(status, &bytes, resource_name));
         }
         serde_json::from_slice(&bytes).map_err(|err| ResourceError::decode(format!("decode JSON response: {err}")))
     }
 
-    async fn expect_success(response: reqwest::Response) -> Result<(), ResourceError> {
+    async fn expect_success(response: reqwest::Response, resource_name: Option<&str>) -> Result<(), ResourceError> {
         let status = response.status();
         if status.is_success() {
             return Ok(());
         }
         let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read response body: {err}")))?;
-        Err(map_status_error(status, &bytes))
+        Err(map_status_error(status, &bytes, resource_name))
     }
 
     pub(crate) async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("GET resource: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response).await?;
+        let wire: WireResource<T> = Self::decode_response(response, Some(name)).await?;
         wire.into_public()
     }
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;
-        let wire: WireList<T> = Self::decode_response(response).await?;
+        let wire: WireList<T> = Self::decode_response(response, None).await?;
         wire.into_public()
     }
 
@@ -93,7 +92,7 @@ impl HttpBackend {
         let body = OutgoingResource::<T>::for_spec(meta, None, spec)?;
         let response =
             self.http.post(url).json(&body).send().await.map_err(|err| ResourceError::other(format!("CREATE resource: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response).await?;
+        let wire: WireResource<T> = Self::decode_response(response, Some(&meta.name)).await?;
         wire.into_public()
     }
 
@@ -108,7 +107,7 @@ impl HttpBackend {
         let body = OutgoingResource::<T>::for_spec(meta, Some(resource_version), spec)?;
         let response =
             self.http.put(url).json(&body).send().await.map_err(|err| ResourceError::other(format!("UPDATE resource: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response).await?;
+        let wire: WireResource<T> = Self::decode_response(response, Some(&meta.name)).await?;
         wire.into_public()
     }
 
@@ -122,14 +121,14 @@ impl HttpBackend {
         let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), true);
         let body = OutgoingStatusResource::<T>::new(name, resource_version, status)?;
         let response = self.http.put(url).json(&body).send().await.map_err(|err| ResourceError::other(format!("UPDATE status: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response).await?;
+        let wire: WireResource<T> = Self::decode_response(response, Some(name)).await?;
         wire.into_public()
     }
 
     pub(crate) async fn delete_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<(), ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), false);
         let response = self.http.delete(url).send().await.map_err(|err| ResourceError::other(format!("DELETE resource: {err}")))?;
-        Self::expect_success(response).await
+        Self::expect_success(response, Some(name)).await
     }
 
     pub(crate) async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
@@ -143,7 +142,7 @@ impl HttpBackend {
         let status = response.status();
         if !status.is_success() {
             let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read watch error body: {err}")))?;
-            return Err(map_status_error(status, &bytes));
+            return Err(map_status_error(status, &bytes, None));
         }
 
         let state = HttpWatchState::<T> {
@@ -204,16 +203,29 @@ struct HttpWatchState<T: Resource> {
 #[derive(Debug, Deserialize)]
 struct StatusResponseBody {
     message: Option<String>,
+    details: Option<StatusResponseDetails>,
 }
 
-fn map_status_error(status: StatusCode, bytes: &[u8]) -> ResourceError {
-    let message = serde_json::from_slice::<StatusResponseBody>(bytes)
-        .ok()
-        .and_then(|status| status.message)
-        .unwrap_or_else(|| String::from_utf8_lossy(bytes).trim().to_string());
+#[derive(Debug, Deserialize)]
+struct StatusResponseDetails {
+    name: Option<String>,
+}
+
+fn map_status_error(status: StatusCode, bytes: &[u8], resource_name: Option<&str>) -> ResourceError {
+    let parsed = serde_json::from_slice::<StatusResponseBody>(bytes).ok();
+    let message =
+        parsed.as_ref().and_then(|status| status.message.clone()).unwrap_or_else(|| String::from_utf8_lossy(bytes).trim().to_string());
+    let resolved_name =
+        resource_name.map(str::to_owned).or_else(|| parsed.and_then(|status| status.details.and_then(|details| details.name)));
     match status {
-        StatusCode::NOT_FOUND => ResourceError::not_found(message),
-        StatusCode::CONFLICT => ResourceError::conflict("", message),
+        StatusCode::NOT_FOUND => match resolved_name {
+            Some(name) => ResourceError::not_found(name),
+            None => ResourceError::other(format!("HTTP {}: {}", status.as_u16(), message)),
+        },
+        StatusCode::CONFLICT => match resolved_name {
+            Some(name) => ResourceError::conflict(name, message),
+            None => ResourceError::other(format!("HTTP {}: {}", status.as_u16(), message)),
+        },
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => ResourceError::invalid(message),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ResourceError::unauthorized(message),
         _ => ResourceError::other(format!("HTTP {}: {}", status.as_u16(), message)),

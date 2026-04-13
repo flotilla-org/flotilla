@@ -1,9 +1,9 @@
-pub mod backend;
-pub mod error;
-pub mod http;
-pub mod in_memory;
-pub mod resource;
-pub mod watch;
+mod backend;
+mod error;
+mod http;
+mod in_memory;
+mod resource;
+mod watch;
 
 pub use backend::{ResourceBackend, TypedResolver};
 pub use error::ResourceError;

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::{error::ResourceError, http::HttpBackend};
 
 #[derive(Debug, Deserialize)]
-pub struct Kubeconfig {
+struct Kubeconfig {
     #[serde(rename = "current-context")]
     current_context: String,
     clusters: Vec<NamedCluster>,

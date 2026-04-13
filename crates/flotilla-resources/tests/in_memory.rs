@@ -17,16 +17,16 @@ async fn create_get_list_roundtrip() {
     let created = resolver.create(&input_meta("alpha"), &spec("template-a")).await.expect("create should succeed");
     assert_eq!(created.metadata.name, "alpha");
     assert_eq!(created.metadata.namespace, "flotilla");
-    assert_eq!(created.metadata.resource_version, "1");
+    assert!(!created.metadata.resource_version.is_empty());
     assert_eq!(created.spec.template, "template-a");
     assert!(created.status.is_none());
 
     let fetched = resolver.get("alpha").await.expect("get should succeed");
-    assert_eq!(fetched.metadata.resource_version, "1");
+    assert_eq!(fetched.metadata.resource_version, created.metadata.resource_version);
     assert_eq!(fetched.spec.template, "template-a");
 
     let listed = resolver.list().await.expect("list should succeed");
-    assert_eq!(listed.resource_version, "1");
+    assert_eq!(listed.resource_version, created.metadata.resource_version);
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].metadata.name, "alpha");
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Debug};
 
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -12,8 +12,8 @@ pub struct ApiPaths {
 }
 
 pub trait Resource: Send + Sync + 'static {
-    type Spec: Serialize + DeserializeOwned + Send + Sync;
-    type Status: Serialize + DeserializeOwned + Send + Sync;
+    type Spec: Serialize + DeserializeOwned + Send + Sync + Debug + Clone;
+    type Status: Serialize + DeserializeOwned + Send + Sync + Debug + Clone;
 
     const API_PATHS: ApiPaths;
 }
@@ -37,7 +37,7 @@ pub struct ObjectMeta {
     pub creation_timestamp: DateTime<Utc>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "T::Spec: Serialize, T::Status: Serialize",
     deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"

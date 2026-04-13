@@ -162,8 +162,25 @@ async fn status_errors_map_to_resource_errors() {
 
     let err = resolver.update(&input_meta("alpha"), "7", &spec("review")).await.err().expect("update should conflict");
     match err {
-        ResourceError::Conflict { message, .. } => assert!(message.contains("resource version conflict")),
+        ResourceError::Conflict { name, message } => {
+            assert_eq!(name, "alpha");
+            assert!(message.contains("resource version conflict"));
+        }
         other => panic!("expected conflict, got {other}"),
+    }
+}
+
+#[tokio::test]
+async fn not_found_errors_preserve_requested_name() {
+    let body = serde_json::json!({ "message": "convoys.flotilla.io \"alpha\" not found" }).to_string();
+    let (base_url, _request_rx) = spawn_one_shot_server(response("404 Not Found", &body)).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
+    let resolver = backend.using::<ConvoyResource>("flotilla");
+
+    let err = resolver.get("alpha").await.err().expect("get should fail");
+    match err {
+        ResourceError::NotFound { name } => assert_eq!(name, "alpha"),
+        other => panic!("expected not found, got {other}"),
     }
 }
 

@@ -8,7 +8,7 @@ use crate::{
 
 pub type WatchStream<T> = BoxStream<'static, Result<WatchEvent<T>, ResourceError>>;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchStart {
     /// Deliver future events only. No replay of current state.
     Now,
@@ -16,7 +16,7 @@ pub enum WatchStart {
     FromVersion(String),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "T::Spec: Serialize, T::Status: Serialize",
     deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"
@@ -27,7 +27,7 @@ pub enum WatchEvent<T: Resource> {
     Deleted(ResourceObject<T>),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "T::Spec: Serialize, T::Status: Serialize",
     deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"
