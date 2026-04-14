@@ -1,8 +1,8 @@
 use std::{env, path::PathBuf, time::Duration};
 
 use flotilla_resources::{
-    apply_status_patch, ensure_crd, ensure_namespace, reconcile, Convoy, HttpBackend, ResourceBackend, WatchEvent, WatchStart,
-    WorkflowTemplate,
+    apply_status_patch, ensure_crd, ensure_namespace, reconcile, Convoy, HttpBackend, ResourceBackend, ResourceError, WatchEvent,
+    WatchStart, WorkflowTemplate,
 };
 use futures::StreamExt;
 use tracing::{error, info, warn};
@@ -22,7 +22,11 @@ async fn reconcile_and_apply(
 ) -> Result<(), flotilla_resources::ResourceError> {
     let convoy = convoys.get(name).await?;
     let template = if convoy.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_none() {
-        Some(templates.get(&convoy.spec.workflow_ref).await?)
+        match templates.get(&convoy.spec.workflow_ref).await {
+            Ok(template) => Some(template),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(err) => return Err(err),
+        }
     } else {
         None
     };

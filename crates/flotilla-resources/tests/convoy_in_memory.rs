@@ -2,7 +2,7 @@ mod common;
 
 use common::{convoy_meta, timestamp, valid_convoy_spec, valid_workflow_template_object, workflow_template_meta};
 use flotilla_resources::{
-    apply_status_patch, external_patches, reconcile, Convoy, ConvoyPhase, InMemoryBackend, ResourceBackend, WorkflowTemplate,
+    apply_status_patch, external_patches, reconcile, Convoy, ConvoyPhase, InMemoryBackend, ResourceBackend, ResourceError, WorkflowTemplate,
 };
 
 async fn reconcile_once(
@@ -13,7 +13,11 @@ async fn reconcile_once(
 ) -> Option<flotilla_resources::ConvoyStatusPatch> {
     let convoy = convoys.get(name).await.expect("convoy get should succeed");
     let template = if convoy.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_none() {
-        Some(templates.get(&convoy.spec.workflow_ref).await.expect("template get should succeed"))
+        match templates.get(&convoy.spec.workflow_ref).await {
+            Ok(template) => Some(template),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(err) => panic!("template get should succeed: {err}"),
+        }
     } else {
         None
     };
@@ -70,4 +74,21 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     assert_eq!(final_status.phase, ConvoyPhase::Completed);
     assert_eq!(final_status.tasks["implement"].phase, flotilla_resources::TaskPhase::Completed);
     assert_eq!(final_status.tasks["review"].phase, flotilla_resources::TaskPhase::Completed);
+}
+
+#[tokio::test]
+async fn missing_template_transitions_convoy_to_failed() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+    let convoys = backend.using::<Convoy>("flotilla");
+
+    convoys.create(&convoy_meta("convoy-missing-template"), &valid_convoy_spec()).await.expect("convoy create should succeed");
+
+    let patch = reconcile_once(&convoys, &templates, "convoy-missing-template", timestamp(10)).await.expect("fail-init patch");
+    assert!(matches!(patch, flotilla_resources::ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, .. }));
+
+    let convoy = convoys.get("convoy-missing-template").await.expect("convoy get should succeed");
+    let status = convoy.status.expect("convoy status");
+    assert_eq!(status.phase, ConvoyPhase::Failed);
+    assert!(status.message.as_deref().is_some_and(|message| message.contains("not found")));
 }

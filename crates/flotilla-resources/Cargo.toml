@@ -15,8 +15,8 @@ serde_yml = "0.0.12"
 base64 = "0.22"
 bytes = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
