@@ -9,6 +9,10 @@ use crate::{
     workflow_template::ProcessDefinition,
 };
 
+mod reconcile;
+
+pub use reconcile::{reconcile, ConvoyEvent, ReconcileOutcome};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Convoy;
 

@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 
 use flotilla_resources::{
-    ApiPaths, InputDefinition, InputMeta, ProcessDefinition, ProcessSource, Resource, Selector, StatusPatch, TaskDefinition,
-    WorkflowTemplateSpec,
+    ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, InputDefinition, InputMeta,
+    ObjectMeta, ProcessDefinition, ProcessSource, Resource, ResourceObject, Selector, StatusPatch, TaskDefinition, TaskPhase,
+    TaskState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde::{Deserialize, Serialize};
+use chrono::{TimeZone, Utc};
 
 pub struct ConvoyResource;
 
@@ -115,4 +117,79 @@ pub fn updated_workflow_template_spec() -> WorkflowTemplateSpec {
 
 pub fn valid_workflow_template_yaml() -> &'static str {
     include_str!("../../examples/review-and-fix.yaml")
+}
+
+pub fn timestamp(seconds: i64) -> chrono::DateTime<Utc> {
+    Utc.timestamp_opt(seconds, 0).single().expect("valid timestamp")
+}
+
+pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> ObjectMeta {
+    ObjectMeta {
+        name: name.to_string(),
+        namespace: namespace.to_string(),
+        resource_version: resource_version.to_string(),
+        labels: Default::default(),
+        annotations: Default::default(),
+        creation_timestamp: timestamp(1),
+    }
+}
+
+pub fn valid_convoy_spec() -> RealConvoySpec {
+    RealConvoySpec {
+        workflow_ref: "review-and-fix".to_string(),
+        inputs: [
+            ("feature".to_string(), flotilla_resources::InputValue::String("Retry logic".to_string())),
+            ("branch".to_string(), flotilla_resources::InputValue::String("fix-retry-logic".to_string())),
+        ]
+        .into_iter()
+        .collect(),
+        placement_policy: Some("laptop-docker".to_string()),
+    }
+}
+
+pub fn pending_task_state() -> TaskState {
+    TaskState { phase: TaskPhase::Pending, ready_at: None, started_at: None, finished_at: None, message: None, placement: None }
+}
+
+pub fn valid_workflow_template_object(name: &str) -> ResourceObject<WorkflowTemplate> {
+    ResourceObject {
+        metadata: object_meta(name, "flotilla", "42"),
+        spec: valid_workflow_template_spec(),
+        status: None,
+    }
+}
+
+pub fn convoy_object(name: &str, spec: RealConvoySpec, status: Option<RealConvoyStatus>) -> ResourceObject<RealConvoy> {
+    ResourceObject { metadata: object_meta(name, "flotilla", "7"), spec, status }
+}
+
+pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
+    let snapshot = flotilla_resources::WorkflowSnapshot {
+        tasks: valid_workflow_template_spec()
+            .tasks
+            .into_iter()
+            .map(|task| flotilla_resources::SnapshotTask {
+                name: task.name,
+                depends_on: task.depends_on,
+                processes: task.processes,
+            })
+            .collect(),
+    };
+    let tasks = [
+        ("implement".to_string(), pending_task_state()),
+        ("review".to_string(), pending_task_state()),
+    ]
+    .into_iter()
+    .collect();
+
+    RealConvoyStatus {
+        phase: flotilla_resources::ConvoyPhase::Pending,
+        workflow_snapshot: Some(snapshot),
+        tasks,
+        message: None,
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some([("review-and-fix".to_string(), "42".to_string())].into_iter().collect()),
+    }
 }

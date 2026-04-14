@@ -11,7 +11,7 @@ mod workflow_template;
 pub use backend::{ResourceBackend, TypedResolver};
 pub use convoy::{
     controller_patches, external_patches, provisioning_patches, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
-    InputValue, PlacementStatus, SnapshotTask, TaskPhase, TaskState, WorkflowSnapshot,
+    ConvoyEvent, InputValue, PlacementStatus, ReconcileOutcome, SnapshotTask, TaskPhase, TaskState, WorkflowSnapshot, reconcile,
 };
 pub use error::ResourceError;
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
