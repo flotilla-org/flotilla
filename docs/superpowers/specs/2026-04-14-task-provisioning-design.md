@@ -386,7 +386,6 @@ pub enum Actuation {
     CreateTerminalSession { spec: TerminalSessionSpec, owner_ref: ResourceRef, name: String },
     CreateTaskWorkspace  { spec: TaskWorkspaceSpec, owner_ref: ResourceRef, name: String },
     DeleteResource       { kind: ResourceKind, name: String },
-    PatchConvoyTask      { convoy_name: String, patch: ConvoyStatusPatch },
 }
 
 /// A secondary watch is spawned alongside the primary watch and feeds primary
@@ -430,7 +429,8 @@ impl<R: Reconciler> ControllerLoop<R> {
 - **Primary watch**: `list()` → reconcile each → `watch(WatchStart::FromVersion(rv))`. Standard Stage 3 list-then-watch.
 - **Secondary watches**: one task per secondary spawned alongside the primary watch. Each watched event maps via `SecondaryWatch::map_to_primary_keys` (typically reading a label) to a list of primary keys to enqueue.
 - **Shared reconcile channel**: all watches push primary keys into one mpsc channel. A worker dequeues, dedupes consecutive entries for the same key, fetches the primary by name, calls `reconcile`, then enacts each `Actuation` first and applies the typed patch via `apply_status_patch` afterwards.
-- **Actuate-then-patch ordering, with idempotent actuations.** The framework enacts actuations *before* applying the status patch. If an actuation fails, no patch lands and the task stays in its previous phase, so the next reconcile pass retries cleanly. All `Create*` actuations are name-keyed and idempotent — `AlreadyExists` is treated as success so the actuator is safe to re-enact. Reconcilers should not rely on single-pass atomicity; they must be written to converge over multiple passes.
+- **Actuate-then-patch ordering, with idempotent actuations.** The framework enacts actuations *before* applying the status patch. If an actuation fails, no patch lands and the task stays in its previous phase, so the next reconcile pass retries cleanly. All actuations are idempotent: `Create*` is name-keyed (`AlreadyExists` is success); `DeleteResource` treats `NotFound` as success. Reconcilers should not rely on single-pass atomicity; they must be written to converge over multiple passes.
+- **No cross-resource status patches as actuations.** Every reconciler patches only its own resource's status. State propagation between resources happens via observation: a reconciler watches sibling/parent resources (as secondaries) and reacts to their status changes during its own reconcile pass. This eliminates a whole class of cross-resource ordering hazards (the parent advancing ahead of the child) and keeps single-writer-per-status discipline.
 - **Resync ticker** (~60s): periodically pushes every known primary key. Standard k8s safety net.
 - **Finalizer handling**: on a primary with `metadata.deletionTimestamp` set and the configured finalizer present, call `reconciler.run_finalizer(...)`, then patch the resource to remove the finalizer entry, then let GC complete.
 
@@ -504,25 +504,37 @@ Reconcile flow:
    - `host_direct`: look up the shared host-direct Environment for the host. Set `status.environment_ref`. No creation.
    - `docker_per_task`: if `status.environment_ref` unset, emit `CreateEnvironment` with mounts derived from `Checkout.status.path` (mount source_path = checkout path; target_path = policy's `checkout_mount_path`). Wait until `Ready`.
 6. **Ensure TerminalSessions**, one per process. If a session for a given role is missing, emit `CreateTerminalSession` with `env_ref` = the chosen Environment, `cwd` derived from policy + Environment (e.g. `default_cwd: /workspace` for docker_per_task; checkout path for host_direct), `pool` from policy.
-7. **All Ready** → patch `status.phase = Ready` and emit `PatchConvoyTask` with `MarkTaskRunning` for the Convoy.
+7. **All Ready** → patch own `status.phase = Ready`. The Convoy reconciler observes this change via its TaskWorkspace secondary watch and patches the convoy task to `Running` as part of its own next reconcile pass.
 
-Failure at any step: `status.phase = Failed` + `MarkTaskFailed` propagation. No automatic retry.
+Failure at any step: own `status.phase = Failed` with a clear message. The Convoy reconciler observes Failed TaskWorkspace status and patches the convoy task to `Failed` as part of its own reconcile. No automatic retry.
+
+`TaskWorkspaceReconciler` never patches another resource's status. Cross-resource state propagation is observation-driven, not actuation-driven.
 
 No finalizer on TaskWorkspace itself; child finalizers handle external state.
 
 ### Convoy reconciler extension (Stage 4a)
 
-The convoy reconciler from Stage 3 grows TaskWorkspace responsibilities. To avoid the stuck-state hazard where a status patch lands but the corresponding actuation doesn't, the new logic is **fully declarative** — every reconcile pass examines each task's current state and ensures the right TaskWorkspace exists, regardless of whether a previous pass succeeded or failed mid-way. Combined with the framework's actuate-then-patch ordering, this is robust to transient failures of either the actuation or the patch.
+The convoy reconciler from Stage 3 grows TaskWorkspace responsibilities. The new logic is **fully declarative** — every reconcile pass examines each task's current state plus the corresponding TaskWorkspace's status, and produces whichever patches/actuations are needed to make them consistent. Combined with the framework's actuate-then-patch ordering and the no-cross-resource-patch rule, this is robust to transient failures of either the actuation or the patch.
 
-Per-task logic on every reconcile pass:
+The convoy reconciler watches Convoys (primary) and TaskWorkspaces (secondary, mapped via `flotilla.work/convoy: <convoy-name>` label).
+
+Per-task logic on every reconcile pass — first looks up the TaskWorkspace by deterministic name (`<convoy>-<task>`):
 
 - **`Pending`**, deps satisfied → emit `MarkTaskReady` patch (Stage 3 unchanged).
-- **`Ready`** → check by deterministic name whether a TaskWorkspace exists. If not, emit `CreateTaskWorkspace` actuation (idempotent; AlreadyExists is success). If it exists, emit `MarkTaskLaunching` patch.
-- **`Launching`** → check by deterministic name whether a TaskWorkspace exists. If not, emit `CreateTaskWorkspace` (recovers from prior actuation failure or lost watch event). If it exists, no further work — wait for `TaskWorkspaceReconciler` to report `Running`.
-- **`Running`** → no convoy-side work; explicit completion comes from external actor.
+- **`Ready`**:
+  - If TaskWorkspace doesn't exist → emit `CreateTaskWorkspace` actuation (idempotent; AlreadyExists is success).
+  - If TaskWorkspace exists → emit `MarkTaskLaunching` patch.
+- **`Launching`**:
+  - If TaskWorkspace doesn't exist → emit `CreateTaskWorkspace` (recovers from prior actuation failure or lost watch event).
+  - If TaskWorkspace exists with `status.phase == Ready` → emit `MarkTaskRunning` patch (the observation-driven propagation that replaces the old `PatchConvoyTask` actuation).
+  - If TaskWorkspace exists with `status.phase == Failed` → emit `MarkTaskFailed` patch with the workspace's failure message.
+  - Otherwise → no work; wait for next reconcile.
+- **`Running`**:
+  - If TaskWorkspace's `status.phase == Failed` → emit `MarkTaskFailed` (a workspace failing while the task is Running, e.g. terminal session crash, propagates).
+  - Otherwise → no convoy-side work; explicit completion comes from an external actor (CLI, future agent CLI).
 - **`Completed | Failed | Cancelled`** → terminal; phase rollup applies.
 
-The deterministic naming convention (`<convoy>-<task>`) makes the existence check cheap and the actuation safe to re-issue.
+Single-writer discipline preserved: the convoy reconciler is the only thing that writes to convoy task phase. TaskWorkspaceReconciler only writes to its own TaskWorkspace status. State propagates between them via observation.
 
 ## Daemon startup
 
@@ -535,7 +547,7 @@ The daemon at startup, after connecting to the resource backend:
    - Always: `host-direct-<host-id>` (variant: `host_direct`).
    - If `Host.status.capabilities.docker == true`: `docker-on-<host-id>` (variant: `docker_per_task`, with a sensible default image).
 5. **Spawn the `HostHeartbeatTask`** (per-daemon background task; not a controller).
-6. **Spawn all controller loops**: EnvironmentReconciler, RepositoryReconciler, CheckoutReconciler, TerminalSessionReconciler, TaskWorkspaceReconciler, ConvoyReconciler (refactored from Stage 3, extended to emit `CreateTaskWorkspace` actuations on task `Pending → Ready` transitions).
+6. **Spawn all controller loops**: EnvironmentReconciler, RepositoryReconciler, CheckoutReconciler, TerminalSessionReconciler, TaskWorkspaceReconciler, ConvoyReconciler (refactored from Stage 3, extended to ensure TaskWorkspaces and observe their status as described above; declarative per-pass).
 
 This is the "discovered resources" pattern in its simplest form: the daemon creates the resources that describe its own capabilities, and they lifecycle out of band from user interaction. User can edit or replace any of them; the daemon doesn't keep regenerating.
 
@@ -610,12 +622,12 @@ For each resource that carries a finalizer: verify cleanup runs, finalizer entry
 5. Seven new CRDs: `Host`, `Environment`, `Repository`, `Checkout`, `TerminalSession`, `TaskWorkspace`, `PlacementPolicy`. CEL immutability where applicable.
 6. Rust types for each + `StatusPatch` enums + per-resource reconcilers (five reconcilers: Environment, Repository, Checkout, TerminalSession, TaskWorkspace) plus a `HostHeartbeatTask` (not a reconciler).
 7. Three actuators wrapping existing flotilla-core providers: Docker (Environment), CheckoutManager (Repository + Checkout), TerminalPool (TerminalSession).
-8. **Convoy reconciler extension** (Plan A2 or A3): emit `CreateTaskWorkspace` actuation when a task transitions Pending → Ready, alongside the existing `MarkTaskLaunching` patch. Grow the `Actuation` enum with `CreateRepository` + `CreateTaskWorkspace`.
+8. **Convoy reconciler extension** (Plan A2 or A3): per-task declarative logic that ensures a TaskWorkspace exists and propagates TaskWorkspace status into convoy task phase via observation (no cross-resource patches). Adds TaskWorkspace as a secondary watch with the `flotilla.work/convoy` label mapping. Grow the `Actuation` enum with `CreateRepository` + `CreateTaskWorkspace`.
 9. Daemon startup logic: self-register as Host, create host-direct Environment, discover existing Repositories from flotilla-core registry, create default PlacementPolicies, spawn the heartbeat task and all controller loops.
-10. **CLI completion path** (touches several crates):
-    - `flotilla-protocol` — new `ProtoCommand::MarkConvoyTaskComplete { namespace, convoy, task }` variant + matching `CommandResult` shape.
-    - `flotilla-client` — `mark_convoy_task_complete(namespace, convoy, task)` method on the daemon-handle surface, sending the new ProtoCommand.
-    - `flotilla-daemon` — server handler that validates the request and calls `apply_status_patch::<Convoy>(...)` with `ConvoyStatusPatch::MarkTaskCompleted`.
+10. **CLI completion path** (touches several crates, extending the existing `Command`/`CommandAction` vocabulary):
+    - `flotilla-protocol` — new `CommandAction::MarkConvoyTaskComplete { namespace, convoy, task }` variant on the existing `CommandAction` enum (sent through the existing `Request::Execute { command }` flow). Matching success/error shape on the existing result type.
+    - `flotilla-client` — `mark_convoy_task_complete(namespace, convoy, task)` method on the daemon-handle surface, building a `Command` with the new `CommandAction` and sending via `Request::Execute`.
+    - `flotilla-daemon` — extend the existing command dispatcher with a handler for the new `CommandAction` that validates the request and calls `apply_status_patch::<Convoy>(...)` with `ConvoyStatusPatch::MarkTaskCompleted`.
     - `flotilla` binary — CLI subcommand `flotilla convoy <name> task <task> complete [--namespace <ns>]` invoking the client method.
     Future short-form (`flotilla complete` driven by env-var context) is deferred.
 11. New `flotillad` binary target in `flotilla-daemon`.
@@ -698,8 +710,8 @@ To capture in the brainstorm-prompts master deferred list under "From Stage 4a":
 - **Exit-code-as-completion opt-in** — for tasks whose configured "progress-bearing" process should drive task completion (e.g. a one-shot `cargo test`). Requires extending `TerminalPool` to surface inner-command exit events plus a per-task / per-process opt-in flag. Watcher-kind processes (test runners, dev servers, log tails) explicitly opt out — they're informational and never complete by design.
 - **CLI shortcutting for task completion** — env-var-derived context (`FLOTILLA_CONVOY`, `FLOTILLA_TASK`, `FLOTILLA_ROLE`) propagated into terminal sessions so a process can call `flotilla complete` without the long form. Part of a wider story about how `flotilla` CLI infers context from the calling environment.
 - **Per-task retry / convoy-task reset** — once richer workflows are in flight, we'll want to mark a failed task for retry without recreating the whole convoy. Today's Stage 3 fail-fast + Stage 4a's "no in-place retry" forces convoy recreation. Likely needs a new convoy-controller patch variant (`ResetTaskToPending` or similar) plus a corresponding CLI affordance.
-- **Richer convoy CLI surface** — Stage 4a ships exactly one CLI verb (`task complete`). Future verbs (create, list, inspect, cancel, mark-failed, kill-session, reset-task, …) each currently require their own `ProtoCommand` variant + client method + daemon handler. If this surface grows large enough that per-verb protocol bloat becomes annoying, revisit a generic "apply this typed status patch" shape with serialised payloads — but that has its own ergonomic costs (protocol-resource type coupling).
-- **Client/daemon protocol convergence with resource-management protocol** — the long-term direction: the client/daemon protocol probably becomes essentially HTTP-over-UDS, mirroring the resource-management protocol that controllers already speak. This eliminates per-verb protocol mapping and naturally supports remote-HTTP daemons. Stage 4a is the hybrid middle, where the existing `ProtoCommand` surface coexists with the new resource-shaped flows. Once the one-task-convoy story works end-to-end, we can start safe cruft-cutting on the protocol layer.
+- **Richer convoy CLI surface** — Stage 4a ships exactly one CLI verb (`task complete`). Future verbs (create, list, inspect, cancel, mark-failed, kill-session, reset-task, …) each currently require their own `CommandAction` variant + client method + daemon handler. If this surface grows large enough that per-verb protocol bloat becomes annoying, revisit a generic "apply this typed status patch" shape with serialised payloads — but that has its own ergonomic costs (protocol-resource type coupling).
+- **Client/daemon protocol convergence with resource-management protocol** — the long-term direction: the client/daemon protocol probably becomes essentially HTTP-over-UDS, mirroring the resource-management protocol that controllers already speak. This eliminates per-verb protocol mapping and naturally supports remote-HTTP daemons. Stage 4a is the hybrid middle, where the existing `Command`/`CommandAction` surface coexists with the new resource-shaped flows. Once the one-task-convoy story works end-to-end, we can start safe cruft-cutting on the protocol layer.
 
 ## Plan structure
 
