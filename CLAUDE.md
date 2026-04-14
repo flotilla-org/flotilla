@@ -153,6 +153,20 @@ Union-find over `CorrelationKey` values (`Branch`, `CheckoutPath`, `AttachableSe
 - **Correctness first**: Always favour correct solutions over "pragmatic" shortcuts. Get the architecture right rather than patching around structural problems.
 - **Tracing**: Use structured fields, not format-string interpolation. Fields go before the message: `debug!(repo = %path.display(), %since, "issue incremental")`. Use `%` for Display, `?` for Debug, and shorthand `%var` when the field name matches the variable name.
 
+## Design and Substrate Work
+
+A lot of work in this repo is substrate design — defining resources, controllers, abstractions, protocols that many things will sit on top of. The default "ship a feature" calibration that prefers smaller scope and deferred abstraction is wrong for substrate work, where the cheap moment to make a sound architectural cut is right now.
+
+Guidance specifically for brainstorming, design discussions, and substrate implementation:
+
+- **Don't reflexively scope down when scope is coherent.** A coherent scope that does the right thing is preferable to a smaller scope that bakes in cuts you'll have to undo.
+- **Treat "small framework / abstraction extraction that pays off" as a strong signal, not a YAGNI red flag.** If three controllers will share the same watch loop, extract it now — not when the third one is half-written.
+- **When uncertain between "simpler now, refactor later" and "more considered now," lean more considered.** Especially when: multiple consumers will sit on the abstraction, refactoring requires data-shape changes on disk / wire / DB, or you've already pushed back toward the more-considered option once.
+- **Disaggregation transitions are expensive; getting the cuts wrong now and changing them is comparatively cheap.** Optimise against the former, not the latter.
+- **Don't underspec to "force a refactor later."** That's a polite name for accumulating debt. If the right shape is visible, write the right shape.
+
+This complements (does not replace) the "do not add features no one asked for" instinct elsewhere — that's still right for application-layer work, where YAGNI is a healthy default. The two modes coexist; pick the one matching the work.
+
 ## UI Modes
 
 `UiMode` has three variants: `Normal`, `Config`, `IssueSearch`. Most modal behaviour is driven by `BindingModeId` in the binding table:
