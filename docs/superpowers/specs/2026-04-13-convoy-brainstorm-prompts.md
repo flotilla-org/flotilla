@@ -262,6 +262,26 @@ See `docs/superpowers/specs/2026-04-14-convoy-resource-design.md` for the spec.
   - (c) Cluster-native deployments schedule N flotilla daemon pods into the cluster, all competing for the same leases — standard k8s HA.
   - (d) Open problem: leader election for flotilla-cp *itself* when embedded across multiple daemons. Leases depend on the API server, which is what needs electing — a separate (consensus / external coordinator / static leader) mechanism, not a convoy-controller concern.
 
-### From Stage 4 (Task provisioning / policy)
+### From Stage 4a (Task provisioning via flotilla-daemon placement)
 
-*(To be filled in when Stage 4 is designed.)*
+See `docs/superpowers/specs/2026-04-14-task-provisioning-design.md` for the spec. Stage 4a is scoped to the flotilla-daemon placement column of the state×placement matrix; cluster-native placement is Stage 4k.
+
+- **Stage 4k**: k8s cluster-native placement backend (Pods). Requires image-as-resource, cross-cluster checkout, selector resolution, per-tool config preparation. Each is a real design problem; deserves its own brainstorm.
+- **Image as a cluster resource** — declarative spec with availability guarantees ("make this image accessible from this provider"), on-demand vs pre-fetched, registry policy. Likely a CRD authored in source control like workflows.
+- **Selector resolution** (capability → concrete agent command). Carried over from Stage 2; agent processes still cannot run end-to-end until this lands. Tool processes work in Stage 4a.
+- **Auto-discovery of additional policies / discovered resources pattern** — controller for "found lying around" resources with explicit out-of-band lifecycle metadata.
+- **Agent-side completion CLI** — agents marking their own task complete via a CLI command that issues a status patch.
+- **Per-tool config preparation** in environments (`~/.claude` shuttling, auth tokens, etc.). Carried forward as a known gap for the Docker variant.
+- **Step-plan retirement** — `StepPlan` → convoy-driven coordination throughout flotilla-core. Bigger refactor; not Stage 4a.
+- **Multi-host placement** — SSH-reachable Hosts, mesh-aware Host resources, label-selector host targeting.
+- **Bosun-style automatic restart / repair / cleanup** — restart policies, terminal-session restarts on inner-command crash, cleanup on terminal task transitions.
+- **Convoy launched against an existing Checkout** — workflow flexibility for "use this existing tree as the work area," constrains compatible environments.
+- **Repository as a resource** — currently URL on `Checkout.spec`; a Repository resource would let URL → name indirection and per-repo configuration.
+- **Detached-head / sha / tag refs on Checkout** — useful for agent-driven bisect workflows and pinned-version provisioning.
+- **Shared Docker environments as a placement variant** — needs the shared-env-plus-per-task-checkout composability question solved.
+- **Meta-policy variant** for PlacementPolicy — delegate to a Quartermaster agent that picks among other policies. Sits on top of `PersistentAgent` (which is its own deferred item).
+- **TUI/CLI binary split** — separate the TUI from the CLI in `flotilla` as the next structural cleanup. Stage 4a creates `flotillad`; the user-facing `flotilla` binary still bundles TUI and CLI.
+- **Per-task restart policies / explicit retry UX** — a way to say "retry this failed task" without manually deleting resources.
+- **Auto-cleanup of stopped sessions on terminal task transitions** — opt-in policy field; today TerminalSessions stay alive until the TaskWorkspace cascades on Convoy deletion.
+- **Vessel / Crew / Shipment naming pass** — convoy-themed renames once the abstractions settle: TaskWorkspace → Vessel, processes → Crew, artifacts → Shipment.
+- **VCS abstraction in resource shape** — Checkout is git-shaped in v1; future `vcs:` discriminator for hg / fossil / etc.
