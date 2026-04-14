@@ -175,7 +175,7 @@ status:
 
 - **Git-shaped in v1.** The "VCS abstraction" is notional in flotilla today (provider trait exists, no real consumer); we don't expose it as a CRD field. Future: a `vcs:` discriminator (`git | hg | fossil | …`) if we add other backends.
 - **Three creation paths in Stage 4a:**
-  1. **Auto-discovery on daemon startup** — daemon scans flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`) and creates Clone resources for what it finds (env_ref = host-direct env of this daemon). Marked with `flotilla.work/discovered: "true"`. Lifecycle is out-of-band — these persist regardless of any TaskWorkspace.
+  1. **Auto-discovery on daemon startup** — daemon scans flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`) and creates Clone resources for what it finds (env_ref = host-direct env of this daemon). The canonical URL is derived per-path by running `git remote get-url origin`; entries without an origin remote are skipped with a warning (see Daemon startup). Marked with `flotilla.work/discovered: "true"`. Lifecycle is out-of-band — these persist regardless of any TaskWorkspace.
   2. **User-authored** — `kubectl apply` of a Clone spec. The `CloneReconciler` actuates the clone if not already present; the resource exists in `phase: Pending` until the clone completes.
   3. **On-demand by `TaskWorkspaceReconciler`** — when a task needs a Clone (for worktree strategies) in some env and no matching Clone exists for `(url, env)`, the reconciler emits a `CreateClone` actuation. URL comes from `convoy.spec.repository.url` (see ConvoySpec extensions); env comes from the resolved PlacementPolicy. Deterministic naming means concurrent tasks converge on the same Clone.
 - **Not owned** by any TaskWorkspace — Clones outlive the tasks that use them. Multiple tasks (possibly across multiple convoys) share a Clone by URL+env.
@@ -282,6 +282,7 @@ metadata:
   labels:
     flotilla.work/convoy: fix-bug-123
     flotilla.work/task: implement
+    flotilla.work/url-slug: flotilla-flotilla-org     # slug(convoy.spec.repository.url); lets Clone→TaskWorkspace join
 spec:
   convoy_ref: fix-bug-123
   task: implement                                   # task name in the parent's workflow_snapshot
@@ -433,8 +434,8 @@ pub enum Actuation {
 
 /// A secondary watch is spawned alongside the primary watch and feeds primary
 /// keys into the shared reconcile channel. Each impl handles one Watched
-/// resource type and a label-based mapping back to primary names. The trait
-/// is object-safe (no Watched associated type leaks through `dyn`); concrete
+/// resource type and a mapping back to primary names. The trait is
+/// object-safe (no Watched associated type leaks through `dyn`); concrete
 /// impls keep their Watched type internal.
 pub trait SecondaryWatch: Send + Sync {
     type Primary: Resource;
@@ -447,10 +448,29 @@ pub trait SecondaryWatch: Send + Sync {
     ) -> Result<(), ResourceError>;
 }
 
-// A typed helper for the common case (concrete impls use this internally,
+// Typed helpers for the two common shapes (concrete impls use these internally,
 // not the dyn-erased trait above):
+
+/// Direct: watched object carries a label whose value IS the primary's name.
+/// Fires one primary-name enqueue per watched event. Used for owned-child
+/// relationships: e.g. TerminalSession labelled with
+/// `flotilla.work/task_workspace: <name>` wakes exactly that TaskWorkspace.
 pub struct LabelMappedWatch<W: Resource, P: Resource> {
     pub label_key: &'static str,    // e.g. "flotilla.work/task_workspace"
+    pub _marker: PhantomData<(W, P)>,
+}
+
+/// Join: watched object carries a label whose value matches the same label
+/// on zero or more primaries. On a watched event, the framework reads the
+/// label value, lists primaries where the same label key has that value, and
+/// enqueues every match. Used for shared-referent fan-out: e.g. a Clone
+/// labelled `flotilla.work/url-slug: foo-bar` wakes every TaskWorkspace
+/// carrying the same `flotilla.work/url-slug: foo-bar` label.
+///
+/// Implementation uses the backend's label-selector list (already required by
+/// the primary watch's initial list path, so no new backend capability).
+pub struct LabelJoinWatch<W: Resource, P: Resource> {
+    pub label_key: &'static str,    // e.g. "flotilla.work/url-slug"
     pub _marker: PhantomData<(W, P)>,
 }
 
@@ -470,7 +490,7 @@ impl<R: Reconciler> ControllerLoop<R> {
 ### Loop mechanics
 
 - **Primary watch**: `list()` → reconcile each → `watch(WatchStart::FromVersion(rv))`. Standard Stage 3 list-then-watch.
-- **Secondary watches**: one task per secondary spawned alongside the primary watch. Each watched event maps via `SecondaryWatch::map_to_primary_keys` (typically reading a label) to a list of primary keys to enqueue.
+- **Secondary watches**: one task per secondary spawned alongside the primary watch. Two typed helpers cover the mapping patterns we need: `LabelMappedWatch` (watched's label value *is* a primary name — 1:1 owned-child case) and `LabelJoinWatch` (watched's label value matches the same label on zero-or-more primaries — shared-referent fan-out). Custom `SecondaryWatch` impls can do anything the trait allows; the helpers just cover the common shapes cleanly.
 - **`ObjectMeta` on `Create*` actuations**: every create carries a full `ObjectMeta { name, owner_ref, labels, annotations }`, not just a name. Labels drive secondary-watch routing (e.g. `flotilla.work/convoy`, `flotilla.work/task_workspace`, `flotilla.work/role`), so they must flow through actuation rather than being bolted on after creation. Keeping the metadata bundle in one struct means future additions (e.g. annotations for observability) don't require widening every variant.
 - **Shared reconcile channel**: all watches push primary keys into one mpsc channel. A worker dequeues, dedupes consecutive entries for the same key, fetches the primary by name, calls `reconcile`, then enacts each `Actuation` first and applies the typed patch via `apply_status_patch` afterwards.
 - **Actuate-then-patch ordering, with idempotent actuations.** The framework enacts actuations *before* applying the status patch. If an actuation fails, no patch lands and the task stays in its previous phase, so the next reconcile pass retries cleanly. All actuations are idempotent: `Create*` is name-keyed (`AlreadyExists` is success); `DeleteResource` treats `NotFound` as success. Reconcilers should not rely on single-pass atomicity; they must be written to converge over multiple passes.
@@ -536,7 +556,7 @@ Finalizer: `flotilla.work/terminal-teardown`. Stops the session and releases the
 
 ### `TaskWorkspaceReconciler`
 
-Watches TaskWorkspace (primary) plus Environment, Checkout, TerminalSession as owned-child secondaries (mapped via `flotilla.work/task_workspace`). Clone is also watched as a secondary, mapped via `flotilla.work/url-slug`: each task's target Clone carries a url-slug label that matches the slug derivable from `convoy.spec.repository.url`, so Clone status changes wake the right TaskWorkspaces without requiring the reconciler to rescan on every tick.
+Watches TaskWorkspace (primary) plus Environment, Checkout, TerminalSession as owned-child secondaries via `LabelMappedWatch` on `flotilla.work/task_workspace` (1:1 mapping — the watched object's label value *is* the TaskWorkspace name). Clone is a shared-referent secondary via `LabelJoinWatch` on `flotilla.work/url-slug`: Clone carries the url-slug label, TaskWorkspace carries it too (written at creation from the parent Convoy's `spec.repository.url`), and a Clone status change enqueues every TaskWorkspace with the same slug. This wakes the right reconcilers without a 60s resync wait and without inventing a framework mechanism beyond the two typed helpers.
 
 **Reconcile flow — ordering depends on the policy's checkout strategy.** The three supported strategies produce three dependency chains:
 
@@ -585,7 +605,7 @@ Per-task logic on every reconcile pass — first looks up the TaskWorkspace by d
 
 - **`Pending`**, deps satisfied → emit `MarkTaskReady` patch (Stage 3 unchanged).
 - **`Ready`**:
-  - If TaskWorkspace doesn't exist → emit `CreateTaskWorkspace` actuation (idempotent; AlreadyExists is success).
+  - If TaskWorkspace doesn't exist → emit `CreateTaskWorkspace` actuation. The actuation's `ObjectMeta.labels` include `flotilla.work/convoy: <convoy>`, `flotilla.work/task: <task>`, and `flotilla.work/url-slug: slug(convoy.spec.repository.url)` — the last of which is the key that `LabelJoinWatch` uses to wake this TaskWorkspace when its Clone transitions. Idempotent; `AlreadyExists` is success.
   - If TaskWorkspace exists with `status.phase == Failed` → emit `MarkTaskFailed` patch with the workspace's failure message. A task is not considered launched just because the TaskWorkspace object exists.
   - If TaskWorkspace exists with `status.phase == Ready` → emit `MarkTaskLaunching` patch. This is the point where `started_at` and placement metadata become true for the convoy task.
   - Otherwise → no work; wait for next reconcile.
@@ -607,7 +627,11 @@ The daemon at startup, after connecting to the resource backend:
 
 1. **Self-register as Host**: create-or-update a Host resource for itself (using the existing persistent host id as the resource name). Spawn a periodic heartbeat task that updates `Host.status.heartbeat_at` every ~30s.
 2. **Create the host-direct Environment** for itself if not present. Includes `repo_default_dir` from existing flotilla-core config or a sensible default. Idempotent.
-3. **Discover Clones**: scan flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`); for each entry, create-or-update a Clone resource (env_ref = host-direct env, url/path from the registry, labels `flotilla.work/discovered: "true"` + `flotilla.work/url-slug: <slug>`). Idempotent; deterministic naming means reruns don't duplicate.
+3. **Discover Clones**: scan flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`). The registry is path-only; the canonical URL lives in the on-disk clone's git config, not in flotilla's config. For each registered path:
+   1. Run `git remote get-url origin` against the path. If that fails (no origin remote, bare local repo, renamed remote), log a warning and skip this entry — a Clone without a URL can't be matched against any convoy's `repository.url`.
+   2. Compute the deterministic name (`<url-slug>-<host-direct-env-ref>`).
+   3. Create-or-update the Clone resource with `spec.url` = the derived URL, `spec.env_ref` = the host-direct env, `spec.path` from the registry, and labels `flotilla.work/discovered: "true"` + `flotilla.work/url-slug: <slug>` + `flotilla.work/env: <env-ref>`.
+   Idempotent across daemon restarts; if the user manually renamed a remote or moved a path, the next discovery pass picks up the current URL.
 4. **Create default PlacementPolicies**:
    - Always: `host-direct-<host-id>` (variant: `host_direct`).
    - If `Host.status.capabilities.docker == true`: `docker-on-<host-id>` (variant: `docker_per_task`, with a sensible default image).
@@ -677,7 +701,7 @@ For each resource that carries a finalizer: verify cleanup runs, finalizer entry
 
 ### Stage 1 layer (in `flotilla-resources`)
 
-1. `controller` module: `Reconciler` trait, `SecondaryWatch` trait, `ControllerLoop`, `Actuation` enum (with `ObjectMeta` struct carrying name + owner_ref + labels + annotations on every `Create*` variant), `ReconcileOutcome`.
+1. `controller` module: `Reconciler` trait, `SecondaryWatch` trait plus `LabelMappedWatch` (1:1) and `LabelJoinWatch` (shared-referent fan-out) typed helpers, `ControllerLoop`, `Actuation` enum (with `ObjectMeta` struct carrying name + owner_ref + labels + annotations on every `Create*` variant), `ReconcileOutcome`.
 2. Refactor Stage 3 convoy controller to implement `Reconciler` (mechanical, no behavior change).
 3. Framework tests.
 
