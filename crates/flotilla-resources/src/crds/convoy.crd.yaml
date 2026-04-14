@@ -9,25 +9,108 @@ spec:
     plural: convoys
     singular: convoy
     kind: Convoy
+    shortNames: [cvy]
   versions:
     - name: v1
       served: true
       storage: true
       subresources:
         status: {}
+      additionalPrinterColumns:
+        - name: Workflow
+          type: string
+          jsonPath: .spec.workflow_ref
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
       schema:
         openAPIV3Schema:
           type: object
           properties:
             spec:
               type: object
+              required: [workflow_ref]
               properties:
-                template:
+                workflow_ref:
                   type: string
-              required:
-                - template
+                  minLength: 1
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "workflow_ref is immutable after creation"
+                inputs:
+                  type: object
+                  additionalProperties: true
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: "inputs are immutable after creation"
+                placement_policy:
+                  type: string
+                  minLength: 1
             status:
               type: object
               properties:
                 phase:
                   type: string
+                  enum: [Pending, Active, Completed, Failed, Cancelled]
+                observed_workflow_ref:
+                  type: string
+                observed_workflows:
+                  type: object
+                  additionalProperties:
+                    type: string
+                workflow_snapshot:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                  properties:
+                    tasks:
+                      type: array
+                      items:
+                        type: object
+                        required: [name, processes]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                          depends_on:
+                            type: array
+                            items:
+                              type: string
+                          processes:
+                            type: array
+                            items:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                message:
+                  type: string
+                started_at:
+                  type: string
+                  format: date-time
+                finished_at:
+                  type: string
+                  format: date-time
+                tasks:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    required: [phase]
+                    properties:
+                      phase:
+                        type: string
+                        enum: [Pending, Ready, Launching, Running, Completed, Failed, Cancelled]
+                      ready_at:
+                        type: string
+                        format: date-time
+                      started_at:
+                        type: string
+                        format: date-time
+                      finished_at:
+                        type: string
+                        format: date-time
+                      message:
+                        type: string
+                      placement:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true

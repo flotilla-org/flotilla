@@ -25,6 +25,12 @@ fn test_node_id(name: &str) -> NodeId {
     NodeId::new(format!("node-{name}"))
 }
 
+fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
+}
+
 /// Peer sender that captures messages and signals a `Notify` on each send,
 /// allowing tests to wait deterministically instead of sleeping.
 struct NotifyPeerSender {
@@ -70,7 +76,7 @@ async fn peer_connect_triggers_local_state_send() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_path = tmp.path().join("repo");
     init_git_repo(&repo_path);
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let host_a = HostName::new("host-a");
     let _host_b = HostName::new("host-b");
     let node_b = test_node_id("host-b");
@@ -111,7 +117,7 @@ async fn peer_reconnect_resends_local_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_path = tmp.path().join("repo");
     init_git_repo(&repo_path);
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let host_a = HostName::new("host-a");
     let _host_b = HostName::new("host-b");
     let node_b = test_node_id("host-b");

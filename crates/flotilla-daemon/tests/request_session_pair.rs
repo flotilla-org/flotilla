@@ -13,9 +13,15 @@ use flotilla_core::{
 use flotilla_daemon::server::test_support::{spawn_in_memory_request_topology, spawn_in_memory_request_topology_stateful};
 use flotilla_protocol::{provider_data::Issue, Command, CommandAction, CommandValue, HostName, RepoSelector};
 
+fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
+}
+
 async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = Arc::new(ConfigStore::with_base(tmp.keep()));
+    let config = test_config_store(tmp.keep());
     InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await
 }
 
@@ -93,7 +99,7 @@ async fn remote_issue_query_returns_results() {
     let follower_tmp = tempfile::tempdir().expect("tempdir");
     let follower_repo = follower_tmp.path().join("repo");
     init_git_repo_with_remote(&follower_repo, "git@github.com:owner/repo.git");
-    let follower_config = Arc::new(ConfigStore::with_base(follower_tmp.path().join("config")));
+    let follower_config = test_config_store(follower_tmp.path().join("config"));
     let follower_discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_query_service(Arc::clone(&mock_service) as Arc<dyn IssueQueryService>),
     );

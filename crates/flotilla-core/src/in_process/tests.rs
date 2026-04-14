@@ -525,15 +525,13 @@ fn snapshot_includes_linked_issues_when_populated() {
 async fn get_repo_providers_uses_preferred_root_environment_host_discovery_for_non_local_direct_repo() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
+    let config_base = temp.path().join("config");
     std::fs::create_dir_all(&repo).expect("create repo dir");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
 
-    let daemon = InProcessDaemon::new(
-        vec![],
-        Arc::new(ConfigStore::with_base(temp.path().join("config"))),
-        fake_discovery(false),
-        HostName::local(),
-    )
-    .await;
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
 
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("LOCAL_MARKER", "local")))

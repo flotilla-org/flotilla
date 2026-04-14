@@ -1,8 +1,8 @@
 use std::{env, path::PathBuf};
 
 use flotilla_resources::{
-    ensure_crd, ensure_namespace, validate, HttpBackend, InputMeta, ResourceBackend, WatchEvent, WatchStart, WorkflowTemplate,
-    WorkflowTemplateSpec,
+    ensure_crd, ensure_namespace, validate, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, HttpBackend, InputMeta, InputValue,
+    ResourceBackend, WatchEvent, WatchStart, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -38,6 +38,19 @@ fn updated_workflow_spec() -> WorkflowTemplateSpec {
     spec
 }
 
+fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
+    ConvoySpec {
+        workflow_ref: workflow_ref.to_string(),
+        inputs: [
+            ("feature".to_string(), InputValue::String("Retry logic for the poller".to_string())),
+            ("branch".to_string(), InputValue::String("fix-bug-123".to_string())),
+        ]
+        .into_iter()
+        .collect(),
+        placement_policy: Some("laptop-docker".to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kubeconfig = kubeconfig_path();
@@ -47,31 +60,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_crd(&backend, include_str!("../src/crds/convoy.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../src/crds/workflow_template.crd.yaml")).await?;
 
-    let resolver = ResourceBackend::Http(backend).using::<WorkflowTemplate>(namespace);
-    let spec = load_workflow_spec()?;
-    validate(&spec).map_err(|errors| format!("sample workflow failed validation: {errors:?}"))?;
-    let meta = InputMeta {
+    let backend = ResourceBackend::Http(backend);
+    let workflow_resolver = backend.clone().using::<WorkflowTemplate>(namespace);
+    let convoy_resolver = backend.using::<Convoy>(namespace);
+    let workflow_spec = load_workflow_spec()?;
+    validate(&workflow_spec).map_err(|errors| format!("sample workflow failed validation: {errors:?}"))?;
+    let workflow_meta = InputMeta {
         name: format!("demo-workflow-template-{}", std::process::id()),
         labels: [("app".to_string(), "flotilla".to_string())].into_iter().collect(),
         annotations: Default::default(),
     };
-    if let Err(err) = resolver.delete(&meta.name).await {
+    if let Err(err) = workflow_resolver.delete(&workflow_meta.name).await {
+        if !matches!(err, flotilla_resources::ResourceError::NotFound { .. }) {
+            return Err(err.into());
+        }
+    }
+    let convoy_meta = InputMeta {
+        name: format!("demo-convoy-{}", std::process::id()),
+        labels: [("app".to_string(), "flotilla".to_string())].into_iter().collect(),
+        annotations: Default::default(),
+    };
+    if let Err(err) = convoy_resolver.delete(&convoy_meta.name).await {
         if !matches!(err, flotilla_resources::ResourceError::NotFound { .. }) {
             return Err(err.into());
         }
     }
 
-    println!("creating resource");
-    let created = resolver.create(&meta, &spec).await?;
-    println!("created {} rv={}", created.metadata.name, created.metadata.resource_version);
+    println!("creating workflow template");
+    let created_workflow = workflow_resolver.create(&workflow_meta, &workflow_spec).await?;
+    println!("created workflow {} rv={}", created_workflow.metadata.name, created_workflow.metadata.resource_version);
 
-    let listed = resolver.list().await?;
-    println!("listed {} resources at rv={}", listed.items.len(), listed.resource_version);
+    println!("updating workflow template");
+    let updated_workflow =
+        workflow_resolver.update(&workflow_meta, &created_workflow.metadata.resource_version, &updated_workflow_spec()).await?;
+    println!("updated workflow rv={}", updated_workflow.metadata.resource_version);
 
-    let mut watch = resolver.watch(WatchStart::FromVersion(listed.resource_version.clone())).await?;
-    println!("updating spec");
-    let updated = resolver.update(&meta, &created.metadata.resource_version, &updated_workflow_spec()).await?;
-    println!("updated rv={}", updated.metadata.resource_version);
+    println!("creating convoy");
+    let created_convoy = convoy_resolver.create(&convoy_meta, &convoy_spec(&workflow_meta.name)).await?;
+    println!("created convoy {} rv={}", created_convoy.metadata.name, created_convoy.metadata.resource_version);
+
+    let listed = convoy_resolver.list().await?;
+    println!("listed {} convoys at rv={}", listed.items.len(), listed.resource_version);
+
+    let mut watch = convoy_resolver.watch(WatchStart::FromVersion(listed.resource_version.clone())).await?;
+    println!("updating convoy status");
+    let updated_convoy = convoy_resolver
+        .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            workflow_snapshot: None,
+            tasks: Default::default(),
+            message: None,
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            observed_workflows: None,
+        })
+        .await?;
+    println!("updated convoy rv={}", updated_convoy.metadata.resource_version);
 
     if let Some(event) = watch.next().await {
         match event? {
@@ -82,13 +127,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("deleting resource");
-    resolver.delete(&created.metadata.name).await?;
+    println!("deleting convoy");
+    convoy_resolver.delete(&created_convoy.metadata.name).await?;
     if let Some(event) = watch.next().await {
         match event? {
             WatchEvent::Deleted(object) => println!("watch saw deleted resource rv={}", object.metadata.resource_version),
             WatchEvent::Added(_) | WatchEvent::Modified(_) => println!("watch saw non-deleted event"),
         }
     }
+
+    println!("deleting workflow template");
+    workflow_resolver.delete(&created_workflow.metadata.name).await?;
     Ok(())
 }

@@ -80,8 +80,15 @@ async fn wait_for_local_checkout(daemon: &Arc<InProcessDaemon>, repo: &std::path
     .await
     .expect("timeout waiting for local checkout providers")
 }
+
+fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
+}
+
 async fn empty_daemon_with_host(temp: &tempfile::TempDir, host: &str) -> Arc<InProcessDaemon> {
-    let config = Arc::new(ConfigStore::with_base(temp.path().join(format!("config-{host}"))));
+    let config = test_config_store(temp.path().join(format!("config-{host}")));
     InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host)).await
 }
 // ---------------------------------------------------------------------------
@@ -222,7 +229,7 @@ async fn daemon_snapshot_has_correct_host_attribution() {
     let repo = temp.path().to_path_buf();
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
 
     // Subscribe first, then trigger a refresh so the snapshot cannot race ahead.
@@ -264,14 +271,14 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
 
     let leader = InProcessDaemon::new(
         vec![leader_repo.clone()],
-        Arc::new(ConfigStore::with_base(temp.path().join("leader-config"))),
+        test_config_store(temp.path().join("leader-config")),
         git_process_discovery(false),
         HostName::new("leader"),
     )
     .await;
     let follower = InProcessDaemon::new(
         vec![follower_repo.clone()],
-        Arc::new(ConfigStore::with_base(temp.path().join("follower-config"))),
+        test_config_store(temp.path().join("follower-config")),
         git_process_discovery(false),
         HostName::new("follower"),
     )
@@ -326,7 +333,7 @@ async fn daemon_snapshot_includes_follower_checkout_overlay() {
     let repo = temp.path().to_path_buf();
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
 
     let follower_host = HostName::new("follower");
@@ -618,7 +625,7 @@ async fn follower_mode_has_only_local_providers() {
     let repo = temp.path().to_path_buf();
     init_git_repo(&repo);
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo], config, git_process_discovery(true), HostName::local()).await;
 
     assert!(daemon.is_follower(), "daemon should be in follower mode");

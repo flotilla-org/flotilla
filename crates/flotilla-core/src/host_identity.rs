@@ -770,6 +770,10 @@ mod tests {
     async fn resolve_local_node_id_uses_machine_scoped_identity_dir() {
         let base = tempfile::tempdir().unwrap();
         let machine_runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder()
+            // This test resolves the machine UUID once per `resolve_local_node_id()` call and
+            // once more when asserting the scoped identity directory path directly.
+            .on_run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Ok("\"IOPlatformUUID\" = \"machine-uuid\"\n".into()))
+            .on_run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Ok("\"IOPlatformUUID\" = \"machine-uuid\"\n".into()))
             .on_run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Ok("\"IOPlatformUUID\" = \"machine-uuid\"\n".into()))
             .build();
 

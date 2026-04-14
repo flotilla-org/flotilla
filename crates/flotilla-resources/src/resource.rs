@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, fmt::Debug};
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::status_patch::StatusPatch;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiPaths {
     pub group: &'static str,
@@ -14,6 +16,7 @@ pub struct ApiPaths {
 pub trait Resource: Send + Sync + 'static {
     type Spec: Serialize + DeserializeOwned + Send + Sync + Debug + Clone;
     type Status: Serialize + DeserializeOwned + Send + Sync + Debug + Clone;
+    type StatusPatch: StatusPatch<Self::Status>;
 
     const API_PATHS: ApiPaths;
 }

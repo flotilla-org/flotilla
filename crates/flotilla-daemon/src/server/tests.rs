@@ -91,9 +91,15 @@ async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {
 
 async fn empty_daemon_named(host_name: &str) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await;
     (tmp, daemon)
+}
+
+fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
 }
 
 type RoutingState = (
@@ -317,7 +323,7 @@ async fn dispatch_repo_query_methods_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -699,7 +705,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -784,7 +790,7 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -884,7 +890,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let workspace_manager = Arc::new(FakeWorkspaceManager::new());
     let discovery =
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager.clone() as Arc<_>));
@@ -1056,7 +1062,7 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let workspace_manager = Arc::new(FakeWorkspaceManager::new());
     let discovery =
         fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager.clone() as Arc<_>));
@@ -1298,7 +1304,7 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -1452,7 +1458,7 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -1649,7 +1655,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -1747,7 +1753,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("remote-root").join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -1913,7 +1919,7 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     let repo_identity = init_git_repo_with_remote(&remote_repo, "git@github.com:owner/repo.git");
     init_git_repo_with_remote(&requester_repo, "git@github.com:owner/repo.git");
 
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.refresh(&flotilla_protocol::RepoSelector::Path(remote_repo.clone())).await.expect("refresh repo");
 
@@ -1965,7 +1971,7 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
 #[tokio::test]
 async fn take_peer_data_rx_returns_some_once() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let mut server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
         .await
         .expect("create daemon server");
@@ -1979,7 +1985,7 @@ async fn daemon_server_does_not_replay_configured_peers_without_host_environment
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
     std::fs::create_dir_all(&base).expect("create config directory");
-    std::fs::write(base.join("daemon.toml"), "host_name = \"local\"\n").expect("write daemon config");
+    std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\nhost_name = \"local\"\n").expect("write daemon config");
     std::fs::write(
             base.join("hosts.toml"),
             "[hosts.udder]\nhostname = \"udder\"\ndaemon_socket = \"/tmp/udder.sock\"\n\n[hosts.feta]\nhostname = \"feta\"\ndaemon_socket = \"/tmp/feta.sock\"\n",
@@ -2596,7 +2602,7 @@ async fn peer_manager_initialized_from_config() {
     std::fs::create_dir_all(&base).expect("create config directory");
 
     // Write daemon config with a custom host name
-    std::fs::write(base.join("daemon.toml"), "host_name = \"test-host\"\n").expect("write daemon config");
+    std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\nhost_name = \"test-host\"\n").expect("write daemon config");
 
     // Write hosts config with one peer
     std::fs::write(
@@ -2619,7 +2625,7 @@ async fn peer_manager_initialized_from_config() {
 #[tokio::test]
 async fn peer_manager_default_when_no_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let server = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60))
         .await
         .expect("create daemon server");
@@ -2634,6 +2640,7 @@ async fn daemon_server_new_returns_error_for_invalid_hosts_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
     std::fs::create_dir_all(&base).expect("create config directory");
+    std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     std::fs::write(
         base.join("hosts.toml"),
         "[hosts.remote]\nhostname = \"10.0.0.5\"\nexpected_host_name = [\ndaemon_socket = \"/tmp/daemon.sock\"\n",
@@ -2654,7 +2661,7 @@ async fn daemon_server_new_returns_error_for_invalid_daemon_config() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().join("config");
     std::fs::create_dir_all(&base).expect("create config directory");
-    std::fs::write(base.join("daemon.toml"), "environments = 123\n").expect("write invalid daemon config");
+    std::fs::write(base.join("daemon.toml"), "machine_id = \"test-machine\"\nenvironments = 123\n").expect("write invalid daemon config");
 
     let config = Arc::new(ConfigStore::with_base(&base));
     let result = DaemonServer::new(vec![], config, fake_discovery(false), tmp.path().join("test.sock"), Duration::from_secs(60)).await;
@@ -3033,7 +3040,7 @@ async fn set_peer_providers_rejects_stale_version() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git");
-    let config = Arc::new(ConfigStore::with_base(tmp.path().join("config")));
+    let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
 
     let fresh_peers = vec![(NodeInfo::new(NodeId::new("hostB"), "hostB"), ProviderData {

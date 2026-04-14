@@ -116,19 +116,21 @@ fn issue_page(range: std::ops::RangeInclusive<usize>, has_more: bool) -> IssueRe
     IssueResultPage { items: range.map(issue_row).collect(), total: None, has_more }
 }
 
+fn daemon_test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create daemon config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
+}
+
 async fn app_with_issue_query_service(service: Arc<dyn IssueQueryService>) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, App) {
     let temp = tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 
     let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_query_service(service));
-    let daemon = InProcessDaemon::new(
-        vec![repo.clone()],
-        Arc::new(ConfigStore::with_base(temp.path().join("daemon-config"))),
-        discovery,
-        HostName::local(),
-    )
-    .await;
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], daemon_test_config_store(temp.path().join("daemon-config")), discovery, HostName::local())
+            .await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
     let daemon_handle: Arc<dyn DaemonHandle> = daemon.clone();

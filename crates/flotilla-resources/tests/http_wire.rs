@@ -2,8 +2,8 @@ mod common;
 
 use std::{net::SocketAddr, time::Duration};
 
-use common::{input_meta, spec, status, ConvoyResource};
-use flotilla_resources::{HttpBackend, ResourceBackend, ResourceError, WatchEvent, WatchStart};
+use common::{convoy_meta, convoy_spec, convoy_status};
+use flotilla_resources::{Convoy, ConvoyPhase, HttpBackend, ResourceBackend, ResourceError, WatchEvent, WatchStart};
 use futures::StreamExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -73,20 +73,25 @@ async fn list_decodes_collection_resource_version() {
                 "annotations": { "note": "test" },
                 "creationTimestamp": "2026-04-13T12:00:00Z"
             },
-            "spec": { "template": "review" },
-            "status": { "phase": "Running" }
+            "spec": {
+                "workflow_ref": "review",
+                "inputs": {},
+                "placement_policy": "laptop-docker"
+            },
+            "status": { "phase": "Active" }
         }]
     })
     .to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
     let listed = resolver.list().await.expect("list should succeed");
     assert_eq!(listed.resource_version, "7");
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].metadata.name, "alpha");
-    assert_eq!(listed.items[0].status.as_ref().expect("status").phase, "Running");
+    assert_eq!(listed.items[0].spec.workflow_ref, "review");
+    assert_eq!(listed.items[0].status.as_ref().expect("status").phase, ConvoyPhase::Active);
 }
 
 #[tokio::test]
@@ -102,32 +107,36 @@ async fn update_status_uses_status_subresource_path_and_body() {
             "annotations": { "note": "test" },
             "creationTimestamp": "2026-04-13T12:00:00Z"
         },
-        "spec": { "template": "review" },
-        "status": { "phase": "Running" }
+        "spec": {
+            "workflow_ref": "review",
+            "inputs": {},
+            "placement_policy": "laptop-docker"
+        },
+        "status": { "phase": "Active" }
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
-    let updated = resolver.update_status("alpha", "7", &status("Running")).await.expect("status update should succeed");
+    let updated = resolver.update_status("alpha", "7", &convoy_status(ConvoyPhase::Active)).await.expect("status update should succeed");
     assert_eq!(updated.metadata.resource_version, "8");
 
     let request = request_rx.await.expect("captured request");
     assert!(request.starts_with("PUT /apis/flotilla.work/v1/namespaces/flotilla/convoys/alpha/status HTTP/1.1"));
     assert!(request.contains("\"resourceVersion\":\"7\""));
-    assert!(request.contains("\"phase\":\"Running\""));
+    assert!(request.contains("\"phase\":\"Active\""));
 }
 
 #[tokio::test]
 async fn watch_decodes_kubernetes_watch_events() {
     let body = concat!(
-        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"template\":\"review\"},\"status\":{\"phase\":\"Pending\"}}}\n",
-        "{\"type\":\"DELETED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"8\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"template\":\"review\"},\"status\":{\"phase\":\"Pending\"}}}\n"
+        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n",
+        "{\"type\":\"DELETED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"8\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n"
     );
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", body)).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
     let mut watch = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect("watch should succeed");
     let first = timeout(Duration::from_secs(1), watch.next())
@@ -156,10 +165,10 @@ async fn watch_decodes_kubernetes_watch_events() {
 #[tokio::test]
 async fn watch_decodes_crlf_terminated_events() {
     let body =
-        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"template\":\"review\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
+        "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", body)).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
     let mut watch = resolver.watch(WatchStart::Now).await.expect("watch should succeed");
     let event =
@@ -175,9 +184,9 @@ async fn status_errors_map_to_resource_errors() {
     let body = serde_json::json!({ "message": "resource version conflict" }).to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("409 Conflict", &body)).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
-    let err = resolver.update(&input_meta("alpha"), "7", &spec("review")).await.err().expect("update should conflict");
+    let err = resolver.update(&convoy_meta("alpha"), "7", &convoy_spec("review")).await.expect_err("update should conflict");
     match err {
         ResourceError::Conflict { name, message } => {
             assert_eq!(name, "alpha");
@@ -192,9 +201,9 @@ async fn not_found_errors_preserve_requested_name() {
     let body = serde_json::json!({ "message": "convoys.flotilla.work \"alpha\" not found" }).to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("404 Not Found", &body)).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
-    let err = resolver.get("alpha").await.err().expect("get should fail");
+    let err = resolver.get("alpha").await.expect_err("get should fail");
     match err {
         ResourceError::NotFound { name } => assert_eq!(name, "alpha"),
         other => panic!("expected not found, got {other}"),
@@ -205,7 +214,7 @@ async fn not_found_errors_preserve_requested_name() {
 async fn server_disconnect_ends_watch_stream_cleanly() {
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", "")).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
-    let resolver = backend.using::<ConvoyResource>("flotilla");
+    let resolver = backend.using::<Convoy>("flotilla");
 
     let mut watch = resolver.watch(WatchStart::Now).await.expect("watch should succeed");
     let next = timeout(Duration::from_millis(200), watch.next()).await.expect("watch poll should finish");

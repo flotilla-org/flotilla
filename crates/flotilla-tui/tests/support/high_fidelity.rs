@@ -37,6 +37,12 @@ use tempfile::TempDir;
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 30;
 
+fn daemon_test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
+    std::fs::create_dir_all(&config_dir).expect("create daemon config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    Arc::new(ConfigStore::with_base(config_dir))
+}
+
 pub struct HighFidelityHarness {
     _tempdir: TempDir,
     _leader: Arc<InProcessDaemon>,
@@ -96,14 +102,14 @@ impl HighFidelityHarness {
 
         let leader = InProcessDaemon::new(
             vec![leader_repo.clone()],
-            Arc::new(ConfigStore::with_base(tempdir.path().join("leader-config"))),
+            daemon_test_config_store(tempdir.path().join("leader-config")),
             leader_runtime,
             HostName::new("leader"),
         )
         .await;
         let follower = InProcessDaemon::new(
             vec![follower_repo.clone()],
-            Arc::new(ConfigStore::with_base(tempdir.path().join("follower-config"))),
+            daemon_test_config_store(tempdir.path().join("follower-config")),
             follower_runtime,
             HostName::new("follower"),
         )

@@ -547,7 +547,8 @@ fn static_ssh_test_discovery_with_env_and_detectors(
 
 fn write_static_environment_config(config_dir: &Path, contents: &str) {
     std::fs::create_dir_all(config_dir).expect("create config dir");
-    std::fs::write(config_dir.join("daemon.toml"), contents).expect("write daemon config");
+    let rendered = if contents.contains("machine_id") { contents.to_owned() } else { format!("machine_id = \"test-machine\"\n{contents}") };
+    std::fs::write(config_dir.join("daemon.toml"), rendered).expect("write daemon config");
 }
 
 async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &str) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
@@ -555,12 +556,12 @@ async fn daemon_for_plain_dir_with_local_environment_id(local_environment_id: &s
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config_dir = temp.path().join("config");
-    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    let config = test_config_store(config_dir.clone());
     let discovery = fake_discovery(false);
-    let machine_state_dir = flotilla_core::host_identity::resolve_local_environment_state_dir(&config_dir, None, &*discovery.runner).await;
+    let machine_state_dir =
+        flotilla_core::host_identity::resolve_local_environment_state_dir(&config_dir, Some("test-machine"), &*discovery.runner).await;
     std::fs::create_dir_all(&machine_state_dir).expect("create machine-scoped state dir");
     std::fs::write(machine_state_dir.join("environment-id"), format!("{local_environment_id}\n")).expect("seed environment id");
-    let config = Arc::new(ConfigStore::with_base(config_dir));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     (temp, repo, daemon)
 }
@@ -1305,7 +1306,7 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     let mut discovery = fake_vcs_discovery(state);
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
     (temp, repo, daemon, identity)
@@ -1327,7 +1328,7 @@ async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathB
         vec![Box::new(FakeCheckoutManagerFactory::new(state_a)), Box::new(FakeCheckoutManagerFactory::new(state_b))];
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, discovery, HostName::local()).await;
     (temp, repo_a, repo_b, daemon)
 }
@@ -1550,13 +1551,8 @@ async fn daemon_uses_persisted_local_environment_id() {
 
     drop(daemon);
 
-    let restarted = InProcessDaemon::new(
-        vec![repo],
-        Arc::new(ConfigStore::with_base(temp.path().join("config"))),
-        fake_discovery(false),
-        HostName::local(),
-    )
-    .await;
+    let restarted =
+        InProcessDaemon::new(vec![repo], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
     assert_eq!(restarted.local_environment_id().as_str(), "test-local-environment-id");
 }
 
@@ -1570,8 +1566,7 @@ async fn daemon_uses_config_machine_id_for_local_node_identity_storage() {
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"override-machine\"\n").expect("write daemon config");
 
     let daemon =
-        InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(config_dir.clone())), fake_discovery(false), HostName::local())
-            .await;
+        InProcessDaemon::new(vec![repo], Arc::new(ConfigStore::with_base(&config_dir)), fake_discovery(false), HostName::local()).await;
 
     assert!(
         config_dir.join("identity/override-machine/node.key").exists(),
@@ -1593,13 +1588,8 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
 
     let discovery = fake_discovery(false);
-    let daemon = InProcessDaemon::new(
-        vec![repo.clone()],
-        Arc::new(ConfigStore::with_base(config_dir.clone())),
-        discovery,
-        HostName::new("display-host"),
-    )
-    .await;
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], test_config_store(config_dir.clone()), discovery, HostName::new("display-host")).await;
 
     let first_node_id = daemon.node_id().clone();
     assert_eq!(first_node_id.as_str().len(), 32, "node id should be a 16-byte hex fingerprint");
@@ -1609,7 +1599,7 @@ async fn daemon_uses_persisted_fingerprint_backed_node_id() {
 
     let restarted = InProcessDaemon::new(
         vec![repo],
-        Arc::new(ConfigStore::with_base(config_dir.clone())),
+        test_config_store(config_dir.clone()),
         fake_discovery(false),
         HostName::new("renamed-display-host"),
     )
@@ -1751,8 +1741,7 @@ async fn provisioned_repo_refresh_stamps_discovered_checkout_environment_id() {
     discovery.factories.checkout_managers.push(Box::new(FakeCheckoutManagerFactory::new(state)));
 
     let runner = Arc::new(DiscoveryMockRunner::builder().build());
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(temp.path().join("config"))), discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
     let environment_id = EnvironmentId::new("provisioned-checkout-env");
     let handle: EnvironmentHandle = Arc::new(TestProvisionedEnvironment {
         id: environment_id.clone(),
@@ -2266,7 +2255,7 @@ async fn list_hosts_uses_environment_scoped_counts_for_multiple_hosts_on_same_no
     discovery.factories.checkout_managers =
         vec![Box::new(FakeCheckoutManagerFactory::new(state_a)), Box::new(FakeCheckoutManagerFactory::new(state_b))];
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, discovery, HostName::local()).await;
     let peer = test_node("shared-peer");
     let env_a = EnvironmentId::host(HostId::new("shared-peer-host-a"));
@@ -2794,7 +2783,7 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let repo = temp.path().join("new-repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
@@ -2912,7 +2901,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let remote = temp.path().join("origin.git");
     let _ = init_git_repo_with_local_bare_remote(&local_repo, &remote);
     let identity = test_repo_identity();
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![], config, local_bare_remote_discovery(), HostName::local()).await;
 
     daemon.add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), vec![], 0).await.expect("add virtual repo");
@@ -3291,7 +3280,8 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
 
 #[tokio::test]
 async fn execute_on_untracked_repo_returns_error_without_started_event() {
-    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    let config_tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(config_tmp.path().to_path_buf());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
@@ -3322,7 +3312,8 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
 
 #[tokio::test]
 async fn untrack_missing_repo_returns_error_without_started_event() {
-    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    let config_tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(config_tmp.path().to_path_buf());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
     let repo = std::path::PathBuf::from("/tmp/does-not-exist-for-daemon-test");
@@ -3359,7 +3350,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     std::fs::create_dir_all(&repo_a).unwrap();
     std::fs::create_dir_all(&repo_b).unwrap();
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
@@ -3489,7 +3480,8 @@ async fn checkout_target_branch_and_fresh_branch_are_distinct_errors() {
 
 #[tokio::test]
 async fn follower_mode_flag_is_stored() {
-    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    let config_tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(config_tmp.path().to_path_buf());
     let leader = InProcessDaemon::new(vec![], config.clone(), fake_discovery(false), HostName::local()).await;
     assert!(!leader.is_follower(), "default daemon should not be follower");
 
@@ -3503,7 +3495,7 @@ async fn follower_mode_skips_external_providers() {
     let repo = temp.path().to_path_buf();
     init_git_repo(&repo);
 
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(true), HostName::local()).await;
 
     assert!(daemon.is_follower());
@@ -3530,7 +3522,8 @@ async fn follower_mode_skips_external_providers() {
 
 #[tokio::test]
 async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
-    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    let config_tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(config_tmp.path().to_path_buf());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
     let mut rx = daemon.subscribe();
 
@@ -3602,7 +3595,8 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
 
 #[tokio::test]
 async fn add_virtual_repo_is_idempotent() {
-    let config = Arc::new(ConfigStore::with_base(tempfile::tempdir().expect("tempdir").path()));
+    let config_tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(config_tmp.path().to_path_buf());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
@@ -3654,7 +3648,7 @@ async fn get_repo_detail_returns_provider_health_and_errors() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(
         vec![repo.clone()],
         config,
@@ -3708,7 +3702,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon =
         InProcessDaemon::new(vec![], config, fake_discovery_with_provider_set(FakeDiscoveryProviders::new()), HostName::local()).await;
 
@@ -3736,7 +3730,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let terminal_pool: Arc<dyn TerminalPool> = Arc::new(FakeTerminalPool::new());
     let mut discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
     discovery
@@ -4083,7 +4077,7 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(flotilla_core::config::ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon =
         flotilla_core::in_process::InProcessDaemon::new(vec![repo.clone()], config, discovery, flotilla_protocol::HostName::local()).await;
 
@@ -4177,7 +4171,7 @@ async fn attachable_set_cascade_deletes_on_checkout_removal() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
-    let config = Arc::new(flotilla_core::config::ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let daemon = flotilla_core::in_process::InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     let mut rx = daemon.subscribe();
 
@@ -4270,7 +4264,7 @@ async fn two_commands_can_run_concurrently() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
-    let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+    let config = test_config_store(temp.path().join("config"));
     let agent = Arc::new(SlowCloudAgent::new());
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, slow_cloud_agent_discovery(Arc::clone(&agent)), HostName::local()).await;
     let mut rx = daemon.subscribe();
