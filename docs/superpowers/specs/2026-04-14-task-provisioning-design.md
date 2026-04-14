@@ -150,36 +150,63 @@ status:
 - **`docker_per_task` Environments** are owned by their TaskWorkspace via `ownerReferences` and GC-cascade on TaskWorkspace deletion.
 - **Finalizer** `flotilla.work/environment-teardown` on `docker_per_task` Environments runs `docker rm -f` before deletion completes. `host_direct` Environments carry no finalizer — there is no per-env state to tear down (the host filesystem outlives them).
 
+### URL canonicalization and slug
+
+Clone identity is (URL, env) — but raw URL strings don't work as identity: `git@github.com:foo/bar.git` and `https://github.com/foo/bar` address the same remote, and neither is a valid k8s resource name (DNS-1035 allows only `[a-z0-9-]`, max 63 chars, no leading/trailing hyphen). Stage 4a defines one canonicalization function and one slug function, applied in exactly the two places where URL identity matters: Clone discovery (when deriving from `git remote get-url origin`) and convoy bootstrap (when reading `convoy.spec.repository.url`). Everywhere downstream uses the canonical URL.
+
+**Canonicalization** — deliberately narrow for Stage 4a:
+
+1. SSH short form `git@host:owner/repo` → `https://host/owner/repo`.
+2. `ssh://git@host/path` → `https://host/path`.
+3. Lowercase the host component. Path stays as-given (GitHub is case-preserving on paths).
+4. Strip trailing `.git`.
+5. Strip trailing `/`.
+
+Deferred: redirect-following, case-insensitive path handling, URL re-encoding normalization, explicit `.git`-suffixed canonical form, submodule paths. Users with unusual remotes can paper over by editing their registry or convoy YAML to a canonical form by hand; the narrow rules above cover the SSH/HTTPS equivalence that 99% of users hit.
+
+Note the canonical form is only used as an **identity key** — actual git operations still read the on-disk `origin` URL from the clone's git config, so SSH-authenticated clones keep fetching via SSH even though their Clone resource's `spec.url` is HTTPS.
+
+**Slug**:
+
+```
+slug(canonical_url) = sha256(canonical_url).hex()[:12]
+```
+
+12-char hex prefix of the SHA-256 digest. ~48 bits of collision resistance — birthday threshold around 16M distinct URLs, comfortable for any flotilla fleet. Always DNS-1035 safe (lowercase hex). Different canonical URLs → different slugs by construction, so cross-waking via `LabelJoinWatch` is structurally impossible.
+
+Human-readability goes into a separate descriptive label (`flotilla.work/repo`), not the identity key. `kubectl get clones -L flotilla.work/repo` shows the friendly form; the slug stays terse and safe.
+
 ### `Clone`
 
-A specific on-disk git clone in some Environment's filesystem. The home of the `.git` directory; the parent for worktree-strategy Checkouts. Identity is (URL, env): at most one Clone per `(spec.url, spec.env_ref)` pair (enforced by deterministic naming + controller reuse logic).
+A specific on-disk git clone in some Environment's filesystem. The home of the `.git` directory; the parent for worktree-strategy Checkouts. Identity is (canonical URL, env): at most one Clone per `(slug(spec.url), spec.env_ref)` pair (enforced by deterministic naming + controller reuse logic).
 
 ```yaml
 apiVersion: flotilla.work/v1
 kind: Clone
 metadata:
-  name: flotilla-flotilla-org-host-direct-01HXYZ    # derived from url-slug + env_ref
+  name: clone-a3f2b7e84c01-host-direct-01HXYZ         # clone-<hash12>-<env_ref>
   labels:
-    flotilla.work/discovered: "true"                # set when auto-created via discovery
+    flotilla.work/discovered: "true"                  # set when auto-created via discovery
     flotilla.work/env: host-direct-01HXYZ
-    flotilla.work/url-slug: flotilla-flotilla-org
+    flotilla.work/url-slug: a3f2b7e84c01              # sha256(canonical_url).hex()[:12]; LabelJoinWatch key
+    flotilla.work/repo: github-com-flotilla-org-flotilla  # descriptive; not used for identity
 spec:
-  url: https://github.com/flotilla-org/flotilla     # canonical git URL
-  env_ref: host-direct-01HXYZ                        # env that owns the filesystem
-  path: /Users/alice/dev/flotilla                    # path within env_ref's filesystem
+  url: https://github.com/flotilla-org/flotilla      # canonical form (post-canonicalization)
+  env_ref: host-direct-01HXYZ                         # env that owns the filesystem
+  path: /Users/alice/dev/flotilla                     # path within env_ref's filesystem
 status:
-  phase: Ready                                       # Pending | Cloning | Ready | Failed
+  phase: Ready                                        # Pending | Cloning | Ready | Failed
   default_branch: main
   message: null
 ```
 
 - **Git-shaped in v1.** The "VCS abstraction" is notional in flotilla today (provider trait exists, no real consumer); we don't expose it as a CRD field. Future: a `vcs:` discriminator (`git | hg | fossil | …`) if we add other backends.
 - **Three creation paths in Stage 4a:**
-  1. **Auto-discovery on daemon startup** — daemon scans flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`) and creates Clone resources for what it finds (env_ref = host-direct env of this daemon). The canonical URL is derived per-path by running `git remote get-url origin`; entries without an origin remote are skipped with a warning (see Daemon startup). Marked with `flotilla.work/discovered: "true"`. Lifecycle is out-of-band — these persist regardless of any TaskWorkspace.
-  2. **User-authored** — `kubectl apply` of a Clone spec. The `CloneReconciler` actuates the clone if not already present; the resource exists in `phase: Pending` until the clone completes.
-  3. **On-demand by `TaskWorkspaceReconciler`** — when a task needs a Clone (for worktree strategies) in some env and no matching Clone exists for `(url, env)`, the reconciler emits a `CreateClone` actuation. URL comes from `convoy.spec.repository.url` (see ConvoySpec extensions); env comes from the resolved PlacementPolicy. Deterministic naming means concurrent tasks converge on the same Clone.
-- **Not owned** by any TaskWorkspace — Clones outlive the tasks that use them. Multiple tasks (possibly across multiple convoys) share a Clone by URL+env.
-- **Deterministic naming**: `name = <url-slug>-<env_ref>`. Stable across restarts and across concurrent reconciles; `AlreadyExists` on `CreateClone` is success.
+  1. **Auto-discovery on daemon startup** — daemon scans flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`) and creates Clone resources for what it finds (env_ref = host-direct env of this daemon). The canonical URL is derived per-path by running `git remote get-url origin` and applying the canonicalization function; entries without an origin remote are skipped with a warning (see Daemon startup). Marked with `flotilla.work/discovered: "true"`. Lifecycle is out-of-band — these persist regardless of any TaskWorkspace.
+  2. **User-authored** — `kubectl apply` of a Clone spec. The `CloneReconciler` validates that `spec.url` is already in canonical form and that `metadata.name` matches `clone-<slug(spec.url)>-<spec.env_ref>`; if not, it transitions the Clone to `Failed` with a message stating the expected canonical URL and name (user re-applies with the corrected form). Once valid, the reconciler actuates the clone if not already present; the resource exists in `phase: Pending` until the clone completes. The daemon-discovery and on-demand-by-TaskWorkspaceReconciler paths generate canonical form directly so they never hit this validation failure.
+  3. **On-demand by `TaskWorkspaceReconciler`** — when a task needs a Clone (for worktree strategies) in some env and no matching Clone exists for `(slug, env)`, the reconciler emits a `CreateClone` actuation. URL comes from `convoy.spec.repository.url` canonicalized (see ConvoySpec extensions); env comes from the resolved PlacementPolicy. Deterministic naming means concurrent tasks converge on the same Clone.
+- **Not owned** by any TaskWorkspace — Clones outlive the tasks that use them. Multiple tasks (possibly across multiple convoys) share a Clone by slug+env.
+- **Deterministic naming**: `name = "clone-" + slug(canonical_url) + "-" + env_ref`. The `clone-` prefix is cosmetic — makes names self-describing in bare output. Total length well within 63 chars even for long env_refs. `AlreadyExists` on `CreateClone` is success.
 - **Finalizer** `flotilla.work/clone-cleanup` only runs on explicit delete. Stage 4a default: don't auto-delete the on-disk clone (deleting the resource removes the resource only). Explicit-delete-with-cleanup is a future opt-in.
 
 ### `Checkout`
@@ -205,7 +232,7 @@ spec:
 
   # Exactly one strategy variant populated:
   worktree:
-    clone_ref: flotilla-flotilla-org-host-direct-01HXYZ
+    clone_ref: clone-a3f2b7e84c01-host-direct-01HXYZ
   # fresh_clone:
   #   url: https://github.com/...
 
@@ -282,7 +309,7 @@ metadata:
   labels:
     flotilla.work/convoy: fix-bug-123
     flotilla.work/task: implement
-    flotilla.work/url-slug: flotilla-flotilla-org     # slug(convoy.spec.repository.url); lets Clone→TaskWorkspace join
+    flotilla.work/url-slug: a3f2b7e84c01              # slug(canonical(convoy.spec.repository.url)); LabelJoinWatch key
 spec:
   convoy_ref: fix-bug-123
   task: implement                                   # task name in the parent's workflow_snapshot
@@ -362,7 +389,7 @@ spec:
 - **`repository`** is inline, not a resource reference. In Stage 4a it only carries `url`. This is the invariant identity of the repo across any clones that materialize in any envs. A future logical `Repository` resource would move this into a reference (`repository_ref: foo-bar`), with `url` living on the Repository. The nested-object shape (`repository: { … }`) is forward-compatible: adding a `ref` (resource-name) field or moving fields out later doesn't reshape callers.
 - **`ref`** is the branch used by the convoy's Checkouts. Convoy-level rather than per-task because every task in a Stage 4a convoy works the same branch. Per-task overrides, sha/tag refs, detached-head, and shared-branch coordination are deferred.
 - Both fields are immutable after create (CEL validation), matching Stage 3's immutability story for `workflow_ref`.
-- The TaskWorkspaceReconciler consumes both: `convoy.spec.ref` flows into `CheckoutSpec.ref`; `convoy.spec.repository.url` flows into per-env Clone materialization (see reconcile flow).
+- The TaskWorkspaceReconciler consumes both: `convoy.spec.ref` flows into `CheckoutSpec.ref`; `convoy.spec.repository.url` is canonicalized at read time (see "URL canonicalization and slug") and flows into per-env Clone materialization. Canonicalization is deterministic, so consumers recompute on each read rather than mutating the immutable spec. A user who writes the SSH form gets the HTTPS-canonical form used for identity throughout; the raw spec field preserves what they wrote.
 
 ### Resource interactions and ownership summary
 
@@ -429,8 +456,9 @@ pub enum Actuation {
     DeleteResource        { kind: ResourceKind, name: String },
 }
 // CreateClone is safe because URL comes from convoy.spec.repository.url (one
-// authoritative source) and naming is deterministic `<url-slug>-<env>`, so
-// concurrent tasks converge on the same Clone via AlreadyExists-is-success.
+// authoritative source) and naming is deterministic
+// `clone-<slug(canonical_url)>-<env>`, so concurrent tasks converge on the
+// same Clone via AlreadyExists-is-success.
 
 /// A secondary watch is spawned alongside the primary watch and feeds primary
 /// keys into the shared reconcile channel. Each impl handles one Watched
@@ -464,8 +492,8 @@ pub struct LabelMappedWatch<W: Resource, P: Resource> {
 /// on zero or more primaries. On a watched event, the framework reads the
 /// label value, lists primaries where the same label key has that value, and
 /// enqueues every match. Used for shared-referent fan-out: e.g. a Clone
-/// labelled `flotilla.work/url-slug: foo-bar` wakes every TaskWorkspace
-/// carrying the same `flotilla.work/url-slug: foo-bar` label.
+/// labelled `flotilla.work/url-slug: a3f2b7e84c01` wakes every TaskWorkspace
+/// carrying the same `flotilla.work/url-slug: a3f2b7e84c01` label.
 ///
 /// Implementation uses the backend's label-selector list (already required by
 /// the primary watch's initial list path, so no new backend capability).
@@ -568,9 +596,9 @@ The reconciler computes the dependency order from the strategy and drives the pe
 
 1. **Resolve PlacementPolicy** via `placement_policy_ref`. Missing → `Failed`; the Convoy reconciler observes and propagates.
 2. **Read parent Convoy's `spec` and `status.workflow_snapshot`** for `repository.url`, `ref`, process definitions, and inputs.
-3. **Ensure Clone** (when strategy needs one — skipped for `fresh_clone_in_container`). Compute the clone env (the host-direct env of the policy's host) and the deterministic Clone name: `<url-slug(convoy.spec.repository.url)>-<clone_env_ref>`. Look it up:
-   - Not found → emit `CreateClone` actuation with `spec.url = convoy.spec.repository.url`, `spec.env_ref = clone_env_ref`, `spec.path = <clone_env.spec.host_direct.repo_default_dir>/<url-slug>`. Labels include `flotilla.work/url-slug` so the secondary watch maps back here. On `AlreadyExists` (a peer task got there first), treat as success and proceed.
-   - Found → reuse. Clone is shared by URL+env across all tasks and all convoys.
+3. **Ensure Clone** (when strategy needs one — skipped for `fresh_clone_in_container`). Canonicalize `convoy.spec.repository.url`, compute `slug = sha256(canonical_url).hex()[:12]`, and look up the Clone by deterministic name `clone-<slug>-<clone_env_ref>` (where `clone_env_ref` is the host-direct env of the policy's host):
+   - Not found → emit `CreateClone` actuation with `spec.url = canonical_url`, `spec.env_ref = clone_env_ref`, `spec.path = <clone_env.spec.host_direct.repo_default_dir>/<slug>`, labels `flotilla.work/url-slug: <slug>` + `flotilla.work/env: <clone_env_ref>` + `flotilla.work/repo: <descriptive-slug>`. On `AlreadyExists` (a peer task got there first), treat as success and proceed.
+   - Found → reuse. Clone is shared by (slug, env) across all tasks and all convoys.
    Then wait for `phase: Ready`.
 4. **Ensure Environment** (only before Checkout for `fresh_clone_in_container`; otherwise after Checkout). Branch on policy variant:
    - `host_direct` → reuse the shared host-direct Environment for the host; write `status.environment_ref`. No creation.
@@ -605,7 +633,7 @@ Per-task logic on every reconcile pass — first looks up the TaskWorkspace by d
 
 - **`Pending`**, deps satisfied → emit `MarkTaskReady` patch (Stage 3 unchanged).
 - **`Ready`**:
-  - If TaskWorkspace doesn't exist → emit `CreateTaskWorkspace` actuation. The actuation's `ObjectMeta.labels` include `flotilla.work/convoy: <convoy>`, `flotilla.work/task: <task>`, and `flotilla.work/url-slug: slug(convoy.spec.repository.url)` — the last of which is the key that `LabelJoinWatch` uses to wake this TaskWorkspace when its Clone transitions. Idempotent; `AlreadyExists` is success.
+  - If TaskWorkspace doesn't exist → emit `CreateTaskWorkspace` actuation. The actuation's `ObjectMeta.labels` include `flotilla.work/convoy: <convoy>`, `flotilla.work/task: <task>`, and `flotilla.work/url-slug: sha256(canonical(convoy.spec.repository.url)).hex()[:12]` — the last of which is the key that `LabelJoinWatch` uses to wake this TaskWorkspace when its Clone transitions. Idempotent; `AlreadyExists` is success.
   - If TaskWorkspace exists with `status.phase == Failed` → emit `MarkTaskFailed` patch with the workspace's failure message. A task is not considered launched just because the TaskWorkspace object exists.
   - If TaskWorkspace exists with `status.phase == Ready` → emit `MarkTaskLaunching` patch. This is the point where `started_at` and placement metadata become true for the convoy task.
   - Otherwise → no work; wait for next reconcile.
@@ -629,9 +657,10 @@ The daemon at startup, after connecting to the resource backend:
 2. **Create the host-direct Environment** for itself if not present. Includes `repo_default_dir` from existing flotilla-core config or a sensible default. Idempotent.
 3. **Discover Clones**: scan flotilla-core's repo registry (`~/.config/flotilla/repos/*.toml`). The registry is path-only; the canonical URL lives in the on-disk clone's git config, not in flotilla's config. For each registered path:
    1. Run `git remote get-url origin` against the path. If that fails (no origin remote, bare local repo, renamed remote), log a warning and skip this entry — a Clone without a URL can't be matched against any convoy's `repository.url`.
-   2. Compute the deterministic name (`<url-slug>-<host-direct-env-ref>`).
-   3. Create-or-update the Clone resource with `spec.url` = the derived URL, `spec.env_ref` = the host-direct env, `spec.path` from the registry, and labels `flotilla.work/discovered: "true"` + `flotilla.work/url-slug: <slug>` + `flotilla.work/env: <env-ref>`.
-   Idempotent across daemon restarts; if the user manually renamed a remote or moved a path, the next discovery pass picks up the current URL.
+   2. Apply the canonicalization function to the output (SSH→HTTPS, lowercase host, strip `.git` and trailing `/`).
+   3. Compute `slug = sha256(canonical_url).hex()[:12]` and the deterministic name (`clone-<slug>-<host-direct-env-ref>`).
+   4. Create-or-update the Clone resource with `spec.url` = the canonical URL, `spec.env_ref` = the host-direct env, `spec.path` from the registry, and labels `flotilla.work/discovered: "true"` + `flotilla.work/url-slug: <slug>` + `flotilla.work/env: <env-ref>` + `flotilla.work/repo: <descriptive-slug>`.
+   Idempotent across daemon restarts; if the user manually renamed a remote or moved a path, the next discovery pass picks up the current canonical URL (possibly creating a new Clone if it canonicalizes differently).
 4. **Create default PlacementPolicies**:
    - Always: `host-direct-<host-id>` (variant: `host_direct`).
    - If `Host.status.capabilities.docker == true`: `docker-on-<host-id>` (variant: `docker_per_task`, with a sensible default image).
