@@ -24,7 +24,7 @@ Lives in the existing `crates/flotilla-resources` crate alongside the convoy CRD
 ### Out of scope (for this stage)
 
 - Convoy controller or any controller at all.
-- Selector resolution, prompt rendering, variable interpolation.
+- Selector resolution, prompt rendering, variable *substitution*. (Interpolation *syntax and reference validation* is in scope — resolving the values isn't.)
 - Status subresource, admission webhooks, server-side validation.
 - Presentation/layout configuration.
 - Compatibility with today's `WorkspaceTemplate` (`.flotilla/workspace.yaml`). We are in a no-backwards-compatibility phase; new workflows are authored fresh.
@@ -60,11 +60,7 @@ pub struct InputDefinition {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default = "default_true")]
-    pub required: bool,
 }
-
-fn default_true() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskDefinition {
@@ -115,8 +111,8 @@ spec:
         - role: coder
           selector: { capability: code }
           prompt: |
-            Implement {feature} on branch {branch}.
-            Push commits as you go.
+            Convoy {{workflow.name}} — implement {{inputs.feature}} on
+            branch {{inputs.branch}}. Push commits as you go.
 
         - role: build
           command: "cargo watch -x check"
@@ -126,7 +122,7 @@ spec:
       processes:
         - role: reviewer
           selector: { capability: code-review }
-          prompt: "Review the branch {branch} for correctness and style."
+          prompt: "Review branch {{inputs.branch}} for correctness and style."
 
         - role: tests
           command: "cargo test --watch"
@@ -137,7 +133,7 @@ spec:
 - **`status: ()`** because WorkflowTemplate has no observed state. If that changes later (validity tracking, reference-counting), widen the type.
 - **`#[serde(flatten, untagged)]`** on `ProcessSource` gives the verbatim YAML shape — `selector` present → `Agent`, `command` present → `Tool`. No explicit `kind:` discriminator is required.
 - **Task list order** is an authoring convenience; execution order comes from `depends_on` alone.
-- **Commands and prompts are opaque strings.** `{var}` placeholders are permitted and must reference declared inputs, but substitution happens at convoy launch (Stage 3), not here.
+- **Commands and prompts are opaque strings** apart from `{{...}}` interpolation tokens. See the Interpolation section for scoped references (`inputs.<name>`, `workflow.name`, `workflow.namespace`). Substitution happens at convoy launch (Stage 3); Stage 2 only validates that references resolve.
 - **`role` uniqueness is per-task, not per-workflow.** Two tasks can each have a `coder`; they are different process instances at different times.
 - **`deny_unknown_fields` on `ProcessSource`.** Without it, serde's untagged decode silently drops unknown fields — a `prompt:` alongside `command:` would deserialise as a tool process and discard the prompt. `deny_unknown_fields` surfaces the mismatch as a parse error, which authoring agents can act on.
 
@@ -178,7 +174,6 @@ spec:
                     properties:
                       name: { type: string, minLength: 1 }
                       description: { type: string }
-                      required: { type: boolean, default: true }
                 tasks:
                   type: array
                   minItems: 1
@@ -214,6 +209,15 @@ spec:
 - `shortNames: [wft]` gives `kubectl get wft`.
 - Structural constraints only — semantic rules (cycles, missing deps, unknown input references) live in Rust.
 
+## Parse vs. Validate
+
+Two layers with distinct responsibilities:
+
+- **Parse** (`serde_yml::from_str::<WorkflowTemplateSpec>`): catches *structural* errors — missing required fields, wrong types, a process with neither `selector` nor `command`, a process with both, unknown fields on `ProcessSource`. Serde reports the first structural error and stops.
+- **Validate** (`validate(&WorkflowTemplateSpec)`): runs on a successfully-parsed spec. Catches *semantic* errors — cycles, unknown dependency names, duplicate task/role/input names, unresolved `{{...}}` references. Returns **all** semantic errors in a single pass so template authors see the full set.
+
+The CLI runs parse first; if parsing fails, it reports the parse error and exits. If parsing succeeds, it runs `validate()` and reports every error it finds.
+
 ## Validation
 
 ### API
@@ -226,14 +230,24 @@ pub enum ValidationError {
     DuplicateRoleInTask { task: String, role: String },
     UnknownDependency { task: String, missing: String },
     DependencyCycle { cycle: Vec<String> },
-    ProcessMissingSource { task: String, role: String },
-    ProcessBothSources { task: String, role: String },
-    UnknownInputReference { task: String, role: String, input: String },
     DuplicateInputName { name: String },
-}
-```
 
-One pass, returns **all** errors. Agents authoring templates benefit from seeing the full set rather than fixing one at a time.
+    // Interpolation errors — `location` points at the offending token
+    // (task name, process role, and which field it appeared in).
+    MalformedInterpolation { location: InterpolationLocation, text: String },
+    UnknownInterpolationScope { location: InterpolationLocation, scope: String },
+    UnknownInputReference { location: InterpolationLocation, name: String },
+    UnknownWorkflowField { location: InterpolationLocation, name: String },
+}
+
+pub struct InterpolationLocation {
+    pub task: String,
+    pub role: String,
+    pub field: InterpolationField,
+}
+
+pub enum InterpolationField { Prompt, Command }
+```
 
 ### Rules
 
@@ -241,15 +255,38 @@ One pass, returns **all** errors. Agents authoring templates benefit from seeing
 - Role names unique within a task.
 - Every `depends_on` entry resolves to an existing task name.
 - No cycles; reported with the cycle path (`[a, b, c, a]`).
-- Each process has exactly one source: `selector` (agent) or `command` (tool). Serde's untagged decode enforces this structurally; the validator double-checks with a clearer error.
-- `{name}` placeholders in any prompt or command must match a declared input name. Literal brace escape (`{{`) is deferred unless a real command needs it.
 - Input names unique.
+- Every `{{...}}` token in any prompt or command must parse and resolve (see Interpolation).
 
 ### Where validation runs
 
 - **Client-side before `kubectl apply`**, via the `flotilla-resources validate <path>` CLI or a future higher-level `flotilla` subcommand.
 - **Inside any consumer on read** (Stage 3's convoy controller will re-validate before using a template).
 - **Not** via a status-writing controller in this stage. See the deferred list.
+
+## Interpolation
+
+Prompts and commands may contain `{{path}}` tokens that are resolved at convoy launch. Stage 2 only parses and validates them.
+
+### Syntax
+
+- A token starts with `{{` and ends with `}}`. Literal `{{` in a prompt or command has no escape in v1 — avoid it, or wait for an escape story if a real case emerges.
+- The path between the braces is a dotted sequence of segments matching `[A-Za-z0-9_-]+`. No internal whitespace permitted in v1 (Argo allows whitespace but documents interpolation bugs around it; stricter is simpler).
+- Matches Argo's `{{var}}` convention; the `{{=expression}}` expression form is deferred.
+
+### Scopes in v1
+
+| Scope | Example | Meaning |
+|-------|---------|---------|
+| `inputs.<name>` | `{{inputs.branch}}` | Declared workflow input; must appear in `spec.inputs[*].name`. |
+| `workflow.name` | `{{workflow.name}}` | Convoy name (set at launch). |
+| `workflow.namespace` | `{{workflow.namespace}}` | Convoy namespace. |
+
+Any other scope (`tasks.*`, `items.*`, `steps.*`, expression form) errors as `UnknownInterpolationScope` in v1 and will be added later.
+
+### Absent values
+
+All declared inputs in v1 are required — convoy launch must supply a value. Optional inputs and the "absent ⇒ empty string" semantics that Argo uses for skipped-task outputs are deferred (see "Optional / multi-valued inputs" in the deferred list).
 
 ## Tests
 
@@ -305,7 +342,15 @@ The brainstorm prompt framed WorkflowTemplate as "pure data, no controller neede
 
 ### Inputs declared at workflow level
 
-`inputs:` makes it explicit what a convoy must supply at launch. This lets validation check that `{var}` references are resolvable without running the convoy, and documents the template's interface. `required: false` covers truly optional inputs. Multi-valued / richer-typed inputs are deferred.
+`inputs:` makes it explicit what a convoy must supply at launch. This lets the validator check that `{{inputs.<name>}}` references are resolvable without running the convoy, and documents the template's interface. All v1 inputs are required; optionality and multi-valued inputs are deferred (bundled together because they share a runtime-semantics question — likely Argo-style empty-string substitution for absent values).
+
+### Argo-style `{{...}}` interpolation
+
+Collision with real commands (`jq '{name: .name}'`, brace expansion, etc.) ruled out single-brace `{var}`. `{{var}}` matches Argo's well-trodden convention, and scoping from day one (`inputs.<name>`, `workflow.name`) means future additions (`tasks.<name>.outputs.*`, `items.*`, expression form `{{=...}}`) slot in without a migration. Strict no-internal-whitespace in v1 avoids the interpolation bug Argo's own docs flag.
+
+### Parse vs. validate split
+
+Structural errors (missing required fields, wrong types, selector-xor-command violations) are handled by serde at parse time, where the type system makes them unreachable as a running state. The validator runs on already-typed data and covers only the semantic rules that a type system can't express (cycles, name resolution, input references). This keeps each layer's job clear and honest about what it catches.
 
 ### Prompts on agent processes
 
@@ -337,7 +382,9 @@ Captured in `docs/superpowers/specs/2026-04-13-convoy-brainstorm-prompts.md` und
 - Named artifacts / data flow (one task produces a value, downstream consumes it; branch-naming is the canonical case).
 - Agent lifetime across tasks (resume, session continuity).
 - One-shot agent processes (non-long-running agents that produce a value, e.g. haiku branch-namer).
-- Multi-valued / richer inputs (starting from N issues; typed inputs, defaults).
+- Optional and multi-valued inputs (starting from 0+ issues, defaults, typed inputs). Runtime semantics likely follow Argo's "absent value ⇒ empty string."
+- Additional interpolation scopes (`tasks.<name>.outputs.*`, `items.*`, `workflow.creationTimestamp`, etc.) and the expression form `{{=...}}`.
+- Literal `{{` escape rule (Argo compatible if/when needed).
 - Non-terminal content (port-forwarding for dev servers, background services, HTTP probes).
 - GitOps sync (templates authored in VCS, synced by an Argo CD / Flux style controller).
 - Status subresource + validator controller — likely the right end state once templates reference each other or shared-cluster authoring demands fast-feedback validity.
