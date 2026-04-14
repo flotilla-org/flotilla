@@ -237,7 +237,6 @@ Things deliberately pushed out of earlier stages. Each stage's spec should resta
 - **Optional and multi-valued / richer inputs** — starting a workflow from 0+ issues (each with number, title, body, URL), not just a scalar string. Also: default values, typed inputs, `required: false`. Runtime semantics likely follow Argo's "absent value ⇒ empty string substitution." Deferred as a bundle because the runtime semantics and schema shape move together.
 - **Additional interpolation scopes** — `{{tasks.<name>.outputs.*}}`, `{{items.*}}`, `{{workflow.creationTimestamp}}`, `{{workflow.uid}}`, etc. Tracks Argo's reference table as we add the corresponding runtime concepts.
 - **Expression form `{{=...}}`** — Argo's expression mode (casts, filters, sprig functions). Useful once the simple form is paying its way.
-- **Literal `{{` escape** — not needed for v1 commands/prompts; adopt Argo's convention when a concrete case emerges.
 - **Non-terminal content** — port-forwarding for dev servers, HTTP probes, background services. Process definitions are terminal-only in v1.
 - **GitOps sync** — templates authored in project VCS, synced into the cluster by a controller (Argo CD / Flux style). Relevant when templates live in repos rather than being applied manually.
 

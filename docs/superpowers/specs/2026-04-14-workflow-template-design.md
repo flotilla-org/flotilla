@@ -133,7 +133,7 @@ spec:
 - **`status: ()`** because WorkflowTemplate has no observed state. If that changes later (validity tracking, reference-counting), widen the type.
 - **`#[serde(flatten, untagged)]`** on `ProcessSource` gives the verbatim YAML shape — `selector` present → `Agent`, `command` present → `Tool`. No explicit `kind:` discriminator is required.
 - **Task list order** is an authoring convenience; execution order comes from `depends_on` alone.
-- **Commands and prompts are opaque strings** apart from `{{...}}` interpolation tokens. See the Interpolation section for scoped references (`inputs.<name>`, `workflow.name`, `workflow.namespace`). Substitution happens at convoy launch (Stage 3); Stage 2 only validates that references resolve.
+- **Commands and prompts both support `{{...}}` interpolation.** Collision with kubectl/Helm/Go-template snippets (`{{.metadata.name}}`, `{{ .Release.Name }}`) is avoided by a prefix allowlist: only tokens starting with a known scope (`inputs.`, `workflow.`) are recognized; any other token is left alone verbatim for downstream tooling to handle. Matches Argo's approach. Substitution happens at convoy launch (Stage 3); Stage 2 only validates that *recognized* references resolve.
 - **`role` uniqueness is per-task, not per-workflow.** Two tasks can each have a `coder`; they are different process instances at different times.
 - **`deny_unknown_fields` on `ProcessSource`.** Without it, serde's untagged decode silently drops unknown fields — a `prompt:` alongside `command:` would deserialise as a tool process and discard the prompt. `deny_unknown_fields` surfaces the mismatch as a parse error, which authoring agents can act on.
 
@@ -202,10 +202,15 @@ spec:
                             command: { type: string }
                           oneOf:
                             - required: [selector]
+                              not: { required: [command] }
                             - required: [command]
+                              not:
+                                anyOf:
+                                  - required: [selector]
+                                  - required: [prompt]
 ```
 
-- `oneOf` enforces the `selector` XOR `command` rule at the API layer.
+- The symmetric `oneOf`+`not` block enforces the full XOR: a process is either `{selector, prompt?}` or `{command}` — never both, and a `prompt` on a `command`-only process is rejected at the API layer (matching Rust's `deny_unknown_fields`).
 - `shortNames: [wft]` gives `kubectl get wft`.
 - Structural constraints only — semantic rules (cycles, missing deps, unknown input references) live in Rust.
 
@@ -232,10 +237,10 @@ pub enum ValidationError {
     DependencyCycle { cycle: Vec<String> },
     DuplicateInputName { name: String },
 
-    // Interpolation errors — `location` points at the offending token
-    // (task name, process role, and which field it appeared in).
-    MalformedInterpolation { location: InterpolationLocation, text: String },
-    UnknownInterpolationScope { location: InterpolationLocation, scope: String },
+    // Interpolation errors — raised only for tokens whose prefix is in
+    // the recognized allowlist. Tokens with foreign prefixes pass through
+    // without error (they are assumed to belong to downstream tooling
+    // such as kubectl/Go-templates, Helm, Jinja).
     UnknownInputReference { location: InterpolationLocation, name: String },
     UnknownWorkflowField { location: InterpolationLocation, name: String },
 }
@@ -256,7 +261,7 @@ pub enum InterpolationField { Prompt, Command }
 - Every `depends_on` entry resolves to an existing task name.
 - No cycles; reported with the cycle path (`[a, b, c, a]`).
 - Input names unique.
-- Every `{{...}}` token in any prompt or command must parse and resolve (see Interpolation).
+- `{{...}}` tokens in any prompt or command whose prefix matches the allowlist (`inputs.`, `workflow.`) must resolve. Tokens with any other prefix are passed through verbatim and not validated (see Interpolation).
 
 ### Where validation runs
 
@@ -266,23 +271,37 @@ pub enum InterpolationField { Prompt, Command }
 
 ## Interpolation
 
-Prompts and commands may contain `{{path}}` tokens that are resolved at convoy launch. Stage 2 only parses and validates them.
+Prompts and commands may contain `{{path}}` tokens that are resolved at convoy launch. Stage 2 only parses them and validates that the ones we recognize resolve.
 
 ### Syntax
 
-- A token starts with `{{` and ends with `}}`. Literal `{{` in a prompt or command has no escape in v1 — avoid it, or wait for an escape story if a real case emerges.
-- The path between the braces is a dotted sequence of segments matching `[A-Za-z0-9_-]+`. No internal whitespace permitted in v1 (Argo allows whitespace but documents interpolation bugs around it; stricter is simpler).
-- Matches Argo's `{{var}}` convention; the `{{=expression}}` expression form is deferred.
+- A token starts with `{{` and ends with `}}`.
+- The path between the braces is a dotted sequence of segments matching `[A-Za-z0-9_-]+`. No internal whitespace in v1 (Argo allows whitespace but documents interpolation bugs around it; stricter is simpler).
+- No escape for literal `{{` is needed because foreign tokens pass through unchanged — see below.
 
-### Scopes in v1
+### Recognized prefix allowlist (v1)
 
-| Scope | Example | Meaning |
-|-------|---------|---------|
-| `inputs.<name>` | `{{inputs.branch}}` | Declared workflow input; must appear in `spec.inputs[*].name`. |
+Only tokens whose first segment is one of these scopes are subject to validation and substitution:
+
+| Prefix | Examples | Meaning |
+|--------|----------|---------|
+| `inputs.<name>` | `{{inputs.branch}}`, `{{inputs.feature}}` | Declared workflow input; must appear in `spec.inputs[*].name`. |
 | `workflow.name` | `{{workflow.name}}` | Convoy name (set at launch). |
 | `workflow.namespace` | `{{workflow.namespace}}` | Convoy namespace. |
 
-Any other scope (`tasks.*`, `items.*`, `steps.*`, expression form) errors as `UnknownInterpolationScope` in v1 and will be added later.
+### Foreign-token passthrough
+
+Tokens whose first segment is **not** in the allowlist are left in place verbatim. The validator does not inspect them; convoy launch does not substitute them. They are assumed to be downstream-tool templates. Examples that pass through unchanged:
+
+- `kubectl get pod -o go-template='{{.metadata.name}}'` (Go template — leading `.`)
+- `helm template . --set name={{ .Release.Name }}` (Helm template)
+- Jinja, Mustache, or other `{{...}}` based languages embedded in commands.
+
+This matches Argo's approach (`workflow/common/common.go#GlobalVarValidWorkflowVariablePrefix`, `workflow/validate/validate.go#checkValidWorkflowVariablePrefix`).
+
+### Tradeoff
+
+Tokens like `{{inptus.branch}}` (typo of `inputs.`) are treated as foreign and pass through silently. The validator cannot tell a misspelled scope from a real downstream template. This is the accepted cost of natural interop with Go templates, Helm, etc. — Argo makes the same tradeoff.
 
 ### Absent values
 
@@ -334,7 +353,7 @@ No controller. No selector resolution. No rendering. No convoy integration. Thos
 
 ### Untagged `selector` XOR `command`
 
-Matches the design doc's YAML shape verbatim and reads naturally when authored by humans or agents. Serde's `#[serde(flatten, untagged)]` disambiguates on field presence. The CRD's `oneOf` enforces the constraint at the API layer; the Rust validator double-checks with clearer errors.
+Matches the design doc's YAML shape verbatim and reads naturally when authored by humans or agents. Serde's `#[serde(flatten, untagged, deny_unknown_fields)]` catches structural errors (neither or both sources, unknown fields) at parse time, before the validator runs. The CRD's `oneOf` + `not` block enforces the same rule at the API layer so `kubectl apply` doesn't admit a template that Rust can't read.
 
 ### No status, no controller
 
@@ -344,9 +363,11 @@ The brainstorm prompt framed WorkflowTemplate as "pure data, no controller neede
 
 `inputs:` makes it explicit what a convoy must supply at launch. This lets the validator check that `{{inputs.<name>}}` references are resolvable without running the convoy, and documents the template's interface. All v1 inputs are required; optionality and multi-valued inputs are deferred (bundled together because they share a runtime-semantics question — likely Argo-style empty-string substitution for absent values).
 
-### Argo-style `{{...}}` interpolation
+### Argo-style `{{...}}` interpolation with prefix allowlist
 
-Collision with real commands (`jq '{name: .name}'`, brace expansion, etc.) ruled out single-brace `{var}`. `{{var}}` matches Argo's well-trodden convention, and scoping from day one (`inputs.<name>`, `workflow.name`) means future additions (`tasks.<name>.outputs.*`, `items.*`, expression form `{{=...}}`) slot in without a migration. Strict no-internal-whitespace in v1 avoids the interpolation bug Argo's own docs flag.
+Collision with real commands (`jq '{name: .name}'`, brace expansion, etc.) ruled out single-brace `{var}`. `{{var}}` matches Argo's well-trodden convention, and scoping from day one (`inputs.<name>`, `workflow.name`) means future additions (`tasks.<name>.outputs.*`, `items.*`, expression form `{{=...}}`) slot in without a migration.
+
+The deeper collision — `{{.metadata.name}}` Go templates, Helm, Jinja — is handled by adopting Argo's **prefix allowlist** model (`workflow/common/common.go#GlobalVarValidWorkflowVariablePrefix`). Only tokens whose first segment is a recognized flotilla scope are validated and substituted; every other token is left alone. No escape character needed; natural interop with downstream template languages. The cost is that typos in our own scope names (`{{inptus.branch}}`) are not caught — an acceptable tradeoff for the interop benefit. Strict no-internal-whitespace in v1 avoids the interpolation bug Argo's own docs flag.
 
 ### Parse vs. validate split
 
@@ -384,7 +405,6 @@ Captured in `docs/superpowers/specs/2026-04-13-convoy-brainstorm-prompts.md` und
 - One-shot agent processes (non-long-running agents that produce a value, e.g. haiku branch-namer).
 - Optional and multi-valued inputs (starting from 0+ issues, defaults, typed inputs). Runtime semantics likely follow Argo's "absent value ⇒ empty string."
 - Additional interpolation scopes (`tasks.<name>.outputs.*`, `items.*`, `workflow.creationTimestamp`, etc.) and the expression form `{{=...}}`.
-- Literal `{{` escape rule (Argo compatible if/when needed).
 - Non-terminal content (port-forwarding for dev servers, background services, HTTP probes).
 - GitOps sync (templates authored in VCS, synced by an Argo CD / Flux style controller).
 - Status subresource + validator controller — likely the right end state once templates reference each other or shared-cluster authoring demands fast-feedback validity.
