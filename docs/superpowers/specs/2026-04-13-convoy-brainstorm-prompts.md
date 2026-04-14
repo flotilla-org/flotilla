@@ -256,6 +256,11 @@ See `docs/superpowers/specs/2026-04-14-convoy-resource-design.md` for the spec.
 - **Convoy re-run** — copy a convoy, reset status, re-snapshot against newer template. Not a common case, but useful enough to capture.
 - **Convoy cancellation** — user-initiated cancel producing `ConvoyPhase::Cancelled`. The phase is reserved in Stage 3 but never produced.
 - **Admission webhook / fast-feedback validation** — complements the client-side Convoy validator once shared-cluster authoring demands it.
+- **Controller deployment and leader election.** Stage 3 runs the controller as a single example binary. Intended trajectory:
+  - (a) Every controller uses a k8s `Lease` resource for leader election — exactly one replica active.
+  - (b) The regular `flotilla` binary embeds controllers, activated by default, claiming leases unless explicitly disabled. Single-process installs get controllers for free.
+  - (c) Cluster-native deployments schedule N flotilla daemon pods into the cluster, all competing for the same leases — standard k8s HA.
+  - (d) Open problem: leader election for flotilla-cp *itself* when embedded across multiple daemons. Leases depend on the API server, which is what needs electing — a separate (consensus / external coordinator / static leader) mechanism, not a convoy-controller concern.
 
 ### From Stage 4 (Task provisioning / policy)
 

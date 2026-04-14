@@ -744,3 +744,8 @@ To add under "From Stage 3":
 - **Convoy cancellation** — user-initiated cancel producing `ConvoyPhase::Cancelled`.
 - **Admission webhook / fast-feedback validation** — complements the client-side Convoy validator once shared-cluster workflows demand it; also a fallback for clusters without CEL support (k8s < 1.25).
 - **Immutable-by-convention templates** — if flotilla-cp introduces versioned-history semantics (retrievable by `resourceVersion`) plus admission enforcement against in-place template edits, `workflow_snapshot` becomes redundant for that deployment and convoys could just reference `(ref, version)`.
+- **Controller deployment and leader election.** Stage 3 runs the controller as a standalone example binary — a single process. The intended trajectory, deliberately deferred:
+  - (a) Every controller uses a k8s `Lease` resource for leader election. Exactly one replica is active; others stand by.
+  - (b) The regular `flotilla` binary carries controllers embedded, activated by default, trying to claim the lease unless explicitly disabled. Single-process flotilla installs get controllers for free.
+  - (c) "Cluster-native" mode schedules N flotilla daemon pods into the cluster, all competing for the same leases — standard k8s HA pattern.
+  - (d) Open problem: when flotilla-cp itself is embedded across multiple daemons, the Lease mechanism can't elect the leader flotilla-cp — leases depend on the API server whose implementation is what needs electing. Solved separately (consensus, external coordinator, static leader, etc.); not a convoy-controller concern.
