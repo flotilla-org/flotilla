@@ -243,7 +243,19 @@ Things deliberately pushed out of earlier stages. Each stage's spec should resta
 
 ### From Stage 3 (Convoy resource + controller)
 
-*(To be filled in when Stage 3 is designed.)*
+See `docs/superpowers/specs/2026-04-14-convoy-resource-design.md` for the spec.
+
+- **`PlacementPolicy` resource** — named, default, auto-discovered (today's `docker@host` style). Eventually delegates to or is implemented by a `PersistentAgent`. Stage 3's Convoy references one by opaque string in `spec.placement_policy`; Stage 4 reifies.
+- **`PersistentAgent` resource** — one resource type with k8s-style labels/selectors. Quartermaster, Yeoman, TestCoach, SecurityReviewer, etc. are conventionally-labeled instances. Agent runtime shape deliberately open: managed CLI (input-send), external CLI (shell-out), headless JSON/ACP, or internal LLM loop. All presentable — CLI by attaching terminals, others via interaction-log views.
+- **Presentation-scope decoupling** — `PresentationManager` at full-flotilla / repo / convoy scopes, no longer coupled to a single workspace.
+- **Interactive launch UX** — CLI/TUI flow: fetch template → infer inputs from context (current branch, selected issues) → present for approval → create convoy.
+- **Typed `InputValue` variants** — `Issue`, `IssueList`, `Branch`, `ChangeRequest`. Requires matching `InputDefinition.kind` in `WorkflowTemplate` (Stage 2 revision). Enables UI-driven workflow discovery ("user has issues selected → find workflows that accept issue[]") and semantic downstream use (correlation, PR metadata).
+- **Label-based workflow discovery** — alternative or complement to typed inputs; `flotilla.work/accepts: issue` label on `WorkflowTemplate`.
+- **Workflow composition (`includes`)** — sub-workflows; transitive snapshotting into `observed_workflows` (the map shape in Stage 3 is already forward-compatible). Opens snapshot-at-root vs snapshot-per-include choice.
+- **Template versioning / rev references** — `spec.workflow_ref_revision` for convoys that want a specific template version. Stage 3 just snapshots whatever was current at init.
+- **Convoy re-run** — copy a convoy, reset status, re-snapshot against newer template. Not a common case, but useful enough to capture.
+- **Convoy cancellation** — user-initiated cancel producing `ConvoyPhase::Cancelled`. The phase is reserved in Stage 3 but never produced.
+- **Admission webhook / fast-feedback validation** — complements the client-side Convoy validator once shared-cluster authoring demands it.
 
 ### From Stage 4 (Task provisioning / policy)
 
