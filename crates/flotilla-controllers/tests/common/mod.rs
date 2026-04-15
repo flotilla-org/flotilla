@@ -126,29 +126,29 @@ pub async fn create_host_direct_policy(backend: &ResourceBackend, namespace: &st
     .await;
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn create_docker_worktree_policy(
-    backend: &ResourceBackend,
-    namespace: &str,
-    name: &str,
-    host_ref: &str,
-    pool: &str,
-    image: &str,
-    mount_path: &str,
-    default_cwd: Option<&str>,
-) {
+#[derive(bon::Builder)]
+pub struct DockerWorktreePolicyFixture {
+    pub name: String,
+    pub host_ref: String,
+    pub pool: String,
+    pub image: String,
+    pub mount_path: String,
+    pub default_cwd: Option<String>,
+}
+
+pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace: &str, fixture: DockerWorktreePolicyFixture) {
     create_policy(
         backend,
         namespace,
-        name,
+        &fixture.name,
         PlacementPolicySpec::builder()
-            .pool(pool.to_string())
+            .pool(fixture.pool)
             .docker_per_task(DockerPerTaskPlacementPolicySpec {
-                host_ref: host_ref.to_string(),
-                image: image.to_string(),
-                default_cwd: default_cwd.map(ToString::to_string),
+                host_ref: fixture.host_ref,
+                image: fixture.image,
+                default_cwd: fixture.default_cwd,
                 env: Default::default(),
-                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: mount_path.to_string() },
+                checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: fixture.mount_path },
             })
             .build(),
     )
@@ -229,77 +229,85 @@ pub async fn create_ready_clone(
     clones.get(name).await.expect("clone get should succeed")
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(bon::Builder)]
+pub struct ReadyCheckoutFixture {
+    pub name: String,
+    pub env_ref: String,
+    pub git_ref: String,
+    pub path: String,
+    pub worktree: Option<flotilla_resources::CheckoutWorktreeSpec>,
+    pub fresh_clone: Option<flotilla_resources::FreshCloneCheckoutSpec>,
+}
+
 pub async fn create_ready_checkout(
     backend: &ResourceBackend,
     namespace: &str,
-    name: &str,
-    env_ref: &str,
-    git_ref: &str,
-    path: &str,
-    worktree: Option<flotilla_resources::CheckoutWorktreeSpec>,
-    fresh_clone: Option<flotilla_resources::FreshCloneCheckoutSpec>,
+    fixture: ReadyCheckoutFixture,
 ) -> flotilla_resources::ResourceObject<Checkout> {
     let checkouts = backend.clone().using::<Checkout>(namespace);
     let created = checkouts
-        .create(&meta(name), &CheckoutSpec {
-            env_ref: env_ref.to_string(),
-            r#ref: git_ref.to_string(),
-            target_path: path.to_string(),
-            worktree,
-            fresh_clone,
+        .create(&meta(&fixture.name), &CheckoutSpec {
+            env_ref: fixture.env_ref.clone(),
+            r#ref: fixture.git_ref,
+            target_path: fixture.path.clone(),
+            worktree: fixture.worktree,
+            fresh_clone: fixture.fresh_clone,
         })
         .await
         .expect("checkout create should succeed");
     checkouts
-        .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
+        .update_status(&fixture.name, &created.metadata.resource_version, &CheckoutStatus {
             phase: CheckoutPhase::Ready,
-            path: Some(path.to_string()),
+            path: Some(fixture.path.clone()),
             commit: Some("44982740".to_string()),
             message: None,
         })
         .await
         .expect("checkout status update should succeed");
-    checkouts.get(name).await.expect("checkout get should succeed")
+    checkouts.get(&fixture.name).await.expect("checkout get should succeed")
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(bon::Builder)]
+pub struct StoppedTerminalFixture {
+    pub name: String,
+    pub env_ref: String,
+    pub role: String,
+    pub command: String,
+    pub cwd: String,
+    pub pool: String,
+    pub message: String,
+}
+
 pub async fn create_stopped_terminal(
     backend: &ResourceBackend,
     namespace: &str,
-    name: &str,
-    env_ref: &str,
-    role: &str,
-    command: &str,
-    cwd: &str,
-    pool: &str,
-    message: &str,
+    fixture: StoppedTerminalFixture,
 ) -> flotilla_resources::ResourceObject<TerminalSession> {
     let sessions = backend.clone().using::<TerminalSession>(namespace);
     let created = sessions
-        .create(&meta(name), &TerminalSessionSpec {
-            env_ref: env_ref.to_string(),
-            role: role.to_string(),
-            command: command.to_string(),
-            cwd: cwd.to_string(),
-            pool: pool.to_string(),
+        .create(&meta(&fixture.name), &TerminalSessionSpec {
+            env_ref: fixture.env_ref,
+            role: fixture.role,
+            command: fixture.command,
+            cwd: fixture.cwd,
+            pool: fixture.pool,
         })
         .await
         .expect("terminal create should succeed");
     sessions
-        .update_status(name, &created.metadata.resource_version, &TerminalSessionStatus {
+        .update_status(&fixture.name, &created.metadata.resource_version, &TerminalSessionStatus {
             phase: TerminalSessionPhase::Stopped,
-            session_id: Some(format!("session-{name}")),
+            session_id: Some(format!("session-{}", fixture.name)),
             pid: Some(42),
             started_at: Some(Utc::now()),
             stopped_at: Some(Utc::now()),
             inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
             inner_exit_code: Some(1),
-            message: Some(message.to_string()),
+            message: Some(fixture.message),
         })
         .await
         .expect("terminal status update should succeed");
-    sessions.get(name).await.expect("terminal get should succeed")
+    sessions.get(&fixture.name).await.expect("terminal get should succeed")
 }
 
 pub struct ControllerLoopHarness {

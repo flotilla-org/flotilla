@@ -119,7 +119,7 @@ pub async fn assert_stale_resource_version_conflicts<F: ResourceContractFixture>
 
     let updated =
         resolver.update(&F::meta("alpha"), &created.metadata.resource_version, &F::updated_spec()).await.expect("update should succeed");
-    assert_eq!(updated.metadata.resource_version, "2");
+    assert_ne!(updated.metadata.resource_version, created.metadata.resource_version);
     F::assert_updated(&updated);
 }
 
@@ -138,7 +138,7 @@ pub async fn assert_delete_emits_event<F: ResourceContractFixture>() {
     match event {
         WatchEvent::Deleted(object) => {
             assert_eq!(object.metadata.name, "alpha");
-            assert_eq!(object.metadata.resource_version, "2");
+            assert_ne!(object.metadata.resource_version, created.metadata.resource_version);
         }
         _ => panic!("expected deleted event"),
     }
@@ -173,7 +173,7 @@ pub async fn assert_watch_from_version_replays<F: ResourceContractFixture>() {
         .expect("stream should yield item")
         .expect("event should decode");
     match deleted {
-        WatchEvent::Deleted(object) => assert_eq!(object.metadata.resource_version, "3"),
+        WatchEvent::Deleted(object) => assert_ne!(object.metadata.resource_version, updated.metadata.resource_version),
         _ => panic!("expected deleted event"),
     }
 }

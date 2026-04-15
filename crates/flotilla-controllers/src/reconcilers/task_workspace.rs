@@ -100,10 +100,7 @@ impl TaskWorkspaceDeps {
     }
 
     fn ready(environment_ref: String, checkout_ref: String, terminal_session_refs: Vec<String>, actuations: Vec<Actuation>) -> Self {
-        Self {
-            patch: PlannedPatch::Ready { environment_ref, checkout_ref, terminal_session_refs },
-            actuations,
-        }
+        Self { patch: PlannedPatch::Ready { environment_ref, checkout_ref, terminal_session_refs }, actuations }
     }
 
     fn failed(message: impl Into<String>) -> Self {

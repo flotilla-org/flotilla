@@ -15,12 +15,8 @@ macro_rules! define_resource {
             type Status = $status;
             type StatusPatch = $patch;
 
-            const API_PATHS: $crate::resource::ApiPaths = $crate::resource::ApiPaths {
-                group: "flotilla.work",
-                version: "v1",
-                plural: $plural,
-                kind: stringify!($name),
-            };
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
         }
     };
 }

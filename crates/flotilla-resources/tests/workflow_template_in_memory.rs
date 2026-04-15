@@ -6,6 +6,8 @@ use common::contract::{
 };
 use rstest::rstest;
 
+// Keep the rstest shape even with a single fixture so this suite can grow into
+// shared backend contract coverage without restructuring each test.
 #[rstest]
 #[case(WorkflowTemplateFixture)]
 #[tokio::test]

@@ -3,6 +3,7 @@ mod common;
 use common::{
     create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
+    DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::TaskWorkspaceReconciler;
 use flotilla_resources::{
@@ -68,12 +69,13 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     create_docker_worktree_policy(
         &backend,
         NAMESPACE,
-        "policy-worktree",
-        HOST_REF,
-        "cleat",
-        "ghcr.io/flotilla/dev:latest",
-        "/workspace",
-        None,
+        DockerWorktreePolicyFixture::builder()
+            .name("policy-worktree".to_string())
+            .host_ref(HOST_REF.to_string())
+            .pool("cleat".to_string())
+            .image("ghcr.io/flotilla/dev:latest".to_string())
+            .mount_path("/workspace".to_string())
+            .build(),
     )
     .await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
@@ -92,12 +94,13 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     create_ready_checkout(
         &backend,
         NAMESPACE,
-        "checkout-workspace-c",
-        &host_direct_env_name(),
-        GIT_REF,
-        "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c",
-        Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }),
-        None,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-workspace-c".to_string())
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string())
+            .maybe_worktree(Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }))
+            .build(),
     )
     .await;
     let current = backend.clone().using::<TaskWorkspace>(NAMESPACE).get("workspace-c").await.expect("workspace get should succeed");
@@ -201,24 +204,27 @@ async fn child_failure_propagates_to_workspace_failure() {
     create_ready_checkout(
         &backend,
         NAMESPACE,
-        "checkout-workspace-f",
-        &host_direct_env_name(),
-        GIT_REF,
-        "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-f",
-        Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }),
-        None,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-workspace-f".to_string())
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-f".to_string())
+            .maybe_worktree(Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }))
+            .build(),
     )
     .await;
     create_stopped_terminal(
         &backend,
         NAMESPACE,
-        "terminal-workspace-f-coder",
-        &host_direct_env_name(),
-        "coder",
-        "cargo test",
-        "/workspace",
-        "cleat",
-        "boom",
+        StoppedTerminalFixture::builder()
+            .name("terminal-workspace-f-coder".to_string())
+            .env_ref(host_direct_env_name())
+            .role("coder".to_string())
+            .command("cargo test".to_string())
+            .cwd("/workspace".to_string())
+            .pool("cleat".to_string())
+            .message("boom".to_string())
+            .build(),
     )
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-f", "convoy-f", "implement", "policy-f", REPO_URL).await;
@@ -262,20 +268,22 @@ async fn assert_terminal_cwd_for_strategy(
     create_ready_checkout(
         &backend,
         NAMESPACE,
-        &format!("checkout-{workspace_name}"),
-        &checkout_env_ref,
-        GIT_REF,
-        checkout_path,
-        if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-            None
-        } else {
-            Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() })
-        },
-        if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-            Some(flotilla_resources::FreshCloneCheckoutSpec { url: REPO_URL.to_string() })
-        } else {
-            None
-        },
+        ReadyCheckoutFixture::builder()
+            .name(format!("checkout-{workspace_name}"))
+            .env_ref(checkout_env_ref)
+            .git_ref(GIT_REF.to_string())
+            .path(checkout_path.to_string())
+            .maybe_worktree(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
+                None
+            } else {
+                Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() })
+            })
+            .maybe_fresh_clone(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
+                Some(flotilla_resources::FreshCloneCheckoutSpec { url: REPO_URL.to_string() })
+            } else {
+                None
+            })
+            .build(),
     )
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, workspace_name, "convoy-cwd", "implement", "policy-cwd", REPO_URL).await;

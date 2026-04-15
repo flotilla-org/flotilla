@@ -307,19 +307,12 @@ impl TestLoopHarness {
         }));
     }
 
-    pub async fn wait_until<F, Fut>(&self, timeout: Duration, mut condition: F)
+    pub async fn wait_until<F, Fut>(&self, timeout: Duration, condition: F)
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = bool>,
     {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if condition().await {
-                return;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-        panic!("condition was not satisfied within {:?}", timeout);
+        wait_until(timeout, condition).await;
     }
 
     pub async fn shutdown(mut self) {
@@ -336,6 +329,22 @@ impl Drop for TestLoopHarness {
             handle.abort();
         }
     }
+}
+
+#[allow(dead_code)]
+pub async fn wait_until<F, Fut>(timeout: Duration, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if condition().await {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("condition was not satisfied within {:?}", timeout);
 }
 
 pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
