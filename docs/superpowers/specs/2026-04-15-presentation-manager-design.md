@@ -68,7 +68,8 @@ Presentation reconciler watches:
   │
   ▼  fetch_dependencies:
   │   list sessions via selector
-  │   walk Environment / Host / Checkout → hop-chain resolve attach commands
+  │   walk Environment / Host → hop-chain resolve attach commands
+  │   (working directory comes from TerminalSession.spec.cwd — no Checkout read)
   │   sort by (task_ordinal, process_ordinal, session_name)
   │   compute spec_hash → compare to observed
   │
@@ -177,7 +178,7 @@ pub enum PresentationStatusPatch {
 
 `observed_spec_hash` compares cheaply; no need to store the full last-applied spec.
 
-**Ownership:** `OwnerReference` to the Convoy. Convoy delete cascades. The Presentation's `metadata.labels` includes `flotilla.work/convoy: <convoy-name>` so secondary watches can key off it.
+**Ownership:** `OwnerReference` to the Convoy (recorded for discoverability / future owner-ref GC; flotilla-cp backends do **not** implement owner-ref cascade today — see Convoy finalizer below). The Presentation's `metadata.labels` includes `flotilla.work/convoy: <convoy-name>` so secondary watches and the Convoy finalizer can key off it.
 
 ## Labels
 
@@ -325,7 +326,6 @@ pub struct PresentationReconciler<R> {
     runtime: Arc<R>,
     terminal_sessions: TypedResolver<TerminalSession>,
     environments: TypedResolver<Environment>,
-    checkouts: TypedResolver<Checkout>,
     hosts: TypedResolver<Host>,
     hop_chain: HopChainContext,   // encapsulates flotilla-core::hop_chain resolver + local_host + config_base
 }
@@ -343,9 +343,9 @@ pub enum PresentationDeps {
 
 1. `terminal_sessions.list_matching_labels(&spec.process_selector)`. No TaskWorkspace or Convoy read — session existence is the liveness signal (since the task_workspace cascade removes sessions when tasks complete).
 2. For each matched session, resolve routing:
-   - `environments.get(&session.spec.env_ref)` → host_ref + docker_container_id
-   - `hosts.get(host_ref)` → HostName
-   - `checkouts.get(checkout_ref_from_session_label)` → path
+   - `environments.get(&session.spec.env_ref)` → `host_ref` + `docker_container_id`
+   - `hosts.get(host_ref)` → `HostName`
+   - Working directory for the hop chain = `session.spec.cwd` (already carried on TerminalSessionSpec — set by the task_workspace reconciler when the session is provisioned). No Checkout read needed.
 3. Build hop-chain plan per session → resolve to attach command string via `flotilla-core::hop_chain` (same machinery `WorkspaceOrchestrator::resolve_prepared_commands_via_hop_chain` uses today). The `HopChainContext` bundles the SSH config base path, local `HostName`, and environment/terminal resolver construction.
 4. Sort the resolved process list by `(task_ordinal_label, process_ordinal_label, session_name)` — deterministic regardless of backend list order.
 5. Compute `spec_hash = hash((policy_ref, sorted_process_list))` over the sorted list (role, command, labels).
@@ -464,7 +464,7 @@ pub enum Actuation {
 }
 ```
 
-### Presentation creation/deletion
+### Presentation creation/deletion on phase transitions
 
 - Convoy transitions to `Active` with no existing Presentation (checked via label-indexed read or one-shot list) → emit `CreatePresentation` actuation with:
   - `meta.name = format!("{}-presentation", convoy.metadata.name)` (or similar — single deterministic derivation)
@@ -478,6 +478,19 @@ pub enum Actuation {
 
 The presentation creation site is the single swap point for future explicit-trigger creation policies.
 
+### Convoy finalizer (new in stage 5)
+
+Today `ConvoyReconciler::run_finalizer` is a no-op and `finalizer_name` returns `None`. That makes the stage 4a claim "TaskWorkspace stays alive until it cascades on Convoy deletion" aspirational — nothing actually implements cascade. Stage 5 closes this by adding:
+
+- `finalizer_name` returns `Some("flotilla.work/convoy-teardown")`.
+- `run_finalizer` enumerates owned resources by label and deletes them:
+  - `presentations.list_matching_labels({CONVOY_LABEL: name})` → delete each
+  - `task_workspaces.list_matching_labels({CONVOY_LABEL: name})` → delete each
+
+Each deleted TaskWorkspace runs its own finalizer (above), which deletes its per-task Environment/Checkout/TerminalSessions. Each of those runs its own finalizer (existing stage 4a code), which performs the actual runtime teardown. A direct `DELETE convoys/<name>` now propagates all the way through the chain — no orphans.
+
+The pair of finalizer semantics: phase transitions (Completed/Failed/Cancelled) + actuations remain the "natural" lifecycle path. The Convoy finalizer handles the explicit-delete-a-running-convoy path, which is otherwise a leak.
+
 ### Per-task TaskWorkspace lifecycle (stage 4a semantics change)
 
 When the convoy reconciler observes a task transition to `Completed`, `Failed`, or `Cancelled`, it emits `DeleteTaskWorkspace { name }` for that task's TaskWorkspace.
@@ -487,12 +500,16 @@ When the convoy reconciler observes a task transition to `Completed`, `Failed`, 
 Today `TaskWorkspaceReconciler::run_finalizer` is a no-op (`finalizer_name` returns `None`). Stage 5 adds:
 
 - `finalizer_name` returns `Some("flotilla.work/task-workspace-teardown")`.
-- `run_finalizer` deletes:
-  - All `TerminalSession`s labelled `TASK_WORKSPACE_LABEL == name`
-  - The referenced `Checkout` (if `status.checkout_ref` is set)
-  - The referenced `Environment` (if `status.environment_ref` is set)
+- `run_finalizer` enumerates children **by label selector**, not by status refs:
+  - `terminal_sessions.list_matching_labels({TASK_WORKSPACE_LABEL: name})` → delete each
+  - `checkouts.list_matching_labels({TASK_WORKSPACE_LABEL: name})` → delete each
+  - `environments.list_matching_labels({TASK_WORKSPACE_LABEL: name})` → delete each
 
-Stage 4a's per-task placement model means each TaskWorkspace has its own Environment/Checkout/TerminalSessions, so blanket deletion is safe. The shared-environment placement variant (deferred from stage 4a) will need owner-list / reference-count semantics when it lands; stage 5's cleanup is explicitly scoped to per-task placement.
+Using label selectors (rather than `status.environment_ref` / `status.checkout_ref`) is deliberate: stage 4a's TaskWorkspace only records those refs on `MarkReady`, so a partially-provisioned TaskWorkspace that failed before `MarkReady` would leak child resources if the finalizer read status. Labels are stamped when the children are created (already visible in existing `LabelMappedWatch::<Environment, TaskWorkspace>` wiring), so label-selector lookup finds them regardless of provisioning progress.
+
+Each child resource (Environment, Checkout, TerminalSession) has its own existing finalizer that handles the actual runtime teardown (Docker destroy, shpool kill, etc.). The TaskWorkspace finalizer only does resource-level deletion; runtime effects chain through each child's finalizer.
+
+Stage 4a's per-task placement model means each TaskWorkspace has its own Environment/Checkout/TerminalSessions, so blanket deletion by label is safe. The shared-environment placement variant (deferred from stage 4a) will need owner-list / reference-count semantics when it lands; stage 5's cleanup is explicitly scoped to per-task placement.
 
 The disappearing sessions fire the presentation reconciler's selector watch, which recomputes membership and either replaces the workspace (new set of active-task sessions) or tears it down (no active tasks left).
 
@@ -525,6 +542,13 @@ This revises the stage 4a deferred item "Auto-cleanup of stopped sessions on ter
 - Convoy → Active twice (re-reconcile) → only one Presentation created (idempotent).
 - Convoy → Completed → `DeletePresentation { name }` emitted.
 - **Per-task lifecycle**: task transitions to Completed → `DeleteTaskWorkspace { name }` emitted for that task's workspace; sibling tasks still Running do not have their workspaces deleted.
+- **Convoy finalizer**: direct Convoy delete while Active → finalizer deletes Presentation + all labelled TaskWorkspaces; finalizer is removed and Convoy object deletes.
+
+### TaskWorkspace finalizer tests
+
+- **Fully-provisioned TaskWorkspace** delete → all labelled Environment/Checkout/TerminalSession resources deleted.
+- **Partially-provisioned TaskWorkspace** (Environment created, MarkReady never reached, `status.environment_ref` is `None`) → finalizer still deletes the Environment because it's found by `TASK_WORKSPACE_LABEL` selector, not by status. Asserts no orphaned children.
+- **Missing children** (already deleted by something else) → finalizer tolerates NotFound and completes successfully.
 
 ### Label propagation tests
 
@@ -551,9 +575,10 @@ Stage 5 ships:
 3. `Presentation` resource + reconciler + `PresentationRuntime` trait + `ProviderPresentationRuntime` impl + `PresentationPolicyRegistry` with `DefaultPolicy`.
 4. `labels: BTreeMap<String, String>` on `ProcessDefinition`; reserved `flotilla.work/` prefix with `WorkflowTemplate::validate` enforcement.
 5. `build_session_labels` helper in the task_workspace reconciler; `TASK_ORDINAL_LABEL` / `PROCESS_ORDINAL_LABEL` + existing labels.
-6. Convoy reconciler extensions: `CreatePresentation` / `DeletePresentation` / `DeleteTaskWorkspace` actuations.
-7. TaskWorkspace finalizer: deletes TerminalSessions / Environment / Checkout for its task.
-8. Test coverage above.
+6. Convoy reconciler extensions: `CreatePresentation` / `DeletePresentation` / `DeleteTaskWorkspace` actuations on phase transitions.
+7. **Convoy finalizer** (new): deletes Presentation and all labelled TaskWorkspaces on direct Convoy delete.
+8. **TaskWorkspace finalizer** (new): deletes child TerminalSession / Environment / Checkout resources **by label selector** (robust to partial provisioning).
+9. Test coverage above.
 
 ## Out of Scope
 
