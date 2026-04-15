@@ -1,5 +1,13 @@
 # Code size reduction cleanup plan
 
+## Related documents
+
+- **Original draft (archived):** `docs/plans/archive/2026-04-15-post-pr-code-size-reduction-cleanup-plan-original.md`
+- **Phase 0 + 1 + Task E implementation plan:** `docs/plans/2026-04-15-code-size-reduction-phase-1-implementation.md`
+- **Phase 2 (Task A) implementation plan:** `docs/plans/2026-04-15-code-size-reduction-phase-2-implementation.md`
+- **Phase 3 (Tasks D, B) implementation plan:** `docs/plans/2026-04-15-code-size-reduction-phase-3-implementation.md`
+- **Phase 4 (Tasks C, F) implementation plan:** `docs/plans/2026-04-15-code-size-reduction-phase-4-implementation.md`
+
 ## Goal
 
 Reduce overall code size and review burden once the current feature work settles, without making architectural changes during the ongoing transition from the earlier gossip-oriented protocol toward the reconciler/resource model.
