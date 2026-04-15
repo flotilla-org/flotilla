@@ -68,8 +68,9 @@ Presentation reconciler watches:
   │
   ▼  fetch_dependencies:
   │   list sessions via selector
-  │   walk Environment / Host → hop-chain resolve attach commands
-  │   (working directory comes from TerminalSession.spec.cwd — no Checkout read)
+  │   walk Environment / Host → hop-chain resolve per-session attach commands
+  │   (per-session cwd = TerminalSession.spec.cwd, baked into attach_command)
+  │   resolve presentation_local_cwd via fallback chain (home → cwd → config_base)
   │   sort by (task_ordinal, process_ordinal, session_name)
   │   compute spec_hash → compare to observed
   │
@@ -253,7 +254,7 @@ pub trait PresentationPolicy: Send + Sync {
 
 pub struct PolicyContext {
     pub name: String,
-    pub working_directory: ExecutionEnvironmentPath,
+    pub presentation_local_cwd: ExecutionEnvironmentPath,   // multiplexer's own cwd; valid local path
 }
 
 pub struct ResolvedProcess {
@@ -283,13 +284,25 @@ Replicates today's `default_template()` behaviour over the **sorted** process li
 1. Group processes by `role`, preserving the input order — i.e., ordered by the first appearance of each role in the sorted list.
 2. One pane per role. Multiple processes for the same role → tabs inside the pane (overflow=tab, matching `build_pane_layout`).
 3. First role → main pane; later roles → split right.
-4. Emits `WorkspaceAttachRequest { template_yaml: None, attach_commands: Vec<(role, attach_command)>, working_directory, name }`. `PresentationManager.create_workspace` then walks its existing `resolve_template` → `build_pane_layout` path.
+4. Emits `WorkspaceAttachRequest { template_yaml: None, attach_commands: Vec<(role, attach_command)>, working_directory: presentation_local_cwd, name }`. `PresentationManager.create_workspace` then walks its existing `resolve_template` → `build_pane_layout` path. Per-session cwds are already inside each `attach_command`.
 
 Because the reconciler sorts by `(task_ordinal, process_ordinal, session_name)` before the policy sees the list, the "first appearance" in step 1 is deterministic and backend-independent. A single-task convoy renders identically to today's `.flotilla/workspace.yaml` default.
 
 ### Unknown policy name
 
 Reconciler emits `PresentationStatusPatch::MarkFailed { message: "unknown presentation policy '{name}'" }`. No runtime invocation. Mirrors stage 4a's rejection of unsupported process sources.
+
+### Working directory model — two distinct cwds
+
+The presentation pipeline carries **two unrelated working directories**. They must not be conflated; today's `WorkspaceOrchestrator` already keeps them apart and the new pipeline preserves that.
+
+- **Per-session cwd** (`TerminalSession.spec.cwd`). The directory the inner command runs in. May live inside a Docker container, on a remote host via SSH, or on the local host. The hop-chain resolver bakes this into the `attach_command` for each process — no consumer downstream of `ResolvedProcess.attach_command` needs to look at it again. Set by the task_workspace reconciler when it provisions the session.
+
+- **Presentation-host local cwd** (`PresentationPlan.presentation_local_cwd`). The cwd the multiplexer process itself opens with — passed to tmux/zellij/cmux as `WorkspaceAttachRequest.working_directory`, which they use as the local pane cwd before the attach command runs. This **must be a valid local path on the presentation host**. It's not the per-session cwd (which may not exist locally — e.g. a docker mount path or remote checkout).
+
+Today's `WorkspaceOrchestrator::attach_prepared_workspace` resolves this via a fallback chain: `repo_root` if locally present → `home_dir()` → `current_dir()` → `config_base`. The presentation reconciler uses **the same fallback chain** in `fetch_dependencies`. v1 does not try to discover a convoy-specific local repo path — `ConvoySpec.repository: { url }` is URL-level, not path-level, so there's no convoy-derived local root to use yet.
+
+When the deferred stage-4a item "Convoy launched against an existing Checkout" lands, it brings a presentation-host-local checkout path with it, and the reconciler can prefer that over the home-dir fallback. No schema change to `Presentation` is needed for that — it's a one-line preference change in the reconciler.
 
 ## Presentation Reconciler
 
@@ -306,7 +319,7 @@ pub struct PresentationPlan {
     pub policy: String,
     pub name: String,
     pub processes: Vec<ResolvedProcess>,
-    pub working_directory: ExecutionEnvironmentPath,
+    pub presentation_local_cwd: ExecutionEnvironmentPath,   // multiplexer's own cwd; valid local path
     pub previous: Option<PreviousWorkspace>,
     pub spec_hash: String,
 }
@@ -342,17 +355,18 @@ pub enum PresentationDeps {
 ### `fetch_dependencies`
 
 1. `terminal_sessions.list_matching_labels(&spec.process_selector)`. No TaskWorkspace or Convoy read — session existence is the liveness signal (since the task_workspace cascade removes sessions when tasks complete).
-2. For each matched session, resolve routing:
+2. For each matched session, resolve **per-session routing** (used by hop chain only):
    - `environments.get(&session.spec.env_ref)` → `host_ref` + `docker_container_id`
    - `hosts.get(host_ref)` → `HostName`
-   - Working directory for the hop chain = `session.spec.cwd` (already carried on TerminalSessionSpec — set by the task_workspace reconciler when the session is provisioned). No Checkout read needed.
-3. Build hop-chain plan per session → resolve to attach command string via `flotilla-core::hop_chain` (same machinery `WorkspaceOrchestrator::resolve_prepared_commands_via_hop_chain` uses today). The `HopChainContext` bundles the SSH config base path, local `HostName`, and environment/terminal resolver construction.
-4. Sort the resolved process list by `(task_ordinal_label, process_ordinal_label, session_name)` — deterministic regardless of backend list order.
-5. Compute `spec_hash = hash((policy_ref, sorted_process_list))` over the sorted list (role, command, labels).
-6. **If the sorted process list is empty:**
+   - Per-session cwd for the hop chain = `session.spec.cwd` (set by the task_workspace reconciler when the session is provisioned). No Checkout read needed.
+3. Build hop-chain plan per session → resolve to `attach_command` string via `flotilla-core::hop_chain` (same machinery `WorkspaceOrchestrator::resolve_prepared_commands_via_hop_chain` uses today). The `HopChainContext` bundles the SSH config base path, local `HostName`, and environment/terminal resolver construction. The per-session cwd is now baked into `attach_command` and not threaded any further.
+4. Resolve `presentation_local_cwd` (the multiplexer's own cwd, distinct from any per-session cwd) via the fallback chain documented in "Working directory model": local repo root if known → `home_dir()` → `current_dir()` → `config_base`. v1 has no convoy-derived local repo root, so the chain effectively starts at `home_dir()`.
+5. Sort the resolved process list by `(task_ordinal_label, process_ordinal_label, session_name)` — deterministic regardless of backend list order.
+6. Compute `spec_hash = hash((policy_ref, sorted_process_list))` over the sorted list (role, command, labels).
+7. **If the sorted process list is empty:**
    - If `status.observed_workspace_ref` is `Some` → `runtime.tear_down(manager, ws_ref)` → `Deps::TornDown`.
    - Else → `Deps::InSync` (nothing live, nothing to tear down).
-7. **Else:**
+8. **Else:**
    - If `status.observed_spec_hash == spec_hash` → `Deps::InSync`.
    - Else `runtime.apply(PresentationPlan { previous: status_derived, ... }).await`:
      - `Ok(applied)` → `Deps::Applied(applied)`.
@@ -432,7 +446,7 @@ impl PresentationRuntime for ProviderPresentationRuntime {
             .ok_or_else(|| "no presentation manager configured".to_string())?;
         let RenderedWorkspace { attach_request } = policy.render(&plan.processes, &PolicyContext {
             name: plan.name.clone(),
-            working_directory: plan.working_directory.clone(),
+            presentation_local_cwd: plan.presentation_local_cwd.clone(),
         });
         let (ws_ref, _) = new_manager.create_workspace(&attach_request).await?;
 
@@ -533,6 +547,7 @@ This revises the stage 4a deferred item "Auto-cleanup of stopped sessions on ter
 - **Cross-manager replace**: simulate `prev.presentation_manager` differs from current preferred → `delete_workspace` goes to prev's manager, `create_workspace` goes to current preferred.
 - **Previous manager no longer configured**: `apply` logs a warning, proceeds with create via current preferred (old workspace leaked on absent backend — asserted via recorded call list).
 - **Deterministic ordering**: two sessions with `(task_ordinal=0, process_ordinal=1)` and `(task_ordinal=0, process_ordinal=0)` — regardless of list order, `apply` receives them sorted by process_ordinal.
+- **Working-directory separation**: a session with `spec.cwd = "/workspace/repo"` (a docker-internal path that doesn't exist locally) → `attach_command` contains the path; `PresentationPlan.presentation_local_cwd` resolves to the home-dir fallback (a real local path). The two cwds are independent and don't leak into each other.
 - Unknown policy → `Failed`, no runtime call.
 - Finalizer on Presentation delete → `tear_down` called with recorded manager + ws_ref.
 
