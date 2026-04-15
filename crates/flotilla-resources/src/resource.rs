@@ -68,11 +68,6 @@ pub struct InputMeta {
 }
 
 impl InputMeta {
-    pub fn with_finalizers(mut self, finalizers: Vec<String>) -> Self {
-        self.finalizers = finalizers;
-        self
-    }
-
     pub fn with_added_finalizer(mut self, finalizer: impl Into<String>) -> Self {
         let finalizer = finalizer.into();
         if self.finalizers.iter().all(|existing| existing != &finalizer) {
