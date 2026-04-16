@@ -11,20 +11,22 @@ use flotilla_resources::{
     canonicalize_repo_url,
     controller::{Actuation, Reconciler},
     controller_patches, reconcile, repo_key, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, InMemoryBackend,
-    InputMeta, InputValue, OwnerReference, ResourceBackend, TaskPhase, TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceSpec,
-    TaskWorkspaceStatus, ValidationError, WorkflowTemplate,
+    InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, TaskPhase, TaskWorkspace,
+    TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, ValidationError, WorkflowTemplate, CONVOY_LABEL,
 };
 
 async fn reconcile_once_with_resources(
     convoy: &flotilla_resources::ResourceObject<Convoy>,
     template: Option<&flotilla_resources::ResourceObject<WorkflowTemplate>>,
     workspaces: Vec<flotilla_resources::ResourceObject<TaskWorkspace>>,
+    presentations: Vec<flotilla_resources::ResourceObject<Presentation>>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> flotilla_resources::controller::ReconcileOutcome<Convoy> {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let presentations_resolver = backend.clone().using::<Presentation>("flotilla");
 
     if let Some(template) = template {
         templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
@@ -51,8 +53,26 @@ async fn reconcile_once_with_resources(
         }
     }
 
+    for presentation in presentations {
+        let created = presentations_resolver
+            .create(
+                &presentation_meta(&presentation.metadata.name, &presentation.spec.convoy_ref),
+                &presentation.spec,
+            )
+            .await
+            .expect("presentation create should succeed");
+        if let Some(status) = presentation.status.as_ref() {
+            presentations_resolver
+                .update_status(&presentation.metadata.name, &created.metadata.resource_version, status)
+                .await
+                .expect("presentation status update should succeed");
+        }
+    }
+
     let current = convoys.get(&convoy.metadata.name).await.expect("convoy get should succeed");
-    let reconciler = ConvoyReconciler::new(templates.clone()).with_task_workspaces(task_workspaces.clone());
+    let reconciler = ConvoyReconciler::new(templates.clone())
+        .with_task_workspaces(task_workspaces.clone())
+        .with_presentations(presentations_resolver.clone());
     let deps = reconciler.fetch_dependencies(&current).await.expect("dependency fetch should succeed");
     reconciler.reconcile(&current, &deps, now)
 }
@@ -104,6 +124,32 @@ fn task_workspace_object(
             started_at: Some(timestamp(16)),
             ready_at: (phase == TaskWorkspacePhase::Ready).then(|| timestamp(18)),
         }),
+    }
+}
+
+fn presentation_meta(name: &str, convoy_name: &str) -> InputMeta {
+    InputMeta::builder()
+        .name(name.to_string())
+        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+        .owner_references(vec![OwnerReference {
+            api_version: "flotilla.work/v1".to_string(),
+            kind: "Convoy".to_string(),
+            name: convoy_name.to_string(),
+            controller: true,
+        }])
+        .build()
+}
+
+fn presentation_object(convoy_name: &str) -> flotilla_resources::ResourceObject<Presentation> {
+    flotilla_resources::ResourceObject {
+        metadata: common::object_meta(&format!("{convoy_name}-presentation"), "flotilla", "23"),
+        spec: PresentationSpec {
+            convoy_ref: convoy_name.to_string(),
+            presentation_policy_ref: "default".to_string(),
+            name: convoy_name.to_string(),
+            process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]),
+        },
+        status: None,
     }
 }
 
@@ -464,15 +510,20 @@ async fn ready_task_emits_task_workspace_creation_actuation() {
     status.tasks.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), timestamp(20)).await;
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
 
     assert!(matches!(
         outcome.patch,
         Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(started_at), finished_at: None })
             if started_at == timestamp(20)
     ));
-    assert_eq!(outcome.actuations.len(), 1);
-    match &outcome.actuations[0] {
+    assert_eq!(outcome.actuations.len(), 2);
+    match outcome
+        .actuations
+        .iter()
+        .find(|actuation| matches!(actuation, Actuation::CreateTaskWorkspace { .. }))
+        .expect("task workspace actuation should be present")
+    {
         Actuation::CreateTaskWorkspace { meta, spec } => {
             let canonical_repo = canonicalize_repo_url("git@github.com:flotilla-org/flotilla.git").expect("repo url should canonicalize");
             assert_eq!(meta.name, "convoy-a-implement");
@@ -488,6 +539,7 @@ async fn ready_task_emits_task_workspace_creation_actuation() {
         }
         other => panic!("expected task workspace actuation, got {other:?}"),
     }
+    assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
 }
 
 #[tokio::test]
@@ -501,6 +553,7 @@ async fn ready_task_with_ready_workspace_moves_to_launching() {
         &convoy,
         None,
         vec![task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Ready, None)],
+        Vec::new(),
         timestamp(20),
     )
     .await;
@@ -527,6 +580,7 @@ async fn launching_task_with_ready_workspace_moves_to_running() {
         &convoy,
         None,
         vec![task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Ready, None)],
+        Vec::new(),
         timestamp(20),
     )
     .await;
@@ -545,6 +599,7 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
         &convoy,
         None,
         vec![task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Failed, Some("terminal session crashed"))],
+        Vec::new(),
         timestamp(21),
     )
     .await;
@@ -554,4 +609,129 @@ async fn running_task_with_failed_workspace_marks_task_failed() {
         Some(ConvoyStatusPatch::MarkTaskFailed { ref task, finished_at, ref message })
             if task == "implement" && finished_at == timestamp(21) && message == "terminal session crashed"
     ));
+}
+
+#[tokio::test]
+async fn active_convoy_creates_presentation_when_missing() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.tasks.get_mut("implement").expect("implement task").phase = TaskPhase::Running;
+    status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
+
+    assert!(matches!(
+        outcome.patch,
+        Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(started_at), finished_at: None })
+            if started_at == timestamp(20)
+    ));
+    assert!(outcome.actuations.iter().any(|actuation| {
+        matches!(
+            actuation,
+            Actuation::CreatePresentation { meta, spec }
+                if meta.name == "convoy-a-presentation"
+                    && meta.labels.get(CONVOY_LABEL).map(String::as_str) == Some("convoy-a")
+                    && meta.owner_references.len() == 1
+                    && meta.owner_references[0].kind == "Convoy"
+                    && meta.owner_references[0].name == "convoy-a"
+                    && spec.convoy_ref == "convoy-a"
+                    && spec.presentation_policy_ref == "default"
+                    && spec.name == "convoy-a"
+                    && spec.process_selector == BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())])
+        )
+    }));
+}
+
+#[tokio::test]
+async fn active_convoy_does_not_recreate_existing_presentation() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    status.tasks.get_mut("implement").expect("implement task").phase = TaskPhase::Running;
+    status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        Vec::new(),
+        vec![presentation_object("convoy-a")],
+        timestamp(20),
+    )
+    .await;
+
+    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
+}
+
+#[tokio::test]
+async fn completed_convoy_emits_presentation_and_workspace_deletes() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    for task in status.tasks.values_mut() {
+        task.phase = TaskPhase::Completed;
+        task.finished_at = Some(timestamp(19));
+    }
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![
+            task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Ready, None),
+            task_workspace_object("convoy-a", "review", TaskWorkspacePhase::Ready, None),
+        ],
+        vec![presentation_object("convoy-a")],
+        timestamp(20),
+    )
+    .await;
+
+    assert!(matches!(
+        outcome.patch,
+        Some(ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(finished_at) })
+            if finished_at == timestamp(20)
+    ));
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-presentation")));
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteTaskWorkspace { name } if name == "convoy-a-implement")));
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteTaskWorkspace { name } if name == "convoy-a-review")));
+}
+
+#[tokio::test]
+async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Completed;
+    status.finished_at = Some(timestamp(20));
+    for task in status.tasks.values_mut() {
+        task.phase = TaskPhase::Completed;
+        task.finished_at = Some(timestamp(19));
+    }
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Ready, None)],
+        vec![presentation_object("convoy-a")],
+        timestamp(21),
+    )
+    .await;
+
+    assert_eq!(outcome.patch, None);
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-presentation")));
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteTaskWorkspace { name } if name == "convoy-a-implement")));
 }

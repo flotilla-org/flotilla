@@ -9,14 +9,15 @@ use super::{
 use crate::{
     canonicalize_repo_url,
     controller::{Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
+    labels::{CONVOY_LABEL, TASK_LABEL},
+    presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
+    status_patch::StatusPatch,
     task_workspace::{TaskWorkspace, TaskWorkspacePhase},
     workflow_template::{validate, ValidationError, WorkflowTemplate},
-    OwnerReference, PlacementStatus, Resource, ResourceError, TypedResolver,
+    InputMeta, OwnerReference, PlacementStatus, Resource, ResourceError, TypedResolver,
 };
 
-const CONVOY_LABEL: &str = "flotilla.work/convoy";
-const TASK_LABEL: &str = "flotilla.work/task";
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const STAGE_4A_AGENT_MESSAGE: &str = "Stage 4a supports tool processes only; agent processes require selector resolution (Stage 4b).";
 
@@ -47,17 +48,19 @@ pub enum ConvoyEvent {
 pub struct ConvoyReconciler {
     templates: TypedResolver<WorkflowTemplate>,
     task_workspaces: Option<TypedResolver<TaskWorkspace>>,
+    presentations: Option<TypedResolver<Presentation>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConvoyDependencies {
     template: Option<ResourceObject<WorkflowTemplate>>,
     task_workspaces: BTreeMap<String, ResourceObject<TaskWorkspace>>,
+    presentations: BTreeMap<String, ResourceObject<Presentation>>,
 }
 
 impl ConvoyReconciler {
     pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
-        Self { templates, task_workspaces: None }
+        Self { templates, task_workspaces: None, presentations: None }
     }
 
     pub fn with_task_workspaces(mut self, task_workspaces: TypedResolver<TaskWorkspace>) -> Self {
@@ -65,8 +68,16 @@ impl ConvoyReconciler {
         self
     }
 
+    pub fn with_presentations(mut self, presentations: TypedResolver<Presentation>) -> Self {
+        self.presentations = Some(presentations);
+        self
+    }
+
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
-        vec![Box::new(LabelMappedWatch::<TaskWorkspace, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData })]
+        vec![
+            Box::new(LabelMappedWatch::<TaskWorkspace, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+        ]
     }
 }
 
@@ -96,7 +107,19 @@ impl Reconciler for ConvoyReconciler {
             }
             _ => BTreeMap::new(),
         };
-        Ok(ConvoyDependencies { template, task_workspaces })
+        let presentations = match &self.presentations {
+            Some(presentations) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
+                presentations
+                    .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
+                    .await?
+                    .items
+                    .into_iter()
+                    .map(|presentation| (presentation.metadata.name.clone(), presentation))
+                    .collect()
+            }
+            _ => BTreeMap::new(),
+        };
+        Ok(ConvoyDependencies { template, task_workspaces, presentations })
     }
 
     fn reconcile(
@@ -105,7 +128,7 @@ impl Reconciler for ConvoyReconciler {
         deps: &Self::Dependencies,
         now: DateTime<Utc>,
     ) -> ControllerReconcileOutcome<Self::Resource> {
-        let outcome = reconcile_internal(obj, deps.template.as_ref(), &deps.task_workspaces, now);
+        let outcome = reconcile_internal(obj, deps.template.as_ref(), &deps.task_workspaces, &deps.presentations, now);
         ControllerReconcileOutcome {
             patch: outcome.patch,
             actuations: outcome.actuations,
@@ -114,12 +137,19 @@ impl Reconciler for ConvoyReconciler {
         }
     }
 
-    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]);
+        if let Some(presentations) = &self.presentations {
+            delete_matching(presentations, &selector).await?;
+        }
+        if let Some(task_workspaces) = &self.task_workspaces {
+            delete_matching(task_workspaces, &selector).await?;
+        }
         Ok(())
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
-        None
+        Some("flotilla.work/convoy-teardown")
     }
 }
 
@@ -128,7 +158,7 @@ pub fn reconcile(
     template: Option<&ResourceObject<WorkflowTemplate>>,
     now: DateTime<Utc>,
 ) -> ReconcileOutcome {
-    let outcome = reconcile_internal(convoy, template, &BTreeMap::new(), now);
+    let outcome = reconcile_internal(convoy, template, &BTreeMap::new(), &BTreeMap::new(), now);
     ReconcileOutcome { patch: outcome.patch, events: outcome.events }
 }
 
@@ -136,17 +166,29 @@ fn reconcile_internal(
     convoy: &ResourceObject<Convoy>,
     template: Option<&ResourceObject<WorkflowTemplate>>,
     task_workspaces: &BTreeMap<String, ResourceObject<TaskWorkspace>>,
+    presentations: &BTreeMap<String, ResourceObject<Presentation>>,
     now: DateTime<Utc>,
 ) -> InternalReconcileOutcome {
     let status = convoy.status.clone().unwrap_or_default();
 
     if matches!(status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled) {
-        return InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() };
+        return with_cleanup(
+            convoy,
+            &status,
+            task_workspaces,
+            presentations,
+            InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() },
+        );
     }
 
     if let Some(observed) = status.observed_workflow_ref.as_ref() {
         if observed != &convoy.spec.workflow_ref {
-            return InternalReconcileOutcome {
+            return with_cleanup(
+                convoy,
+                &status,
+                task_workspaces,
+                presentations,
+                InternalReconcileOutcome {
                 patch: Some(controller_patches::fail_init(
                     ConvoyPhase::Failed,
                     "workflow_ref changed after init; not supported".to_string(),
@@ -154,7 +196,8 @@ fn reconcile_internal(
                 )),
                 actuations: Vec::new(),
                 events: vec![ConvoyEvent::WorkflowRefChanged { from: observed.clone(), to: convoy.spec.workflow_ref.clone() }],
-            };
+            },
+            );
         }
     }
 
@@ -163,23 +206,35 @@ fn reconcile_internal(
     }
 
     if let Some(outcome) = fail_fast_outcome(&status, now) {
-        return outcome;
+        return with_cleanup(convoy, &status, task_workspaces, presentations, outcome);
     }
 
     let provisioning = task_workspace_outcome(convoy, &status, task_workspaces, now);
     if provisioning.patch.is_some() {
-        return provisioning;
+        return with_cleanup(convoy, &status, task_workspaces, presentations, provisioning);
     }
 
     if let Some(outcome) = advance_ready_outcome(&status, now) {
-        return InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events };
+        return with_cleanup(
+            convoy,
+            &status,
+            task_workspaces,
+            presentations,
+            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
+        );
     }
 
     if let Some(outcome) = roll_up_phase_outcome(&status, now) {
-        return InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events };
+        return with_cleanup(
+            convoy,
+            &status,
+            task_workspaces,
+            presentations,
+            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
+        );
     }
 
-    provisioning
+    with_cleanup(convoy, &status, task_workspaces, presentations, provisioning)
 }
 
 fn bootstrap_outcome(
@@ -429,6 +484,61 @@ fn task_workspace_outcome(
     InternalReconcileOutcome { patch: None, actuations, events: Vec::new() }
 }
 
+fn with_cleanup(
+    convoy: &ResourceObject<Convoy>,
+    status: &super::ConvoyStatus,
+    task_workspaces: &BTreeMap<String, ResourceObject<TaskWorkspace>>,
+    presentations: &BTreeMap<String, ResourceObject<Presentation>>,
+    mut outcome: InternalReconcileOutcome,
+) -> InternalReconcileOutcome {
+    outcome
+        .actuations
+        .extend(cleanup_actuations(convoy, status, task_workspaces, presentations, outcome.patch.as_ref()));
+    outcome
+}
+
+fn cleanup_actuations(
+    convoy: &ResourceObject<Convoy>,
+    status: &super::ConvoyStatus,
+    task_workspaces: &BTreeMap<String, ResourceObject<TaskWorkspace>>,
+    presentations: &BTreeMap<String, ResourceObject<Presentation>>,
+    patch: Option<&ConvoyStatusPatch>,
+) -> Vec<Actuation> {
+    let mut predicted_status = status.clone();
+    if let Some(patch) = patch {
+        patch.apply(&mut predicted_status);
+    }
+
+    let mut actuations = Vec::new();
+
+    if predicted_status.phase == ConvoyPhase::Active && presentations.is_empty() {
+        actuations.push(create_presentation_actuation(convoy));
+    }
+
+    if matches!(predicted_status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled)
+        && (!presentations.is_empty() || !matches!(status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled))
+    {
+        if presentations.is_empty() {
+            actuations.push(Actuation::DeletePresentation { name: presentation_name(&convoy.metadata.name) });
+        } else {
+            actuations.extend(
+                presentations.keys().cloned().map(|name| Actuation::DeletePresentation { name }),
+            );
+        }
+    }
+
+    for (task, state) in &predicted_status.tasks {
+        if matches!(state.phase, TaskPhase::Completed | TaskPhase::Failed | TaskPhase::Cancelled) {
+            let name = task_workspace_name(&convoy.metadata.name, task);
+            if task_workspaces.contains_key(&name) {
+                actuations.push(Actuation::DeleteTaskWorkspace { name });
+            }
+        }
+    }
+
+    actuations
+}
+
 fn create_task_workspace_outcome(convoy: &ResourceObject<Convoy>, task: &str, now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
     let placement_policy_ref = convoy.spec.placement_policy.clone()?;
     let repo_url = convoy.spec.repository.as_ref()?.url.clone();
@@ -464,6 +574,27 @@ fn create_task_workspace_outcome(convoy: &ResourceObject<Convoy>, task: &str, no
         }],
         events: Vec::new(),
     })
+}
+
+fn create_presentation_actuation(convoy: &ResourceObject<Convoy>) -> Actuation {
+    Actuation::CreatePresentation {
+        meta: InputMeta::builder()
+            .name(presentation_name(&convoy.metadata.name))
+            .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]))
+            .owner_references(vec![OwnerReference {
+                api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
+                kind: Convoy::API_PATHS.kind.to_string(),
+                name: convoy.metadata.name.clone(),
+                controller: true,
+            }])
+            .build(),
+        spec: PresentationSpec {
+            convoy_ref: convoy.metadata.name.clone(),
+            presentation_policy_ref: "default".to_string(),
+            name: convoy.metadata.name.clone(),
+            process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]),
+        },
+    }
 }
 
 fn task_failed_outcome(
@@ -513,4 +644,19 @@ fn insert_optional_field(fields: &mut BTreeMap<String, serde_json::Value>, key: 
 
 fn task_workspace_name(convoy_name: &str, task: &str) -> String {
     format!("{convoy_name}-{task}")
+}
+
+fn presentation_name(convoy_name: &str) -> String {
+    format!("{convoy_name}-presentation")
+}
+
+async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
+    let listed = resolver.list_matching_labels(selector).await?;
+    for object in listed.items {
+        match resolver.delete(&object.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
