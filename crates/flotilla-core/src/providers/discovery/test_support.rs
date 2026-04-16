@@ -27,10 +27,10 @@ use crate::{
         change_request::ChangeRequestTracker,
         discovery::EnvVars,
         issue_tracker::IssueProvider,
+        presentation::PresentationManager,
         terminal::TerminalPool,
         types::BranchInfo,
         vcs::{CheckoutManager, Vcs},
-        workspace::WorkspaceManager,
         ChannelLabel, CommandOutput, CommandRunner,
     },
 };
@@ -114,7 +114,7 @@ pub struct FakeDiscoveryProviders {
     pub change_request: Option<Arc<dyn ChangeRequestTracker>>,
     pub issue_tracker: Option<Arc<dyn IssueProvider>>,
     pub issue_query_service: Option<Arc<dyn crate::providers::issue_query::IssueQueryService>>,
-    pub workspace_manager: Option<Arc<dyn WorkspaceManager>>,
+    pub presentation_manager: Option<Arc<dyn PresentationManager>>,
     pub terminal_pool: Option<Arc<dyn TerminalPool>>,
     pub attachable_store: Option<SharedAttachableStore>,
 }
@@ -144,8 +144,8 @@ impl FakeDiscoveryProviders {
         self
     }
 
-    pub fn with_workspace_manager(mut self, provider: Arc<dyn WorkspaceManager>) -> Self {
-        self.workspace_manager = Some(provider);
+    pub fn with_presentation_manager(mut self, provider: Arc<dyn PresentationManager>) -> Self {
+        self.presentation_manager = Some(provider);
         self
     }
 
@@ -650,18 +650,18 @@ pub struct FakeChangeRequest {
     pub merged_branches: Arc<TokioMutex<Vec<String>>>,
 }
 
-pub struct FakeWorkspaceManager {
+pub struct FakePresentationManager {
     pub workspaces: Arc<TokioMutex<Vec<(String, Workspace)>>>,
     pub selected: Arc<TokioMutex<Vec<String>>>,
 }
 
-impl Default for FakeWorkspaceManager {
+impl Default for FakePresentationManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FakeWorkspaceManager {
+impl FakePresentationManager {
     pub fn new() -> Self {
         Self { workspaces: Arc::new(TokioMutex::new(Vec::new())), selected: Arc::new(TokioMutex::new(Vec::new())) }
     }
@@ -672,7 +672,7 @@ impl FakeWorkspaceManager {
 }
 
 #[async_trait::async_trait]
-impl WorkspaceManager for FakeWorkspaceManager {
+impl PresentationManager for FakePresentationManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         Ok(self.workspaces.lock().await.clone())
     }
@@ -948,12 +948,12 @@ impl Factory for FakeChangeRequestFactory {
     }
 }
 
-pub struct FakeWorkspaceManagerFactory(pub Arc<dyn WorkspaceManager>);
+pub struct FakePresentationManagerFactory(pub Arc<dyn PresentationManager>);
 
 #[async_trait::async_trait]
-impl Factory for FakeWorkspaceManagerFactory {
+impl Factory for FakePresentationManagerFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn WorkspaceManager;
+    type Output = dyn PresentationManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled_simple(
@@ -972,7 +972,7 @@ impl Factory for FakeWorkspaceManagerFactory {
         _config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
         Ok(Arc::clone(&self.0))
     }
 }
@@ -1121,9 +1121,9 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         issue_tracker_factories.push(Box::new(FakeIssueProviderFactory(it)));
     }
 
-    let mut workspace_manager_factories: Vec<Box<super::WorkspaceManagerFactory>> = Vec::new();
-    if let Some(ws) = providers.workspace_manager {
-        workspace_manager_factories.push(Box::new(FakeWorkspaceManagerFactory(ws)));
+    let mut presentation_manager_factories: Vec<Box<super::PresentationManagerFactory>> = Vec::new();
+    if let Some(ws) = providers.presentation_manager {
+        presentation_manager_factories.push(Box::new(FakePresentationManagerFactory(ws)));
     }
 
     let mut terminal_pool_factories: Vec<Box<super::TerminalPoolFactory>> = Vec::new();
@@ -1153,7 +1153,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             issue_trackers: issue_tracker_factories,
             cloud_agents: vec![],
             ai_utilities: vec![],
-            workspace_managers: workspace_manager_factories,
+            presentation_managers: presentation_manager_factories,
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![],
             issue_query_services: issue_query_service_factories,

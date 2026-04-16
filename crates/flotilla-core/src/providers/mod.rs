@@ -7,12 +7,12 @@ pub mod environment;
 pub mod github_api;
 pub mod issue_query;
 pub mod issue_tracker;
+pub mod presentation;
 pub mod registry;
 pub mod ssh_runner;
 pub mod terminal;
 pub mod types;
 pub mod vcs;
-pub mod workspace;
 
 use std::path::Path;
 

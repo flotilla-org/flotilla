@@ -238,7 +238,7 @@ async fn refresh_providers(
     );
 
     let ws_fut = async {
-        if let Some((desc, ws_mgr)) = registry.workspace_managers.preferred_with_desc() {
+        if let Some((desc, ws_mgr)) = registry.presentation_managers.preferred_with_desc() {
             let name = desc.display_name.clone();
             match ws_mgr.list_workspaces().await {
                 Ok(entries) => (entries, vec![]),
@@ -336,7 +336,7 @@ async fn refresh_providers(
 }
 
 fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, attachable_store: &SharedAttachableStore) {
-    let workspace_provider = registry.workspace_managers.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
+    let workspace_provider = registry.presentation_managers.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
     let Ok(mut store) = attachable_store.lock() else {
         tracing::warn!("attachable store lock poisoned while projecting provider data");
         return;
@@ -357,7 +357,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
     // Skip when workspace list is empty — it may indicate a list failure,
     // and pruning would incorrectly delete all bindings.
     if !pd.workspaces.is_empty() {
-        if let Some((desc, ws_mgr)) = registry.workspace_managers.preferred_with_desc() {
+        if let Some((desc, ws_mgr)) = registry.presentation_managers.preferred_with_desc() {
             let provider_name = &desc.implementation;
             let scope_prefix = ws_mgr.binding_scope_prefix();
             let live_ws_refs: std::collections::HashSet<&str> = pd.workspaces.keys().map(|s| s.as_str()).collect();
@@ -477,7 +477,7 @@ fn compute_provider_health(registry: &ProviderRegistry, errors: &[RefreshError])
         &mut health,
         errors,
         ProviderCategory::WorkspaceManager.slug(),
-        registry.workspace_managers.display_names().map(|s| s.to_string()),
+        registry.presentation_managers.display_names().map(|s| s.to_string()),
         &["workspaces"],
     );
     insert_category_health(

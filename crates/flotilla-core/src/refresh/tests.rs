@@ -16,7 +16,7 @@ use crate::{
         terminal::TerminalPool,
         types::*,
         vcs::{CheckoutManager, Vcs},
-        workspace::WorkspaceManager,
+        presentation::PresentationManager,
     },
 };
 
@@ -205,7 +205,7 @@ impl MockWorkspaceManager {
 }
 
 #[async_trait]
-impl WorkspaceManager for MockWorkspaceManager {
+impl PresentationManager for MockWorkspaceManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         self.result.clone()
     }
@@ -396,7 +396,7 @@ async fn refresh_populates_all_provider_data_and_merged_wins_branch_conflict() {
         Arc::new(MockCloudAgent::ok(vec![("sess-1".to_string(), TestSession::new("Debug").with_session_ref("mock", "sess-1").build())])),
     );
     registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::ok(vec!["remote-only".to_string(), "shared".to_string()])));
-    registry.workspace_managers.insert(
+    registry.presentation_managers.insert(
         "cmux",
         desc("cmux"),
         Arc::new(MockWorkspaceManager::ok(vec![("ws-1".to_string(), make_workspace("dev"))])),
@@ -451,7 +451,7 @@ async fn refresh_uses_host_id_for_local_checkout_publication_when_available() {
 #[test]
 fn project_attachable_data_populates_sets_and_ids() {
     let mut registry = ProviderRegistry::new();
-    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::ok(vec![])));
+    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::ok(vec![])));
     registry.terminal_pools.insert("shpool", desc("shpool"), Arc::new(MockTerminalPool::ok(vec![])));
 
     let store_dir = tempfile::tempdir().expect("tempdir");
@@ -533,7 +533,7 @@ async fn refresh_collects_multiple_errors_and_preserves_successful_providers() {
     registry.change_requests.insert("github", desc("github"), Arc::new(MockChangeRequestTracker::failing("pr fail", "merged fail")));
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::failing("sessions fail")));
     registry.vcs.insert("git", desc("git"), Arc::new(MockVcs::failing("branches fail")));
-    registry.workspace_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));
+    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::failing("workspaces fail")));
 
     let mut pd = ProviderData::default();
     let errors =

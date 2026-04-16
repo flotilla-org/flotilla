@@ -46,7 +46,7 @@ pub struct ClaudeAiUtilityConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct WorkspaceManagerConfig {
+pub struct PresentationManagerConfig {
     #[serde(flatten)]
     pub preference: ProviderPreference,
 }
@@ -73,7 +73,7 @@ pub struct FlotillaConfig {
     #[serde(default)]
     pub ai_utility: AiUtilityConfig,
     #[serde(default)]
-    pub workspace_manager: WorkspaceManagerConfig,
+    pub presentation_manager: PresentationManagerConfig,
     #[serde(default)]
     pub terminal_pool: TerminalPoolConfig,
 }

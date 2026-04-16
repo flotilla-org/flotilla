@@ -17,7 +17,7 @@ use crate::{
         Hop, ResolutionContext, ResolvedAction,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::{registry::ProviderRegistry, types::WorkspaceAttachRequest, workspace::WorkspaceManager},
+    providers::{presentation::PresentationManager, registry::ProviderRegistry, types::WorkspaceAttachRequest},
     terminal_manager::TerminalManager,
 };
 
@@ -199,14 +199,14 @@ impl<'a> WorkspaceOrchestrator<'a> {
     }
 
     pub(super) async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        if let Some(ws_mgr) = self.registry.workspace_managers.preferred() {
+        if let Some(ws_mgr) = self.registry.presentation_managers.preferred() {
             ws_mgr.select_workspace(ws_ref).await?;
         }
         Ok(())
     }
 
-    fn preferred_workspace_manager(&self) -> Option<(&str, &Arc<dyn WorkspaceManager>)> {
-        self.registry.workspace_managers.preferred_with_desc().map(|(desc, provider)| (desc.implementation.as_str(), provider))
+    fn preferred_workspace_manager(&self) -> Option<(&str, &Arc<dyn PresentationManager>)> {
+        self.registry.presentation_managers.preferred_with_desc().map(|(desc, provider)| (desc.implementation.as_str(), provider))
     }
 
     fn find_existing_workspace_ref(

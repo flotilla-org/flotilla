@@ -1,4 +1,4 @@
-//! Workspace manager factory for tmux.
+//! Presentation manager factory for tmux.
 
 use std::sync::Arc;
 
@@ -9,17 +9,17 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        workspace::{tmux::TmuxWorkspaceManager, WorkspaceManager},
+        presentation::{tmux::TmuxPresentationManager, PresentationManager},
         CommandRunner,
     },
 };
 
-pub struct TmuxWorkspaceManagerFactory;
+pub struct TmuxPresentationManagerFactory;
 
 #[async_trait]
-impl Factory for TmuxWorkspaceManagerFactory {
+impl Factory for TmuxPresentationManagerFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn WorkspaceManager;
+    type Output = dyn PresentationManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled_simple(ProviderCategory::WorkspaceManager, "tmux", "tmux Workspaces", "", "", "")
@@ -31,9 +31,9 @@ impl Factory for TmuxWorkspaceManagerFactory {
         _config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("TMUX").is_some() {
-            Ok(Arc::new(TmuxWorkspaceManager::new(runner)))
+            Ok(Arc::new(TmuxPresentationManager::new(runner)))
         } else {
             Err(vec![UnmetRequirement::MissingEnvVar("TMUX".into())])
         }
@@ -44,7 +44,7 @@ impl Factory for TmuxWorkspaceManagerFactory {
 mod tests {
     use std::sync::Arc;
 
-    use super::TmuxWorkspaceManagerFactory;
+    use super::TmuxPresentationManagerFactory;
     use crate::{
         config::ConfigStore,
         path_context::ExecutionEnvironmentPath,
@@ -57,7 +57,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = TmuxWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = TmuxPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -67,14 +67,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = TmuxWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = TmuxPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without TMUX env var");
         assert!(unmet.contains(&UnmetRequirement::MissingEnvVar("TMUX".into())));
     }
 
     #[tokio::test]
     async fn tmux_factory_descriptor() {
-        let desc = TmuxWorkspaceManagerFactory.descriptor();
+        let desc = TmuxPresentationManagerFactory.descriptor();
         assert_eq!(desc.backend, "tmux");
         assert_eq!(desc.implementation, "tmux");
         assert_eq!(desc.display_name, "tmux Workspaces");

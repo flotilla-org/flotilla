@@ -29,11 +29,11 @@ pub(super) fn terminal_env_defaults_from_bag(env: &EnvironmentBag) -> TerminalEn
     defaults
 }
 
-fn workspace_factories() -> Vec<Box<super::WorkspaceManagerFactory>> {
+fn presentation_factories() -> Vec<Box<super::PresentationManagerFactory>> {
     vec![
         Box::new(cmux::CmuxInsideFactory),
-        Box::new(zellij::ZellijWorkspaceManagerFactory),
-        Box::new(tmux::TmuxWorkspaceManagerFactory),
+        Box::new(zellij::ZellijPresentationManagerFactory),
+        Box::new(tmux::TmuxPresentationManagerFactory),
         Box::new(cmux::CmuxBinaryFallbackFactory),
     ]
 }
@@ -64,7 +64,7 @@ impl FactoryRegistry {
             ],
             ai_utilities: vec![Box::new(claude::ClaudeApiAiUtilityFactory), Box::new(claude::ClaudeCliAiUtilityFactory)],
             // Priority: inside-cmux > inside-zellij > inside-tmux > cmux-binary-fallback
-            workspace_managers: workspace_factories(),
+            presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
             issue_query_services: vec![Box::new(github_issue_query::GitHubIssueQueryServiceFactory)],
@@ -79,7 +79,7 @@ impl FactoryRegistry {
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
-            workspace_managers: workspace_factories(),
+            presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
             issue_query_services: vec![],
@@ -100,7 +100,7 @@ mod tests {
         assert!(!reg.issue_trackers.is_empty());
         assert!(!reg.cloud_agents.is_empty());
         assert!(!reg.ai_utilities.is_empty());
-        assert!(!reg.workspace_managers.is_empty());
+        assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
     }
 
@@ -113,7 +113,7 @@ mod tests {
         assert!(reg.issue_trackers.is_empty());
         assert!(reg.cloud_agents.is_empty());
         assert!(reg.ai_utilities.is_empty());
-        assert!(!reg.workspace_managers.is_empty());
+        assert!(!reg.presentation_managers.is_empty());
         assert!(!reg.terminal_pools.is_empty());
     }
 }

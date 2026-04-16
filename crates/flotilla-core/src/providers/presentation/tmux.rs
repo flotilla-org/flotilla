@@ -5,11 +5,11 @@ use tracing::{info, warn};
 
 use crate::providers::{run, types::*, CommandRunner};
 
-pub struct TmuxWorkspaceManager {
+pub struct TmuxPresentationManager {
     runner: Arc<dyn CommandRunner>,
 }
 
-impl TmuxWorkspaceManager {
+impl TmuxPresentationManager {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self { runner }
     }
@@ -39,7 +39,7 @@ impl TmuxWorkspaceManager {
 }
 
 #[async_trait]
-impl super::WorkspaceManager for TmuxWorkspaceManager {
+impl super::PresentationManager for TmuxPresentationManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let session = self.session_name().await?;
         let start_time = self.tmux_cmd(&["display-message", "-p", "#{start_time}"]).await?;
@@ -166,17 +166,17 @@ mod tests {
     use super::*;
     use crate::{
         path_context::ExecutionEnvironmentPath,
-        providers::{replay, workspace::WorkspaceManager},
+        providers::{presentation::PresentationManager, replay},
     };
 
     #[test]
     fn split_flag_maps_directions() {
-        assert_eq!(TmuxWorkspaceManager::split_flag("left"), "-h");
-        assert_eq!(TmuxWorkspaceManager::split_flag("right"), "-h");
-        assert_eq!(TmuxWorkspaceManager::split_flag("up"), "-v");
-        assert_eq!(TmuxWorkspaceManager::split_flag("down"), "-v");
-        assert_eq!(TmuxWorkspaceManager::split_flag("unknown"), "-h");
-        assert_eq!(TmuxWorkspaceManager::split_flag(""), "-h");
+        assert_eq!(TmuxPresentationManager::split_flag("left"), "-h");
+        assert_eq!(TmuxPresentationManager::split_flag("right"), "-h");
+        assert_eq!(TmuxPresentationManager::split_flag("up"), "-v");
+        assert_eq!(TmuxPresentationManager::split_flag("down"), "-v");
+        assert_eq!(TmuxPresentationManager::split_flag("unknown"), "-h");
+        assert_eq!(TmuxPresentationManager::split_flag(""), "-h");
     }
 
     fn fixture(name: &str) -> String {
@@ -231,7 +231,7 @@ mod tests {
         let session = replay::test_session(&fixture("tmux_workspaces.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = TmuxWorkspaceManager::new(runner.clone());
+        let mgr = TmuxPresentationManager::new(runner.clone());
 
         // Create workspace "feat-123"
         let config1 = WorkspaceAttachRequest {
@@ -296,7 +296,7 @@ mod tests {
         let session = replay::test_session(&fixture("tmux_list.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = TmuxWorkspaceManager::new(runner);
+        let mgr = TmuxPresentationManager::new(runner);
         let workspaces = mgr.list_workspaces().await.unwrap();
 
         assert_eq!(workspaces.len(), 2);

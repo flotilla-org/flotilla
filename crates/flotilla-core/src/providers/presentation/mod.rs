@@ -12,7 +12,7 @@ use crate::{
 };
 
 #[async_trait]
-pub trait WorkspaceManager: Send + Sync {
+pub trait PresentationManager: Send + Sync {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String>;
     async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String>;
     async fn select_workspace(&self, ws_ref: &str) -> Result<(), String>;
@@ -23,7 +23,7 @@ pub trait WorkspaceManager: Send + Sync {
     fn binding_scope_prefix(&self) -> String;
 }
 
-/// Resolve a `WorkspaceAttachRequest` into a `PaneLayout` for workspace managers.
+/// Resolve a `WorkspaceAttachRequest` into a `PaneLayout` for presentation managers.
 ///
 /// Parses the template YAML as a `WorkspaceTemplate` (content + layout format),
 /// then builds panes from attach commands. Falls back to the default template

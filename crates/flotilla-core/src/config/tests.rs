@@ -568,7 +568,7 @@ backend = "claude"
 [ai_utility.claude]
 implementation = "api"
 
-[workspace_manager]
+[presentation_manager]
 backend = "zellij"
 
 [vcs.git]
@@ -578,7 +578,7 @@ checkout_path = "/tmp/{{ branch }}"
     let config: FlotillaConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.ai_utility.preference.backend.as_deref(), Some("claude"));
     assert_eq!(config.ai_utility.claude.unwrap().implementation.as_deref(), Some("api"));
-    assert_eq!(config.workspace_manager.preference.backend.as_deref(), Some("zellij"));
+    assert_eq!(config.presentation_manager.preference.backend.as_deref(), Some("zellij"));
     assert_eq!(config.vcs.git.checkout_strategy, "wt");
     assert_eq!(config.vcs.git.checkout_path, "/tmp/{{ branch }}");
 }

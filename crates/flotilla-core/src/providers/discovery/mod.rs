@@ -29,10 +29,10 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         issue_tracker::IssueProvider,
+        presentation::PresentationManager,
         registry::{ProviderRegistry, ProviderSet},
         terminal::TerminalPool,
         vcs::{CheckoutManager, Vcs},
-        workspace::WorkspaceManager,
         CommandRunner,
     },
 };
@@ -433,7 +433,7 @@ pub type ChangeRequestFactory = ProviderFactory<dyn ChangeRequestTracker>;
 pub type IssueProviderFactory = ProviderFactory<dyn IssueProvider>;
 pub type CloudAgentFactory = ProviderFactory<dyn CloudAgentService>;
 pub type AiUtilityFactory = ProviderFactory<dyn AiUtility>;
-pub type WorkspaceManagerFactory = ProviderFactory<dyn WorkspaceManager>;
+pub type PresentationManagerFactory = ProviderFactory<dyn PresentationManager>;
 pub type TerminalPoolFactory = ProviderFactory<dyn TerminalPool>;
 pub type EnvironmentProviderFactory = ProviderFactory<dyn crate::providers::environment::EnvironmentProvider>;
 pub type IssueQueryServiceFactory = ServiceFactory<dyn crate::providers::issue_query::IssueQueryService>;
@@ -449,7 +449,7 @@ pub struct FactoryRegistry {
     pub issue_trackers: Vec<Box<IssueProviderFactory>>,
     pub cloud_agents: Vec<Box<CloudAgentFactory>>,
     pub ai_utilities: Vec<Box<AiUtilityFactory>>,
-    pub workspace_managers: Vec<Box<WorkspaceManagerFactory>>,
+    pub presentation_managers: Vec<Box<PresentationManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
     pub issue_query_services: Vec<Box<IssueQueryServiceFactory>>,
@@ -502,8 +502,8 @@ impl FactoryRegistry {
         for (desc, p) in probe_category(&self.ai_utilities, env, config, repo_root, &runner).await {
             registry.ai_utilities.insert(desc.implementation.clone(), desc, p);
         }
-        for (desc, p) in probe_category(&self.workspace_managers, env, config, repo_root, &runner).await {
-            registry.workspace_managers.insert(desc.implementation.clone(), desc, p);
+        for (desc, p) in probe_category(&self.presentation_managers, env, config, repo_root, &runner).await {
+            registry.presentation_managers.insert(desc.implementation.clone(), desc, p);
         }
         for (desc, p) in probe_category(&self.terminal_pools, env, config, repo_root, &runner).await {
             registry.terminal_pools.insert(desc.implementation.clone(), desc, p);
@@ -644,8 +644,8 @@ pub async fn discover_providers(
         registry.ai_utilities.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.workspace_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.workspace_managers.insert(desc.implementation.clone(), desc, provider);
+    probe_all(&factories.presentation_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+        registry.presentation_managers.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
     probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
@@ -720,9 +720,9 @@ pub async fn discover_providers(
         }
     }
     apply_backend_pref(
-        &mut registry.workspace_managers,
+        &mut registry.presentation_managers,
         ProviderCategory::WorkspaceManager,
-        flotilla_config.workspace_manager.preference.backend.as_deref(),
+        flotilla_config.presentation_manager.preference.backend.as_deref(),
         &mut unmet,
     );
     apply_backend_pref(
@@ -886,7 +886,7 @@ mod orchestrator_tests {
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
-            workspace_managers: vec![],
+            presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
             issue_query_services: vec![],
@@ -916,7 +916,7 @@ mod orchestrator_tests {
             issue_trackers: vec![],
             cloud_agents: vec![],
             ai_utilities: vec![],
-            workspace_managers: vec![],
+            presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
             issue_query_services: vec![],
@@ -930,7 +930,7 @@ mod orchestrator_tests {
         assert!(result.registry.issue_trackers.is_empty());
         assert!(result.registry.cloud_agents.is_empty());
         assert!(result.registry.ai_utilities.is_empty());
-        assert!(result.registry.workspace_managers.is_empty());
+        assert!(result.registry.presentation_managers.is_empty());
         assert!(result.registry.terminal_pools.is_empty());
         assert!(result.unmet.is_empty());
         assert!(result.repo_slug.is_none());
