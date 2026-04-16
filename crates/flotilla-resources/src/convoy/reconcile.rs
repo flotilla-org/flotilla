@@ -108,15 +108,13 @@ impl Reconciler for ConvoyReconciler {
             _ => BTreeMap::new(),
         };
         let presentations = match &self.presentations {
-            Some(presentations) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => {
-                presentations
-                    .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
-                    .await?
-                    .items
-                    .into_iter()
-                    .map(|presentation| (presentation.metadata.name.clone(), presentation))
-                    .collect()
-            }
+            Some(presentations) if obj.status.as_ref().and_then(|status| status.observed_workflow_ref.as_ref()).is_some() => presentations
+                .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]))
+                .await?
+                .items
+                .into_iter()
+                .map(|presentation| (presentation.metadata.name.clone(), presentation))
+                .collect(),
             _ => BTreeMap::new(),
         };
         Ok(ConvoyDependencies { template, task_workspaces, presentations })
@@ -172,23 +170,16 @@ fn reconcile_internal(
     let status = convoy.status.clone().unwrap_or_default();
 
     if matches!(status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled) {
-        return with_cleanup(
-            convoy,
-            &status,
-            task_workspaces,
-            presentations,
-            InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() },
-        );
+        return with_cleanup(convoy, &status, task_workspaces, presentations, InternalReconcileOutcome {
+            patch: None,
+            actuations: Vec::new(),
+            events: Vec::new(),
+        });
     }
 
     if let Some(observed) = status.observed_workflow_ref.as_ref() {
         if observed != &convoy.spec.workflow_ref {
-            return with_cleanup(
-                convoy,
-                &status,
-                task_workspaces,
-                presentations,
-                InternalReconcileOutcome {
+            return with_cleanup(convoy, &status, task_workspaces, presentations, InternalReconcileOutcome {
                 patch: Some(controller_patches::fail_init(
                     ConvoyPhase::Failed,
                     "workflow_ref changed after init; not supported".to_string(),
@@ -196,8 +187,7 @@ fn reconcile_internal(
                 )),
                 actuations: Vec::new(),
                 events: vec![ConvoyEvent::WorkflowRefChanged { from: observed.clone(), to: convoy.spec.workflow_ref.clone() }],
-            },
-            );
+            });
         }
     }
 
@@ -215,23 +205,19 @@ fn reconcile_internal(
     }
 
     if let Some(outcome) = advance_ready_outcome(&status, now) {
-        return with_cleanup(
-            convoy,
-            &status,
-            task_workspaces,
-            presentations,
-            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
-        );
+        return with_cleanup(convoy, &status, task_workspaces, presentations, InternalReconcileOutcome {
+            patch: outcome.patch,
+            actuations: provisioning.actuations,
+            events: outcome.events,
+        });
     }
 
     if let Some(outcome) = roll_up_phase_outcome(&status, now) {
-        return with_cleanup(
-            convoy,
-            &status,
-            task_workspaces,
-            presentations,
-            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
-        );
+        return with_cleanup(convoy, &status, task_workspaces, presentations, InternalReconcileOutcome {
+            patch: outcome.patch,
+            actuations: provisioning.actuations,
+            events: outcome.events,
+        });
     }
 
     with_cleanup(convoy, &status, task_workspaces, presentations, provisioning)
@@ -491,9 +477,7 @@ fn with_cleanup(
     presentations: &BTreeMap<String, ResourceObject<Presentation>>,
     mut outcome: InternalReconcileOutcome,
 ) -> InternalReconcileOutcome {
-    outcome
-        .actuations
-        .extend(cleanup_actuations(convoy, status, task_workspaces, presentations, outcome.patch.as_ref()));
+    outcome.actuations.extend(cleanup_actuations(convoy, status, task_workspaces, presentations, outcome.patch.as_ref()));
     outcome
 }
 
@@ -521,9 +505,7 @@ fn cleanup_actuations(
         if presentations.is_empty() {
             actuations.push(Actuation::DeletePresentation { name: presentation_name(&convoy.metadata.name) });
         } else {
-            actuations.extend(
-                presentations.keys().cloned().map(|name| Actuation::DeletePresentation { name }),
-            );
+            actuations.extend(presentations.keys().cloned().map(|name| Actuation::DeletePresentation { name }));
         }
     }
 

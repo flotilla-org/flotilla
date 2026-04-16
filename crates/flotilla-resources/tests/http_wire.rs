@@ -59,6 +59,7 @@ fn response(status: &str, body: &str) -> String {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn list_decodes_collection_resource_version() {
     let body = serde_json::json!({
         "metadata": { "resourceVersion": "7" },
@@ -95,6 +96,7 @@ async fn list_decodes_collection_resource_version() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn update_status_uses_status_subresource_path_and_body() {
     let body = serde_json::json!({
         "apiVersion": "flotilla.work/v1",
@@ -129,6 +131,7 @@ async fn update_status_uses_status_subresource_path_and_body() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn watch_decodes_kubernetes_watch_events() {
     let body = concat!(
         "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\n",
@@ -163,6 +166,7 @@ async fn watch_decodes_kubernetes_watch_events() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn watch_decodes_crlf_terminated_events() {
     let body =
         "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
@@ -180,6 +184,7 @@ async fn watch_decodes_crlf_terminated_events() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn status_errors_map_to_resource_errors() {
     let body = serde_json::json!({ "message": "resource version conflict" }).to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("409 Conflict", &body)).await;
@@ -197,6 +202,7 @@ async fn status_errors_map_to_resource_errors() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn not_found_errors_preserve_requested_name() {
     let body = serde_json::json!({ "message": "convoys.flotilla.work \"alpha\" not found" }).to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("404 Not Found", &body)).await;
@@ -211,6 +217,7 @@ async fn not_found_errors_preserve_requested_name() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn server_disconnect_ends_watch_stream_cleanly() {
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", "")).await;
     let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
@@ -222,6 +229,7 @@ async fn server_disconnect_ends_watch_stream_cleanly() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn filtered_list_encodes_exact_match_label_selector() {
     let body = serde_json::json!({
         "metadata": { "resourceVersion": "9" },

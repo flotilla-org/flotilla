@@ -48,7 +48,7 @@ async fn main() {
     println!("  issue_trackers: {}", registry.issue_trackers.len());
     println!("  cloud_agents: {}", registry.cloud_agents.len());
     println!("  vcs: {}", registry.vcs.len());
-    println!("  workspace_managers: {}", !registry.workspace_managers.is_empty());
+    println!("  presentation_managers: {}", !registry.presentation_managers.is_empty());
 
     // Step 2: Spawn background refresh and wait for first snapshot
     println!("\n=== Step 2: Background refresh ===");

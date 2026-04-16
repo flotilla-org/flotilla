@@ -21,7 +21,7 @@ use flotilla_core::{
             test_support::{
                 fake_discovery, fake_discovery_with_provider_set, fake_discovery_with_providers, fake_vcs_discovery, git_process_discovery,
                 init_git_repo, init_git_repo_with_remote, DiscoveryMockRunner, FakeCheckoutManager, FakeCheckoutManagerFactory,
-                FakeDiscoveryProviders, FakeIssueProvider, FakeTerminalPool, FakeVcsFactory, FakeVcsState, FakeWorkspaceManager,
+                FakeDiscoveryProviders, FakeIssueProvider, FakePresentationManager, FakeTerminalPool, FakeVcsFactory, FakeVcsState,
                 TestEnvVars,
             },
             DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag, Factory, HostDetector, HostPlatform, ProviderCategory,
@@ -3094,7 +3094,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     let remote_checkout = HostPath::new(remote_host.clone(), "/home/robert/dev/flotilla.terminal-stuff");
     let set_id = AttachableSetId::new("set-remote");
     let workspace_ref = "workspace:9".to_string();
-    let workspace_manager = Arc::new(FakeWorkspaceManager::new());
+    let workspace_manager = Arc::new(FakePresentationManager::new());
     let attachable_store = shared_in_memory_attachable_store();
 
     workspace_manager
@@ -3125,7 +3125,7 @@ async fn in_process_daemon_keeps_remote_attachable_set_anchor_when_local_workspa
     }
 
     let discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager).with_attachable_store(Arc::clone(&attachable_store)),
+        FakeDiscoveryProviders::new().with_presentation_manager(workspace_manager).with_attachable_store(Arc::clone(&attachable_store)),
     );
     let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
     let mut rx = daemon.subscribe();
@@ -3190,7 +3190,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
     let remote_checkout = HostPath::new(remote_host.clone(), "/home/robert/dev/flotilla.issue-356-watch");
     let set_id = AttachableSetId::new("set-issue-356-watch");
     let workspace_ref = "workspace:10".to_string();
-    let workspace_manager = Arc::new(FakeWorkspaceManager::new());
+    let workspace_manager = Arc::new(FakePresentationManager::new());
     let terminal_pool = Arc::new(FakeTerminalPool::new());
     let attachable_store = shared_in_memory_attachable_store();
 
@@ -3223,7 +3223,7 @@ async fn in_process_daemon_correlates_workspace_into_one_remote_checkout_item() 
 
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new()
-            .with_workspace_manager(workspace_manager)
+            .with_presentation_manager(workspace_manager)
             .with_terminal_pool(terminal_pool)
             .with_attachable_store(Arc::clone(&attachable_store)),
     );

@@ -139,13 +139,7 @@ impl Reconciler for TaskWorkspaceReconciler {
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .and_then(|snapshot| {
-                snapshot
-                    .tasks
-                    .iter()
-                    .enumerate()
-                    .find(|(_, task)| task.name == obj.spec.task)
-            })
+            .and_then(|snapshot| snapshot.tasks.iter().enumerate().find(|(_, task)| task.name == obj.spec.task))
         {
             Some((task_index, task)) => (task_index, task),
             None => return Ok(TaskWorkspaceDeps::failed(format!("task {} missing from convoy snapshot", obj.spec.task))),
@@ -426,11 +420,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                 }
                 Err(ResourceError::NotFound { .. }) => {
                     actuations.push(Actuation::CreateTerminalSession {
-                        meta: owned_child_meta(
-                            &terminal_name,
-                            obj,
-                            build_session_labels(obj, process, task_index, process_index),
-                        ),
+                        meta: owned_child_meta(&terminal_name, obj, build_session_labels(obj, process, task_index, process_index)),
                         spec: TerminalSessionSpec {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),

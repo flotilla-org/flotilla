@@ -11,8 +11,8 @@ use flotilla_resources::{
     canonicalize_repo_url,
     controller::{Actuation, Reconciler},
     controller_patches, reconcile, repo_key, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, InMemoryBackend,
-    InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, TaskPhase, TaskWorkspace,
-    TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, ValidationError, WorkflowTemplate, CONVOY_LABEL,
+    InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, TaskPhase, TaskWorkspace, TaskWorkspacePhase,
+    TaskWorkspaceSpec, TaskWorkspaceStatus, ValidationError, WorkflowTemplate, CONVOY_LABEL,
 };
 
 async fn reconcile_once_with_resources(
@@ -55,10 +55,7 @@ async fn reconcile_once_with_resources(
 
     for presentation in presentations {
         let created = presentations_resolver
-            .create(
-                &presentation_meta(&presentation.metadata.name, &presentation.spec.convoy_ref),
-                &presentation.spec,
-            )
+            .create(&presentation_meta(&presentation.metadata.name, &presentation.spec.convoy_ref), &presentation.spec)
             .await
             .expect("presentation create should succeed");
         if let Some(status) = presentation.status.as_ref() {
@@ -651,14 +648,7 @@ async fn active_convoy_does_not_recreate_existing_presentation() {
     status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
-    let outcome = reconcile_once_with_resources(
-        &convoy,
-        None,
-        Vec::new(),
-        vec![presentation_object("convoy-a")],
-        timestamp(20),
-    )
-    .await;
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), vec![presentation_object("convoy-a")], timestamp(20)).await;
 
     assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreatePresentation { .. })));
 }

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license.workspace = true
 
+[features]
+default = []
+skip-no-sandbox-tests = []
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -19,6 +23,8 @@ tracing = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
+flotilla-controllers = { path = "../flotilla-controllers" }
+flotilla-core = { path = "../flotilla-core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rstest = { workspace = true }
 tempfile = "3"

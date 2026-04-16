@@ -583,26 +583,20 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
     let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
     presentations
-        .create(
-            &resource_meta().name("alpha-presentation").call(),
-            &PresentationSpec {
-                convoy_ref: "alpha".to_string(),
-                presentation_policy_ref: "default".to_string(),
-                name: "alpha".to_string(),
-                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
-            },
-        )
+        .create(&resource_meta().name("alpha-presentation").call(), &PresentationSpec {
+            convoy_ref: "alpha".to_string(),
+            presentation_policy_ref: "default".to_string(),
+            name: "alpha".to_string(),
+            process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
+        })
         .await
         .expect("presentation create should succeed");
     task_workspaces
-        .create(
-            &resource_meta().name("alpha-task").call(),
-            &TaskWorkspaceSpec {
-                convoy_ref: "alpha".to_string(),
-                task: "implement".to_string(),
-                placement_policy_ref: "local".to_string(),
-            },
-        )
+        .create(&resource_meta().name("alpha-task").call(), &TaskWorkspaceSpec {
+            convoy_ref: "alpha".to_string(),
+            task: "implement".to_string(),
+            placement_policy_ref: "local".to_string(),
+        })
         .await
         .expect("task workspace create should succeed");
 

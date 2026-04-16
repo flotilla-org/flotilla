@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-skip-no-sandbox-tests = []
+skip-no-sandbox-tests = ["flotilla-resources/skip-no-sandbox-tests"]
 test-support = ["flotilla-protocol/test-support", "dep:flotilla-client"]
 
 [dependencies]

@@ -256,30 +256,24 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
     let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
 
-    let created = convoys
-        .create(&convoy_meta("convoy-delete"), &task_provisioning_convoy_spec())
-        .await
-        .expect("convoy create should succeed");
+    let created =
+        convoys.create(&convoy_meta("convoy-delete"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
     status.tasks.get_mut("implement").expect("implement").phase = flotilla_resources::TaskPhase::Running;
     status.tasks.get_mut("implement").expect("implement").started_at = Some(timestamp(18));
-    convoys
-        .update_status("convoy-delete", &created.metadata.resource_version, &status)
-        .await
-        .expect("convoy status update should succeed");
+    convoys.update_status("convoy-delete", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
 
     workspaces
         .create(
             &InputMeta::builder()
                 .name("convoy-delete-implement".to_string())
-                .labels([
-                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (TASK_LABEL.to_string(), "implement".to_string()),
-                ]
-                .into_iter()
-                .collect())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "implement".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
                 .build(),
             &flotilla_resources::TaskWorkspaceSpec {
                 convoy_ref: "convoy-delete".to_string(),

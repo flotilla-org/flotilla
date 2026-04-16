@@ -13,10 +13,10 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::{ProviderCategory, ProviderDescriptor},
+        presentation::PresentationManager,
         terminal::TerminalPool,
         types::*,
         vcs::{CheckoutManager, Vcs},
-        presentation::PresentationManager,
     },
 };
 

@@ -189,19 +189,14 @@ tasks:
 #[test]
 fn validate_rejects_reserved_process_label_keys() {
     let mut spec = valid_workflow_template_spec();
-    spec.tasks[0].processes[0]
-        .labels
-        .insert("flotilla.work/convoy".to_string(), "manual".to_string());
+    spec.tasks[0].processes[0].labels.insert("flotilla.work/convoy".to_string(), "manual".to_string());
 
     let errors = validate(&spec).expect_err("reserved labels should fail validation");
-    assert_has_error(
-        &errors,
-        &ValidationError::ReservedLabelKey {
-            task: "implement".to_string(),
-            role: "coder".to_string(),
-            key: "flotilla.work/convoy".to_string(),
-        },
-    );
+    assert_has_error(&errors, &ValidationError::ReservedLabelKey {
+        task: "implement".to_string(),
+        role: "coder".to_string(),
+        key: "flotilla.work/convoy".to_string(),
+    });
 }
 
 #[test]

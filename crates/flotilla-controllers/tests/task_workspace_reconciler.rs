@@ -15,9 +15,9 @@ use flotilla_resources::{
     Checkout, CheckoutSpec, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, DockerCheckoutStrategy,
     DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, PlacementPolicySpec, ProcessDefinition,
-    ProcessSource, ResourceBackend, ResourceError, SnapshotTask, TaskWorkspace, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSpec, TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL,
-    TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    ProcessSource, ResourceBackend, ResourceError, SnapshotTask, TaskWorkspace, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
+    TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL,
+    TASK_WORKSPACE_LABEL,
 };
 use rstest::rstest;
 
@@ -258,17 +258,16 @@ async fn run_finalizer_deletes_all_labeled_children() {
     let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
-    assert!(matches!(backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-finalize").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(
+        backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-finalize").await,
+        Err(ResourceError::NotFound { .. })
+    ));
     assert!(matches!(
         backend.clone().using::<Checkout>(NAMESPACE).get("checkout-workspace-finalize").await,
         Err(ResourceError::NotFound { .. })
     ));
     assert!(matches!(
-        backend
-            .clone()
-            .using::<TerminalSession>(NAMESPACE)
-            .get("terminal-workspace-finalize-coder")
-            .await,
+        backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-finalize-coder").await,
         Err(ResourceError::NotFound { .. })
     ));
 }
@@ -283,7 +282,10 @@ async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
     let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
-    assert!(matches!(backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-partial").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(
+        backend.clone().using::<Environment>(NAMESPACE).get("env-workspace-partial").await,
+        Err(ResourceError::NotFound { .. })
+    ));
 }
 
 #[tokio::test]
@@ -476,6 +478,7 @@ async fn create_convoy_with_labeled_processes(
     convoys.get(name).await.expect("convoy get should succeed")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_running_terminal(
     backend: &ResourceBackend,
     namespace: &str,
@@ -517,16 +520,13 @@ async fn create_labeled_environment(backend: &ResourceBackend, namespace: &str, 
     backend
         .clone()
         .using::<Environment>(namespace)
-        .create(
-            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]),
-            &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec {
-                    host_ref: HOST_REF.to_string(),
-                    repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
-                }),
-                docker: None,
-            },
-        )
+        .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec {
+                host_ref: HOST_REF.to_string(),
+                repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
+            }),
+            docker: None,
+        })
         .await
         .expect("environment create should succeed");
 }
@@ -535,16 +535,13 @@ async fn create_labeled_checkout(backend: &ResourceBackend, namespace: &str, nam
     backend
         .clone()
         .using::<Checkout>(namespace)
-        .create(
-            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]),
-            &CheckoutSpec {
-                env_ref: host_direct_env_name(),
-                r#ref: GIT_REF.to_string(),
-                target_path: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
-                worktree: Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }),
-                fresh_clone: None,
-            },
-        )
+        .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &CheckoutSpec {
+            env_ref: host_direct_env_name(),
+            r#ref: GIT_REF.to_string(),
+            target_path: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
+            worktree: Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }),
+            fresh_clone: None,
+        })
         .await
         .expect("checkout create should succeed");
 }
@@ -553,16 +550,13 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
     backend
         .clone()
         .using::<TerminalSession>(namespace)
-        .create(
-            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]),
-            &TerminalSessionSpec {
-                env_ref: host_direct_env_name(),
-                role: "coder".to_string(),
-                command: "cargo test".to_string(),
-                cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
-                pool: "cleat".to_string(),
-            },
-        )
+        .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &TerminalSessionSpec {
+            env_ref: host_direct_env_name(),
+            role: "coder".to_string(),
+            command: "cargo test".to_string(),
+            cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
+            pool: "cleat".to_string(),
+        })
         .await
         .expect("terminal create should succeed");
 }

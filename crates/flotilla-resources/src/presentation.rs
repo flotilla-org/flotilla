@@ -42,29 +42,15 @@ pub struct PresentationStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresentationStatusPatch {
-    MarkActive {
-        presentation_manager: String,
-        workspace_ref: String,
-        spec_hash: String,
-        ready_at: DateTime<Utc>,
-    },
-    MarkTornDown {
-        message: Option<String>,
-    },
-    MarkFailed {
-        message: String,
-    },
+    MarkActive { presentation_manager: String, workspace_ref: String, spec_hash: String, ready_at: DateTime<Utc> },
+    MarkTornDown { message: Option<String> },
+    MarkFailed { message: String },
 }
 
 impl StatusPatch<PresentationStatus> for PresentationStatusPatch {
     fn apply(&self, status: &mut PresentationStatus) {
         match self {
-            Self::MarkActive {
-                presentation_manager,
-                workspace_ref,
-                spec_hash,
-                ready_at,
-            } => {
+            Self::MarkActive { presentation_manager, workspace_ref, spec_hash, ready_at } => {
                 status.phase = PresentationPhase::Active;
                 status.observed_presentation_manager = Some(presentation_manager.clone());
                 status.observed_workspace_ref = Some(workspace_ref.clone());

@@ -172,7 +172,7 @@ pub enum PresentationStatusPatch {
         spec_hash: String,
         ready_at: DateTime<Utc>,
     },
-    MarkTornDown,                       // workspace deleted; no observed_workspace_ref/manager/hash
+    MarkTornDown { message: Option<String> }, // workspace deleted; clears observed_workspace_ref/manager/hash
     MarkFailed { message: String },
 }
 ```
@@ -311,7 +311,7 @@ When the deferred stage-4a item "Convoy launched against an existing Checkout" l
 ```rust
 #[async_trait]
 pub trait PresentationRuntime: Send + Sync {
-    async fn apply(&self, plan: &PresentationPlan) -> Result<AppliedPresentation, String>;
+    async fn apply(&self, plan: &PresentationPlan) -> Result<AppliedPresentation, ApplyPresentationError>;
     async fn tear_down(&self, manager: &str, workspace_ref: &str) -> Result<(), String>;
 }
 
@@ -335,6 +335,12 @@ pub struct AppliedPresentation {
     pub spec_hash: String,
 }
 
+pub enum ApplyPresentationError {
+    UnknownPolicy(String),
+    RetryFromCleanSlate(String),   // previous workspace was torn down; clear observed_* so the next reconcile retries apply
+    Failed(String),
+}
+
 pub struct PresentationReconciler<R> {
     runtime: Arc<R>,
     terminal_sessions: TypedResolver<TerminalSession>,
@@ -346,7 +352,7 @@ pub struct PresentationReconciler<R> {
 pub enum PresentationDeps {
     InSync,                      // sessions match observed_spec_hash; no action
     Applied(AppliedPresentation),
-    TornDown,                    // sessions empty; tear_down succeeded (or there was nothing to tear down)
+    TornDown { message: Option<String> }, // workspace deleted (or there was nothing to tear down); clears observed_*
     Failed(String),
     UnknownPolicy(String),
 }
@@ -364,14 +370,15 @@ pub enum PresentationDeps {
 5. Sort the resolved process list by `(task_ordinal_label, process_ordinal_label, session_name)` — deterministic regardless of backend list order.
 6. Compute `spec_hash = hash((policy_ref, sorted_process_list))` over the sorted list (role, command, labels).
 7. **If the sorted process list is empty:**
-   - If `status.observed_workspace_ref` is `Some` → `runtime.tear_down(manager, ws_ref)` → `Deps::TornDown`.
+   - If `status.observed_workspace_ref` is `Some` → `runtime.tear_down(manager, ws_ref)` → `Deps::TornDown { message: None }`.
    - Else → `Deps::InSync` (nothing live, nothing to tear down).
 8. **Else:**
    - If `status.observed_spec_hash == spec_hash` → `Deps::InSync`.
    - Else `runtime.apply(PresentationPlan { previous: status_derived, ... }).await`:
      - `Ok(applied)` → `Deps::Applied(applied)`.
-     - `Err(msg)` if unknown policy → `Deps::UnknownPolicy(name)`.
-     - `Err(msg)` otherwise → `Deps::Failed(msg)`.
+     - `Err(ApplyPresentationError::UnknownPolicy(name))` → `Deps::UnknownPolicy(name)`.
+     - `Err(ApplyPresentationError::RetryFromCleanSlate(msg))` → `Deps::TornDown { message: Some(msg) }`.
+     - `Err(ApplyPresentationError::Failed(msg))` → `Deps::Failed(msg)`.
 
 ### `reconcile`
 
@@ -379,7 +386,7 @@ Pure. Deps → status patch:
 
 - `Deps::InSync` → `None`.
 - `Deps::Applied(a)` → `Some(MarkActive { ... })`.
-- `Deps::TornDown` → `Some(MarkTornDown)`.
+- `Deps::TornDown { message }` → `Some(MarkTornDown { message })`.
 - `Deps::Failed(msg)` → `Some(MarkFailed { message: msg })`.
 - `Deps::UnknownPolicy(name)` → `Some(MarkFailed { message: format!("unknown presentation policy '{name}'") })`.
 
@@ -425,30 +432,37 @@ pub struct ProviderPresentationRuntime {
 
 #[async_trait]
 impl PresentationRuntime for ProviderPresentationRuntime {
-    async fn apply(&self, plan: &PresentationPlan) -> Result<AppliedPresentation, String> {
+    async fn apply(&self, plan: &PresentationPlan) -> Result<AppliedPresentation, ApplyPresentationError> {
         let policy = self.policies.resolve(&plan.policy)
-            .ok_or_else(|| format!("unknown presentation policy '{}'", plan.policy))?;
+            .ok_or_else(|| ApplyPresentationError::UnknownPolicy(plan.policy.clone()))?;
+        let (new_manager_name, new_manager) = self.registry.presentation_managers.preferred_with_desc()
+            .ok_or_else(|| ApplyPresentationError::Failed("no presentation manager configured".to_string()))?;
+        let RenderedWorkspace { attach_request } = policy.render(&plan.processes, &PolicyContext {
+            name: plan.name.clone(),
+            presentation_local_cwd: plan.presentation_local_cwd.clone(),
+        });
 
         // Delete the old workspace via the manager that CREATED it — not the current preferred.
         // If the preferred manager changed between apply() calls, a cross-manager replace is correct:
         // old teardown happens via old manager, new creation via current preferred.
+        let mut tore_down_previous = false;
         if let Some(prev) = &plan.previous {
             if let Some(old_mgr) = self.registry.presentation_managers.get(&prev.presentation_manager) {
                 let _ = old_mgr.delete_workspace(&prev.workspace_ref).await;
+                tore_down_previous = true;
             } else {
                 // Old manager no longer configured. Log; the workspace is effectively leaked on that backend.
                 tracing::warn!(manager = %prev.presentation_manager, ws = %prev.workspace_ref,
                     "previous presentation manager unavailable; old workspace may be leaked");
             }
         }
-
-        let (new_manager_name, new_manager) = self.registry.presentation_managers.preferred_with_desc()
-            .ok_or_else(|| "no presentation manager configured".to_string())?;
-        let RenderedWorkspace { attach_request } = policy.render(&plan.processes, &PolicyContext {
-            name: plan.name.clone(),
-            presentation_local_cwd: plan.presentation_local_cwd.clone(),
-        });
-        let (ws_ref, _) = new_manager.create_workspace(&attach_request).await?;
+        let (ws_ref, _) = new_manager.create_workspace(&attach_request).await.map_err(|err| {
+            if tore_down_previous {
+                ApplyPresentationError::RetryFromCleanSlate(err)
+            } else {
+                ApplyPresentationError::Failed(err)
+            }
+        })?;
 
         Ok(AppliedPresentation {
             presentation_manager: new_manager_name.to_string(),
@@ -465,7 +479,7 @@ impl PresentationRuntime for ProviderPresentationRuntime {
 }
 ```
 
-Best-effort delete for the previous workspace means a partial failure (delete ok, create fails) leaves the Presentation without a live workspace but with the old `observed_*` fields cleared; next reconcile sees no observed workspace and attempts apply with `previous: None`. Documented as an accepted v1 limitation.
+If replace tears down the previous workspace and creation then fails, `apply()` returns `RetryFromCleanSlate`. The reconciler records `MarkTornDown { message: Some(...) }`, clearing `observed_*` so the next reconcile retries from a clean slate. If teardown never happened (for example, no preferred manager is configured before any delete starts), the reconciler records `MarkFailed` and preserves the observed workspace reference.
 
 ## Convoy Reconciler Extension
 
@@ -477,6 +491,15 @@ pub enum Actuation {
     DeleteTaskWorkspace { name: String },          // NEW — per-task lifecycle tie-in
 }
 ```
+
+### Controller infrastructure change
+
+`crates/flotilla-resources/src/controller/mod.rs` must grow matching actuation handling:
+
+- `CreatePresentation` → `create_if_missing()` against the `Presentation` resolver.
+- `DeletePresentation` / `DeleteTaskWorkspace` → `resolver.delete(name)`, treating `NotFound` as success for idempotence.
+
+Stage 5 depends on delete actuations being first-class controller operations, not reconciler-local side effects.
 
 ### Presentation creation/deletion on phase transitions
 
@@ -491,6 +514,8 @@ pub enum Actuation {
 - Convoy transitions to `Completed` / `Failed` / `Cancelled` → emit `DeletePresentation { name }`.
 
 The presentation creation site is the single swap point for future explicit-trigger creation policies.
+
+Cleanup planning must happen **before** the convoy reconciler's current terminal-phase short-circuit. Today `reconcile_internal()` returns immediately for `Completed` / `Failed` / `Cancelled`. Stage 5 moves that guard after the one-shot teardown-planning pass (or splits reconcile into cleanup + steady-state passes) so a convoy that has just entered a terminal phase can still emit `DeletePresentation` / `DeleteTaskWorkspace` actuations exactly once.
 
 ### Convoy finalizer (new in stage 5)
 
@@ -543,6 +568,7 @@ This revises the stage 4a deferred item "Auto-cleanup of stopped sessions on ter
 - Second reconcile, unchanged world → `Deps::InSync`, no runtime call, status unchanged.
 - Session deleted (task completed → cascade) leaving some remaining → next reconcile recomputes, new hash, `apply` called with `previous` populated from current status, status updates.
 - **All sessions deleted, observed workspace present** → `tear_down` called with observed manager + ws_ref, status → `TornDown` with `observed_*` cleared.
+- **Replace create fails after old workspace delete** → `apply` returns `RetryFromCleanSlate`, status → `TornDown { message: Some(..) }`, and the next reconcile retries with `previous: None`.
 - From `TornDown`, sessions reappear → `apply` called with `previous: None`, status → `Active`.
 - **Cross-manager replace**: simulate `prev.presentation_manager` differs from current preferred → `delete_workspace` goes to prev's manager, `create_workspace` goes to current preferred.
 - **Previous manager no longer configured**: `apply` logs a warning, proceeds with create via current preferred (old workspace leaked on absent backend — asserted via recorded call list).
@@ -556,8 +582,14 @@ This revises the stage 4a deferred item "Auto-cleanup of stopped sessions on ter
 - Convoy → Active → `CreatePresentation` actuation emitted.
 - Convoy → Active twice (re-reconcile) → only one Presentation created (idempotent).
 - Convoy → Completed → `DeletePresentation { name }` emitted.
+- **Terminal-phase cleanup ordering**: once a convoy first reaches `Completed` / `Failed` / `Cancelled`, the reconciler still emits teardown actuations before it settles into the steady-state terminal no-op path.
 - **Per-task lifecycle**: task transitions to Completed → `DeleteTaskWorkspace { name }` emitted for that task's workspace; sibling tasks still Running do not have their workspaces deleted.
 - **Convoy finalizer**: direct Convoy delete while Active → finalizer deletes Presentation + all labelled TaskWorkspaces; finalizer is removed and Convoy object deletes.
+
+### Controller loop tests
+
+- `CreatePresentation` actuation creates the resource if missing and ignores `Conflict`.
+- `DeletePresentation` / `DeleteTaskWorkspace` actuations delete the resource and ignore `NotFound`.
 
 ### TaskWorkspace finalizer tests
 
@@ -588,12 +620,13 @@ Stage 5 ships:
 1. Rename: `WorkspaceManager` → `PresentationManager` (trait + module + config key + registry field + impls).
 2. `delete_workspace` method on `PresentationManager` trait + impl per multiplexer.
 3. `Presentation` resource + reconciler + `PresentationRuntime` trait + `ProviderPresentationRuntime` impl + `PresentationPolicyRegistry` with `DefaultPolicy`.
-4. `labels: BTreeMap<String, String>` on `ProcessDefinition`; reserved `flotilla.work/` prefix with `WorkflowTemplate::validate` enforcement.
-5. `build_session_labels` helper in the task_workspace reconciler; `TASK_ORDINAL_LABEL` / `PROCESS_ORDINAL_LABEL` + existing labels.
-6. Convoy reconciler extensions: `CreatePresentation` / `DeletePresentation` / `DeleteTaskWorkspace` actuations on phase transitions.
-7. **Convoy finalizer** (new): deletes Presentation and all labelled TaskWorkspaces on direct Convoy delete.
-8. **TaskWorkspace finalizer** (new): deletes child TerminalSession / Environment / Checkout resources **by label selector** (robust to partial provisioning).
-9. Test coverage above.
+4. Controller actuation plumbing for `CreatePresentation`, `DeletePresentation`, and `DeleteTaskWorkspace`, including idempotent delete semantics.
+5. `labels: BTreeMap<String, String>` on `ProcessDefinition`; reserved `flotilla.work/` prefix with `WorkflowTemplate::validate` enforcement.
+6. `build_session_labels` helper in the task_workspace reconciler; `TASK_ORDINAL_LABEL` / `PROCESS_ORDINAL_LABEL` + existing labels.
+7. Convoy reconciler extensions: `CreatePresentation` / `DeletePresentation` / `DeleteTaskWorkspace` actuations on phase transitions, with teardown planning ordered ahead of the terminal-phase no-op guard.
+8. **Convoy finalizer** (new): deletes Presentation and all labelled TaskWorkspaces on direct Convoy delete.
+9. **TaskWorkspace finalizer** (new): deletes child TerminalSession / Environment / Checkout resources **by label selector** (robust to partial provisioning).
+10. Test coverage above.
 
 ## Out of Scope
 
@@ -616,4 +649,3 @@ Stage 5 ships:
 3. **Silent selector breakage.** A missed well-known label on a TerminalSession silently excludes it from the Presentation. Mitigation: `flotilla-resources::labels` constants + `build_session_labels` helper used uniformly by the task_workspace reconciler.
 4. **Non-atomic replace.** Delete succeeds then create fails → Presentation has no live workspace but `observed_*` are cleared. Next reconcile sees no observed workspace and retries `apply` with `previous: None`. Acceptable for v1.
 5. **Cross-manager replace in flight.** If a user changes the preferred presentation manager mid-flight, the next `apply` tears down the old via the old manager and creates new via current preferred — correct but briefly disorienting. If the old manager was removed from config entirely, the old workspace is leaked on that backend (logged). Rare, and no-backcompat phase tolerates it.
-
