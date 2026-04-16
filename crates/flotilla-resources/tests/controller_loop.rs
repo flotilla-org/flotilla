@@ -10,8 +10,9 @@ use std::{
 
 use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
-    controller::{ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
-    ApiPaths, InMemoryBackend, InputMeta, NoStatusPatch, Resource, ResourceBackend, ResourceError, ResourceObject,
+    controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
+    ApiPaths, InMemoryBackend, InputMeta, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, TaskWorkspace, TaskWorkspaceSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::timeout};
@@ -134,6 +135,37 @@ impl flotilla_resources::controller::SecondaryWatch for RestartingSecondaryWatch
             self.spawns.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
+    }
+}
+
+#[derive(Clone)]
+struct ActuatingReconciler {
+    actuation: Actuation,
+}
+
+impl Reconciler for ActuatingReconciler {
+    type Resource = PrimaryResource;
+    type Dependencies = ();
+
+    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Dependencies,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        ReconcileOutcome::with_actuations(None, vec![self.actuation.clone()])
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -496,6 +528,133 @@ async fn secondary_watch_restart_is_backed_off() {
     })
     .await
     .expect("secondary watch should restart once the backoff elapses");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_applies_create_presentation_actuation() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let presentations = backend.clone().using::<Presentation>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::CreatePresentation {
+                    meta: resource_meta().name("alpha-presentation").call(),
+                    spec: PresentationSpec {
+                        convoy_ref: "alpha".to_string(),
+                        presentation_policy_ref: "default".to_string(),
+                        name: "alpha".to_string(),
+                        process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
+                    },
+                },
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if presentations.get("alpha-presentation").await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("create presentation actuation should create the resource");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_applies_delete_actuations_idempotently() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let presentations = backend.clone().using::<Presentation>("flotilla");
+    let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    presentations
+        .create(
+            &resource_meta().name("alpha-presentation").call(),
+            &PresentationSpec {
+                convoy_ref: "alpha".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "alpha".to_string(),
+                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    task_workspaces
+        .create(
+            &resource_meta().name("alpha-task").call(),
+            &TaskWorkspaceSpec {
+                convoy_ref: "alpha".to_string(),
+                task: "implement".to_string(),
+                placement_policy_ref: "local".to_string(),
+            },
+        )
+        .await
+        .expect("task workspace create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler { actuation: Actuation::DeletePresentation { name: "alpha-presentation".to_string() } },
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(presentations.get("alpha-presentation").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete presentation actuation should remove the resource");
+
+    harness.shutdown().await;
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler { actuation: Actuation::DeleteTaskWorkspace { name: "alpha-task".to_string() } },
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(task_workspaces.get("alpha-task").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete task workspace actuation should remove the resource");
+
+    task_workspaces.delete("alpha-task").await.expect_err("resource should already be gone");
 
     harness.shutdown().await;
 }
