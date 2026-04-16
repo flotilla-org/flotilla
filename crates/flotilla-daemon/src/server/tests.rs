@@ -1140,10 +1140,10 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
         let mut workspace_started = false;
         loop {
             match rx.recv().await.expect("broadcast channel should stay open") {
-                DaemonEvent::CommandStepUpdate { command_id: id, description, status, .. } if id == command_id => {
-                    if description == "Attach workspace" && status == StepStatus::Started {
-                        workspace_started = true;
-                    }
+                DaemonEvent::CommandStepUpdate { command_id: id, description, status, .. }
+                    if id == command_id && description == "Attach workspace" && status == StepStatus::Started =>
+                {
+                    workspace_started = true;
                 }
                 DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => {
                     return (workspace_started, result);
