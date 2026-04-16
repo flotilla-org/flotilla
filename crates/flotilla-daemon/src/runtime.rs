@@ -8,8 +8,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler,
-    TaskWorkspaceReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
+    CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, HopChainContext,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TaskWorkspaceReconciler, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler,
 };
 use flotilla_core::{
     config::ConfigStore,
@@ -28,7 +29,7 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, repo_key, Clone, CloneSpec, Convoy,
     ConvoyReconciler, DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError, ResourceObject, TaskWorkspace, WorkflowTemplate,
+    PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, TaskWorkspace, WorkflowTemplate,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -89,11 +90,14 @@ impl DaemonRuntime {
             vec![spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval)];
 
         if options.start_controllers {
+            let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(ControllerRuntimeState::new(
                 daemon,
                 config,
                 local_registry,
                 daemon_socket_path.map(DaemonHostPath::new),
+                profile.host_id.clone(),
+                local_repo_root,
                 profile.host_direct_environment_name(),
             ));
             tasks.extend(spawn_controller_loops(state, &options.namespace, options.controller_resync_interval));
@@ -140,6 +144,8 @@ struct ControllerRuntimeState {
     config: Arc<ConfigStore>,
     local_registry: Arc<ProviderRegistry>,
     daemon_socket_path: Option<DaemonHostPath>,
+    local_host_ref: String,
+    local_repo_root: Option<ExecutionEnvironmentPath>,
     host_direct_environment_name: String,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     active_sessions: Mutex<HashMap<String, ActiveSession>>,
@@ -151,6 +157,8 @@ impl ControllerRuntimeState {
         config: Arc<ConfigStore>,
         local_registry: Arc<ProviderRegistry>,
         daemon_socket_path: Option<DaemonHostPath>,
+        local_host_ref: String,
+        local_repo_root: Option<ExecutionEnvironmentPath>,
         host_direct_environment_name: String,
     ) -> Self {
         Self {
@@ -158,6 +166,8 @@ impl ControllerRuntimeState {
             config,
             local_registry,
             daemon_socket_path,
+            local_host_ref,
+            local_repo_root,
             host_direct_environment_name,
             provisioned_environments: Mutex::new(HashMap::new()),
             active_sessions: Mutex::new(HashMap::new()),
@@ -535,13 +545,56 @@ fn spawn_controller_loops(
             }
         }),
         tokio::spawn({
+            let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let state = Arc::clone(&state);
+            async move {
+                let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
+                let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
+                let mut hop_chain = HopChainContext::new(
+                    state.local_host_ref.clone(),
+                    state.daemon.host_name().clone(),
+                    state.config.base_path().clone(),
+                    {
+                        let state = Arc::clone(&state);
+                        move |env_ref| {
+                            if env_ref == state.host_direct_environment_name {
+                                return Ok(Arc::clone(&state.local_registry));
+                            }
+                            state
+                                .daemon
+                                .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
+                                .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
+                        }
+                    },
+                );
+                if let Some(repo_root) = state.local_repo_root.clone() {
+                    hop_chain = hop_chain.with_repo_root(repo_root);
+                }
+
+                if let Err(err) = (ControllerLoop {
+                    primary: backend.clone().using::<Presentation>(&namespace_string),
+                    secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
+                    reconciler: PresentationReconciler::new(runtime, backend.clone(), &namespace_string, hop_chain, policies),
+                    resync_interval: controller_resync_interval,
+                    backend: backend.clone(),
+                })
+                .run()
+                .await
+                {
+                    error!(controller = "presentation", %err, "controller loop exited");
+                }
+            }
+        }),
+        tokio::spawn({
             let namespace_string = namespace_string.clone();
             async move {
                 if let Err(err) = (ControllerLoop {
                     primary: backend.clone().using::<Convoy>(&namespace_string),
                     secondaries: ConvoyReconciler::secondary_watches(),
                     reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
-                        .with_task_workspaces(backend.clone().using::<TaskWorkspace>(&namespace_string)),
+                        .with_task_workspaces(backend.clone().using::<TaskWorkspace>(&namespace_string))
+                        .with_presentations(backend.clone().using::<Presentation>(&namespace_string)),
                     resync_interval: controller_resync_interval,
                     backend,
                 })
@@ -1014,6 +1067,8 @@ mod tests {
             Arc::clone(&config),
             passthrough_registry(),
             None,
+            profile.host_id.clone(),
+            Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
         let controller_handles = spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25));

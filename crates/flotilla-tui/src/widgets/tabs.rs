@@ -192,21 +192,17 @@ impl Tabs {
                     TabBarAction::None => {}
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if self.drag.dragging_tab.is_some() && !self.drag.active {
-                    let dx = (x as i16 - self.drag.start_x as i16).unsigned_abs();
-                    if dx >= 2 {
-                        self.drag.active = true;
-                    }
+            MouseEventKind::Drag(MouseButton::Left) if self.drag.dragging_tab.is_some() && !self.drag.active => {
+                let dx = (x as i16 - self.drag.start_x as i16).unsigned_abs();
+                if dx >= 2 {
+                    self.drag.active = true;
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.drag.dragging_tab.take().is_some() {
-                    if self.drag.active {
-                        actions.push(AppAction::SaveTabOrder);
-                    }
-                    self.drag.active = false;
+            MouseEventKind::Up(MouseButton::Left) if self.drag.dragging_tab.take().is_some() => {
+                if self.drag.active {
+                    actions.push(AppAction::SaveTabOrder);
                 }
+                self.drag.active = false;
             }
             _ => {}
         }

@@ -15,7 +15,7 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     providers::discovery::test_support::{
         fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, FakeDiscoveryProviders,
-        FakeWorkspaceManager,
+        FakePresentationManager,
     },
 };
 use flotilla_protocol::{
@@ -891,9 +891,9 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let workspace_manager = Arc::new(FakeWorkspaceManager::new());
+    let workspace_manager = Arc::new(FakePresentationManager::new());
     let discovery =
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager.clone() as Arc<_>));
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_presentation_manager(workspace_manager.clone() as Arc<_>));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -1063,9 +1063,9 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let workspace_manager = Arc::new(FakeWorkspaceManager::new());
+    let workspace_manager = Arc::new(FakePresentationManager::new());
     let discovery =
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_workspace_manager(workspace_manager.clone() as Arc<_>));
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_presentation_manager(workspace_manager.clone() as Arc<_>));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
@@ -1140,10 +1140,10 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
         let mut workspace_started = false;
         loop {
             match rx.recv().await.expect("broadcast channel should stay open") {
-                DaemonEvent::CommandStepUpdate { command_id: id, description, status, .. } if id == command_id => {
-                    if description == "Attach workspace" && status == StepStatus::Started {
-                        workspace_started = true;
-                    }
+                DaemonEvent::CommandStepUpdate { command_id: id, description, status, .. }
+                    if id == command_id && description == "Attach workspace" && status == StepStatus::Started =>
+                {
+                    workspace_started = true;
                 }
                 DaemonEvent::CommandFinished { command_id: id, result, .. } if id == command_id => {
                     return (workspace_started, result);

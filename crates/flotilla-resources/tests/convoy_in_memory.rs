@@ -1,11 +1,13 @@
 mod common;
 
 use common::{
-    convoy_meta, task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object, valid_convoy_spec, workflow_template_meta,
+    bootstrapped_tool_only_convoy_status, convoy_meta, task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object,
+    valid_convoy_spec, workflow_template_meta,
 };
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyPhase, ConvoyReconciler, InMemoryBackend,
-    ResourceBackend, ResourceError, TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatus, WorkflowTemplate,
+    InputMeta, Presentation, PresentationSpec, ResourceBackend, ResourceError, TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatus,
+    WorkflowTemplate, CONVOY_LABEL, TASK_LABEL,
 };
 use tokio::time::{timeout, Duration};
 
@@ -243,6 +245,100 @@ async fn controller_loop_advances_task_via_task_workspace_secondary_watch() {
     })
     .await
     .expect("controller loop should advance the task to running after the workspace becomes ready");
+
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let presentations = backend.clone().using::<Presentation>("flotilla");
+
+    let created =
+        convoys.create(&convoy_meta("convoy-delete"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    status.tasks.get_mut("implement").expect("implement").phase = flotilla_resources::TaskPhase::Running;
+    status.tasks.get_mut("implement").expect("implement").started_at = Some(timestamp(18));
+    convoys.update_status("convoy-delete", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
+
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-implement".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "implement".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build(),
+            &flotilla_resources::TaskWorkspaceSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                task: "implement".to_string(),
+                placement_policy_ref: "laptop-docker".to_string(),
+            },
+        )
+        .await
+        .expect("task workspace create should succeed");
+    presentations
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-presentation".to_string())
+                .labels([(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect())
+                .build(),
+            &PresentationSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "convoy-delete".to_string(),
+                process_selector: [(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect(),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: ConvoyReconciler::secondary_watches(),
+            reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
+                .with_task_workspaces(workspaces.clone())
+                .with_presentations(presentations.clone()),
+            resync_interval: Duration::from_millis(50),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let convoy = convoys.get("convoy-delete").await.expect("convoy get should succeed");
+            if convoy.metadata.finalizers == vec!["flotilla.work/convoy-teardown".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should attach convoy finalizer");
+
+    convoys.delete("convoy-delete").await.expect("convoy delete should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
+                && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
+                && matches!(presentations.get("convoy-delete-presentation").await, Err(ResourceError::NotFound { .. }))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("convoy finalizer should delete presentation and task workspaces");
 
     loop_task.abort();
 }

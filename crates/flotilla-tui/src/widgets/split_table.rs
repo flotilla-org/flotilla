@@ -616,8 +616,8 @@ impl SplitTable {
         // Build per-host home directories for remote path shortening.
         let host_home_dirs: HashMap<HostName, std::path::PathBuf> = model
             .hosts
-            .iter()
-            .filter_map(|(_, state)| state.summary.system.home_dir.as_ref().map(|d| (state.host_name.clone(), d.clone())))
+            .values()
+            .filter_map(|state| state.summary.system.home_dir.as_ref().map(|d| (state.host_name.clone(), d.clone())))
             .collect();
 
         let providers = model.active_opt().map(|r| r.providers.as_ref());

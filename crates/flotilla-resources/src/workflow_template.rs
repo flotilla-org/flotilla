@@ -35,6 +35,9 @@ pub struct ProcessDefinition {
     pub role: String,
     #[serde(flatten)]
     pub source: ProcessSource,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +62,7 @@ pub struct Selector {
 pub enum ValidationError {
     DuplicateTaskName { name: String },
     DuplicateRoleInTask { task: String, role: String },
+    ReservedLabelKey { task: String, role: String, key: String },
     UnknownDependency { task: String, missing: String },
     DependencyCycle { cycle: Vec<String> },
     DuplicateInputName { name: String },
@@ -139,6 +143,16 @@ fn validate_task(
     for process in &task.processes {
         if !roles.insert(process.role.clone()) {
             push_error(errors, ValidationError::DuplicateRoleInTask { task: task.name.clone(), role: process.role.clone() });
+        }
+
+        for key in process.labels.keys() {
+            if key.starts_with(crate::labels::RESERVED_PREFIX) {
+                push_error(errors, ValidationError::ReservedLabelKey {
+                    task: task.name.clone(),
+                    role: process.role.clone(),
+                    key: key.clone(),
+                });
+            }
         }
 
         match &process.source {
@@ -256,11 +270,10 @@ fn validate_token(token: &str, location: &InterpolationLocation, declared_inputs
     }
 
     match segments.as_slice() {
-        ["inputs", input_name] => {
-            if !declared_inputs.contains(*input_name) {
-                push_error(errors, ValidationError::UnknownInputReference { location: location.clone(), name: (*input_name).to_string() });
-            }
+        ["inputs", input_name] if !declared_inputs.contains(*input_name) => {
+            push_error(errors, ValidationError::UnknownInputReference { location: location.clone(), name: (*input_name).to_string() });
         }
+        ["inputs", _] => {}
         ["workflow", "name"] | ["workflow", "namespace"] => {}
         ["workflow", field] => {
             push_error(errors, ValidationError::UnknownWorkflowField { location: location.clone(), name: (*field).to_string() })

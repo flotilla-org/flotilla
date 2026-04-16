@@ -7,15 +7,14 @@ use flotilla_resources::{
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
     FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, ProcessSource, Resource, ResourceBackend, ResourceError, ResourceObject, TaskWorkspace, TaskWorkspacePhase,
-    TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TypedResolver,
+    PlacementPolicySpec, ProcessDefinition, ProcessSource, Resource, ResourceBackend, ResourceError, ResourceObject, TaskWorkspace,
+    TaskWorkspacePhase, TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, CONVOY_LABEL,
+    PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
 };
 
-const TASK_WORKSPACE_LABEL: &str = "flotilla.work/task_workspace";
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
-const ROLE_LABEL: &str = "flotilla.work/role";
 
 pub struct TaskWorkspaceReconciler {
     convoys: TypedResolver<Convoy>,
@@ -136,13 +135,13 @@ impl Reconciler for TaskWorkspaceReconciler {
             Err(message) => return Ok(TaskWorkspaceDeps::failed(message)),
         };
 
-        let task = match convoy
+        let (task_index, task) = match convoy
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .and_then(|snapshot| snapshot.tasks.iter().find(|task| task.name == obj.spec.task).cloned())
+            .and_then(|snapshot| snapshot.tasks.iter().enumerate().find(|(_, task)| task.name == obj.spec.task))
         {
-            Some(task) => task,
+            Some((task_index, task)) => (task_index, task),
             None => return Ok(TaskWorkspaceDeps::failed(format!("task {} missing from convoy snapshot", obj.spec.task))),
         };
 
@@ -392,7 +391,7 @@ impl Reconciler for TaskWorkspaceReconciler {
         };
 
         let mut terminal_refs = Vec::new();
-        for process in &task.processes {
+        for (process_index, process) in task.processes.iter().enumerate() {
             let command = match &process.source {
                 ProcessSource::Tool { command } => command.clone(),
                 ProcessSource::Agent { .. } => {
@@ -421,7 +420,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                 }
                 Err(ResourceError::NotFound { .. }) => {
                     actuations.push(Actuation::CreateTerminalSession {
-                        meta: owned_child_meta(&terminal_name, obj, BTreeMap::from([(ROLE_LABEL.to_string(), process.role.clone())])),
+                        meta: owned_child_meta(&terminal_name, obj, build_session_labels(obj, process, task_index, process_index)),
                         spec: TerminalSessionSpec {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),
@@ -466,12 +465,18 @@ impl Reconciler for TaskWorkspaceReconciler {
         ReconcileOutcome::with_actuations(patch, deps.actuations.clone())
     }
 
-    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        let selector = BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), obj.metadata.name.clone())]);
+
+        delete_matching(&self.terminal_sessions, &selector).await?;
+        delete_matching(&self.checkouts, &selector).await?;
+        delete_matching(&self.environments, &selector).await?;
+
         Ok(())
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
-        None
+        Some("flotilla.work/task-workspace-teardown")
     }
 }
 
@@ -547,6 +552,33 @@ fn owned_child_meta(name: &str, workspace: &ResourceObject<TaskWorkspace>, mut e
             controller: true,
         }])
         .build()
+}
+
+fn build_session_labels(
+    workspace: &ResourceObject<TaskWorkspace>,
+    process: &ProcessDefinition,
+    task_index: usize,
+    process_index: usize,
+) -> BTreeMap<String, String> {
+    let mut labels = process.labels.clone();
+    labels.insert(TASK_WORKSPACE_LABEL.to_string(), workspace.metadata.name.clone());
+    labels.insert(ROLE_LABEL.to_string(), process.role.clone());
+    labels.insert(CONVOY_LABEL.to_string(), workspace.spec.convoy_ref.clone());
+    labels.insert(TASK_LABEL.to_string(), workspace.spec.task.clone());
+    labels.insert(TASK_ORDINAL_LABEL.to_string(), format!("{task_index:03}"));
+    labels.insert(PROCESS_ORDINAL_LABEL.to_string(), format!("{process_index:03}"));
+    labels
+}
+
+async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
+    let listed = resolver.list_matching_labels(selector).await?;
+    for object in listed.items {
+        match resolver.delete(&object.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 impl PlacementStrategy {

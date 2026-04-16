@@ -187,6 +187,38 @@ tasks:
 }
 
 #[test]
+fn validate_rejects_reserved_process_label_keys() {
+    let mut spec = valid_workflow_template_spec();
+    spec.tasks[0].processes[0].labels.insert("flotilla.work/convoy".to_string(), "manual".to_string());
+
+    let errors = validate(&spec).expect_err("reserved labels should fail validation");
+    assert_has_error(&errors, &ValidationError::ReservedLabelKey {
+        task: "implement".to_string(),
+        role: "coder".to_string(),
+        key: "flotilla.work/convoy".to_string(),
+    });
+}
+
+#[test]
+fn validate_allows_non_reserved_process_label_keys() {
+    let spec = parse_spec(
+        r#"
+inputs: []
+tasks:
+  - name: implement
+    processes:
+      - role: build
+        command: cargo test
+        labels:
+          service: api
+          queue: fast-lane
+"#,
+    );
+
+    assert!(validate(&spec).is_ok(), "non-reserved labels should validate");
+}
+
+#[test]
 fn parser_round_trip_preserves_sample_workflow() {
     let first: WorkflowTemplateDocument = serde_yml::from_str(valid_workflow_template_yaml()).expect("parse workflow template document");
     let encoded = serde_yml::to_string(&first.spec).expect("serialize workflow template spec");

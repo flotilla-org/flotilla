@@ -300,14 +300,12 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
 
     for item in &group.items {
         match (&item.kind, &item.source_key) {
-            (CorItemKind::Checkout, ProviderItemKey::Checkout(path)) => {
-                if checkout_ref.is_none() {
-                    let is_main_checkout = providers.checkouts.get(path).is_some_and(|co| co.is_main);
-                    checkout_ref = Some(CheckoutRef::from_qualified_path(path.clone(), is_main_checkout));
-                    host =
-                        path.host_name().cloned().or_else(|| providers.checkouts.get(path).and_then(|checkout| checkout.host_name.clone()));
-                }
+            (CorItemKind::Checkout, ProviderItemKey::Checkout(path)) if checkout_ref.is_none() => {
+                let is_main_checkout = providers.checkouts.get(path).is_some_and(|co| co.is_main);
+                checkout_ref = Some(CheckoutRef::from_qualified_path(path.clone(), is_main_checkout));
+                host = path.host_name().cloned().or_else(|| providers.checkouts.get(path).and_then(|checkout| checkout.host_name.clone()));
             }
+            (CorItemKind::Checkout, ProviderItemKey::Checkout(_)) => {}
             (CorItemKind::AttachableSet, ProviderItemKey::AttachableSet(id)) => {
                 attachable_set_id.get_or_insert_with(|| id.clone());
                 if host.is_none() {
@@ -320,25 +318,23 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
             (CorItemKind::ChangeRequest, ProviderItemKey::ChangeRequest(id)) => {
                 change_request_key = Some(id.clone());
             }
-            (CorItemKind::CloudSession, ProviderItemKey::Session(id)) => {
-                if session_key.is_none() {
-                    session_key = Some(id.clone());
-                }
+            (CorItemKind::CloudSession, ProviderItemKey::Session(id)) if session_key.is_none() => {
+                session_key = Some(id.clone());
             }
+            (CorItemKind::CloudSession, ProviderItemKey::Session(_)) => {}
             (CorItemKind::Agent, ProviderItemKey::Agent(id)) => {
                 agent_keys.push(id.clone());
                 if agent_key.is_none() {
                     agent_key = Some(id.clone());
                 }
             }
-            (CorItemKind::Workspace, ProviderItemKey::Workspace(ws_ref)) => {
-                if providers.workspaces.contains_key(ws_ref.as_str()) {
-                    workspace_refs.push(ws_ref.clone());
-                    if attachable_set_id.is_none() {
-                        attachable_set_id = providers.workspaces.get(ws_ref).and_then(|ws| ws.attachable_set_id.clone());
-                    }
+            (CorItemKind::Workspace, ProviderItemKey::Workspace(ws_ref)) if providers.workspaces.contains_key(ws_ref.as_str()) => {
+                workspace_refs.push(ws_ref.clone());
+                if attachable_set_id.is_none() {
+                    attachable_set_id = providers.workspaces.get(ws_ref).and_then(|ws| ws.attachable_set_id.clone());
                 }
             }
+            (CorItemKind::Workspace, ProviderItemKey::Workspace(_)) => {}
             (CorItemKind::ManagedTerminal, ProviderItemKey::ManagedTerminal(key)) => {
                 if let Some(terminal) = providers.managed_terminals.get(key) {
                     terminal_ids.push(key.clone());

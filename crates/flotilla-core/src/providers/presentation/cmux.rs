@@ -11,11 +11,11 @@ use crate::providers::{run, types::*, CommandRunner};
 
 const CMUX_BIN: &str = "/Applications/cmux.app/Contents/Resources/bin/cmux";
 
-pub struct CmuxWorkspaceManager {
+pub struct CmuxPresentationManager {
     runner: Arc<dyn CommandRunner>,
 }
 
-impl CmuxWorkspaceManager {
+impl CmuxPresentationManager {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self { runner }
     }
@@ -78,7 +78,7 @@ impl CmuxWorkspaceManager {
 }
 
 #[async_trait]
-impl super::WorkspaceManager for CmuxWorkspaceManager {
+impl super::PresentationManager for CmuxPresentationManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let windows_output = self.cmux_cmd(&["--json", "list-windows"]).await?;
         let window_refs = Self::parse_window_refs(&windows_output)?;
@@ -233,6 +233,12 @@ impl super::WorkspaceManager for CmuxWorkspaceManager {
         Ok(())
     }
 
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        info!(%ws_ref, "cmux: deleting workspace");
+        self.cmux_cmd(&["delete-workspace", "--workspace", ws_ref]).await?;
+        Ok(())
+    }
+
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }
@@ -245,26 +251,26 @@ mod tests {
     use super::*;
     use crate::{
         path_context::ExecutionEnvironmentPath,
-        providers::{testing::MockRunner, workspace::WorkspaceManager},
+        providers::{presentation::PresentationManager, testing::MockRunner},
     };
 
     #[test]
     fn shell_quote_escapes_single_quotes() {
-        assert_eq!(CmuxWorkspaceManager::shell_quote("a'b c"), "'a'\\''b c'".to_string());
+        assert_eq!(CmuxPresentationManager::shell_quote("a'b c"), "'a'\\''b c'".to_string());
     }
 
     #[test]
     fn parse_ok_ref_extracts_first_token() {
-        assert_eq!(CmuxWorkspaceManager::parse_ok_ref("OK workspace:42"), "workspace:42");
+        assert_eq!(CmuxPresentationManager::parse_ok_ref("OK workspace:42"), "workspace:42");
         // Defensive fallback for unexpected output without the "OK " prefix.
-        assert_eq!(CmuxWorkspaceManager::parse_ok_ref("surface:7"), "surface:7");
-        assert_eq!(CmuxWorkspaceManager::parse_ok_ref(""), "");
+        assert_eq!(CmuxPresentationManager::parse_ok_ref("surface:7"), "surface:7");
+        assert_eq!(CmuxPresentationManager::parse_ok_ref(""), "");
     }
 
     #[tokio::test]
     async fn list_workspaces_parses_json_response() {
         let output = r#"{"workspaces":[{"id":"CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40","title":"Main"}]}"#;
-        let workspaces = CmuxWorkspaceManager::parse_workspaces(output).expect("parse workspaces");
+        let workspaces = CmuxPresentationManager::parse_workspaces(output).expect("parse workspaces");
         assert_eq!(workspaces.len(), 1);
         let (ws_ref, ws) = &workspaces[0];
         assert_eq!(ws_ref, "CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40");
@@ -274,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_workspaces_aggregates_all_windows() {
-        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![
             Ok(r#"[{"id":"W1","index":0},{"id":"W2","index":1}]"#.to_string()),
             Ok(r#"{"workspaces":[{"id":"CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40","title":"Main"}]}"#.to_string()),
             Ok(r#"{"workspaces":[{"id":"367CC5E4-0C9B-4559-9D97-D6358900ECCA","title":"Feature"}]}"#.to_string()),
@@ -290,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_workspaces_skips_failed_window() {
-        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![
             Ok(r#"[{"id":"W1","index":0},{"id":"W2","index":1}]"#.to_string()),
             Ok(r#"{"workspaces":[{"id":"CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40","title":"Main"}]}"#.to_string()),
             Err("window gone".to_string()),
@@ -303,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_workspaces_fails_when_window_listing_fails() {
-        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Err("cmux unavailable".to_string())])));
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![Err("cmux unavailable".to_string())])));
 
         let err = manager.list_workspaces().await.expect_err("window listing should fail");
         assert!(err.contains("cmux unavailable"));
@@ -311,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_workspaces_dedupes_duplicate_workspace_refs() {
-        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![
             Ok(r#"[{"id":"W1","index":0},{"id":"W2","index":1}]"#.to_string()),
             Ok(r#"{"workspaces":[{"id":"CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40","title":"Main"}]}"#.to_string()),
             Ok(r#"{"workspaces":[{"id":"CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40","title":"Main Copy"}]}"#.to_string()),
@@ -325,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_workspace_returns_error_when_ref_missing() {
-        let manager = CmuxWorkspaceManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
         let config = WorkspaceAttachRequest {
             name: "demo".into(),
             working_directory: ExecutionEnvironmentPath::new("/tmp/repo"),
@@ -338,13 +344,20 @@ mod tests {
         assert!(err.contains("returned no workspace ref"));
     }
 
+    #[tokio::test]
+    async fn delete_workspace_uses_cmux_delete_command() {
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
+
+        manager.delete_workspace("workspace:42").await.expect("delete should succeed");
+    }
+
     #[test]
     fn parse_workspaces_reads_uuid_from_id_field() {
         let json = r#"{"workspaces": [
             {"id": "CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40", "title": "Main", "selected": true, "pinned": false, "index": 0},
             {"id": "367CC5E4-0C9B-4559-9D97-D6358900ECCA", "title": "Feature", "selected": false, "pinned": false, "index": 1}
         ]}"#;
-        let workspaces = CmuxWorkspaceManager::parse_workspaces(json).expect("parse workspaces");
+        let workspaces = CmuxPresentationManager::parse_workspaces(json).expect("parse workspaces");
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].0, "CBC42D5B-AFAE-46BA-A5DB-386D13DA5A40");
         assert_eq!(workspaces[0].1.name, "Main");
@@ -357,7 +370,7 @@ mod tests {
         let json = r#"{"workspaces": [
             {"ref": "workspace:1", "id": "ABC-UUID", "title": "Main", "selected": true, "pinned": false, "index": 0}
         ]}"#;
-        let map = CmuxWorkspaceManager::parse_workspaces_both(json).expect("parse workspaces both");
+        let map = CmuxPresentationManager::parse_workspaces_both(json).expect("parse workspaces both");
         assert_eq!(map.get("workspace:1"), Some(&"ABC-UUID".to_string()));
     }
 }

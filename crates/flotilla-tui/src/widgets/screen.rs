@@ -247,23 +247,19 @@ impl InteractiveWidget for Screen {
                     return Outcome::Consumed;
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if self.tabs.drag.dragging_tab.is_some() {
-                    let tab_actions = self.tabs.handle_mouse(mouse);
-                    if !tab_actions.is_empty() {
-                        ctx.app_actions.extend(tab_actions);
-                    }
-                    return Outcome::Consumed;
+            MouseEventKind::Drag(MouseButton::Left) if self.tabs.drag.dragging_tab.is_some() => {
+                let tab_actions = self.tabs.handle_mouse(mouse);
+                if !tab_actions.is_empty() {
+                    ctx.app_actions.extend(tab_actions);
                 }
+                return Outcome::Consumed;
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.tabs.drag.dragging_tab.is_some() {
-                    let tab_actions = self.tabs.handle_mouse(mouse);
-                    if !tab_actions.is_empty() {
-                        ctx.app_actions.extend(tab_actions);
-                    }
-                    return Outcome::Consumed;
+            MouseEventKind::Up(MouseButton::Left) if self.tabs.drag.dragging_tab.is_some() => {
+                let tab_actions = self.tabs.handle_mouse(mouse);
+                if !tab_actions.is_empty() {
+                    ctx.app_actions.extend(tab_actions);
                 }
+                return Outcome::Consumed;
             }
             _ => {}
         }

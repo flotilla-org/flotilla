@@ -9,12 +9,12 @@ use crate::{
         coding_agent::CloudAgentService,
         discovery::{ProviderCategory, ProviderDescriptor},
         issue_tracker::IssueProvider,
+        presentation::PresentationManager,
         types::{
             AheadBehind, BranchInfo, ChangeRequest, Checkout, CloudAgentSession, CommitInfo, Issue, WorkingTreeStatus, Workspace,
             WorkspaceAttachRequest,
         },
         vcs::{CheckoutManager, Vcs},
-        workspace::WorkspaceManager,
     },
 };
 
@@ -134,9 +134,9 @@ impl AiUtility for StubAiUtility {
     }
 }
 
-struct StubWorkspaceManager;
+struct StubPresentationManager;
 #[async_trait]
-impl WorkspaceManager for StubWorkspaceManager {
+impl PresentationManager for StubPresentationManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         Ok(vec![])
     }
@@ -144,6 +144,9 @@ impl WorkspaceManager for StubWorkspaceManager {
         Err("stub".into())
     }
     async fn select_workspace(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn delete_workspace(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
     fn binding_scope_prefix(&self) -> String {
@@ -176,7 +179,7 @@ fn full_registry() -> ProviderRegistry {
         Arc::new(StubCloudAgent),
     );
     reg.ai_utilities.insert("ai", named_desc(ProviderCategory::AiUtility, "StubAI"), Arc::new(StubAiUtility));
-    reg.workspace_managers.insert("wm", named_desc(ProviderCategory::WorkspaceManager, "StubWM"), Arc::new(StubWorkspaceManager));
+    reg.presentation_managers.insert("wm", named_desc(ProviderCategory::WorkspaceManager, "StubWM"), Arc::new(StubPresentationManager));
     reg
 }
 
@@ -348,7 +351,7 @@ async fn repo_model_new_initializes_state_and_uses_registry_data() {
 
     assert!(model.registry.checkout_managers.contains_key("cm"));
     assert!(model.registry.cloud_agents.contains_key("ca"));
-    assert!(!model.registry.workspace_managers.is_empty());
+    assert!(!model.registry.presentation_managers.is_empty());
     model.refresh_handle.trigger_refresh();
 }
 
@@ -377,7 +380,7 @@ async fn repo_model_new_virtual_has_empty_registry_and_default_labels() {
     assert!(model.registry.change_requests.is_empty());
     assert!(model.registry.issue_trackers.is_empty());
     assert!(model.registry.cloud_agents.is_empty());
-    assert!(model.registry.workspace_managers.is_empty());
+    assert!(model.registry.presentation_managers.is_empty());
     assert_eq!(model.labels.checkouts.section, "Checkouts");
     assert_eq!(model.labels.change_requests.section, "Change Requests");
     assert_eq!(model.labels.issues.section, "Issues");

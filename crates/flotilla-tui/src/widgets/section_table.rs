@@ -238,7 +238,8 @@ impl<T: Identifiable> SectionTable<T> {
         let mut last_fill_idx = None;
         for (i, col) in self.columns.iter().enumerate() {
             if let Constraint::Fill(weight) = col.width {
-                let w = if fill_total > 0 { fill_space * weight / fill_total } else { 0 };
+                let w =
+                    if let Some(fill_total) = std::num::NonZeroU16::new(fill_total) { fill_space * weight / fill_total.get() } else { 0 };
                 widths[i] = w;
                 fill_assigned += w;
                 last_fill_idx = Some(i);

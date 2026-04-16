@@ -1,4 +1,4 @@
-//! Workspace manager factories for cmux.
+//! Presentation manager factories for cmux.
 //!
 //! Two factories implement the old priority chain:
 //! - `CmuxInsideFactory` — requires `CMUX_SOCKET_PATH` env var, proving we're
@@ -15,7 +15,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        workspace::{cmux::CmuxWorkspaceManager, WorkspaceManager},
+        presentation::{cmux::CmuxPresentationManager, PresentationManager},
         CommandRunner,
     },
 };
@@ -30,7 +30,7 @@ pub struct CmuxInsideFactory;
 #[async_trait]
 impl Factory for CmuxInsideFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn WorkspaceManager;
+    type Output = dyn PresentationManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
         cmux_descriptor()
@@ -42,9 +42,9 @@ impl Factory for CmuxInsideFactory {
         _config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("CMUX_SOCKET_PATH").is_some() {
-            Ok(Arc::new(CmuxWorkspaceManager::new(runner)))
+            Ok(Arc::new(CmuxPresentationManager::new(runner)))
         } else {
             Err(vec![UnmetRequirement::MissingEnvVar("CMUX_SOCKET_PATH".into())])
         }
@@ -58,7 +58,7 @@ pub struct CmuxBinaryFallbackFactory;
 #[async_trait]
 impl Factory for CmuxBinaryFallbackFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn WorkspaceManager;
+    type Output = dyn PresentationManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
         cmux_descriptor()
@@ -70,9 +70,9 @@ impl Factory for CmuxBinaryFallbackFactory {
         _config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
         if env.find_binary("cmux").is_some() {
-            Ok(Arc::new(CmuxWorkspaceManager::new(runner)))
+            Ok(Arc::new(CmuxPresentationManager::new(runner)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cmux".into())])
         }

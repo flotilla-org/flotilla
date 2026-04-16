@@ -23,8 +23,13 @@ fn sample_snapshot() -> WorkflowSnapshot {
                             selector: Selector { capability: "code".to_string() },
                             prompt: Some("Implement {{inputs.feature}}".to_string()),
                         },
+                        labels: BTreeMap::new(),
                     },
-                    ProcessDefinition { role: "build".to_string(), source: ProcessSource::Tool { command: "cargo test".to_string() } },
+                    ProcessDefinition {
+                        role: "build".to_string(),
+                        source: ProcessSource::Tool { command: "cargo test".to_string() },
+                        labels: BTreeMap::new(),
+                    },
                 ],
             },
             SnapshotTask {
@@ -36,6 +41,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                         selector: Selector { capability: "code-review".to_string() },
                         prompt: Some("Review {{inputs.feature}}".to_string()),
                     },
+                    labels: BTreeMap::new(),
                 }],
             },
         ],

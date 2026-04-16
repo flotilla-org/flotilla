@@ -66,6 +66,7 @@ fn owner_reference(name: &str) -> OwnerReference {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn http_list_decodes_owner_references() {
     let body = serde_json::json!({
         "metadata": { "resourceVersion": "7" },
@@ -111,6 +112,7 @@ async fn http_list_decodes_owner_references() {
 }
 
 #[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn http_create_serializes_owner_references() {
     let body = serde_json::json!({
         "apiVersion": "flotilla.work/v1",

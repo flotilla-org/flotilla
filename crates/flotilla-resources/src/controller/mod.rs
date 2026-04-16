@@ -17,6 +17,7 @@ use crate::{
     clone::CloneSpec,
     environment::EnvironmentSpec,
     error::ResourceError,
+    presentation::PresentationSpec,
     resource::{InputMeta, Resource, ResourceObject},
     task_workspace::TaskWorkspaceSpec,
     terminal_session::TerminalSessionSpec,
@@ -72,6 +73,9 @@ pub enum Actuation {
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
     CreateTaskWorkspace { meta: InputMeta, spec: TaskWorkspaceSpec },
+    CreatePresentation { meta: InputMeta, spec: PresentationSpec },
+    DeletePresentation { name: String },
+    DeleteTaskWorkspace { name: String },
 }
 
 pub trait SecondaryWatch: Send + Sync {
@@ -247,6 +251,24 @@ impl<R: Reconciler> ControllerLoop<R> {
             Actuation::CreateTaskWorkspace { meta, spec } => {
                 let resolver = backend.using::<crate::TaskWorkspace>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::CreatePresentation { meta, spec } => {
+                let resolver = backend.using::<crate::Presentation>(namespace);
+                Self::create_if_missing(&resolver, meta, spec).await
+            }
+            Actuation::DeletePresentation { name } => {
+                let resolver = backend.using::<crate::Presentation>(namespace);
+                match resolver.delete(&name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            }
+            Actuation::DeleteTaskWorkspace { name } => {
+                let resolver = backend.using::<crate::TaskWorkspace>(namespace);
+                match resolver.delete(&name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(err),
+                }
             }
         }
     }

@@ -1,4 +1,4 @@
-//! Workspace manager factory for zellij.
+//! Presentation manager factory for zellij.
 
 use std::sync::Arc;
 
@@ -9,17 +9,17 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
-        workspace::{zellij::ZellijWorkspaceManager, WorkspaceManager},
+        presentation::{zellij::ZellijPresentationManager, PresentationManager},
         CommandRunner,
     },
 };
 
-pub struct ZellijWorkspaceManagerFactory;
+pub struct ZellijPresentationManagerFactory;
 
 #[async_trait]
-impl Factory for ZellijWorkspaceManagerFactory {
+impl Factory for ZellijPresentationManagerFactory {
     type Descriptor = ProviderDescriptor;
-    type Output = dyn WorkspaceManager;
+    type Output = dyn PresentationManager;
 
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor::labeled_simple(ProviderCategory::WorkspaceManager, "zellij", "zellij Workspaces", "", "", "")
@@ -31,16 +31,16 @@ impl Factory for ZellijWorkspaceManagerFactory {
         _config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn WorkspaceManager>, Vec<UnmetRequirement>> {
+    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
         if env.find_env_var("ZELLIJ").is_none() {
             return Err(vec![UnmetRequirement::MissingEnvVar("ZELLIJ".into())]);
         }
 
-        ZellijWorkspaceManager::check_version(&*runner).await.map_err(|e| vec![UnmetRequirement::MissingBinary(e)])?;
+        ZellijPresentationManager::check_version(&*runner).await.map_err(|e| vec![UnmetRequirement::MissingBinary(e)])?;
 
         let mgr = match env.find_env_var("ZELLIJ_SESSION_NAME") {
-            Some(name) => ZellijWorkspaceManager::with_session_name(runner, name.to_string()),
-            None => ZellijWorkspaceManager::new(runner),
+            Some(name) => ZellijPresentationManager::with_session_name(runner, name.to_string()),
+            None => ZellijPresentationManager::new(runner),
         };
         Ok(Arc::new(mgr))
     }
@@ -50,7 +50,7 @@ impl Factory for ZellijWorkspaceManagerFactory {
 mod tests {
     use std::sync::Arc;
 
-    use super::ZellijWorkspaceManagerFactory;
+    use super::ZellijPresentationManagerFactory;
     use crate::{
         config::ConfigStore,
         path_context::ExecutionEnvironmentPath,
@@ -63,7 +63,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.42.2".into())).build());
-        let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
 
@@ -73,7 +73,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
-        let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         let unmet = result.err().expect("should fail without ZELLIJ env var");
         assert!(unmet.contains(&UnmetRequirement::MissingEnvVar("ZELLIJ".into())));
     }
@@ -84,7 +84,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.39.0".into())).build());
-        let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_err());
     }
 
@@ -94,7 +94,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Err("command not found".into())).build());
-        let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_err());
     }
 
@@ -106,13 +106,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.42.2".into())).build());
-        let result = ZellijWorkspaceManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
+        let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok(), "factory should succeed when ZELLIJ_SESSION_NAME is set");
     }
 
     #[tokio::test]
     async fn zellij_factory_descriptor() {
-        let desc = ZellijWorkspaceManagerFactory.descriptor();
+        let desc = ZellijPresentationManagerFactory.descriptor();
         assert_eq!(desc.backend, "zellij");
         assert_eq!(desc.implementation, "zellij");
         assert_eq!(desc.display_name, "zellij Workspaces");

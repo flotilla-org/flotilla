@@ -14,7 +14,7 @@ use crate::providers::{run, types::*, CommandRunner};
 /// not set `kill_on_drop`.
 const ZELLIJ_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub struct ZellijWorkspaceManager {
+pub struct ZellijPresentationManager {
     runner: Arc<dyn CommandRunner>,
     /// Optional override for the session name. When `None`, falls back to
     /// the `ZELLIJ_SESSION_NAME` environment variable.
@@ -24,7 +24,7 @@ pub struct ZellijWorkspaceManager {
     action_semaphore: Semaphore,
 }
 
-impl ZellijWorkspaceManager {
+impl ZellijPresentationManager {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
         Self { runner, session_name_override: None, action_semaphore: Semaphore::new(1) }
     }
@@ -99,7 +99,7 @@ impl ZellijWorkspaceManager {
 }
 
 #[async_trait]
-impl super::WorkspaceManager for ZellijWorkspaceManager {
+impl super::PresentationManager for ZellijPresentationManager {
     async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         let output = self.zellij_action(&["list-tabs", "--json"]).await?;
         let tabs: Vec<serde_json::Value> = serde_json::from_str(&output).map_err(|e| format!("zellij list-tabs: {e}"))?;
@@ -205,6 +205,13 @@ impl super::WorkspaceManager for ZellijWorkspaceManager {
         Ok(())
     }
 
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        let tab_id = ws_ref.rsplit_once(':').map(|(_, id)| id).ok_or_else(|| format!("invalid zellij ws_ref: {ws_ref}"))?;
+        info!(%ws_ref, %tab_id, "zellij: closing tab by id");
+        self.zellij_action(&["close-tab", "--tab-id", tab_id]).await?;
+        Ok(())
+    }
+
     fn binding_scope_prefix(&self) -> String {
         match self.session_name() {
             Ok(session) => format!("{session}:"),
@@ -218,20 +225,20 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::providers::{replay, workspace::WorkspaceManager};
+    use crate::providers::{presentation::PresentationManager, replay};
 
     #[test]
     fn append_command_args_with_command() {
         let mut args: Vec<&str> = vec!["new-pane"];
         let cmd = "echo hello";
-        ZellijWorkspaceManager::append_command_args(&mut args, cmd);
+        ZellijPresentationManager::append_command_args(&mut args, cmd);
         assert_eq!(args, vec!["new-pane", "--", "sh", "-c", "echo hello"]);
     }
 
     #[test]
     fn append_command_args_empty_is_noop() {
         let mut args: Vec<&str> = vec!["new-pane"];
-        ZellijWorkspaceManager::append_command_args(&mut args, "");
+        ZellijPresentationManager::append_command_args(&mut args, "");
         assert_eq!(args, vec!["new-pane"]);
     }
 
@@ -242,12 +249,12 @@ mod tests {
         let command = "";
         let cmd = if command.is_empty() { SHELL_FALLBACK } else { command };
         let mut args: Vec<&str> = vec!["new-pane", "--cwd", "/tmp/repo"];
-        ZellijWorkspaceManager::append_command_args(&mut args, cmd);
+        ZellijPresentationManager::append_command_args(&mut args, cmd);
         assert_eq!(args, vec!["new-pane", "--cwd", "/tmp/repo", "--", "sh", "-c", "exec \"${SHELL:-sh}\""]);
     }
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("workspace", name)
+        crate::providers::testing::fixture_path("presentation", name)
     }
 
     fn setup_zellij_ws_session() {
@@ -294,7 +301,7 @@ mod tests {
         let session = replay::test_session(&fixture("zellij_workspaces.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = ZellijWorkspaceManager::with_session_name(runner.clone(), "flotilla-test-zj-ws".to_string());
+        let mgr = ZellijPresentationManager::with_session_name(runner.clone(), "flotilla-test-zj-ws".to_string());
 
         // Create workspace "feat-123"
         let config1 = WorkspaceAttachRequest {
@@ -387,7 +394,7 @@ mod tests {
         let session = replay::test_session(&fixture("zellij_list.yaml"), replay::Masks::new());
         let runner = replay::test_runner(&session);
 
-        let mgr = ZellijWorkspaceManager::with_session_name(runner, "flotilla-test-zj".to_string());
+        let mgr = ZellijPresentationManager::with_session_name(runner, "flotilla-test-zj".to_string());
         let workspaces = mgr.list_workspaces().await.unwrap();
 
         assert_eq!(workspaces.len(), 2);
@@ -405,5 +412,13 @@ mod tests {
         }
 
         session.finish();
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_closes_zellij_tab() {
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![Ok("".to_string())]));
+        let mgr = ZellijPresentationManager::with_session_name(runner, "flotilla-test-zj".to_string());
+
+        mgr.delete_workspace("flotilla-test-zj:7").await.expect("delete should succeed");
     }
 }
