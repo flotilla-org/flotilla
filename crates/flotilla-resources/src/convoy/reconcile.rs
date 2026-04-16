@@ -499,14 +499,9 @@ fn cleanup_actuations(
         actuations.push(create_presentation_actuation(convoy));
     }
 
-    if matches!(predicted_status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled)
-        && (!presentations.is_empty() || !matches!(status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled))
+    if matches!(predicted_status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled) && !presentations.is_empty()
     {
-        if presentations.is_empty() {
-            actuations.push(Actuation::DeletePresentation { name: presentation_name(&convoy.metadata.name) });
-        } else {
-            actuations.extend(presentations.keys().cloned().map(|name| Actuation::DeletePresentation { name }));
-        }
+        actuations.extend(presentations.keys().cloned().map(|name| Actuation::DeletePresentation { name }));
     }
 
     for (task, state) in &predicted_status.tasks {

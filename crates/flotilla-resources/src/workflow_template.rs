@@ -270,11 +270,10 @@ fn validate_token(token: &str, location: &InterpolationLocation, declared_inputs
     }
 
     match segments.as_slice() {
-        ["inputs", input_name] => {
-            if !declared_inputs.contains(*input_name) {
-                push_error(errors, ValidationError::UnknownInputReference { location: location.clone(), name: (*input_name).to_string() });
-            }
+        ["inputs", input_name] if !declared_inputs.contains(*input_name) => {
+            push_error(errors, ValidationError::UnknownInputReference { location: location.clone(), name: (*input_name).to_string() });
         }
+        ["inputs", _] => {}
         ["workflow", "name"] | ["workflow", "namespace"] => {}
         ["workflow", field] => {
             push_error(errors, ValidationError::UnknownWorkflowField { location: location.clone(), name: (*field).to_string() })

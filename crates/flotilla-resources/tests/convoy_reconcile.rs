@@ -725,3 +725,34 @@ async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeleteTaskWorkspace { name } if name == "convoy-a-implement")));
 }
+
+#[tokio::test]
+async fn terminal_completed_convoy_without_observed_presentation_does_not_emit_speculative_delete() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Completed;
+    status.finished_at = Some(timestamp(20));
+    for task in status.tasks.values_mut() {
+        task.phase = TaskPhase::Completed;
+        task.finished_at = Some(timestamp(19));
+    }
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Ready, None)],
+        Vec::new(),
+        timestamp(21),
+    )
+    .await;
+
+    assert_eq!(outcome.patch, None);
+    assert!(!outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeletePresentation { name } if name == "convoy-a-presentation")));
+    assert!(outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteTaskWorkspace { name } if name == "convoy-a-implement")));
+}
