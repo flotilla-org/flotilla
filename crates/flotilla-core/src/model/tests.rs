@@ -146,6 +146,9 @@ impl PresentationManager for StubPresentationManager {
     async fn select_workspace(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
+    async fn delete_workspace(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }

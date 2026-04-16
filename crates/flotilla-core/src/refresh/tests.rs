@@ -217,6 +217,9 @@ impl PresentationManager for MockWorkspaceManager {
     async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
         Ok(())
     }
+    async fn delete_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }

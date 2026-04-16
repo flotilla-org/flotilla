@@ -689,6 +689,10 @@ impl PresentationManager for FakePresentationManager {
         self.selected.lock().await.push(ws_ref.to_string());
         Ok(())
     }
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        self.selected.lock().await.push(format!("delete:{ws_ref}"));
+        Ok(())
+    }
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }

@@ -205,6 +205,13 @@ impl super::PresentationManager for ZellijPresentationManager {
         Ok(())
     }
 
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        let tab_id = ws_ref.rsplit_once(':').map(|(_, id)| id).ok_or_else(|| format!("invalid zellij ws_ref: {ws_ref}"))?;
+        info!(%ws_ref, %tab_id, "zellij: closing tab by id");
+        self.zellij_action(&["close-tab", "--tab-id", tab_id]).await?;
+        Ok(())
+    }
+
     fn binding_scope_prefix(&self) -> String {
         match self.session_name() {
             Ok(session) => format!("{session}:"),
@@ -247,7 +254,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("workspace", name)
+        crate::providers::testing::fixture_path("presentation", name)
     }
 
     fn setup_zellij_ws_session() {
@@ -405,5 +412,13 @@ mod tests {
         }
 
         session.finish();
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_closes_zellij_tab() {
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![Ok("".to_string())]));
+        let mgr = ZellijPresentationManager::with_session_name(runner, "flotilla-test-zj".to_string());
+
+        mgr.delete_workspace("flotilla-test-zj:7").await.expect("delete should succeed");
     }
 }

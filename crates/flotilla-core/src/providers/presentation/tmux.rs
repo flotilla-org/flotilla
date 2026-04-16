@@ -154,6 +154,13 @@ impl super::PresentationManager for TmuxPresentationManager {
         Ok(())
     }
 
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        let window_id = ws_ref.rsplit_once(':').map(|(_, id)| id).ok_or_else(|| format!("invalid tmux ws_ref: {ws_ref}"))?;
+        info!(%ws_ref, %window_id, "tmux: killing window by id");
+        self.tmux_cmd(&["kill-window", "-t", window_id]).await?;
+        Ok(())
+    }
+
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }
@@ -180,7 +187,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("workspace", name)
+        crate::providers::testing::fixture_path("presentation", name)
     }
 
     fn setup_tmux_session() {
@@ -314,5 +321,13 @@ mod tests {
         }
 
         session.finish();
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_kills_tmux_window() {
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![Ok("".to_string())]));
+        let mgr = TmuxPresentationManager::new(runner);
+
+        mgr.delete_workspace("1712345678:flotilla:@42").await.expect("delete should succeed");
     }
 }

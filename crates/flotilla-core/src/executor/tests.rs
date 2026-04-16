@@ -180,6 +180,10 @@ impl PresentationManager for MockWorkspaceManager {
         let result = self.select_result.lock().await;
         result.clone()
     }
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        self.calls.lock().await.push(format!("delete_workspace:{ws_ref}"));
+        Ok(())
+    }
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }

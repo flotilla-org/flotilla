@@ -233,6 +233,12 @@ impl super::PresentationManager for CmuxPresentationManager {
         Ok(())
     }
 
+    async fn delete_workspace(&self, ws_ref: &str) -> Result<(), String> {
+        info!(%ws_ref, "cmux: deleting workspace");
+        self.cmux_cmd(&["delete-workspace", "--workspace", ws_ref]).await?;
+        Ok(())
+    }
+
     fn binding_scope_prefix(&self) -> String {
         String::new()
     }
@@ -336,6 +342,13 @@ mod tests {
 
         let err = manager.create_workspace(&config).await.expect_err("should fail when ref is missing");
         assert!(err.contains("returned no workspace ref"));
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_uses_cmux_delete_command() {
+        let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
+
+        manager.delete_workspace("workspace:42").await.expect("delete should succeed");
     }
 
     #[test]
