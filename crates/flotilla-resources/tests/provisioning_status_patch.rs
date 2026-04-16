@@ -1,8 +1,9 @@
 use chrono::Utc;
 use flotilla_resources::{
     CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus, CloneStatusPatch, EnvironmentPhase, EnvironmentStatus,
-    EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, StatusPatch, TaskWorkspacePhase, TaskWorkspaceStatus,
-    TaskWorkspaceStatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch,
+    EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, PresentationPhase, PresentationStatus,
+    PresentationStatusPatch, StatusPatch, TaskWorkspacePhase, TaskWorkspaceStatus, TaskWorkspaceStatusPatch, TerminalSessionPhase,
+    TerminalSessionStatus, TerminalSessionStatusPatch,
 };
 
 #[test]
@@ -110,4 +111,34 @@ fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
     TaskWorkspaceStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, TaskWorkspacePhase::Failed);
     assert_eq!(status.message.as_deref(), Some("clone failed"));
+}
+
+#[test]
+fn presentation_status_patch_marks_active_torn_down_and_failed() {
+    let mut status = PresentationStatus::default();
+    let ready_at = Utc::now();
+
+    PresentationStatusPatch::MarkActive {
+        presentation_manager: "tmux".to_string(),
+        workspace_ref: "ws-123".to_string(),
+        spec_hash: "hash-abc".to_string(),
+        ready_at,
+    }
+    .apply(&mut status);
+    assert_eq!(status.phase, PresentationPhase::Active);
+    assert_eq!(status.observed_presentation_manager.as_deref(), Some("tmux"));
+    assert_eq!(status.observed_workspace_ref.as_deref(), Some("ws-123"));
+    assert_eq!(status.observed_spec_hash.as_deref(), Some("hash-abc"));
+    assert_eq!(status.message, None);
+
+    PresentationStatusPatch::MarkTornDown { message: Some("create failed after replace".to_string()) }.apply(&mut status);
+    assert_eq!(status.phase, PresentationPhase::TornDown);
+    assert_eq!(status.observed_presentation_manager, None);
+    assert_eq!(status.observed_workspace_ref, None);
+    assert_eq!(status.observed_spec_hash, None);
+    assert_eq!(status.message.as_deref(), Some("create failed after replace"));
+
+    PresentationStatusPatch::MarkFailed { message: "unknown policy".to_string() }.apply(&mut status);
+    assert_eq!(status.phase, PresentationPhase::Failed);
+    assert_eq!(status.message.as_deref(), Some("unknown policy"));
 }
