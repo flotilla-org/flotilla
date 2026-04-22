@@ -541,3 +541,11 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
     };
     test_helpers::assert_roundtrip(&attach);
 }
+
+#[test]
+fn stream_key_namespace_round_trips() {
+    let key = StreamKey::Namespace { name: "flotilla".into() };
+    let encoded = serde_json::to_string(&key).unwrap();
+    let decoded: StreamKey = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded, key);
+}

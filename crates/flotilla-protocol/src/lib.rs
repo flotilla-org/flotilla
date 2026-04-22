@@ -118,6 +118,8 @@ pub enum StreamKey {
     Repo { identity: RepoIdentity },
     #[serde(rename = "host")]
     Host { environment_id: EnvironmentId },
+    #[serde(rename = "namespace")]
+    Namespace { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
