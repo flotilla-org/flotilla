@@ -17,7 +17,7 @@ The read model is grounded in convoy **status**, not live WorkflowTemplates:
 
 - **Task DAG structure** comes from `ConvoyStatus.workflow_snapshot.tasks` — frozen at init (see `2026-04-14-convoy-resource-design.md`). Live templates are never read by the projection; if a template is edited after a convoy bootstraps, the snapshot still describes what is actually executing.
 - **Per-task runtime state** comes from `ConvoyStatus.tasks[name]` (the `TaskState` map).
-- **Attach target per task** comes from the `Presentation` resource owned by the convoy/task: specifically `PresentationStatus.observed_workspace_ref`. See `2026-04-15-presentation-manager-design.md`.
+- **Attach target per task** comes from the per-task `Presentation` resource: specifically `PresentationStatus.observed_workspace_ref` on the Presentation keyed by `{ CONVOY_LABEL, TASK_LABEL }`. This is **not** the current stage-5 contract (one Presentation per convoy) — it depends on the stage-5 addendum in `2026-04-22-per-task-presentation-design.md`, which is a prerequisite for PR 3 only.
 
 A convoy in `Pending` phase may have no `workflow_snapshot` yet; the projection surfaces such convoys with an `initializing` placeholder rather than an empty task list so the user sees the convoy came into existence.
 
@@ -69,7 +69,7 @@ flotilla-cp (k8s REST) or InProcess resource store
 Key properties:
 
 - **Convoys live on their own stream.** Today the wire splits into per-repo `RepoSnapshot` and per-host `HostSnapshot` streams (`crates/flotilla-protocol/src/snapshot.rs` and `lib.rs`), with replay cursors keyed via `StreamKey`. Convoys are namespace-scoped resources that may span repos and hosts, so we introduce a third stream keyed by `StreamKey::Namespace { name }`. One stream per active namespace; for MVP the default namespace (`flotilla`) carries everything.
-- **Projection reads convoy + presentation status.** `ConvoyProjection` watches `Convoy` resources (authoritative for DAG structure via `status.workflow_snapshot` and per-task runtime state via `status.tasks`) and `Presentation` resources (for `observed_workspace_ref` per task). It does not read live `WorkflowTemplate` resources; the frozen snapshot on the convoy is the source of truth once a convoy is past `Pending`. `TerminalSession` process-level status is deferred (see Deferred section).
+- **Projection reads convoy + presentation status.** `ConvoyProjection` watches `Convoy` resources (authoritative for DAG structure via `status.workflow_snapshot` and per-task runtime state via `status.tasks`) and `Presentation` resources (for per-task `observed_workspace_ref`, once the per-task Presentation addendum is in). It does not read live `WorkflowTemplate` resources; the frozen snapshot on the convoy is the source of truth once a convoy is past `Pending`. `TerminalSession` process-level status is deferred (see Deferred section). For PR 1 and PR 2, `TaskSummary.workspace_ref` is always `None` — the projection still watches Presentations but the selector match is convoy-level until the addendum lands.
 - **Daemon is the adaptor for the TUI path.** Other daemon components (convoy controller, presentation reconciler) already read resources for their own reconciliation loops. `ConvoyProjection` is the single component on the TUI read path that translates resource state into `NamespaceSnapshot` / `DaemonEvent::NamespaceDelta`. If/when the wire protocol shifts to k8s-shape end-to-end, the projection is the piece that gets rewritten. The TUI sees stable wire shapes across that transition.
 - **Delta-driven refresh.** No polling on the TUI side. The projection emits deltas on every meaningful resource event.
 - **Mutations reuse existing commands.** `CommandAction::ConvoyTaskComplete { convoy, task, message }` already exists in `crates/flotilla-protocol/src/commands.rs` and is wired through `in_process.rs` / daemon runtime. Stage 6 does not add a new completion command — the TUI just plumbs existing binding actions into this command.
@@ -169,7 +169,7 @@ pub struct ProcessSummary {
 
 No new commands are added. Task completion uses the existing `CommandAction::ConvoyTaskComplete { convoy, task, message }`. Convoy deletion is deferred to a later stage along with the rest of convoy editing.
 
-**Resolving the attach target.** `TaskSummary.workspace_ref` is populated by the projection by watching `Presentation` resources: `PresentationSpec.convoy_ref` identifies the convoy, and `flotilla.work/task` labels (per `presentation-manager-design.md`) identify the task. The projection keeps a `convoy/task → ws_ref` index from the latest `PresentationStatus.observed_workspace_ref`. PR 3's `a` keybinding reads this field and dispatches the existing `CommandAction::SelectWorkspace { ws_ref }`.
+**Resolving the attach target.** `TaskSummary.workspace_ref` is populated by the projection by watching per-task `Presentation` resources (see addendum `2026-04-22-per-task-presentation-design.md`): Presentations carry `flotilla.work/convoy` and `flotilla.work/task` labels, which the projection uses to key a `convoy/task → ws_ref` index from the latest `PresentationStatus.observed_workspace_ref`. PR 3's `a` keybinding reads this field and dispatches the existing `CommandAction::SelectWorkspace { ws_ref }`. Until the addendum lands, `workspace_ref` remains `None` and PR 3 cannot ship.
 
 **YAGNI cuts:**
 
@@ -260,10 +260,11 @@ Four PRs off `feat/tui-convoy-view`, each independently mergeable.
 ### PR 1 — Read-only convoy view (core of stage 6)
 
 - `flotilla-protocol`: `ConvoyId`, `ConvoySummary`, `TaskSummary`, `ProcessSummary`, `ConvoyPhase`, `TaskPhase`, `NamespaceSnapshot`, `NamespaceDelta`; `StreamKey::Namespace { name }`; `DaemonEvent::{NamespaceSnapshot, NamespaceDelta}`.
-- `flotilla-daemon`: `ConvoyProjection` watching `Convoy` and `Presentation` resources, producing per-namespace snapshots + deltas. Maintains `convoy/task → workspace_ref` index from Presentation status. Initial-sync and gap-recovery paths mirror the existing `RepoSnapshot` machinery. Unit tested against the in-memory resource client.
+- `flotilla-daemon`: `ConvoyProjection` watching `Convoy` and `Presentation` resources, producing per-namespace snapshots + deltas. Maintains `convoy/task → workspace_ref` index from Presentation status (empty until the per-task Presentation addendum lands). Initial-sync and gap-recovery paths mirror the existing `RepoSnapshot` machinery. Unit tested against the in-memory resource client.
+- `flotilla-client`: extend replay-cursor and gap-recovery handling for the new `StreamKey::Namespace` variant (`crates/flotilla-client/src/lib.rs` around 454/563/693 currently hard-codes repo+host stream types). Track per-namespace seq and include it in `ReplaySince` cursors.
 - `flotilla-tui`: global `Convoys` tab, `ConvoysPage`, `ConvoyList`, `ConvoyDetail`, `TaskTree` (tui-tree-widget), `TaskProcesses`; `BindingModeId::Convoys` with navigation-only keys; `/` filter; `initializing…` placeholder for pre-snapshot convoys.
 - Empty state, status glyphs for both phase enums, tab reachable via `[` / `]`.
-- No mutations. Integration tests with scripted convoy resource fixtures validate display.
+- No mutations. Integration tests with scripted convoy resource fixtures validate display. Client tests cover namespace-stream replay with simulated seq gaps.
 
 ### PR 2 — Task completion
 
@@ -273,9 +274,11 @@ Four PRs off `feat/tui-convoy-view`, each independently mergeable.
 
 ### PR 3 — Task attach
 
+**Prerequisite:** per-task Presentation addendum (`2026-04-22-per-task-presentation-design.md`) must be landed. Until then, Presentations remain convoy-level and every task would either resolve to the same workspace or none.
+
 - `a` keybinding on a task reads `TaskSummary.workspace_ref`. When `Some(ws_ref)` it dispatches `CommandAction::SelectWorkspace { ws_ref }`. When `None` it shows a transient status line ("no workspace yet") rather than erroring.
 - No new command or attach machinery.
-- Tests: integration test covering select-task → `a` → existing `SelectWorkspace` dispatched with the correct `ws_ref`; test for the no-workspace case.
+- Tests: integration test covering select-task → `a` → existing `SelectWorkspace` dispatched with the correct `ws_ref`; test for the no-workspace case; two-task convoy test asserting different `workspace_ref` per task.
 
 ### PR 4 — `flotilla tui --convoy <namespace>/<name>` pane mode
 
@@ -300,7 +303,7 @@ PR 1 (read-only view) depends only on stages 1–3. Task state will render wheth
 
 PR 2 (task completion) depends on the same foundation — marking a task complete is a pure resource PATCH and does not need provisioning or presentation to be working.
 
-PR 3 (task attach) depends on stage 5 being functional enough that tasks have associated terminals for the attach flow to reach.
+PR 3 (task attach) depends on the per-task Presentation addendum (`2026-04-22-per-task-presentation-design.md`) being landed, so per-task `workspace_ref` values are actually produced by the reconciler chain.
 
 PR 4 (pane mode) is CLI + widget scoping only; no new runtime dependencies beyond PR 1.
 
