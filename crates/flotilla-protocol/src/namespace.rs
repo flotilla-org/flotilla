@@ -120,6 +120,25 @@ pub struct ConvoySummary {
     pub initializing: bool,
 }
 
+/// Full snapshot for one namespace. Sent on initial connect, after seq gaps,
+/// or when a delta would be larger than the full snapshot. Mirrors the
+/// RepoSnapshot idiom.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceSnapshot {
+    pub seq: u64,
+    pub namespace: String,
+    pub convoys: Vec<ConvoySummary>,
+}
+
+/// Incremental delta for one namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamespaceDelta {
+    pub seq: u64,
+    pub namespace: String,
+    pub changed: Vec<ConvoySummary>,
+    pub removed: Vec<ConvoyId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +227,31 @@ mod tests {
         let encoded = serde_json::to_string(&task).unwrap();
         let decoded: TaskSummary = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, task);
+    }
+
+    #[test]
+    fn namespace_snapshot_round_trips() {
+        let snap = NamespaceSnapshot {
+            seq: 17,
+            namespace: "flotilla".into(),
+            convoys: vec![],
+        };
+        let encoded = serde_json::to_string(&snap).unwrap();
+        let decoded: NamespaceSnapshot = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, snap);
+    }
+
+    #[test]
+    fn namespace_delta_round_trips() {
+        let delta = NamespaceDelta {
+            seq: 18,
+            namespace: "flotilla".into(),
+            changed: Vec::new(),
+            removed: vec![ConvoyId::new("flotilla", "old-convoy")],
+        };
+        let encoded = serde_json::to_string(&delta).unwrap();
+        let decoded: NamespaceDelta = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, delta);
     }
 
     #[test]
