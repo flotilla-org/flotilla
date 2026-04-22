@@ -103,6 +103,7 @@ pub struct TaskSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::hp;
 
     #[test]
     fn convoy_id_round_trips_through_string() {
@@ -119,7 +120,13 @@ mod tests {
 
     #[test]
     fn convoy_phase_serde_round_trips() {
-        for phase in [ConvoyPhase::Pending, ConvoyPhase::Active, ConvoyPhase::Completed, ConvoyPhase::Failed, ConvoyPhase::Cancelled] {
+        for phase in [
+            ConvoyPhase::Pending,
+            ConvoyPhase::Active,
+            ConvoyPhase::Completed,
+            ConvoyPhase::Failed,
+            ConvoyPhase::Cancelled,
+        ] {
             let encoded = serde_json::to_string(&phase).unwrap();
             let decoded: ConvoyPhase = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, phase);
@@ -153,6 +160,26 @@ mod tests {
             host: None,
             checkout: None,
             workspace_ref: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            message: None,
+        };
+        let encoded = serde_json::to_string(&task).unwrap();
+        let decoded: TaskSummary = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, task);
+    }
+
+    #[test]
+    fn task_summary_round_trips_with_populated_checkout() {
+        let task = TaskSummary {
+            name: "implement".into(),
+            depends_on: vec![],
+            phase: TaskPhase::Ready,
+            processes: vec![],
+            host: None,
+            checkout: Some(CheckoutRef::from_host_path(hp("/repos/project/wt"), false)),
+            workspace_ref: Some("ws-1".into()),
             ready_at: None,
             started_at: None,
             finished_at: None,
