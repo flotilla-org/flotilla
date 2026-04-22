@@ -34,12 +34,12 @@ impl ConvoyId {
 
     /// Namespace component (substring before `/`).
     pub fn namespace(&self) -> &str {
-        self.0.split_once('/').map(|(ns, _)| ns).unwrap_or("")
+        self.0.split_once('/').map(|(ns, _)| ns).expect("ConvoyId invariant: inner string always contains '/'")
     }
 
     /// Name component (substring after `/`).
     pub fn name(&self) -> &str {
-        self.0.split_once('/').map(|(_, nm)| nm).unwrap_or("")
+        self.0.split_once('/').map(|(_, nm)| nm).expect("ConvoyId invariant: inner string always contains '/'")
     }
 }
 
