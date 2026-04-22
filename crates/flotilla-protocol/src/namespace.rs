@@ -8,7 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{host::HostName, snapshot::CheckoutRef};
+use crate::{host::HostName, snapshot::CheckoutRef, snapshot::RepoKey};
 
 /// Stable identifier for a convoy resource: `"namespace/name"`.
 /// Opaque string; parsing validates the `/` separator. No rename support.
@@ -100,6 +100,26 @@ pub struct TaskSummary {
     pub message: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoySummary {
+    pub id: ConvoyId,
+    pub namespace: String,
+    pub name: String,
+    pub workflow_ref: String,
+    pub phase: ConvoyPhase,
+    pub message: Option<String>,
+    /// Populated from a `flotilla.work/repo` label on the convoy when present.
+    /// Consumed by the TUI as a filter hint; None means unclaimed.
+    pub repo_hint: Option<RepoKey>,
+    pub tasks: Vec<TaskSummary>,
+    pub started_at: Option<Timestamp>,
+    pub finished_at: Option<Timestamp>,
+    pub observed_workflow_ref: Option<String>,
+    /// True while the convoy's workflow_snapshot has not yet been populated by
+    /// the controller. UI shows "initializing…" instead of an empty task tree.
+    pub initializing: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +208,26 @@ mod tests {
         let encoded = serde_json::to_string(&task).unwrap();
         let decoded: TaskSummary = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, task);
+    }
+
+    #[test]
+    fn convoy_summary_initializing_round_trips() {
+        let convoy = ConvoySummary {
+            id: ConvoyId::new("flotilla", "fix-bug-123"),
+            namespace: "flotilla".into(),
+            name: "fix-bug-123".into(),
+            workflow_ref: "review-and-fix".into(),
+            phase: ConvoyPhase::Pending,
+            message: None,
+            repo_hint: None,
+            tasks: Vec::new(),
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: true,
+        };
+        let encoded = serde_json::to_string(&convoy).unwrap();
+        let decoded: ConvoySummary = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, convoy);
     }
 }

@@ -101,7 +101,7 @@ pub enum ConnectionRole {
     Peer,
 }
 pub use snapshot::{
-    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind,
+    CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoKey, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

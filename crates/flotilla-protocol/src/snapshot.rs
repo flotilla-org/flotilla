@@ -9,6 +9,12 @@ use crate::{
     NodeId,
 };
 
+/// Opaque repo identifier used as a filter hint on convoy wire types.
+/// Populated from a `flotilla.work/repo` label on the convoy resource when present.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepoKey(pub String);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryLabels {
     pub section: String,
