@@ -1465,6 +1465,34 @@ impl App {
         self.convoys_ui.selected = Some(ids[new_idx].clone());
     }
 
+    /// Set the filter string for the Convoys tab.
+    ///
+    /// Updates the stored filter and invalidates the current selection if it is
+    /// no longer visible under the new filter.
+    pub fn set_convoy_filter(&mut self, f: impl Into<String>) {
+        self.convoys_ui.filter = f.into();
+        self.refresh_convoy_selection_for_filter("flotilla");
+    }
+
+    /// Iterate over convoys in the given namespace, filtered by the active
+    /// filter string (case-insensitive substring match on name and repo_hint).
+    pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> + 'a {
+        let f = self.convoys_ui.filter.to_lowercase();
+        self.convoys(namespace).into_iter().filter(move |c| {
+            f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
+        })
+    }
+
+    /// When the filter changes, check whether the current selection is still
+    /// visible. If not, default to the first visible convoy (or `None`).
+    fn refresh_convoy_selection_for_filter(&mut self, namespace: &str) {
+        let visible_ids: Vec<_> = self.visible_convoys(namespace).map(|c| c.id.clone()).collect();
+        let current_visible = self.convoys_ui.selected.as_ref().is_some_and(|id| visible_ids.contains(id));
+        if !current_visible {
+            self.convoys_ui.selected = visible_ids.into_iter().next();
+        }
+    }
+
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
         let start_dir = self
             .model

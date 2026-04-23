@@ -1543,3 +1543,132 @@ fn delta_removing_all_convoys_clears_selection() {
 
     assert!(app.selected_convoy_id().is_none(), "removing the last convoy should clear selection");
 }
+
+// -- Convoy filter --
+
+#[test]
+fn convoy_filter_narrows_visible_convoys() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    fn convoy(name: &str) -> ConvoySummary {
+        ConvoySummary {
+            id: ConvoyId::new("flotilla", name),
+            namespace: "flotilla".into(),
+            name: name.into(),
+            workflow_ref: "wf".into(),
+            phase: ConvoyPhase::Active,
+            message: None,
+            repo_hint: None,
+            tasks: vec![],
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: false,
+        }
+    }
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
+    })));
+
+    // No filter — all three visible.
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 3);
+
+    // Filter matches a substring case-insensitively.
+    app.set_convoy_filter("BRA");
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "bravo");
+
+    // Empty filter restores all.
+    app.set_convoy_filter("");
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 3);
+}
+
+#[test]
+fn convoy_filter_matches_repo_hint() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        snapshot::RepoKey,
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+
+    let c1 = ConvoySummary {
+        id: ConvoyId::new("flotilla", "one"),
+        namespace: "flotilla".into(),
+        name: "one".into(),
+        workflow_ref: "wf".into(),
+        phase: ConvoyPhase::Active,
+        message: None,
+        repo_hint: Some(RepoKey("flotilla-org/flotilla".into())),
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+    let c2 = ConvoySummary {
+        id: ConvoyId::new("flotilla", "two"),
+        namespace: "flotilla".into(),
+        name: "two".into(),
+        workflow_ref: "wf".into(),
+        phase: ConvoyPhase::Active,
+        message: None,
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![c1, c2],
+    })));
+
+    app.set_convoy_filter("flotilla-org");
+
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "one");
+}
+
+#[test]
+fn convoy_filter_invalidates_hidden_selection() {
+    use flotilla_protocol::{
+        namespace::{ConvoyPhase, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![
+            test_convoy("flotilla", "alpha", ConvoyPhase::Active, false),
+            test_convoy("flotilla", "bravo", ConvoyPhase::Active, false),
+        ],
+    })));
+
+    // Select bravo
+    app.convoys_tab_select_delta(1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"));
+
+    // Filter to only show alpha — bravo is hidden, selection should move
+    app.set_convoy_filter("alp");
+    let selected_name = app.selected_convoy_id().map(|id| id.name().to_string());
+    // The visible set contains only "alpha"; selection must have moved
+    assert_eq!(selected_name.as_deref(), Some("alpha"), "filter should invalidate hidden selection");
+}
