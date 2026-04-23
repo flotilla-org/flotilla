@@ -15,8 +15,9 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Convoy, ConvoyPhase as ResConvoyPhase, Presentation, ProcessSource, ResourceObject, SnapshotTask,
-    TaskPhase as ResTaskPhase, TaskState, WatchEvent, CONVOY_LABEL, TASK_LABEL,
+    TaskPhase as ResTaskPhase, TaskState, TypedResolver, WatchEvent, WatchStart, CONVOY_LABEL, TASK_LABEL,
 };
+use futures::StreamExt;
 use tokio::sync::mpsc;
 
 /// In-memory view of one namespace's convoys, owned by the projection.
@@ -40,6 +41,75 @@ pub struct ConvoyProjection {
 impl ConvoyProjection {
     pub fn new(event_tx: mpsc::Sender<DaemonEvent>) -> Self {
         Self { namespaces: HashMap::new(), presentation_workspaces: HashMap::new(), event_tx }
+    }
+
+    /// Drive the projection event loop. Lists both resources to get initial state, then
+    /// starts a live watch from the current resource version, dispatching each event to
+    /// the appropriate apply method. Returns when both watch streams are exhausted.
+    pub async fn run(mut self, convoys: TypedResolver<Convoy>, presentations: TypedResolver<Presentation>) {
+        // Snapshot list + watch for Convoy.
+        let convoy_version = match convoys.list().await {
+            Ok(listed) => {
+                for convoy in listed.items {
+                    self.apply_convoy_event(WatchEvent::Added(convoy)).await;
+                }
+                listed.resource_version
+            }
+            Err(err) => {
+                tracing::error!(%err, "convoy projection: failed to list convoys; aborting");
+                return;
+            }
+        };
+        let mut convoy_stream = match convoys.watch(WatchStart::FromVersion(convoy_version)).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::error!(%err, "convoy projection: failed to start convoy watch; aborting");
+                return;
+            }
+        };
+
+        // Snapshot list + watch for Presentation.
+        let presentation_version = match presentations.list().await {
+            Ok(listed) => {
+                for presentation in listed.items {
+                    self.apply_presentation_event(WatchEvent::Added(presentation)).await;
+                }
+                listed.resource_version
+            }
+            Err(err) => {
+                tracing::error!(%err, "convoy projection: failed to list presentations; aborting");
+                return;
+            }
+        };
+        let mut presentation_stream = match presentations.watch(WatchStart::FromVersion(presentation_version)).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::error!(%err, "convoy projection: failed to start presentation watch; aborting");
+                return;
+            }
+        };
+
+        loop {
+            tokio::select! {
+                biased;
+                maybe = convoy_stream.next() => match maybe {
+                    Some(Ok(event)) => self.apply_convoy_event(event).await,
+                    Some(Err(err)) => {
+                        tracing::error!(%err, "convoy projection: convoy watch error; aborting");
+                        break;
+                    }
+                    None => break,
+                },
+                maybe = presentation_stream.next() => match maybe {
+                    Some(Ok(event)) => self.apply_presentation_event(event).await,
+                    Some(Err(err)) => {
+                        tracing::error!(%err, "convoy projection: presentation watch error; aborting");
+                        break;
+                    }
+                    None => break,
+                },
+            }
+        }
     }
 
     pub fn apply_presentation(&mut self, p: &ResourceObject<Presentation>) {
@@ -589,5 +659,47 @@ mod tests {
             }
             other => panic!("expected NamespaceDelta, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_loop_consumes_in_memory_client_events() {
+        use flotilla_resources::{InputMeta, InMemoryBackend, ResourceBackend};
+
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let projection = ConvoyProjection::new(tx);
+
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let presentations = backend.clone().using::<Presentation>("flotilla");
+        let handle = tokio::spawn(projection.run(convoys, presentations));
+
+        // Create a convoy after spawning the run loop.
+        let convoy = convoy_for_test("flotilla", "x", "wf", ResConvoyPhase::Pending, &[]);
+        let meta = InputMeta {
+            name: convoy.metadata.name.clone(),
+            labels: convoy.metadata.labels.clone(),
+            annotations: convoy.metadata.annotations.clone(),
+            owner_references: convoy.metadata.owner_references.clone(),
+            finalizers: convoy.metadata.finalizers.clone(),
+            deletion_timestamp: convoy.metadata.deletion_timestamp,
+        };
+        backend
+            .using::<Convoy>("flotilla")
+            .create(&meta, &convoy.spec)
+            .await
+            .expect("create convoy");
+
+        // Expect a NamespaceSnapshot within a short timeout.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for namespace snapshot event")
+            .expect("event channel closed before first event");
+        assert!(
+            matches!(event, DaemonEvent::NamespaceSnapshot(_)),
+            "expected NamespaceSnapshot, got {event:?}"
+        );
+
+        handle.abort();
     }
 }
