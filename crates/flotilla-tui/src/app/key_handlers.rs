@@ -31,9 +31,12 @@ impl App {
     /// Handle actions that the widget stack returned `Ignored` for.
     ///
     /// These are actions that need `&mut App` context the widget doesn't
-    /// have: confirm/enter, action menu, file picker, and dispatch intent.
+    /// have: confirm/enter, action menu, file picker, dispatch intent, and
+    /// convoy selection navigation.
     pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
+            Action::SelectNext if self.ui.is_convoys => self.convoys_tab_select_delta(1),
+            Action::SelectPrev if self.ui.is_convoys => self.convoys_tab_select_delta(-1),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),

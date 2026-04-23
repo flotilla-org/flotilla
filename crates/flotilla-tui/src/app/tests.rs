@@ -1417,3 +1417,129 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     assert!(rendered.contains("Convoys"), "expected 'Convoys' title, got: {rendered}");
     assert!(rendered.contains("demo"), "expected convoy name 'demo' in rendered output, got: {rendered}");
 }
+
+// -- Convoys tab selection --
+
+fn make_namespace_snapshot(names: &[&str]) -> flotilla_protocol::namespace::NamespaceSnapshot {
+    flotilla_protocol::namespace::NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: names.iter().map(|n| test_convoy("flotilla", n, flotilla_protocol::namespace::ConvoyPhase::Active, false)).collect(),
+    }
+}
+
+#[test]
+fn convoys_tab_select_next_advances_selection() {
+    use crate::keymap::Action;
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(make_namespace_snapshot(&["a", "b", "c"]))));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "first convoy should be auto-selected");
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"), "should clamp at last convoy");
+
+    // Also verify via convoys_tab_select_delta directly
+    app.convoys_tab_select_delta(-10);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "large negative delta clamps at first convoy");
+
+    let _ = Action::SelectNext; // confirm Action is reachable in this module
+}
+
+#[test]
+fn convoys_tab_select_prev_moves_back() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(make_namespace_snapshot(&["a", "b", "c"]))));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Move to the end
+    app.convoys_tab_select_delta(2);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "should clamp at first convoy");
+}
+
+#[test]
+fn delta_removing_selected_convoy_reselects_to_adjacent() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![
+            test_convoy("flotilla", "a", flotilla_protocol::namespace::ConvoyPhase::Active, false),
+            test_convoy("flotilla", "b", flotilla_protocol::namespace::ConvoyPhase::Active, false),
+            test_convoy("flotilla", "c", flotilla_protocol::namespace::ConvoyPhase::Active, false),
+        ],
+    })));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Move to "b"
+    app.convoys_tab_select_delta(1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
+
+    // Delta removes "b"
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 2,
+        namespace: "flotilla".into(),
+        changed: vec![],
+        removed: vec![ConvoyId::new("flotilla", "b")],
+    })));
+
+    let selected = app.selected_convoy_id().expect("must still have a selection after removing 'b'");
+    assert!(
+        matches!(selected.name(), "a" | "c"),
+        "after removing 'b', selection should fall back to an adjacent remaining convoy, got {}",
+        selected.name()
+    );
+}
+
+#[test]
+fn delta_removing_all_convoys_clears_selection() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![test_convoy("flotilla", "a", flotilla_protocol::namespace::ConvoyPhase::Active, false)],
+    })));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    assert!(app.selected_convoy_id().is_some(), "should have a selection after snapshot");
+
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 2,
+        namespace: "flotilla".into(),
+        changed: vec![],
+        removed: vec![ConvoyId::new("flotilla", "a")],
+    })));
+
+    assert!(app.selected_convoy_id().is_none(), "removing the last convoy should clear selection");
+}

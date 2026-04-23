@@ -1155,7 +1155,7 @@ impl App {
                     entry.convoys.insert(convoy.id.clone(), convoy.clone());
                 }
                 entry.last_seq = snap.seq;
-                self.maybe_auto_select_convoy(&namespace);
+                self.refresh_convoy_selection(&namespace);
             }
             DaemonEvent::NamespaceDelta(delta) => {
                 let namespace = delta.namespace.clone();
@@ -1167,7 +1167,7 @@ impl App {
                     entry.convoys.shift_remove(id);
                 }
                 entry.last_seq = delta.seq;
-                self.maybe_auto_select_convoy(&namespace);
+                self.refresh_convoy_selection(&namespace);
             }
         }
     }
@@ -1427,18 +1427,42 @@ impl App {
         &self.convoys_ui.filter
     }
 
-    /// Ensure the Convoys tab has a selection when convoys are present.
+    /// Validate the current convoy selection and default-select when needed.
     ///
-    /// Called after namespace snapshots/deltas to default-select the first
-    /// convoy when no selection is set yet. Full prev/next navigation lands
-    /// in Task 26.
-    fn maybe_auto_select_convoy(&mut self, namespace: &str) {
-        if self.convoys_ui.selected.is_some() {
+    /// Called after every namespace snapshot or delta:
+    /// - Clears selection when there are no convoys.
+    /// - Replaces a dangling selection (removed convoy) with the first available convoy.
+    /// - Sets the first convoy as the default when no selection is set yet.
+    fn refresh_convoy_selection(&mut self, namespace: &str) {
+        let Some(model) = self.namespaces.get(namespace) else {
+            self.convoys_ui.selected = None;
+            return;
+        };
+        if model.convoys.is_empty() {
+            self.convoys_ui.selected = None;
             return;
         }
-        if let Some(first_id) = self.namespaces.get(namespace).and_then(|m| m.convoys.keys().next()) {
-            self.convoys_ui.selected = Some(first_id.clone());
+        let still_valid = self.convoys_ui.selected.as_ref().is_some_and(|id| model.convoys.contains_key(id));
+        if !still_valid {
+            self.convoys_ui.selected = Some(model.convoys.keys().next().cloned().expect("non-empty checked above"));
         }
+    }
+
+    /// Move the convoy selection by `delta` positions (positive = down, negative = up).
+    ///
+    /// Clamps at both ends. No-ops when there are no convoys.
+    pub(crate) fn convoys_tab_select_delta(&mut self, delta: isize) {
+        let Some(model) = self.namespaces.get("flotilla") else {
+            return;
+        };
+        let ids: Vec<&flotilla_protocol::namespace::ConvoyId> = model.convoys.keys().collect();
+        if ids.is_empty() {
+            self.convoys_ui.selected = None;
+            return;
+        }
+        let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| *candidate == id)).unwrap_or(0);
+        let new_idx = (current_idx as isize + delta).clamp(0, (ids.len() - 1) as isize) as usize;
+        self.convoys_ui.selected = Some(ids[new_idx].clone());
     }
 
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
