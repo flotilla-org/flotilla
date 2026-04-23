@@ -490,6 +490,11 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
+    /// Retained namespace snapshots, keyed by namespace name.
+    /// Updated by a background subscriber whenever `NamespaceSnapshot` or
+    /// `NamespaceDelta` events arrive on the broadcast channel.  Consulted by
+    /// `replay_since` so reconnecting clients can receive missed namespace state.
+    namespace_state: Arc<RwLock<HashMap<String, flotilla_protocol::namespace::NamespaceSnapshot>>>,
 }
 
 impl InProcessDaemon {
@@ -612,6 +617,7 @@ impl InProcessDaemon {
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
             resource_backend,
+            namespace_state: Arc::new(RwLock::new(HashMap::new())),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -625,6 +631,44 @@ impl InProcessDaemon {
                 match weak.upgrade() {
                     Some(d) => d.poll_snapshots().await,
                     None => break,
+                }
+            }
+        });
+
+        // Subscribe to the broadcast channel and mirror namespace events into
+        // `namespace_state` for replay.  Uses a Weak reference so the daemon
+        // can be dropped while the subscriber exits cleanly.
+        let namespace_state = Arc::clone(&daemon.namespace_state);
+        let mut namespace_rx = daemon.event_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match namespace_rx.recv().await {
+                    Ok(DaemonEvent::NamespaceSnapshot(snap)) => {
+                        let mut state = namespace_state.write().await;
+                        state.insert(snap.namespace.clone(), *snap);
+                    }
+                    Ok(DaemonEvent::NamespaceDelta(delta)) => {
+                        let mut state = namespace_state.write().await;
+                        let entry =
+                            state.entry(delta.namespace.clone()).or_insert_with(|| flotilla_protocol::namespace::NamespaceSnapshot {
+                                seq: 0,
+                                namespace: delta.namespace.clone(),
+                                convoys: Vec::new(),
+                            });
+                        // Apply delta: remove deleted convoys, upsert changed ones.
+                        entry.convoys.retain(|c| !delta.removed.contains(&c.id));
+                        for changed in &delta.changed {
+                            if let Some(existing) = entry.convoys.iter_mut().find(|c| c.id == changed.id) {
+                                *existing = changed.clone();
+                            } else {
+                                entry.convoys.push(changed.clone());
+                            }
+                        }
+                        entry.seq = delta.seq;
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -2386,6 +2430,16 @@ impl DaemonHandle for InProcessDaemon {
                     // Client has never seen this repo — send full snapshot
                     events.push(DaemonEvent::RepoSnapshot(Box::new((**snapshot).clone())));
                 }
+            }
+        }
+
+        // Emit namespace events for each retained namespace snapshot.
+        let namespace_state = self.namespace_state.read().await;
+        for (namespace, snap) in namespace_state.iter() {
+            let stream_key = StreamKey::Namespace { name: namespace.clone() };
+            let up_to_date = last_seen.get(&stream_key).is_some_and(|&seq| seq == snap.seq);
+            if !up_to_date {
+                events.push(DaemonEvent::NamespaceSnapshot(Box::new(snap.clone())));
             }
         }
 
