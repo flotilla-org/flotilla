@@ -4,9 +4,15 @@
 //! The test subscribes the TUI App directly to the daemon's broadcast channel
 //! and polls app.convoys() — no real socket needed.
 
-use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+use flotilla_core::{
+    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
+};
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{Convoy, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend};
@@ -57,9 +63,7 @@ async fn tui_shows_convoys_from_daemon() {
         controller_resync_interval: Duration::from_secs(300),
         start_controllers: true,
     };
-    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options)
-        .await
-        .expect("runtime start");
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
     // Build a TUI App wired to the same daemon (no repos needed for convoy view).
     let daemon_handle: Arc<dyn DaemonHandle> = Arc::clone(&daemon) as Arc<dyn DaemonHandle>;
