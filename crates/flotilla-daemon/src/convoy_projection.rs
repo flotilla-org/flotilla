@@ -68,6 +68,17 @@ impl ConvoyProjection {
             .get(&(namespace.to_owned(), convoy.to_owned(), task.to_owned()))
             .cloned()
     }
+
+    pub fn summarize(&self, convoy: &ResourceObject<Convoy>) -> ConvoySummary {
+        let mut summary = summarize_convoy(convoy);
+        for task in summary.tasks.iter_mut() {
+            task.workspace_ref = self.workspace_ref_for(&summary.namespace, &summary.name, &task.name);
+        }
+        if let Some(repo) = convoy.metadata.labels.get(flotilla_resources::REPO_LABEL) {
+            summary.repo_hint = Some(flotilla_protocol::snapshot::RepoKey(repo.clone()));
+        }
+        summary
+    }
 }
 
 #[allow(dead_code)]
@@ -125,7 +136,7 @@ fn summarize_task(def: &SnapshotTask, state: Option<&TaskState>) -> TaskSummary 
 }
 
 #[allow(dead_code)]
-pub(crate) fn summarize_convoy(convoy: &ResourceObject<Convoy>) -> ConvoySummary {
+fn summarize_convoy(convoy: &ResourceObject<Convoy>) -> ConvoySummary {
     let namespace = convoy.metadata.namespace.clone();
     let name = convoy.metadata.name.clone();
     let id = ConvoyId::new(&namespace, &name);
@@ -217,6 +228,39 @@ mod tests {
         TaskState { phase, ready_at: None, started_at: None, finished_at: None, message: None, placement: None }
     }
 
+    fn convoy_for_test(
+        ns: &str,
+        name: &str,
+        workflow_ref: &str,
+        phase: ResConvoyPhase,
+        tasks: &[(&str, ResTaskPhase)],
+    ) -> ResourceObject<Convoy> {
+        let snapshot_tasks: Vec<SnapshotTask> = tasks
+            .iter()
+            .map(|(task_name, _)| SnapshotTask {
+                name: (*task_name).into(),
+                depends_on: vec![],
+                processes: vec![],
+            })
+            .collect();
+        let task_states: BTreeMap<String, TaskState> = tasks
+            .iter()
+            .map(|(task_name, task_phase)| ((*task_name).into(), task_state(*task_phase)))
+            .collect();
+        let workflow_snapshot = if snapshot_tasks.is_empty() { None } else { Some(WorkflowSnapshot { tasks: snapshot_tasks }) };
+        ResourceObject {
+            metadata: meta(ns, name),
+            spec: ConvoySpec {
+                workflow_ref: workflow_ref.into(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repository: None,
+                r#ref: None,
+            },
+            status: Some(ConvoyStatus { phase, workflow_snapshot, tasks: task_states, ..Default::default() }),
+        }
+    }
+
     #[test]
     fn summarize_convoy_builds_full_summary_when_snapshot_present() {
         let convoy = ResourceObject {
@@ -247,7 +291,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let summary = summarize_convoy(&convoy);
+        let summary = ConvoyProjection::new(mpsc::channel(16).0).summarize(&convoy);
         assert_eq!(summary.namespace, "flotilla");
         assert_eq!(summary.name, "fix-bug-123");
         assert_eq!(summary.workflow_ref, "review-and-fix");
@@ -275,9 +319,37 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let summary = summarize_convoy(&convoy);
+        let summary = ConvoyProjection::new(mpsc::channel(16).0).summarize(&convoy);
         assert!(summary.initializing);
         assert!(summary.tasks.is_empty());
+    }
+
+    #[test]
+    fn summarize_with_index_populates_workspace_ref() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut projection = ConvoyProjection::new(tx);
+        projection.apply_presentation(&presentation_obj("fix-bug-123", "implement", Some("ws-1")));
+
+        let convoy = convoy_for_test("flotilla", "fix-bug-123", "wf", ResConvoyPhase::Active, &[
+            ("implement", ResTaskPhase::Running),
+        ]);
+
+        let summary = projection.summarize(&convoy);
+        assert_eq!(summary.tasks[0].workspace_ref.as_deref(), Some("ws-1"));
+    }
+
+    #[test]
+    fn summarize_populates_repo_hint_from_label() {
+        use flotilla_resources::REPO_LABEL;
+
+        let (tx, _rx) = mpsc::channel(16);
+        let projection = ConvoyProjection::new(tx);
+
+        let mut convoy = convoy_for_test("flotilla", "x", "wf", ResConvoyPhase::Pending, &[]);
+        convoy.metadata.labels.insert(REPO_LABEL.into(), "flotilla-org/flotilla".into());
+
+        let summary = projection.summarize(&convoy);
+        assert_eq!(summary.repo_hint.as_ref().map(|r| r.0.as_str()), Some("flotilla-org/flotilla"));
     }
 
     #[test]
