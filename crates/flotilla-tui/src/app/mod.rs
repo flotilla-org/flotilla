@@ -1450,17 +1450,15 @@ impl App {
 
     /// Move the convoy selection by `delta` positions (positive = down, negative = up).
     ///
-    /// Clamps at both ends. No-ops when there are no convoys.
+    /// Operates on the *filtered* visible set so j/k never lands on a hidden convoy.
+    /// Clamps at both ends. No-ops when there are no visible convoys.
     pub(crate) fn convoys_tab_select_delta(&mut self, delta: isize) {
-        let Some(model) = self.namespaces.get("flotilla") else {
-            return;
-        };
-        let ids: Vec<&flotilla_protocol::namespace::ConvoyId> = model.convoys.keys().collect();
+        let ids: Vec<flotilla_protocol::namespace::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
         if ids.is_empty() {
             self.convoys_ui.selected = None;
             return;
         }
-        let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| *candidate == id)).unwrap_or(0);
+        let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| candidate == id)).unwrap_or(0);
         let new_idx = (current_idx as isize + delta).clamp(0, (ids.len() - 1) as isize) as usize;
         self.convoys_ui.selected = Some(ids[new_idx].clone());
     }

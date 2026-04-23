@@ -37,6 +37,12 @@ impl App {
         match action {
             Action::SelectNext if self.ui.is_convoys => self.convoys_tab_select_delta(1),
             Action::SelectPrev if self.ui.is_convoys => self.convoys_tab_select_delta(-1),
+            // Focus detail / expand tree — deferred; no-op for now.
+            // This guard also prevents zero-repo panics and stops Enter from
+            // acting on the hidden repo page while the Convoys tab is visible.
+            Action::Confirm if self.ui.is_convoys => {}
+            // Collapse tree / back — deferred; no-op for now.
+            Action::Dismiss if self.ui.is_convoys => {}
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),

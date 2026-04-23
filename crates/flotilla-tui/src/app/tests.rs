@@ -1672,3 +1672,49 @@ fn convoy_filter_invalidates_hidden_selection() {
     // The visible set contains only "alpha"; selection must have moved
     assert_eq!(selected_name.as_deref(), Some("alpha"), "filter should invalidate hidden selection");
 }
+
+#[test]
+fn select_next_stays_within_filtered_set() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    fn convoy(name: &str) -> ConvoySummary {
+        ConvoySummary {
+            id: ConvoyId::new("flotilla", name),
+            namespace: "flotilla".into(),
+            name: name.into(),
+            workflow_ref: "wf".into(),
+            phase: ConvoyPhase::Active,
+            message: None,
+            repo_hint: None,
+            tasks: vec![],
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: false,
+        }
+    }
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
+    })));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Apply a filter that matches only "bravo".
+    app.set_convoy_filter("BRA");
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "filter should select the only visible convoy");
+
+    // select_next has nowhere to go — should stay on bravo.
+    app.convoys_tab_select_delta(1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "next should clamp within filtered set");
+
+    // select_prev also stays.
+    app.convoys_tab_select_delta(-1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "prev should clamp within filtered set");
+}

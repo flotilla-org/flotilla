@@ -80,7 +80,7 @@ impl Tabs {
         for (i, repo_identity) in model.repo_order.iter().enumerate() {
             let rm = &model.repos[repo_identity];
             let name = TuiModel::repo_name(&rm.path);
-            let is_active = !ui.is_config && i == model.active_repo;
+            let is_active = !ui.is_config && !ui.is_convoys && i == model.active_repo;
             let loading = if rm.loading { " ⟳" } else { "" };
             let changed = if rm.has_unseen_changes { "*" } else { "" };
             let label = format!("{name}{changed}{loading}");

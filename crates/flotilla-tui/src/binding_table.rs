@@ -135,13 +135,13 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::Convoys, "k", Action::SelectPrev, "Up"),
     h(BindingModeId::Convoys, "l", Action::Confirm, "Focus"),
     h(BindingModeId::Convoys, "enter", Action::Confirm, "Focus"),
-    h(BindingModeId::Convoys, "h", Action::Dismiss, "Back"),
-    h(BindingModeId::Convoys, "esc", Action::Dismiss, "Back"),
+    // h/esc (Back) and / (Filter) are omitted: their target behaviour
+    // (nested focus navigation and filter overlay) isn't shipped in PR 1.
+    // Add them back when the behaviour is implemented.
     h(BindingModeId::Convoys, "[", Action::PrevTab, "Prev"),
     h(BindingModeId::Convoys, "]", Action::NextTab, "Next"),
     h(BindingModeId::Convoys, "q", Action::Quit, "Quit"),
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
-    h(BindingModeId::Convoys, "/", Action::OpenCommandPalette, "Filter"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),
