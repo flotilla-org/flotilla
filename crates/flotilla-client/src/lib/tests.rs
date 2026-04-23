@@ -1,6 +1,10 @@
 use std::time::Duration;
 
-use flotilla_protocol::{qualified_path::HostId, EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot};
+use flotilla_protocol::{
+    namespace::{NamespaceDelta, NamespaceSnapshot},
+    qualified_path::HostId,
+    EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
+};
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -846,6 +850,115 @@ async fn recover_from_gap_handles_empty_replay() {
     assert!(event_rx.try_recv().is_err(), "no events should be forwarded for empty replay");
     // Seq unchanged.
     assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&StreamKey::Repo { identity: repo_identity() }), Some(&5));
+}
+
+// --- Namespace stream gap detection ---
+
+fn make_namespace_snapshot(namespace: &str, seq: u64) -> NamespaceSnapshot {
+    NamespaceSnapshot { seq, namespace: namespace.to_string(), convoys: vec![] }
+}
+
+fn make_namespace_delta(namespace: &str, seq: u64) -> NamespaceDelta {
+    NamespaceDelta { seq, namespace: namespace.to_string(), changed: vec![], removed: vec![] }
+}
+
+#[tokio::test]
+async fn handle_event_namespace_snapshot_updates_local_seq_and_forwards() {
+    let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (event_tx, mut event_rx) = broadcast::channel(16);
+    let (session, pending, next_id, _server) = event_harness();
+
+    handle_event(
+        DaemonEvent::NamespaceSnapshot(Box::new(make_namespace_snapshot("flotilla", 5))),
+        &local_seqs,
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
+
+    let event = event_rx.try_recv().expect("should receive NamespaceSnapshot");
+    assert!(matches!(event, DaemonEvent::NamespaceSnapshot(_)));
+    assert_eq!(local_seqs.read().unwrap().get(&StreamKey::Namespace { name: "flotilla".into() }).copied(), Some(5));
+}
+
+#[tokio::test]
+async fn handle_event_namespace_delta_happy_path_applies_and_forwards() {
+    let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    local_seqs.write().unwrap().insert(StreamKey::Namespace { name: "flotilla".into() }, 1);
+    let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (event_tx, mut event_rx) = broadcast::channel(16);
+    let (session, pending, next_id, _server) = event_harness();
+
+    // seq=2, local is 1 — exactly one ahead, happy path.
+    handle_event(
+        DaemonEvent::NamespaceDelta(Box::new(make_namespace_delta("flotilla", 2))),
+        &local_seqs,
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
+
+    let event = event_rx.try_recv().expect("should receive NamespaceDelta");
+    assert!(matches!(event, DaemonEvent::NamespaceDelta(_)));
+    assert_eq!(local_seqs.read().unwrap().get(&StreamKey::Namespace { name: "flotilla".into() }).copied(), Some(2));
+}
+
+#[tokio::test]
+async fn handle_event_namespace_delta_seq_gap_triggers_recovery() {
+    let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    // Local seq is 1, but incoming delta seq is 3 — seq 2 was dropped.
+    local_seqs.write().unwrap().insert(StreamKey::Namespace { name: "flotilla".into() }, 1);
+    let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (event_tx, _event_rx) = broadcast::channel(16);
+    let (session, pending, next_id, server) = event_harness();
+
+    handle_event(
+        DaemonEvent::NamespaceDelta(Box::new(make_namespace_delta("flotilla", 3))),
+        &local_seqs,
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
+
+    // Recovery should be spawned: a ReplaySince request should arrive on the server end.
+    let (_, request) = tokio::time::timeout(std::time::Duration::from_secs(1), read_request(&server))
+        .await
+        .expect("expected ReplaySince request within 1 second");
+
+    assert!(matches!(request, Request::ReplaySince { .. }), "namespace seq gap should trigger a ReplaySince request, got: {request:?}");
+}
+
+#[tokio::test]
+async fn handle_event_namespace_delta_for_unknown_namespace_triggers_recovery() {
+    let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    // No local seq for "flotilla" at all.
+    let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (event_tx, _event_rx) = broadcast::channel(16);
+    let (session, pending, next_id, server) = event_harness();
+
+    handle_event(
+        DaemonEvent::NamespaceDelta(Box::new(make_namespace_delta("flotilla", 1))),
+        &local_seqs,
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
+
+    // Recovery should be spawned: a ReplaySince request should arrive.
+    let (_, request) = tokio::time::timeout(std::time::Duration::from_secs(1), read_request(&server))
+        .await
+        .expect("expected ReplaySince request within 1 second for unknown namespace delta");
+
+    assert!(matches!(request, Request::ReplaySince { .. }), "delta for unknown namespace should trigger recovery, got: {request:?}");
 }
 
 // --- ResponseResult helper paths ---

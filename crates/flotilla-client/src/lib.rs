@@ -551,14 +551,41 @@ fn handle_event(
             let _ = event_tx.send(event);
         }
         DaemonEvent::NamespaceSnapshot(snap) => {
-            // TODO: namespace stream support — follow-up tasks
             local_seqs.write().unwrap().insert(StreamKey::Namespace { name: snap.namespace.clone() }, snap.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::NamespaceDelta(delta) => {
-            // TODO: namespace stream support — follow-up tasks
-            local_seqs.write().unwrap().insert(StreamKey::Namespace { name: delta.namespace.clone() }, delta.seq);
-            let _ = event_tx.send(event);
+            let namespace = delta.namespace.clone();
+            let seq = delta.seq;
+            let stream_key = StreamKey::Namespace { name: namespace.clone() };
+            let local_seq = local_seqs.read().unwrap().get(&stream_key).copied();
+
+            match local_seq {
+                Some(ls) if seq == ls + 1 => {
+                    // Happy path: exactly one ahead of what we last saw.
+                    local_seqs.write().unwrap().insert(stream_key, seq);
+                    debug!(%namespace, %seq, "applied namespace delta");
+                    let _ = event_tx.send(event);
+                }
+                _ => {
+                    // Seq gap or unknown namespace — spawn recovery.
+                    if let Some(ls) = local_seq {
+                        warn!(%namespace, local_seq = ls, %seq, "namespace seq gap, requesting replay");
+                    } else {
+                        warn!(%namespace, %seq, "received namespace delta for unknown namespace, requesting replay");
+                    }
+
+                    let local_seqs = Arc::clone(local_seqs);
+                    let event_tx = event_tx.clone();
+                    let session = Arc::clone(session);
+                    let pending = Arc::clone(pending);
+                    let next_id = Arc::clone(next_id);
+
+                    tokio::spawn(async move {
+                        recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
+                    });
+                }
+            }
         }
         DaemonEvent::RepoTracked(_)
         | DaemonEvent::CommandStarted { .. }
@@ -626,7 +653,6 @@ async fn recover_from_gap(
                                 }
                             }
                             DaemonEvent::NamespaceSnapshot(snap) => {
-                                // TODO: namespace stream support — follow-up tasks
                                 let key = StreamKey::Namespace { name: snap.namespace.clone() };
                                 let current = seqs.get(&key).copied().unwrap_or(0);
                                 if snap.seq >= current {
@@ -634,7 +660,6 @@ async fn recover_from_gap(
                                 }
                             }
                             DaemonEvent::NamespaceDelta(delta) => {
-                                // TODO: namespace stream support — follow-up tasks
                                 let key = StreamKey::Namespace { name: delta.namespace.clone() };
                                 let current = seqs.get(&key).copied().unwrap_or(0);
                                 if delta.seq >= current {
@@ -740,7 +765,6 @@ impl DaemonHandle for SocketDaemon {
                     DaemonEvent::RepoDelta(delta) => (StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq),
                     DaemonEvent::HostSnapshot(snap) => (StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq),
                     DaemonEvent::HostRemoved { environment_id, seq } => (StreamKey::Host { environment_id: environment_id.clone() }, *seq),
-                    // TODO: namespace stream support — follow-up tasks
                     DaemonEvent::NamespaceSnapshot(snap) => (StreamKey::Namespace { name: snap.namespace.clone() }, snap.seq),
                     DaemonEvent::NamespaceDelta(delta) => (StreamKey::Namespace { name: delta.namespace.clone() }, delta.seq),
                     DaemonEvent::RepoTracked(_)
