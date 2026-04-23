@@ -63,6 +63,65 @@ impl ConvoyProjection {
         }
     }
 
+    pub async fn apply_presentation_event(&mut self, event: WatchEvent<Presentation>) {
+        // 1. Update the presentation index and capture which (ns, convoy) is affected.
+        let (namespace, convoy_name) = match &event {
+            WatchEvent::Added(p) | WatchEvent::Modified(p) => {
+                self.apply_presentation(p);
+                let ns = p.metadata.namespace.clone();
+                let convoy = p.metadata.labels.get(CONVOY_LABEL).cloned().unwrap_or_default();
+                (ns, convoy)
+            }
+            WatchEvent::Deleted(p) => {
+                let ns = p.metadata.namespace.clone();
+                let convoy = p.metadata.labels.get(CONVOY_LABEL).cloned().unwrap_or_default();
+                let task = p.metadata.labels.get(TASK_LABEL).cloned().unwrap_or_default();
+                if !convoy.is_empty() && !task.is_empty() {
+                    self.presentation_workspaces.remove(&(ns.clone(), convoy.clone(), task));
+                }
+                (ns, convoy)
+            }
+        };
+
+        if convoy_name.is_empty() {
+            return;
+        }
+
+        // 2. Re-emit a delta for the affected convoy with refreshed workspace_ref values.
+        let id = ConvoyId::new(&namespace, &convoy_name);
+
+        // Collect workspace refs before taking a mutable borrow on the namespace view,
+        // to avoid the conflict between &self (workspace_ref_for) and &mut self (view).
+        let Some(existing) = self.namespaces.get(&namespace).and_then(|v| v.convoys.get(&id)).cloned() else {
+            return;
+        };
+        let refreshed_refs: Vec<Option<String>> = existing
+            .tasks
+            .iter()
+            .map(|t| self.workspace_ref_for(&namespace, &convoy_name, &t.name))
+            .collect();
+
+        // Now take the mutable borrow and apply the refreshed refs.
+        let view = self.namespaces.get_mut(&namespace).expect("namespace present; just read above");
+        let Some(stored) = view.convoys.get_mut(&id) else { return };
+        for (task, ws_ref) in stored.tasks.iter_mut().zip(refreshed_refs.iter()) {
+            task.workspace_ref = ws_ref.clone();
+        }
+        let refreshed = stored.clone();
+        view.seq = view.seq.saturating_add(1);
+        let seq = view.seq;
+
+        let _ = self
+            .event_tx
+            .send(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+                seq,
+                namespace,
+                changed: vec![refreshed],
+                removed: Vec::new(),
+            })))
+            .await;
+    }
+
     pub fn workspace_ref_for(&self, namespace: &str, convoy: &str, task: &str) -> Option<String> {
         self.presentation_workspaces
             .get(&(namespace.to_owned(), convoy.to_owned(), task.to_owned()))
@@ -430,12 +489,46 @@ mod tests {
         );
     }
 
+    fn presentation(convoy_name: &str, task_name: &str, ws_ref: Option<&str>) -> ResourceObject<Presentation> {
+        presentation_obj(convoy_name, task_name, ws_ref)
+    }
+
     async fn drain(rx: &mut mpsc::Receiver<DaemonEvent>) -> Vec<DaemonEvent> {
         let mut out = Vec::new();
         while let Ok(event) = rx.try_recv() {
             out.push(event);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn presentation_update_refreshes_workspace_ref_on_affected_convoy() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut projection = ConvoyProjection::new(tx);
+
+        let convoy = convoy_for_test(
+            "flotilla",
+            "fix-bug-123",
+            "wf",
+            ResConvoyPhase::Active,
+            &[("implement", ResTaskPhase::Running)],
+        );
+        projection.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
+        let _ = drain(&mut rx).await; // consume snapshot
+
+        let p = presentation("fix-bug-123", "implement", Some("ws-1"));
+        projection.apply_presentation_event(WatchEvent::Added(p)).await;
+
+        let events = drain(&mut rx).await;
+        assert!(!events.is_empty(), "expected a delta");
+        match &events[0] {
+            DaemonEvent::NamespaceDelta(delta) => {
+                assert_eq!(delta.changed.len(), 1);
+                let task = &delta.changed[0].tasks[0];
+                assert_eq!(task.workspace_ref.as_deref(), Some("ws-1"));
+            }
+            other => panic!("expected NamespaceDelta, got {other:?}"),
+        }
     }
 
     #[tokio::test]
