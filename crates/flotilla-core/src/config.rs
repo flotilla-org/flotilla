@@ -123,6 +123,8 @@ pub struct KeysConfig {
     #[serde(default)]
     pub normal: HashMap<String, String>,
     #[serde(default)]
+    pub tab_page: HashMap<String, String>,
+    #[serde(default)]
     pub help: HashMap<String, String>,
     #[serde(default)]
     pub config: HashMap<String, String>,

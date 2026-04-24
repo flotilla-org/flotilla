@@ -1778,3 +1778,21 @@ fn action_menu_overlay_masks_tab_nav() {
 
     assert_eq!(tab_before, tab_after, "tab navigation should be masked by the ActionMenu overlay");
 }
+
+#[test]
+fn move_tab_is_ignored_on_convoys_tab() {
+    // '{' (MoveTabLeft) and '}' (MoveTabRight) are in Normal, not TabPage.
+    // Pressing them on the Convoys tab must not mutate repo_order or active_repo.
+    let mut app = stub_app_with_repos(2);
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    let order_before = app.model.repo_order.clone();
+    let active_before = app.model.active_repo;
+
+    app.handle_key(key(KeyCode::Char('{')));
+    app.handle_key(key(KeyCode::Char('}')));
+
+    assert_eq!(app.model.repo_order, order_before, "{{ / }} must not reorder repos while on the Convoys tab");
+    assert_eq!(app.model.active_repo, active_before, "active_repo must be unchanged after {{ / }} on Convoys tab");
+}

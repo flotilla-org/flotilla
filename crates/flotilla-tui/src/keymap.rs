@@ -268,6 +268,7 @@ impl Keymap {
 
         let mode_configs: &[(&std::collections::HashMap<String, String>, BindingModeId)] = &[
             (&config.normal, BindingModeId::Normal),
+            (&config.tab_page, BindingModeId::TabPage),
             (&config.help, BindingModeId::Help),
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
