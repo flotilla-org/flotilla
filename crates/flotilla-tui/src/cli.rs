@@ -375,11 +375,9 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             format!("[host]     {environment_id}: removed (seq {seq})")
         }
         DaemonEvent::NamespaceSnapshot(snap) => {
-            // TODO: namespace stream support — follow-up tasks
             format!("[namespace] {}: full snapshot (seq {}, {} convoys)", snap.namespace, snap.seq, snap.convoys.len())
         }
         DaemonEvent::NamespaceDelta(delta) => {
-            // TODO: namespace stream support — follow-up tasks
             format!(
                 "[namespace] {}: delta (seq {}, {} changed, {} removed)",
                 delta.namespace,
@@ -398,7 +396,6 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
         DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq)),
         DaemonEvent::HostRemoved { environment_id, seq } => Some((StreamKey::Host { environment_id: environment_id.clone() }, *seq)),
-        // TODO: namespace stream support — follow-up tasks
         DaemonEvent::NamespaceSnapshot(snap) => Some((StreamKey::Namespace { name: snap.namespace.clone() }, snap.seq)),
         DaemonEvent::NamespaceDelta(delta) => Some((StreamKey::Namespace { name: delta.namespace.clone() }, delta.seq)),
         DaemonEvent::RepoTracked(_)

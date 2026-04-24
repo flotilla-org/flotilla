@@ -264,6 +264,7 @@ pub type NamespaceMap = HashMap<String, NamespaceModel>;
 
 /// Per-namespace convoy state tracked by the TUI. Populated from
 /// `DaemonEvent::NamespaceSnapshot` and updated by `DaemonEvent::NamespaceDelta`.
+#[derive(Default)]
 pub struct NamespaceModel {
     pub convoys: IndexMap<flotilla_protocol::namespace::ConvoyId, flotilla_protocol::namespace::ConvoySummary>,
     pub last_seq: u64,
@@ -277,12 +278,6 @@ pub struct NamespaceModel {
 pub struct ConvoysUiState {
     pub selected: Option<flotilla_protocol::namespace::ConvoyId>,
     pub filter: String,
-}
-
-impl Default for NamespaceModel {
-    fn default() -> Self {
-        Self { convoys: IndexMap::new(), last_seq: 0 }
-    }
 }
 
 /// A command that has been dispatched to the daemon and is awaiting completion.
@@ -1470,6 +1465,9 @@ impl App {
     /// Operates on the *filtered* visible set so j/k never lands on a hidden convoy.
     /// Clamps at both ends. No-ops when there are no visible convoys.
     pub(crate) fn convoys_tab_select_delta(&mut self, delta: isize) {
+        // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
+        // support will need a namespace scoping concept on ConvoysUiState —
+        // see issue #589 (arbitrary tabs).
         let ids: Vec<flotilla_protocol::namespace::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
         if ids.is_empty() {
             self.convoys_ui.selected = None;

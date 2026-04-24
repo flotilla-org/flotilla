@@ -50,6 +50,8 @@ impl<'a> ConvoyDetail<'a> {
             })
             .collect();
 
+        // TODO(task-attach): lift tree expansion state into ConvoysUiState once
+        // tree interaction (expand/collapse) lands with the task-attach PR.
         let mut state = TreeState::default();
         let tree = Tree::new(&items).expect("unique task names").block(body_block);
         f.render_stateful_widget(tree, body_area, &mut state);

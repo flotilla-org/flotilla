@@ -249,7 +249,6 @@ impl ConvoyProjection {
     }
 }
 
-#[allow(dead_code)]
 fn wire_convoy_phase(phase: ResConvoyPhase) -> WireConvoyPhase {
     match phase {
         ResConvoyPhase::Pending => WireConvoyPhase::Pending,
@@ -260,7 +259,6 @@ fn wire_convoy_phase(phase: ResConvoyPhase) -> WireConvoyPhase {
     }
 }
 
-#[allow(dead_code)]
 fn wire_task_phase(phase: ResTaskPhase) -> WireTaskPhase {
     match phase {
         ResTaskPhase::Pending => WireTaskPhase::Pending,
@@ -273,7 +271,6 @@ fn wire_task_phase(phase: ResTaskPhase) -> WireTaskPhase {
     }
 }
 
-#[allow(dead_code)]
 fn summarize_task(def: &SnapshotTask, state: Option<&TaskState>) -> TaskSummary {
     let phase = state.map(|s| wire_task_phase(s.phase)).unwrap_or(WireTaskPhase::Pending);
     TaskSummary {
@@ -301,7 +298,6 @@ fn summarize_task(def: &SnapshotTask, state: Option<&TaskState>) -> TaskSummary 
     }
 }
 
-#[allow(dead_code)]
 fn summarize_convoy(convoy: &ResourceObject<Convoy>) -> ConvoySummary {
     let namespace = convoy.metadata.namespace.clone();
     let name = convoy.metadata.name.clone();
@@ -521,10 +517,6 @@ mod tests {
         );
     }
 
-    fn presentation(convoy_name: &str, task_name: &str, ws_ref: Option<&str>) -> ResourceObject<Presentation> {
-        presentation_obj(convoy_name, task_name, ws_ref)
-    }
-
     fn drain(rx: &mut broadcast::Receiver<DaemonEvent>) -> Vec<DaemonEvent> {
         let mut out = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -542,7 +534,7 @@ mod tests {
         projection.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let _ = drain(&mut rx); // consume snapshot
 
-        let p = presentation("fix-bug-123", "implement", Some("ws-1"));
+        let p = presentation_obj("fix-bug-123", "implement", Some("ws-1"));
         projection.apply_presentation_event(WatchEvent::Added(p)).await;
 
         let events = drain(&mut rx);
