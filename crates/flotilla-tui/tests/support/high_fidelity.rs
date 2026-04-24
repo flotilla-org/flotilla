@@ -358,6 +358,8 @@ impl HighFidelityHarness {
         terminal
             .draw(|frame| {
                 let area = frame.area();
+                let raw = self.app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
+                let convoys: Vec<&_> = flotilla_tui::app::filter_convoys_by_str(raw.iter().copied(), &self.app.convoys_ui.filter).collect();
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.app.model,
                     ui: &mut self.app.ui,
@@ -367,6 +369,7 @@ impl HighFidelityHarness {
                     namespaces: &self.app.namespaces,
                     convoys_selected,
                     convoy_filter: &convoy_filter_str,
+                    convoys,
                 };
                 self.app.screen.render(frame, area, &mut ctx);
             })

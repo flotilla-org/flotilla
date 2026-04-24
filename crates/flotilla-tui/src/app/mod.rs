@@ -331,6 +331,23 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
     items.into_iter().filter(|item| !ui.status_bar.dismissed_status_ids.contains(&item.id)).collect()
 }
 
+/// Filter a slice of convoy summaries by a case-insensitive substring `filter`.
+///
+/// Matches against convoy name and `repo_hint`. An empty filter passes everything.
+/// This is the single source of truth for the Convoys tab filter — call sites that
+/// need a pre-filtered list (e.g. `render_frame`) should invoke this directly with
+/// field-level borrows rather than going through `App::visible_convoys` (which
+/// borrows all of `self`).
+pub fn filter_convoys_by_str<'a>(
+    convoys: impl IntoIterator<Item = &'a flotilla_protocol::namespace::ConvoySummary>,
+    filter: &str,
+) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> {
+    let f = filter.to_lowercase();
+    convoys.into_iter().filter(move |c| {
+        f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
+    })
+}
+
 /// Log provider errors and format them into a status message.
 ///
 /// Suppresses "issues disabled" messages since the daemon handles those.
@@ -1475,10 +1492,7 @@ impl App {
     /// Iterate over convoys in the given namespace, filtered by the active
     /// filter string (case-insensitive substring match on name and repo_hint).
     pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> + 'a {
-        let f = self.convoys_ui.filter.to_lowercase();
-        self.convoys(namespace).into_iter().filter(move |c| {
-            f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
-        })
+        filter_convoys_by_str(self.convoys(namespace), &self.convoys_ui.filter)
     }
 
     /// When the filter changes, check whether the current selection is still

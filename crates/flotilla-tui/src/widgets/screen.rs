@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use super::{
-    convoys_page::{ConvoyScope, ConvoysPage},
+    convoys_page::ConvoysPage,
     overview_page::OverviewPage,
     repo_page::RepoPage,
     status_bar_widget::{self, StatusBarWidget},
@@ -324,26 +324,8 @@ impl InteractiveWidget for Screen {
         let is_convoys = ctx.ui.is_convoys;
         let active_identity = self.active_repo_identity(&ctx.model.repo_order, ctx.model.active_repo, is_config, is_convoys).cloned();
         if is_convoys {
-            // Render the Convoys page. Namespace is always "flotilla" for the global tab.
-            // Apply the active filter string (case-insensitive substring on name / repo_hint).
-            let filter = ctx.convoy_filter;
-            let filter_lower = filter.to_lowercase();
-            let convoys: Vec<&_> = ctx
-                .namespaces
-                .get("flotilla")
-                .map(|m| {
-                    m.convoys
-                        .values()
-                        .filter(|c| {
-                            filter_lower.is_empty()
-                                || c.name.to_lowercase().contains(&filter_lower)
-                                || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&filter_lower))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
             let selected = ctx.convoys_selected.as_ref();
-            ConvoysPage { convoys, scope: ConvoyScope::All, selected, filter }.render(frame, chunks[1]);
+            ConvoysPage { convoys: ctx.convoys.clone(), selected, filter: ctx.convoy_filter }.render(frame, chunks[1]);
         } else if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
                 page.render(frame, chunks[1], ctx);

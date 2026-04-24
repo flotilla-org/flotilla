@@ -131,6 +131,10 @@ pub struct RenderContext<'a> {
     pub convoys_selected: Option<flotilla_protocol::namespace::ConvoyId>,
     /// Active filter string for the Convoys tab.
     pub convoy_filter: &'a str,
+    /// Pre-filtered convoy list for the Convoys tab.
+    /// Produced once by `App` via `visible_convoys("flotilla")` so the filter
+    /// lives in a single place and `screen.rs` can consume it directly.
+    pub convoys: Vec<&'a flotilla_protocol::namespace::ConvoySummary>,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.

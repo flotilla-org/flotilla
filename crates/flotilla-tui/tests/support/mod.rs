@@ -188,6 +188,7 @@ impl TestHarness {
                     namespaces: &empty_namespaces,
                     convoys_selected: None,
                     convoy_filter: "",
+                    convoys: vec![],
                 };
                 self.screen.render(frame, area, &mut ctx);
             })

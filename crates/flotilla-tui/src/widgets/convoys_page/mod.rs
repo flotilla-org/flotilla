@@ -1,14 +1,14 @@
 //! Convoys tab page widget: list on the left, detail on the right.
+//!
+//! Per-scope filtering is applied at the App layer (`visible_convoys`); add a scope
+//! field here when scope-specific rendering is needed.
 
 mod detail;
 mod glyphs;
 mod list;
 
 pub use detail::ConvoyDetail;
-use flotilla_protocol::{
-    namespace::{ConvoyId, ConvoySummary},
-    snapshot::RepoKey,
-};
+use flotilla_protocol::namespace::{ConvoyId, ConvoySummary};
 pub use list::ConvoyList;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -17,14 +17,8 @@ use ratatui::{
     Frame,
 };
 
-pub enum ConvoyScope {
-    All,
-    Repo(RepoKey),
-}
-
 pub struct ConvoysPage<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
-    pub scope: ConvoyScope,
     pub selected: Option<&'a ConvoyId>,
     pub filter: &'a str,
 }

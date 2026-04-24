@@ -146,6 +146,7 @@ mod tests {
                     namespaces: &empty_namespaces,
                     convoys_selected: None,
                     convoy_filter: "",
+                    convoys: vec![],
                 };
                 page.render(frame, frame.area(), &mut ctx);
             })

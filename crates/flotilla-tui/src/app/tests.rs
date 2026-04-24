@@ -1399,6 +1399,8 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     terminal
         .draw(|f| {
             let area = f.area();
+            let raw = app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
+            let convoys: Vec<&_> = crate::app::filter_convoys_by_str(raw.iter().copied(), &app.convoys_ui.filter).collect();
             let mut ctx = crate::widgets::RenderContext {
                 model: &app.model,
                 ui: &mut app.ui,
@@ -1408,6 +1410,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
                 namespaces: &app.namespaces,
                 convoys_selected,
                 convoy_filter: &convoy_filter,
+                convoys,
             };
             app.screen.render(f, area, &mut ctx);
         })
