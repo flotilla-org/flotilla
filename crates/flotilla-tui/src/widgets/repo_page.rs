@@ -428,9 +428,9 @@ impl InteractiveWidget for RepoPage {
 
     fn binding_mode(&self) -> KeyBindingMode {
         if self.active_search_query.is_some() {
-            KeyBindingMode::Composed(vec![BindingModeId::Normal, BindingModeId::SearchActive])
+            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal, BindingModeId::SearchActive])
         } else {
-            BindingModeId::Normal.into()
+            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal])
         }
     }
 

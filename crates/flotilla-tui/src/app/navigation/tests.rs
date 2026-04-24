@@ -66,11 +66,21 @@ fn next_tab_wraps_to_config() {
 }
 
 #[test]
-fn next_tab_from_config_goes_to_first() {
+fn next_tab_from_config_goes_to_convoys() {
     let mut app = stub_app_with_repos(3);
     app.ui.is_config = true;
     app.next_tab();
+    assert!(app.ui.is_convoys, "expected Convoys tab after next from config");
+    assert!(!app.ui.is_config);
+}
+
+#[test]
+fn next_tab_from_convoys_goes_to_first_repo() {
+    let mut app = stub_app_with_repos(3);
+    app.ui.is_convoys = true;
+    app.next_tab();
     assert_eq!(app.model.active_repo, 0);
+    assert!(!app.ui.is_convoys);
     assert!(!app.ui.is_config);
 }
 
@@ -92,11 +102,22 @@ fn prev_tab_decrements_active_repo() {
 }
 
 #[test]
-fn prev_tab_wraps_to_config() {
+fn prev_tab_wraps_to_convoys() {
     let mut app = stub_app_with_repos(2);
-    // active_repo is 0
+    // active_repo is 0 — prev goes to Convoys, not Config directly
+    app.prev_tab();
+    assert!(app.ui.is_convoys);
+    assert!(!app.ui.is_config);
+}
+
+#[test]
+fn prev_tab_wraps_to_config_from_convoys() {
+    let mut app = stub_app_with_repos(2);
+    app.ui.is_convoys = true;
+    app.ui.is_config = false;
     app.prev_tab();
     assert!(app.ui.is_config);
+    assert!(!app.ui.is_convoys);
 }
 
 #[test]

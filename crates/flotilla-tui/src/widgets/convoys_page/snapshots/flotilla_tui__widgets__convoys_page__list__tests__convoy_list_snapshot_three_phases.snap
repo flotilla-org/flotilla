@@ -1,0 +1,14 @@
+---
+source: crates/flotilla-tui/src/widgets/convoys_page/list.rs
+expression: terminal.backend()
+---
+"┌ Convoys ─────────────────────────────┐"
+"│● fix-a                               │"
+"│✓ fix-b                               │"
+"│✗ fix-c                               │"
+"│                                      │"
+"│                                      │"
+"│                                      │"
+"│                                      │"
+"│                                      │"
+"└──────────────────────────────────────┘"

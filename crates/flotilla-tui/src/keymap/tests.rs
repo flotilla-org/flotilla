@@ -167,44 +167,37 @@ fn shared_bindings_work_across_modes() {
 #[test]
 fn normal_mode_specific_bindings() {
     let km = Keymap::defaults();
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(q)), Some(Action::Quit));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(r)), Some(Action::Refresh));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(space)), Some(Action::ToggleMultiSelect));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(h)), Some(Action::ToggleHelp));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(l)), Some(Action::CycleLayout));
-    assert_eq!(
-        km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('T'), KeyModifiers::SHIFT)),
-        Some(Action::CycleTheme)
-    );
-    assert_eq!(
-        km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('.'), KeyModifiers::NONE)),
-        Some(Action::OpenActionMenu)
-    );
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(n)), Some(Action::OpenBranchInput));
-    assert_eq!(
-        km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('/'), KeyModifiers::NONE)),
-        Some(Action::OpenCommandPalette)
-    );
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(a)), Some(Action::OpenFilePicker));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(c)), Some(Action::ToggleProviders));
-    assert_eq!(
-        km.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('D'), KeyModifiers::SHIFT)),
-        Some(Action::ToggleDebug)
-    );
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(d)), Some(Action::Dispatch(Intent::RemoveCheckout)));
-    assert_eq!(
-        km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(p)),
-        Some(Action::Dispatch(Intent::OpenChangeRequest))
-    );
+    // The effective Normal mode is Composed([TabPage, Normal]) — use that for keys that moved to TabPage.
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    // Keys from TabPage (app-global):
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(q)), Some(Action::Quit));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(h)), Some(Action::ToggleHelp));
+    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('T'), KeyModifiers::SHIFT)), Some(Action::CycleTheme));
+    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::OpenCommandPalette));
+    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('D'), KeyModifiers::SHIFT)), Some(Action::ToggleDebug));
+    // Keys from Normal (repo-tab specific):
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(r)), Some(Action::Refresh));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(space)), Some(Action::ToggleMultiSelect));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(l)), Some(Action::CycleLayout));
+    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('.'), KeyModifiers::NONE)), Some(Action::OpenActionMenu));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(n)), Some(Action::OpenBranchInput));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(a)), Some(Action::OpenFilePicker));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(c)), Some(Action::ToggleProviders));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(d)), Some(Action::Dispatch(Intent::RemoveCheckout)));
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(p)), Some(Action::Dispatch(Intent::OpenChangeRequest)));
 }
 
 #[test]
 fn mode_specific_overrides_shared() {
     let km = Keymap::defaults();
-    // q is Quit in Normal, but Dismiss in Help/Overview/ActionMenu/DeleteConfirm/CloseConfirm
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(q)), Some(Action::Quit));
+    // q is Quit in TabPage (composed with top-level tabs), but Dismiss in overlay modes.
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    let overview_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]);
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(q)), Some(Action::Quit));
+    // Overview overrides q → Dismiss (navigates back to repo tab, not quit app).
+    assert_eq!(km.resolve(&overview_composed, crokey::key!(q)), Some(Action::Dismiss));
+    // Overlay modes use Single and get their own q binding:
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), crokey::key!(q)), Some(Action::Dismiss));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), crokey::key!(q)), Some(Action::Dismiss));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::ActionMenu), crokey::key!(q)), Some(Action::Dismiss));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DeleteConfirm), crokey::key!(q)), Some(Action::Dismiss));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::CloseConfirm), crokey::key!(q)), Some(Action::Dismiss));
@@ -216,10 +209,16 @@ fn tab_switching_in_normal_and_overview() {
     let bracket_left = kc(KeyCode::Char('['), KeyModifiers::NONE);
     let bracket_right = kc(KeyCode::Char(']'), KeyModifiers::NONE);
 
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), bracket_left), Some(Action::PrevTab));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), bracket_right), Some(Action::NextTab));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), bracket_left), Some(Action::PrevTab));
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Overview), bracket_right), Some(Action::NextTab));
+    // [/] live in TabPage; resolve through composed modes.
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    let overview_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]);
+    let convoys_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys]);
+    assert_eq!(km.resolve(&normal_composed, bracket_left), Some(Action::PrevTab));
+    assert_eq!(km.resolve(&normal_composed, bracket_right), Some(Action::NextTab));
+    assert_eq!(km.resolve(&overview_composed, bracket_left), Some(Action::PrevTab));
+    assert_eq!(km.resolve(&overview_composed, bracket_right), Some(Action::NextTab));
+    assert_eq!(km.resolve(&convoys_composed, bracket_left), Some(Action::PrevTab));
+    assert_eq!(km.resolve(&convoys_composed, bracket_right), Some(Action::NextTab));
 }
 
 #[test]
@@ -241,8 +240,9 @@ fn close_confirm_has_y_n_bindings() {
 #[test]
 fn help_mode_toggle_with_h() {
     let km = Keymap::defaults();
-    // h maps to ToggleHelp in Normal and Help modes
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(h)), Some(Action::ToggleHelp));
+    // h maps to ToggleHelp in TabPage (composed with top-level tabs) and in Help mode.
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    assert_eq!(km.resolve(&normal_composed, crokey::key!(h)), Some(Action::ToggleHelp));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), crokey::key!(h)), Some(Action::ToggleHelp));
 }
 
@@ -250,9 +250,10 @@ fn help_mode_toggle_with_h() {
 fn question_mark_maps_to_contextual_palette_in_normal() {
     let km = Keymap::defaults();
     let question_mark = kc(KeyCode::Char('?'), KeyModifiers::NONE);
-    // ? now maps to OpenContextualPalette in Normal mode
-    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), question_mark), Some(Action::OpenContextualPalette));
-    // ? is not bound in Help mode (no longer a shared binding)
+    // ? maps to OpenContextualPalette via TabPage, available in all top-level tab modes.
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    assert_eq!(km.resolve(&normal_composed, question_mark), Some(Action::OpenContextualPalette));
+    // ? is not bound in overlay modes like Help (no TabPage composition there).
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Help), question_mark), None);
 }
 
@@ -347,15 +348,10 @@ fn from_config_overrides_mode_binding() {
     let mut keys = KeysConfig::default();
     keys.normal.insert("x".into(), "quit".into());
     let keymap = Keymap::from_config(&keys);
-    assert_eq!(
-        keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('x'), KeyModifiers::NONE)),
-        Some(Action::Quit)
-    );
-    // original 'q' still works
-    assert_eq!(
-        keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Some(Action::Quit)
-    );
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    assert_eq!(keymap.resolve(&normal_composed, kc(KeyCode::Char('x'), KeyModifiers::NONE)), Some(Action::Quit));
+    // original 'q' (now in TabPage) still resolves through the composed mode
+    assert_eq!(keymap.resolve(&normal_composed, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
 }
 
 #[test]
@@ -363,11 +359,9 @@ fn from_config_skips_invalid_key_string() {
     let mut keys = KeysConfig::default();
     keys.shared.insert("NOT_A_VALID_KEY!!!".into(), "quit".into());
     let keymap = Keymap::from_config(&keys);
-    // defaults still work despite invalid override
-    assert_eq!(
-        keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Some(Action::Quit)
-    );
+    // defaults still work despite invalid override — 'q' now in TabPage
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    assert_eq!(keymap.resolve(&normal_composed, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
 }
 
 #[test]
@@ -383,14 +377,11 @@ fn from_config_skips_invalid_action_name() {
 fn from_config_empty_uses_defaults() {
     let keys = KeysConfig::default();
     let keymap = Keymap::from_config(&keys);
-    assert_eq!(
-        keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('j'), KeyModifiers::NONE)),
-        Some(Action::SelectNext)
-    );
-    assert_eq!(
-        keymap.resolve(&KeyBindingMode::from(BindingModeId::Normal), kc(KeyCode::Char('q'), KeyModifiers::NONE)),
-        Some(Action::Quit)
-    );
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+    // j is in Shared, accessible from Normal composed mode.
+    assert_eq!(keymap.resolve(&normal_composed, kc(KeyCode::Char('j'), KeyModifiers::NONE)), Some(Action::SelectNext));
+    // q is now in TabPage, accessible through the composed mode.
+    assert_eq!(keymap.resolve(&normal_composed, kc(KeyCode::Char('q'), KeyModifiers::NONE)), Some(Action::Quit));
 }
 
 #[test]

@@ -92,7 +92,7 @@ impl InteractiveWidget for OverviewPage {
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
-        BindingModeId::Overview.into()
+        KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview])
     }
 
     fn status_fragment(&self) -> StatusFragment {
@@ -136,7 +136,18 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                let mut ctx = RenderContext { model: &harness.model, ui: &mut ui, theme: &theme, keymap: &keymap, in_flight: &in_flight };
+                let empty_namespaces = crate::app::NamespaceMap::new();
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &keymap,
+                    in_flight: &in_flight,
+                    namespaces: &empty_namespaces,
+                    convoys_selected: None,
+                    convoy_filter: "",
+                    convoys: vec![],
+                };
                 page.render(frame, frame.area(), &mut ctx);
             })
             .expect("draw should succeed");
@@ -179,7 +190,7 @@ mod tests {
     #[test]
     fn overview_page_binding_mode_is_overview() {
         let page = OverviewPage::new();
-        assert_eq!(page.binding_mode(), KeyBindingMode::from(BindingModeId::Overview));
+        assert_eq!(page.binding_mode(), KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]));
     }
 
     #[test]

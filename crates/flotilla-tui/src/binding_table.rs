@@ -19,6 +19,14 @@ pub enum BindingModeId {
     Shared,
     Normal,
     Overview,
+    /// App-global page-level bindings that are common to all top-level tabs
+    /// (tab navigation, quit, command palette, etc.). Top-level tab modes
+    /// (`Normal`, `Overview`, `Convoys`) compose with this via
+    /// `KeyBindingMode::Composed`. Overlay modes do NOT compose with it — they
+    /// mask tab-page globals so users can't accidentally switch tabs from a
+    /// confirm dialog.
+    TabPage,
+    Convoys,
     Help,
     ActionMenu,
     DeleteConfirm,
@@ -106,34 +114,42 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Shared, "enter", Action::Confirm),
     b(BindingModeId::Shared, "esc", Action::Dismiss),
     b(BindingModeId::Shared, "S-K", Action::ToggleStatusBarKeys),
+    // ── TabPage — app-global tab-level bindings, composed by all top-level tabs ──
+    h(BindingModeId::TabPage, "q", Action::Quit, "Quit"),
+    b(BindingModeId::TabPage, "[", Action::PrevTab),
+    b(BindingModeId::TabPage, "]", Action::NextTab),
+    h(BindingModeId::TabPage, "h", Action::ToggleHelp, "Help"),
+    h(BindingModeId::TabPage, "?", Action::OpenContextualPalette, "Ctx"),
+    b(BindingModeId::TabPage, "S-T", Action::CycleTheme),
+    b(BindingModeId::TabPage, "S-D", Action::ToggleDebug),
+    b(BindingModeId::TabPage, "/", Action::OpenCommandPalette),
     // ── Normal ──
     // Hint order matters: ENT, ., n, ?, q matches the old status bar layout.
     hk(BindingModeId::Normal, "enter", "ENT", Action::Confirm, "Open"),
     h(BindingModeId::Normal, ".", Action::OpenActionMenu, "Menu"),
     h(BindingModeId::Normal, "n", Action::OpenBranchInput, "New"),
-    h(BindingModeId::Normal, "?", Action::OpenContextualPalette, "Ctx"),
-    h(BindingModeId::Normal, "q", Action::Quit, "Quit"),
-    b(BindingModeId::Normal, "r", Action::Refresh),
-    b(BindingModeId::Normal, "[", Action::PrevTab),
-    b(BindingModeId::Normal, "]", Action::NextTab),
     b(BindingModeId::Normal, "{", Action::MoveTabLeft),
     b(BindingModeId::Normal, "}", Action::MoveTabRight),
+    b(BindingModeId::Normal, "r", Action::Refresh),
     b(BindingModeId::Normal, "space", Action::ToggleMultiSelect),
-    h(BindingModeId::Normal, "h", Action::ToggleHelp, "Help"),
     b(BindingModeId::Normal, "l", Action::CycleLayout),
-    b(BindingModeId::Normal, "S-T", Action::CycleTheme),
-    b(BindingModeId::Normal, "/", Action::OpenCommandPalette),
     b(BindingModeId::Normal, "a", Action::OpenFilePicker),
     b(BindingModeId::Normal, "c", Action::ToggleProviders),
     b(BindingModeId::Normal, "u", Action::ToggleArchived),
-    b(BindingModeId::Normal, "S-D", Action::ToggleDebug),
     b(BindingModeId::Normal, "d", Action::Dispatch(Intent::RemoveCheckout)),
     b(BindingModeId::Normal, "p", Action::Dispatch(Intent::OpenChangeRequest)),
+    // ── Convoys ──
+    h(BindingModeId::Convoys, "j", Action::SelectNext, "Down"),
+    h(BindingModeId::Convoys, "k", Action::SelectPrev, "Up"),
+    // l/enter (Focus) are omitted: the nested focus navigation isn't shipped in PR 1.
+    // Add them back when the behaviour is implemented.
+    // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
+    h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),
-    h(BindingModeId::Overview, "[", Action::PrevTab, "Prev"),
-    h(BindingModeId::Overview, "]", Action::NextTab, "Next"),
+    // [, ] come from TabPage (composed). q is intentionally Dismiss (not Quit) on
+    // the Overview tab — it switches back to the active repo tab, not quit the app.
     h(BindingModeId::Overview, "q", Action::Dismiss, "Quit"),
     // ── Help ──
     h(BindingModeId::Help, "j", Action::SelectNext, "Down"),
@@ -485,10 +501,13 @@ mod tests {
     #[test]
     fn compiled_bindings_resolve_single_mode() {
         let compiled = CompiledBindings::from_table(BINDINGS);
-        let mode = KeyBindingMode::Single(BindingModeId::Normal);
-        // 'q' in Normal should be Quit.
+        // 'q' is now in TabPage, not Normal. Normal still resolves ENT → Confirm.
+        let mode_tabpage = KeyBindingMode::Single(BindingModeId::TabPage);
         let q = parse_key_string("q");
-        assert_eq!(compiled.resolve(&mode, q), Some(Action::Quit));
+        assert_eq!(compiled.resolve(&mode_tabpage, q), Some(Action::Quit));
+        // Composed [TabPage, Normal] resolves 'q' from TabPage.
+        let mode_normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
+        assert_eq!(compiled.resolve(&mode_normal_composed, q), Some(Action::Quit));
     }
 
     #[test]

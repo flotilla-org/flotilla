@@ -25,6 +25,7 @@ use flotilla_protocol::{
     ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
     WorkItemIdentity,
 };
+use indexmap::IndexMap;
 pub use intent::Intent;
 use tokio::sync::mpsc;
 use tui_input::Input;
@@ -258,6 +259,27 @@ impl TuiModel {
     }
 }
 
+/// Alias for the per-namespace map stored on `App` and passed into `RenderContext`.
+pub type NamespaceMap = HashMap<String, NamespaceModel>;
+
+/// Per-namespace convoy state tracked by the TUI. Populated from
+/// `DaemonEvent::NamespaceSnapshot` and updated by `DaemonEvent::NamespaceDelta`.
+#[derive(Default)]
+pub struct NamespaceModel {
+    pub convoys: IndexMap<flotilla_protocol::namespace::ConvoyId, flotilla_protocol::namespace::ConvoySummary>,
+    pub last_seq: u64,
+}
+
+/// UI state for the Convoys tab (selection, filter).
+///
+/// Minimal stub for Task 25; full selection wiring lands in Task 26,
+/// filter input in Task 27.
+#[derive(Default)]
+pub struct ConvoysUiState {
+    pub selected: Option<flotilla_protocol::namespace::ConvoyId>,
+    pub filter: String,
+}
+
 /// A command that has been dispatched to the daemon and is awaiting completion.
 pub struct InFlightCommand {
     pub repo_identity: RepoIdentity,
@@ -302,6 +324,23 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
     }
 
     items.into_iter().filter(|item| !ui.status_bar.dismissed_status_ids.contains(&item.id)).collect()
+}
+
+/// Filter a slice of convoy summaries by a case-insensitive substring `filter`.
+///
+/// Matches against convoy name and `repo_hint`. An empty filter passes everything.
+/// This is the single source of truth for the Convoys tab filter — call sites that
+/// need a pre-filtered list (e.g. `render_frame`) should invoke this directly with
+/// field-level borrows rather than going through `App::visible_convoys` (which
+/// borrows all of `self`).
+pub fn filter_convoys_by_str<'a>(
+    convoys: impl IntoIterator<Item = &'a flotilla_protocol::namespace::ConvoySummary>,
+    filter: &str,
+) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> {
+    let f = filter.to_lowercase();
+    convoys.into_iter().filter(move |c| {
+        f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
+    })
 }
 
 /// Log provider errors and format them into a status message.
@@ -349,6 +388,11 @@ pub struct App {
     pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
+    /// Per-namespace convoy state. Keyed by namespace string. Populated from
+    /// `DaemonEvent::NamespaceSnapshot` / `NamespaceDelta`.
+    pub namespaces: HashMap<String, NamespaceModel>,
+    /// Convoys tab UI state (selection, filter).
+    pub convoys_ui: ConvoysUiState,
 }
 
 impl App {
@@ -403,6 +447,8 @@ impl App {
             issue_update_tx,
             issue_update_rx,
             session_id: uuid::Uuid::new_v4(),
+            namespaces: HashMap::new(),
+            convoys_ui: ConvoysUiState::default(),
         }
     }
 
@@ -794,6 +840,7 @@ impl App {
         let my_host = self.model.my_host().cloned();
         let my_node_id = self.model.my_node_id().cloned();
         let active_repo_is_remote_only = self.active_repo_is_remote_only();
+        let is_convoys = self.ui.is_convoys;
         crate::widgets::WidgetContext {
             model: &self.model,
             keymap: &self.keymap,
@@ -806,6 +853,7 @@ impl App {
             repo_order: &self.model.repo_order,
             commands: &mut self.proto_commands,
             is_config: &mut self.ui.is_config,
+            is_convoys,
             active_repo_is_remote_only,
             app_actions: Vec::new(),
         }
@@ -932,9 +980,16 @@ impl App {
                 AppAction::SwitchToConfig => {
                     self.dismiss_modals();
                     self.ui.is_config = true;
+                    self.ui.is_convoys = false;
+                }
+                AppAction::SwitchToConvoys => {
+                    self.dismiss_modals();
+                    self.ui.is_config = false;
+                    self.ui.is_convoys = true;
                 }
                 AppAction::SwitchToRepo(i) => {
                     self.dismiss_modals();
+                    self.ui.is_convoys = false;
                     self.switch_tab(i);
                 }
                 AppAction::SaveTabOrder => {
@@ -1103,6 +1158,28 @@ impl App {
                 if clear_target {
                     self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }
+            }
+            DaemonEvent::NamespaceSnapshot(snap) => {
+                let namespace = snap.namespace.clone();
+                let entry = self.namespaces.entry(namespace.clone()).or_default();
+                entry.convoys.clear();
+                for convoy in snap.convoys.iter() {
+                    entry.convoys.insert(convoy.id.clone(), convoy.clone());
+                }
+                entry.last_seq = snap.seq;
+                self.refresh_convoy_selection(&namespace);
+            }
+            DaemonEvent::NamespaceDelta(delta) => {
+                let namespace = delta.namespace.clone();
+                let entry = self.namespaces.entry(namespace.clone()).or_default();
+                for convoy in delta.changed.iter() {
+                    entry.convoys.insert(convoy.id.clone(), convoy.clone());
+                }
+                for id in delta.removed.iter() {
+                    entry.convoys.shift_remove(id);
+                }
+                entry.last_seq = delta.seq;
+                self.refresh_convoy_selection(&namespace);
             }
         }
     }
@@ -1345,6 +1422,85 @@ impl App {
     /// Build a repo command for an issue-row action (where no WorkItem context exists).
     pub(super) fn provider_repo_command_for_issue(&self, action: CommandAction) -> Command {
         self.repo_command(action)
+    }
+
+    /// Returns convoys for the given namespace in insertion order.
+    pub fn convoys(&self, namespace: &str) -> Vec<&flotilla_protocol::namespace::ConvoySummary> {
+        self.namespaces.get(namespace).map(|m| m.convoys.values().collect()).unwrap_or_default()
+    }
+
+    /// Returns the selected convoy id for the Convoys tab, if any.
+    pub fn selected_convoy_id(&self) -> Option<&flotilla_protocol::namespace::ConvoyId> {
+        self.convoys_ui.selected.as_ref()
+    }
+
+    /// Returns the convoy filter string for the Convoys tab.
+    pub fn convoy_filter_str(&self) -> &str {
+        &self.convoys_ui.filter
+    }
+
+    /// Validate the current convoy selection and default-select when needed.
+    ///
+    /// Called after every namespace snapshot or delta:
+    /// - Clears selection when there are no convoys.
+    /// - Replaces a dangling selection (removed convoy) with the first available convoy.
+    /// - Sets the first convoy as the default when no selection is set yet.
+    fn refresh_convoy_selection(&mut self, namespace: &str) {
+        let Some(model) = self.namespaces.get(namespace) else {
+            self.convoys_ui.selected = None;
+            return;
+        };
+        if model.convoys.is_empty() {
+            self.convoys_ui.selected = None;
+            return;
+        }
+        let still_valid = self.convoys_ui.selected.as_ref().is_some_and(|id| model.convoys.contains_key(id));
+        if !still_valid {
+            self.convoys_ui.selected = Some(model.convoys.keys().next().cloned().expect("non-empty checked above"));
+        }
+    }
+
+    /// Move the convoy selection by `delta` positions (positive = down, negative = up).
+    ///
+    /// Operates on the *filtered* visible set so j/k never lands on a hidden convoy.
+    /// Clamps at both ends. No-ops when there are no visible convoys.
+    pub(crate) fn convoys_tab_select_delta(&mut self, delta: isize) {
+        // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
+        // support will need a namespace scoping concept on ConvoysUiState —
+        // see issue #589 (arbitrary tabs).
+        let ids: Vec<flotilla_protocol::namespace::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
+        if ids.is_empty() {
+            self.convoys_ui.selected = None;
+            return;
+        }
+        let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| candidate == id)).unwrap_or(0);
+        let new_idx = (current_idx as isize + delta).clamp(0, (ids.len() - 1) as isize) as usize;
+        self.convoys_ui.selected = Some(ids[new_idx].clone());
+    }
+
+    /// Set the filter string for the Convoys tab.
+    ///
+    /// Updates the stored filter and invalidates the current selection if it is
+    /// no longer visible under the new filter.
+    pub fn set_convoy_filter(&mut self, f: impl Into<String>) {
+        self.convoys_ui.filter = f.into();
+        self.refresh_convoy_selection_for_filter("flotilla");
+    }
+
+    /// Iterate over convoys in the given namespace, filtered by the active
+    /// filter string (case-insensitive substring match on name and repo_hint).
+    pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> + 'a {
+        filter_convoys_by_str(self.convoys(namespace), &self.convoys_ui.filter)
+    }
+
+    /// When the filter changes, check whether the current selection is still
+    /// visible. If not, default to the first visible convoy (or `None`).
+    fn refresh_convoy_selection_for_filter(&mut self, namespace: &str) {
+        let visible_ids: Vec<_> = self.visible_convoys(namespace).map(|c| c.id.clone()).collect();
+        let current_visible = self.convoys_ui.selected.as_ref().is_some_and(|id| visible_ids.contains(id));
+        if !current_visible {
+            self.convoys_ui.selected = visible_ids.into_iter().next();
+        }
     }
 
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {

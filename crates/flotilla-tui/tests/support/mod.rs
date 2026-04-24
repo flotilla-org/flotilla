@@ -175,6 +175,7 @@ impl TestHarness {
         let mut terminal = Terminal::new(backend).expect("failed to create test terminal");
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
+        let empty_namespaces = flotilla_tui::app::NamespaceMap::new();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -184,6 +185,10 @@ impl TestHarness {
                     theme: &theme,
                     keymap: &keymap,
                     in_flight: &self.in_flight,
+                    namespaces: &empty_namespaces,
+                    convoys_selected: None,
+                    convoy_filter: "",
+                    convoys: vec![],
                 };
                 self.screen.render(frame, area, &mut ctx);
             })

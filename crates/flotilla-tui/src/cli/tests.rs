@@ -874,3 +874,144 @@ mod query_event_formatting {
         assert!(output.starts_with("[command]"), "non-query result should have [command] prefix, got: {output}");
     }
 }
+
+mod namespace_event_formatting {
+    use flotilla_protocol::{
+        namespace::{NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    use crate::cli::format_event_human;
+
+    #[test]
+    fn namespace_snapshot_formatting() {
+        let snap = NamespaceSnapshot { seq: 7, namespace: "flotilla".into(), convoys: vec![] };
+        let event = DaemonEvent::NamespaceSnapshot(Box::new(snap));
+        let line = format_event_human(&event);
+        assert!(line.contains("[namespace]"), "should have namespace tag");
+        assert!(line.contains("flotilla"), "should include namespace name");
+        assert!(line.contains("seq 7"), "should include seq number");
+        assert!(line.contains("0 convoys"), "should count convoys");
+    }
+
+    #[test]
+    fn namespace_delta_formatting() {
+        use flotilla_protocol::namespace::ConvoyId;
+        let delta = NamespaceDelta {
+            seq: 12,
+            namespace: "flotilla".into(),
+            changed: vec![],
+            removed: vec![ConvoyId::new("flotilla", "old-convoy")],
+        };
+        let event = DaemonEvent::NamespaceDelta(Box::new(delta));
+        let line = format_event_human(&event);
+        assert!(line.contains("[namespace]"), "should have namespace tag");
+        assert!(line.contains("flotilla"), "should include namespace name");
+        assert!(line.contains("seq 12") || line.contains("12"), "should include seq number");
+        assert!(line.contains("0 changed"), "should show changed count");
+        assert!(line.contains("1 removed"), "should show removed count");
+    }
+}
+
+mod watch_dedupe_namespace {
+    use std::collections::HashMap;
+
+    use flotilla_protocol::{
+        namespace::{NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent, StreamKey,
+    };
+
+    use crate::cli::event_stream_seq;
+
+    fn ns_snapshot(namespace: &str, seq: u64) -> DaemonEvent {
+        DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot { seq, namespace: namespace.into(), convoys: vec![] }))
+    }
+
+    fn ns_delta(namespace: &str, seq: u64) -> DaemonEvent {
+        DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta { seq, namespace: namespace.into(), changed: vec![], removed: vec![] }))
+    }
+
+    /// Simulate the run_watch dedup logic: build replay_seqs from a slice of
+    /// replay events, then return which of the live events would be printed
+    /// (i.e. not suppressed by the dedup guard).
+    fn events_printed_after_dedup<'a>(replay: &[DaemonEvent], live: &'a [DaemonEvent]) -> Vec<&'a DaemonEvent> {
+        let mut replay_seqs: HashMap<StreamKey, u64> = HashMap::new();
+        for event in replay {
+            if let Some((stream_key, seq)) = event_stream_seq(event) {
+                replay_seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
+            }
+        }
+        live.iter()
+            .filter(|event| {
+                if let Some((stream_key, seq)) = event_stream_seq(event) {
+                    if let Some(&replay_seq) = replay_seqs.get(&stream_key) {
+                        return seq > replay_seq;
+                    }
+                }
+                true
+            })
+            .collect()
+    }
+
+    #[test]
+    fn event_stream_seq_returns_namespace_key_for_snapshot() {
+        let event = ns_snapshot("flotilla", 5);
+        let result = event_stream_seq(&event);
+        assert_eq!(result, Some((StreamKey::Namespace { name: "flotilla".into() }, 5)));
+    }
+
+    #[test]
+    fn event_stream_seq_returns_namespace_key_for_delta() {
+        let event = ns_delta("flotilla", 9);
+        let result = event_stream_seq(&event);
+        assert_eq!(result, Some((StreamKey::Namespace { name: "flotilla".into() }, 9)));
+    }
+
+    #[test]
+    fn duplicate_seq_namespace_delta_is_suppressed() {
+        // A delta arrives in replay at seq=5; the broadcast channel then delivers
+        // the same event again (seq=5). The live duplicate must be suppressed.
+        let replay = [ns_delta("flotilla", 5)];
+        let live = [ns_delta("flotilla", 5)];
+        let printed = events_printed_after_dedup(&replay, &live);
+        assert!(printed.is_empty(), "duplicate-seq delta should be suppressed by dedup, but {} event(s) were printed", printed.len());
+    }
+
+    #[test]
+    fn newer_seq_namespace_delta_is_printed() {
+        // Replay has seq=5; a genuinely new delta (seq=6) must pass through.
+        let replay = [ns_delta("flotilla", 5)];
+        let live = [ns_delta("flotilla", 6)];
+        let printed = events_printed_after_dedup(&replay, &live);
+        assert_eq!(printed.len(), 1, "new-seq delta should pass dedup filter");
+    }
+
+    #[test]
+    fn snapshot_replay_suppresses_same_seq_live_snapshot() {
+        // Replay delivers a full namespace snapshot at seq=3; the broadcast
+        // buffer then delivers that same snapshot — must be suppressed.
+        let replay = [ns_snapshot("flotilla", 3)];
+        let live = [ns_snapshot("flotilla", 3)];
+        let printed = events_printed_after_dedup(&replay, &live);
+        assert!(printed.is_empty(), "duplicate-seq snapshot should be suppressed");
+    }
+
+    #[test]
+    fn different_namespace_events_are_not_cross_suppressed() {
+        // Replay has "flotilla" at seq=5; a live delta for "other" at seq=5
+        // should still be printed (different StreamKey).
+        let replay = [ns_delta("flotilla", 5)];
+        let live = [ns_delta("other", 5)];
+        let printed = events_printed_after_dedup(&replay, &live);
+        assert_eq!(printed.len(), 1, "events for different namespaces should not suppress each other");
+    }
+
+    #[test]
+    fn older_seq_live_event_is_suppressed() {
+        // Replay has seq=10; if a stale live event with seq=8 arrives, suppress it.
+        let replay = [ns_snapshot("flotilla", 10)];
+        let live = [ns_delta("flotilla", 8)];
+        let printed = events_printed_after_dedup(&replay, &live);
+        assert!(printed.is_empty(), "stale live event (seq < replay_seq) should be suppressed");
+    }
+}

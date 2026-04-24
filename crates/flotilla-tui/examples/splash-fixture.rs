@@ -5,7 +5,7 @@ use std::{
 
 use color_eyre::Result;
 use ratatui_image::{
-    picker::{cap_parser::QueryStdioOptions, Picker},
+    picker::{cap_parser::QueryStdioOptions, Picker, ProtocolType},
     StatefulImage,
 };
 
@@ -22,6 +22,16 @@ async fn main() -> Result<()> {
     result
 }
 
+fn forced_protocol_type_from_env() -> Option<ProtocolType> {
+    match std::env::var("FLOTILLA_SPLASH_PROTOCOL").ok().map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("halfblocks") => Some(ProtocolType::Halfblocks),
+        Some("sixel") => Some(ProtocolType::Sixel),
+        Some("kitty") => Some(ProtocolType::Kitty),
+        Some("iterm2") => Some(ProtocolType::Iterm2),
+        _ => None,
+    }
+}
+
 async fn show_splash_with_report(terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
     let img_bytes = include_bytes!("../../../assets/splash.webp");
     let decode_started = Instant::now();
@@ -35,8 +45,13 @@ async fn show_splash_with_report(terminal: &mut ratatui::DefaultTerminal) -> Res
     query_options.timeout = Duration::from_millis(query_timeout_ms);
 
     let query_started = Instant::now();
-    let picker = Picker::from_query_stdio_with_options(query_options).unwrap_or_else(|_| Picker::halfblocks());
+    let mut picker = Picker::from_query_stdio_with_options(query_options).unwrap_or_else(|_| Picker::halfblocks());
     let query_elapsed = query_started.elapsed();
+    let detected_protocol_type = picker.protocol_type();
+    let forced_protocol_type = forced_protocol_type_from_env();
+    if let Some(forced_protocol_type) = forced_protocol_type {
+        picker.set_protocol_type(forced_protocol_type);
+    }
     let protocol_type = picker.protocol_type();
 
     let resize_started = Instant::now();
@@ -69,7 +84,7 @@ async fn show_splash_with_report(terminal: &mut ratatui::DefaultTerminal) -> Res
     }
 
     let report = format!(
-        "splash-fixture protocol={protocol_type:?} decode_ms={} query_ms={} resize_ms={} show_ms={}",
+        "splash-fixture detected_protocol={detected_protocol_type:?} forced_protocol={forced_protocol_type:?} protocol={protocol_type:?} decode_ms={} query_ms={} resize_ms={} show_ms={}",
         decode_elapsed.as_millis(),
         query_elapsed.as_millis(),
         resize_elapsed.as_millis(),

@@ -147,12 +147,25 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     terminal.draw(|f| {
         let area = f.area();
+        let convoys_selected = app.convoys_ui.selected.clone();
+        let convoy_filter = app.convoys_ui.filter.as_str();
+        // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
+        // support will need a namespace scoping concept on ConvoysUiState —
+        // see issue #589 (arbitrary tabs).
+        // Borrow only the convoy-related fields to avoid a whole-struct borrow
+        // conflict with `&mut app.ui` below.
+        let raw = app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
+        let convoys: Vec<&_> = crate::app::filter_convoys_by_str(raw.iter().copied(), &app.convoys_ui.filter).collect();
         let mut ctx = crate::widgets::RenderContext {
             model: &app.model,
             ui: &mut app.ui,
             theme: &app.theme,
             keymap: &app.keymap,
             in_flight: &app.in_flight,
+            namespaces: &app.namespaces,
+            convoys_selected,
+            convoy_filter,
+            convoys,
         };
         app.screen.render(f, area, &mut ctx);
     })?;

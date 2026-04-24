@@ -11,22 +11,37 @@ use crate::{
 impl App {
     // ── Key handling ──
 
-    /// Resolve a key event using the app-level config/normal distinction.
+    /// Resolve a key event using the app-level config/convoys/normal distinction.
     ///
     /// Called when the base layer widget (Normal mode_id) is on top, so that
-    /// config mode gets Overview bindings instead of Normal.
+    /// config mode gets Overview bindings, convoys mode gets Convoys bindings,
+    /// and normal mode gets Normal bindings.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode_id = if self.ui.is_config { BindingModeId::Overview } else { BindingModeId::Normal };
-        let mode: KeyBindingMode = mode_id.into();
+        let mode = if self.ui.is_config {
+            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview])
+        } else if self.ui.is_convoys {
+            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys])
+        } else {
+            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal])
+        };
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
     }
 
     /// Handle actions that the widget stack returned `Ignored` for.
     ///
     /// These are actions that need `&mut App` context the widget doesn't
-    /// have: confirm/enter, action menu, file picker, and dispatch intent.
+    /// have: confirm/enter, action menu, file picker, dispatch intent, and
+    /// convoy selection navigation.
     pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
+            Action::SelectNext if self.ui.is_convoys => self.convoys_tab_select_delta(1),
+            Action::SelectPrev if self.ui.is_convoys => self.convoys_tab_select_delta(-1),
+            // Focus detail / expand tree — deferred; no-op for now.
+            // This guard also prevents zero-repo panics and stops Enter from
+            // acting on the hidden repo page while the Convoys tab is visible.
+            Action::Confirm if self.ui.is_convoys => {}
+            // Collapse tree / back — deferred; no-op for now.
+            Action::Dismiss if self.ui.is_convoys => {}
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),

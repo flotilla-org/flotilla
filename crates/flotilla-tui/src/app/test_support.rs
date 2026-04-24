@@ -243,6 +243,7 @@ impl TestWidgetHarness {
             repo_order: &self.model.repo_order,
             commands: &mut self.commands,
             is_config: &mut self.is_config,
+            is_convoys: false,
             active_repo_is_remote_only: self.active_repo_is_remote_only,
             app_actions: Vec::new(),
         }

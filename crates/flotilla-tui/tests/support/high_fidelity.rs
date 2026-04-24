@@ -322,6 +322,8 @@ impl HighFidelityHarness {
             DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
             DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
             DaemonEvent::HostRemoved { environment_id, .. } => format!("host_removed {environment_id}"),
+            DaemonEvent::NamespaceSnapshot(snap) => format!("namespace_snapshot ns={} seq={}", snap.namespace, snap.seq),
+            DaemonEvent::NamespaceDelta(delta) => format!("namespace_delta ns={} seq={}", delta.namespace, delta.seq),
         };
         self.recent_events.push(summary);
         if self.recent_events.len() > 20 {
@@ -351,15 +353,23 @@ impl HighFidelityHarness {
         let backend = TestBackend::new(WIDTH, HEIGHT);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let theme = self.app.theme.clone();
+        let convoys_selected = self.app.convoys_ui.selected.clone();
+        let convoy_filter_str = self.app.convoys_ui.filter.clone();
         terminal
             .draw(|frame| {
                 let area = frame.area();
+                let raw = self.app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
+                let convoys: Vec<&_> = flotilla_tui::app::filter_convoys_by_str(raw.iter().copied(), &self.app.convoys_ui.filter).collect();
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.app.model,
                     ui: &mut self.app.ui,
                     theme: &theme,
                     keymap: &self.app.keymap,
                     in_flight: &self.app.in_flight,
+                    namespaces: &self.app.namespaces,
+                    convoys_selected,
+                    convoy_filter: &convoy_filter_str,
+                    convoys,
                 };
                 self.app.screen.render(frame, area, &mut ctx);
             })
@@ -424,6 +434,8 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
         DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),
         DaemonEvent::HostRemoved { environment_id, .. } => format!("{source}: host_removed {environment_id}"),
+        DaemonEvent::NamespaceSnapshot(snap) => format!("{source}: namespace_snapshot ns={} seq={}", snap.namespace, snap.seq),
+        DaemonEvent::NamespaceDelta(delta) => format!("{source}: namespace_delta ns={} seq={}", delta.namespace, delta.seq),
     };
     recent.push(summary);
     if recent.len() > 20 {

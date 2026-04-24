@@ -2,7 +2,7 @@
 source: crates/flotilla-tui/tests/snapshots.rs
 expression: output
 ---
- ⚓  flotilla  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project | [+]
                                                                     ⚙   ┌ Preview ─────────────────────────────────────┐
                                                                         │                                              │
                                                                         │                                              │

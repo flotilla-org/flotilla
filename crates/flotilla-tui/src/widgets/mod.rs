@@ -3,6 +3,7 @@ pub mod branch_input;
 pub mod close_confirm;
 pub mod columns;
 pub mod command_palette;
+pub mod convoys_page;
 pub mod delete_confirm;
 pub mod event_log;
 pub mod file_picker;
@@ -67,6 +68,7 @@ pub enum AppAction {
     StatusBarKeyPress { code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers },
     ClearError(usize),
     SwitchToConfig,
+    SwitchToConvoys,
     SwitchToRepo(usize),
     SaveTabOrder,
     OpenFilePicker,
@@ -107,6 +109,8 @@ pub struct WidgetContext<'a> {
     pub repo_order: &'a [RepoIdentity],
     pub commands: &'a mut CommandQueue,
     pub is_config: &'a mut bool,
+    /// Whether the Convoys tab is currently active.
+    pub is_convoys: bool,
     pub active_repo_is_remote_only: bool,
     pub app_actions: Vec<AppAction>,
 }
@@ -121,6 +125,16 @@ pub struct RenderContext<'a> {
     pub theme: &'a Theme,
     pub keymap: &'a Keymap,
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
+    /// Per-namespace convoy model, keyed by namespace string.
+    pub namespaces: &'a crate::app::NamespaceMap,
+    /// Currently selected convoy id for the Convoys tab.
+    pub convoys_selected: Option<flotilla_protocol::namespace::ConvoyId>,
+    /// Active filter string for the Convoys tab.
+    pub convoy_filter: &'a str,
+    /// Pre-filtered convoy list for the Convoys tab.
+    /// Produced once by `App` via `visible_convoys("flotilla")` so the filter
+    /// lives in a single place and `screen.rs` can consume it directly.
+    pub convoys: Vec<&'a flotilla_protocol::namespace::ConvoySummary>,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.

@@ -1,8 +1,9 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 357
 expression: output
 ---
- ⚓  flotilla  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project | [+]
                                                                     ⚙   ┌ Preview ─────────────────────────────────────┐
                                                                         │                                              │
                                                                         │                                              │
@@ -31,4 +32,4 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         └──────────────────────────────────────────────┘
-/ for commands               <ENT> OPEN  <.> MENU  <n> NEW         ◫ auto   @local - Refreshing repository... (+1)
+/ for commands               <q> QUIT  <h> HELP  <?> CTX           ◫ auto   @local - Refreshing repository... (+1)

@@ -1,8 +1,9 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 262
 expression: output
 ---
- ⚓  flotilla  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project | [+]
 ── Checkouts ────────────────────────────────────────────────────────────────────────────────────────────────────── ⚙
       Source     Path              Description                         Branch             WT  WS  PR   SS   Issues Git
 ▸  ○                   feat-dashb… checkout feat-dashboard             feat-dashboard     ✓
@@ -31,4 +32,4 @@ expression: output
 
 
 
-/ for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     □ zoom   @local
+/ for commands               <q> QUIT  <h> HELP  <?> CTX  <ENT> OPEN  <.> MENU  <n> NEW     □ zoom   @local

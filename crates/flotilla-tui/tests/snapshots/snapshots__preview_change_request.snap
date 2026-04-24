@@ -1,8 +1,9 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
+assertion_line: 302
 expression: output
 ---
- ⚓  flotilla  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project | [+]
 ── Pull Requests ────────────────────────────────────────────────── ⚙   ┌ Preview ─────────────────────────────────────┐
       PR#    Title                      Branch         State    Issues  │Description: Refactor auth module             │
 ▸  ⊙  #77    Refactor auth module       feat-auth      open             │Branch: feat-auth                             │
@@ -31,4 +32,4 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         └──────────────────────────────────────────────┘
-/ for commands               <ENT> OPEN  <.> MENU  <n> NEW  <?> CTX  <q> QUIT  <h> HELP     ◫ auto   @local
+/ for commands               <q> QUIT  <h> HELP  <?> CTX  <ENT> OPEN  <.> MENU  <n> NEW     ◫ auto   @local

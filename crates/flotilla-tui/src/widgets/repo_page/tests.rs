@@ -646,7 +646,7 @@ fn open_action_menu_returns_ignored() {
 #[test]
 fn binding_mode_normal_when_no_search() {
     let page = page_with_items(vec![]);
-    assert_eq!(page.binding_mode(), KeyBindingMode::from(BindingModeId::Normal));
+    assert_eq!(page.binding_mode(), KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]));
 }
 
 #[test]
@@ -655,7 +655,7 @@ fn binding_mode_composed_when_search_active() {
     page.active_search_query = Some("test".into());
     match page.binding_mode() {
         KeyBindingMode::Composed(ids) => {
-            assert_eq!(ids, vec![BindingModeId::Normal, BindingModeId::SearchActive]);
+            assert_eq!(ids, vec![BindingModeId::TabPage, BindingModeId::Normal, BindingModeId::SearchActive]);
         }
         other => panic!("expected Composed, got {:?}", other),
     }

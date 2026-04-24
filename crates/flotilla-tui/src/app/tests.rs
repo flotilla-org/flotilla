@@ -1282,3 +1282,520 @@ fn resolve_environment_target_accepts_non_host_environment_identity_directly() {
     assert_eq!(node_id, NodeId::new("node-alpha"));
     assert_eq!(target, ProvisioningTarget::ExistingEnvironment { host: host_name, env_id: nested_env });
 }
+
+// -- Namespace snapshot / delta handling --
+
+fn test_convoy(
+    namespace: &str,
+    name: &str,
+    phase: flotilla_protocol::namespace::ConvoyPhase,
+    initializing: bool,
+) -> flotilla_protocol::namespace::ConvoySummary {
+    flotilla_protocol::namespace::ConvoySummary {
+        id: flotilla_protocol::namespace::ConvoyId::new(namespace, name),
+        namespace: namespace.into(),
+        name: name.into(),
+        workflow_ref: "wf".into(),
+        phase,
+        message: None,
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing,
+    }
+}
+
+#[test]
+fn app_applies_namespace_snapshot() {
+    use flotilla_protocol::{
+        namespace::{ConvoyPhase, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    let convoy = test_convoy("flotilla", "x", ConvoyPhase::Active, false);
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy],
+    })));
+
+    assert_eq!(app.convoys("flotilla").len(), 1);
+    assert_eq!(app.convoys("flotilla")[0].name, "x");
+}
+
+#[test]
+fn app_applies_namespace_delta() {
+    use flotilla_protocol::{
+        namespace::{ConvoyPhase, NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    let convoy = test_convoy("flotilla", "x", ConvoyPhase::Pending, true);
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy.clone()],
+    })));
+
+    // Update phase via delta
+    let mut modified = convoy.clone();
+    modified.phase = ConvoyPhase::Active;
+    modified.initializing = false;
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 2,
+        namespace: "flotilla".into(),
+        changed: vec![modified],
+        removed: vec![],
+    })));
+    assert_eq!(app.convoys("flotilla")[0].phase, ConvoyPhase::Active);
+
+    // Remove via delta
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 3,
+        namespace: "flotilla".into(),
+        changed: vec![],
+        removed: vec![convoy.id.clone()],
+    })));
+    assert!(app.convoys("flotilla").is_empty());
+}
+
+// -- Convoys tab rendering --
+
+#[test]
+fn screen_renders_convoys_page_on_convoys_tab() {
+    use flotilla_protocol::{
+        namespace::{ConvoyPhase, NamespaceSnapshot},
+        DaemonEvent,
+    };
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::widgets::InteractiveWidget as _;
+
+    let mut app = stub_app();
+
+    // Feed a namespace snapshot with one convoy named "demo".
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![test_convoy("flotilla", "demo", ConvoyPhase::Active, false)],
+    })));
+
+    // Switch to the Convoys tab.
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Render into a test terminal.
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+
+    let convoys_selected = app.convoys_ui.selected.clone();
+    let convoy_filter = app.convoys_ui.filter.clone();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            let raw = app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
+            let convoys: Vec<&_> = crate::app::filter_convoys_by_str(raw.iter().copied(), &app.convoys_ui.filter).collect();
+            let mut ctx = crate::widgets::RenderContext {
+                model: &app.model,
+                ui: &mut app.ui,
+                theme: &app.theme,
+                keymap: &app.keymap,
+                in_flight: &app.in_flight,
+                namespaces: &app.namespaces,
+                convoys_selected,
+                convoy_filter: &convoy_filter,
+                convoys,
+            };
+            app.screen.render(f, area, &mut ctx);
+        })
+        .expect("draw");
+
+    let rendered: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(rendered.contains("Convoys"), "expected 'Convoys' title, got: {rendered}");
+    assert!(rendered.contains("demo"), "expected convoy name 'demo' in rendered output, got: {rendered}");
+}
+
+// -- Convoys tab selection --
+
+fn make_namespace_snapshot(names: &[&str]) -> flotilla_protocol::namespace::NamespaceSnapshot {
+    flotilla_protocol::namespace::NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: names.iter().map(|n| test_convoy("flotilla", n, flotilla_protocol::namespace::ConvoyPhase::Active, false)).collect(),
+    }
+}
+
+#[test]
+fn convoys_tab_select_next_advances_selection() {
+    use crate::keymap::Action;
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(make_namespace_snapshot(&["a", "b", "c"]))));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "first convoy should be auto-selected");
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"), "should clamp at last convoy");
+
+    // Also verify via convoys_tab_select_delta directly
+    app.convoys_tab_select_delta(-10);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "large negative delta clamps at first convoy");
+
+    let _ = Action::SelectNext; // confirm Action is reachable in this module
+}
+
+#[test]
+fn convoys_tab_select_prev_moves_back() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(make_namespace_snapshot(&["a", "b", "c"]))));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Move to the end
+    app.convoys_tab_select_delta(2);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "should clamp at first convoy");
+}
+
+#[test]
+fn delta_removing_selected_convoy_reselects_to_adjacent() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![
+            test_convoy("flotilla", "a", flotilla_protocol::namespace::ConvoyPhase::Active, false),
+            test_convoy("flotilla", "b", flotilla_protocol::namespace::ConvoyPhase::Active, false),
+            test_convoy("flotilla", "c", flotilla_protocol::namespace::ConvoyPhase::Active, false),
+        ],
+    })));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Move to "b"
+    app.convoys_tab_select_delta(1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
+
+    // Delta removes "b"
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 2,
+        namespace: "flotilla".into(),
+        changed: vec![],
+        removed: vec![ConvoyId::new("flotilla", "b")],
+    })));
+
+    let selected = app.selected_convoy_id().expect("must still have a selection after removing 'b'");
+    assert!(
+        matches!(selected.name(), "a" | "c"),
+        "after removing 'b', selection should fall back to an adjacent remaining convoy, got {}",
+        selected.name()
+    );
+}
+
+#[test]
+fn delta_removing_all_convoys_clears_selection() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, NamespaceDelta, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![test_convoy("flotilla", "a", flotilla_protocol::namespace::ConvoyPhase::Active, false)],
+    })));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    assert!(app.selected_convoy_id().is_some(), "should have a selection after snapshot");
+
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 2,
+        namespace: "flotilla".into(),
+        changed: vec![],
+        removed: vec![ConvoyId::new("flotilla", "a")],
+    })));
+
+    assert!(app.selected_convoy_id().is_none(), "removing the last convoy should clear selection");
+}
+
+// -- Convoy filter --
+
+#[test]
+fn convoy_filter_narrows_visible_convoys() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    fn convoy(name: &str) -> ConvoySummary {
+        ConvoySummary {
+            id: ConvoyId::new("flotilla", name),
+            namespace: "flotilla".into(),
+            name: name.into(),
+            workflow_ref: "wf".into(),
+            phase: ConvoyPhase::Active,
+            message: None,
+            repo_hint: None,
+            tasks: vec![],
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: false,
+        }
+    }
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
+    })));
+
+    // No filter — all three visible.
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 3);
+
+    // Filter matches a substring case-insensitively.
+    app.set_convoy_filter("BRA");
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "bravo");
+
+    // Empty filter restores all.
+    app.set_convoy_filter("");
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 3);
+}
+
+#[test]
+fn convoy_filter_matches_repo_hint() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        snapshot::RepoKey,
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+
+    let c1 = ConvoySummary {
+        id: ConvoyId::new("flotilla", "one"),
+        namespace: "flotilla".into(),
+        name: "one".into(),
+        workflow_ref: "wf".into(),
+        phase: ConvoyPhase::Active,
+        message: None,
+        repo_hint: Some(RepoKey("flotilla-org/flotilla".into())),
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+    let c2 = ConvoySummary {
+        id: ConvoyId::new("flotilla", "two"),
+        namespace: "flotilla".into(),
+        name: "two".into(),
+        workflow_ref: "wf".into(),
+        phase: ConvoyPhase::Active,
+        message: None,
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![c1, c2],
+    })));
+
+    app.set_convoy_filter("flotilla-org");
+
+    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "one");
+}
+
+#[test]
+fn convoy_filter_invalidates_hidden_selection() {
+    use flotilla_protocol::{
+        namespace::{ConvoyPhase, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![
+            test_convoy("flotilla", "alpha", ConvoyPhase::Active, false),
+            test_convoy("flotilla", "bravo", ConvoyPhase::Active, false),
+        ],
+    })));
+
+    // Select bravo
+    app.convoys_tab_select_delta(1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"));
+
+    // Filter to only show alpha — bravo is hidden, selection should move
+    app.set_convoy_filter("alp");
+    let selected_name = app.selected_convoy_id().map(|id| id.name().to_string());
+    // The visible set contains only "alpha"; selection must have moved
+    assert_eq!(selected_name.as_deref(), Some("alpha"), "filter should invalidate hidden selection");
+}
+
+#[test]
+fn select_next_stays_within_filtered_set() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let mut app = stub_app();
+    fn convoy(name: &str) -> ConvoySummary {
+        ConvoySummary {
+            id: ConvoyId::new("flotilla", name),
+            namespace: "flotilla".into(),
+            name: name.into(),
+            workflow_ref: "wf".into(),
+            phase: ConvoyPhase::Active,
+            message: None,
+            repo_hint: None,
+            tasks: vec![],
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: false,
+        }
+    }
+
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
+    })));
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    // Apply a filter that matches only "bravo".
+    app.set_convoy_filter("BRA");
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "filter should select the only visible convoy");
+
+    // select_next has nowhere to go — should stay on bravo.
+    app.convoys_tab_select_delta(1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "next should clamp within filtered set");
+
+    // select_prev also stays.
+    app.convoys_tab_select_delta(-1);
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "prev should clamp within filtered set");
+}
+
+// -- TabPage binding mode: app-global keys work on the Convoys tab --
+
+#[test]
+fn command_palette_opens_on_convoys_tab() {
+    // '/' is now in TabPage, which Convoys composes. Verify it opens the palette.
+    let mut app = stub_app();
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Char('/')));
+
+    assert!(app.screen.has_modal(), "pressing '/' on the Convoys tab should open the command palette modal");
+}
+
+#[test]
+fn tab_nav_works_on_convoys_tab() {
+    // ']' (NextTab) is in TabPage and composed with Convoys.
+    // With two repos, switching from Convoys to the next tab should land on a repo tab.
+    let mut app = stub_app_with_repos(2);
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Char(']')));
+
+    assert!(!app.ui.is_convoys, "pressing ']' on the Convoys tab should navigate to a repo tab");
+}
+
+#[test]
+fn quit_works_on_convoys_tab() {
+    // 'q' is in TabPage and composed with Convoys.
+    let mut app = stub_app();
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Char('q')));
+
+    assert!(app.should_quit, "pressing 'q' on the Convoys tab should quit the app");
+}
+
+#[test]
+fn action_menu_overlay_masks_tab_nav() {
+    // Overlay modes (ActionMenu) act as focus barriers — they should NOT let
+    // tab-page globals (like ']') fall through.
+    let mut app = stub_app_with_repos(2);
+    app.ui.is_config = false;
+    app.ui.is_convoys = false;
+
+    // Open an action menu by pushing the widget directly.
+    let items = Vec::new();
+    let dummy_item = checkout_item("feat", "/wt", false);
+    app.screen.modal_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(items, dummy_item)));
+    assert!(app.screen.has_modal());
+
+    let tab_before = app.model.active_repo;
+    app.handle_key(key(KeyCode::Char(']')));
+    let tab_after = app.model.active_repo;
+
+    assert_eq!(tab_before, tab_after, "tab navigation should be masked by the ActionMenu overlay");
+}
+
+#[test]
+fn move_tab_is_ignored_on_convoys_tab() {
+    // '{' (MoveTabLeft) and '}' (MoveTabRight) are in Normal, not TabPage.
+    // Pressing them on the Convoys tab must not mutate repo_order or active_repo.
+    let mut app = stub_app_with_repos(2);
+    app.ui.is_config = false;
+    app.ui.is_convoys = true;
+
+    let order_before = app.model.repo_order.clone();
+    let active_before = app.model.active_repo;
+
+    app.handle_key(key(KeyCode::Char('{')));
+    app.handle_key(key(KeyCode::Char('}')));
+
+    assert_eq!(app.model.repo_order, order_before, "{{ / }} must not reorder repos while on the Convoys tab");
+    assert_eq!(app.model.active_repo, active_before, "active_repo must be unchanged after {{ / }} on Convoys tab");
+}

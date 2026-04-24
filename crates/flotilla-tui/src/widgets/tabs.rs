@@ -17,6 +17,8 @@ use crate::{
 pub enum TabBarAction {
     /// Switch to the flotilla config screen.
     SwitchToConfig,
+    /// Switch to the global convoys view.
+    SwitchToConvoys,
     /// Switch to a repo tab and start a potential drag.
     SwitchToRepo(usize),
     /// Open the file picker to add a new repo.
@@ -64,11 +66,21 @@ impl Tabs {
         });
         tab_ids.push(TabId::Flotilla);
 
+        // Convoys global tab
+        items.push(segment_bar::SegmentItem {
+            label: TabId::CONVOYS_LABEL.to_string(),
+            key_hint: None,
+            active: ui.is_convoys,
+            dragging: false,
+            style_override: None,
+        });
+        tab_ids.push(TabId::Convoys);
+
         // Repo tabs
         for (i, repo_identity) in model.repo_order.iter().enumerate() {
             let rm = &model.repos[repo_identity];
             let name = TuiModel::repo_name(&rm.path);
-            let is_active = !ui.is_config && i == model.active_repo;
+            let is_active = !ui.is_config && !ui.is_convoys && i == model.active_repo;
             let loading = if rm.loading { " ⟳" } else { "" };
             let changed = if rm.has_unseen_changes { "*" } else { "" };
             let label = format!("{name}{changed}{loading}");
@@ -124,9 +136,10 @@ impl Tabs {
 
         match hit {
             Some(TabId::Flotilla) => TabBarAction::SwitchToConfig,
+            Some(TabId::Convoys) => TabBarAction::SwitchToConvoys,
             Some(TabId::Repo(i)) => TabBarAction::SwitchToRepo(i),
             Some(TabId::Add) => TabBarAction::OpenFilePicker,
-            _ => TabBarAction::None,
+            None => TabBarAction::None,
         }
     }
 
@@ -179,6 +192,10 @@ impl Tabs {
                         self.drag.dragging_tab = None;
                         actions.push(AppAction::SwitchToConfig);
                     }
+                    TabBarAction::SwitchToConvoys => {
+                        self.drag.dragging_tab = None;
+                        actions.push(AppAction::SwitchToConvoys);
+                    }
                     TabBarAction::SwitchToRepo(i) => {
                         actions.push(AppAction::SwitchToRepo(i));
                         // Start potential drag
@@ -228,6 +245,7 @@ impl Tabs {
     pub fn switch_to(&self, idx: usize, model: &mut TuiModel, ui: &mut UiState) {
         if idx < model.repo_order.len() {
             ui.is_config = false;
+            ui.is_convoys = false;
             model.active_repo = idx;
             let key = &model.repo_order[idx];
             model.repos.get_mut(key).expect("active repo must have model entry").has_unseen_changes = false;
@@ -261,23 +279,56 @@ impl Tabs {
     // ── Private helpers ──
 
     fn step_tab(&mut self, model: &mut TuiModel, ui: &mut UiState, direction: TabDirection) {
-        if model.repo_order.is_empty() {
-            return;
-        }
+        // Tab order: Flotilla (config) → Convoys → Repo(0) → Repo(1) → … → Repo(N-1) → Flotilla
+        // When there are no repos: Flotilla ↔ Convoys.
         if ui.is_config {
-            ui.is_config = false;
-            model.active_repo = match direction {
-                TabDirection::Forward => 0,
-                TabDirection::Backward => model.repo_order.len() - 1,
-            };
+            match direction {
+                TabDirection::Forward => {
+                    // Config → Convoys
+                    ui.is_config = false;
+                    ui.is_convoys = true;
+                }
+                TabDirection::Backward => {
+                    // Config ← last repo (or stay at Convoys if no repos)
+                    ui.is_config = false;
+                    if model.repo_order.is_empty() {
+                        ui.is_convoys = true;
+                    } else {
+                        ui.is_convoys = false;
+                        model.active_repo = model.repo_order.len() - 1;
+                    }
+                }
+            }
             return;
         }
 
+        if ui.is_convoys {
+            match direction {
+                TabDirection::Forward => {
+                    // Convoys → Repo(0), or back to Config if no repos
+                    ui.is_convoys = false;
+                    if model.repo_order.is_empty() {
+                        ui.is_config = true;
+                    } else {
+                        model.active_repo = 0;
+                    }
+                }
+                TabDirection::Backward => {
+                    // Convoys → Config
+                    ui.is_convoys = false;
+                    ui.is_config = true;
+                }
+            }
+            return;
+        }
+
+        // On a repo tab
         match direction {
             TabDirection::Forward => {
                 if model.active_repo + 1 < model.repo_order.len() {
                     self.switch_to(model.active_repo + 1, model, ui);
                 } else {
+                    // Last repo → Config
                     ui.is_config = true;
                 }
             }
@@ -285,7 +336,8 @@ impl Tabs {
                 if model.active_repo > 0 {
                     self.switch_to(model.active_repo - 1, model, ui);
                 } else {
-                    ui.is_config = true;
+                    // First repo → Convoys
+                    ui.is_convoys = true;
                 }
             }
         }
@@ -354,12 +406,23 @@ mod tests {
     }
 
     #[test]
-    fn next_tab_from_config_goes_to_first() {
+    fn next_tab_from_config_goes_to_convoys() {
         let mut app = stub_app_with_repos(3);
         let mut tabs = Tabs::new();
         app.ui.is_config = true;
         tabs.next_tab(&mut app.model, &mut app.ui);
+        assert!(app.ui.is_convoys, "expected Convoys tab after next from config");
+        assert!(!app.ui.is_config);
+    }
+
+    #[test]
+    fn next_tab_from_convoys_goes_to_first_repo() {
+        let mut app = stub_app_with_repos(3);
+        let mut tabs = Tabs::new();
+        app.ui.is_convoys = true;
+        tabs.next_tab(&mut app.model, &mut app.ui);
         assert_eq!(app.model.active_repo, 0);
+        assert!(!app.ui.is_convoys);
         assert!(!app.ui.is_config);
     }
 
@@ -380,12 +443,24 @@ mod tests {
     }
 
     #[test]
-    fn prev_tab_wraps_to_config() {
+    fn prev_tab_wraps_to_convoys() {
         let mut app = stub_app_with_repos(2);
         let mut tabs = Tabs::new();
-        // active_repo is 0
+        // active_repo is 0 — prev goes to Convoys, not Config directly
+        tabs.prev_tab(&mut app.model, &mut app.ui);
+        assert!(app.ui.is_convoys);
+        assert!(!app.ui.is_config);
+    }
+
+    #[test]
+    fn prev_tab_from_convoys_wraps_to_config() {
+        let mut app = stub_app_with_repos(2);
+        let mut tabs = Tabs::new();
+        app.ui.is_convoys = true;
+        app.ui.is_config = false;
         tabs.prev_tab(&mut app.model, &mut app.ui);
         assert!(app.ui.is_config);
+        assert!(!app.ui.is_convoys);
     }
 
     #[test]

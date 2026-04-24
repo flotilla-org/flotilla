@@ -35,6 +35,8 @@ use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{error, warn};
 
+use crate::ConvoyProjection;
+
 const NAMESPACE: &str = "flotilla";
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
@@ -588,21 +590,31 @@ fn spawn_controller_loops(
         }),
         tokio::spawn({
             let namespace_string = namespace_string.clone();
+            let backend_for_reconciler = backend.clone();
             async move {
                 if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<Convoy>(&namespace_string),
+                    primary: backend_for_reconciler.clone().using::<Convoy>(&namespace_string),
                     secondaries: ConvoyReconciler::secondary_watches(),
-                    reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
-                        .with_task_workspaces(backend.clone().using::<TaskWorkspace>(&namespace_string))
-                        .with_presentations(backend.clone().using::<Presentation>(&namespace_string)),
+                    reconciler: ConvoyReconciler::new(backend_for_reconciler.clone().using::<WorkflowTemplate>(&namespace_string))
+                        .with_task_workspaces(backend_for_reconciler.clone().using::<TaskWorkspace>(&namespace_string))
+                        .with_presentations(backend_for_reconciler.clone().using::<Presentation>(&namespace_string)),
                     resync_interval: controller_resync_interval,
-                    backend,
+                    backend: backend_for_reconciler,
                 })
                 .run()
                 .await
                 {
                     error!(controller = "convoy", %err, "controller loop exited");
                 }
+            }
+        }),
+        tokio::spawn({
+            let namespace_string = namespace_string.clone();
+            let event_tx = state.daemon.event_sender();
+            async move {
+                ConvoyProjection::new(event_tx)
+                    .run(backend.clone().using::<Convoy>(&namespace_string), backend.using::<Presentation>(&namespace_string))
+                    .await;
             }
         }),
     ]

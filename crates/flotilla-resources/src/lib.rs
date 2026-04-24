@@ -37,7 +37,9 @@ pub use error::ResourceError;
 pub use host::{Host, HostSpec, HostStatus, HostStatusPatch};
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
-pub use labels::{CONVOY_LABEL, PROCESS_ORDINAL_LABEL, RESERVED_PREFIX, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL};
+pub use labels::{
+    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+};
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     PlacementPolicy, PlacementPolicySpec,
