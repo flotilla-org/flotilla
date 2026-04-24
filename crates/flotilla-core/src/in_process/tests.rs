@@ -828,3 +828,113 @@ async fn normalize_local_provider_hosts_keeps_environment_qualified_checkout_whe
     assert_eq!(checkout.environment_id.as_ref(), Some(&environment_id));
     assert_eq!(checkout.correlation_keys, vec![CorrelationKey::CheckoutPath(checkout_path.clone())]);
 }
+
+// --- namespace_state correctness under lag / delta-before-snapshot ---
+
+/// A NamespaceDelta that arrives before any snapshot for that namespace must be
+/// silently skipped.  `replay_since` must not return a synthetic seq-0 snapshot.
+#[tokio::test]
+async fn namespace_delta_before_snapshot_is_skipped() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceDelta},
+        DaemonEvent,
+    };
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+
+    // Broadcast a NamespaceDelta with no prior snapshot — simulates the broken
+    // path (lag/race).  The background subscriber should discard it.
+    let delta = DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+        seq: 5,
+        namespace: "flotilla".into(),
+        changed: vec![ConvoySummary {
+            id: ConvoyId::new("flotilla", "orphan-convoy"),
+            namespace: "flotilla".into(),
+            name: "orphan-convoy".into(),
+            workflow_ref: "wf".into(),
+            phase: ConvoyPhase::Active,
+            message: None,
+            repo_hint: None,
+            tasks: vec![],
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: false,
+        }],
+        removed: vec![],
+    }));
+    daemon.event_tx.send(delta).expect("broadcast delta should succeed");
+
+    // Give the background subscriber time to process the event.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // replay_since should not surface a synthetic seq-0 snapshot for "flotilla".
+    let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since should succeed");
+    let has_flotilla_snapshot = events.iter().any(|e| match e {
+        DaemonEvent::NamespaceSnapshot(snap) => snap.namespace == "flotilla",
+        _ => false,
+    });
+    assert!(!has_flotilla_snapshot, "delta-before-snapshot must not produce a synthetic seq-0 entry in replay_since");
+}
+
+/// On broadcast lag the entire namespace_state cache is cleared.  After clearing,
+/// `replay_since` must not return any namespace snapshots until the next real snapshot
+/// arrives and repopulates the cache.
+#[tokio::test]
+async fn namespace_state_cleared_on_broadcast_lag() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+        DaemonEvent,
+    };
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+
+    // Inject a snapshot directly into namespace_state, bypassing the projection.
+    // This simulates a namespace that was previously populated.
+    {
+        let mut state = daemon.namespace_state.write().await;
+        state.insert("flotilla".into(), NamespaceSnapshot {
+            seq: 10,
+            namespace: "flotilla".into(),
+            convoys: vec![ConvoySummary {
+                id: ConvoyId::new("flotilla", "existing-convoy"),
+                namespace: "flotilla".into(),
+                name: "existing-convoy".into(),
+                workflow_ref: "wf".into(),
+                phase: ConvoyPhase::Active,
+                message: None,
+                repo_hint: None,
+                tasks: vec![],
+                started_at: None,
+                finished_at: None,
+                observed_workflow_ref: None,
+                initializing: false,
+            }],
+        });
+    }
+
+    // Confirm it shows up in replay_since before lag.
+    let events_before = daemon.replay_since(&HashMap::new()).await.expect("replay_since before lag");
+    let snap_before = events_before.iter().any(|e| matches!(e, DaemonEvent::NamespaceSnapshot(s) if s.namespace == "flotilla"));
+    assert!(snap_before, "namespace snapshot should appear in replay_since before lag");
+
+    // Simulate lag by directly clearing namespace_state (as the subscriber now does on Lagged).
+    daemon.namespace_state.write().await.clear();
+
+    // After clearing, replay_since must return no namespace snapshots for "flotilla".
+    let events_after = daemon.replay_since(&HashMap::new()).await.expect("replay_since after lag");
+    let snap_after = events_after.iter().any(|e| matches!(e, DaemonEvent::NamespaceSnapshot(s) if s.namespace == "flotilla"));
+    assert!(!snap_after, "namespace snapshot must not appear in replay_since after namespace_state was cleared");
+}

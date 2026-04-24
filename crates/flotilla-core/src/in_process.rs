@@ -650,12 +650,14 @@ impl InProcessDaemon {
                     }
                     Ok(DaemonEvent::NamespaceDelta(delta)) => {
                         let mut state = namespace_state.write().await;
-                        let entry =
-                            state.entry(delta.namespace.clone()).or_insert_with(|| flotilla_protocol::namespace::NamespaceSnapshot {
-                                seq: 0,
-                                namespace: delta.namespace.clone(),
-                                convoys: Vec::new(),
-                            });
+                        let Some(entry) = state.get_mut(&delta.namespace) else {
+                            // Delta arrived before any snapshot for this namespace — this can
+                            // happen under lag or ordering anomalies.  Synthesising a seq-0
+                            // baseline risks client regression (a reconnecting client at seq N>0
+                            // would regress).  Skip and wait for the next full snapshot.
+                            warn!(ns = %delta.namespace, "received NamespaceDelta for unknown namespace; skipping — awaiting snapshot");
+                            continue;
+                        };
                         // Apply delta: remove deleted convoys, upsert changed ones.
                         entry.convoys.retain(|c| !delta.removed.contains(&c.id));
                         for changed in &delta.changed {
@@ -669,7 +671,12 @@ impl InProcessDaemon {
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(lagged = n, "namespace_state subscriber lagged; retained state may be stale until next snapshot");
+                        // We dropped messages — we don't know which namespaces were affected,
+                        // so clear all namespace state.  Reconnecting clients will get nothing
+                        // from replay_since until the next snapshot arrives; that is preferable
+                        // to serving known-stale data.
+                        warn!(lagged = n, "namespace_state subscriber lagged; clearing all namespace state");
+                        namespace_state.write().await.clear();
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
