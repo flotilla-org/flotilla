@@ -14,6 +14,7 @@ use super::glyphs::convoy_glyph;
 pub struct ConvoyList<'a> {
     pub convoys: &'a [&'a ConvoySummary],
     pub selected: Option<&'a ConvoyId>,
+    pub focused: bool,
 }
 
 impl<'a> ConvoyList<'a> {
@@ -35,7 +36,8 @@ impl<'a> ConvoyList<'a> {
                 ]))
             })
             .collect();
-        let block = Block::default().borders(Borders::ALL).title(" Convoys ");
+        let border_style = if self.focused { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
+        let block = Block::default().borders(Borders::ALL).border_style(border_style).title(" Convoys ");
         f.render_widget(List::new(items).block(block), area);
     }
 }
@@ -73,7 +75,7 @@ mod tests {
         let convoys: Vec<&ConvoySummary> = vec![&a, &b, &c];
         terminal
             .draw(|f| {
-                ConvoyList { convoys: &convoys, selected: Some(&a.id) }.render(f, f.area());
+                ConvoyList { convoys: &convoys, selected: Some(&a.id), focused: true }.render(f, f.area());
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());

@@ -325,7 +325,14 @@ impl InteractiveWidget for Screen {
         let active_identity = self.active_repo_identity(&ctx.model.repo_order, ctx.model.active_repo, is_config, is_convoys).cloned();
         if is_convoys {
             let selected = ctx.convoys_selected.as_ref();
-            ConvoysPage { convoys: ctx.convoys.clone(), selected, filter: ctx.convoy_filter }.render(frame, chunks[1]);
+            ConvoysPage {
+                convoys: ctx.convoys.clone(),
+                selected,
+                selected_task: ctx.convoys_selected_task,
+                focus: ctx.convoys_focus,
+                filter: ctx.convoy_filter,
+            }
+            .render(frame, chunks[1]);
         } else if let Some(ref identity) = active_identity {
             if let Some(page) = self.repo_pages.get_mut(identity) {
                 page.render(frame, chunks[1], ctx);

@@ -211,7 +211,12 @@ const REPO_SCOPED_NOUNS: &[&str] = &["checkout", "cr", "issue", "agent", "worksp
 /// - Noun + space: subject completions from model
 /// - Noun + subject + space: verb completions from clap tree
 /// - Palette-local command + space: argument completions
-pub fn palette_completions(input: &str, model: &TuiModel, has_repo_context: bool) -> Vec<PaletteCompletion> {
+pub fn palette_completions(
+    input: &str,
+    model: &TuiModel,
+    namespaces: &crate::app::NamespaceMap,
+    has_repo_context: bool,
+) -> Vec<PaletteCompletion> {
     let trailing_space = input.ends_with(' ');
     let tokens: Vec<&str> = input.split_whitespace().collect();
 
@@ -242,17 +247,35 @@ pub fn palette_completions(input: &str, model: &TuiModel, has_repo_context: bool
     // tokens[0] = noun, tokens[1..] = rest
     if tokens.len() == 1 && trailing_space {
         // Noun typed with trailing space: show subjects from model.
-        return subject_completions(&noun_name, "", model);
+        return subject_completions(&noun_name, "", model, namespaces);
     }
 
     if tokens.len() == 2 && !trailing_space {
         // Partial subject: filter subjects.
-        return subject_completions(&noun_name, tokens[1], model);
+        return subject_completions(&noun_name, tokens[1], model, namespaces);
     }
 
     if tokens.len() == 2 && trailing_space {
         // Noun + subject + space: show verbs from clap tree.
         return verb_completions(&noun_name, "");
+    }
+
+    // `convoy <id> task <Tab>` and `convoy <id> task <partial>`: complete with
+    // task names from the named convoy. The clap tree treats the task subject as
+    // a free-form positional and would otherwise return nothing.
+    if noun_name == "convoy" && tokens.len() >= 3 && tokens[2] == "task" {
+        let convoy_id = tokens[1];
+        let partial = if tokens.len() == 3 && trailing_space {
+            ""
+        } else if tokens.len() == 4 && !trailing_space {
+            tokens[3]
+        } else {
+            // We're past the task subject — fall through to the clap walker for verbs.
+            ""
+        };
+        if tokens.len() == 3 || (tokens.len() == 4 && !trailing_space) {
+            return convoy_task_completions(convoy_id, partial, namespaces);
+        }
     }
 
     if tokens.len() >= 3 {
@@ -267,6 +290,20 @@ pub fn palette_completions(input: &str, model: &TuiModel, has_repo_context: bool
     }
 
     vec![]
+}
+
+/// Task-name completions for `convoy <id> task <Tab>` / partial.
+fn convoy_task_completions(convoy_id: &str, partial: &str, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
+    // Single-namespace MVP: search the "flotilla" namespace.
+    let lower = partial.to_lowercase();
+    let Some(model) = namespaces.get("flotilla") else { return vec![] };
+    let Some(convoy) = model.convoys.values().find(|c| c.id.name() == convoy_id) else { return vec![] };
+    convoy
+        .tasks
+        .iter()
+        .filter(|t| lower.is_empty() || t.name.to_lowercase().starts_with(&lower))
+        .map(|t| PaletteCompletion { value: t.name.clone(), description: format!("{:?}", t.phase), key_hint: None })
+        .collect()
 }
 
 /// Completions at the root level: noun names, aliases, and palette-local entries.
@@ -345,9 +382,16 @@ fn resolve_noun_name(token: &str) -> Option<String> {
 }
 
 /// Subject completions for a given noun, drawn from model data.
-fn subject_completions(noun: &str, partial: &str, model: &TuiModel) -> Vec<PaletteCompletion> {
+fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
     let lower = partial.to_lowercase();
     let items: Vec<(String, String)> = match noun {
+        "convoy" => {
+            // Single-namespace MVP: list convoys in "flotilla".
+            namespaces
+                .get("flotilla")
+                .map(|m| m.convoys.values().map(|c| (c.id.name().to_string(), format!("{:?}", c.phase))).collect::<Vec<(String, String)>>())
+                .unwrap_or_default()
+        }
         "checkout" => {
             if let Some(repo) = model.active_opt() {
                 repo.providers.checkouts.values().map(|c| (c.branch.clone(), String::new())).collect()
@@ -727,6 +771,44 @@ mod tests {
 
     use crate::app::test_builders::repo_info;
 
+    fn namespaces_with_convoy(name: &str, tasks: &[&str]) -> crate::app::NamespaceMap {
+        use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase, ConvoySummary, TaskPhase, TaskSummary};
+        let convoy = ConvoySummary {
+            id: ConvoyId::new("flotilla", name),
+            namespace: "flotilla".into(),
+            name: name.into(),
+            workflow_ref: "wf".into(),
+            phase: ConvoyPhase::Active,
+            message: None,
+            repo_hint: None,
+            tasks: tasks
+                .iter()
+                .map(|t| TaskSummary {
+                    name: (*t).into(),
+                    depends_on: vec![],
+                    phase: TaskPhase::Pending,
+                    processes: vec![],
+                    host: None,
+                    checkout: None,
+                    workspace_ref: None,
+                    ready_at: None,
+                    started_at: None,
+                    finished_at: None,
+                    message: None,
+                })
+                .collect(),
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: false,
+        };
+        let mut model = crate::app::NamespaceModel::default();
+        model.convoys.insert(convoy.id.clone(), convoy);
+        let mut map = crate::app::NamespaceMap::default();
+        map.insert("flotilla".into(), model);
+        map
+    }
+
     fn empty_model() -> TuiModel {
         TuiModel::from_repo_info(vec![repo_info("/tmp/test-repo", "test-repo", RepoLabels::default())])
     }
@@ -795,7 +877,7 @@ mod tests {
     #[test]
     fn empty_input_shows_nouns_and_local_commands() {
         let model = empty_model();
-        let completions = palette_completions("", &model, true);
+        let completions = palette_completions("", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"cr"), "expected 'cr' in {values:?}");
         assert!(values.contains(&"checkout"), "expected 'checkout' in {values:?}");
@@ -807,7 +889,7 @@ mod tests {
     #[test]
     fn overview_tab_excludes_repo_scoped_nouns() {
         let model = empty_model();
-        let completions = palette_completions("", &model, false);
+        let completions = palette_completions("", &model, &Default::default(), false);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"host"), "expected 'host' in {values:?}");
         assert!(values.contains(&"layout"), "expected 'layout' in {values:?}");
@@ -821,7 +903,7 @@ mod tests {
     #[test]
     fn partial_noun_filters() {
         let model = empty_model();
-        let completions = palette_completions("cr", &model, true);
+        let completions = palette_completions("cr", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"cr"), "expected 'cr' in {values:?}");
         assert!(!values.contains(&"checkout"), "checkout should be filtered out by 'cr' prefix");
@@ -830,7 +912,7 @@ mod tests {
     #[test]
     fn noun_typed_shows_subjects_from_model() {
         let model = model_with_crs();
-        let completions = palette_completions("cr ", &model, true);
+        let completions = palette_completions("cr ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"42"), "expected '42' in {values:?}");
         assert!(values.contains(&"99"), "expected '99' in {values:?}");
@@ -839,7 +921,7 @@ mod tests {
     #[test]
     fn noun_subject_shows_verbs() {
         let model = empty_model();
-        let completions = palette_completions("cr 42 ", &model, true);
+        let completions = palette_completions("cr 42 ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"open"), "expected 'open' in {values:?}");
         assert!(values.contains(&"close"), "expected 'close' in {values:?}");
@@ -848,7 +930,7 @@ mod tests {
     #[test]
     fn layout_shows_values() {
         let model = empty_model();
-        let completions = palette_completions("layout ", &model, true);
+        let completions = palette_completions("layout ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"zoom"), "expected 'zoom' in {values:?}");
         assert!(values.contains(&"auto"), "expected 'auto' in {values:?}");
@@ -859,7 +941,7 @@ mod tests {
     #[test]
     fn host_typed_shows_host_names() {
         let model = model_with_hosts();
-        let completions = palette_completions("host ", &model, true);
+        let completions = palette_completions("host ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"feta"), "expected 'feta' in {values:?}");
         assert!(values.contains(&"brie"), "expected 'brie' in {values:?}");
@@ -868,7 +950,7 @@ mod tests {
     #[test]
     fn environment_typed_shows_host_and_nested_environment_ids() {
         let model = model_with_rich_hosts();
-        let completions = palette_completions("environment ", &model, true);
+        let completions = palette_completions("environment ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"host:feta-env"), "expected host environment id in {values:?}");
         assert!(values.contains(&"host:brie-env"), "expected host environment id in {values:?}");
@@ -878,7 +960,7 @@ mod tests {
     #[test]
     fn pr_alias_appears_in_root_completions() {
         let model = empty_model();
-        let completions = palette_completions("pr", &model, true);
+        let completions = palette_completions("pr", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"pr"), "expected 'pr' alias in {values:?}");
     }
@@ -886,7 +968,7 @@ mod tests {
     #[test]
     fn repo_noun_visible_at_root() {
         let model = empty_model();
-        let completions = palette_completions("", &model, true);
+        let completions = palette_completions("", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"repo"), "expected 'repo' in {values:?}");
     }
@@ -894,7 +976,7 @@ mod tests {
     #[test]
     fn layout_partial_arg_filters() {
         let model = empty_model();
-        let completions = palette_completions("layout z", &model, true);
+        let completions = palette_completions("layout z", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["zoom"]);
     }
@@ -941,7 +1023,7 @@ mod tests {
     #[test]
     fn target_shows_bare_hosts() {
         let model = model_with_hosts();
-        let completions = palette_completions("target ", &model, true);
+        let completions = palette_completions("target ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"@feta"), "expected '@feta' in {values:?}");
         assert!(values.contains(&"@brie"), "expected '@brie' in {values:?}");
@@ -950,7 +1032,7 @@ mod tests {
     #[test]
     fn target_shows_environment_providers_and_existing_envs() {
         let model = model_with_rich_hosts();
-        let completions = palette_completions("target ", &model, true);
+        let completions = palette_completions("target ", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
 
         // Bare hosts always present.
@@ -970,7 +1052,7 @@ mod tests {
     #[test]
     fn target_partial_filters() {
         let model = model_with_rich_hosts();
-        let completions = palette_completions("target @f", &model, true);
+        let completions = palette_completions("target @f", &model, &Default::default(), true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"@feta"), "expected '@feta' in {values:?}");
         assert!(!values.contains(&"@brie"), "@brie should be filtered by '@f' prefix");
@@ -979,7 +1061,53 @@ mod tests {
     #[test]
     fn target_no_completions_without_hosts() {
         let model = empty_model();
-        let completions = palette_completions("target ", &model, true);
+        let completions = palette_completions("target ", &model, &Default::default(), true);
         assert!(completions.is_empty(), "expected no completions with no hosts");
+    }
+
+    #[test]
+    fn convoy_subjects_listed_after_noun_space() {
+        let model = empty_model();
+        let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
+        let completions = palette_completions("convoy ", &model, &namespaces, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"fix-bug-123"), "expected convoy id in completions: {values:?}");
+    }
+
+    #[test]
+    fn convoy_subjects_filter_by_partial() {
+        let model = empty_model();
+        let namespaces = namespaces_with_convoy("fix-bug-123", &[]);
+        let completions = palette_completions("convoy fix", &model, &namespaces, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["fix-bug-123"]);
+    }
+
+    #[test]
+    fn convoy_task_names_listed_after_task_keyword() {
+        let model = empty_model();
+        let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
+        let completions = palette_completions("convoy fix-bug-123 task ", &model, &namespaces, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"implement"), "expected 'implement' in {values:?}");
+        assert!(values.contains(&"review"), "expected 'review' in {values:?}");
+    }
+
+    #[test]
+    fn convoy_task_names_filter_by_partial() {
+        let model = empty_model();
+        let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
+        let completions = palette_completions("convoy fix-bug-123 task imp", &model, &namespaces, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(values, vec!["implement"]);
+    }
+
+    #[test]
+    fn convoy_task_complete_verb_completes_after_task_subject() {
+        let model = empty_model();
+        let namespaces = namespaces_with_convoy("fix-bug-123", &["implement"]);
+        let completions = palette_completions("convoy fix-bug-123 task implement ", &model, &namespaces, true);
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"complete"), "expected 'complete' verb in {values:?}");
     }
 }

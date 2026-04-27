@@ -43,6 +43,8 @@ pub enum Action {
     OpenCommandPalette,
     OpenContextualPalette,
     FillSelected,
+    /// Open the command palette pre-filled to complete the selected convoy task.
+    CompleteConvoyTask,
     Dispatch(Intent),
 }
 
@@ -109,6 +111,7 @@ impl Action {
             "open_command_palette" => Action::OpenCommandPalette,
             "open_contextual_palette" => Action::OpenContextualPalette,
             "fill_selected" => Action::FillSelected,
+            "complete_convoy_task" => Action::CompleteConvoyTask,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
             "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
@@ -157,6 +160,7 @@ impl Action {
             Action::OpenCommandPalette => "open_command_palette",
             Action::OpenContextualPalette => "open_contextual_palette",
             Action::FillSelected => "fill_selected",
+            Action::CompleteConvoyTask => "complete_convoy_task",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
                 Intent::CreateWorkspace => "create_workspace",
@@ -202,6 +206,7 @@ impl Action {
             Action::OpenCommandPalette => "Open command palette",
             Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::FillSelected => "Fill selected item",
+            Action::CompleteConvoyTask => "Complete convoy task",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
                 Intent::CreateWorkspace => "Create workspace",
@@ -272,6 +277,7 @@ impl Keymap {
             (&config.help, BindingModeId::Help),
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
+            (&config.convoy_tasks, BindingModeId::ConvoyTasks),
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
             (&config.close_confirm, BindingModeId::CloseConfirm),

@@ -112,6 +112,8 @@ pub struct WidgetContext<'a> {
     /// Whether the Convoys tab is currently active.
     pub is_convoys: bool,
     pub active_repo_is_remote_only: bool,
+    /// Per-namespace convoy model — used by the command palette for convoy/task completions.
+    pub namespaces: &'a crate::app::NamespaceMap,
     pub app_actions: Vec<AppAction>,
 }
 
@@ -129,6 +131,10 @@ pub struct RenderContext<'a> {
     pub namespaces: &'a crate::app::NamespaceMap,
     /// Currently selected convoy id for the Convoys tab.
     pub convoys_selected: Option<flotilla_protocol::namespace::ConvoyId>,
+    /// Currently selected task name within the selected convoy, if any.
+    pub convoys_selected_task: Option<&'a str>,
+    /// Which pane (list / tasks) currently has focus on the Convoys tab.
+    pub convoys_focus: crate::app::ConvoysFocus,
     /// Active filter string for the Convoys tab.
     pub convoy_filter: &'a str,
     /// Pre-filtered convoy list for the Convoys tab.

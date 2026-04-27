@@ -1395,6 +1395,8 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     let mut terminal = Terminal::new(backend).expect("terminal");
 
     let convoys_selected = app.convoys_ui.selected.clone();
+    let convoys_selected_task = app.convoys_ui.selected_task.clone();
+    let convoys_focus = app.convoys_ui.focus;
     let convoy_filter = app.convoys_ui.filter.clone();
     terminal
         .draw(|f| {
@@ -1409,6 +1411,8 @@ fn screen_renders_convoys_page_on_convoys_tab() {
                 in_flight: &app.in_flight,
                 namespaces: &app.namespaces,
                 convoys_selected,
+                convoys_selected_task: convoys_selected_task.as_deref(),
+                convoys_focus,
                 convoy_filter: &convoy_filter,
                 convoys,
             };
@@ -1798,4 +1802,245 @@ fn move_tab_is_ignored_on_convoys_tab() {
 
     assert_eq!(app.model.repo_order, order_before, "{{ / }} must not reorder repos while on the Convoys tab");
     assert_eq!(app.model.active_repo, active_before, "active_repo must be unchanged after {{ / }} on Convoys tab");
+}
+
+// -- Convoy task selection state --
+
+fn convoy_with_tasks(name: &str, tasks: &[&str]) -> flotilla_protocol::namespace::ConvoySummary {
+    let mut c = test_convoy("flotilla", name, flotilla_protocol::namespace::ConvoyPhase::Active, false);
+    c.tasks = tasks
+        .iter()
+        .map(|t| flotilla_protocol::namespace::TaskSummary {
+            name: (*t).into(),
+            depends_on: vec![],
+            phase: flotilla_protocol::namespace::TaskPhase::Pending,
+            processes: vec![],
+            host: None,
+            checkout: None,
+            workspace_ref: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            message: None,
+        })
+        .collect();
+    c
+}
+
+fn snapshot_with(convoys: Vec<flotilla_protocol::namespace::ConvoySummary>) -> flotilla_protocol::namespace::NamespaceSnapshot {
+    flotilla_protocol::namespace::NamespaceSnapshot { seq: 1, namespace: "flotilla".into(), convoys }
+}
+
+#[test]
+fn enter_tasks_focus_default_selects_first_task() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
+    app.ui.is_convoys = true;
+
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+    assert_eq!(app.selected_convoy_task(), None);
+
+    app.enter_convoy_tasks_focus("flotilla");
+
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.selected_convoy_task(), Some("t1"));
+}
+
+#[test]
+fn enter_tasks_focus_noop_on_empty_tasks() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &[])]))));
+    app.ui.is_convoys = true;
+
+    app.enter_convoy_tasks_focus("flotilla");
+
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "focus should stay on List when convoy has no tasks");
+    assert_eq!(app.selected_convoy_task(), None);
+}
+
+#[test]
+fn convoy_tasks_select_delta_clamps_within_tasks() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2", "t3"])]))));
+    app.ui.is_convoys = true;
+    app.enter_convoy_tasks_focus("flotilla");
+
+    app.convoy_tasks_select_delta("flotilla", 1);
+    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    app.convoy_tasks_select_delta("flotilla", 5);
+    assert_eq!(app.selected_convoy_task(), Some("t3"), "clamps at last task");
+    app.convoy_tasks_select_delta("flotilla", -10);
+    assert_eq!(app.selected_convoy_task(), Some("t1"), "clamps at first task");
+}
+
+#[test]
+fn switching_convoys_resets_task_state_and_focus() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![
+        convoy_with_tasks("alpha", &["a1"]),
+        convoy_with_tasks("beta", &["b1"]),
+    ]))));
+    app.ui.is_convoys = true;
+    app.enter_convoy_tasks_focus("flotilla");
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+
+    app.convoys_tab_select_delta(1);
+
+    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("beta"));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "switching convoy snaps focus back to List");
+    assert_eq!(app.selected_convoy_task(), None, "switching convoy clears task selection");
+}
+
+#[test]
+fn delta_removing_selected_task_clamps_to_none() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
+    app.ui.is_convoys = true;
+    app.enter_convoy_tasks_focus("flotilla");
+    app.convoy_tasks_select_delta("flotilla", 1);
+    assert_eq!(app.selected_convoy_task(), Some("t2"));
+
+    // Remove t2 via delta.
+    let mut shrunk = convoy_with_tasks("alpha", &["t1"]);
+    shrunk.id = flotilla_protocol::namespace::ConvoyId::new("flotilla", "alpha");
+    app.handle_daemon_event(DaemonEvent::NamespaceDelta(Box::new(flotilla_protocol::namespace::NamespaceDelta {
+        seq: 2,
+        namespace: "flotilla".into(),
+        changed: vec![shrunk],
+        removed: vec![],
+    })));
+
+    assert_eq!(app.selected_convoy_task(), None, "selected_task is reset when it disappears from the convoy");
+}
+
+#[test]
+fn exit_tasks_focus_keeps_selected_task() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
+    app.ui.is_convoys = true;
+    app.enter_convoy_tasks_focus("flotilla");
+    app.convoy_tasks_select_delta("flotilla", 1);
+
+    app.exit_convoy_tasks_focus();
+
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+    assert_eq!(app.selected_convoy_task(), Some("t2"), "selected_task survives exit so re-entering picks up the same row");
+}
+
+#[test]
+fn l_drills_in_then_esc_returns_to_list_focus() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
+    app.ui.is_convoys = true;
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.selected_convoy_task(), Some("t1"));
+
+    app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+}
+
+#[test]
+fn enter_also_drills_into_tasks_focus() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1"])]))));
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+}
+
+#[test]
+fn right_and_left_arrows_navigate_focus() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1"])]))));
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Right));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+
+    app.handle_key(key(KeyCode::Left));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+}
+
+#[test]
+fn arrow_keys_route_task_navigation_when_tasks_focused() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2", "t3"])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Right));
+
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.selected_convoy_task(), Some("t1"));
+}
+
+#[test]
+fn jk_routes_to_task_navigation_when_tasks_focused() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2", "t3"])]))));
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.selected_convoy_task(), Some("t1"));
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_task(), Some("t2"));
+
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_task(), Some("t3"));
+
+    app.handle_key(key(KeyCode::Char('k')));
+    assert_eq!(app.selected_convoy_task(), Some("t2"));
+}
+
+#[test]
+fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("fix-bug-123", &[
+        "implement",
+        "review",
+    ])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_task(), Some("review"));
+
+    app.handle_key(key(KeyCode::Char('x')));
+
+    assert!(app.screen.has_modal(), "pressing 'x' on a task should open the command palette modal");
+    let palette = app
+        .screen
+        .modal_stack
+        .last()
+        .expect("modal pushed")
+        .as_any()
+        .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
+        .expect("top modal is CommandPaletteWidget");
+    assert_eq!(palette.input_value(), "convoy fix-bug-123 task review complete ");
+}
+
+#[test]
+fn x_then_enter_dispatches_convoy_task_complete() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("fix-bug-123", &[
+        "implement",
+    ])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('x')));
+    app.handle_key(key(KeyCode::Enter));
+
+    let cmd = app.proto_commands.take_next().expect("expected a command after Enter on palette");
+    match &cmd.0.action {
+        flotilla_protocol::CommandAction::ConvoyTaskComplete { convoy, task, message } => {
+            assert_eq!(convoy, "fix-bug-123");
+            assert_eq!(task, "implement");
+            assert_eq!(*message, None);
+        }
+        other => panic!("expected ConvoyTaskComplete, got {other:?}"),
+    }
 }

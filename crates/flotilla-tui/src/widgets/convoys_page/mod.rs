@@ -20,6 +20,8 @@ use ratatui::{
 pub struct ConvoysPage<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
     pub selected: Option<&'a ConvoyId>,
+    pub selected_task: Option<&'a str>,
+    pub focus: crate::app::ConvoysFocus,
     pub filter: &'a str,
 }
 
@@ -36,10 +38,11 @@ impl<'a> ConvoysPage<'a> {
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(area);
 
-        ConvoyList { convoys: self.convoys.as_slice(), selected: self.selected }.render(f, chunks[0]);
+        let list_focused = matches!(self.focus, crate::app::ConvoysFocus::List);
+        ConvoyList { convoys: self.convoys.as_slice(), selected: self.selected, focused: list_focused }.render(f, chunks[0]);
         if let Some(id) = self.selected {
             if let Some(convoy) = self.convoys.iter().find(|c| &c.id == id) {
-                ConvoyDetail { convoy }.render(f, chunks[1]);
+                ConvoyDetail { convoy, selected_task: self.selected_task, focused: !list_focused }.render(f, chunks[1]);
             }
         }
     }

@@ -27,6 +27,10 @@ pub enum BindingModeId {
     /// confirm dialog.
     TabPage,
     Convoys,
+    /// Inner focus on the Convoys tab — the task tree on the right pane.
+    /// Composed with `TabPage`. `j/k` navigate tasks; `esc` returns to the
+    /// convoy list; `x` opens the palette pre-filled to complete the task.
+    ConvoyTasks,
     Help,
     ActionMenu,
     DeleteConfirm,
@@ -138,13 +142,22 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Normal, "u", Action::ToggleArchived),
     b(BindingModeId::Normal, "d", Action::Dispatch(Intent::RemoveCheckout)),
     b(BindingModeId::Normal, "p", Action::Dispatch(Intent::OpenChangeRequest)),
-    // ── Convoys ──
-    h(BindingModeId::Convoys, "j", Action::SelectNext, "Down"),
-    h(BindingModeId::Convoys, "k", Action::SelectPrev, "Up"),
-    // l/enter (Focus) are omitted: the nested focus navigation isn't shipped in PR 1.
-    // Add them back when the behaviour is implemented.
+    // ── Convoys (outer focus: convoy list) ──
+    // j/k/up/down come from Shared (SelectNext/SelectPrev). enter comes from Shared (Confirm).
+    // l and right are vim-style and arrow-style synonyms for "drill into the task tree" — the
+    // app dispatches Confirm on the Convoys list to enter task focus.
+    h(BindingModeId::Convoys, "l", Action::Confirm, "Tasks"),
+    b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
+    // ── ConvoyTasks (inner focus: task tree) ──
+    // j/k/up/down come from Shared. esc comes from Shared (Dismiss). left mirrors esc as the
+    // arrow-style synonym for "back to the convoy list" — the app dispatches Dismiss in Tasks
+    // focus to return to the list.
+    b(BindingModeId::ConvoyTasks, "left", Action::Dismiss),
+    hk(BindingModeId::ConvoyTasks, "esc", "ESC", Action::Dismiss, "List"),
+    h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyTask, "Complete"),
+    h(BindingModeId::ConvoyTasks, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),
