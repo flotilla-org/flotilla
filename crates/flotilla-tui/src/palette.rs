@@ -1150,7 +1150,7 @@ mod tests {
         // Round-trip property: quote(s) tokenizes back to a single token equal to s.
         // Empty strings are not a valid resource name and are not exercised here —
         // the tokenizer drops empty-quoted tokens, which is fine for that case.
-        for s in ["fix-bug-123", "implement", "fix my bug", "name with \"quote\"", "back\\slash"] {
+        for s in ["fix-bug-123", "implement", "fix my bug", "name with \"quote\"", "it's", "back\\slash"] {
             let quoted = quote_palette_token(s);
             let tokens = tokenize_palette_input(&quoted).expect("tokenize");
             assert_eq!(tokens.len(), 1, "quoted {quoted:?} should tokenize to one token");
