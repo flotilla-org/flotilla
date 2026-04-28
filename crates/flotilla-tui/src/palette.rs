@@ -286,6 +286,13 @@ pub fn palette_completions(
     // a free-form positional and would otherwise return nothing. Past the task
     // subject we fall through to the clap walker for verbs (`complete` etc.).
     if noun_name == "convoy" && tokens.len() >= 3 && tokens[2] == "task" {
+        // tokens[1] is the raw whitespace-split token: convoy ids that contain
+        // whitespace (and would have been double-quoted by `quote_palette_token`)
+        // won't look up correctly here, since `palette_completions` uses
+        // `split_whitespace` rather than `tokenize_palette_input`. Acceptable at
+        // MVP scale — convoy ids are slug-style. Enter-dispatch goes through
+        // `parse_palette_input` (which uses the quote-aware tokenizer), so the
+        // command itself dispatches correctly even when completions don't fire.
         let convoy_id = tokens[1];
         if tokens.len() == 3 && trailing_space {
             return convoy_task_completions(convoy_id, "", namespaces);
