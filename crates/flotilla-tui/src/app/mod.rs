@@ -1498,12 +1498,15 @@ impl App {
     }
 
     /// If `selected_task` no longer matches a task in the selected convoy,
-    /// reset it (`None`). Doesn't auto-pick a default — that's `enter_tasks_focus`'s job.
+    /// reset it (`None`) and snap focus back to the convoy list. Otherwise the
+    /// task pane would render with bold borders but no selected row — visual
+    /// limbo until the user pressed `j`/`k`.
     fn clamp_selected_task(&mut self, namespace: &str) {
         let Some(task) = self.convoys_ui.selected_task.clone() else { return };
         let still_valid = self.selected_convoy_summary(namespace).is_some_and(|c| c.tasks.iter().any(|t| t.name == task));
         if !still_valid {
             self.convoys_ui.selected_task = None;
+            self.convoys_ui.focus = ConvoysFocus::List;
         }
     }
 

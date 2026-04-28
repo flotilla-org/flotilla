@@ -1892,13 +1892,14 @@ fn switching_convoys_resets_task_state_and_focus() {
 }
 
 #[test]
-fn delta_removing_selected_task_clamps_to_none() {
+fn delta_removing_selected_task_clamps_to_none_and_drops_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
     app.enter_convoy_tasks_focus("flotilla");
     app.convoy_tasks_select_delta("flotilla", 1);
     assert_eq!(app.selected_convoy_task(), Some("t2"));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
 
     // Remove t2 via delta.
     let mut shrunk = convoy_with_tasks("alpha", &["t1"]);
@@ -1911,6 +1912,11 @@ fn delta_removing_selected_task_clamps_to_none() {
     })));
 
     assert_eq!(app.selected_convoy_task(), None, "selected_task is reset when it disappears from the convoy");
+    assert_eq!(
+        app.convoys_focus(),
+        crate::app::ConvoysFocus::List,
+        "focus snaps back to List so the task pane isn't focused with no row selected"
+    );
 }
 
 #[test]
@@ -2021,6 +2027,28 @@ fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
         .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
         .expect("top modal is CommandPaletteWidget");
     assert_eq!(palette.input_value(), "convoy fix-bug-123 task review complete ");
+}
+
+#[test]
+fn x_prefill_quotes_task_names_with_whitespace() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_tasks("fix-bug-123", &[
+        "fix my bug",
+    ])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.selected_convoy_task(), Some("fix my bug"));
+
+    app.handle_key(key(KeyCode::Char('x')));
+    let palette = app
+        .screen
+        .modal_stack
+        .last()
+        .expect("modal pushed")
+        .as_any()
+        .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
+        .expect("top modal is CommandPaletteWidget");
+    assert_eq!(palette.input_value(), "convoy fix-bug-123 task \"fix my bug\" complete ");
 }
 
 #[test]

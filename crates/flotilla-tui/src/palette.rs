@@ -111,6 +111,27 @@ pub struct Token {
 ///
 /// Returns tokens with their byte offsets in the original input, enabling
 /// prefix slicing for Tab completion.
+/// Quote a palette token if it contains whitespace, quotes, or backslashes.
+/// Inverse of the tokenizer: round-trips arbitrary identifier strings (including
+/// those with spaces) through the palette grammar without breaking subsequent
+/// parses or completions.
+pub fn quote_palette_token(s: &str) -> String {
+    let needs_quoting = s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '\\');
+    if !needs_quoting {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 pub fn tokenize_palette_input(input: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -262,19 +283,15 @@ pub fn palette_completions(
 
     // `convoy <id> task <Tab>` and `convoy <id> task <partial>`: complete with
     // task names from the named convoy. The clap tree treats the task subject as
-    // a free-form positional and would otherwise return nothing.
+    // a free-form positional and would otherwise return nothing. Past the task
+    // subject we fall through to the clap walker for verbs (`complete` etc.).
     if noun_name == "convoy" && tokens.len() >= 3 && tokens[2] == "task" {
         let convoy_id = tokens[1];
-        let partial = if tokens.len() == 3 && trailing_space {
-            ""
-        } else if tokens.len() == 4 && !trailing_space {
-            tokens[3]
-        } else {
-            // We're past the task subject — fall through to the clap walker for verbs.
-            ""
-        };
-        if tokens.len() == 3 || (tokens.len() == 4 && !trailing_space) {
-            return convoy_task_completions(convoy_id, partial, namespaces);
+        if tokens.len() == 3 && trailing_space {
+            return convoy_task_completions(convoy_id, "", namespaces);
+        }
+        if tokens.len() == 4 && !trailing_space {
+            return convoy_task_completions(convoy_id, tokens[3], namespaces);
         }
     }
 
@@ -1109,5 +1126,35 @@ mod tests {
         let completions = palette_completions("convoy fix-bug-123 task implement ", &model, &namespaces, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"complete"), "expected 'complete' verb in {values:?}");
+    }
+
+    #[test]
+    fn quote_palette_token_passes_simple_identifiers_through() {
+        assert_eq!(quote_palette_token("fix-bug-123"), "fix-bug-123");
+        assert_eq!(quote_palette_token("implement"), "implement");
+    }
+
+    #[test]
+    fn quote_palette_token_quotes_whitespace() {
+        assert_eq!(quote_palette_token("fix my bug"), "\"fix my bug\"");
+    }
+
+    #[test]
+    fn quote_palette_token_escapes_embedded_quotes_and_backslashes() {
+        assert_eq!(quote_palette_token("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_palette_token("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn quote_palette_token_round_trips_through_tokenizer() {
+        // Round-trip property: quote(s) tokenizes back to a single token equal to s.
+        // Empty strings are not a valid resource name and are not exercised here —
+        // the tokenizer drops empty-quoted tokens, which is fine for that case.
+        for s in ["fix-bug-123", "implement", "fix my bug", "name with \"quote\"", "back\\slash"] {
+            let quoted = quote_palette_token(s);
+            let tokens = tokenize_palette_input(&quoted).expect("tokenize");
+            assert_eq!(tokens.len(), 1, "quoted {quoted:?} should tokenize to one token");
+            assert_eq!(tokens[0].value, s, "round-trip for {s:?} via {quoted:?}");
+        }
     }
 }

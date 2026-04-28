@@ -405,11 +405,17 @@ impl App {
     }
 
     /// Open the command palette pre-filled with `convoy <id> task <task> complete `.
-    /// No-op when no convoy or task is selected.
+    /// No-op when no convoy or task is selected. Convoy ids and task names are
+    /// arbitrary strings (no validation), so they are routed through the
+    /// palette's quoting helper to round-trip whitespace and special characters.
     pub(super) fn open_complete_convoy_task_palette(&mut self) {
         let Some(convoy_id) = self.convoys_ui.selected.as_ref() else { return };
         let Some(task) = self.convoys_ui.selected_task.as_ref() else { return };
-        let prefill = format!("convoy {} task {} complete ", convoy_id.name(), task);
+        let prefill = format!(
+            "convoy {} task {} complete ",
+            crate::palette::quote_palette_token(convoy_id.name()),
+            crate::palette::quote_palette_token(task),
+        );
         let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill(prefill, None);
         self.screen.modal_stack.push(Box::new(widget));
     }
