@@ -495,21 +495,24 @@ fn cleanup_actuations(
 
     let mut actuations = Vec::new();
 
-    if predicted_status.phase == ConvoyPhase::Active && presentations.is_empty() {
-        actuations.push(create_presentation_actuation(convoy));
-    }
-
-    if matches!(predicted_status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled) && !presentations.is_empty()
-    {
-        actuations.extend(presentations.keys().cloned().map(|name| Actuation::DeletePresentation { name }));
-    }
-
     for (task, state) in &predicted_status.tasks {
-        if matches!(state.phase, TaskPhase::Completed | TaskPhase::Failed | TaskPhase::Cancelled) {
-            let name = task_workspace_name(&convoy.metadata.name, task);
-            if task_workspaces.contains_key(&name) {
-                actuations.push(Actuation::DeleteTaskWorkspace { name });
+        let presentation = presentation_name(&convoy.metadata.name, task);
+        let workspace = task_workspace_name(&convoy.metadata.name, task);
+        match state.phase {
+            TaskPhase::Ready | TaskPhase::Launching | TaskPhase::Running => {
+                if !presentations.contains_key(&presentation) {
+                    actuations.push(create_presentation_actuation(convoy, task));
+                }
             }
+            TaskPhase::Completed | TaskPhase::Failed | TaskPhase::Cancelled => {
+                if presentations.contains_key(&presentation) {
+                    actuations.push(Actuation::DeletePresentation { name: presentation });
+                }
+                if task_workspaces.contains_key(&workspace) {
+                    actuations.push(Actuation::DeleteTaskWorkspace { name: workspace });
+                }
+            }
+            TaskPhase::Pending => {}
         }
     }
 
@@ -553,11 +556,11 @@ fn create_task_workspace_outcome(convoy: &ResourceObject<Convoy>, task: &str, no
     })
 }
 
-fn create_presentation_actuation(convoy: &ResourceObject<Convoy>) -> Actuation {
+fn create_presentation_actuation(convoy: &ResourceObject<Convoy>, task: &str) -> Actuation {
     Actuation::CreatePresentation {
         meta: InputMeta::builder()
-            .name(presentation_name(&convoy.metadata.name))
-            .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]))
+            .name(presentation_name(&convoy.metadata.name, task))
+            .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone()), (TASK_LABEL.to_string(), task.to_string())]))
             .owner_references(vec![OwnerReference {
                 api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
                 kind: Convoy::API_PATHS.kind.to_string(),
@@ -570,8 +573,11 @@ fn create_presentation_actuation(convoy: &ResourceObject<Convoy>) -> Actuation {
             // Stage 4a always uses the built-in default policy. Threading a policy ref through
             // ConvoySpec remains follow-up work once convoys can choose among multiple layouts.
             presentation_policy_ref: "default".to_string(),
-            name: convoy.metadata.name.clone(),
-            process_selector: BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone())]),
+            name: task.to_string(),
+            process_selector: BTreeMap::from([
+                (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
+                (TASK_LABEL.to_string(), task.to_string()),
+            ]),
         },
     }
 }
@@ -625,8 +631,8 @@ fn task_workspace_name(convoy_name: &str, task: &str) -> String {
     format!("{convoy_name}-{task}")
 }
 
-fn presentation_name(convoy_name: &str) -> String {
-    format!("{convoy_name}-presentation")
+fn presentation_name(convoy_name: &str, task: &str) -> String {
+    format!("{convoy_name}-{task}")
 }
 
 async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
