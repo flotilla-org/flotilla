@@ -2072,3 +2072,98 @@ fn x_then_enter_dispatches_convoy_task_complete() {
         other => panic!("expected ConvoyTaskComplete, got {other:?}"),
     }
 }
+
+// -- Convoy task attach (`a`) --
+
+fn convoy_with_task_workspace_refs(name: &str, tasks: &[(&str, Option<&str>)]) -> flotilla_protocol::namespace::ConvoySummary {
+    let mut c = test_convoy("flotilla", name, flotilla_protocol::namespace::ConvoyPhase::Active, false);
+    c.tasks = tasks
+        .iter()
+        .map(|(t, ws)| flotilla_protocol::namespace::TaskSummary {
+            name: (*t).into(),
+            depends_on: vec![],
+            phase: flotilla_protocol::namespace::TaskPhase::Running,
+            processes: vec![],
+            host: None,
+            checkout: None,
+            workspace_ref: ws.map(str::to_string),
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            message: None,
+        })
+        .collect();
+    c
+}
+
+#[test]
+fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_task_workspace_refs("alpha", &[(
+        "implement",
+        Some("ws://task-a-implement"),
+    )])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.selected_convoy_task(), Some("implement"));
+
+    app.handle_key(key(KeyCode::Char('a')));
+
+    let cmd = app.proto_commands.take_next().expect("expected a SelectWorkspace command");
+    match &cmd.0.action {
+        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => {
+            assert_eq!(ws_ref, "ws://task-a-implement");
+        }
+        other => panic!("expected SelectWorkspace, got {other:?}"),
+    }
+    assert!(app.model.status_message.is_none(), "no status message when workspace_ref is present");
+}
+
+#[test]
+fn a_on_task_without_workspace_ref_sets_status_message() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_task_workspace_refs("alpha", &[(
+        "implement",
+        None,
+    )])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.selected_convoy_task(), Some("implement"));
+
+    app.handle_key(key(KeyCode::Char('a')));
+
+    assert!(app.proto_commands.take_next().is_none(), "no command dispatched when workspace_ref is None");
+    let msg = app.model.status_message.as_deref().expect("expected a transient status message");
+    assert!(msg.contains("implement"), "status message should reference the task name, got: {msg}");
+    assert!(msg.contains("no workspace yet"), "status message should explain no workspace yet, got: {msg}");
+}
+
+#[test]
+fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
+    let mut app = stub_app();
+    app.handle_daemon_event(DaemonEvent::NamespaceSnapshot(Box::new(snapshot_with(vec![convoy_with_task_workspace_refs("alpha", &[
+        ("implement", Some("ws://impl")),
+        ("review", Some("ws://rev")),
+    ])]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.selected_convoy_task(), Some("implement"));
+
+    // First task selected -> dispatches implement's ws_ref.
+    app.handle_key(key(KeyCode::Char('a')));
+    let first = app.proto_commands.take_next().expect("first dispatch");
+    match &first.0.action {
+        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws://impl"),
+        other => panic!("expected SelectWorkspace, got {other:?}"),
+    }
+
+    // Move to second task -> dispatches review's ws_ref.
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(app.selected_convoy_task(), Some("review"));
+    app.handle_key(key(KeyCode::Char('a')));
+    let second = app.proto_commands.take_next().expect("second dispatch");
+    match &second.0.action {
+        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws://rev"),
+        other => panic!("expected SelectWorkspace, got {other:?}"),
+    }
+}

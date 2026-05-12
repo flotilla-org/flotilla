@@ -45,6 +45,8 @@ pub enum Action {
     FillSelected,
     /// Open the command palette pre-filled to complete the selected convoy task.
     CompleteConvoyTask,
+    /// Attach the active workspace manager to the selected convoy task's workspace.
+    AttachConvoyTask,
     Dispatch(Intent),
 }
 
@@ -112,6 +114,7 @@ impl Action {
             "open_contextual_palette" => Action::OpenContextualPalette,
             "fill_selected" => Action::FillSelected,
             "complete_convoy_task" => Action::CompleteConvoyTask,
+            "attach_convoy_task" => Action::AttachConvoyTask,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
             "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
@@ -161,6 +164,7 @@ impl Action {
             Action::OpenContextualPalette => "open_contextual_palette",
             Action::FillSelected => "fill_selected",
             Action::CompleteConvoyTask => "complete_convoy_task",
+            Action::AttachConvoyTask => "attach_convoy_task",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
                 Intent::CreateWorkspace => "create_workspace",
@@ -207,6 +211,7 @@ impl Action {
             Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::FillSelected => "Fill selected item",
             Action::CompleteConvoyTask => "Complete convoy task",
+            Action::AttachConvoyTask => "Attach to task workspace",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
                 Intent::CreateWorkspace => "Create workspace",
