@@ -774,14 +774,13 @@ async fn terminal_completed_convoy_without_observed_presentation_does_not_emit_s
 }
 
 #[tokio::test]
-async fn multi_task_convoy_creates_one_presentation_per_active_task() {
+async fn multi_task_convoy_creates_presentations_only_for_active_tasks() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
     status.tasks.get_mut("implement").expect("implement task").phase = TaskPhase::Running;
     status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    status.tasks.get_mut("review").expect("review task").phase = TaskPhase::Ready;
-    status.tasks.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
+    // `review` intentionally stays in Pending — covers the `TaskPhase::Pending => {}` arm.
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
 
     let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
@@ -794,15 +793,64 @@ async fn multi_task_convoy_creates_one_presentation_per_active_task() {
             _ => None,
         })
         .collect();
-    assert_eq!(creates.len(), 2);
-    assert!(creates.contains(&("convoy-a-implement".to_string(), "implement".to_string())));
-    assert!(creates.contains(&("convoy-a-review".to_string(), "review".to_string())));
-
-    let pending_task_has_no_create = !outcome
+    assert_eq!(creates, vec![("convoy-a-implement".to_string(), "implement".to_string())]);
+    assert!(!outcome
         .actuations
         .iter()
-        .any(|actuation| matches!(actuation, Actuation::CreatePresentation { meta, .. } if meta.name == "convoy-a-pending-task"));
-    assert!(pending_task_has_no_create);
+        .any(|actuation| matches!(actuation, Actuation::CreatePresentation { meta, .. } if meta.name == "convoy-a-review")));
+}
+
+#[tokio::test]
+async fn ready_and_running_tasks_both_create_presentations_when_missing() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    status.tasks.get_mut("implement").expect("implement task").phase = TaskPhase::Running;
+    status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    status.tasks.get_mut("review").expect("review task").phase = TaskPhase::Ready;
+    status.tasks.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(20)).await;
+
+    let mut create_names: Vec<_> = outcome
+        .actuations
+        .iter()
+        .filter_map(|actuation| match actuation {
+            Actuation::CreatePresentation { meta, .. } => Some(meta.name.clone()),
+            _ => None,
+        })
+        .collect();
+    create_names.sort();
+    assert_eq!(create_names, vec!["convoy-a-implement".to_string(), "convoy-a-review".to_string()]);
+}
+
+#[tokio::test]
+async fn launching_task_creates_presentation_when_missing() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    status.tasks.get_mut("implement").expect("implement task").phase = TaskPhase::Launching;
+    status.tasks.get_mut("implement").expect("implement task").ready_at = Some(timestamp(12));
+    status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(
+        &convoy,
+        None,
+        vec![task_workspace_object("convoy-a", "implement", TaskWorkspacePhase::Ready, None)],
+        Vec::new(),
+        timestamp(20),
+    )
+    .await;
+
+    assert!(outcome.actuations.iter().any(|actuation| matches!(
+        actuation,
+        Actuation::CreatePresentation { meta, spec }
+            if meta.name == "convoy-a-implement"
+                && spec.name == "implement"
+                && spec.process_selector.get(TASK_LABEL).map(String::as_str) == Some("implement")
+    )));
 }
 
 #[tokio::test]

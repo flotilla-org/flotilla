@@ -408,7 +408,7 @@ fn task_workspace_outcome(
         let Some(state) = status.tasks.get(&task.name) else {
             continue;
         };
-        let workspace = task_workspaces.get(&task_workspace_name(&convoy.metadata.name, &task.name));
+        let workspace = task_workspaces.get(&per_task_resource_name(&convoy.metadata.name, &task.name));
         match state.phase {
             TaskPhase::Ready => {
                 if let Some(workspace) = workspace {
@@ -496,20 +496,19 @@ fn cleanup_actuations(
     let mut actuations = Vec::new();
 
     for (task, state) in &predicted_status.tasks {
-        let presentation = presentation_name(&convoy.metadata.name, task);
-        let workspace = task_workspace_name(&convoy.metadata.name, task);
+        let resource_name = per_task_resource_name(&convoy.metadata.name, task);
         match state.phase {
             TaskPhase::Ready | TaskPhase::Launching | TaskPhase::Running => {
-                if !presentations.contains_key(&presentation) {
+                if !presentations.contains_key(&resource_name) {
                     actuations.push(create_presentation_actuation(convoy, task));
                 }
             }
             TaskPhase::Completed | TaskPhase::Failed | TaskPhase::Cancelled => {
-                if presentations.contains_key(&presentation) {
-                    actuations.push(Actuation::DeletePresentation { name: presentation });
+                if presentations.contains_key(&resource_name) {
+                    actuations.push(Actuation::DeletePresentation { name: resource_name.clone() });
                 }
-                if task_workspaces.contains_key(&workspace) {
-                    actuations.push(Actuation::DeleteTaskWorkspace { name: workspace });
+                if task_workspaces.contains_key(&resource_name) {
+                    actuations.push(Actuation::DeleteTaskWorkspace { name: resource_name });
                 }
             }
             TaskPhase::Pending => {}
@@ -537,7 +536,7 @@ fn create_task_workspace_outcome(convoy: &ResourceObject<Convoy>, task: &str, no
         patch: None,
         actuations: vec![Actuation::CreateTaskWorkspace {
             meta: crate::InputMeta::builder()
-                .name(task_workspace_name(&convoy.metadata.name, task))
+                .name(per_task_resource_name(&convoy.metadata.name, task))
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
                     (TASK_LABEL.to_string(), task.to_string()),
@@ -559,7 +558,7 @@ fn create_task_workspace_outcome(convoy: &ResourceObject<Convoy>, task: &str, no
 fn create_presentation_actuation(convoy: &ResourceObject<Convoy>, task: &str) -> Actuation {
     Actuation::CreatePresentation {
         meta: InputMeta::builder()
-            .name(presentation_name(&convoy.metadata.name, task))
+            .name(per_task_resource_name(&convoy.metadata.name, task))
             .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.metadata.name.clone()), (TASK_LABEL.to_string(), task.to_string())]))
             .owner_references(vec![OwnerReference {
                 api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
@@ -627,11 +626,11 @@ fn insert_optional_field(fields: &mut BTreeMap<String, serde_json::Value>, key: 
     }
 }
 
-fn task_workspace_name(convoy_name: &str, task: &str) -> String {
-    format!("{convoy_name}-{task}")
-}
-
-fn presentation_name(convoy_name: &str, task: &str) -> String {
+/// Per-task convoy resources (`TaskWorkspace`, `Presentation`) share the name
+/// shape `<convoy>-<task>`. Resource kinds have separate namespaces, so the
+/// shared shape causes no collision and keeps both resources discoverable
+/// together by name.
+fn per_task_resource_name(convoy_name: &str, task: &str) -> String {
     format!("{convoy_name}-{task}")
 }
 
