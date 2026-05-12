@@ -354,6 +354,8 @@ impl HighFidelityHarness {
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let theme = self.app.theme.clone();
         let convoys_selected = self.app.convoys_ui.selected.clone();
+        let convoys_selected_task = self.app.convoys_ui.selected_task.clone();
+        let convoys_focus = self.app.convoys_ui.focus;
         let convoy_filter_str = self.app.convoys_ui.filter.clone();
         terminal
             .draw(|frame| {
@@ -368,6 +370,8 @@ impl HighFidelityHarness {
                     in_flight: &self.app.in_flight,
                     namespaces: &self.app.namespaces,
                     convoys_selected,
+                    convoys_selected_task: convoys_selected_task.as_deref(),
+                    convoys_focus,
                     convoy_filter: &convoy_filter_str,
                     convoys,
                 };

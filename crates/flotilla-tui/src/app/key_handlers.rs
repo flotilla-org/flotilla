@@ -14,13 +14,18 @@ impl App {
     /// Resolve a key event using the app-level config/convoys/normal distinction.
     ///
     /// Called when the base layer widget (Normal mode_id) is on top, so that
-    /// config mode gets Overview bindings, convoys mode gets Convoys bindings,
-    /// and normal mode gets Normal bindings.
+    /// config mode gets Overview bindings, convoys mode gets Convoys bindings
+    /// (or ConvoyTasks when the user has drilled into the task tree), and
+    /// normal mode gets Normal bindings.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
         let mode = if self.ui.is_config {
             KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview])
         } else if self.ui.is_convoys {
-            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys])
+            let inner = match self.convoys_focus() {
+                super::ConvoysFocus::List => BindingModeId::Convoys,
+                super::ConvoysFocus::Tasks => BindingModeId::ConvoyTasks,
+            };
+            KeyBindingMode::Composed(vec![BindingModeId::TabPage, inner])
         } else {
             KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal])
         };
@@ -34,14 +39,29 @@ impl App {
     /// convoy selection navigation.
     pub(super) fn dispatch_action(&mut self, action: Action) {
         match action {
-            Action::SelectNext if self.ui.is_convoys => self.convoys_tab_select_delta(1),
-            Action::SelectPrev if self.ui.is_convoys => self.convoys_tab_select_delta(-1),
-            // Focus detail / expand tree — deferred; no-op for now.
-            // This guard also prevents zero-repo panics and stops Enter from
-            // acting on the hidden repo page while the Convoys tab is visible.
-            Action::Confirm if self.ui.is_convoys => {}
-            // Collapse tree / back — deferred; no-op for now.
-            Action::Dismiss if self.ui.is_convoys => {}
+            Action::SelectNext if self.ui.is_convoys => match self.convoys_focus() {
+                super::ConvoysFocus::List => self.convoys_tab_select_delta(1),
+                super::ConvoysFocus::Tasks => self.convoy_tasks_select_delta("flotilla", 1),
+            },
+            Action::SelectPrev if self.ui.is_convoys => match self.convoys_focus() {
+                super::ConvoysFocus::List => self.convoys_tab_select_delta(-1),
+                super::ConvoysFocus::Tasks => self.convoy_tasks_select_delta("flotilla", -1),
+            },
+            // On the Convoys list, Confirm (enter / l / right) drills into the task tree.
+            // In the task tree, Confirm is currently a no-op (task-attach lands in PR 3).
+            Action::Confirm if self.ui.is_convoys => {
+                if matches!(self.convoys_focus(), super::ConvoysFocus::List) {
+                    self.enter_convoy_tasks_focus("flotilla");
+                }
+            }
+            // In the task tree, Dismiss (esc / left) returns to the convoy list.
+            // On the convoy list, Dismiss is a no-op (don't act on the hidden repo page).
+            Action::Dismiss if self.ui.is_convoys => {
+                if matches!(self.convoys_focus(), super::ConvoysFocus::Tasks) {
+                    self.exit_convoy_tasks_focus();
+                }
+            }
+            Action::CompleteConvoyTask if self.ui.is_convoys => self.open_complete_convoy_task_palette(),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
@@ -382,6 +402,22 @@ impl App {
             };
             self.proto_commands.push_with_context(cmd, Some(pending_ctx));
         }
+    }
+
+    /// Open the command palette pre-filled with `convoy <id> task <task> complete `.
+    /// No-op when no convoy or task is selected. Convoy ids and task names are
+    /// arbitrary strings (no validation), so they are routed through the
+    /// palette's quoting helper to round-trip whitespace and special characters.
+    pub(super) fn open_complete_convoy_task_palette(&mut self) {
+        let Some(convoy_id) = self.convoys_ui.selected.as_ref() else { return };
+        let Some(task) = self.convoys_ui.selected_task.as_ref() else { return };
+        let prefill = format!(
+            "convoy {} task {} complete ",
+            crate::palette::quote_palette_token(convoy_id.name()),
+            crate::palette::quote_palette_token(task),
+        );
+        let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill(prefill, None);
+        self.screen.modal_stack.push(Box::new(widget));
     }
 
     pub(super) fn open_action_menu(&mut self) {

@@ -211,6 +211,7 @@ pub(crate) struct TestWidgetHarness {
     pub my_node_id: Option<NodeId>,
     pub is_config: bool,
     pub active_repo_is_remote_only: bool,
+    pub namespaces: crate::app::NamespaceMap,
 }
 
 impl TestWidgetHarness {
@@ -227,6 +228,7 @@ impl TestWidgetHarness {
             my_node_id: None,
             is_config: false,
             active_repo_is_remote_only: false,
+            namespaces: Default::default(),
         }
     }
 
@@ -245,6 +247,7 @@ impl TestWidgetHarness {
             is_config: &mut self.is_config,
             is_convoys: false,
             active_repo_is_remote_only: self.active_repo_is_remote_only,
+            namespaces: &self.namespaces,
             app_actions: Vec::new(),
         }
     }

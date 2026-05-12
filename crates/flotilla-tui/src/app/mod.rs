@@ -270,13 +270,25 @@ pub struct NamespaceModel {
     pub last_seq: u64,
 }
 
-/// UI state for the Convoys tab (selection, filter).
-///
-/// Minimal stub for Task 25; full selection wiring lands in Task 26,
-/// filter input in Task 27.
+/// Which pane has focus on the Convoys tab — the convoy list (left) or the
+/// task tree (right). `j/k` semantics depend on this: in `List` they move
+/// between convoys; in `Tasks` they move between tasks of the selected convoy.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvoysFocus {
+    #[default]
+    List,
+    Tasks,
+}
+
+/// UI state for the Convoys tab.
 #[derive(Default)]
 pub struct ConvoysUiState {
     pub selected: Option<flotilla_protocol::namespace::ConvoyId>,
+    /// Name of the selected task within `selected`. Cleared when the convoy
+    /// selection changes; clamped against the convoy's task list on every
+    /// snapshot/delta apply.
+    pub selected_task: Option<String>,
+    pub focus: ConvoysFocus,
     pub filter: String,
 }
 
@@ -855,6 +867,7 @@ impl App {
             is_config: &mut self.ui.is_config,
             is_convoys,
             active_repo_is_remote_only,
+            namespaces: &self.namespaces,
             app_actions: Vec::new(),
         }
     }
@@ -1439,25 +1452,100 @@ impl App {
         &self.convoys_ui.filter
     }
 
+    /// Returns the selected task name within the selected convoy, if any.
+    pub fn selected_convoy_task(&self) -> Option<&str> {
+        self.convoys_ui.selected_task.as_deref()
+    }
+
+    /// Returns the current focus pane for the Convoys tab.
+    pub fn convoys_focus(&self) -> ConvoysFocus {
+        self.convoys_ui.focus
+    }
+
     /// Validate the current convoy selection and default-select when needed.
     ///
     /// Called after every namespace snapshot or delta:
     /// - Clears selection when there are no convoys.
     /// - Replaces a dangling selection (removed convoy) with the first available convoy.
     /// - Sets the first convoy as the default when no selection is set yet.
+    /// - Resets task focus state when the selected convoy changes.
+    /// - Clamps `selected_task` against the selected convoy's current task list.
     fn refresh_convoy_selection(&mut self, namespace: &str) {
+        let prior_selected = self.convoys_ui.selected.clone();
         let Some(model) = self.namespaces.get(namespace) else {
             self.convoys_ui.selected = None;
+            self.reset_convoy_task_state();
             return;
         };
         if model.convoys.is_empty() {
             self.convoys_ui.selected = None;
+            self.reset_convoy_task_state();
             return;
         }
         let still_valid = self.convoys_ui.selected.as_ref().is_some_and(|id| model.convoys.contains_key(id));
         if !still_valid {
             self.convoys_ui.selected = Some(model.convoys.keys().next().cloned().expect("non-empty checked above"));
         }
+        if self.convoys_ui.selected != prior_selected {
+            self.reset_convoy_task_state();
+        }
+        self.clamp_selected_task(namespace);
+    }
+
+    fn reset_convoy_task_state(&mut self) {
+        self.convoys_ui.selected_task = None;
+        self.convoys_ui.focus = ConvoysFocus::List;
+    }
+
+    /// If `selected_task` no longer matches a task in the selected convoy,
+    /// reset it (`None`) and snap focus back to the convoy list. Otherwise the
+    /// task pane would render with bold borders but no selected row — visual
+    /// limbo until the user pressed `j`/`k`.
+    fn clamp_selected_task(&mut self, namespace: &str) {
+        let Some(task) = self.convoys_ui.selected_task.clone() else { return };
+        let still_valid = self.selected_convoy_summary(namespace).is_some_and(|c| c.tasks.iter().any(|t| t.name == task));
+        if !still_valid {
+            self.convoys_ui.selected_task = None;
+            self.convoys_ui.focus = ConvoysFocus::List;
+        }
+    }
+
+    fn selected_convoy_summary<'a>(&'a self, namespace: &str) -> Option<&'a flotilla_protocol::namespace::ConvoySummary> {
+        let id = self.convoys_ui.selected.as_ref()?;
+        self.namespaces.get(namespace)?.convoys.get(id)
+    }
+
+    /// Switch focus to the task tree, defaulting to the first task if none selected.
+    /// No-op when no convoy is selected or the convoy has no tasks.
+    pub fn enter_convoy_tasks_focus(&mut self, namespace: &str) {
+        let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
+        if convoy.tasks.is_empty() {
+            return;
+        }
+        if self.convoys_ui.selected_task.is_none() {
+            self.convoys_ui.selected_task = Some(convoy.tasks[0].name.clone());
+        }
+        self.convoys_ui.focus = ConvoysFocus::Tasks;
+    }
+
+    /// Return focus to the convoy list. Keeps `selected_task` so re-entering Tasks
+    /// resumes at the same row.
+    pub fn exit_convoy_tasks_focus(&mut self) {
+        self.convoys_ui.focus = ConvoysFocus::List;
+    }
+
+    /// Move task selection within the selected convoy by `delta` (positive = down).
+    /// Clamps at both ends. No-op when no tasks are visible.
+    pub fn convoy_tasks_select_delta(&mut self, namespace: &str, delta: isize) {
+        let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
+        if convoy.tasks.is_empty() {
+            self.convoys_ui.selected_task = None;
+            return;
+        }
+        let names: Vec<String> = convoy.tasks.iter().map(|t| t.name.clone()).collect();
+        let current_idx = self.convoys_ui.selected_task.as_ref().and_then(|n| names.iter().position(|m| m == n)).unwrap_or(0);
+        let new_idx = (current_idx as isize + delta).clamp(0, (names.len() - 1) as isize) as usize;
+        self.convoys_ui.selected_task = Some(names[new_idx].clone());
     }
 
     /// Move the convoy selection by `delta` positions (positive = down, negative = up).
@@ -1468,14 +1556,19 @@ impl App {
         // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
         // support will need a namespace scoping concept on ConvoysUiState —
         // see issue #589 (arbitrary tabs).
+        let prior_selected = self.convoys_ui.selected.clone();
         let ids: Vec<flotilla_protocol::namespace::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
         if ids.is_empty() {
             self.convoys_ui.selected = None;
+            self.reset_convoy_task_state();
             return;
         }
         let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| candidate == id)).unwrap_or(0);
         let new_idx = (current_idx as isize + delta).clamp(0, (ids.len() - 1) as isize) as usize;
         self.convoys_ui.selected = Some(ids[new_idx].clone());
+        if self.convoys_ui.selected != prior_selected {
+            self.reset_convoy_task_state();
+        }
     }
 
     /// Set the filter string for the Convoys tab.
@@ -1496,11 +1589,16 @@ impl App {
     /// When the filter changes, check whether the current selection is still
     /// visible. If not, default to the first visible convoy (or `None`).
     fn refresh_convoy_selection_for_filter(&mut self, namespace: &str) {
+        let prior_selected = self.convoys_ui.selected.clone();
         let visible_ids: Vec<_> = self.visible_convoys(namespace).map(|c| c.id.clone()).collect();
         let current_visible = self.convoys_ui.selected.as_ref().is_some_and(|id| visible_ids.contains(id));
         if !current_visible {
             self.convoys_ui.selected = visible_ids.into_iter().next();
         }
+        if self.convoys_ui.selected != prior_selected {
+            self.reset_convoy_task_state();
+        }
+        self.clamp_selected_task(namespace);
     }
 
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {

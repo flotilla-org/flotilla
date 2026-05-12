@@ -74,13 +74,18 @@ impl CommandPaletteWidget {
         Self { input: Input::from(text.as_ref()), entries: palette::all_entries(), selected: 0, scroll_top: 0, source_item: item }
     }
 
+    /// Current input text (for tests / introspection).
+    pub fn input_value(&self) -> &str {
+        self.input.value()
+    }
+
     fn filtered(&self) -> Vec<&'static PaletteEntry> {
         palette::filter_entries(self.entries, self.input.value())
     }
 
     /// Compute position-aware completions using model context.
-    fn completions(&self, model: &TuiModel, has_repo_context: bool) -> Vec<PaletteCompletion> {
-        palette::palette_completions(self.input.value(), model, has_repo_context)
+    fn completions(&self, model: &TuiModel, namespaces: &crate::app::NamespaceMap, has_repo_context: bool) -> Vec<PaletteCompletion> {
+        palette::palette_completions(self.input.value(), model, namespaces, has_repo_context)
     }
 
     /// Fill the selected completion value into the input, appending to the
@@ -450,7 +455,7 @@ impl InteractiveWidget for CommandPaletteWidget {
         let has_repo_context = !*ctx.is_config;
         match action {
             Action::SelectNext => {
-                let count = self.completions(ctx.model, has_repo_context).len();
+                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context).len();
                 if count > 0 {
                     self.selected = (self.selected + 1) % count;
                     self.adjust_scroll();
@@ -458,7 +463,7 @@ impl InteractiveWidget for CommandPaletteWidget {
                 Outcome::Consumed
             }
             Action::SelectPrev => {
-                let count = self.completions(ctx.model, has_repo_context).len();
+                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context).len();
                 if count > 0 {
                     self.selected = if self.selected == 0 { count - 1 } else { self.selected - 1 };
                     self.adjust_scroll();
@@ -468,7 +473,7 @@ impl InteractiveWidget for CommandPaletteWidget {
             Action::Confirm => self.confirm(ctx),
             Action::Dismiss => Outcome::Finished,
             Action::FillSelected => {
-                let completions = self.completions(ctx.model, has_repo_context);
+                let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
                 if let Some(completion) = completions.get(self.selected) {
                     self.fill_completion(completion);
                 }
@@ -482,7 +487,7 @@ impl InteractiveWidget for CommandPaletteWidget {
         let has_repo_context = !*ctx.is_config;
         // Right arrow: fill selected completion into input (Tab goes through handle_action)
         if matches!(key.code, KeyCode::Right) {
-            let completions = self.completions(ctx.model, has_repo_context);
+            let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
             if let Some(completion) = completions.get(self.selected) {
                 self.fill_completion(completion);
             }
@@ -512,7 +517,7 @@ impl InteractiveWidget for CommandPaletteWidget {
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
         let has_repo_context = !ctx.ui.is_config;
-        let completions = self.completions(ctx.model, has_repo_context);
+        let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
         let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
         let area = overlay.body;
 
@@ -618,7 +623,7 @@ mod tests {
     fn select_next_wraps_around() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let total = widget.completions(&harness.model, true).len();
+        let total = widget.completions(&harness.model, &harness.namespaces, true).len();
 
         // Advance to end
         for _ in 0..total - 1 {
@@ -637,7 +642,7 @@ mod tests {
     fn select_prev_wraps_around() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let total = widget.completions(&harness.model, true).len();
+        let total = widget.completions(&harness.model, &harness.namespaces, true).len();
 
         // Prev from 0 wraps to end
         let mut ctx = harness.ctx();
@@ -651,7 +656,7 @@ mod tests {
         let mut harness = TestWidgetHarness::new();
 
         // Get the first completion value to verify fill works
-        let first_value = widget.completions(&harness.model, true)[0].value.clone();
+        let first_value = widget.completions(&harness.model, &harness.namespaces, true)[0].value.clone();
 
         let mut ctx = harness.ctx();
         let outcome = widget.handle_action(Action::FillSelected, &mut ctx);

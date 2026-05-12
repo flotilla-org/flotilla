@@ -3,6 +3,7 @@
 use flotilla_protocol::namespace::ConvoySummary;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -13,11 +14,15 @@ use super::glyphs::{convoy_glyph, task_glyph};
 
 pub struct ConvoyDetail<'a> {
     pub convoy: &'a ConvoySummary,
+    pub selected_task: Option<&'a str>,
+    pub focused: bool,
 }
 
 impl<'a> ConvoyDetail<'a> {
     pub fn render(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(0)]).split(area);
+
+        let border_style = if self.focused { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() };
 
         // Header
         let glyph = convoy_glyph(self.convoy.phase);
@@ -26,11 +31,11 @@ impl<'a> ConvoyDetail<'a> {
             Span::raw(format!(" {} ", self.convoy.name)),
             Span::raw(format!("[{}]", self.convoy.workflow_ref)),
         ]))
-        .block(Block::default().borders(Borders::ALL));
+        .block(Block::default().borders(Borders::ALL).border_style(border_style));
         f.render_widget(header, chunks[0]);
 
         // Body: task tree OR initializing placeholder
-        let body_block = Block::default().borders(Borders::ALL).title(" Tasks ");
+        let body_block = Block::default().borders(Borders::ALL).border_style(border_style).title(" Tasks ");
         let body_area = chunks[1];
         if self.convoy.initializing {
             let p = Paragraph::new("initializing…").block(body_block);
@@ -50,10 +55,17 @@ impl<'a> ConvoyDetail<'a> {
             })
             .collect();
 
-        // TODO(task-attach): lift tree expansion state into ConvoysUiState once
-        // tree interaction (expand/collapse) lands with the task-attach PR.
+        // TreeState is built from `selected_task` on every render. Selection lives
+        // in `ConvoysUiState` (the source of truth); expansion isn't needed because
+        // tasks render as flat leaves today. Lift TreeState if we get nested tasks.
         let mut state = TreeState::default();
-        let tree = Tree::new(&items).expect("unique task names").block(body_block);
+        if let Some(name) = self.selected_task {
+            state.select(vec![name.to_string()]);
+        }
+        let tree = Tree::new(&items)
+            .expect("unique task names")
+            .block(body_block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(tree, body_area, &mut state);
     }
 }
@@ -115,10 +127,26 @@ mod tests {
         let convoy = multi_task_convoy();
         terminal
             .draw(|f| {
-                ConvoyDetail { convoy: &convoy }.render(f, f.area());
+                ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn convoy_detail_with_selected_task_renders() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let convoy = multi_task_convoy();
+        terminal
+            .draw(|f| {
+                ConvoyDetail { convoy: &convoy, selected_task: Some("review"), focused: true }.render(f, f.area());
+            })
+            .unwrap();
+        let rendered: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        // Both task names should appear; selection is style-only so the buffer
+        // content check is for parity with the unselected snapshot.
+        assert!(rendered.contains("implement"), "expected 'implement' task in render: {rendered}");
+        assert!(rendered.contains("review"), "expected 'review' task in render: {rendered}");
     }
 
     #[test]
@@ -129,7 +157,7 @@ mod tests {
         convoy.tasks.clear();
         terminal
             .draw(|f| {
-                ConvoyDetail { convoy: &convoy }.render(f, f.area());
+                ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
