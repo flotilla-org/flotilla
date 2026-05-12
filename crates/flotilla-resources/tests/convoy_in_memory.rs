@@ -286,14 +286,23 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
     presentations
         .create(
             &InputMeta::builder()
-                .name("convoy-delete-presentation".to_string())
-                .labels([(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect())
+                .name("convoy-delete-implement".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "implement".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
                 .build(),
             &PresentationSpec {
                 convoy_ref: "convoy-delete".to_string(),
                 presentation_policy_ref: "default".to_string(),
-                name: "convoy-delete".to_string(),
-                process_selector: [(CONVOY_LABEL.to_string(), "convoy-delete".to_string())].into_iter().collect(),
+                name: "implement".to_string(),
+                process_selector: [
+                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
+                    (TASK_LABEL.to_string(), "implement".to_string()),
+                ]
+                .into_iter()
+                .collect(),
             },
         )
         .await
@@ -330,7 +339,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
         loop {
             if matches!(convoys.get("convoy-delete").await, Err(ResourceError::NotFound { .. }))
                 && matches!(workspaces.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
-                && matches!(presentations.get("convoy-delete-presentation").await, Err(ResourceError::NotFound { .. }))
+                && matches!(presentations.get("convoy-delete-implement").await, Err(ResourceError::NotFound { .. }))
             {
                 break;
             }
@@ -339,6 +348,65 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
     })
     .await
     .expect("convoy finalizer should delete presentation and task workspaces");
+
+    loop_task.abort();
+}
+
+#[tokio::test]
+async fn controller_loop_creates_one_presentation_per_active_task() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let presentations = backend.clone().using::<Presentation>("flotilla");
+    let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
+
+    let created =
+        convoys.create(&convoy_meta("convoy-multi"), &task_provisioning_convoy_spec()).await.expect("convoy create should succeed");
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.started_at = Some(timestamp(18));
+    status.tasks.get_mut("implement").expect("implement task").phase = flotilla_resources::TaskPhase::Running;
+    status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    status.tasks.get_mut("review").expect("review task").phase = flotilla_resources::TaskPhase::Ready;
+    status.tasks.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
+    convoys.update_status("convoy-multi", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
+
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: convoys.clone(),
+            secondaries: ConvoyReconciler::secondary_watches(),
+            reconciler: ConvoyReconciler::new(templates.clone())
+                .with_task_workspaces(workspaces.clone())
+                .with_presentations(presentations.clone()),
+            resync_interval: Duration::from_millis(50),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if let (Ok(implement), Ok(review)) =
+                (presentations.get("convoy-multi-implement").await, presentations.get("convoy-multi-review").await)
+            {
+                break (implement, review);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map(|(implement, review)| {
+        assert_eq!(implement.spec.name, "implement");
+        assert_eq!(implement.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
+        assert_eq!(implement.spec.process_selector.get(TASK_LABEL).map(String::as_str), Some("implement"));
+        assert_eq!(implement.metadata.labels.get(TASK_LABEL).map(String::as_str), Some("implement"));
+
+        assert_eq!(review.spec.name, "review");
+        assert_eq!(review.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
+        assert_eq!(review.spec.process_selector.get(TASK_LABEL).map(String::as_str), Some("review"));
+        assert_eq!(review.metadata.labels.get(TASK_LABEL).map(String::as_str), Some("review"));
+    })
+    .expect("controller loop should create one presentation per active task");
 
     loop_task.abort();
 }
