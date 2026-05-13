@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use flotilla_core::namespace_projection::{NamespaceProjectionState, NamespaceView};
+use flotilla_core::namespace_projection::NamespaceProjectionState;
 use flotilla_protocol::{
     namespace::{
         ConvoyId, ConvoyPhase as WireConvoyPhase, ConvoySummary, NamespaceDelta, NamespaceSnapshot, ProcessSummary,
@@ -28,13 +28,16 @@ pub struct ConvoyProjection {
     /// Authoritative namespace state, shared with `InProcessDaemon::replay_since`.
     state: NamespaceProjectionState,
     presentation_workspaces: HashMap<PresentationKey, String>,
+    /// Per-namespace flag: has the projection emitted its initial `NamespaceSnapshot`?
+    /// Private to the projection — replay reads do not need it.
+    emitted_initial_snapshot: HashMap<String, bool>,
     /// Emitter for events going to connected clients.
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl ConvoyProjection {
     pub fn new(state: NamespaceProjectionState, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { state, presentation_workspaces: HashMap::new(), event_tx }
+        Self { state, presentation_workspaces: HashMap::new(), emitted_initial_snapshot: HashMap::new(), event_tx }
     }
 
     /// Drive the projection event loop. Lists both resources to get initial state, then
@@ -201,28 +204,29 @@ impl ConvoyProjection {
                 let namespace = summary.namespace.clone();
                 let id = summary.id.clone();
 
+                let already_emitted_snapshot = *self.emitted_initial_snapshot.entry(namespace.clone()).or_default();
                 let daemon_event = {
                     let mut namespaces = self.state.write().await;
-                    let view = namespaces.entry(namespace.clone()).or_insert_with(NamespaceView::default);
+                    let view = namespaces.entry(namespace.clone()).or_default();
                     view.convoys.insert(id, summary.clone());
                     view.seq = view.seq.saturating_add(1);
 
-                    if !view.emitted_initial_snapshot {
-                        view.emitted_initial_snapshot = true;
+                    if already_emitted_snapshot {
+                        DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+                            seq: view.seq,
+                            namespace: namespace.clone(),
+                            changed: vec![summary],
+                            removed: Vec::new(),
+                        }))
+                    } else {
                         DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
                             seq: view.seq,
                             namespace: namespace.clone(),
                             convoys: view.convoys.values().cloned().collect(),
                         }))
-                    } else {
-                        DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
-                            seq: view.seq,
-                            namespace,
-                            changed: vec![summary],
-                            removed: Vec::new(),
-                        }))
                     }
                 };
+                self.emitted_initial_snapshot.insert(namespace, true);
                 let _ = self.event_tx.send(daemon_event);
             }
             WatchEvent::Deleted(convoy) => {

@@ -18,7 +18,6 @@ use tokio::sync::{RwLock, RwLockWriteGuard};
 pub struct NamespaceView {
     pub convoys: HashMap<ConvoyId, ConvoySummary>,
     pub seq: u64,
-    pub emitted_initial_snapshot: bool,
 }
 
 impl NamespaceView {
