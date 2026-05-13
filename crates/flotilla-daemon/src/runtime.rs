@@ -15,6 +15,7 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     config::ConfigStore,
     in_process::InProcessDaemon,
+    namespace_projection::NamespaceProjectionState,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -82,6 +83,8 @@ impl DaemonRuntime {
             daemon.set_daemon_socket_path(path.clone()).await;
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
+        let namespace_projection_state = NamespaceProjectionState::new();
+        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -102,7 +105,7 @@ impl DaemonRuntime {
                 local_repo_root,
                 profile.host_direct_environment_name(),
             ));
-            tasks.extend(spawn_controller_loops(state, &options.namespace, options.controller_resync_interval));
+            tasks.extend(spawn_controller_loops(state, &options.namespace, options.controller_resync_interval, namespace_projection_state));
         }
 
         Ok(Self { tasks })
@@ -436,6 +439,7 @@ fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
     namespace: &str,
     controller_resync_interval: Duration,
+    namespace_projection_state: NamespaceProjectionState,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let namespace_string = namespace.to_string();
@@ -612,7 +616,7 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let event_tx = state.daemon.event_sender();
             async move {
-                ConvoyProjection::new(event_tx)
+                ConvoyProjection::new(namespace_projection_state, event_tx)
                     .run(backend.clone().using::<Convoy>(&namespace_string), backend.using::<Presentation>(&namespace_string))
                     .await;
             }
@@ -1084,7 +1088,10 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let controller_handles = spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25));
+        let namespace_projection_state = NamespaceProjectionState::new();
+        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let controller_handles =
+            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), namespace_projection_state);
 
         backend
             .clone()

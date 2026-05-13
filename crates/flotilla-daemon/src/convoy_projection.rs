@@ -4,8 +4,9 @@
 //
 // Spec: docs/superpowers/specs/2026-04-21-tui-convoy-view-design.md §Architecture.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use flotilla_core::namespace_projection::NamespaceProjectionState;
 use flotilla_protocol::{
     namespace::{
         ConvoyId, ConvoyPhase as WireConvoyPhase, ConvoySummary, NamespaceDelta, NamespaceSnapshot, ProcessSummary,
@@ -20,27 +21,23 @@ use flotilla_resources::{
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
-/// In-memory view of one namespace's convoys, owned by the projection.
-#[derive(Default)]
-struct NamespaceView {
-    convoys: HashMap<ConvoyId, ConvoySummary>,
-    seq: u64,
-    emitted_initial_snapshot: bool,
-}
-
 /// Key: `(namespace, convoy_name, task_name)`.
 type PresentationKey = (String, String, String);
 
 pub struct ConvoyProjection {
-    namespaces: HashMap<String, NamespaceView>,
+    /// Authoritative namespace state, shared with `InProcessDaemon::replay_since`.
+    state: NamespaceProjectionState,
     presentation_workspaces: HashMap<PresentationKey, String>,
+    /// Namespaces that have already received their initial `NamespaceSnapshot`.
+    /// Private to the projection — replay reads do not need it.
+    emitted_initial_snapshot: HashSet<String>,
     /// Emitter for events going to connected clients.
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl ConvoyProjection {
-    pub fn new(event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { namespaces: HashMap::new(), presentation_workspaces: HashMap::new(), event_tx }
+    pub fn new(state: NamespaceProjectionState, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
+        Self { state, presentation_workspaces: HashMap::new(), emitted_initial_snapshot: HashSet::new(), event_tx }
     }
 
     /// Drive the projection event loop. Lists both resources to get initial state, then
@@ -160,23 +157,22 @@ impl ConvoyProjection {
         // 2. Re-emit a delta for the affected convoy with refreshed workspace_ref values.
         let id = ConvoyId::new(&namespace, &convoy_name);
 
-        // Collect workspace refs before taking a mutable borrow on the namespace view,
-        // to avoid the conflict between &self (workspace_ref_for) and &mut self (view).
-        let Some(existing) = self.namespaces.get(&namespace).and_then(|v| v.convoys.get(&id)).cloned() else {
+        let mut namespaces = self.state.write().await;
+        let Some(stored) = namespaces.get(&namespace).and_then(|v| v.convoys.get(&id)).cloned() else {
             return;
         };
         let refreshed_refs: Vec<Option<String>> =
-            existing.tasks.iter().map(|t| self.workspace_ref_for(&namespace, &convoy_name, &t.name)).collect();
+            stored.tasks.iter().map(|t| self.workspace_ref_for(&namespace, &convoy_name, &t.name)).collect();
 
-        // Now take the mutable borrow and apply the refreshed refs.
-        let view = self.namespaces.get_mut(&namespace).expect("namespace present; just read above");
-        let Some(stored) = view.convoys.get_mut(&id) else { return };
+        let view = namespaces.get_mut(&namespace).expect("namespace present; just read above");
+        let stored = view.convoys.get_mut(&id).expect("convoy present; write lock held continuously from the cloned read above");
         for (task, ws_ref) in stored.tasks.iter_mut().zip(refreshed_refs.iter()) {
             task.workspace_ref = ws_ref.clone();
         }
         let refreshed = stored.clone();
         view.seq = view.seq.saturating_add(1);
         let seq = view.seq;
+        drop(namespaces);
 
         let _ = self.event_tx.send(DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
             seq,
@@ -207,43 +203,52 @@ impl ConvoyProjection {
                 let summary = self.summarize(&convoy);
                 let namespace = summary.namespace.clone();
                 let id = summary.id.clone();
-                let view = self.namespaces.entry(namespace.clone()).or_default();
-                view.convoys.insert(id, summary.clone());
-                view.seq = view.seq.saturating_add(1);
 
-                let daemon_event = if !view.emitted_initial_snapshot {
-                    view.emitted_initial_snapshot = true;
-                    DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
-                        seq: view.seq,
-                        namespace: namespace.clone(),
-                        convoys: view.convoys.values().cloned().collect(),
-                    }))
-                } else {
-                    DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
-                        seq: view.seq,
-                        namespace,
-                        changed: vec![summary],
-                        removed: Vec::new(),
-                    }))
+                let already_emitted = self.emitted_initial_snapshot.contains(&namespace);
+                let daemon_event = {
+                    let mut namespaces = self.state.write().await;
+                    let view = namespaces.entry(namespace.clone()).or_default();
+                    view.convoys.insert(id, summary.clone());
+                    view.seq = view.seq.saturating_add(1);
+
+                    if already_emitted {
+                        DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+                            seq: view.seq,
+                            namespace: namespace.clone(),
+                            changed: vec![summary],
+                            removed: Vec::new(),
+                        }))
+                    } else {
+                        DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot {
+                            seq: view.seq,
+                            namespace: namespace.clone(),
+                            convoys: view.convoys.values().cloned().collect(),
+                        }))
+                    }
                 };
+                self.emitted_initial_snapshot.insert(namespace);
                 let _ = self.event_tx.send(daemon_event);
             }
             WatchEvent::Deleted(convoy) => {
                 let namespace = convoy.metadata.namespace.clone();
                 let name = convoy.metadata.name.clone();
                 let id = ConvoyId::new(&namespace, &name);
-                if let Some(view) = self.namespaces.get_mut(&namespace) {
-                    if view.convoys.remove(&id).is_some() {
-                        view.seq = view.seq.saturating_add(1);
-                        let daemon_event = DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
-                            seq: view.seq,
-                            namespace,
-                            changed: Vec::new(),
-                            removed: vec![id],
-                        }));
-                        let _ = self.event_tx.send(daemon_event);
+
+                let daemon_event = {
+                    let mut namespaces = self.state.write().await;
+                    let Some(view) = namespaces.get_mut(&namespace) else { return };
+                    if view.convoys.remove(&id).is_none() {
+                        return;
                     }
-                }
+                    view.seq = view.seq.saturating_add(1);
+                    DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
+                        seq: view.seq,
+                        namespace,
+                        changed: Vec::new(),
+                        removed: vec![id],
+                    }))
+                };
+                let _ = self.event_tx.send(daemon_event);
             }
         }
     }
@@ -439,7 +444,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let summary = ConvoyProjection::new(broadcast::channel(16).0).summarize(&convoy);
+        let summary = ConvoyProjection::new(NamespaceProjectionState::new(), broadcast::channel(16).0).summarize(&convoy);
         assert_eq!(summary.namespace, "flotilla");
         assert_eq!(summary.name, "fix-bug-123");
         assert_eq!(summary.workflow_ref, "review-and-fix");
@@ -461,7 +466,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        let summary = ConvoyProjection::new(broadcast::channel(16).0).summarize(&convoy);
+        let summary = ConvoyProjection::new(NamespaceProjectionState::new(), broadcast::channel(16).0).summarize(&convoy);
         assert!(summary.initializing);
         assert!(summary.tasks.is_empty());
     }
@@ -469,7 +474,7 @@ mod tests {
     #[test]
     fn summarize_with_index_populates_workspace_ref() {
         let (tx, _rx) = broadcast::channel(16);
-        let mut projection = ConvoyProjection::new(tx);
+        let mut projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
         projection.apply_presentation(&presentation_obj("fix-bug-123", "implement", Some("ws-1")));
 
         let convoy = convoy_for_test("flotilla", "fix-bug-123", "wf", ResConvoyPhase::Active, &[("implement", ResTaskPhase::Running)]);
@@ -483,7 +488,7 @@ mod tests {
         use flotilla_resources::REPO_LABEL;
 
         let (tx, _rx) = broadcast::channel(16);
-        let projection = ConvoyProjection::new(tx);
+        let projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
 
         let mut convoy = convoy_for_test("flotilla", "x", "wf", ResConvoyPhase::Pending, &[]);
         convoy.metadata.labels.insert(REPO_LABEL.into(), "flotilla-org/flotilla".into());
@@ -495,7 +500,7 @@ mod tests {
     #[test]
     fn presentation_index_resolves_workspace_ref_per_task() {
         let (tx, _rx) = broadcast::channel(16);
-        let mut projection = ConvoyProjection::new(tx);
+        let mut projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
         projection.apply_presentation(&presentation_obj("fix-bug-123", "implement", Some("ws-1")));
         projection.apply_presentation(&presentation_obj("fix-bug-123", "review", Some("ws-2")));
 
@@ -506,7 +511,7 @@ mod tests {
     #[test]
     fn presentation_without_task_label_is_ignored() {
         let (tx, _rx) = broadcast::channel(16);
-        let mut projection = ConvoyProjection::new(tx);
+        let mut projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
         let mut p = presentation_obj("fix-bug-123", "implement", Some("ws-1"));
         p.metadata.labels.remove(TASK_LABEL);
         projection.apply_presentation(&p);
@@ -528,7 +533,7 @@ mod tests {
     #[tokio::test]
     async fn presentation_update_refreshes_workspace_ref_on_affected_convoy() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut projection = ConvoyProjection::new(tx);
+        let mut projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
 
         let convoy = convoy_for_test("flotilla", "fix-bug-123", "wf", ResConvoyPhase::Active, &[("implement", ResTaskPhase::Running)]);
         projection.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
@@ -552,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn applying_convoy_added_emits_initial_snapshot_then_delta() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut projection = ConvoyProjection::new(tx);
+        let mut projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
 
         let convoy = convoy_for_test("flotilla", "x", "wf", ResConvoyPhase::Pending, &[]);
         projection.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
@@ -592,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn applying_convoy_deleted_emits_removal_delta() {
         let (tx, mut rx) = broadcast::channel(16);
-        let mut projection = ConvoyProjection::new(tx);
+        let mut projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
         let convoy = convoy_for_test("flotilla", "x", "wf", ResConvoyPhase::Pending, &[]);
         projection.apply_convoy_event(WatchEvent::Added(convoy.clone())).await;
         let _ = drain(&mut rx); // consume snapshot
@@ -616,7 +621,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
 
         let (tx, mut rx) = broadcast::channel(16);
-        let projection = ConvoyProjection::new(tx);
+        let projection = ConvoyProjection::new(NamespaceProjectionState::new(), tx);
 
         let convoys = backend.clone().using::<Convoy>("flotilla");
         let presentations = backend.clone().using::<Presentation>("flotilla");
