@@ -459,3 +459,17 @@ impl<R: Reconciler> ControllerLoop<R> {
         }
     }
 }
+
+/// List every resource matching `selector` and delete it, swallowing `NotFound` from
+/// races with concurrent deletes. Used by cascading-teardown reconcilers (TaskWorkspace,
+/// Convoy) to garbage-collect their owned children before the finalizer is removed.
+pub async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
+    let listed = resolver.list_matching_labels(selector).await?;
+    for object in listed.items {
+        match resolver.delete(&object.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, marker::PhantomData};
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
-    controller::{Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{delete_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
     FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, OwnerReference, PlacementPolicy,
@@ -568,17 +568,6 @@ fn build_session_labels(
     labels.insert(TASK_ORDINAL_LABEL.to_string(), format!("{task_index:03}"));
     labels.insert(PROCESS_ORDINAL_LABEL.to_string(), format!("{process_index:03}"));
     labels
-}
-
-async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
-    let listed = resolver.list_matching_labels(selector).await?;
-    for object in listed.items {
-        match resolver.delete(&object.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
 }
 
 impl PlacementStrategy {
