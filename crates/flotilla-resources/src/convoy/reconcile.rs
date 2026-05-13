@@ -8,7 +8,9 @@ use super::{
 };
 use crate::{
     canonicalize_repo_url,
-    controller::{Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{
+        delete_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch,
+    },
     labels::{CONVOY_LABEL, TASK_LABEL},
     presentation::{Presentation, PresentationSpec},
     resource::ResourceObject,
@@ -632,15 +634,4 @@ fn insert_optional_field(fields: &mut BTreeMap<String, serde_json::Value>, key: 
 /// together by name.
 fn per_task_resource_name(convoy_name: &str, task: &str) -> String {
     format!("{convoy_name}-{task}")
-}
-
-async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
-    let listed = resolver.list_matching_labels(selector).await?;
-    for object in listed.items {
-        match resolver.delete(&object.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
 }
