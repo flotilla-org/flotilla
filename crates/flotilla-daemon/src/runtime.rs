@@ -15,6 +15,7 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     config::ConfigStore,
     in_process::InProcessDaemon,
+    namespace_projection::NamespaceProjectionState,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -82,6 +83,8 @@ impl DaemonRuntime {
             daemon.set_daemon_socket_path(path.clone()).await;
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
+        let namespace_projection_state = NamespaceProjectionState::new();
+        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -611,8 +614,10 @@ fn spawn_controller_loops(
         tokio::spawn({
             let namespace_string = namespace_string.clone();
             let event_tx = state.daemon.event_sender();
+            let daemon = Arc::clone(&state.daemon);
             async move {
-                ConvoyProjection::new(event_tx)
+                let namespace_projection_state = daemon.namespace_projection_state().await;
+                ConvoyProjection::new(namespace_projection_state, event_tx)
                     .run(backend.clone().using::<Convoy>(&namespace_string), backend.using::<Presentation>(&namespace_string))
                     .await;
             }

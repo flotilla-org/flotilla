@@ -41,6 +41,7 @@ use crate::{
     },
     host_registry::HostCounts,
     model::{provider_names_from_registry, repo_name, RepoModel},
+    namespace_projection::NamespaceProjectionState,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{discover_providers, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag},
@@ -490,11 +491,11 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
-    /// Retained namespace snapshots, keyed by namespace name.
-    /// Updated by a background subscriber whenever `NamespaceSnapshot` or
-    /// `NamespaceDelta` events arrive on the broadcast channel.  Consulted by
-    /// `replay_since` so reconnecting clients can receive missed namespace state.
-    namespace_state: Arc<RwLock<HashMap<String, flotilla_protocol::namespace::NamespaceSnapshot>>>,
+    /// Shared with `ConvoyProjection` (in flotilla-daemon): the projection is the
+    /// sole writer, the daemon reads here for `replay_since`.  Replaces an earlier
+    /// broadcast-driven mirror that had correctness seams under lag and
+    /// delta-before-snapshot races.  Set by the daemon runtime at startup.
+    namespace_projection_state: RwLock<NamespaceProjectionState>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
@@ -626,7 +627,7 @@ impl InProcessDaemon {
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
             resource_backend,
-            namespace_state: Arc::new(RwLock::new(HashMap::new())),
+            namespace_projection_state: RwLock::new(NamespaceProjectionState::new()),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
         });
 
@@ -641,54 +642,6 @@ impl InProcessDaemon {
                 match weak.upgrade() {
                     Some(d) => d.poll_snapshots().await,
                     None => break,
-                }
-            }
-        });
-
-        // Subscribe to the broadcast channel and mirror namespace events into
-        // `namespace_state` for replay.  The subscriber holds a strong Arc to
-        // `namespace_state` but exits cleanly when the daemon drops its broadcast
-        // sender (Err(Closed) breaks the loop).
-        let namespace_state = Arc::clone(&daemon.namespace_state);
-        let mut namespace_rx = daemon.event_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match namespace_rx.recv().await {
-                    Ok(DaemonEvent::NamespaceSnapshot(snap)) => {
-                        let mut state = namespace_state.write().await;
-                        state.insert(snap.namespace.clone(), *snap);
-                    }
-                    Ok(DaemonEvent::NamespaceDelta(delta)) => {
-                        let mut state = namespace_state.write().await;
-                        let Some(entry) = state.get_mut(&delta.namespace) else {
-                            // Delta arrived before any snapshot for this namespace — this can
-                            // happen under lag or ordering anomalies.  Synthesising a seq-0
-                            // baseline risks client regression (a reconnecting client at seq N>0
-                            // would regress).  Skip and wait for the next full snapshot.
-                            warn!(ns = %delta.namespace, "received NamespaceDelta for unknown namespace; skipping — awaiting snapshot");
-                            continue;
-                        };
-                        // Apply delta: remove deleted convoys, upsert changed ones.
-                        entry.convoys.retain(|c| !delta.removed.contains(&c.id));
-                        for changed in &delta.changed {
-                            if let Some(existing) = entry.convoys.iter_mut().find(|c| c.id == changed.id) {
-                                *existing = changed.clone();
-                            } else {
-                                entry.convoys.push(changed.clone());
-                            }
-                        }
-                        entry.seq = delta.seq;
-                    }
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // We dropped messages — we don't know which namespaces were affected,
-                        // so clear all namespace state.  Reconnecting clients will get nothing
-                        // from replay_since until the next snapshot arrives; that is preferable
-                        // to serving known-stale data.
-                        warn!(lagged = n, "namespace_state subscriber lagged; clearing all namespace state");
-                        namespace_state.write().await.clear();
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -795,6 +748,17 @@ impl InProcessDaemon {
 
     pub async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().await.clone()
+    }
+
+    /// Install the shared namespace state that `ConvoyProjection` (in flotilla-daemon)
+    /// will write into.  `replay_since` reads from the same state.  Called by the daemon
+    /// runtime at startup before the projection is spawned.
+    pub async fn set_namespace_projection_state(&self, state: NamespaceProjectionState) {
+        *self.namespace_projection_state.write().await = state;
+    }
+
+    pub async fn namespace_projection_state(&self) -> NamespaceProjectionState {
+        self.namespace_projection_state.read().await.clone()
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -2465,13 +2429,14 @@ impl DaemonHandle for InProcessDaemon {
             }
         }
 
-        // Emit namespace events for each retained namespace snapshot.
-        let namespace_state = self.namespace_state.read().await;
-        for (namespace, snap) in namespace_state.iter() {
-            let stream_key = StreamKey::Namespace { name: namespace.clone() };
+        // Emit namespace events by reading directly from the projection's authoritative
+        // state.  No mirror, no lag — see [`NamespaceProjectionState`] for the rationale.
+        let projection_state = self.namespace_projection_state.read().await.clone();
+        for snap in projection_state.all_snapshots().await {
+            let stream_key = StreamKey::Namespace { name: snap.namespace.clone() };
             let up_to_date = last_seen.get(&stream_key).is_some_and(|&seq| seq == snap.seq);
             if !up_to_date {
-                events.push(DaemonEvent::NamespaceSnapshot(Box::new(snap.clone())));
+                events.push(DaemonEvent::NamespaceSnapshot(Box::new(snap)));
             }
         }
 
