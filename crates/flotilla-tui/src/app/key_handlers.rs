@@ -421,19 +421,12 @@ impl App {
         self.screen.modal_stack.push(Box::new(widget));
     }
 
-    /// Resolve the selected convoy task's `workspace_ref` and dispatch
-    /// `SelectWorkspace { ws_ref }`. When the task has no workspace yet
-    /// (its Presentation has not produced an `observed_workspace_ref`),
-    /// surface a transient status line instead of erroring.
+    /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
     pub(super) fn attach_selected_convoy_task(&mut self) {
-        let Some(convoy_id) = self.convoys_ui.selected.clone() else { return };
         let Some(task) = self.convoys_ui.selected_task.clone() else { return };
-        // Single-namespace MVP: all convoys live in "flotilla" (see app::mod for
-        // the matching note in convoys_tab_select_delta).
+        // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
         let workspace_ref = self
-            .namespaces
-            .get("flotilla")
-            .and_then(|ns| ns.convoys.get(&convoy_id))
+            .selected_convoy_summary("flotilla")
             .and_then(|convoy| convoy.tasks.iter().find(|t| t.name == task))
             .and_then(|t| t.workspace_ref.clone());
         match workspace_ref {
