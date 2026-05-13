@@ -165,7 +165,7 @@ impl ConvoyProjection {
             stored.tasks.iter().map(|t| self.workspace_ref_for(&namespace, &convoy_name, &t.name)).collect();
 
         let view = namespaces.get_mut(&namespace).expect("namespace present; just read above");
-        let Some(stored) = view.convoys.get_mut(&id) else { return };
+        let stored = view.convoys.get_mut(&id).expect("convoy present; write lock held continuously from the cloned read above");
         for (task, ws_ref) in stored.tasks.iter_mut().zip(refreshed_refs.iter()) {
             task.workspace_ref = ws_ref.clone();
         }

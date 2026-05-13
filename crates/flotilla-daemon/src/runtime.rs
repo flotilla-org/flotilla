@@ -105,7 +105,7 @@ impl DaemonRuntime {
                 local_repo_root,
                 profile.host_direct_environment_name(),
             ));
-            tasks.extend(spawn_controller_loops(state, &options.namespace, options.controller_resync_interval));
+            tasks.extend(spawn_controller_loops(state, &options.namespace, options.controller_resync_interval, namespace_projection_state));
         }
 
         Ok(Self { tasks })
@@ -439,6 +439,7 @@ fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
     namespace: &str,
     controller_resync_interval: Duration,
+    namespace_projection_state: NamespaceProjectionState,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let namespace_string = namespace.to_string();
@@ -614,9 +615,7 @@ fn spawn_controller_loops(
         tokio::spawn({
             let namespace_string = namespace_string.clone();
             let event_tx = state.daemon.event_sender();
-            let daemon = Arc::clone(&state.daemon);
             async move {
-                let namespace_projection_state = daemon.namespace_projection_state().await;
                 ConvoyProjection::new(namespace_projection_state, event_tx)
                     .run(backend.clone().using::<Convoy>(&namespace_string), backend.using::<Presentation>(&namespace_string))
                     .await;
@@ -1089,7 +1088,10 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let controller_handles = spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25));
+        let namespace_projection_state = NamespaceProjectionState::new();
+        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let controller_handles =
+            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), namespace_projection_state);
 
         backend
             .clone()
