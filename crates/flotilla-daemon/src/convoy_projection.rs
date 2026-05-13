@@ -4,7 +4,7 @@
 //
 // Spec: docs/superpowers/specs/2026-04-21-tui-convoy-view-design.md §Architecture.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use flotilla_core::namespace_projection::NamespaceProjectionState;
 use flotilla_protocol::{
@@ -28,16 +28,16 @@ pub struct ConvoyProjection {
     /// Authoritative namespace state, shared with `InProcessDaemon::replay_since`.
     state: NamespaceProjectionState,
     presentation_workspaces: HashMap<PresentationKey, String>,
-    /// Per-namespace flag: has the projection emitted its initial `NamespaceSnapshot`?
+    /// Namespaces that have already received their initial `NamespaceSnapshot`.
     /// Private to the projection — replay reads do not need it.
-    emitted_initial_snapshot: HashMap<String, bool>,
+    emitted_initial_snapshot: HashSet<String>,
     /// Emitter for events going to connected clients.
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl ConvoyProjection {
     pub fn new(state: NamespaceProjectionState, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { state, presentation_workspaces: HashMap::new(), emitted_initial_snapshot: HashMap::new(), event_tx }
+        Self { state, presentation_workspaces: HashMap::new(), emitted_initial_snapshot: HashSet::new(), event_tx }
     }
 
     /// Drive the projection event loop. Lists both resources to get initial state, then
@@ -204,7 +204,7 @@ impl ConvoyProjection {
                 let namespace = summary.namespace.clone();
                 let id = summary.id.clone();
 
-                let already_emitted = self.emitted_initial_snapshot.get(&namespace).copied().unwrap_or(false);
+                let already_emitted = self.emitted_initial_snapshot.contains(&namespace);
                 let daemon_event = {
                     let mut namespaces = self.state.write().await;
                     let view = namespaces.entry(namespace.clone()).or_default();
@@ -226,7 +226,7 @@ impl ConvoyProjection {
                         }))
                     }
                 };
-                self.emitted_initial_snapshot.insert(namespace, true);
+                self.emitted_initial_snapshot.insert(namespace);
                 let _ = self.event_tx.send(daemon_event);
             }
             WatchEvent::Deleted(convoy) => {
