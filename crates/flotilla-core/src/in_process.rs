@@ -495,7 +495,16 @@ pub struct InProcessDaemon {
     /// `NamespaceDelta` events arrive on the broadcast channel.  Consulted by
     /// `replay_since` so reconnecting clients can receive missed namespace state.
     namespace_state: Arc<RwLock<HashMap<String, flotilla_protocol::namespace::NamespaceSnapshot>>>,
+    /// Provisioning namespace used by daemon-side resource operations (e.g.
+    /// looking up the Convoy whose task is being marked complete). Set by the
+    /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
+    provisioning_namespace: RwLock<String>,
 }
+
+/// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
+/// is called. Matches `RuntimeOptions::namespace`'s default so tests that construct
+/// the daemon directly hit the same namespace the runtime uses.
+pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
 
 impl InProcessDaemon {
     /// Create a new in-process daemon tracking the given repo paths.
@@ -618,6 +627,7 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
             resource_backend,
             namespace_state: Arc::new(RwLock::new(HashMap::new())),
+            provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -774,6 +784,17 @@ impl InProcessDaemon {
 
     pub async fn daemon_socket_path(&self) -> Option<PathBuf> {
         self.daemon_socket_path.read().await.clone()
+    }
+
+    /// Override the provisioning namespace used for daemon-side resource lookups
+    /// (e.g. `ConvoyTaskComplete`). Called by the daemon runtime at startup with
+    /// `RuntimeOptions::namespace`.
+    pub async fn set_provisioning_namespace(&self, namespace: String) {
+        *self.provisioning_namespace.write().await = namespace;
+    }
+
+    pub async fn provisioning_namespace(&self) -> String {
+        self.provisioning_namespace.read().await.clone()
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -1984,7 +2005,8 @@ impl InProcessDaemon {
                 repo: None,
                 description: command.description().to_string(),
             });
-            let convoys = self.resource_backend.clone().using::<ResourceConvoy>("flotilla");
+            let namespace = self.provisioning_namespace().await;
+            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
             let result = match convoys.get(convoy).await {
                 Ok(current) => match current.status.as_ref() {
                     None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },

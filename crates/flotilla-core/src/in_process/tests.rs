@@ -678,6 +678,90 @@ async fn convoy_completion_command_updates_convoy_task_status() {
 }
 
 #[tokio::test]
+async fn convoy_completion_command_targets_configured_provisioning_namespace() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    daemon.set_provisioning_namespace("custom-ns".to_string()).await;
+
+    let convoys = daemon.resource_backend().using::<Convoy>("custom-ns");
+    let created = convoys
+        .create(&empty_input_meta("convoy-a"), &ConvoySpec {
+            workflow_ref: "review-and-fix".to_string(),
+            inputs: BTreeMap::new(),
+            placement_policy: Some("laptop-docker".to_string()),
+            repository: None,
+            r#ref: None,
+        })
+        .await
+        .expect("convoy create should succeed");
+    convoys
+        .update_status("convoy-a", &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            workflow_snapshot: None,
+            tasks: [("implement".to_string(), TaskState {
+                phase: TaskPhase::Running,
+                ready_at: None,
+                started_at: None,
+                finished_at: None,
+                message: None,
+                placement: None,
+            })]
+            .into_iter()
+            .collect(),
+            message: None,
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: Some("review-and-fix".to_string()),
+            observed_workflows: None,
+        })
+        .await
+        .expect("convoy status update should succeed");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyTaskComplete {
+                convoy: "convoy-a".to_string(),
+                task: "implement".to_string(),
+                message: Some("done".to_string()),
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(err) => panic!("unexpected event error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for command result");
+
+    assert_eq!(result, CommandValue::Ok);
+    let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
+    let status = convoy.status.expect("convoy status should exist");
+    assert_eq!(status.tasks["implement"].phase, TaskPhase::Completed);
+
+    // The default namespace must NOT contain the convoy — completion should target
+    // only the configured provisioning namespace, not the legacy hardcoded one.
+    let default_convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let missing = default_convoys.get("convoy-a").await;
+    assert!(missing.is_err(), "convoy should not exist in the default namespace: got {missing:?}");
+}
+
+#[tokio::test]
 async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_checkouts() {
     struct TestProvisionedEnvironment {
         id: EnvironmentId,

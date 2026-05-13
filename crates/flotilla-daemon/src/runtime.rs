@@ -37,7 +37,6 @@ use tracing::{error, warn};
 
 use crate::ConvoyProjection;
 
-const NAMESPACE: &str = "flotilla";
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
@@ -52,7 +51,7 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            namespace: NAMESPACE.to_string(),
+            namespace: flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE.to_string(),
             heartbeat_interval: Duration::from_secs(30),
             controller_resync_interval: Duration::from_secs(60),
             start_controllers: true,
@@ -82,6 +81,7 @@ impl DaemonRuntime {
         if let Some(path) = daemon_socket_path.as_ref() {
             daemon.set_daemon_socket_path(path.clone()).await;
         }
+        daemon.set_provisioning_namespace(options.namespace.clone()).await;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -872,6 +872,7 @@ mod tests {
     use flotilla_core::{
         config::ConfigStore,
         daemon::DaemonHandle,
+        in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
         providers::discovery::{test_support::git_process_discovery, EnvironmentAssertion, EnvironmentBag},
     };
     use flotilla_protocol::{Command, CommandAction};
