@@ -28,7 +28,7 @@ impl NamespaceView {
 
 /// Shared namespace state owned by the projection and read by the daemon for
 /// `replay_since`.  Cloning is cheap — it shares the same inner `Arc<RwLock>`.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct NamespaceProjectionState {
     inner: Arc<RwLock<HashMap<String, NamespaceView>>>,
 }
