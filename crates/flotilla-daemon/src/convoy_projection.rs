@@ -204,14 +204,14 @@ impl ConvoyProjection {
                 let namespace = summary.namespace.clone();
                 let id = summary.id.clone();
 
-                let already_emitted_snapshot = *self.emitted_initial_snapshot.entry(namespace.clone()).or_default();
+                let already_emitted = self.emitted_initial_snapshot.get(&namespace).copied().unwrap_or(false);
                 let daemon_event = {
                     let mut namespaces = self.state.write().await;
                     let view = namespaces.entry(namespace.clone()).or_default();
                     view.convoys.insert(id, summary.clone());
                     view.seq = view.seq.saturating_add(1);
 
-                    if already_emitted_snapshot {
+                    if already_emitted {
                         DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta {
                             seq: view.seq,
                             namespace: namespace.clone(),

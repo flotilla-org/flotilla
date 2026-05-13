@@ -2434,6 +2434,9 @@ impl DaemonHandle for InProcessDaemon {
         let projection_state = self.namespace_projection_state.read().await.clone();
         for snap in projection_state.all_snapshots().await {
             let stream_key = StreamKey::Namespace { name: snap.namespace.clone() };
+            // `==`, not `>=`: if a client's `last_seen` is ahead of the daemon's current
+            // seq (e.g. after a daemon restart that resets in-memory seq to 0), we still
+            // want to resend a full snapshot rather than treat the client as up-to-date.
             let up_to_date = last_seen.get(&stream_key).is_some_and(|&seq| seq == snap.seq);
             if !up_to_date {
                 events.push(DaemonEvent::NamespaceSnapshot(Box::new(snap)));

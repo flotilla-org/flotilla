@@ -1014,3 +1014,120 @@ async fn replay_since_skips_namespace_when_last_seen_matches_seq() {
     let has_flotilla_snapshot = events.iter().any(|e| matches!(e, DaemonEvent::NamespaceSnapshot(snap) if snap.namespace == "flotilla"));
     assert!(!has_flotilla_snapshot, "client up-to-date at seq=7 should not receive a redundant namespace snapshot");
 }
+
+/// With two namespaces at different seqs and the client up-to-date on only one,
+/// `replay_since` resends only the stale namespace's snapshot.
+#[tokio::test]
+async fn replay_since_emits_only_stale_namespace_when_one_is_current() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary},
+        DaemonEvent, StreamKey,
+    };
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+
+    let summary = |namespace: &str, name: &str| ConvoySummary {
+        id: ConvoyId::new(namespace, name),
+        namespace: namespace.into(),
+        name: name.into(),
+        workflow_ref: "wf".into(),
+        phase: ConvoyPhase::Active,
+        message: None,
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+
+    let projection_state = daemon.namespace_projection_state().await;
+    {
+        let mut namespaces = projection_state.write().await;
+        let ns_a = namespaces.entry("alpha".into()).or_default();
+        let s_a = summary("alpha", "convoy-a");
+        ns_a.convoys.insert(s_a.id.clone(), s_a);
+        ns_a.seq = 3;
+
+        let ns_b = namespaces.entry("beta".into()).or_default();
+        let s_b = summary("beta", "convoy-b");
+        ns_b.convoys.insert(s_b.id.clone(), s_b);
+        ns_b.seq = 5;
+    }
+
+    let mut last_seen = HashMap::new();
+    last_seen.insert(StreamKey::Namespace { name: "alpha".into() }, 3); // up-to-date
+    last_seen.insert(StreamKey::Namespace { name: "beta".into() }, 2); // stale
+
+    let events = daemon.replay_since(&last_seen).await.expect("replay_since should succeed");
+    let namespace_snapshots: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            DaemonEvent::NamespaceSnapshot(snap) => Some(snap.namespace.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(namespace_snapshots, vec!["beta"], "only the stale namespace should be resent");
+}
+
+/// If `last_seen` is ahead of the daemon's current namespace seq — e.g. after
+/// a daemon restart that resets in-memory seq to 0 — the client still receives
+/// a full snapshot (`==`, not `>=`).  Regression guard for the conservative
+/// behaviour documented in `replay_since`.
+#[tokio::test]
+async fn replay_since_resends_snapshot_when_client_seq_is_ahead() {
+    use flotilla_protocol::{
+        namespace::{ConvoyId, ConvoyPhase, ConvoySummary},
+        DaemonEvent, StreamKey,
+    };
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+
+    let projection_state = daemon.namespace_projection_state().await;
+    let summary = ConvoySummary {
+        id: ConvoyId::new("flotilla", "convoy-1"),
+        namespace: "flotilla".into(),
+        name: "convoy-1".into(),
+        workflow_ref: "wf".into(),
+        phase: ConvoyPhase::Active,
+        message: None,
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+    {
+        let mut namespaces = projection_state.write().await;
+        let view = namespaces.entry("flotilla".into()).or_default();
+        view.convoys.insert(summary.id.clone(), summary.clone());
+        view.seq = 2;
+    }
+
+    // Client's last_seen is ahead of the daemon's seq — simulates daemon restart.
+    let mut last_seen = HashMap::new();
+    last_seen.insert(StreamKey::Namespace { name: "flotilla".into() }, 99);
+
+    let events = daemon.replay_since(&last_seen).await.expect("replay_since should succeed");
+    let snap = events
+        .iter()
+        .find_map(|e| match e {
+            DaemonEvent::NamespaceSnapshot(snap) if snap.namespace == "flotilla" => Some(snap.clone()),
+            _ => None,
+        })
+        .expect("client ahead of daemon must still receive a snapshot");
+    assert_eq!(snap.seq, 2, "snapshot reflects the daemon's current seq, not the client's stale claim");
+}
