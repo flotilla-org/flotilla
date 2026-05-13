@@ -62,6 +62,7 @@ impl App {
                 }
             }
             Action::CompleteConvoyTask if self.ui.is_convoys => self.open_complete_convoy_task_palette(),
+            Action::AttachConvoyTask if self.ui.is_convoys => self.attach_selected_convoy_task(),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
@@ -418,6 +419,23 @@ impl App {
         );
         let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill(prefill, None);
         self.screen.modal_stack.push(Box::new(widget));
+    }
+
+    /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
+    pub(super) fn attach_selected_convoy_task(&mut self) {
+        let Some(task) = self.convoys_ui.selected_task.clone() else { return };
+        // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
+        let workspace_ref = self
+            .selected_convoy_summary("flotilla")
+            .and_then(|convoy| convoy.tasks.iter().find(|t| t.name == task))
+            .and_then(|t| t.workspace_ref.clone());
+        match workspace_ref {
+            Some(ws_ref) => {
+                let cmd = self.repo_command(flotilla_protocol::CommandAction::SelectWorkspace { ws_ref });
+                self.proto_commands.push(cmd);
+            }
+            None => self.set_status_message(Some(format!("no workspace yet for task '{task}'"))),
+        }
     }
 
     pub(super) fn open_action_menu(&mut self) {
