@@ -65,6 +65,7 @@ async fn tui_shows_convoys_from_daemon() {
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
         start_controllers: true,
+        ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
@@ -141,6 +142,7 @@ async fn x_then_enter_completes_task_via_palette() {
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
         start_controllers: true,
+        ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 

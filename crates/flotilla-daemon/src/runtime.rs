@@ -34,9 +34,12 @@ use flotilla_resources::{
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::{error, warn};
+use tracing::warn;
 
-use crate::ConvoyProjection;
+use crate::{
+    supervisor::{supervise, ControllerSupervision},
+    ConvoyProjection,
+};
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
@@ -46,6 +49,7 @@ pub struct RuntimeOptions {
     pub namespace: String,
     pub heartbeat_interval: Duration,
     pub controller_resync_interval: Duration,
+    pub controller_supervision: ControllerSupervision,
     pub start_controllers: bool,
 }
 
@@ -55,6 +59,7 @@ impl Default for RuntimeOptions {
             namespace: flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE.to_string(),
             heartbeat_interval: Duration::from_secs(30),
             controller_resync_interval: Duration::from_secs(60),
+            controller_supervision: ControllerSupervision::default(),
             start_controllers: true,
         }
     }
@@ -105,7 +110,13 @@ impl DaemonRuntime {
                 local_repo_root,
                 profile.host_direct_environment_name(),
             ));
-            tasks.extend(spawn_controller_loops(state, &options.namespace, options.controller_resync_interval, namespace_projection_state));
+            tasks.extend(spawn_controller_loops(
+                state,
+                &options.namespace,
+                options.controller_resync_interval,
+                options.controller_supervision.clone(),
+                namespace_projection_state,
+            ));
         }
 
         Ok(Self { tasks })
@@ -439,6 +450,7 @@ fn spawn_controller_loops(
     state: Arc<ControllerRuntimeState>,
     namespace: &str,
     controller_resync_interval: Duration,
+    supervision: ControllerSupervision,
     namespace_projection_state: NamespaceProjectionState,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
@@ -448,168 +460,204 @@ fn spawn_controller_loops(
             let backend = backend.clone();
             let namespace_string = namespace_string.clone();
             let state = Arc::clone(&state);
+            let supervision = supervision.clone();
             async move {
-                if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<Environment>(&namespace_string),
-                    secondaries: vec![],
-                    reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state: Arc::clone(&state) })),
-                    resync_interval: controller_resync_interval,
-                    backend: backend.clone(),
-                })
-                .run()
-                .await
-                {
-                    error!(controller = "environment", %err, "controller loop exited");
-                }
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            let state = Arc::clone(&state);
-            async move {
-                if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<Clone>(&namespace_string),
-                    secondaries: vec![],
-                    reconciler: CloneReconciler::new(Arc::new(CloneControllerRuntime {
-                        runner: state.daemon.local_command_runner().expect("local runner should exist"),
-                    })),
-                    resync_interval: controller_resync_interval,
-                    backend: backend.clone(),
-                })
-                .run()
-                .await
-                {
-                    error!(controller = "clone", %err, "controller loop exited");
-                }
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            let state = Arc::clone(&state);
-            async move {
-                if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
-                    secondaries: vec![],
-                    reconciler: CheckoutReconciler::new(
-                        Arc::new(CheckoutControllerRuntime {
-                            runner: state.daemon.local_command_runner().expect("local runner should exist"),
-                        }),
-                        backend.clone(),
-                        &namespace_string,
-                    ),
-                    resync_interval: controller_resync_interval,
-                    backend: backend.clone(),
-                })
-                .run()
-                .await
-                {
-                    error!(controller = "checkout", %err, "controller loop exited");
-                }
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            let state = Arc::clone(&state);
-            async move {
-                if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<flotilla_resources::TerminalSession>(&namespace_string),
-                    secondaries: vec![],
-                    reconciler: TerminalSessionReconciler::new(
-                        Arc::new(TerminalControllerRuntime { state: Arc::clone(&state) }),
-                        backend.clone(),
-                        &namespace_string,
-                    ),
-                    resync_interval: controller_resync_interval,
-                    backend: backend.clone(),
-                })
-                .run()
-                .await
-                {
-                    error!(controller = "terminal_session", %err, "controller loop exited");
-                }
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            async move {
-                if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<TaskWorkspace>(&namespace_string),
-                    secondaries: TaskWorkspaceReconciler::secondary_watches(),
-                    reconciler: TaskWorkspaceReconciler::new(backend.clone(), &namespace_string),
-                    resync_interval: controller_resync_interval,
-                    backend: backend.clone(),
-                })
-                .run()
-                .await
-                {
-                    error!(controller = "task_workspace", %err, "controller loop exited");
-                }
-            }
-        }),
-        tokio::spawn({
-            let backend = backend.clone();
-            let namespace_string = namespace_string.clone();
-            let state = Arc::clone(&state);
-            async move {
-                let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
-                let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
-                let mut hop_chain = HopChainContext::new(
-                    state.local_host_ref.clone(),
-                    state.daemon.host_name().clone(),
-                    state.config.base_path().clone(),
-                    {
-                        let state = Arc::clone(&state);
-                        move |env_ref| {
-                            if env_ref == state.host_direct_environment_name {
-                                return Ok(Arc::clone(&state.local_registry));
-                            }
-                            state
-                                .daemon
-                                .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
-                                .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
+                supervise("environment", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    let state = Arc::clone(&state);
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<Environment>(&namespace_string),
+                            secondaries: vec![],
+                            reconciler: EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state })),
+                            resync_interval: controller_resync_interval,
+                            backend,
                         }
-                    },
-                );
-                if let Some(repo_root) = state.local_repo_root.clone() {
-                    hop_chain = hop_chain.with_repo_root(repo_root);
-                }
-
-                if let Err(err) = (ControllerLoop {
-                    primary: backend.clone().using::<Presentation>(&namespace_string),
-                    secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
-                    reconciler: PresentationReconciler::new(runtime, backend.clone(), &namespace_string, hop_chain, policies),
-                    resync_interval: controller_resync_interval,
-                    backend: backend.clone(),
+                        .run()
+                        .await
+                    }
                 })
-                .run()
-                .await
-                {
-                    error!(controller = "presentation", %err, "controller loop exited");
-                }
+                .await;
             }
         }),
         tokio::spawn({
+            let backend = backend.clone();
             let namespace_string = namespace_string.clone();
-            let backend_for_reconciler = backend.clone();
+            let state = Arc::clone(&state);
+            let supervision = supervision.clone();
             async move {
-                if let Err(err) = (ControllerLoop {
-                    primary: backend_for_reconciler.clone().using::<Convoy>(&namespace_string),
-                    secondaries: ConvoyReconciler::secondary_watches(),
-                    reconciler: ConvoyReconciler::new(backend_for_reconciler.clone().using::<WorkflowTemplate>(&namespace_string))
-                        .with_task_workspaces(backend_for_reconciler.clone().using::<TaskWorkspace>(&namespace_string))
-                        .with_presentations(backend_for_reconciler.clone().using::<Presentation>(&namespace_string)),
-                    resync_interval: controller_resync_interval,
-                    backend: backend_for_reconciler,
+                supervise("clone", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<Clone>(&namespace_string),
+                            secondaries: vec![],
+                            reconciler: CloneReconciler::new(Arc::new(CloneControllerRuntime { runner })),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
                 })
-                .run()
-                .await
-                {
-                    error!(controller = "convoy", %err, "controller loop exited");
-                }
+                .await;
+            }
+        }),
+        tokio::spawn({
+            let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let state = Arc::clone(&state);
+            let supervision = supervision.clone();
+            async move {
+                supervise("checkout", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
+                            secondaries: vec![],
+                            reconciler: CheckoutReconciler::new(
+                                Arc::new(CheckoutControllerRuntime { runner }),
+                                backend.clone(),
+                                &namespace_string,
+                            ),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
+                })
+                .await;
+            }
+        }),
+        tokio::spawn({
+            let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let state = Arc::clone(&state);
+            let supervision = supervision.clone();
+            async move {
+                supervise("terminal_session", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    let state = Arc::clone(&state);
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<flotilla_resources::TerminalSession>(&namespace_string),
+                            secondaries: vec![],
+                            reconciler: TerminalSessionReconciler::new(
+                                Arc::new(TerminalControllerRuntime { state }),
+                                backend.clone(),
+                                &namespace_string,
+                            ),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
+                })
+                .await;
+            }
+        }),
+        tokio::spawn({
+            let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let supervision = supervision.clone();
+            async move {
+                supervise("task_workspace", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<TaskWorkspace>(&namespace_string),
+                            secondaries: TaskWorkspaceReconciler::secondary_watches(),
+                            reconciler: TaskWorkspaceReconciler::new(backend.clone(), &namespace_string),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
+                })
+                .await;
+            }
+        }),
+        tokio::spawn({
+            let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let state = Arc::clone(&state);
+            let supervision = supervision.clone();
+            async move {
+                supervise("presentation", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    let state = Arc::clone(&state);
+                    async move {
+                        let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
+                        let runtime = Arc::new(ProviderPresentationRuntime::new(Arc::clone(&state.local_registry), Arc::clone(&policies)));
+                        let mut hop_chain = HopChainContext::new(
+                            state.local_host_ref.clone(),
+                            state.daemon.host_name().clone(),
+                            state.config.base_path().clone(),
+                            {
+                                let state = Arc::clone(&state);
+                                move |env_ref| {
+                                    if env_ref == state.host_direct_environment_name {
+                                        return Ok(Arc::clone(&state.local_registry));
+                                    }
+                                    state
+                                        .daemon
+                                        .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
+                                        .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
+                                }
+                            },
+                        );
+                        if let Some(repo_root) = state.local_repo_root.clone() {
+                            hop_chain = hop_chain.with_repo_root(repo_root);
+                        }
+
+                        ControllerLoop {
+                            primary: backend.clone().using::<Presentation>(&namespace_string),
+                            secondaries: PresentationReconciler::<ProviderPresentationRuntime>::secondary_watches(),
+                            reconciler: PresentationReconciler::new(runtime, backend.clone(), &namespace_string, hop_chain, policies),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
+                })
+                .await;
+            }
+        }),
+        tokio::spawn({
+            let backend = backend.clone();
+            let namespace_string = namespace_string.clone();
+            let supervision = supervision.clone();
+            async move {
+                supervise("convoy", supervision, move || {
+                    let backend = backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<Convoy>(&namespace_string),
+                            secondaries: ConvoyReconciler::secondary_watches(),
+                            reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
+                                .with_task_workspaces(backend.clone().using::<TaskWorkspace>(&namespace_string))
+                                .with_presentations(backend.clone().using::<Presentation>(&namespace_string)),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
+                })
+                .await;
             }
         }),
         tokio::spawn({
@@ -1090,8 +1138,13 @@ mod tests {
         ));
         let namespace_projection_state = NamespaceProjectionState::new();
         daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
-        let controller_handles =
-            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), namespace_projection_state);
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            namespace_projection_state,
+        );
 
         backend
             .clone()
