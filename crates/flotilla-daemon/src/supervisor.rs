@@ -1,16 +1,5 @@
-//! Bounded restart supervision for daemon controller tasks.
-//!
-//! Each provisioning controller runs a `ControllerLoop::run()` future that can return
-//! `Err` from reconcile-path work (`fetch_dependencies`, `apply_actuation`, status
-//! patches). The internal watch loop already restarts watch streams on disconnect,
-//! but a reconcile-path error bubbles out and ends the loop. Without supervision
-//! the daemon's `tokio::spawn` task ends silently and provisioning stays disabled
-//! until daemon restart.
-//!
-//! `supervise` re-invokes the controller after backoff, resetting the budget after
-//! a run survives long enough to suggest the controller has stabilised. When the
-//! budget is exhausted the supervisor logs and gives up — better to fail loudly
-//! than to spin forever on a permanent error.
+//! Bounded restart supervision: reconcile-path errors from `ControllerLoop::run()` bubble
+//! out and kill the spawned task; this re-invokes the loop with exponential backoff and a capped budget.
 
 use std::{future::Future, time::Duration};
 
@@ -64,7 +53,7 @@ where
                     backoff = config.initial_backoff;
                 }
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures > config.max_consecutive_failures {
+                if consecutive_failures >= config.max_consecutive_failures {
                     error!(
                         controller = name,
                         %err,
@@ -157,18 +146,16 @@ mod tests {
             }
         })
         .await;
-        // Budget of 2 means: 1st failure (count=1) → retry; 2nd (count=2) → retry;
-        // 3rd (count=3 > 2) → give up. So make_run runs 3 times.
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        // Budget of 2 means: 1st failure (cf=1, 1>=2 false) retries; 2nd (cf=2, 2>=2) gives up.
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
     async fn supervise_resets_budget_after_long_run() {
-        // Budget tolerates 2 consecutive failures (gives up at the 3rd). The scenario:
-        // 2 quick fails (cf=1,2), then a long-running fail that exceeds
-        // `success_reset_after` so cf resets to 0 → next quick fail re-enters at cf=1, and
-        // exhaustion happens on the cumulative 5th call. Without the reset, the supervisor
-        // would have given up after call 3.
+        // Budget of 2 gives up on the 2nd consecutive failure. Scenario: 1 quick fail (cf=1),
+        // 1 long fail that exceeds `success_reset_after` so cf resets to 0 then increments to 1,
+        // then 1 quick fail (cf=2 → give up). Total 3 calls. Without the reset the supervisor
+        // would have given up after call 2.
         let config = ControllerSupervision {
             max_consecutive_failures: 2,
             initial_backoff: Duration::from_millis(1),
@@ -182,7 +169,7 @@ mod tests {
                 let attempts = Arc::clone(&attempts);
                 async move {
                     let n = attempts.fetch_add(1, Ordering::SeqCst);
-                    if n == 2 {
+                    if n == 1 {
                         tokio::time::sleep(Duration::from_millis(30)).await;
                     }
                     Err::<(), _>(ResourceError::other("flap"))
@@ -190,6 +177,6 @@ mod tests {
             }
         })
         .await;
-        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }
