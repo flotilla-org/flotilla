@@ -57,6 +57,7 @@ async fn convoy_projection_emits_namespace_events() {
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
         start_controllers: true,
+        ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
@@ -114,6 +115,7 @@ async fn replay_since_returns_namespace_events_after_seq() {
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
         start_controllers: true,
+        ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
