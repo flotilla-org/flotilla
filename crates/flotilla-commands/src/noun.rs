@@ -5,7 +5,7 @@ use clap::Subcommand;
 use crate::{
     commands::{
         agent::AgentNoun, checkout::CheckoutNoun, convoy::ConvoyNoun, cr::CrNoun, environment::EnvironmentNoun, issue::IssueNoun,
-        repo::RepoNoun, workspace::WorkspaceNoun,
+        repo::RepoNoun, workflow_template::WorkflowTemplateNoun, workspace::WorkspaceNoun,
     },
     Resolved,
 };
@@ -22,6 +22,7 @@ pub enum NounCommand {
     Issue(IssueNoun),
     Agent(AgentNoun),
     Workspace(WorkspaceNoun),
+    WorkflowTemplate(WorkflowTemplateNoun),
     // Host is NOT included — host doesn't nest inside host
 }
 
@@ -36,6 +37,7 @@ impl NounCommand {
             NounCommand::Issue(noun) => noun.resolve(),
             NounCommand::Agent(noun) => noun.resolve(),
             NounCommand::Workspace(noun) => noun.resolve(),
+            NounCommand::WorkflowTemplate(noun) => noun.resolve(),
         }
     }
 }
@@ -51,6 +53,7 @@ impl fmt::Display for NounCommand {
             NounCommand::Issue(noun) => write!(f, "{noun}"),
             NounCommand::Agent(noun) => write!(f, "{noun}"),
             NounCommand::Workspace(noun) => write!(f, "{noun}"),
+            NounCommand::WorkflowTemplate(noun) => write!(f, "{noun}"),
         }
     }
 }

@@ -29,8 +29,9 @@ use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, repo_key, Clone, CloneSpec, Convoy,
     ConvoyReconciler, DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, Host,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
-    PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, TaskWorkspace, WorkflowTemplate,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError,
+    ResourceObject, TaskDefinition, TaskWorkspace, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -250,6 +251,36 @@ async fn register_startup_resources(
     ensure_host_direct_environment_exists(&backend, namespace, profile).await?;
     discover_local_clones(daemon, &backend, namespace, profile).await?;
     ensure_default_policies(&backend, namespace, profile).await?;
+    ensure_default_workflow_templates(&backend, namespace).await?;
+    Ok(())
+}
+
+fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
+    vec![(
+        "scratch",
+        WorkflowTemplateSpec::builder()
+            .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
+            .tasks(vec![TaskDefinition::builder()
+                .name("work".to_string())
+                .processes(vec![ProcessDefinition::builder()
+                    .role("shell".to_string())
+                    .source(ProcessSource::Tool {
+                        command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
+                    })
+                    .build()])
+                .build()])
+            .build(),
+    )]
+}
+
+async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
+    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
+    for (name, spec) in default_workflow_templates() {
+        if templates.get(name).await.is_ok() {
+            continue;
+        }
+        templates.create(&empty_meta(name), &spec).await.map(|_| ()).map_err(|err| format!("seed workflow template {name}: {err}"))?;
+    }
     Ok(())
 }
 

@@ -20,6 +20,29 @@ pub struct ConvoyNoun {
 pub enum ConvoyVerb {
     /// Manage convoy tasks
     Task(ConvoyTaskNoun),
+    /// Create a convoy from a workflow template
+    Create {
+        /// Workflow template to instantiate
+        #[arg(long)]
+        template: String,
+        /// Input value (repeatable): --input key=value
+        #[arg(long = "input", value_parser = parse_input_kv)]
+        inputs: Vec<(String, String)>,
+        /// Repository URL the workflow operates on
+        #[arg(long = "repo")]
+        repository_url: Option<String>,
+        /// Git ref (branch/tag/commit) within the repository
+        #[arg(long = "ref")]
+        r#ref: Option<String>,
+    },
+}
+
+fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = raw.split_once('=').ok_or_else(|| format!("input must be key=value: {raw}"))?;
+    if key.is_empty() {
+        return Err(format!("input key cannot be empty: {raw}"));
+    }
+    Ok((key.to_string(), value.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
@@ -56,6 +79,16 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref } => Ok(Resolved::NeedsContext {
+                command: Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ConvoyCreate { name: self.subject, workflow_ref: template, inputs, repository_url, r#ref },
+                },
+                repo: RepoContext::None,
+                host: HostResolution::Local,
+            }),
         }
     }
 }
@@ -73,6 +106,18 @@ impl std::fmt::Display for ConvoyNoun {
                             write!(f, " --message {message}")?;
                         }
                     }
+                }
+            }
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref } => {
+                write!(f, " create --template {template}")?;
+                for (k, v) in inputs {
+                    write!(f, " --input {k}={v}")?;
+                }
+                if let Some(url) = repository_url {
+                    write!(f, " --repo {url}")?;
+                }
+                if let Some(reference) = r#ref {
+                    write!(f, " --ref {reference}")?;
                 }
             }
         }
@@ -133,5 +178,80 @@ mod tests {
     #[test]
     fn round_trip_complete() {
         assert_round_trip::<ConvoyNoun>(&["convoy", "convoy-a", "task", "implement", "complete"]);
+    }
+
+    #[test]
+    fn convoy_create_resolves() {
+        let resolved = parse(&[
+            "convoy",
+            "my-convoy",
+            "create",
+            "--template",
+            "scratch",
+            "--input",
+            "topic=demo",
+            "--input",
+            "branch=foo",
+            "--repo",
+            "https://github.com/flotilla-org/flotilla.git",
+            "--ref",
+            "main",
+        ])
+        .resolve()
+        .expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "my-convoy".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![("topic".into(), "demo".into()), ("branch".into(), "foo".into())],
+                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
+                    r#ref: Some("main".into()),
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
+    fn convoy_create_minimal_resolves() {
+        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch"]).resolve().expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "scratch-1".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![],
+                    repository_url: None,
+                    r#ref: None,
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
+    fn round_trip_create() {
+        assert_round_trip::<ConvoyNoun>(&[
+            "convoy",
+            "my-convoy",
+            "create",
+            "--template",
+            "scratch",
+            "--input",
+            "topic=demo",
+            "--repo",
+            "https://example.com/repo.git",
+            "--ref",
+            "main",
+        ]);
     }
 }

@@ -22,7 +22,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy,
-    ResourceBackend,
+    ConvoyRepositorySpec, ConvoySpec, InputMeta, InputValue, ResourceBackend, ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -198,6 +198,15 @@ async fn register_static_ssh_direct_environments(
 
 fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.to_string_lossy().into_owned() }
+}
+
+fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
+    let spec: WorkflowTemplateSpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid workflow template YAML: {err}"))?;
+    flotilla_resources::validate(&spec).map_err(|errors| {
+        let joined = errors.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join("; ");
+        format!("workflow template validation failed: {joined}")
+    })?;
+    Ok(spec)
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
@@ -1991,6 +2000,75 @@ impl InProcessDaemon {
                     }
                 },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyCreate { name, workflow_ref, inputs, repository_url, r#ref } = &command.action {
+            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let namespace = self.provisioning_namespace().await;
+            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+            let spec = ConvoySpec {
+                workflow_ref: workflow_ref.clone(),
+                inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
+                placement_policy: None,
+                repository: repository_url.clone().map(|url| ConvoyRepositorySpec { url }),
+                r#ref: r#ref.clone(),
+            };
+            let meta = InputMeta::builder().name(name.clone()).build();
+            let result = match convoys.create(&meta, &spec).await {
+                Ok(_) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },
+                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
+            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let namespace = self.provisioning_namespace().await;
+            let templates = self.resource_backend.clone().using::<WorkflowTemplate>(&namespace);
+            let result = match parse_and_validate_workflow_template_yaml(spec_yaml) {
+                Ok(spec) => {
+                    let meta = InputMeta::builder().name(name.clone()).build();
+                    let outcome = match templates.get(name).await {
+                        Ok(existing) => templates.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
+                        Err(ResourceError::NotFound { .. }) => templates.create(&meta, &spec).await.map(|_| ()),
+                        Err(err) => Err(err),
+                    };
+                    match outcome {
+                        Ok(()) => flotilla_protocol::CommandValue::WorkflowTemplateApplied { name: name.clone() },
+                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                    }
+                }
+                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
