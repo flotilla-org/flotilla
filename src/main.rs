@@ -88,6 +88,8 @@ enum SubCommand {
     Workspace(flotilla_commands::commands::workspace::WorkspaceNoun),
     /// Manage and route to hosts
     Host(flotilla_commands::commands::host::HostNounPartial),
+    /// Manage workflow templates
+    WorkflowTemplate(flotilla_commands::commands::workflow_template::WorkflowTemplateNoun),
 
     /// Generate completions (hidden, called by shell scripts)
     #[command(hide = true)]
@@ -185,6 +187,7 @@ async fn main() -> Result<()> {
             use flotilla_commands::Refinable;
             dispatch(partial.refine().and_then(|n| n.resolve()).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
         }
+        Some(SubCommand::WorkflowTemplate(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
 
         Some(SubCommand::Complete { line, cursor_pos }) => {
             run_complete(&line, cursor_pos);
@@ -886,6 +889,20 @@ mod tests {
     fn cli_parses_workspace_noun() {
         let cli = Cli::try_parse_from(["flotilla", "workspace", "feat-ws", "select"]).expect("workspace cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Workspace(_))));
+    }
+
+    #[test]
+    fn cli_parses_workflow_template_noun() {
+        let cli = Cli::try_parse_from(["flotilla", "workflow-template", "scratch", "apply", "--file", "/tmp/x.yaml"])
+            .expect("workflow-template cli should parse");
+        assert!(matches!(cli.command, Some(SubCommand::WorkflowTemplate(_))));
+    }
+
+    #[test]
+    fn cli_parses_convoy_create() {
+        let cli = Cli::try_parse_from(["flotilla", "convoy", "my-convoy", "create", "--template", "scratch", "--input", "topic=hi"])
+            .expect("convoy create cli should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Convoy(_))));
     }
 
     #[test]
