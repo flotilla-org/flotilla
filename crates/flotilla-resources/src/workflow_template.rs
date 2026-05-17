@@ -84,6 +84,41 @@ pub enum InterpolationField {
     Command,
 }
 
+impl std::fmt::Display for InterpolationField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InterpolationField::Prompt => f.write_str("prompt"),
+            InterpolationField::Command => f.write_str("command"),
+        }
+    }
+}
+
+impl std::fmt::Display for InterpolationLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task `{}` role `{}` {}", self.task, self.role, self.field)
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationError::DuplicateTaskName { name } => write!(f, "duplicate task name `{name}`"),
+            ValidationError::DuplicateRoleInTask { task, role } => write!(f, "duplicate role `{role}` in task `{task}`"),
+            ValidationError::ReservedLabelKey { task, role, key } => {
+                write!(f, "reserved label key `{key}` on task `{task}` role `{role}`")
+            }
+            ValidationError::UnknownDependency { task, missing } => write!(f, "task `{task}` depends on unknown task `{missing}`"),
+            ValidationError::DependencyCycle { cycle } => write!(f, "dependency cycle: {}", cycle.join(" -> ")),
+            ValidationError::DuplicateInputName { name } => write!(f, "duplicate input name `{name}`"),
+            ValidationError::MalformedInterpolation { location, text } => {
+                write!(f, "malformed interpolation `{{{{{text}}}}}` at {location}")
+            }
+            ValidationError::UnknownInputReference { location, name } => write!(f, "unknown input `{name}` at {location}"),
+            ValidationError::UnknownWorkflowField { location, name } => write!(f, "unknown workflow field `{name}` at {location}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     Visiting,

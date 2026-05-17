@@ -309,6 +309,8 @@ pub async fn build_plan(
 
         // Daemon-level commands should not reach build_plan.
         CommandAction::ConvoyTaskComplete { .. }
+        | CommandAction::ConvoyCreate { .. }
+        | CommandAction::WorkflowTemplateApply { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
         | CommandAction::Refresh { .. }

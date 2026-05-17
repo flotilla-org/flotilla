@@ -140,6 +140,14 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             tracing::warn!("unexpected environment lifecycle result reached UI handler");
         }
         CommandValue::IssuePage(_) | CommandValue::IssuesByIds { .. } => {}
+        CommandValue::ConvoyCreated { name } => {
+            info!(%name, "convoy created");
+            app.model.status_message = Some(format!("Convoy created: {name}"));
+        }
+        CommandValue::WorkflowTemplateApplied { name } => {
+            info!(%name, "workflow template applied");
+            app.model.status_message = Some(format!("Workflow template applied: {name}"));
+        }
     }
 }
 

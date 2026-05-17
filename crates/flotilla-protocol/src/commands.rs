@@ -149,6 +149,20 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    ConvoyCreate {
+        name: String,
+        workflow_ref: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inputs: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_url: Option<String>,
+        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+    },
+    WorkflowTemplateApply {
+        name: String,
+        spec_yaml: String,
+    },
     TeleportSession {
         session_id: String,
         branch: Option<String>,
@@ -234,6 +248,8 @@ impl Command {
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyTaskComplete { .. } => "Completing convoy task...",
+            CommandAction::ConvoyCreate { .. } => "Creating convoy...",
+            CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
             CommandAction::UntrackRepo { .. } => "Untracking repository...",
@@ -317,6 +333,12 @@ pub enum CommandValue {
     IssuePage(IssueResultPage),
     IssuesByIds {
         items: Vec<(String, crate::provider_data::Issue)>,
+    },
+    ConvoyCreated {
+        name: String,
+    },
+    WorkflowTemplateApplied {
+        name: String,
     },
 }
 
@@ -485,6 +507,24 @@ mod tests {
                     task: "implement".into(),
                     message: Some("done".into()),
                 },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "my-convoy".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![("topic".into(), "convoy-create-cli".into())],
+                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
+                    r#ref: Some("main".into()),
+                },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "tasks: []\n".into() },
             },
             Command {
                 node_id: Some(NodeId::new("feta")),
@@ -708,6 +748,8 @@ mod tests {
             },
             CommandValue::IssuePage(crate::issue_query::IssueResultPage { items: vec![], total: Some(10), has_more: true }),
             CommandValue::IssuesByIds { items: vec![] },
+            CommandValue::ConvoyCreated { name: "my-convoy".into() },
+            CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
         ];
 
         for result in cases {
