@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
 use crate::{
+    quote::quote_value,
     resolved::{HostResolution, RepoContext},
     Resolved,
 };
@@ -50,9 +51,9 @@ impl WorkflowTemplateNoun {
 
 impl std::fmt::Display for WorkflowTemplateNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "workflow-template {}", self.subject)?;
+        write!(f, "workflow-template {}", quote_value(&self.subject))?;
         match &self.verb {
-            WorkflowTemplateVerb::Apply { file } => write!(f, " apply --file {}", file.display())?,
+            WorkflowTemplateVerb::Apply { file } => write!(f, " apply --file {}", quote_value(&file.display().to_string()))?,
         }
         Ok(())
     }
@@ -66,6 +67,7 @@ mod tests {
     use super::WorkflowTemplateNoun;
     use crate::{
         resolved::{HostResolution, RepoContext},
+        test_utils::assert_round_trip,
         Resolved,
     };
 
@@ -98,5 +100,17 @@ mod tests {
             .resolve()
             .expect_err("should fail");
         assert!(err.contains("read"));
+    }
+
+    #[test]
+    fn round_trip_apply() {
+        assert_round_trip::<WorkflowTemplateNoun>(&["workflow-template", "scratch", "apply", "--file", "/tmp/x.yaml"]);
+    }
+
+    #[test]
+    fn apply_display_quotes_path_with_whitespace() {
+        let parsed = parse(&["workflow-template", "scratch", "apply", "--file", "/tmp/my dir/template.yaml"]);
+        let displayed = parsed.to_string();
+        assert!(displayed.contains("--file \"/tmp/my dir/template.yaml\""), "expected quoted file path in {displayed:?}");
     }
 }

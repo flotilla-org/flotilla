@@ -276,8 +276,10 @@ fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
 async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
     for (name, spec) in default_workflow_templates() {
-        if templates.get(name).await.is_ok() {
-            continue;
+        match templates.get(name).await {
+            Ok(_) => continue,
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(err) => return Err(format!("check workflow template {name}: {err}")),
         }
         templates.create(&empty_meta(name), &spec).await.map(|_| ()).map_err(|err| format!("seed workflow template {name}: {err}"))?;
     }
@@ -286,8 +288,10 @@ async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace:
 
 async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_name: &str) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace);
-    if hosts.get(host_name).await.is_ok() {
-        return Ok(());
+    match hosts.get(host_name).await {
+        Ok(_) => return Ok(()),
+        Err(ResourceError::NotFound { .. }) => {}
+        Err(err) => return Err(format!("check host {host_name}: {err}")),
     }
     hosts.create(&empty_meta(host_name), &HostSpec {}).await.map(|_| ()).map_err(|err| err.to_string())
 }
@@ -299,8 +303,10 @@ async fn ensure_host_direct_environment_exists(
 ) -> Result<(), String> {
     let name = profile.host_direct_environment_name();
     let environments = backend.clone().using::<Environment>(namespace);
-    if environments.get(&name).await.is_ok() {
-        return Ok(());
+    match environments.get(&name).await {
+        Ok(_) => return Ok(()),
+        Err(ResourceError::NotFound { .. }) => {}
+        Err(err) => return Err(format!("check environment {name}: {err}")),
     }
 
     environments

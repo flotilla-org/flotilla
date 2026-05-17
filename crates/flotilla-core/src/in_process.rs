@@ -200,10 +200,14 @@ fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.to_string_lossy().into_owned() }
 }
 
+fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
+    flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
+}
+
 fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
     let spec: WorkflowTemplateSpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid workflow template YAML: {err}"))?;
     flotilla_resources::validate(&spec).map_err(|errors| {
-        let joined = errors.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join("; ");
+        let joined = errors.iter().map(|e| format!("{e}")).collect::<Vec<_>>().join("; ");
         format!("workflow template validation failed: {joined}")
     })?;
     Ok(spec)
@@ -1908,7 +1912,7 @@ impl InProcessDaemon {
         if command.action.is_query() {
             // Query commands should be dispatched through `execute_query`,
             // not through `execute`. Return an error to surface misrouting.
-            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
@@ -1970,7 +1974,7 @@ impl InProcessDaemon {
         }
 
         if let flotilla_protocol::CommandAction::ConvoyTaskComplete { convoy, task, message } = &command.action {
-            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
@@ -2012,7 +2016,7 @@ impl InProcessDaemon {
         }
 
         if let flotilla_protocol::CommandAction::ConvoyCreate { name, workflow_ref, inputs, repository_url, r#ref } = &command.action {
-            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
@@ -2045,7 +2049,7 @@ impl InProcessDaemon {
         }
 
         if let flotilla_protocol::CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
-            let empty_identity = flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() };
+            let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),

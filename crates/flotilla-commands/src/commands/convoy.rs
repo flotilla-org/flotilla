@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
 use crate::{
+    quote::quote_value,
     resolved::{HostResolution, RepoContext},
     Resolved,
 };
@@ -109,15 +110,15 @@ impl std::fmt::Display for ConvoyNoun {
                 }
             }
             ConvoyVerb::Create { template, inputs, repository_url, r#ref } => {
-                write!(f, " create --template {template}")?;
+                write!(f, " create --template {}", quote_value(template))?;
                 for (k, v) in inputs {
-                    write!(f, " --input {k}={v}")?;
+                    write!(f, " --input {}", quote_value(&format!("{k}={v}")))?;
                 }
                 if let Some(url) = repository_url {
-                    write!(f, " --repo {url}")?;
+                    write!(f, " --repo {}", quote_value(url))?;
                 }
                 if let Some(reference) = r#ref {
-                    write!(f, " --ref {reference}")?;
+                    write!(f, " --ref {}", quote_value(reference))?;
                 }
             }
         }
@@ -253,5 +254,23 @@ mod tests {
             "--ref",
             "main",
         ]);
+    }
+
+    #[test]
+    fn create_display_quotes_values_with_whitespace() {
+        let parsed = parse(&[
+            "convoy",
+            "my-convoy",
+            "create",
+            "--template",
+            "scratch",
+            "--input",
+            "topic=my work",
+            "--repo",
+            "https://example.com/path with space.git",
+        ]);
+        let displayed = parsed.to_string();
+        assert!(displayed.contains("--input \"topic=my work\""), "expected quoted input in {displayed:?}");
+        assert!(displayed.contains("--repo \"https://example.com/path with space.git\""), "expected quoted repo in {displayed:?}");
     }
 }
