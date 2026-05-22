@@ -617,6 +617,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             placement_policy: Some("laptop-docker".to_string()),
             repository: None,
             r#ref: None,
+            project_ref: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -696,6 +697,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             placement_policy: Some("laptop-docker".to_string()),
             repository: None,
             r#ref: None,
+            project_ref: None,
         })
         .await
         .expect("convoy create should succeed");

@@ -64,6 +64,7 @@ pub async fn create_convoy_with_single_task(
             placement_policy: None,
             repository: Some(ConvoyRepositorySpec { url: repo_url.to_string() }),
             r#ref: Some(git_ref.to_string()),
+            project_ref: None,
         })
         .await
         .expect("convoy create should succeed");

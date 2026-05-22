@@ -90,6 +90,8 @@ enum SubCommand {
     Host(flotilla_commands::commands::host::HostNounPartial),
     /// Manage workflow templates
     WorkflowTemplate(flotilla_commands::commands::workflow_template::WorkflowTemplateNoun),
+    /// Manage projects
+    Project(flotilla_commands::commands::project::ProjectNoun),
 
     /// Generate completions (hidden, called by shell scripts)
     #[command(hide = true)]
@@ -188,6 +190,7 @@ async fn main() -> Result<()> {
             dispatch(partial.refine().and_then(|n| n.resolve()).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
         }
         Some(SubCommand::WorkflowTemplate(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
+        Some(SubCommand::Project(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
 
         Some(SubCommand::Complete { line, cursor_pos }) => {
             run_complete(&line, cursor_pos);
@@ -896,6 +899,13 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "workflow-template", "scratch", "apply", "--file", "/tmp/x.yaml"])
             .expect("workflow-template cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::WorkflowTemplate(_))));
+    }
+
+    #[test]
+    fn cli_parses_project_noun() {
+        let cli = Cli::try_parse_from(["flotilla", "project", "my-project", "create", "--repo", "https://example.com/repo.git"])
+            .expect("project cli should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Project(_))));
     }
 
     #[test]

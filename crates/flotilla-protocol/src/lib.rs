@@ -176,6 +176,7 @@ pub enum ResponseResult {
 }
 
 /// Top-level message envelope for the JSON protocol.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Message {

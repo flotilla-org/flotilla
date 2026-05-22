@@ -11,6 +11,7 @@ mod in_memory;
 mod labels;
 mod placement_policy;
 mod presentation;
+mod project;
 mod provisioning_identity;
 mod resource;
 mod status_patch;
@@ -45,6 +46,7 @@ pub use placement_policy::{
     PlacementPolicy, PlacementPolicySpec,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
+pub use project::{Project, ProjectRepositorySpec, ProjectSpec};
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use resource::{ApiPaths, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject};
 pub use status_patch::{apply_status_patch, NoStatusPatch, StatusPatch};

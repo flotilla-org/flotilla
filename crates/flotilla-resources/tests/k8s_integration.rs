@@ -37,6 +37,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         placement_policy: Some("laptop-docker".to_string()),
         repository: None,
         r#ref: None,
+        project_ref: None,
     }
 }
 

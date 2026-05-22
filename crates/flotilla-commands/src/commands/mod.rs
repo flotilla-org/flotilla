@@ -5,6 +5,7 @@ pub mod cr;
 pub mod environment;
 pub mod host;
 pub mod issue;
+pub mod project;
 pub mod repo;
 pub mod workflow_template;
 pub mod workspace;

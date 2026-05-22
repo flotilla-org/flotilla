@@ -22,7 +22,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy,
-    ConvoyRepositorySpec, ConvoySpec, InputMeta, InputValue, ResourceBackend, ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
+    ConvoyRepositorySpec, ConvoySpec, InputMeta, InputValue, Project, ProjectRepositorySpec, ProjectSpec, ResourceBackend, ResourceError,
+    WorkflowTemplate, WorkflowTemplateSpec,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -211,6 +212,10 @@ fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTempl
         format!("workflow template validation failed: {joined}")
     })?;
     Ok(spec)
+}
+
+fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
+    serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
@@ -2015,7 +2020,9 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyCreate { name, workflow_ref, inputs, repository_url, r#ref } = &command.action {
+        if let flotilla_protocol::CommandAction::ConvoyCreate { name, workflow_ref, inputs, repository_url, r#ref, project_ref } =
+            &command.action
+        {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -2032,6 +2039,7 @@ impl InProcessDaemon {
                 placement_policy: None,
                 repository: repository_url.clone().map(|url| ConvoyRepositorySpec { url }),
                 r#ref: r#ref.clone(),
+                project_ref: project_ref.clone(),
             };
             let meta = InputMeta::builder().name(name.clone()).build();
             let result = match convoys.create(&meta, &spec).await {
@@ -2069,6 +2077,73 @@ impl InProcessDaemon {
                     };
                     match outcome {
                         Ok(()) => flotilla_protocol::CommandValue::WorkflowTemplateApplied { name: name.clone() },
+                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                    }
+                }
+                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ProjectCreate { name, display_name, repository_url, subpath, r#ref } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let namespace = self.provisioning_namespace().await;
+            let projects = self.resource_backend.clone().using::<Project>(&namespace);
+            let repositories = match repository_url {
+                Some(url) => vec![ProjectRepositorySpec { repo: url.clone(), subpath: subpath.clone(), default_branch: r#ref.clone() }],
+                None => vec![],
+            };
+            let spec = ProjectSpec { display_name: display_name.clone(), repositories };
+            let meta = InputMeta::builder().name(name.clone()).build();
+            let result = match projects.create(&meta, &spec).await {
+                Ok(_) => flotilla_protocol::CommandValue::ProjectCreated { name: name.clone() },
+                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ProjectApply { name, spec_yaml } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let namespace = self.provisioning_namespace().await;
+            let projects = self.resource_backend.clone().using::<Project>(&namespace);
+            let result = match parse_project_yaml(spec_yaml) {
+                Ok(spec) => {
+                    let meta = InputMeta::builder().name(name.clone()).build();
+                    let outcome = match projects.get(name).await {
+                        Ok(existing) => projects.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
+                        Err(ResourceError::NotFound { .. }) => projects.create(&meta, &spec).await.map(|_| ()),
+                        Err(err) => Err(err),
+                    };
+                    match outcome {
+                        Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
                         Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
                     }
                 }
