@@ -209,6 +209,8 @@ mod tests {
 
     #[test]
     fn round_trip_apply() {
+        // `assert_round_trip` only exercises the parse → Display → reparse cycle on the
+        // clap struct, not the file-reading path in `resolve()` — the path doesn't need to exist.
         assert_round_trip::<ProjectNoun>(&["project", "p", "apply", "--file", "/tmp/p.yaml"]);
     }
 
