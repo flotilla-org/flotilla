@@ -203,3 +203,26 @@ async fn project_apply_rejects_invalid_yaml() {
     let result = await_command_result(&mut rx, id).await;
     assert!(matches!(result, CommandValue::Error { .. }), "expected Error, got {result:?}");
 }
+
+#[tokio::test]
+async fn project_apply_rejects_wrong_shape_yaml() {
+    // Valid YAML, but a `repositories` entry is missing the required `repo` field.
+    let (daemon, _backend, _config, _runtime, _tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+
+    let id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ProjectApply {
+                name: "shapeless".into(),
+                spec_yaml: "repositories:\n  - subpath: apps/x\n    default_branch: main\n".into(),
+            },
+        })
+        .await
+        .expect("execute");
+
+    let result = await_command_result(&mut rx, id).await;
+    assert!(matches!(result, CommandValue::Error { .. }), "expected Error, got {result:?}");
+}

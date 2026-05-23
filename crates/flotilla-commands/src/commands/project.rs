@@ -29,11 +29,11 @@ pub enum ProjectVerb {
         /// Repository URL (creates a single-entry `repositories` list)
         #[arg(long = "repo")]
         repository_url: Option<String>,
-        /// Subpath within the repository (monorepo slice)
-        #[arg(long = "subpath")]
+        /// Subpath within the repository (monorepo slice). Requires `--repo`.
+        #[arg(long = "subpath", requires = "repository_url")]
         subpath: Option<String>,
-        /// Default branch for the repository
-        #[arg(long = "ref")]
+        /// Default branch for the repository. Requires `--repo`.
+        #[arg(long = "ref", requires = "repository_url")]
         r#ref: Option<String>,
     },
     /// Apply a project spec from a YAML file (full multi-repo form)
@@ -210,5 +210,17 @@ mod tests {
     #[test]
     fn round_trip_apply() {
         assert_round_trip::<ProjectNoun>(&["project", "p", "apply", "--file", "/tmp/p.yaml"]);
+    }
+
+    #[test]
+    fn subpath_without_repo_is_rejected() {
+        let err = ProjectNoun::try_parse_from(["project", "p", "create", "--subpath", "apps/x"]).expect_err("should fail");
+        assert!(err.to_string().contains("--subpath"), "error should mention --subpath: {err}");
+    }
+
+    #[test]
+    fn ref_without_repo_is_rejected() {
+        let err = ProjectNoun::try_parse_from(["project", "p", "create", "--ref", "main"]).expect_err("should fail");
+        assert!(err.to_string().contains("--ref"), "error should mention --ref: {err}");
     }
 }
