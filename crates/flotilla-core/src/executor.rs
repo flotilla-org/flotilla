@@ -311,6 +311,8 @@ pub async fn build_plan(
         CommandAction::ConvoyTaskComplete { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::WorkflowTemplateApply { .. }
+        | CommandAction::ProjectCreate { .. }
+        | CommandAction::ProjectApply { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
         | CommandAction::Refresh { .. }

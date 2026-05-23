@@ -35,6 +35,9 @@ pub enum ConvoyVerb {
         /// Git ref (branch/tag/commit) within the repository
         #[arg(long = "ref")]
         r#ref: Option<String>,
+        /// Project this convoy belongs to (metadata grouping)
+        #[arg(long = "project")]
+        project_ref: Option<String>,
     },
 }
 
@@ -80,12 +83,19 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref } => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref } => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
                     context_repo: None,
-                    action: CommandAction::ConvoyCreate { name: self.subject, workflow_ref: template, inputs, repository_url, r#ref },
+                    action: CommandAction::ConvoyCreate {
+                        name: self.subject,
+                        workflow_ref: template,
+                        inputs,
+                        repository_url,
+                        r#ref,
+                        project_ref,
+                    },
                 },
                 repo: RepoContext::None,
                 host: HostResolution::Local,
@@ -109,7 +119,7 @@ impl std::fmt::Display for ConvoyNoun {
                     }
                 }
             }
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref } => {
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref } => {
                 write!(f, " create --template {}", quote_value(template))?;
                 for (k, v) in inputs {
                     write!(f, " --input {}", quote_value(&format!("{k}={v}")))?;
@@ -119,6 +129,9 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 if let Some(reference) = r#ref {
                     write!(f, " --ref {}", quote_value(reference))?;
+                }
+                if let Some(project) = project_ref {
+                    write!(f, " --project {}", quote_value(project))?;
                 }
             }
         }
@@ -211,6 +224,7 @@ mod tests {
                     inputs: vec![("topic".into(), "demo".into()), ("branch".into(), "foo".into())],
                     repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
                     r#ref: Some("main".into()),
+                    project_ref: None,
                 },
             },
             repo: RepoContext::None,
@@ -232,6 +246,7 @@ mod tests {
                     inputs: vec![],
                     repository_url: None,
                     r#ref: None,
+                    project_ref: None,
                 },
             },
             repo: RepoContext::None,

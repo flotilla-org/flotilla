@@ -22,6 +22,10 @@ pub struct ConvoySpec {
     pub repository: Option<ConvoyRepositorySpec>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
+    /// Grouping reference to a [`Project`](crate::Project) resource. Metadata only in v1 —
+    /// the reconciler does not consult it. Future: substitute repository/ref from project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

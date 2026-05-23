@@ -202,6 +202,7 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         placement_policy: Some("laptop-docker".to_string()),
         repository: None,
         r#ref: None,
+        project_ref: None,
     }
 }
 

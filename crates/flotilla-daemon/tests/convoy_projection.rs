@@ -30,7 +30,14 @@ fn convoy_meta(name: &str) -> InputMeta {
 }
 
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
-    ConvoySpec { workflow_ref: workflow_ref.to_string(), inputs: BTreeMap::new(), placement_policy: None, repository: None, r#ref: None }
+    ConvoySpec {
+        workflow_ref: workflow_ref.to_string(),
+        inputs: BTreeMap::new(),
+        placement_policy: None,
+        repository: None,
+        r#ref: None,
+        project_ref: None,
+    }
 }
 
 #[tokio::test]

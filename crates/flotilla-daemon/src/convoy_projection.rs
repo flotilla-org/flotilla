@@ -410,6 +410,7 @@ mod tests {
                 placement_policy: None,
                 repository: None,
                 r#ref: None,
+                project_ref: None,
             },
             status: Some(ConvoyStatus { phase, workflow_snapshot, tasks: task_states, ..Default::default() }),
         }
@@ -425,6 +426,7 @@ mod tests {
                 placement_policy: None,
                 repository: None,
                 r#ref: None,
+                project_ref: None,
             },
             status: Some(ConvoyStatus {
                 phase: ResConvoyPhase::Active,
@@ -458,7 +460,14 @@ mod tests {
     fn summarize_convoy_marks_initializing_when_snapshot_absent() {
         let convoy = ResourceObject {
             metadata: meta("flotilla", "new-one"),
-            spec: ConvoySpec { workflow_ref: "wf".into(), inputs: BTreeMap::new(), placement_policy: None, repository: None, r#ref: None },
+            spec: ConvoySpec {
+                workflow_ref: "wf".into(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repository: None,
+                r#ref: None,
+                project_ref: None,
+            },
             status: Some(ConvoyStatus {
                 phase: ResConvoyPhase::Pending,
                 workflow_snapshot: None,

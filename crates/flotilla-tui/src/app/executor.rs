@@ -148,6 +148,14 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "workflow template applied");
             app.model.status_message = Some(format!("Workflow template applied: {name}"));
         }
+        CommandValue::ProjectCreated { name } => {
+            info!(%name, "project created");
+            app.model.status_message = Some(format!("Project created: {name}"));
+        }
+        CommandValue::ProjectApplied { name } => {
+            info!(%name, "project applied");
+            app.model.status_message = Some(format!("Project applied: {name}"));
+        }
     }
 }
 

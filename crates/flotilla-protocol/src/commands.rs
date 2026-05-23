@@ -158,8 +158,25 @@ pub enum CommandAction {
         repository_url: Option<String>,
         #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
         r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_ref: Option<String>,
     },
     WorkflowTemplateApply {
+        name: String,
+        spec_yaml: String,
+    },
+    ProjectCreate {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+    },
+    ProjectApply {
         name: String,
         spec_yaml: String,
     },
@@ -250,6 +267,8 @@ impl Command {
             CommandAction::ConvoyTaskComplete { .. } => "Completing convoy task...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
+            CommandAction::ProjectCreate { .. } => "Creating project...",
+            CommandAction::ProjectApply { .. } => "Applying project...",
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
             CommandAction::UntrackRepo { .. } => "Untracking repository...",
@@ -338,6 +357,12 @@ pub enum CommandValue {
         name: String,
     },
     WorkflowTemplateApplied {
+        name: String,
+    },
+    ProjectCreated {
+        name: String,
+    },
+    ProjectApplied {
         name: String,
     },
 }
@@ -518,6 +543,7 @@ mod tests {
                     inputs: vec![("topic".into(), "convoy-create-cli".into())],
                     repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
                     r#ref: Some("main".into()),
+                    project_ref: Some("my-project".into()),
                 },
             },
             Command {
@@ -525,6 +551,24 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "tasks: []\n".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ProjectCreate {
+                    name: "my-project".into(),
+                    display_name: Some("My Project".into()),
+                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
+                    subpath: Some("apps/frontend".into()),
+                    r#ref: Some("main".into()),
+                },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ProjectApply { name: "my-project".into(), spec_yaml: "repositories: []\n".into() },
             },
             Command {
                 node_id: Some(NodeId::new("feta")),
@@ -750,6 +794,8 @@ mod tests {
             CommandValue::IssuesByIds { items: vec![] },
             CommandValue::ConvoyCreated { name: "my-convoy".into() },
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
+            CommandValue::ProjectCreated { name: "my-project".into() },
+            CommandValue::ProjectApplied { name: "my-project".into() },
         ];
 
         for result in cases {

@@ -305,6 +305,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
         CommandValue::WorkflowTemplateApplied { name } => format!("workflow template applied: {name}"),
+        CommandValue::ProjectCreated { name } => format!("project created: {name}"),
+        CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
     }
 }
 

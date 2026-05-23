@@ -1210,6 +1210,7 @@ mod tests {
                 placement_policy: Some(format!("host-direct-{host_id}")),
                 repository: Some(ConvoyRepositorySpec { url: "https://github.com/flotilla-org/flotilla.git".to_string() }),
                 r#ref: Some(commit),
+                project_ref: None,
             })
             .await
             .expect("convoy create should succeed");

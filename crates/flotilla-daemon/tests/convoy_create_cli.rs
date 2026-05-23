@@ -78,6 +78,7 @@ async fn convoy_create_command_creates_convoy_resource() {
                 inputs: vec![("topic".into(), "first-convoy".into())],
                 repository_url: None,
                 r#ref: None,
+                project_ref: None,
             },
         })
         .await
