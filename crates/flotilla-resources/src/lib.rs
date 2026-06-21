@@ -14,6 +14,7 @@ mod presentation;
 mod project;
 mod provisioning_identity;
 mod resource;
+mod sqlite;
 mod status_patch;
 mod task_workspace;
 mod terminal_session;
@@ -48,7 +49,11 @@ pub use placement_policy::{
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use project::{Project, ProjectRepositorySpec, ProjectSpec};
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
-pub use resource::{ApiPaths, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject};
+pub use resource::{
+    api_version, ApiPaths, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, K8sWatchEvent, ObjectMeta,
+    OwnerReference, Resource, ResourceObject,
+};
+pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, NoStatusPatch, StatusPatch};
 pub use task_workspace::{TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TaskWorkspaceStatusPatch};
 pub use terminal_session::{

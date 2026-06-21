@@ -22,6 +22,7 @@ use flotilla_core::{
     agents::SharedAgentStateStore, config::ConfigStore, in_process::InProcessDaemon, providers::discovery::DiscoveryRuntime,
 };
 use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, HostName, Message, NodeId, PROTOCOL_VERSION};
+use flotilla_resources::{ResourceBackend, SqliteBackend};
 use flotilla_transport::message::{unix_message_session, MessageSession};
 use tokio::{
     net::UnixListener,
@@ -96,6 +97,14 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
     info!(host = %host_name, %peer_count, "initialized PeerManager");
 
     Ok(Arc::new(Mutex::new(peer_manager)))
+}
+
+fn build_embedded_resource_backend(config: &ConfigStore) -> Result<ResourceBackend, String> {
+    let path = config.state_dir().as_path().join("resources.sqlite");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("create embedded resource store directory {}: {err}", parent.display()))?;
+    }
+    SqliteBackend::open(&path).map(ResourceBackend::Sqlite).map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -178,7 +187,10 @@ impl DaemonServer {
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let daemon = InProcessDaemon::new(repo_paths, Arc::clone(&config), discovery, host_name.clone()).await;
+        let resource_backend = build_embedded_resource_backend(&config)?;
+        let daemon =
+            InProcessDaemon::new_with_resource_backend(repo_paths, Arc::clone(&config), discovery, host_name.clone(), resource_backend)
+                .await;
         let peer_manager = build_peer_manager(&daemon, &config)?;
         sync_peer_query_state(&peer_manager, &daemon).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

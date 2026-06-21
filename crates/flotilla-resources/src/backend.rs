@@ -5,6 +5,7 @@ use crate::{
     http::HttpBackend,
     in_memory::InMemoryBackend,
     resource::{InputMeta, Resource, ResourceObject},
+    sqlite::SqliteBackend,
     watch::{ResourceList, WatchStart, WatchStream},
 };
 
@@ -13,6 +14,7 @@ macro_rules! dispatch_backend {
         match &$self.backend {
             ResourceBackend::InMemory(backend) => backend.$method::<T>(&$self.namespace $(, $args)*).await,
             ResourceBackend::Http(backend) => backend.$method::<T>(&$self.namespace $(, $args)*).await,
+            ResourceBackend::Sqlite(backend) => backend.$method::<T>(&$self.namespace $(, $args)*).await,
         }
     };
 }
@@ -21,6 +23,7 @@ macro_rules! dispatch_backend {
 pub enum ResourceBackend {
     InMemory(InMemoryBackend),
     Http(HttpBackend),
+    Sqlite(SqliteBackend),
 }
 
 impl ResourceBackend {

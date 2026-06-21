@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use flotilla_resources::{
-    Convoy, InMemoryBackend, InputMeta, OwnerReference, Resource, ResourceBackend, ResourceError, ResourceObject, WatchEvent, WatchStart,
-    WorkflowTemplate,
+    Convoy, InMemoryBackend, InputMeta, OwnerReference, Resource, ResourceBackend, ResourceError, ResourceObject, TypedResolver,
+    WatchEvent, WatchStart, WorkflowTemplate,
 };
 use futures::StreamExt;
 use tokio::time::timeout;
@@ -88,12 +88,16 @@ impl ResourceContractFixture for WorkflowTemplateFixture {
     }
 }
 
-pub fn resolver<F: ResourceContractFixture>(namespace: &str) -> flotilla_resources::TypedResolver<F::Resource> {
-    ResourceBackend::InMemory(InMemoryBackend::default()).using::<F::Resource>(namespace)
+pub fn in_memory_backend() -> ResourceBackend {
+    ResourceBackend::InMemory(InMemoryBackend::default())
 }
 
-pub async fn assert_create_get_list_roundtrip<F: ResourceContractFixture>() {
-    let resolver = resolver::<F>("flotilla");
+pub fn resolver<F: ResourceContractFixture>(backend: ResourceBackend, namespace: &str) -> TypedResolver<F::Resource> {
+    backend.using::<F::Resource>(namespace)
+}
+
+pub async fn assert_create_get_list_roundtrip_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
     let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
 
     assert_eq!(created.metadata.name, "alpha", "{} create should preserve name", F::label());
@@ -110,8 +114,12 @@ pub async fn assert_create_get_list_roundtrip<F: ResourceContractFixture>() {
     assert_eq!(listed.items[0].metadata.name, "alpha");
 }
 
-pub async fn assert_stale_resource_version_conflicts<F: ResourceContractFixture>() {
-    let resolver = resolver::<F>("flotilla");
+pub async fn assert_create_get_list_roundtrip<F: ResourceContractFixture>() {
+    assert_create_get_list_roundtrip_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_stale_resource_version_conflicts_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
     let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
 
     let conflict = resolver.update(&F::meta("alpha"), "0", &F::updated_spec()).await.err().expect("stale version should conflict");
@@ -123,8 +131,12 @@ pub async fn assert_stale_resource_version_conflicts<F: ResourceContractFixture>
     F::assert_updated(&updated);
 }
 
-pub async fn assert_delete_emits_event<F: ResourceContractFixture>() {
-    let resolver = resolver::<F>("flotilla");
+pub async fn assert_stale_resource_version_conflicts<F: ResourceContractFixture>() {
+    assert_stale_resource_version_conflicts_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_delete_emits_event_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
     let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
     let mut watch = resolver.watch(WatchStart::FromVersion(created.metadata.resource_version.clone())).await.expect("watch should succeed");
 
@@ -144,8 +156,12 @@ pub async fn assert_delete_emits_event<F: ResourceContractFixture>() {
     }
 }
 
-pub async fn assert_watch_from_version_replays<F: ResourceContractFixture>() {
-    let resolver = resolver::<F>("flotilla");
+pub async fn assert_delete_emits_event<F: ResourceContractFixture>() {
+    assert_delete_emits_event_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_watch_from_version_replays_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
     resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
 
     let listed = resolver.list().await.expect("list should succeed");
@@ -178,8 +194,12 @@ pub async fn assert_watch_from_version_replays<F: ResourceContractFixture>() {
     }
 }
 
-pub async fn assert_watch_now_semantics<F: ResourceContractFixture>() {
-    let resolver = resolver::<F>("flotilla");
+pub async fn assert_watch_from_version_replays<F: ResourceContractFixture>() {
+    assert_watch_from_version_replays_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_watch_now_semantics_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
     resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
 
     let mut watch = resolver.watch(WatchStart::Now).await.expect("watch should succeed");
@@ -199,8 +219,11 @@ pub async fn assert_watch_now_semantics<F: ResourceContractFixture>() {
     }
 }
 
-pub async fn assert_namespace_isolation<F: ResourceContractFixture>() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+pub async fn assert_watch_now_semantics<F: ResourceContractFixture>() {
+    assert_watch_now_semantics_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_namespace_isolation_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
     let alpha = backend.using::<F::Resource>("alpha");
     let beta = backend.using::<F::Resource>("beta");
 
@@ -215,8 +238,12 @@ pub async fn assert_namespace_isolation<F: ResourceContractFixture>() {
     assert_ne!(beta_item.metadata.resource_version, "");
 }
 
-pub async fn assert_metadata_roundtrip<F: ResourceContractFixture>() {
-    let resolver = resolver::<F>("flotilla");
+pub async fn assert_namespace_isolation<F: ResourceContractFixture>() {
+    assert_namespace_isolation_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_metadata_roundtrip_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
     let mut meta = F::meta("alpha");
     meta.labels.insert("flotilla.work/convoy".to_string(), "convoy-a".to_string());
     meta.annotations.insert("note".to_string(), "preserve-me".to_string());
@@ -236,4 +263,8 @@ pub async fn assert_metadata_roundtrip<F: ResourceContractFixture>() {
     assert_eq!(fetched.metadata.annotations, meta.annotations);
     assert_eq!(created.metadata.owner_references, meta.owner_references);
     assert_eq!(fetched.metadata.owner_references, meta.owner_references);
+}
+
+pub async fn assert_metadata_roundtrip<F: ResourceContractFixture>() {
+    assert_metadata_roundtrip_with_backend::<F>(in_memory_backend()).await;
 }

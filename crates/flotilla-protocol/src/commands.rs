@@ -160,6 +160,8 @@ pub enum CommandAction {
         r#ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placement_policy: Option<String>,
     },
     WorkflowTemplateApply {
         name: String,
@@ -544,6 +546,7 @@ mod tests {
                     repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
                     r#ref: Some("main".into()),
                     project_ref: Some("my-project".into()),
+                    placement_policy: Some("host-direct-local".into()),
                 },
             },
             Command {

@@ -25,6 +25,7 @@ use flotilla_protocol::{
     Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey,
     VectorClock, PROTOCOL_VERSION,
 };
+use flotilla_resources::{Convoy, ConvoySpec, InputMeta, ResourceBackend};
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
 use tokio::{
@@ -262,6 +263,42 @@ async fn dispatch_add_list_remove_repo_round_trip() {
     })
     .await;
     assert!(matches!(ok_response(remove, 12), Response::RemoveRepo));
+}
+
+#[tokio::test]
+async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let socket_path = tmp.path().join("flotilla.sock");
+
+    let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
+        .await
+        .expect("server should start");
+    let backend = server.daemon().resource_backend();
+    assert!(matches!(backend, ResourceBackend::Sqlite(_)));
+    assert!(config.state_dir().as_path().join("resources.sqlite").exists());
+
+    backend
+        .using::<Convoy>("flotilla")
+        .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
+            workflow_ref: "scratch".to_string(),
+            inputs: Default::default(),
+            placement_policy: None,
+            repository: None,
+            r#ref: None,
+            project_ref: None,
+        })
+        .await
+        .expect("convoy create should succeed");
+    drop(server);
+
+    let restarted = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path, StdDuration::from_secs(30))
+        .await
+        .expect("server should restart");
+    let fetched =
+        restarted.daemon().resource_backend().using::<Convoy>("flotilla").get("persisted").await.expect("convoy should survive restart");
+
+    assert_eq!(fetched.spec.workflow_ref, "scratch");
 }
 
 #[tokio::test]

@@ -38,13 +38,6 @@ impl TestGitRepo {
         self
     }
 
-    pub fn head(&self) -> String {
-        let path_str = self.path.to_string_lossy().to_string();
-        let output = Command::new("git").args(["-C", &path_str, "rev-parse", "HEAD"]).output().expect("git rev-parse should run");
-        assert!(output.status.success(), "git rev-parse failed");
-        String::from_utf8(output.stdout).expect("git rev-parse stdout utf-8").trim().to_string()
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }
