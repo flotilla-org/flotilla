@@ -6,6 +6,14 @@ A system for improving multi-agent developer workflows. Consists of a daemon mes
 
 We are in a **no backwards compatibility** phase. Protocol types, snapshot formats, config file formats, and wire formats can all change freely without migration logic or deprecation paths.
 
+### Plane-A freeze (transition in progress)
+
+Flotilla is mid-transition from a fleet *observer* (providers → correlation → WorkItems → snapshots → TUI) to a *control plane* (k8s-isomorphic resources → reconcilers → convoys). See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
+
+**Plane A is bugfix-only.** Do not add net-new features to: correlation / union-find, `WorkItem`, the `ProviderData → WorkItem → Snapshot` core pipeline, or the peer-merge subsystem (`flotilla-daemon/src/peer`). These are slated for deletion (the observer reshape moves providers to *observed resources* + an on-demand Aggregator; multi-host moves to resource-store federation). Bugfixes and tests are fine; new capability belongs on the control-plane side. If a change feels like it grows Plane A, stop and check the roadmap.
+
+The TUI is *factored, not frozen* — keep it maintained, but extract the surface-agnostic view-model rather than duplicating presentation logic per surface.
+
 ## Quick Reference
 
 ```bash
