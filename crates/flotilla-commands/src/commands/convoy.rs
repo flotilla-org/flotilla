@@ -38,6 +38,9 @@ pub enum ConvoyVerb {
         /// Project this convoy belongs to (metadata grouping)
         #[arg(long = "project")]
         project_ref: Option<String>,
+        /// PlacementPolicy resource to use for task provisioning
+        #[arg(long = "placement-policy")]
+        placement_policy: Option<String>,
     },
 }
 
@@ -83,7 +86,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref } => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy } => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
@@ -95,6 +98,7 @@ impl ConvoyNoun {
                         repository_url,
                         r#ref,
                         project_ref,
+                        placement_policy,
                     },
                 },
                 repo: RepoContext::None,
@@ -119,7 +123,7 @@ impl std::fmt::Display for ConvoyNoun {
                     }
                 }
             }
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref } => {
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy } => {
                 write!(f, " create --template {}", quote_value(template))?;
                 for (k, v) in inputs {
                     write!(f, " --input {}", quote_value(&format!("{k}={v}")))?;
@@ -132,6 +136,9 @@ impl std::fmt::Display for ConvoyNoun {
                 }
                 if let Some(project) = project_ref {
                     write!(f, " --project {}", quote_value(project))?;
+                }
+                if let Some(placement_policy) = placement_policy {
+                    write!(f, " --placement-policy {}", quote_value(placement_policy))?;
                 }
             }
         }
@@ -225,6 +232,7 @@ mod tests {
                     repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
                     r#ref: Some("main".into()),
                     project_ref: None,
+                    placement_policy: None,
                 },
             },
             repo: RepoContext::None,
@@ -247,6 +255,32 @@ mod tests {
                     repository_url: None,
                     r#ref: None,
                     project_ref: None,
+                    placement_policy: None,
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
+    fn convoy_create_with_placement_policy_resolves() {
+        let resolved = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--placement-policy", "host-direct-local"])
+            .resolve()
+            .expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "scratch-1".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![],
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: Some("host-direct-local".into()),
                 },
             },
             repo: RepoContext::None,
@@ -268,6 +302,8 @@ mod tests {
             "https://example.com/repo.git",
             "--ref",
             "main",
+            "--placement-policy",
+            "host-direct-local",
         ]);
     }
 

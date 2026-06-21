@@ -22,8 +22,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy,
-    ConvoyRepositorySpec, ConvoySpec, InputMeta, InputValue, Project, ProjectRepositorySpec, ProjectSpec, ResourceBackend, ResourceError,
-    WorkflowTemplate, WorkflowTemplateSpec,
+    ConvoyRepositorySpec, ConvoySpec, InputMeta, InputValue, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, ResourceBackend,
+    ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -216,6 +216,16 @@ fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTempl
 
 fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
     serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
+}
+
+async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str) -> Option<String> {
+    let mut policies = backend.clone().using::<PlacementPolicy>(namespace).list().await.ok()?.items;
+    policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+    policies
+        .iter()
+        .find(|policy| policy.metadata.name.starts_with("host-direct-"))
+        .or_else(|| policies.first())
+        .map(|policy| policy.metadata.name.clone())
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
@@ -2020,8 +2030,15 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyCreate { name, workflow_ref, inputs, repository_url, r#ref, project_ref } =
-            &command.action
+        if let flotilla_protocol::CommandAction::ConvoyCreate {
+            name,
+            workflow_ref,
+            inputs,
+            repository_url,
+            r#ref,
+            project_ref,
+            placement_policy,
+        } = &command.action
         {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
@@ -2033,10 +2050,14 @@ impl InProcessDaemon {
             });
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+            let placement_policy = match placement_policy {
+                Some(policy) => Some(policy.clone()),
+                None => default_convoy_placement_policy(&self.resource_backend, &namespace).await,
+            };
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
-                placement_policy: None,
+                placement_policy,
                 repository: repository_url.clone().map(|url| ConvoyRepositorySpec { url }),
                 r#ref: r#ref.clone(),
                 project_ref: project_ref.clone(),

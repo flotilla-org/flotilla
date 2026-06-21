@@ -827,21 +827,21 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 
         if local_exists {
             self.runner
-                .run("git", &["-C", clone_path, "worktree", "add", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         } else if remote_exists {
             let _ = self.runner.run("git", &["-C", clone_path, "fetch", "origin", branch], Path::new("/"), &ChannelLabel::Noop).await;
             self.runner
                 .run(
                     "git",
-                    &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &format!("origin/{branch}")],
+                    &["-C", clone_path, "worktree", "add", "--detach", target_path, &format!("origin/{branch}")],
                     Path::new("/"),
                     &ChannelLabel::Noop,
                 )
                 .await?;
         } else {
             self.runner
-                .run("git", &["-C", clone_path, "worktree", "add", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         }
 
@@ -966,8 +966,8 @@ mod tests {
     };
     use flotilla_protocol::{Command, CommandAction};
     use flotilla_resources::{
-        ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, PlacementPolicy, ProcessDefinition, ProcessSource, TaskDefinition, TaskPhase,
-        TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
+        ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, PlacementPolicy, ProcessDefinition, ProcessSource, SqliteBackend, TaskDefinition,
+        TaskPhase, TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -1000,13 +1000,13 @@ mod tests {
         }
     }
 
-    async fn in_memory_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
+    async fn daemon_with_backend(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>, backend: ResourceBackend) -> Arc<InProcessDaemon> {
         let daemon = InProcessDaemon::new_with_resource_backend(
             tracked_repos,
             config,
             git_process_discovery(false),
             flotilla_protocol::HostName::new("test-host"),
-            ResourceBackend::InMemory(Default::default()),
+            backend,
         )
         .await;
         daemon
@@ -1017,6 +1017,137 @@ mod tests {
             )
             .expect("local environment bag should be replaceable in tests");
         daemon
+    }
+
+    async fn in_memory_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
+        daemon_with_backend(tracked_repos, config, ResourceBackend::InMemory(Default::default())).await
+    }
+
+    async fn sqlite_daemon(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>) -> Arc<InProcessDaemon> {
+        std::fs::create_dir_all(config.state_dir()).expect("state dir");
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
+        daemon_with_backend(tracked_repos, config, backend).await
+    }
+
+    async fn run_stage4a_flow_reaches_running_and_completes_convoy(
+        daemon: Arc<InProcessDaemon>,
+        config: Arc<ConfigStore>,
+        repo_default_dir: PathBuf,
+        repo: PathBuf,
+    ) {
+        std::fs::create_dir_all(&repo_default_dir).expect("repo default dir");
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let profile =
+            LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
+        let backend = daemon.resource_backend();
+
+        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat should succeed");
+
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&config),
+            passthrough_registry(),
+            None,
+            profile.host_id.clone(),
+            Some(ExecutionEnvironmentPath::new(&repo)),
+            profile.host_direct_environment_name(),
+        ));
+        let namespace_projection_state = NamespaceProjectionState::new();
+        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            namespace_projection_state,
+        );
+
+        backend
+            .clone()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(
+                &empty_meta("wf-a"),
+                &WorkflowTemplateSpec::builder()
+                    .inputs(Vec::new())
+                    .tasks(vec![TaskDefinition::builder()
+                        .name("implement".to_string())
+                        .processes(vec![ProcessDefinition::builder()
+                            .role("coder".to_string())
+                            .source(ProcessSource::Tool { command: "bash -lc 'echo stage4a'".to_string() })
+                            .build()])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("workflow template create should succeed");
+        backend
+            .clone()
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("convoy-a"), &ConvoySpec {
+                workflow_ref: "wf-a".to_string(),
+                inputs: BTreeMap::new(),
+                placement_policy: Some(format!("host-direct-{host_id}")),
+                repository: Some(ConvoyRepositorySpec { url: "https://github.com/flotilla-org/flotilla.git".to_string() }),
+                r#ref: Some("main".to_string()),
+                project_ref: None,
+            })
+            .await
+            .expect("convoy create should succeed");
+
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        let run_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                Some(status)
+                    if status.phase == ConvoyPhase::Active
+                        && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
+            ) {
+                break;
+            }
+            if tokio::time::Instant::now() >= run_deadline {
+                let convoy = convoys.get("convoy-a").await.expect("convoy should exist");
+                let workspace = backend.clone().using::<TaskWorkspace>(NAMESPACE).list().await.expect("workspace list should succeed");
+                panic!("convoy did not reach running state: convoy={convoy:?} task_workspaces={workspace:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let host = backend.clone().using::<Host>(NAMESPACE).get(&host_id).await.expect("host should exist after startup");
+        assert!(host.status.is_some(), "startup heartbeat should publish host status");
+
+        daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyTaskComplete {
+                    convoy: "convoy-a".to_string(),
+                    task: "implement".to_string(),
+                    message: Some("done".to_string()),
+                },
+            })
+            .await
+            .expect("convoy completion command should succeed");
+
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                matches!(
+                    convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    Some(status)
+                        if status.phase == ConvoyPhase::Completed
+                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Completed)
+                )
+            }
+        })
+        .await;
+
+        for handle in controller_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     async fn wait_for_host_status(hosts: &TypedResolver<Host>, name: &str) -> HostStatus {
@@ -1147,126 +1278,25 @@ mod tests {
     async fn in_memory_stage4a_flow_reaches_running_and_completes_convoy() {
         let temp = TempDir::new().expect("tempdir");
         let repo_default_dir = temp.path().join("flotilla-repos");
-        std::fs::create_dir_all(&repo_default_dir).expect("repo default dir");
         let git_repo =
             TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
         let repo = git_repo.path().to_path_buf();
-        let commit = git_repo.head();
-
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
-        let host_id = daemon.local_host_id().expect("local host id").to_string();
-        let profile =
-            LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
-        let backend = daemon.resource_backend();
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo).await;
+    }
 
-        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
-        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat should succeed");
-
-        let state = Arc::new(ControllerRuntimeState::new(
-            Arc::clone(&daemon),
-            Arc::clone(&config),
-            passthrough_registry(),
-            None,
-            profile.host_id.clone(),
-            Some(ExecutionEnvironmentPath::new(&repo)),
-            profile.host_direct_environment_name(),
-        ));
-        let namespace_projection_state = NamespaceProjectionState::new();
-        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
-        let controller_handles = spawn_controller_loops(
-            Arc::clone(&state),
-            NAMESPACE,
-            Duration::from_millis(25),
-            ControllerSupervision::default(),
-            namespace_projection_state,
-        );
-
-        backend
-            .clone()
-            .using::<WorkflowTemplate>(NAMESPACE)
-            .create(
-                &empty_meta("wf-a"),
-                &WorkflowTemplateSpec::builder()
-                    .inputs(Vec::new())
-                    .tasks(vec![TaskDefinition::builder()
-                        .name("implement".to_string())
-                        .processes(vec![ProcessDefinition::builder()
-                            .role("coder".to_string())
-                            .source(ProcessSource::Tool { command: "bash -lc 'echo stage4a'".to_string() })
-                            .build()])
-                        .build()])
-                    .build(),
-            )
-            .await
-            .expect("workflow template create should succeed");
-        backend
-            .clone()
-            .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("convoy-a"), &ConvoySpec {
-                workflow_ref: "wf-a".to_string(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(format!("host-direct-{host_id}")),
-                repository: Some(ConvoyRepositorySpec { url: "https://github.com/flotilla-org/flotilla.git".to_string() }),
-                r#ref: Some(commit),
-                project_ref: None,
-            })
-            .await
-            .expect("convoy create should succeed");
-
-        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
-        let run_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if matches!(
-                convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
-                Some(status)
-                    if status.phase == ConvoyPhase::Active
-                        && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
-            ) {
-                break;
-            }
-            if tokio::time::Instant::now() >= run_deadline {
-                let convoy = convoys.get("convoy-a").await.expect("convoy should exist");
-                let workspace = backend.clone().using::<TaskWorkspace>(NAMESPACE).list().await.expect("workspace list should succeed");
-                panic!("convoy did not reach running state: convoy={convoy:?} task_workspaces={workspace:?}");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-
-        let host = backend.clone().using::<Host>(NAMESPACE).get(&host_id).await.expect("host should exist after startup");
-        assert!(host.status.is_some(), "startup heartbeat should publish host status");
-
-        daemon
-            .execute(Command {
-                node_id: None,
-                provisioning_target: None,
-                context_repo: None,
-                action: CommandAction::ConvoyTaskComplete {
-                    convoy: "convoy-a".to_string(),
-                    task: "implement".to_string(),
-                    message: Some("done".to_string()),
-                },
-            })
-            .await
-            .expect("convoy completion command should succeed");
-
-        wait_until(|| {
-            let convoys = convoys.clone();
-            async move {
-                matches!(
-                    convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
-                    Some(status)
-                        if status.phase == ConvoyPhase::Completed
-                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Completed)
-                )
-            }
-        })
-        .await;
-
-        for handle in controller_handles {
-            handle.abort();
-            let _ = handle.await;
-        }
+    #[tokio::test]
+    async fn sqlite_stage4a_flow_reaches_running_and_completes_convoy() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_default_dir = temp.path().join("flotilla-repos");
+        let git_repo =
+            TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+        let repo = git_repo.path().to_path_buf();
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo).await;
     }
 }

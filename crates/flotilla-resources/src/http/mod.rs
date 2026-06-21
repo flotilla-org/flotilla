@@ -5,14 +5,16 @@ use std::{borrow::Cow, collections::BTreeMap, pin::Pin};
 
 pub use bootstrap::{ensure_crd, ensure_namespace};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures::{stream, Stream, StreamExt};
 use reqwest::{Client, StatusCode};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::{
     error::ResourceError,
-    resource::{ApiPaths, InputMeta, ObjectMeta, Resource, ResourceObject},
+    resource::{
+        ApiPaths, InputMeta, K8sInputResourceObject, K8sResourceList, K8sResourceObject, K8sStatusResourceObject, K8sWatchEvent, Resource,
+        ResourceObject,
+    },
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -71,15 +73,15 @@ impl HttpBackend {
     pub(crate) async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("GET resource: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response, Some(name)).await?;
-        wire.into_public()
+        let object: K8sResourceObject<T> = Self::decode_response(response, Some(name)).await?;
+        ResourceObject::from_k8s_object(object)
     }
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;
-        let wire: WireList<T> = Self::decode_response(response, None).await?;
-        wire.into_public()
+        let list: K8sResourceList<T> = Self::decode_response(response, None).await?;
+        list.into_resource_list()
     }
 
     pub(crate) async fn list_typed_matching_labels<T: Resource>(
@@ -100,8 +102,8 @@ impl HttpBackend {
             .send()
             .await
             .map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;
-        let wire: WireList<T> = Self::decode_response(response, None).await?;
-        wire.into_public()
+        let list: K8sResourceList<T> = Self::decode_response(response, None).await?;
+        list.into_resource_list()
     }
 
     pub(crate) async fn create_typed<T: Resource>(
@@ -111,11 +113,11 @@ impl HttpBackend {
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
-        let body = OutgoingResource::<T>::for_spec(meta, None, spec)?;
+        let body = K8sInputResourceObject::<T>::for_spec(meta, None, spec);
         let response =
             self.http.post(url).json(&body).send().await.map_err(|err| ResourceError::other(format!("CREATE resource: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response, Some(&meta.name)).await?;
-        wire.into_public()
+        let object: K8sResourceObject<T> = Self::decode_response(response, Some(&meta.name)).await?;
+        ResourceObject::from_k8s_object(object)
     }
 
     pub(crate) async fn update_typed<T: Resource>(
@@ -126,11 +128,11 @@ impl HttpBackend {
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, Some(&meta.name), false);
-        let body = OutgoingResource::<T>::for_spec(meta, Some(resource_version), spec)?;
+        let body = K8sInputResourceObject::<T>::for_spec(meta, Some(resource_version), spec);
         let response =
             self.http.put(url).json(&body).send().await.map_err(|err| ResourceError::other(format!("UPDATE resource: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response, Some(&meta.name)).await?;
-        wire.into_public()
+        let object: K8sResourceObject<T> = Self::decode_response(response, Some(&meta.name)).await?;
+        ResourceObject::from_k8s_object(object)
     }
 
     pub(crate) async fn update_status_typed<T: Resource>(
@@ -141,10 +143,10 @@ impl HttpBackend {
         status: &T::Status,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, Some(name), true);
-        let body = OutgoingStatusResource::<T>::new(name, resource_version, status)?;
+        let body = K8sStatusResourceObject::<T>::new(name, resource_version, status);
         let response = self.http.put(url).json(&body).send().await.map_err(|err| ResourceError::other(format!("UPDATE status: {err}")))?;
-        let wire: WireResource<T> = Self::decode_response(response, Some(name)).await?;
-        wire.into_public()
+        let object: K8sResourceObject<T> = Self::decode_response(response, Some(name)).await?;
+        ResourceObject::from_k8s_object(object)
     }
 
     pub(crate) async fn delete_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<(), ResourceError> {
@@ -258,195 +260,7 @@ fn map_status_error(status: StatusCode, bytes: &[u8], resource_name: Option<&str
 }
 
 fn parse_watch_line<T: Resource>(line: &[u8]) -> Result<WatchEvent<T>, ResourceError> {
-    let wire =
-        serde_json::from_slice::<WireWatchEvent<T>>(line).map_err(|err| ResourceError::decode(format!("decode watch event: {err}")))?;
-    wire.into_public()
-}
-
-fn api_version(paths: ApiPaths) -> String {
-    if paths.group.is_empty() {
-        paths.version.to_string()
-    } else {
-        format!("{}/{}", paths.group, paths.version)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(bound(deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"))]
-struct WireResource<T: Resource> {
-    #[serde(rename = "apiVersion")]
-    api_version: String,
-    kind: String,
-    metadata: WireObjectMeta,
-    spec: T::Spec,
-    #[serde(default)]
-    status: Option<T::Status>,
-}
-
-impl<T: Resource> WireResource<T> {
-    fn into_public(self) -> Result<ResourceObject<T>, ResourceError> {
-        let expected_api_version = api_version(T::API_PATHS);
-        if self.api_version != expected_api_version {
-            return Err(ResourceError::decode(format!(
-                "unexpected apiVersion '{}', expected '{}'",
-                self.api_version, expected_api_version
-            )));
-        }
-        if self.kind != T::API_PATHS.kind {
-            return Err(ResourceError::decode(format!("unexpected kind '{}', expected '{}'", self.kind, T::API_PATHS.kind)));
-        }
-        Ok(ResourceObject { metadata: self.metadata.into_public()?, spec: self.spec, status: self.status })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(bound(deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"))]
-struct WireList<T: Resource> {
-    metadata: WireListMeta,
-    items: Vec<WireResource<T>>,
-}
-
-impl<T: Resource> WireList<T> {
-    fn into_public(self) -> Result<ResourceList<T>, ResourceError> {
-        Ok(ResourceList {
-            items: self.items.into_iter().map(WireResource::into_public).collect::<Result<_, _>>()?,
-            resource_version: self.metadata.resource_version,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct WireListMeta {
-    #[serde(rename = "resourceVersion")]
-    resource_version: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireObjectMeta {
-    name: String,
-    namespace: String,
-    #[serde(rename = "resourceVersion")]
-    resource_version: Option<String>,
-    #[serde(default)]
-    labels: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    annotations: std::collections::BTreeMap<String, String>,
-    #[serde(default, rename = "ownerReferences")]
-    owner_references: Vec<crate::resource::OwnerReference>,
-    #[serde(default)]
-    finalizers: Vec<String>,
-    #[serde(rename = "deletionTimestamp")]
-    deletion_timestamp: Option<DateTime<Utc>>,
-    #[serde(rename = "creationTimestamp")]
-    creation_timestamp: Option<DateTime<Utc>>,
-}
-
-impl WireObjectMeta {
-    fn into_public(self) -> Result<ObjectMeta, ResourceError> {
-        Ok(ObjectMeta {
-            name: self.name,
-            namespace: self.namespace,
-            resource_version: self.resource_version.ok_or_else(|| ResourceError::decode("missing metadata.resourceVersion"))?,
-            labels: self.labels,
-            annotations: self.annotations,
-            owner_references: self.owner_references,
-            finalizers: self.finalizers,
-            deletion_timestamp: self.deletion_timestamp,
-            creation_timestamp: self.creation_timestamp.ok_or_else(|| ResourceError::decode("missing metadata.creationTimestamp"))?,
-        })
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct OutgoingMetadata<'a> {
-    name: &'a str,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    labels: &'a std::collections::BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    annotations: &'a std::collections::BTreeMap<String, String>,
-    #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
-    owner_references: &'a Vec<crate::resource::OwnerReference>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    finalizers: &'a Vec<String>,
-    #[serde(rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
-    deletion_timestamp: &'a Option<DateTime<Utc>>,
-    #[serde(rename = "resourceVersion", skip_serializing_if = "Option::is_none")]
-    resource_version: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(bound(serialize = "T::Spec: Serialize"))]
-struct OutgoingResource<'a, T: Resource> {
-    #[serde(rename = "apiVersion")]
-    api_version: String,
-    kind: &'static str,
-    metadata: OutgoingMetadata<'a>,
-    spec: &'a T::Spec,
-}
-
-impl<'a, T: Resource> OutgoingResource<'a, T> {
-    fn for_spec(meta: &'a InputMeta, resource_version: Option<&'a str>, spec: &'a T::Spec) -> Result<Self, ResourceError> {
-        Ok(Self {
-            api_version: api_version(T::API_PATHS),
-            kind: T::API_PATHS.kind,
-            metadata: OutgoingMetadata {
-                name: &meta.name,
-                labels: &meta.labels,
-                annotations: &meta.annotations,
-                owner_references: &meta.owner_references,
-                finalizers: &meta.finalizers,
-                deletion_timestamp: &meta.deletion_timestamp,
-                resource_version,
-            },
-            spec,
-        })
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(bound(serialize = "T::Status: Serialize"))]
-struct OutgoingStatusResource<'a, T: Resource> {
-    #[serde(rename = "apiVersion")]
-    api_version: String,
-    kind: &'static str,
-    metadata: OutgoingStatusMetadata<'a>,
-    status: &'a T::Status,
-}
-
-#[derive(Debug, Serialize)]
-struct OutgoingStatusMetadata<'a> {
-    name: &'a str,
-    #[serde(rename = "resourceVersion")]
-    resource_version: &'a str,
-}
-
-impl<'a, T: Resource> OutgoingStatusResource<'a, T> {
-    fn new(name: &'a str, resource_version: &'a str, status: &'a T::Status) -> Result<Self, ResourceError> {
-        Ok(Self {
-            api_version: api_version(T::API_PATHS),
-            kind: T::API_PATHS.kind,
-            metadata: OutgoingStatusMetadata { name, resource_version },
-            status,
-        })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(bound(deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"))]
-struct WireWatchEvent<T: Resource> {
-    #[serde(rename = "type")]
-    event_type: String,
-    object: WireResource<T>,
-}
-
-impl<T: Resource> WireWatchEvent<T> {
-    fn into_public(self) -> Result<WatchEvent<T>, ResourceError> {
-        let object = self.object.into_public()?;
-        match self.event_type.as_str() {
-            "ADDED" => Ok(WatchEvent::Added(object)),
-            "MODIFIED" => Ok(WatchEvent::Modified(object)),
-            "DELETED" => Ok(WatchEvent::Deleted(object)),
-            other => Err(ResourceError::decode(format!("unknown watch event type '{other}'"))),
-        }
-    }
+    let event =
+        serde_json::from_slice::<K8sWatchEvent<T>>(line).map_err(|err| ResourceError::decode(format!("decode watch event: {err}")))?;
+    event.into_watch_event()
 }

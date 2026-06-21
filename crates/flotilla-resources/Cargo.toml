@@ -21,6 +21,7 @@ base64 = "0.22"
 bytes = "1"
 tracing = "0.1"
 sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 flotilla-controllers = { path = "../flotilla-controllers" }

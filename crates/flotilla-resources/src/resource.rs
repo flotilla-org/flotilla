@@ -3,7 +3,11 @@ use std::{collections::BTreeMap, fmt::Debug};
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::status_patch::StatusPatch;
+use crate::{
+    error::ResourceError,
+    status_patch::StatusPatch,
+    watch::{ResourceList, WatchEvent},
+};
 
 macro_rules! define_resource {
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty) => {
@@ -108,6 +112,226 @@ pub struct ResourceObject<T: Resource> {
     pub spec: T::Spec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<T::Status>,
+}
+
+impl<T: Resource> ResourceObject<T> {
+    pub fn to_k8s_object(&self) -> K8sResourceObject<T> {
+        K8sResourceObject {
+            api_version: api_version(T::API_PATHS),
+            kind: T::API_PATHS.kind.to_string(),
+            metadata: K8sObjectMeta::from(&self.metadata),
+            spec: self.spec.clone(),
+            status: self.status.clone(),
+        }
+    }
+
+    pub fn from_k8s_object(value: K8sResourceObject<T>) -> Result<Self, ResourceError> {
+        let expected_api_version = api_version(T::API_PATHS);
+        if value.api_version != expected_api_version {
+            return Err(ResourceError::decode(format!(
+                "unexpected apiVersion '{}', expected '{}'",
+                value.api_version, expected_api_version
+            )));
+        }
+        if value.kind != T::API_PATHS.kind {
+            return Err(ResourceError::decode(format!("unexpected kind '{}', expected '{}'", value.kind, T::API_PATHS.kind)));
+        }
+        Ok(Self { metadata: value.metadata.into(), spec: value.spec, status: value.status })
+    }
+}
+
+pub fn api_version(paths: ApiPaths) -> String {
+    if paths.group.is_empty() {
+        paths.version.to_string()
+    } else {
+        format!("{}/{}", paths.group, paths.version)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct K8sObjectMeta {
+    pub name: String,
+    pub namespace: String,
+    #[serde(rename = "resourceVersion")]
+    pub resource_version: String,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub annotations: BTreeMap<String, String>,
+    #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finalizers: Vec<String>,
+    #[serde(default, rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
+    pub deletion_timestamp: Option<DateTime<Utc>>,
+    #[serde(rename = "creationTimestamp")]
+    pub creation_timestamp: DateTime<Utc>,
+}
+
+impl From<&ObjectMeta> for K8sObjectMeta {
+    fn from(value: &ObjectMeta) -> Self {
+        Self {
+            name: value.name.clone(),
+            namespace: value.namespace.clone(),
+            resource_version: value.resource_version.clone(),
+            labels: value.labels.clone(),
+            annotations: value.annotations.clone(),
+            owner_references: value.owner_references.clone(),
+            finalizers: value.finalizers.clone(),
+            deletion_timestamp: value.deletion_timestamp,
+            creation_timestamp: value.creation_timestamp,
+        }
+    }
+}
+
+impl From<K8sObjectMeta> for ObjectMeta {
+    fn from(value: K8sObjectMeta) -> Self {
+        Self {
+            name: value.name,
+            namespace: value.namespace,
+            resource_version: value.resource_version,
+            labels: value.labels,
+            annotations: value.annotations,
+            owner_references: value.owner_references,
+            finalizers: value.finalizers,
+            deletion_timestamp: value.deletion_timestamp,
+            creation_timestamp: value.creation_timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "T::Spec: Serialize, T::Status: Serialize",
+    deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"
+))]
+pub struct K8sResourceObject<T: Resource> {
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    pub kind: String,
+    pub metadata: K8sObjectMeta,
+    pub spec: T::Spec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<T::Status>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct K8sListMeta {
+    #[serde(rename = "resourceVersion")]
+    pub resource_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "T::Spec: Serialize, T::Status: Serialize",
+    deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"
+))]
+pub struct K8sResourceList<T: Resource> {
+    pub metadata: K8sListMeta,
+    pub items: Vec<K8sResourceObject<T>>,
+}
+
+impl<T: Resource> K8sResourceList<T> {
+    pub fn into_resource_list(self) -> Result<ResourceList<T>, ResourceError> {
+        Ok(ResourceList {
+            items: self.items.into_iter().map(ResourceObject::from_k8s_object).collect::<Result<_, _>>()?,
+            resource_version: self.metadata.resource_version,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct K8sInputMetadata<'a> {
+    pub(crate) name: &'a str,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) labels: &'a BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) annotations: &'a BTreeMap<String, String>,
+    #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
+    pub(crate) owner_references: &'a Vec<OwnerReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) finalizers: &'a Vec<String>,
+    #[serde(rename = "deletionTimestamp", skip_serializing_if = "Option::is_none")]
+    pub(crate) deletion_timestamp: &'a Option<DateTime<Utc>>,
+    #[serde(rename = "resourceVersion", skip_serializing_if = "Option::is_none")]
+    pub(crate) resource_version: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(bound(serialize = "T::Spec: Serialize"))]
+pub(crate) struct K8sInputResourceObject<'a, T: Resource> {
+    #[serde(rename = "apiVersion")]
+    pub(crate) api_version: String,
+    pub(crate) kind: &'static str,
+    pub(crate) metadata: K8sInputMetadata<'a>,
+    pub(crate) spec: &'a T::Spec,
+}
+
+impl<'a, T: Resource> K8sInputResourceObject<'a, T> {
+    pub(crate) fn for_spec(meta: &'a InputMeta, resource_version: Option<&'a str>, spec: &'a T::Spec) -> Self {
+        Self {
+            api_version: api_version(T::API_PATHS),
+            kind: T::API_PATHS.kind,
+            metadata: K8sInputMetadata {
+                name: &meta.name,
+                labels: &meta.labels,
+                annotations: &meta.annotations,
+                owner_references: &meta.owner_references,
+                finalizers: &meta.finalizers,
+                deletion_timestamp: &meta.deletion_timestamp,
+                resource_version,
+            },
+            spec,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct K8sStatusMetadata<'a> {
+    pub(crate) name: &'a str,
+    #[serde(rename = "resourceVersion")]
+    pub(crate) resource_version: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(bound(serialize = "T::Status: Serialize"))]
+pub(crate) struct K8sStatusResourceObject<'a, T: Resource> {
+    #[serde(rename = "apiVersion")]
+    pub(crate) api_version: String,
+    pub(crate) kind: &'static str,
+    pub(crate) metadata: K8sStatusMetadata<'a>,
+    pub(crate) status: &'a T::Status,
+}
+
+impl<'a, T: Resource> K8sStatusResourceObject<'a, T> {
+    pub(crate) fn new(name: &'a str, resource_version: &'a str, status: &'a T::Status) -> Self {
+        Self {
+            api_version: api_version(T::API_PATHS),
+            kind: T::API_PATHS.kind,
+            metadata: K8sStatusMetadata { name, resource_version },
+            status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(bound(deserialize = "T::Spec: DeserializeOwned, T::Status: DeserializeOwned"))]
+pub struct K8sWatchEvent<T: Resource> {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub object: K8sResourceObject<T>,
+}
+
+impl<T: Resource> K8sWatchEvent<T> {
+    pub fn into_watch_event(self) -> Result<WatchEvent<T>, ResourceError> {
+        let object = ResourceObject::from_k8s_object(self.object)?;
+        match self.event_type.as_str() {
+            "ADDED" => Ok(WatchEvent::Added(object)),
+            "MODIFIED" => Ok(WatchEvent::Modified(object)),
+            "DELETED" => Ok(WatchEvent::Deleted(object)),
+            other => Err(ResourceError::decode(format!("unknown watch event type '{other}'"))),
+        }
+    }
 }
 
 impl From<&ObjectMeta> for InputMeta {

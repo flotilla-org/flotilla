@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     error::ResourceError,
-    resource::{InputMeta, ObjectMeta, Resource, ResourceObject},
+    resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -102,11 +102,13 @@ impl InMemoryBackend {
     }
 
     fn decode_object<T: Resource>(value: Value) -> Result<ResourceObject<T>, ResourceError> {
-        serde_json::from_value(value).map_err(|err| ResourceError::decode(format!("decode stored object: {err}")))
+        let object: K8sResourceObject<T> =
+            serde_json::from_value(value).map_err(|err| ResourceError::decode(format!("decode stored object: {err}")))?;
+        ResourceObject::from_k8s_object(object)
     }
 
     fn encode_object<T: Resource>(object: &ResourceObject<T>) -> Result<Value, ResourceError> {
-        serde_json::to_value(object).map_err(|err| ResourceError::decode(format!("encode object: {err}")))
+        serde_json::to_value(object.to_k8s_object()).map_err(|err| ResourceError::decode(format!("encode object: {err}")))
     }
 
     fn decode_event<T: Resource>(event: StoredEvent) -> Result<WatchEvent<T>, ResourceError> {
