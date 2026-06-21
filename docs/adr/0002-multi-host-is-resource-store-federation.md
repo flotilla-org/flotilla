@@ -1,18 +1,21 @@
 # Multi-host is resource-store federation, not peer-merge
 
+**Status:** Accepted
+**Date:** 2026-06-21
+
 Multi-host coordination is delivered by **federating the resource store**, not by
 a bespoke peer snapshot/query-state merge protocol.
 
-- A slim, standalone, **per-host federation bridge** owns host inventory, identity,
-  pluggable transport (ssh control-masters now; wireguard/https later), and
-  **arbitrary UDS-listener forwarding**, exposed via its own HTTP-over-UDS control
-  API. It carries no flotilla domain semantics. The whole product family (cleat,
-  porthole, uishell, flotilla) uses it, so remoting is ambient: a service dials a
-  local socket and the bridge forwards it.
+- A slim, standalone, **per-host Tender** (the federation daemon) owns host
+  inventory, identity, pluggable transport (ssh control-masters now; wireguard/https
+  later), and **arbitrary UDS-listener forwarding**, exposed via its own
+  HTTP-over-UDS control API. It carries no flotilla domain semantics. The whole
+  product family (cleat, porthole, uishell, flotilla) uses it, so remoting is
+  ambient: a service dials a local socket and the Tender forwards it.
 - "See host B's work" becomes **"watch host B's resource store over a forwarded
   UDS"** — there is no peer-merge protocol.
-- The control plane sits *above* the bridge: it models `Host` and forward-rules as
-  resources and **actuates** the bridge through its control API (a federation
+- The control plane sits *above* the Tender: it models `Host` and forward-rules as
+  resources and **actuates** the Tender through its control API (a federation
   actuator, same pattern as the docker/checkout actuators). Federation depends on
   nothing flotilla-specific; the control plane depends on federation.
 - Any **merging/aggregation** across hosts is a **view/aggregator** concern,
@@ -22,12 +25,13 @@ a bespoke peer snapshot/query-state merge protocol.
 
 ## Why
 
-The current peering (~4,300 LOC in `flotilla-daemon`: `peer/manager.rs`,
-`peer/merge.rs`, the peer wire protocol, ssh/channel transports) entangles a
-generic transport with flotilla's own snapshot-merge semantics. Splitting out a
-generic bridge and treating multi-host as store-federation lets most of the
-peer-merge layer be deleted, leaves a much smaller flotilla on top of a shared
-substrate, and gives the rest of the product family the same remoting model.
+The current peering (~5,400 LOC in `flotilla-daemon/src/peer`: `manager.rs`,
+`merge.rs`, the peer wire protocol, ssh/channel transports, and their tests)
+entangles a generic transport with flotilla's own snapshot-merge semantics.
+Splitting out a generic Tender and treating multi-host as store-federation lets
+most of the peer-merge layer be deleted, leaves a much smaller flotilla on top of
+a shared substrate, and gives the rest of the product family the same remoting
+model.
 
 ## The event log is the replication primitive
 
@@ -53,6 +57,6 @@ The **Tender** carries the log between hosts; it does not interpret or merge it.
 - The bespoke peer snapshot/query-state merge subsystem is slated for removal once
   resource-store federation is in place. This is the deletion the decision pays
   for.
-- The bridge becomes a new always-on per-host process (small, single-purpose).
+- The Tender becomes a new always-on per-host process (small, single-purpose).
 - A federation actuator/controller is added to the control plane to drive the
-  bridge from `Host`/forward-rule resources.
+  Tender from `Host`/forward-rule resources.

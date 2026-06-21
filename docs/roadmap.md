@@ -16,7 +16,7 @@ Two complete data planes live inside one daemon and barely touch:
   + `flotilla-commands`, ~8.6k LOC, newest work): k8s-isomorphic resources →
   reconcilers → projection → convoy view. *Prescriptive.*
 
-The destination (Q1): **Plane B subsumes Plane A's prescriptive role**, with a
+The destination: **Plane B subsumes Plane A's prescriptive role**, with a
 long transition. Observed reality and desired state share one resource store
 (ADR 0003); correlation demotes to an on-demand Aggregator; convoys become the
 unit of launched work.
@@ -40,7 +40,7 @@ unit of launched work.
    151-vs-22 commit imbalance *is* the straddle; stopping it is the highest-value
    move.
 2. **The TUI is *factored*, not frozen.** Both the TUI and uishell stay relevant
-   (Q6). ~70% of `flotilla-tui` is legitimate ratatui rendering; ~30% is a
+   ~70% of `flotilla-tui` is legitimate ratatui rendering; ~30% is a
    surface-agnostic domain/view-model layer (intent/action engine, declarative
    tables, the data→view-model pipeline) that should be extracted and shared.
    Stop *duplicating* that layer per surface; do keep the TUI itself maintained.
@@ -64,7 +64,7 @@ until boundary-proven, *then* promote to separate repos (as cleat/porthole are).
 
 ## Cross-cutting
 
-- **Tests ride along with the refactors** (Q7). Verbose, ad-hoc tests for old
+- **Tests ride along with the refactors.** Verbose, ad-hoc tests for old
   shapes get deleted wholesale as those shapes move; new shapes get **contract
   tests** per the CLAUDE.md testing philosophy. The only standalone test work
   worth pulling forward is fixing a *harness gap* that is forcing verbosity.

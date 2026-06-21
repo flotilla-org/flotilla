@@ -1,5 +1,8 @@
 # Observed, adopted, and managed resources share one store; lifecycle authority is per-resource
 
+**Status:** Accepted
+**Date:** 2026-06-21
+
 Observed reality and desired state live in **one resource store and the same
 kinds** (ADR 0001's model), distinguished not by a binary observed/desired flag
 but by a **lifecycle-authority** property on each resource:

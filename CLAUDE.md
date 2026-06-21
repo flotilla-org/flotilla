@@ -8,7 +8,7 @@ We are in a **no backwards compatibility** phase. Protocol types, snapshot forma
 
 ### Plane-A freeze (transition in progress)
 
-Flotilla is mid-transition from a fleet *observer* (providers → correlation → WorkItems → snapshots → TUI) to a *control plane* (k8s-isomorphic resources → reconcilers → convoys). See `docs/roadmap.md`, `CONTEXT.md`, and `docs/adr/0001-0003`; the umbrella is flotilla-org/flotilla#604.
+Flotilla is mid-transition from a fleet *observer* (providers → correlation → WorkItems → snapshots → TUI) to a *control plane* (k8s-isomorphic resources → reconcilers → convoys). See `docs/roadmap.md`, `CONTEXT.md`, and the ADRs in `docs/adr/`; the umbrella is flotilla-org/flotilla#604.
 
 **Plane A is bugfix-only.** Do not add net-new features to: correlation / union-find, `WorkItem`, the `ProviderData → WorkItem → Snapshot` core pipeline, or the peer-merge subsystem (`flotilla-daemon/src/peer`). These are slated for deletion (the observer reshape moves providers to *observed resources* + an on-demand Aggregator; multi-host moves to resource-store federation). Bugfixes and tests are fine; new capability belongs on the control-plane side. If a change feels like it grows Plane A, stop and check the roadmap.
 

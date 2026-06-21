@@ -147,8 +147,8 @@ _Avoid_: Bot, assistant.
 These are sibling products in separate repositories, reached over
 HTTP-over-UDS (and, for cleat, a C ABI for native embedding):
 
-- **cleat** — terminal/PTY/VT engine. (`~/dev/cleat`)
+- **cleat** — terminal/PTY/VT engine.
 - **porthole** — window-system helper for composing external side-by-side
-  surfaces. (`~/dev/porthole`)
+  surfaces.
 - **uishell** — native UI shell (RAD-derived) that composes Panels/Views and
-  embeds cleat; the intended premier interface to Flotilla. (`~/dev/ui-scratch`)
+  embeds cleat; the intended premier interface to Flotilla.

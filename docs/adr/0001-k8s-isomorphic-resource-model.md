@@ -1,5 +1,8 @@
 # k8s-isomorphic resource model; k8s is a backend, not the API contract
 
+**Status:** Accepted
+**Date:** 2026-06-21
+
 The control plane's typed resources are deliberately **isomorphic to Kubernetes
 objects** — every resource has a lossless k8s-object representation (`apiVersion`,
 `kind`, k8s-style `metadata` including `resourceVersion`, `ownerReferences`,
