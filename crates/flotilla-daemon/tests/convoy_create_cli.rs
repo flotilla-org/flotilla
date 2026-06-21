@@ -237,15 +237,17 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let event = tokio::time::timeout(remaining, rx.recv()).await.expect("timed out waiting for namespace event").expect("recv");
         match event {
-            DaemonEvent::NamespaceSnapshot(snapshot) if snapshot.namespace == "flotilla" => {
-                if snapshot.convoys.iter().any(|convoy| convoy.name == "sqlite-scratch" && !convoy.initializing) {
-                    break;
-                }
+            DaemonEvent::NamespaceSnapshot(snapshot)
+                if snapshot.namespace == "flotilla"
+                    && snapshot.convoys.iter().any(|convoy| convoy.name == "sqlite-scratch" && !convoy.initializing) =>
+            {
+                break;
             }
-            DaemonEvent::NamespaceDelta(delta) if delta.namespace == "flotilla" => {
-                if delta.changed.iter().any(|convoy| convoy.name == "sqlite-scratch" && !convoy.initializing) {
-                    break;
-                }
+            DaemonEvent::NamespaceDelta(delta)
+                if delta.namespace == "flotilla"
+                    && delta.changed.iter().any(|convoy| convoy.name == "sqlite-scratch" && !convoy.initializing) =>
+            {
+                break;
             }
             _ => {}
         }
