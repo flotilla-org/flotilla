@@ -219,13 +219,23 @@ fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
 }
 
 async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str) -> Option<String> {
-    let mut policies = backend.clone().using::<PlacementPolicy>(namespace).list().await.ok()?.items;
+    let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
+        Ok(list) => list.items,
+        Err(err) => {
+            warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
+            return None;
+        }
+    };
     policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-    policies
+    let policy = policies
         .iter()
         .find(|policy| policy.metadata.name.starts_with("host-direct-"))
         .or_else(|| policies.first())
-        .map(|policy| policy.metadata.name.clone())
+        .map(|policy| policy.metadata.name.clone());
+    if policy.is_none() {
+        warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
+    }
+    policy
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {

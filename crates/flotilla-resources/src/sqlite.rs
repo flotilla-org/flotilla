@@ -22,6 +22,9 @@ type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
 
 #[derive(Debug, Clone)]
 pub struct SqliteBackend {
+    // rusqlite is synchronous. The embedded daemon currently serializes SQLite
+    // access behind one mutex; move this behind spawn_blocking or tokio-rusqlite
+    // if controller contention shows up in practice.
     connection: Arc<Mutex<Connection>>,
     watchers: Arc<Mutex<WatchersByStore>>,
 }
@@ -73,8 +76,6 @@ impl SqliteBackend {
         connection
             .execute_batch(
                 r#"
-                PRAGMA foreign_keys = ON;
-
                 CREATE TABLE IF NOT EXISTS resource_sequences (
                     group_name TEXT NOT NULL,
                     version TEXT NOT NULL,
@@ -95,6 +96,8 @@ impl SqliteBackend {
                     PRIMARY KEY (group_name, version, kind, namespace, name)
                 );
 
+                -- TODO: add event-log pruning once watch retention requirements
+                -- are clearer for long-running embedded daemons.
                 CREATE TABLE IF NOT EXISTS resource_events (
                     group_name TEXT NOT NULL,
                     version TEXT NOT NULL,
