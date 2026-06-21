@@ -41,6 +41,26 @@ A running program within a **Task**, resolved to a placement by selectors
 (e.g. `capability: code`) rather than by template variable substitution.
 _Avoid_: Pane, terminal (those are presentation concerns).
 
+**CloudAgent**:
+A coding agent whose harness loop runs remotely / under management (Claude Code,
+Codex, Cursor as a managed session), as opposed to an agent running locally in a
+terminal. A **resource** with a lifecycle, typically **service-provided**
+(claude.ai, cursor) and reached via the service's API rather than the **Tender**.
+_Avoid_: Agent (ambiguous — reserve for the abstract notion), bot, session.
+
+**Reference Data**:
+Service-scoped external records that Flotilla links to but does not own the
+lifecycle of — **ChangeRequest** (PR), **Issue**. Not resources: they live in a
+cache layer, fetched per external-service+repo (not per host), and the
+**Aggregator** links them to resources for views.
+_Avoid_: Resource (they are not), entity.
+
+**External Result**:
+An artifact a **Convoy** produces in an external service — a PR, a CMS article, a
+YouTube video. Producing one is an action with an external result that Flotilla
+*references*, not a resource it models.
+_Avoid_: Output resource, artifact resource.
+
 **Control Plane**:
 The desired-state engine: typed resources, reconcilers/controllers, and a
 backing store. Causes work to exist by reconciling observed state toward
@@ -96,8 +116,17 @@ _Avoid_: Bridge, peer, gateway, proxy, router, tug.
 **Aggregator**:
 A view-time component that pieces observed resources together (across hosts or
 providers) on demand, for a particular reason — an event, a view. Where any
-**Correlation** lives now that it is no longer a core always-on service.
+**Correlation** lives now that it is no longer a core always-on service. Treats
+observed views as rebuildable, not as a continuous log.
 _Avoid_: Merger, the correlation engine (that is the retired baked-in form).
+
+**Generation**:
+A lifespan of the ephemeral observed-resource store. A daemon restart discards
+observed state and starts a new generation (repopulated by a full provider
+refresh). Watch-from-version is valid only within a generation; a consumer or
+federated replica that sees the generation change must re-list. The durable
+**Managed** log has no generations — its version is continuous across restarts.
+_Avoid_: Epoch, session, restart-id.
 
 **Provisioning**:
 Bringing an execution context into being — a checkout, an **Environment**
@@ -106,8 +135,11 @@ Interacts closely with **Federation**.
 _Avoid_: Setup, bootstrap.
 
 **Environment**:
-A provisioned execution context (e.g. a Docker container or a host-direct
-context) in which a **Task**'s **Processes** run.
+A provisioned execution context in which a **Task**'s **Processes** run —
+host-direct, a nested container/sandbox (docker, sandbox-exec, firecracker), or
+service-provided (runpod, modal, aws). Most resources live *in* an Environment.
+A **Host** is/has a direct environment and may contain nested ones; the precise
+host/environment relationship is still being pinned down.
 _Avoid_: Sandbox (reserve for the future restricted-execution feature), VM.
 
 **Presentation**:
