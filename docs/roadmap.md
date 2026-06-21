@@ -39,7 +39,7 @@ unit of launched work.
    old `ProviderData → WorkItem → Snapshot` pipeline, or peer-merge. The
    151-vs-22 commit imbalance *is* the straddle; stopping it is the highest-value
    move.
-2. **The TUI is *factored*, not frozen.** Both the TUI and uishell stay relevant
+2. **The TUI is *factored*, not frozen.** Both the TUI and uishell stay relevant:
    ~70% of `flotilla-tui` is legitimate ratatui rendering; ~30% is a
    surface-agnostic domain/view-model layer (intent/action engine, declarative
    tables, the data→view-model pipeline) that should be extracted and shared.

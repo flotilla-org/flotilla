@@ -9,7 +9,9 @@ objects** — every resource has a lossless k8s-object representation (`apiVersi
 `finalizers`, `deletionTimestamp`, `spec`, `status`) and k8s-style semantics
 (optimistic concurrency, list + watch-from-version, status subresource).
 
-We split this into two capabilities that were being conflated:
+We split this into two capabilities that were being conflated (these **A**/**B**
+labels are local to this ADR and unrelated to *Plane A* / *Plane B* in
+`docs/roadmap.md`):
 
 - **B — always maintain a k8s representation of every resource: yes, now.** The
   canonical k8s-object projection is a property of the resource *model*, not of
