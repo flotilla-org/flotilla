@@ -46,6 +46,8 @@ A coding agent whose harness loop runs remotely / under management (Claude Code,
 Codex, Cursor as a managed session), as opposed to an agent running locally in a
 terminal. A **resource** with a lifecycle, typically **service-provided**
 (claude.ai, cursor) and reached via the service's API rather than the **Tender**.
+Used interchangeably with **ManagedAgent**; CloudAgent is the canonical name and
+the precise distinction (if any) is not yet pinned.
 _Avoid_: Agent (ambiguous — reserve for the abstract notion), bot, session.
 
 **Reference Data**:

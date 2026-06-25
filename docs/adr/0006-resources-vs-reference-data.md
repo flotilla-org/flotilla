@@ -1,5 +1,8 @@
 # Observed things split: resources vs reference data
 
+**Status:** Accepted
+**Date:** 2026-06-25
+
 Not everything Flotilla observes is a resource. The distinguishing cut is
 **lifecycle ownership**, *not* where the thing physically lives:
 

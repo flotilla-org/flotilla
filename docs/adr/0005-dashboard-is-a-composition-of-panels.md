@@ -1,5 +1,8 @@
 # The main view is a surface-agnostic composition of panels
 
+**Status:** Accepted
+**Date:** 2026-06-25
+
 The main view is modelled as a **View Model**, not a fixed repo-centric table:
 
 - **A tab is a composition of panels.**

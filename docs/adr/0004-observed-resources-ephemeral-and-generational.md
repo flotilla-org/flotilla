@@ -1,5 +1,8 @@
 # Observed resources are ephemeral and generational; lifecycle authority selects the backing store
 
+**Status:** Accepted
+**Date:** 2026-06-25
+
 Observed facts (open PRs, assigned issues, local checkouts, running agents) are
 contributed into the **same resource store and watch/aggregator interface** as
 managed resources — but **lifecycle authority (ADR 0003) selects the backing
@@ -7,7 +10,8 @@ store**:
 
 - **Observed / Adopted → ephemeral, in-memory backing.** Not persisted. The
   source of truth is the external system; the resource is a published projection
-  of it.
+  of it. (Adopted is treated as Observed for now — the durable adoption *intent*
+  is deferred; see _Consequences_.)
 - **Managed → durable backing** (sqlite, per PR #618). It carries desired state,
   so it must survive restarts with a continuous `resourceVersion` log.
 
