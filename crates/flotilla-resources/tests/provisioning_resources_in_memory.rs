@@ -105,19 +105,21 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
             env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
         }),
     };
-    let checkout_spec = CheckoutSpec {
+    let checkout_spec = CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
         env_ref: "env-a".to_string(),
         r#ref: "feat/convoy-resource".to_string(),
         target_path: "/workspace".to_string(),
-        worktree: None,
-        fresh_clone: Some(FreshCloneCheckoutSpec { url: "git@github.com:flotilla-org/flotilla.git".to_string() }),
-    };
+        url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+    });
 
     let env = environments.create(&docker_environment_meta("env-a"), &env_spec).await.expect("env create should succeed");
     let checkout = checkouts.create(&docker_environment_meta("checkout-a"), &checkout_spec).await.expect("checkout create should succeed");
 
     assert_eq!(env.spec.docker.expect("docker spec").mounts[0].target_path, "/workspace");
-    assert_eq!(checkout.spec.fresh_clone.expect("fresh clone").url, "git@github.com:flotilla-org/flotilla.git");
+    match checkout.spec {
+        CheckoutSpec::FreshClone(spec) => assert_eq!(spec.url, "git@github.com:flotilla-org/flotilla.git"),
+        other => panic!("expected fresh clone checkout, got {other:?}"),
+    }
 }
 
 #[test]

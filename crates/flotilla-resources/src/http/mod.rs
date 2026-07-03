@@ -158,8 +158,12 @@ impl HttpBackend {
     pub(crate) async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let mut query = vec![("watch", Cow::Borrowed("true"))];
-        if let WatchStart::FromVersion(version) = &start {
-            query.push(("resourceVersion", Cow::Owned(version.clone())));
+        match &start {
+            WatchStart::Now => {}
+            WatchStart::FromVersion(version) => query.push(("resourceVersion", Cow::Owned(version.clone()))),
+            WatchStart::FromVersionInGeneration { .. } => {
+                return Err(ResourceError::invalid("http resource watches do not use generations"));
+            }
         }
         let response =
             self.http.get(url).query(&query).send().await.map_err(|err| ResourceError::other(format!("WATCH resources: {err}")))?;
@@ -175,48 +179,51 @@ impl HttpBackend {
             done: false,
             _marker: std::marker::PhantomData,
         };
-        Ok(Box::pin(stream::unfold(state, |mut state| async move {
-            if state.done {
-                return None;
-            }
-            loop {
-                if let Some(position) = state.buffer.iter().position(|byte| *byte == b'\n') {
-                    let line = state.buffer.drain(..=position).collect::<Vec<_>>();
-                    let mut line = &line[..line.len().saturating_sub(1)];
-                    if line.last() == Some(&b'\r') {
-                        line = &line[..line.len().saturating_sub(1)];
-                    }
-                    if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                        continue;
-                    }
-                    let item = parse_watch_line::<T>(line);
-                    if item.is_err() {
-                        state.done = true;
-                    }
-                    return Some((item, state));
+        Ok(WatchStream::new(
+            None,
+            Box::pin(stream::unfold(state, |mut state| async move {
+                if state.done {
+                    return None;
                 }
-
-                match state.stream.next().await {
-                    Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
-                    Some(Err(err)) => {
-                        state.done = true;
-                        return Some((Err(ResourceError::other(format!("watch stream error: {err}"))), state));
-                    }
-                    None if state.buffer.is_empty() => return None,
-                    None => {
-                        let line = std::mem::take(&mut state.buffer);
-                        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                            return None;
+                loop {
+                    if let Some(position) = state.buffer.iter().position(|byte| *byte == b'\n') {
+                        let line = state.buffer.drain(..=position).collect::<Vec<_>>();
+                        let mut line = &line[..line.len().saturating_sub(1)];
+                        if line.last() == Some(&b'\r') {
+                            line = &line[..line.len().saturating_sub(1)];
                         }
-                        let item = parse_watch_line::<T>(&line);
+                        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                            continue;
+                        }
+                        let item = parse_watch_line::<T>(line);
                         if item.is_err() {
                             state.done = true;
                         }
                         return Some((item, state));
                     }
+
+                    match state.stream.next().await {
+                        Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
+                        Some(Err(err)) => {
+                            state.done = true;
+                            return Some((Err(ResourceError::other(format!("watch stream error: {err}"))), state));
+                        }
+                        None if state.buffer.is_empty() => return None,
+                        None => {
+                            let line = std::mem::take(&mut state.buffer);
+                            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                                return None;
+                            }
+                            let item = parse_watch_line::<T>(&line);
+                            if item.is_err() {
+                                state.done = true;
+                            }
+                            return Some((item, state));
+                        }
+                    }
                 }
-            }
-        })))
+            })),
+        ))
     }
 }
 

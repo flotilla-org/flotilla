@@ -303,13 +303,15 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
     .await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     checkouts
-        .create(&controller_meta().name("checkout-a").call(), &flotilla_resources::CheckoutSpec {
-            env_ref: "host-direct-01HXYZ".to_string(),
-            r#ref: "feat/convoy-resource".to_string(),
-            target_path: "/Users/alice/dev/flotilla.feat-123".to_string(),
-            worktree: Some(CheckoutWorktreeSpec { clone_ref: "clone-a".to_string() }),
-            fresh_clone: None,
-        })
+        .create(
+            &controller_meta().name("checkout-a").call(),
+            &flotilla_resources::CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                env_ref: "host-direct-01HXYZ".to_string(),
+                r#ref: "feat/convoy-resource".to_string(),
+                target_path: "/Users/alice/dev/flotilla.feat-123".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
         .await
         .expect("checkout create should succeed");
 
@@ -534,13 +536,12 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
                 .name("checkout-workspace-delete")
                 .labels([(TASK_WORKSPACE_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
-            &CheckoutSpec {
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                 env_ref: "host-direct-01HXYZ".to_string(),
                 r#ref: "feat/task-provisioning".to_string(),
                 target_path: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),
-                worktree: Some(CheckoutWorktreeSpec { clone_ref: "clone-a".to_string() }),
-                fresh_clone: None,
-            },
+                clone_ref: "clone-a".to_string(),
+            }),
         )
         .await
         .expect("checkout create should succeed");
