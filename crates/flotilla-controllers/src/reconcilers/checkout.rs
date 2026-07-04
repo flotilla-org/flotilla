@@ -66,6 +66,8 @@ where
                 Ok(commit) => CheckoutDeps::Ready { commit },
                 Err(err) => CheckoutDeps::Failed(err),
             }),
+            // Observed checkouts are facts from the observed-resource backend.
+            // The managed checkout reconciler must not actuate or patch them.
             CheckoutSpec::Observed(_) => Ok(CheckoutDeps::None),
         }
     }
