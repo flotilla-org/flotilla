@@ -294,12 +294,15 @@ impl Reconciler for TaskWorkspaceReconciler {
                     return Ok(TaskWorkspaceDeps::failed(message));
                 }
                 if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
-                    checkout_ready_path = existing
+                    let Some(path) = existing
                         .status
                         .as_ref()
                         .and_then(|status| status.path.clone())
                         .or_else(|| existing.spec.target_path().map(str::to_string))
-                        .expect("managed checkout should have a target path");
+                    else {
+                        return Ok(TaskWorkspaceDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
+                    };
+                    checkout_ready_path = path;
                 } else {
                     return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
                 }
