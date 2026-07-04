@@ -133,7 +133,12 @@ async fn terminal_actuator_uses_literal_command_and_cwd() {
 
 #[tokio::test]
 async fn checkout_actuator_exposes_fresh_clone_transport_url() {
-    let spec = FreshCloneCheckoutSpec { url: "git@github.com:flotilla-org/flotilla.git".to_string() };
+    let spec = FreshCloneCheckoutSpec {
+        env_ref: "env-a".to_string(),
+        r#ref: "main".to_string(),
+        target_path: "/workspace".to_string(),
+        url: "git@github.com:flotilla-org/flotilla.git".to_string(),
+    };
     let command = flotilla_controllers::actuators::fresh_clone_transport_url(&spec);
 
     assert_eq!(command, "git@github.com:flotilla-org/flotilla.git");

@@ -11,8 +11,8 @@ use std::{
 use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
-    ApiPaths, InMemoryBackend, InputMeta, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, TaskWorkspace, TaskWorkspaceSpec,
+    ApiPaths, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, TaskWorkspace, TaskWorkspaceSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::timeout};
@@ -571,6 +571,9 @@ async fn controller_loop_applies_create_presentation_actuation() {
     })
     .await
     .expect("create presentation actuation should create the resource");
+
+    let created = presentations.get("alpha-presentation").await.expect("created presentation should be readable");
+    assert_eq!(created.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Managed));
 
     harness.shutdown().await;
 }

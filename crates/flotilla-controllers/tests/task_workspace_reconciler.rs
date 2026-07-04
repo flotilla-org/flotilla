@@ -12,12 +12,12 @@ use flotilla_controllers::reconcilers::TaskWorkspaceReconciler;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
-    Checkout, CheckoutSpec, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, DockerCheckoutStrategy,
-    DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, PlacementPolicySpec, ProcessDefinition,
-    ProcessSource, ResourceBackend, ResourceError, SnapshotTask, TaskWorkspace, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
-    TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL,
-    TASK_WORKSPACE_LABEL,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
+    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, ObservedCheckoutSpec,
+    PlacementPolicySpec, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError, SnapshotTask, TaskWorkspace, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL,
+    TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
 };
 use rstest::rstest;
 
@@ -64,7 +64,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
         matches!(
             actuation,
             Actuation::CreateCheckout { spec, .. }
-                if spec.worktree.as_ref().map(|worktree| worktree.clone_ref.as_str()) == Some(clone_name.as_str())
+                if matches!(spec, CheckoutSpec::Worktree(worktree) if worktree.clone_ref == clone_name)
         )
     }));
 }
@@ -106,7 +106,12 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
             .env_ref(host_direct_env_name())
             .git_ref(GIT_REF.to_string())
             .path("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c".to_string())
-            .maybe_worktree(Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }))
+            .maybe_worktree(Some(worktree_checkout_spec(
+                &host_direct_env_name(),
+                GIT_REF,
+                "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-c",
+                "clone-placeholder",
+            )))
             .build(),
     )
     .await;
@@ -216,7 +221,12 @@ async fn child_failure_propagates_to_workspace_failure() {
             .env_ref(host_direct_env_name())
             .git_ref(GIT_REF.to_string())
             .path("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-f".to_string())
-            .maybe_worktree(Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }))
+            .maybe_worktree(Some(worktree_checkout_spec(
+                &host_direct_env_name(),
+                GIT_REF,
+                "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-f",
+                "clone-placeholder",
+            )))
             .build(),
     )
     .await;
@@ -243,6 +253,31 @@ async fn child_failure_propagates_to_workspace_failure() {
     assert!(matches!(
         outcome.patch,
         Some(flotilla_resources::TaskWorkspaceStatusPatch::MarkFailed { ref message }) if message == "boom"
+    ));
+}
+
+#[tokio::test]
+async fn observed_checkout_at_managed_name_marks_workspace_failed() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-observed", "implement", REPO_URL, GIT_REF).await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-observed", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+
+    let canonical_repo = canonicalize_repo_url(REPO_URL).expect("repo canonicalization");
+    let clone_name = format!("clone-{}", clone_key(&canonical_repo, &host_direct_env_name()));
+    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
+    create_ready_observed_checkout_without_status_path(&backend, NAMESPACE, "checkout-workspace-observed").await;
+    let workspace =
+        create_workspace(&backend, NAMESPACE, "workspace-observed", "convoy-observed", "implement", "policy-observed", REPO_URL).await;
+
+    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::TaskWorkspaceStatusPatch::MarkFailed { ref message })
+            if message == "checkout checkout-workspace-observed is ready but has no target path"
     ));
 }
 
@@ -306,7 +341,12 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
             .env_ref(host_direct_env_name())
             .git_ref(GIT_REF.to_string())
             .path("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-labels".to_string())
-            .maybe_worktree(Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }))
+            .maybe_worktree(Some(worktree_checkout_spec(
+                &host_direct_env_name(),
+                GIT_REF,
+                "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-labels",
+                "clone-placeholder",
+            )))
             .build(),
     )
     .await;
@@ -378,16 +418,16 @@ async fn assert_terminal_cwd_for_strategy(
         NAMESPACE,
         ReadyCheckoutFixture::builder()
             .name(format!("checkout-{workspace_name}"))
-            .env_ref(checkout_env_ref)
+            .env_ref(checkout_env_ref.clone())
             .git_ref(GIT_REF.to_string())
             .path(checkout_path.to_string())
             .maybe_worktree(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
                 None
             } else {
-                Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() })
+                Some(worktree_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, "clone-placeholder"))
             })
             .maybe_fresh_clone(if checkout_path == "/workspace" && workspace_name == "workspace-docker-fresh" {
-                Some(flotilla_resources::FreshCloneCheckoutSpec { url: REPO_URL.to_string() })
+                Some(fresh_clone_checkout_spec(&checkout_env_ref, GIT_REF, checkout_path, REPO_URL))
             } else {
                 None
             })
@@ -413,6 +453,24 @@ async fn assert_terminal_cwd_for_strategy(
 
 fn host_direct_env_name() -> String {
     format!("host-direct-{HOST_REF}")
+}
+
+fn worktree_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, clone_ref: &str) -> CheckoutWorktreeSpec {
+    CheckoutWorktreeSpec {
+        env_ref: env_ref.to_string(),
+        r#ref: git_ref.to_string(),
+        target_path: target_path.to_string(),
+        clone_ref: clone_ref.to_string(),
+    }
+}
+
+fn fresh_clone_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, url: &str) -> flotilla_resources::FreshCloneCheckoutSpec {
+    flotilla_resources::FreshCloneCheckoutSpec {
+        env_ref: env_ref.to_string(),
+        r#ref: git_ref.to_string(),
+        target_path: target_path.to_string(),
+        url: url.to_string(),
+    }
 }
 
 async fn create_convoy_with_labeled_processes(
@@ -536,15 +594,42 @@ async fn create_labeled_checkout(backend: &ResourceBackend, namespace: &str, nam
     backend
         .clone()
         .using::<Checkout>(namespace)
-        .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &CheckoutSpec {
-            env_ref: host_direct_env_name(),
-            r#ref: GIT_REF.to_string(),
-            target_path: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
-            worktree: Some(CheckoutWorktreeSpec { clone_ref: "clone-placeholder".to_string() }),
-            fresh_clone: None,
-        })
+        .create(
+            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]),
+            &CheckoutSpec::Worktree(worktree_checkout_spec(
+                &host_direct_env_name(),
+                GIT_REF,
+                &format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
+                "clone-placeholder",
+            )),
+        )
         .await
         .expect("checkout create should succeed");
+}
+
+async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBackend, namespace: &str, name: &str) {
+    let checkouts = backend.clone().using::<Checkout>(namespace);
+    let checkout = checkouts
+        .create(
+            &meta(name),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: GIT_REF.to_string(),
+                path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-observed".to_string(),
+                repo_ref: "repo-flotilla".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+    checkouts
+        .update_status(name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: None,
+            commit: Some("abc123".to_string()),
+            message: None,
+        })
+        .await
+        .expect("checkout status update should succeed");
 }
 
 async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, name: &str, workspace_name: &str) {

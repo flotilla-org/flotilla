@@ -294,33 +294,39 @@ impl Reconciler for TaskWorkspaceReconciler {
                     return Ok(TaskWorkspaceDeps::failed(message));
                 }
                 if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
-                    checkout_ready_path =
-                        existing.status.as_ref().and_then(|status| status.path.clone()).unwrap_or(existing.spec.target_path);
+                    let Some(path) = existing
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.path.clone())
+                        .or_else(|| existing.spec.target_path().map(str::to_string))
+                    else {
+                        return Ok(TaskWorkspaceDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
+                    };
+                    checkout_ready_path = path;
                 } else {
                     return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
                 }
             }
             Err(ResourceError::NotFound { .. }) => {
                 let spec = match &strategy {
-                    PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => CheckoutSpec {
-                        env_ref: clone_env_ref.clone(),
-                        r#ref: git_ref,
-                        target_path: checkout_target_path.clone(),
-                        worktree: Some(CheckoutWorktreeSpec {
+                    PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                        CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                            env_ref: clone_env_ref.clone(),
+                            r#ref: git_ref,
+                            target_path: checkout_target_path.clone(),
                             clone_ref: clone_name.clone().expect("shared-clone strategy requires clone name"),
-                        }),
-                        fresh_clone: None,
-                    },
-                    PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec {
+                        })
+                    }
+                    PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
                         env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
                         r#ref: git_ref,
                         target_path: checkout_target_path.clone(),
-                        worktree: None,
-                        fresh_clone: Some(FreshCloneCheckoutSpec { url: repo_url.clone() }),
-                    },
+                        url: repo_url.clone(),
+                    }),
                 };
+                let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
                 actuations.push(Actuation::CreateCheckout {
-                    meta: owned_child_meta(&checkout_name, obj, BTreeMap::from([(ENV_LABEL.to_string(), spec.env_ref.clone())])),
+                    meta: owned_child_meta(&checkout_name, obj, BTreeMap::from([(ENV_LABEL.to_string(), env_ref)])),
                     spec,
                 });
                 return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));

@@ -17,6 +17,7 @@ use crate::{
     clone::CloneSpec,
     environment::EnvironmentSpec,
     error::ResourceError,
+    labels::LifecycleAuthority,
     presentation::PresentationSpec,
     resource::{InputMeta, Resource, ResourceObject},
     task_workspace::TaskWorkspaceSpec,
@@ -273,7 +274,8 @@ impl<R: Reconciler> ControllerLoop<R> {
         }
     }
 
-    async fn create_if_missing<T: Resource>(resolver: &TypedResolver<T>, meta: InputMeta, spec: T::Spec) -> Result<(), ResourceError> {
+    async fn create_if_missing<T: Resource>(resolver: &TypedResolver<T>, mut meta: InputMeta, spec: T::Spec) -> Result<(), ResourceError> {
+        meta.set_lifecycle_authority(LifecycleAuthority::Managed);
         match resolver.create(&meta, &spec).await {
             Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
             Err(err) => Err(err),

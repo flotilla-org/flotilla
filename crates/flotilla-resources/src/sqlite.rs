@@ -258,7 +258,7 @@ impl SqliteBackend {
             let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
             items.push(Self::decode_object::<T>(value)?);
         }
-        Ok(ResourceList { items, resource_version: Self::current_version(&conn, &key)?.to_string() })
+        Ok(ResourceList { items, resource_version: Self::current_version(&conn, &key)?.to_string(), generation: None })
     }
 
     pub(crate) async fn list_typed_matching_labels<T: Resource>(
@@ -276,7 +276,7 @@ impl SqliteBackend {
             .into_iter()
             .filter(|object| required.iter().all(|(key, expected)| object.metadata.labels.get(key) == Some(expected)))
             .collect();
-        Ok(ResourceList { items, resource_version: listed.resource_version })
+        Ok(ResourceList { items, resource_version: listed.resource_version, generation: None })
     }
 
     pub(crate) async fn create_typed<T: Resource>(
@@ -454,6 +454,9 @@ impl SqliteBackend {
             WatchStart::FromVersion(version) => {
                 Some(version.parse::<u64>().map_err(|err| ResourceError::invalid(format!("invalid resourceVersion '{version}': {err}")))?)
             }
+            WatchStart::FromVersionInGeneration { .. } => {
+                return Err(ResourceError::invalid("sqlite resource watches do not use generations"));
+            }
         };
         let (sender, receiver) = mpsc::unbounded_channel();
         let replay = {
@@ -469,7 +472,7 @@ impl SqliteBackend {
         let live_stream = stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|event| (Self::decode_event::<T>(event), receiver))
         });
-        Ok(Box::pin(replay_stream.chain(live_stream)))
+        Ok(WatchStream::new(None, Box::pin(replay_stream.chain(live_stream))))
     }
 
     fn select_existing<T: Resource>(

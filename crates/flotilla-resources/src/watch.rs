@@ -1,4 +1,10 @@
-use futures::stream::BoxStream;
+use std::{
+    fmt,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use futures::{stream::BoxStream, Stream};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
@@ -6,7 +12,34 @@ use crate::{
     resource::{Resource, ResourceObject},
 };
 
-pub type WatchStream<T> = BoxStream<'static, Result<WatchEvent<T>, ResourceError>>;
+pub struct WatchStream<T: Resource> {
+    generation: Option<String>,
+    inner: BoxStream<'static, Result<WatchEvent<T>, ResourceError>>,
+}
+
+impl<T: Resource> WatchStream<T> {
+    pub fn new(generation: Option<String>, inner: BoxStream<'static, Result<WatchEvent<T>, ResourceError>>) -> Self {
+        Self { generation, inner }
+    }
+
+    pub fn generation(&self) -> Option<&str> {
+        self.generation.as_deref()
+    }
+}
+
+impl<T: Resource> fmt::Debug for WatchStream<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatchStream").field("generation", &self.generation).finish_non_exhaustive()
+    }
+}
+
+impl<T: Resource> Stream for WatchStream<T> {
+    type Item = Result<WatchEvent<T>, ResourceError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchStart {
@@ -14,6 +47,8 @@ pub enum WatchStart {
     Now,
     /// Resume from a specific version, delivering all events since that point.
     FromVersion(String),
+    /// Resume from a specific version within an ephemeral store generation.
+    FromVersionInGeneration { generation: String, resource_version: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +70,8 @@ pub enum WatchEvent<T: Resource> {
 pub struct ResourceList<T: Resource> {
     pub items: Vec<ResourceObject<T>>,
     pub resource_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
 }
 
 #[cfg(test)]

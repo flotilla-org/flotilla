@@ -246,16 +246,13 @@ pub async fn create_ready_checkout(
     fixture: ReadyCheckoutFixture,
 ) -> flotilla_resources::ResourceObject<Checkout> {
     let checkouts = backend.clone().using::<Checkout>(namespace);
-    let created = checkouts
-        .create(&meta(&fixture.name), &CheckoutSpec {
-            env_ref: fixture.env_ref.clone(),
-            r#ref: fixture.git_ref,
-            target_path: fixture.path.clone(),
-            worktree: fixture.worktree,
-            fresh_clone: fixture.fresh_clone,
-        })
-        .await
-        .expect("checkout create should succeed");
+    let spec = match (fixture.worktree, fixture.fresh_clone) {
+        (Some(worktree), None) => CheckoutSpec::Worktree(worktree),
+        (None, Some(fresh_clone)) => CheckoutSpec::FreshClone(fresh_clone),
+        (None, None) => panic!("ready checkout fixture must provide a checkout strategy"),
+        (Some(_), Some(_)) => panic!("ready checkout fixture must provide exactly one checkout strategy"),
+    };
+    let created = checkouts.create(&meta(&fixture.name), &spec).await.expect("checkout create should succeed");
     checkouts
         .update_status(&fixture.name, &created.metadata.resource_version, &CheckoutStatus {
             phase: CheckoutPhase::Ready,

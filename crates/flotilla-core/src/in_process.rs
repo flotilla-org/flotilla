@@ -22,8 +22,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy,
-    ConvoyRepositorySpec, ConvoySpec, InputMeta, InputValue, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, ResourceBackend,
-    ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
+    ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, InputValue, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec,
+    ResourceBackend, ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -529,6 +529,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
+    observed_resource_backend: ResourceBackend,
     /// Shared with `ConvoyProjection` (in flotilla-daemon): the projection is the
     /// sole writer, the daemon reads here for `replay_since`.  Replaces an earlier
     /// broadcast-driven mirror that had correctness seams under lag and
@@ -665,6 +666,7 @@ impl InProcessDaemon {
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
             resource_backend,
+            observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             namespace_projection_state: RwLock::new(NamespaceProjectionState::new()),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
         });
@@ -801,6 +803,10 @@ impl InProcessDaemon {
 
     pub fn resource_backend(&self) -> ResourceBackend {
         self.resource_backend.clone()
+    }
+
+    pub fn observed_resource_backend(&self) -> ResourceBackend {
+        self.observed_resource_backend.clone()
     }
 
     #[cfg(any(test, feature = "test-support"))]

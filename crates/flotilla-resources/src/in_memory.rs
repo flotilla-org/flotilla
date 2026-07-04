@@ -19,6 +19,7 @@ type StoreKey = (String, String, String, String);
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
+    generation: Option<String>,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,10 @@ impl Default for ResourceStore {
 }
 
 impl InMemoryBackend {
+    pub fn observed() -> Self {
+        Self { stores: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()) }
+    }
+
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {
         (T::API_PATHS.group.to_string(), T::API_PATHS.version.to_string(), T::API_PATHS.plural.to_string(), namespace.to_string())
     }
@@ -135,7 +140,7 @@ impl InMemoryBackend {
                 items.push(Self::decode_object::<T>(value)?);
             }
             items.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-            Ok(ResourceList { items, resource_version: store.current_version().to_string() })
+            Ok(ResourceList { items, resource_version: store.current_version().to_string(), generation: self.generation.clone() })
         })
         .await
     }
@@ -159,7 +164,7 @@ impl InMemoryBackend {
                 }
             }
             items.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-            Ok(ResourceList { items, resource_version: store.current_version().to_string() })
+            Ok(ResourceList { items, resource_version: store.current_version().to_string(), generation: self.generation.clone() })
         })
         .await
     }
@@ -285,14 +290,37 @@ impl InMemoryBackend {
     }
 
     pub(crate) async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
+        let generation = self.generation.clone();
         let (replay, receiver) = {
             let mut stores = self.stores.lock().await;
             let store = stores.entry(Self::store_key::<T>(namespace)).or_default();
             let replay_from = match &start {
                 WatchStart::Now => None,
-                WatchStart::FromVersion(version) => Some(
-                    version.parse::<u64>().map_err(|err| ResourceError::invalid(format!("invalid resourceVersion '{version}': {err}")))?,
-                ),
+                WatchStart::FromVersion(version) => {
+                    if generation.is_some() {
+                        return Err(ResourceError::invalid("generational in-memory watches require a generation"));
+                    }
+                    Some(
+                        version
+                            .parse::<u64>()
+                            .map_err(|err| ResourceError::invalid(format!("invalid resourceVersion '{version}': {err}")))?,
+                    )
+                }
+                WatchStart::FromVersionInGeneration { generation: requested_generation, resource_version } => {
+                    let Some(current_generation) = &generation else {
+                        return Err(ResourceError::invalid("in-memory resource watches are not generational"));
+                    };
+                    if requested_generation != current_generation {
+                        return Err(ResourceError::invalid(format!(
+                            "resourceVersion belongs to generation '{requested_generation}', current generation is '{current_generation}'"
+                        )));
+                    }
+                    Some(
+                        resource_version
+                            .parse::<u64>()
+                            .map_err(|err| ResourceError::invalid(format!("invalid resourceVersion '{resource_version}': {err}")))?,
+                    )
+                }
             };
             let replay = match replay_from {
                 Some(version) => store.event_log.iter().filter(|event| event.version > version).cloned().collect(),
@@ -307,6 +335,6 @@ impl InMemoryBackend {
         let live_stream = stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|event| (Self::decode_event::<T>(event), receiver))
         });
-        Ok(Box::pin(replay_stream.chain(live_stream)))
+        Ok(WatchStream::new(generation, Box::pin(replay_stream.chain(live_stream))))
     }
 }

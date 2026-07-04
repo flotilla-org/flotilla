@@ -25,7 +25,10 @@ use flotilla_protocol::{
     Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey,
     VectorClock, PROTOCOL_VERSION,
 };
-use flotilla_resources::{Convoy, ConvoySpec, InputMeta, ResourceBackend};
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceBackend, ResourceError,
+};
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
 use tokio::{
@@ -299,6 +302,42 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
         restarted.daemon().resource_backend().using::<Convoy>("flotilla").get("persisted").await.expect("convoy should survive restart");
 
     assert_eq!(fetched.spec.workflow_ref, "scratch");
+}
+
+#[tokio::test]
+async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let socket_path = tmp.path().join("flotilla.sock");
+
+    let server = DaemonServer::new(Vec::new(), Arc::clone(&config), fake_discovery(false), socket_path.clone(), StdDuration::from_secs(30))
+        .await
+        .expect("server should start");
+    let observed = server.daemon().observed_resource_backend();
+    let checkouts = observed.using::<ResourceCheckout>("flotilla");
+    checkouts
+        .create(
+            &InputMeta::builder().name("local-main".to_string()).build(),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "main".to_string(),
+                path: "/Users/alice/dev/flotilla".to_string(),
+                repo_ref: "project-flotilla".to_string(),
+                is_main: true,
+            }),
+        )
+        .await
+        .expect("observed checkout create should succeed");
+    let first_generation = checkouts.list().await.expect("observed list should succeed").generation.expect("generation");
+    drop(server);
+
+    let restarted = DaemonServer::new(Vec::new(), config, fake_discovery(false), socket_path, StdDuration::from_secs(30))
+        .await
+        .expect("server should restart");
+    let restarted_checkouts = restarted.daemon().observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let restarted_list = restarted_checkouts.list().await.expect("observed list after restart should succeed");
+
+    assert_ne!(restarted_list.generation.expect("generation"), first_generation);
+    assert!(matches!(restarted_checkouts.get("local-main").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]

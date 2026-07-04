@@ -114,3 +114,57 @@ async fn list_matching_labels_returns_only_exact_matches() {
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].metadata.name, "alpha");
 }
+
+#[tokio::test]
+async fn observed_backend_surfaces_generation_on_list_and_watch() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let resolver = backend.using::<Convoy>("flotilla");
+    resolver.create(&convoy_meta("alpha"), &convoy_spec("template-a")).await.expect("create should succeed");
+
+    let listed = resolver.list().await.expect("list should succeed");
+    let generation = listed.generation.clone().expect("observed list should expose generation");
+    let watch = resolver
+        .watch(flotilla_resources::WatchStart::FromVersionInGeneration {
+            generation: generation.clone(),
+            resource_version: listed.resource_version.clone(),
+        })
+        .await
+        .expect("watch should start within listed generation");
+
+    assert_eq!(watch.generation(), Some(generation.as_str()));
+}
+
+#[tokio::test]
+async fn observed_backend_rejects_watch_resume_from_previous_generation() {
+    let first_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let first = first_backend.using::<Convoy>("flotilla");
+    let first_list = first.list().await.expect("first list should succeed");
+    let stale_generation = first_list.generation.expect("observed list should expose generation");
+
+    let restarted_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let restarted = restarted_backend.using::<Convoy>("flotilla");
+    let restarted_generation =
+        restarted.list().await.expect("restarted list should succeed").generation.expect("observed list should expose generation");
+    assert_ne!(restarted_generation, stale_generation, "restart should mint a new observed generation");
+
+    let err = restarted
+        .watch(flotilla_resources::WatchStart::FromVersionInGeneration { generation: stale_generation, resource_version: "0".to_string() })
+        .await
+        .expect_err("watch resume from a previous generation should fail");
+
+    assert!(matches!(err, flotilla_resources::ResourceError::Invalid { .. }));
+}
+
+#[tokio::test]
+async fn observed_backend_rejects_bare_watch_resume_without_generation() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let resolver = backend.using::<Convoy>("flotilla");
+    let listed = resolver.list().await.expect("list should succeed");
+
+    let err = resolver
+        .watch(flotilla_resources::WatchStart::FromVersion(listed.resource_version))
+        .await
+        .expect_err("observed watch resume should require generation");
+
+    assert!(matches!(err, flotilla_resources::ResourceError::Invalid { .. }));
+}

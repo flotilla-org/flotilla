@@ -5,6 +5,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
     error::ResourceError,
+    labels::{LifecycleAuthority, AUTHORITY_LABEL},
     status_patch::StatusPatch,
     watch::{ResourceList, WatchEvent},
 };
@@ -72,6 +73,19 @@ pub struct InputMeta {
 }
 
 impl InputMeta {
+    pub fn lifecycle_authority(&self) -> Result<Option<LifecycleAuthority>, ResourceError> {
+        self.labels.get(AUTHORITY_LABEL).map(|value| LifecycleAuthority::from_label_value(value)).transpose()
+    }
+
+    pub fn set_lifecycle_authority(&mut self, authority: LifecycleAuthority) {
+        self.labels.insert(AUTHORITY_LABEL.to_string(), authority.as_label_value().to_string());
+    }
+
+    pub fn with_lifecycle_authority(mut self, authority: LifecycleAuthority) -> Self {
+        self.set_lifecycle_authority(authority);
+        self
+    }
+
     pub fn with_added_finalizer(mut self, finalizer: impl Into<String>) -> Self {
         let finalizer = finalizer.into();
         if self.finalizers.iter().all(|existing| existing != &finalizer) {
@@ -100,6 +114,16 @@ pub struct ObjectMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<DateTime<Utc>>,
     pub creation_timestamp: DateTime<Utc>,
+}
+
+impl ObjectMeta {
+    pub fn lifecycle_authority(&self) -> Result<Option<LifecycleAuthority>, ResourceError> {
+        self.labels.get(AUTHORITY_LABEL).map(|value| LifecycleAuthority::from_label_value(value)).transpose()
+    }
+
+    pub fn set_lifecycle_authority(&mut self, authority: LifecycleAuthority) {
+        self.labels.insert(AUTHORITY_LABEL.to_string(), authority.as_label_value().to_string());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +260,7 @@ impl<T: Resource> K8sResourceList<T> {
         Ok(ResourceList {
             items: self.items.into_iter().map(ResourceObject::from_k8s_object).collect::<Result<_, _>>()?,
             resource_version: self.metadata.resource_version,
+            generation: None,
         })
     }
 }
