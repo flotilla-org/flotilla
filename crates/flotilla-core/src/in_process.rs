@@ -281,7 +281,10 @@ async fn create_adopted_checkout_resource(
             if existing.metadata.lifecycle_authority().map_err(|err| err.to_string())? != Some(LifecycleAuthority::Adopted) {
                 return Err(format!("checkout {checkout_ref} already exists but is not adopted"));
             }
-            checkouts.update(&meta, &existing.metadata.resource_version, &spec).await.map_err(|err| err.to_string())?
+            if existing.spec != spec {
+                return Err(format!("checkout {checkout_ref} already exists with different adopted checkout details"));
+            }
+            existing
         }
         Err(err) => return Err(err.to_string()),
     };
@@ -2147,6 +2150,31 @@ impl InProcessDaemon {
             });
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+            match convoys.get(name).await {
+                Ok(_) => {
+                    let result = flotilla_protocol::CommandValue::Error { message: format!("convoy {name} already exists") };
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result,
+                    });
+                    return Ok(id);
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(err) => {
+                    let result = flotilla_protocol::CommandValue::Error { message: err.to_string() };
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result,
+                    });
+                    return Ok(id);
+                }
+            }
             let placement_policy = match placement_policy {
                 Some(policy) => Some(policy.clone()),
                 None => default_convoy_placement_policy(&self.resource_backend, &namespace).await,

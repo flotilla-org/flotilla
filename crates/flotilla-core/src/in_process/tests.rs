@@ -62,6 +62,20 @@ fn empty_input_meta(name: &str) -> InputMeta {
     }
 }
 
+async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(err) => panic!("unexpected event error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for command result")
+}
+
 #[test]
 fn choose_event_uses_delta_for_non_initial_changes() {
     let repo = PathBuf::from("/tmp/repo");
@@ -751,6 +765,79 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
     let status = checkout.status.expect("adopted checkout should be ready");
     assert_eq!(status.phase, ResourceCheckoutPhase::Ready);
     assert_eq!(status.path.as_deref(), Some(std::fs::canonicalize(&checkout_path).expect("canonical path").to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
+async fn duplicate_adopted_convoy_create_does_not_repoint_existing_checkout() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let checkout_a = temp.path().join("repo-a");
+    let checkout_b = temp.path().join("repo-b");
+    let remote = "git@github.com:flotilla-org/flotilla.git";
+    init_git_repo_with_remote(&checkout_a, remote);
+    init_git_repo_with_remote(&checkout_b, remote);
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local()).await;
+    let mut events = daemon.subscribe();
+
+    let first_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "convoy-adopted".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: Some(Box::new(checkout_a.clone())),
+            },
+        })
+        .await
+        .expect("first execute should return a command id");
+    assert_eq!(wait_for_command_result(&mut events, first_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+
+    let second_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "convoy-adopted".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: Some(Box::new(checkout_b)),
+            },
+        })
+        .await
+        .expect("second execute should return a command id");
+    let result = wait_for_command_result(&mut events, second_id).await;
+    assert!(matches!(result, CommandValue::Error { message } if message.contains("convoy convoy-adopted already exists")));
+
+    let checkout = daemon
+        .resource_backend()
+        .using::<ResourceCheckout>("flotilla")
+        .get("adopted-checkout-convoy-adopted")
+        .await
+        .expect("adopted checkout should still exist");
+    match checkout.spec {
+        ResourceCheckoutSpec::Observed(spec) => {
+            assert_eq!(spec.path, std::fs::canonicalize(&checkout_a).expect("canonical path").display().to_string());
+        }
+        other => panic!("expected observed checkout spec, got {other:?}"),
+    }
+    let status = checkout.status.expect("adopted checkout should be ready");
+    assert_eq!(status.path.as_deref(), Some(std::fs::canonicalize(&checkout_a).expect("canonical path").to_string_lossy().as_ref()));
 }
 
 #[tokio::test]

@@ -57,6 +57,10 @@ fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+fn resolve_adopted_checkout(path: PathBuf) -> Result<Box<PathBuf>, String> {
+    std::fs::canonicalize(&path).map(Box::new).map_err(|err| format!("adopted checkout path {} cannot be resolved: {err}", path.display()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 pub struct ConvoyTaskNoun {
     /// Task name
@@ -105,7 +109,7 @@ impl ConvoyNoun {
                             r#ref,
                             project_ref,
                             placement_policy,
-                            adopted_checkout: adopted_checkout.map(Box::new),
+                            adopted_checkout: adopted_checkout.map(resolve_adopted_checkout).transpose()?,
                         },
                     },
                     repo: RepoContext::None,
@@ -159,8 +163,6 @@ impl std::fmt::Display for ConvoyNoun {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction};
 
@@ -306,8 +308,9 @@ mod tests {
 
     #[test]
     fn convoy_create_with_adopted_checkout_resolves() {
+        let cwd = std::env::current_dir().expect("current dir");
         let resolved =
-            parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "/tmp/repo"]).resolve().expect("resolve");
+            parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "."]).resolve().expect("resolve");
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 node_id: None,
@@ -321,12 +324,20 @@ mod tests {
                     r#ref: None,
                     project_ref: None,
                     placement_policy: None,
-                    adopted_checkout: Some(Box::new(PathBuf::from("/tmp/repo"))),
+                    adopted_checkout: Some(Box::new(cwd)),
                 },
             },
             repo: RepoContext::None,
             host: HostResolution::Local,
         });
+    }
+
+    #[test]
+    fn convoy_create_with_missing_adopted_checkout_fails_resolution() {
+        let err = parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "/tmp/flotilla-missing-checkout"])
+            .resolve()
+            .expect_err("missing checkout should fail before daemon handoff");
+        assert!(err.contains("adopted checkout path /tmp/flotilla-missing-checkout cannot be resolved"), "{err}");
     }
 
     #[test]
