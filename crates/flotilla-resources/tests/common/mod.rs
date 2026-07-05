@@ -203,6 +203,7 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         repository: None,
         r#ref: None,
         project_ref: None,
+        adopted_checkout_ref: None,
     }
 }
 

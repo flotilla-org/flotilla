@@ -551,7 +551,12 @@ fn create_task_workspace_outcome(convoy: &ResourceObject<Convoy>, task: &str, no
                     controller: true,
                 }])
                 .build(),
-            spec: crate::TaskWorkspaceSpec { convoy_ref: convoy.metadata.name.clone(), task: task.to_string(), placement_policy_ref },
+            spec: crate::TaskWorkspaceSpec {
+                convoy_ref: convoy.metadata.name.clone(),
+                task: task.to_string(),
+                placement_policy_ref,
+                adopted_checkout_ref: convoy.spec.adopted_checkout_ref.clone(),
+            },
         }],
         events: Vec::new(),
     })

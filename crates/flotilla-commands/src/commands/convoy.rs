@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{Command, CommandAction};
 
@@ -41,6 +43,9 @@ pub enum ConvoyVerb {
         /// PlacementPolicy resource to use for task provisioning
         #[arg(long = "placement-policy")]
         placement_policy: Option<String>,
+        /// Existing local checkout/worktree to adopt as the convoy vessel
+        #[arg(long = "adopt-checkout")]
+        adopted_checkout: Option<PathBuf>,
     },
 }
 
@@ -86,24 +91,27 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy } => Ok(Resolved::NeedsContext {
-                command: Command {
-                    node_id: None,
-                    provisioning_target: None,
-                    context_repo: None,
-                    action: CommandAction::ConvoyCreate {
-                        name: self.subject,
-                        workflow_ref: template,
-                        inputs,
-                        repository_url,
-                        r#ref,
-                        project_ref,
-                        placement_policy,
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy, adopted_checkout } => {
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: None,
+                        context_repo: None,
+                        action: CommandAction::ConvoyCreate {
+                            name: self.subject,
+                            workflow_ref: template,
+                            inputs,
+                            repository_url,
+                            r#ref,
+                            project_ref,
+                            placement_policy,
+                            adopted_checkout: adopted_checkout.map(Box::new),
+                        },
                     },
-                },
-                repo: RepoContext::None,
-                host: HostResolution::Local,
-            }),
+                    repo: RepoContext::None,
+                    host: HostResolution::Local,
+                })
+            }
         }
     }
 }
@@ -123,7 +131,7 @@ impl std::fmt::Display for ConvoyNoun {
                     }
                 }
             }
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy } => {
+            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy, adopted_checkout } => {
                 write!(f, " create --template {}", quote_value(template))?;
                 for (k, v) in inputs {
                     write!(f, " --input {}", quote_value(&format!("{k}={v}")))?;
@@ -140,6 +148,9 @@ impl std::fmt::Display for ConvoyNoun {
                 if let Some(placement_policy) = placement_policy {
                     write!(f, " --placement-policy {}", quote_value(placement_policy))?;
                 }
+                if let Some(adopted_checkout) = adopted_checkout {
+                    write!(f, " --adopt-checkout {}", quote_value(&adopted_checkout.display().to_string()))?;
+                }
             }
         }
         Ok(())
@@ -148,6 +159,8 @@ impl std::fmt::Display for ConvoyNoun {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
     use flotilla_protocol::{Command, CommandAction};
 
@@ -233,6 +246,7 @@ mod tests {
                     r#ref: Some("main".into()),
                     project_ref: None,
                     placement_policy: None,
+                    adopted_checkout: None,
                 },
             },
             repo: RepoContext::None,
@@ -256,6 +270,7 @@ mod tests {
                     r#ref: None,
                     project_ref: None,
                     placement_policy: None,
+                    adopted_checkout: None,
                 },
             },
             repo: RepoContext::None,
@@ -281,6 +296,32 @@ mod tests {
                     r#ref: None,
                     project_ref: None,
                     placement_policy: Some("host-direct-local".into()),
+                    adopted_checkout: None,
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
+    fn convoy_create_with_adopted_checkout_resolves() {
+        let resolved =
+            parse(&["convoy", "scratch-1", "create", "--template", "scratch", "--adopt-checkout", "/tmp/repo"]).resolve().expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "scratch-1".into(),
+                    workflow_ref: "scratch".into(),
+                    inputs: vec![],
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: Some(Box::new(PathBuf::from("/tmp/repo"))),
                 },
             },
             repo: RepoContext::None,
@@ -304,6 +345,8 @@ mod tests {
             "main",
             "--placement-policy",
             "host-direct-local",
+            "--adopt-checkout",
+            "/tmp/repo",
         ]);
     }
 

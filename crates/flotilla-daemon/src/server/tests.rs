@@ -290,6 +290,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
             repository: None,
             r#ref: None,
             project_ref: None,
+            adopted_checkout_ref: None,
         })
         .await
         .expect("convoy create should succeed");

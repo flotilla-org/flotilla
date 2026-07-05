@@ -6,7 +6,7 @@ use chrono::Utc;
 use common::{
     create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
-    labeled_meta, meta, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
+    labeled_meta, meta, task_workspace_meta, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::TaskWorkspaceReconciler;
 use flotilla_resources::{
@@ -14,10 +14,10 @@ use flotilla_resources::{
     controller::{Actuation, Reconciler},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, ObservedCheckoutSpec,
-    PlacementPolicySpec, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError, SnapshotTask, TaskWorkspace, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL,
-    TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, LifecycleAuthority,
+    ObservedCheckoutSpec, PlacementPolicySpec, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError, SnapshotTask,
+    TaskWorkspace, TaskWorkspaceSpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, WorkflowSnapshot,
+    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
 };
 use rstest::rstest;
 
@@ -257,6 +257,44 @@ async fn child_failure_propagates_to_workspace_failure() {
 }
 
 #[tokio::test]
+async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-adopted", "implement", REPO_URL, GIT_REF).await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-adopted", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted", "/Users/alice/dev/flotilla-existing").await;
+    let workspace = backend
+        .clone()
+        .using::<TaskWorkspace>(NAMESPACE)
+        .create(&task_workspace_meta("workspace-adopted", REPO_URL), &TaskWorkspaceSpec {
+            convoy_ref: "convoy-adopted".to_string(),
+            task: "implement".to_string(),
+            placement_policy_ref: "policy-adopted".to_string(),
+            adopted_checkout_ref: Some("adopted-checkout-convoy-adopted".to_string()),
+        })
+        .await
+        .expect("workspace create should succeed");
+
+    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    assert!(outcome
+        .actuations
+        .iter()
+        .all(|actuation| { !matches!(actuation, Actuation::CreateClone { .. } | Actuation::CreateCheckout { .. }) }));
+    assert!(outcome.actuations.iter().any(|actuation| {
+        matches!(
+            actuation,
+            Actuation::CreateTerminalSession { spec, .. }
+                if spec.env_ref == host_direct_env_name()
+                    && spec.pool == "cleat"
+                    && spec.cwd == "/Users/alice/dev/flotilla-existing"
+        )
+    }));
+}
+
+#[tokio::test]
 async fn observed_checkout_at_managed_name_marks_workspace_failed() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-observed", "implement", REPO_URL, GIT_REF).await;
@@ -303,6 +341,26 @@ async fn run_finalizer_deletes_all_labeled_children() {
     ));
     assert!(matches!(
         backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-finalize-coder").await,
+        Err(ResourceError::NotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn run_finalizer_preserves_adopted_checkout() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let workspace = create_workspace(&backend, NAMESPACE, "workspace-adopted", "convoy-a", "implement", "policy-a", REPO_URL).await;
+
+    create_labeled_adopted_checkout(&backend, NAMESPACE, "checkout-workspace-adopted", "workspace-adopted").await;
+    create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-adopted-coder", "workspace-adopted").await;
+
+    let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
+    reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
+
+    let checkout =
+        backend.clone().using::<Checkout>(NAMESPACE).get("checkout-workspace-adopted").await.expect("adopted checkout should be preserved");
+    assert_eq!(checkout.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Adopted));
+    assert!(matches!(
+        backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-adopted-coder").await,
         Err(ResourceError::NotFound { .. })
     ));
 }
@@ -489,6 +547,7 @@ async fn create_convoy_with_labeled_processes(
             repository: Some(ConvoyRepositorySpec { url: repo_url.to_string() }),
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
+            adopted_checkout_ref: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -605,6 +664,49 @@ async fn create_labeled_checkout(backend: &ResourceBackend, namespace: &str, nam
         )
         .await
         .expect("checkout create should succeed");
+}
+
+async fn create_labeled_adopted_checkout(backend: &ResourceBackend, namespace: &str, name: &str, workspace_name: &str) {
+    backend
+        .clone()
+        .using::<Checkout>(namespace)
+        .create(
+            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())])
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: GIT_REF.to_string(),
+                path: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
+                repo_ref: "repo-flotilla".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("adopted checkout create should succeed");
+}
+
+async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &str, name: &str, path: &str) {
+    let checkouts = backend.clone().using::<Checkout>(namespace);
+    let created = checkouts
+        .create(
+            &meta(name).with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: GIT_REF.to_string(),
+                path: path.to_string(),
+                repo_ref: "repo-flotilla".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("adopted checkout create should succeed");
+    checkouts
+        .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some(path.to_string()),
+            commit: Some("abc123".to_string()),
+            message: None,
+        })
+        .await
+        .expect("checkout status update should succeed");
 }
 
 async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBackend, namespace: &str, name: &str) {

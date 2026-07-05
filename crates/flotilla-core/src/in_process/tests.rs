@@ -9,7 +9,10 @@ use flotilla_protocol::{
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId,
     EnvironmentStatus, HostPath, ImageId, Issue, RepoSelector,
 };
-use flotilla_resources::{Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, TaskPhase, TaskState};
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoyPhase,
+    ConvoySpec, ConvoyStatus, InputMeta, LifecycleAuthority, TaskPhase, TaskState,
+};
 
 use super::*;
 use crate::{
@@ -20,7 +23,7 @@ use crate::{
     model::RepoModel,
     providers::{
         discovery::{
-            test_support::{fake_discovery, DiscoveryMockRunner},
+            test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner},
             EnvironmentAssertion, EnvironmentBag,
         },
         environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
@@ -618,6 +621,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             repository: None,
             r#ref: None,
             project_ref: None,
+            adopted_checkout_ref: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -679,6 +683,77 @@ async fn convoy_completion_command_updates_convoy_task_status() {
 }
 
 #[tokio::test]
+async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let checkout_path = temp.path().join("repo");
+    let remote = "git@github.com:flotilla-org/flotilla.git";
+    init_git_repo_with_remote(&checkout_path, remote);
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local()).await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "convoy-adopted".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: Some(Box::new(checkout_path.clone())),
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(err) => panic!("unexpected event error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timeout waiting for command result");
+
+    assert_eq!(result, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("convoy-adopted").await.expect("convoy should exist");
+    assert_eq!(convoy.spec.repository.as_ref().map(|repo| repo.url.as_str()), Some(remote));
+    assert_eq!(convoy.spec.r#ref.as_deref(), Some("main"));
+    assert_eq!(convoy.spec.adopted_checkout_ref.as_deref(), Some("adopted-checkout-convoy-adopted"));
+
+    let checkout = daemon
+        .resource_backend()
+        .using::<ResourceCheckout>("flotilla")
+        .get("adopted-checkout-convoy-adopted")
+        .await
+        .expect("adopted checkout should exist");
+    assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
+    match checkout.spec {
+        ResourceCheckoutSpec::Observed(spec) => {
+            assert_eq!(spec.r#ref, "main");
+            assert_eq!(spec.path, std::fs::canonicalize(&checkout_path).expect("canonical path").display().to_string());
+            assert_eq!(spec.repo_ref, remote);
+        }
+        other => panic!("expected observed checkout spec, got {other:?}"),
+    }
+    let status = checkout.status.expect("adopted checkout should be ready");
+    assert_eq!(status.phase, ResourceCheckoutPhase::Ready);
+    assert_eq!(status.path.as_deref(), Some(std::fs::canonicalize(&checkout_path).expect("canonical path").to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
 async fn convoy_completion_command_targets_configured_provisioning_namespace() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
@@ -698,6 +773,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             repository: None,
             r#ref: None,
             project_ref: None,
+            adopted_checkout_ref: None,
         })
         .await
         .expect("convoy create should succeed");

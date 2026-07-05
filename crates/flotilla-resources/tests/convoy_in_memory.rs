@@ -279,6 +279,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
                 convoy_ref: "convoy-delete".to_string(),
                 task: "implement".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
+                adopted_checkout_ref: None,
             },
         )
         .await

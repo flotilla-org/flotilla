@@ -26,6 +26,8 @@ pub struct ConvoySpec {
     /// the reconciler does not consult it. Future: substitute repository/ref from project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_checkout_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
