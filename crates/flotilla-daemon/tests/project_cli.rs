@@ -171,6 +171,7 @@ async fn convoy_create_carries_project_ref() {
                 r#ref: None,
                 project_ref: Some("my-project".into()),
                 placement_policy: None,
+                adopted_checkout: None,
             },
         })
         .await

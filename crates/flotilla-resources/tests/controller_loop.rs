@@ -599,6 +599,7 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
             convoy_ref: "alpha".to_string(),
             task: "implement".to_string(),
             placement_policy_ref: "local".to_string(),
+            adopted_checkout_ref: None,
         })
         .await
         .expect("task workspace create should succeed");

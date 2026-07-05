@@ -112,6 +112,7 @@ fn task_workspace_object(
             convoy_ref: convoy_name.to_string(),
             task: task.to_string(),
             placement_policy_ref: "laptop-docker".to_string(),
+            adopted_checkout_ref: None,
         },
         status: Some(TaskWorkspaceStatus {
             phase,

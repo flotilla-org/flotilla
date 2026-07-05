@@ -105,6 +105,7 @@ async fn convoy_create_command_creates_convoy_resource() {
                 r#ref: None,
                 project_ref: None,
                 placement_policy: None,
+                adopted_checkout: None,
             },
         })
         .await
@@ -212,6 +213,7 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
                 r#ref: None,
                 project_ref: None,
                 placement_policy: None,
+                adopted_checkout: None,
             },
         })
         .await

@@ -65,6 +65,7 @@ pub async fn create_convoy_with_single_task(
             repository: Some(ConvoyRepositorySpec { url: repo_url.to_string() }),
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
+            adopted_checkout_ref: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -102,6 +103,7 @@ pub async fn create_workspace(
             convoy_ref: convoy_ref.to_string(),
             task: task.to_string(),
             placement_policy_ref: placement_policy_ref.to_string(),
+            adopted_checkout_ref: None,
         })
         .await
         .expect("workspace create should succeed")

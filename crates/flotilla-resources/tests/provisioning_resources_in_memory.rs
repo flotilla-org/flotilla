@@ -63,6 +63,7 @@ async fn task_workspace_metadata_and_status_roundtrip() {
         convoy_ref: "fix-bug-123".to_string(),
         task: "implement".to_string(),
         placement_policy_ref: "docker-on-01HXYZ".to_string(),
+        adopted_checkout_ref: None,
     };
     let created = resolver.create(&task_workspace_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
     let updated = resolver

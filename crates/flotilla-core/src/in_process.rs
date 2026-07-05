@@ -4,7 +4,7 @@
 //! and broadcasts events — all within the same process.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -21,9 +21,11 @@ use flotilla_protocol::{
     SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Convoy as ResourceConvoy,
-    ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, InputValue, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec,
-    ResourceBackend, ResourceError, WorkflowTemplate, WorkflowTemplateSpec,
+    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
+    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, ResourceBackend,
+    ResourceError, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -216,6 +218,87 @@ fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTempl
 
 fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
     serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
+}
+
+fn adopted_checkout_name(convoy_name: &str) -> String {
+    format!("adopted-checkout-{convoy_name}")
+}
+
+async fn git_stdout(runner: &dyn CommandRunner, checkout_path: &Path, args: &[&str], description: &str) -> Result<String, String> {
+    runner
+        .run("git", args, checkout_path, &ChannelLabel::Noop)
+        .await
+        .map(|stdout| stdout.trim().to_string())
+        .map_err(|err| format!("{description} for {}: {err}", checkout_path.display()))
+}
+
+async fn infer_adopted_checkout_ref(runner: &dyn CommandRunner, checkout_path: &Path) -> Result<String, String> {
+    let branch = git_stdout(runner, checkout_path, &["rev-parse", "--abbrev-ref", "HEAD"], "failed to read checkout ref").await?;
+    if branch != "HEAD" {
+        return Ok(branch);
+    }
+    git_stdout(runner, checkout_path, &["rev-parse", "HEAD"], "failed to read checkout commit").await
+}
+
+async fn create_adopted_checkout_resource(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy_name: &str,
+    checkout_path: &Path,
+    repository_url: Option<&String>,
+    git_ref: Option<&String>,
+    runner: &dyn CommandRunner,
+) -> Result<(String, String, String), String> {
+    let path = std::fs::canonicalize(checkout_path)
+        .map_err(|err| format!("adopted checkout path {} cannot be resolved: {err}", checkout_path.display()))?;
+    let path_str = path.to_string_lossy().to_string();
+    let repo_url = match repository_url {
+        Some(url) => url.clone(),
+        None => git_stdout(runner, &path, &["config", "--get", "remote.origin.url"], "failed to read origin URL").await?,
+    };
+    let git_ref = match git_ref {
+        Some(git_ref) => git_ref.clone(),
+        None => infer_adopted_checkout_ref(runner, &path).await?,
+    };
+    let checkout_ref = adopted_checkout_name(convoy_name);
+    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
+    let meta = InputMeta::builder()
+        .name(checkout_ref.clone())
+        .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
+        .build()
+        .with_lifecycle_authority(LifecycleAuthority::Adopted);
+    let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+        r#ref: git_ref.clone(),
+        path: path_str.clone(),
+        repo_ref: repo_url.clone(),
+        is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
+    });
+
+    let checkout = match checkouts.create(&meta, &spec).await {
+        Ok(checkout) => checkout,
+        Err(ResourceError::Conflict { .. }) => {
+            let existing = checkouts.get(&checkout_ref).await.map_err(|err| err.to_string())?;
+            if existing.metadata.lifecycle_authority().map_err(|err| err.to_string())? != Some(LifecycleAuthority::Adopted) {
+                return Err(format!("checkout {checkout_ref} already exists but is not adopted"));
+            }
+            if existing.spec != spec {
+                return Err(format!("checkout {checkout_ref} already exists with different adopted checkout details"));
+            }
+            existing
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    checkouts
+        .update_status(&checkout_ref, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some(path_str),
+            commit: None,
+            message: None,
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+
+    Ok((checkout_ref, repo_url, git_ref))
 }
 
 async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str) -> Option<String> {
@@ -2054,6 +2137,7 @@ impl InProcessDaemon {
             r#ref,
             project_ref,
             placement_policy,
+            adopted_checkout,
         } = &command.action
         {
             let empty_identity = empty_repo_identity();
@@ -2066,17 +2150,89 @@ impl InProcessDaemon {
             });
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+            match convoys.get(name).await {
+                Ok(_) => {
+                    let result = flotilla_protocol::CommandValue::Error { message: format!("convoy {name} already exists") };
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result,
+                    });
+                    return Ok(id);
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(err) => {
+                    let result = flotilla_protocol::CommandValue::Error { message: err.to_string() };
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result,
+                    });
+                    return Ok(id);
+                }
+            }
             let placement_policy = match placement_policy {
                 Some(policy) => Some(policy.clone()),
                 None => default_convoy_placement_policy(&self.resource_backend, &namespace).await,
+            };
+            let mut repository_url = repository_url.clone();
+            let mut r#ref = r#ref.clone();
+            let adopted_checkout_ref = match adopted_checkout {
+                Some(path) => match self.local_command_runner() {
+                    Some(runner) => match create_adopted_checkout_resource(
+                        &self.resource_backend,
+                        &namespace,
+                        name,
+                        path.as_ref(),
+                        repository_url.as_ref(),
+                        r#ref.as_ref(),
+                        runner.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok((checkout_ref, inferred_repository_url, inferred_ref)) => {
+                            repository_url.get_or_insert(inferred_repository_url);
+                            r#ref.get_or_insert(inferred_ref);
+                            Some(checkout_ref)
+                        }
+                        Err(message) => {
+                            let result = flotilla_protocol::CommandValue::Error { message };
+                            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                                command_id: id,
+                                node_id: self.node_id.clone(),
+                                repo_identity: empty_identity,
+                                repo: None,
+                                result,
+                            });
+                            return Ok(id);
+                        }
+                    },
+                    None => {
+                        let result = flotilla_protocol::CommandValue::Error { message: "local command runner unavailable".to_string() };
+                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                            command_id: id,
+                            node_id: self.node_id.clone(),
+                            repo_identity: empty_identity,
+                            repo: None,
+                            result,
+                        });
+                        return Ok(id);
+                    }
+                },
+                None => None,
             };
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
                 placement_policy,
-                repository: repository_url.clone().map(|url| ConvoyRepositorySpec { url }),
-                r#ref: r#ref.clone(),
+                repository: repository_url.map(|url| ConvoyRepositorySpec { url }),
+                r#ref,
                 project_ref: project_ref.clone(),
+                adopted_checkout_ref,
             };
             let meta = InputMeta::builder().name(name.clone()).build();
             let result = match convoys.create(&meta, &spec).await {

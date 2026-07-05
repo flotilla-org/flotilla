@@ -3,13 +3,14 @@ use std::{collections::BTreeMap, marker::PhantomData};
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
-    controller::{delete_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
-    FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, ProcessDefinition, ProcessSource, Resource, ResourceBackend, ResourceError, ResourceObject, TaskWorkspace,
-    TaskWorkspacePhase, TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, CONVOY_LABEL,
-    PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority,
+    OwnerReference, PlacementPolicy, PlacementPolicySpec, ProcessDefinition, ProcessSource, Resource, ResourceBackend, ResourceError,
+    ResourceObject, TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSpec, TypedResolver, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL,
+    TASK_WORKSPACE_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -159,11 +160,12 @@ impl Reconciler for TaskWorkspaceReconciler {
         };
         let repo_key = repo_key(&canonical_repo);
         let repo_slug = descriptive_repo_slug(&canonical_repo);
+        let adopted_checkout_ref = obj.spec.adopted_checkout_ref.clone();
 
         let clone_env_ref = host_direct_environment_name(strategy.host_ref());
         let mut actuations = Vec::new();
 
-        let clone_name = if strategy.needs_shared_clone() {
+        let clone_name = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
             let clone_env = match self.environments.get(&clone_env_ref).await {
                 Ok(environment) => environment,
                 Err(ResourceError::NotFound { .. }) => {
@@ -263,7 +265,7 @@ impl Reconciler for TaskWorkspaceReconciler {
             _ => None,
         };
 
-        let checkout_name = checkout_name(&obj.metadata.name);
+        let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| checkout_name(&obj.metadata.name));
         let checkout_target_path = match &strategy {
             PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                 let clone_env = match self.environments.get(&clone_env_ref).await {
@@ -285,6 +287,9 @@ impl Reconciler for TaskWorkspaceReconciler {
         let checkout_ready_path;
         match self.checkouts.get(&checkout_name).await {
             Ok(existing) => {
+                if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
+                    return Ok(TaskWorkspaceDeps::failed(format!("checkout {checkout_name} is not adopted")));
+                }
                 if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
                     let message = existing
                         .status
@@ -308,6 +313,9 @@ impl Reconciler for TaskWorkspaceReconciler {
                 }
             }
             Err(ResourceError::NotFound { .. }) => {
+                if adopted_checkout_ref.is_some() {
+                    return Ok(TaskWorkspaceDeps::failed(format!("adopted checkout {checkout_name} not found")));
+                }
                 let spec = match &strategy {
                     PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                         CheckoutSpec::Worktree(CheckoutWorktreeSpec {
@@ -474,9 +482,9 @@ impl Reconciler for TaskWorkspaceReconciler {
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         let selector = BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), obj.metadata.name.clone())]);
 
-        delete_matching(&self.terminal_sessions, &selector).await?;
-        delete_matching(&self.checkouts, &selector).await?;
-        delete_matching(&self.environments, &selector).await?;
+        delete_lifecycle_owned_matching(&self.terminal_sessions, &selector).await?;
+        delete_lifecycle_owned_matching(&self.checkouts, &selector).await?;
+        delete_lifecycle_owned_matching(&self.environments, &selector).await?;
 
         Ok(())
     }
@@ -484,6 +492,23 @@ impl Reconciler for TaskWorkspaceReconciler {
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/task-workspace-teardown")
     }
+}
+
+async fn delete_lifecycle_owned_matching<T: Resource>(
+    resolver: &TypedResolver<T>,
+    selector: &BTreeMap<String, String>,
+) -> Result<(), ResourceError> {
+    let listed = resolver.list_matching_labels(selector).await?;
+    for object in listed.items {
+        if matches!(object.metadata.lifecycle_authority()?, Some(LifecycleAuthority::Observed | LifecycleAuthority::Adopted)) {
+            continue;
+        }
+        match resolver.delete(&object.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, String> {

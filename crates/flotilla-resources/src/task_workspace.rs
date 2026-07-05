@@ -10,6 +10,8 @@ pub struct TaskWorkspaceSpec {
     pub convoy_ref: String,
     pub task: String,
     pub placement_policy_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_checkout_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

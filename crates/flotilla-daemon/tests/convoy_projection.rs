@@ -37,6 +37,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         repository: None,
         r#ref: None,
         project_ref: None,
+        adopted_checkout_ref: None,
     }
 }
 

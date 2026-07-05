@@ -964,10 +964,10 @@ mod tests {
         in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
         providers::discovery::{test_support::git_process_discovery, EnvironmentAssertion, EnvironmentBag},
     };
-    use flotilla_protocol::{Command, CommandAction};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent};
     use flotilla_resources::{
-        ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, PlacementPolicy, ProcessDefinition, ProcessSource, SqliteBackend, TaskDefinition,
-        TaskPhase, TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
+        Checkout as ResourceCheckout, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, LifecycleAuthority, PlacementPolicy,
+        ProcessDefinition, ProcessSource, SqliteBackend, TaskDefinition, TaskPhase, TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -1091,6 +1091,7 @@ mod tests {
                 repository: Some(ConvoyRepositorySpec { url: "https://github.com/flotilla-org/flotilla.git".to_string() }),
                 r#ref: Some("main".to_string()),
                 project_ref: None,
+                adopted_checkout_ref: None,
             })
             .await
             .expect("convoy create should succeed");
@@ -1175,6 +1176,20 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "timed out waiting for condition");
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    async fn wait_for_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                    Ok(_) => {}
+                    Err(err) => panic!("unexpected event error: {err}"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for command result")
     }
 
     #[tokio::test]
@@ -1298,5 +1313,140 @@ mod tests {
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_adopted_checkout_flow_reaches_running_and_preserves_checkout_on_complete() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_default_dir = temp.path().join("flotilla-repos");
+        std::fs::create_dir_all(&repo_default_dir).expect("repo default dir");
+        let git_repo =
+            TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+        let repo = git_repo.path().to_path_buf();
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
+        let host_id = daemon.local_host_id().expect("local host id").to_string();
+        let profile =
+            LocalProvisioningProfile { repo_default_dir: repo_default_dir.display().to_string(), ..manual_profile(&host_id, false) };
+        let backend = daemon.resource_backend();
+
+        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup registration should succeed");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat should succeed");
+
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&config),
+            passthrough_registry(),
+            None,
+            profile.host_id.clone(),
+            Some(ExecutionEnvironmentPath::new(&repo)),
+            profile.host_direct_environment_name(),
+        ));
+        let namespace_projection_state = NamespaceProjectionState::new();
+        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let controller_handles = spawn_controller_loops(
+            Arc::clone(&state),
+            NAMESPACE,
+            Duration::from_millis(25),
+            ControllerSupervision::default(),
+            namespace_projection_state,
+        );
+
+        backend
+            .clone()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(
+                &empty_meta("wf-a"),
+                &WorkflowTemplateSpec::builder()
+                    .inputs(Vec::new())
+                    .tasks(vec![TaskDefinition::builder()
+                        .name("implement".to_string())
+                        .processes(vec![ProcessDefinition::builder()
+                            .role("coder".to_string())
+                            .source(ProcessSource::Tool { command: "bash -lc 'echo adopted-stage4a'".to_string() })
+                            .build()])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("workflow template create should succeed");
+
+        let mut rx = daemon.subscribe();
+        let create_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "convoy-adopted".to_string(),
+                    workflow_ref: "wf-a".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: Some(format!("host-direct-{host_id}")),
+                    adopted_checkout: Some(Box::new(repo.clone())),
+                },
+            })
+            .await
+            .expect("convoy create command should start");
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                matches!(
+                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    Some(status)
+                        if status.phase == ConvoyPhase::Active
+                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
+                )
+            }
+        })
+        .await;
+
+        let complete_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyTaskComplete {
+                    convoy: "convoy-adopted".to_string(),
+                    task: "implement".to_string(),
+                    message: Some("done".to_string()),
+                },
+            })
+            .await
+            .expect("convoy completion command should start");
+        assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
+
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                matches!(
+                    convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    Some(status)
+                        if status.phase == ConvoyPhase::Completed
+                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Completed)
+                )
+            }
+        })
+        .await;
+
+        let checkout = backend
+            .clone()
+            .using::<ResourceCheckout>(NAMESPACE)
+            .get("adopted-checkout-convoy-adopted")
+            .await
+            .expect("adopted checkout should remain after completion");
+        assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
+        assert!(backend.clone().using::<ResourceCheckout>(NAMESPACE).get("checkout-convoy-adopted-implement").await.is_err());
+
+        for handle in controller_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }

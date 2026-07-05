@@ -162,6 +162,8 @@ pub enum CommandAction {
         project_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         placement_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_checkout: Option<Box<PathBuf>>,
     },
     WorkflowTemplateApply {
         name: String,
@@ -547,6 +549,7 @@ mod tests {
                     r#ref: Some("main".into()),
                     project_ref: Some("my-project".into()),
                     placement_policy: Some("host-direct-local".into()),
+                    adopted_checkout: None,
                 },
             },
             Command {

@@ -411,6 +411,7 @@ mod tests {
                 repository: None,
                 r#ref: None,
                 project_ref: None,
+                adopted_checkout_ref: None,
             },
             status: Some(ConvoyStatus { phase, workflow_snapshot, tasks: task_states, ..Default::default() }),
         }
@@ -427,6 +428,7 @@ mod tests {
                 repository: None,
                 r#ref: None,
                 project_ref: None,
+                adopted_checkout_ref: None,
             },
             status: Some(ConvoyStatus {
                 phase: ResConvoyPhase::Active,
@@ -467,6 +469,7 @@ mod tests {
                 repository: None,
                 r#ref: None,
                 project_ref: None,
+                adopted_checkout_ref: None,
             },
             status: Some(ConvoyStatus {
                 phase: ResConvoyPhase::Pending,
