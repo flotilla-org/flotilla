@@ -26,19 +26,37 @@ _Avoid_: Repo (a Project may span more than the bare git remote), Workspace.
 
 **Convoy**:
 A named instance of a workflow — the primary unit of *launched* work. A DAG of
-**Tasks** that cooperate to accomplish something. Replaces the older "attachable
+**Legs** that cooperate to accomplish something. Replaces the older "attachable
 set" / "new branch" framing.
 _Avoid_: Job, pipeline, attachable set.
 
-**Task**:
-A placement unit within a **Convoy** — a single (host, checkout, environment)
-placement that hosts one or more **Processes**. Completed explicitly, not by
-process exit.
-_Avoid_: Step (a Task is a placement, not a workflow stage), pod.
+**Leg**:
+A workflow stage within a **Convoy** — one node of its DAG. A Leg executes
+aboard a **Vessel** and is completed explicitly, not by process exit. Often
+implicit: a trivial convoy has a single implicit Leg, and Legs may stay out of
+the UX until workflow patterns settle.
+_Avoid_: Task (retired — it conflated stage with placement; code types such as
+`TaskSummary`/`TaskWorkspace` keep the old name until renamed opportunistically),
+Step, pod.
+
+**Vessel**:
+The placement unit a **Leg** executes aboard — an (environment + checkout) unit
+on some host, hosting a **Crew**. Its lifecycle is independent of Legs: it may be
+provisioned (Managed), **adopted** (an existing worktree, per **Lifecycle
+Authority**), kept *warm* between Legs, or revisited by later Legs in loopy
+workflows (e.g. a main dev vessel that fans out to platform-test vessels and
+collates results across iterations).
+_Avoid_: Task, TaskWorkspace, workspace, container.
+
+**Crew**:
+The set of **Processes** (agents and terminals, typically a cleat pool) running
+aboard a **Vessel** for a **Leg** — the thing one attaches to.
+_Avoid_: Attachable set, session group.
 
 **Process**:
-A running program within a **Task**, resolved to a placement by selectors
-(e.g. `capability: code`) rather than by template variable substitution.
+A running program aboard a **Vessel**, as a member of its **Crew**, resolved to
+a placement by selectors (e.g. `capability: code`) rather than by template
+variable substitution.
 _Avoid_: Pane, terminal (those are presentation concerns).
 
 **CloudAgent**:
@@ -132,12 +150,12 @@ _Avoid_: Epoch, session, restart-id.
 
 **Provisioning**:
 Bringing an execution context into being — a checkout, an **Environment**
-(container/host-direct), the sockets and forwarding a **Task** needs to run.
+(container/host-direct), the sockets and forwarding a **Vessel** needs to run.
 Interacts closely with **Federation**.
 _Avoid_: Setup, bootstrap.
 
 **Environment**:
-A provisioned execution context in which a **Task**'s **Processes** run —
+A provisioned execution context in which a **Vessel**'s **Processes** run —
 host-direct, a nested container/sandbox (docker, sandbox-exec, firecracker), or
 service-provided (runpod, modal, aws). Most resources live *in* an Environment.
 A **Host** is/has a direct environment and may contain nested ones; the precise
