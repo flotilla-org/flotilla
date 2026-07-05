@@ -102,6 +102,9 @@ pub enum CommandAction {
     SelectWorkspace {
         ws_ref: String,
     },
+    Attach {
+        reference: String,
+    },
     PrepareTerminalForCheckout {
         checkout_path: PathBuf,
         /// Role→command mappings from the requesting host's template.
@@ -242,6 +245,7 @@ impl CommandAction {
                 | CommandAction::QueryHostList {}
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
+                | CommandAction::Attach { .. }
                 | CommandAction::QueryIssues { .. }
                 | CommandAction::QueryIssueFetchByIds { .. }
                 | CommandAction::QueryIssueOpenInBrowser { .. }
@@ -255,6 +259,7 @@ impl Command {
             CommandAction::CreateWorkspaceForCheckout { .. } => "Creating workspace...",
             CommandAction::CreateWorkspaceFromPreparedTerminal { .. } => "Creating workspace...",
             CommandAction::SelectWorkspace { .. } => "Switching workspace...",
+            CommandAction::Attach { .. } => "Resolving attach target...",
             CommandAction::PrepareTerminalForCheckout { .. } => "Preparing terminal...",
             CommandAction::Checkout { target, .. } => match target {
                 CheckoutTarget::Branch(_) => "Checking out branch...",
@@ -487,6 +492,12 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::SelectWorkspace { ws_ref: "ws://1".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a".into() },
             },
             Command {
                 node_id: None,

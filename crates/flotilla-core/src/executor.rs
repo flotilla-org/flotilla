@@ -6,7 +6,7 @@
 pub(crate) mod checkout;
 mod session_actions;
 mod terminals;
-mod workspace;
+pub(crate) mod workspace;
 
 use std::{
     path::{Path, PathBuf},
@@ -322,6 +322,7 @@ pub async fn build_plan(
         | CommandAction::QueryHostList {}
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }
+        | CommandAction::Attach { .. }
         | CommandAction::QueryIssues { .. }
         | CommandAction::QueryIssueFetchByIds { .. }
         | CommandAction::QueryIssueOpenInBrowser { .. } => {
