@@ -1,8 +1,10 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    namespace::NamespaceSnapshot,
     snapshot::{ProviderError, WorkItem},
     EnvironmentInfo, HostName, HostSummary, NodeInfo, PeerConnectionState,
 };
@@ -78,6 +80,66 @@ pub struct RepoWorkResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
     pub work_items: Vec<WorkItem>,
+}
+
+// --- fleet listing / replicas ---
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetListResponse {
+    pub rows: Vec<FleetListRow>,
+    #[serde(default)]
+    pub replicas: Vec<FleetReplicaStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetListRow {
+    pub convoy: String,
+    pub vessel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority: Option<String>,
+    pub crew: String,
+    pub crew_state: String,
+    pub host: HostName,
+    pub staleness: FleetStaleness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FleetStaleness {
+    Local,
+    Fresh {
+        last_sync: DateTime<Utc>,
+    },
+    Stale {
+        last_sync: DateTime<Utc>,
+    },
+    Unreachable {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_sync: Option<DateTime<Utc>>,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetReplicaStatus {
+    pub host: HostName,
+    pub reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetReplicaSnapshot {
+    pub host: HostName,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    pub rows: Vec<FleetListRow>,
+    #[serde(default)]
+    pub namespaces: Vec<NamespaceSnapshot>,
 }
 
 // --- host / topology ---

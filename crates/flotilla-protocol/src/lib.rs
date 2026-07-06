@@ -89,9 +89,9 @@ pub use provider_data::{
     WorkingTreeStatus, Workspace,
 };
 pub use query::{
-    DiscoveryEntry, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo,
-    RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute,
-    UnmetRequirementInfo,
+    DiscoveryEntry, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry,
+    HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse,
+    RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 use serde::{Deserialize, Serialize};
 

@@ -97,8 +97,10 @@ impl DaemonRuntime {
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
 
-        let mut tasks =
-            vec![spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval)];
+        let mut tasks = vec![
+            spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval),
+            spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
+        ];
 
         if options.start_controllers {
             let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
@@ -462,6 +464,19 @@ fn spawn_heartbeat_task(
             ticker.tick().await;
             if let Err(err) = apply_host_heartbeat(&daemon, &namespace, &profile).await {
                 warn!(%err, "failed to publish host heartbeat");
+            }
+        }
+    })
+}
+
+fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = daemon.refresh_fleet_replicas_once().await {
+                warn!(%err, "failed to refresh fleet replicas");
             }
         }
     })

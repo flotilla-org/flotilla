@@ -1,7 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use async_trait::async_trait;
@@ -11,9 +11,10 @@ use flotilla_protocol::{
     EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, RepoSelector, SystemInfo, ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoyPhase,
-    ConvoySpec, ConvoyStatus, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec,
-    InputMeta, LifecycleAuthority, TaskPhase, TaskState, TerminalSession as ResourceTerminalSession,
+    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Environment as ResourceEnvironment,
+    EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, TaskPhase, TaskState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSpec as ResourceTerminalSessionSpec,
     TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL, TASK_WORKSPACE_LABEL,
 };
@@ -34,7 +35,7 @@ use crate::{
             EnvironmentAssertion, EnvironmentBag,
         },
         environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
-        CommandRunner,
+        ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 
@@ -213,6 +214,247 @@ async fn create_running_attach_session_with_pool(
         })
         .await
         .expect("terminal session should be running");
+}
+
+async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &str) {
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout_name = format!("adopted-checkout-{convoy}");
+    let created = checkouts
+        .create(
+            &InputMeta::builder()
+                .name(checkout_name.clone())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: "main".to_string(),
+                path: "/repo".to_string(),
+                repo_ref: "git@example.com:owner/repo.git".to_string(),
+                is_main: true,
+            }),
+        )
+        .await
+        .expect("adopted checkout should be created");
+    checkouts
+        .update_status(&checkout_name, &created.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/repo".to_string()),
+            commit: None,
+            message: None,
+        })
+        .await
+        .expect("adopted checkout should be ready");
+}
+
+#[test]
+fn fleet_replica_ssh_args_wraps_snapshot_command_in_remote_login_shell() {
+    let remote = crate::config::RemoteHostConfig {
+        hostname: "feta.local".to_string(),
+        expected_host_name: "feta".to_string(),
+        expected_node_id: None,
+        user: Some("alice".to_string()),
+        daemon_socket: "/tmp/flotilla.sock".to_string(),
+        ssh_multiplex: None,
+    };
+
+    let args = fleet_replica_ssh_args(&remote, false);
+
+    assert_eq!(&args[..5], ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2"]);
+    assert_eq!(args[5], "-o");
+    assert_eq!(args[6], "ConnectionAttempts=1");
+    assert_eq!(args[7], "alice@feta.local");
+    assert_eq!(args.len(), 9);
+
+    let remote_command = args.last().expect("remote command arg");
+    assert!(remote_command.starts_with("${SHELL:-/bin/sh} -l -c "), "remote command should start with login shell: {remote_command}");
+    assert!(remote_command.contains("exec flotilla --socket"), "remote command should execute flotilla: {remote_command}");
+    assert!(remote_command.contains("/tmp/flotilla.sock"), "remote command should include socket: {remote_command}");
+    assert!(remote_command.contains("replica-snapshot"), "remote command should include hidden subcommand: {remote_command}");
+    assert!(!args.iter().any(|arg| arg == "&&"), "shell operators must not be separate SSH argv elements: {args:?}");
+}
+
+#[test]
+fn fleet_replica_ssh_args_preserves_multiplex_options() {
+    let remote = crate::config::RemoteHostConfig {
+        hostname: "feta.local".to_string(),
+        expected_host_name: "feta".to_string(),
+        expected_node_id: None,
+        user: None,
+        daemon_socket: "/tmp/flotilla.sock".to_string(),
+        ssh_multiplex: None,
+    };
+
+    let args = fleet_replica_ssh_args(&remote, true);
+
+    assert!(args.windows(2).any(|window| window == ["-o", "ControlMaster=auto"]));
+    assert!(args.windows(2).any(|window| window == ["-o", "ControlPath=/tmp/flotilla-ssh-%C"]));
+    assert!(args.windows(2).any(|window| window == ["-o", "ControlPersist=60"]));
+    assert_eq!(args[13], "feta.local");
+    assert!(args[14].starts_with("${SHELL:-/bin/sh} -l -c "));
+}
+
+struct QueuedOutputRunner {
+    outputs: Mutex<VecDeque<CommandOutput>>,
+}
+
+impl QueuedOutputRunner {
+    fn new(outputs: Vec<CommandOutput>) -> Self {
+        Self { outputs: Mutex::new(outputs.into()) }
+    }
+}
+
+#[async_trait]
+impl CommandRunner for QueuedOutputRunner {
+    async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "git" && args == ["--version"] {
+            Ok("git version 2.43.0".to_string())
+        } else {
+            Err(format!("QueuedOutputRunner: no run response for {cmd} {}", args.join(" ")))
+        }
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+        assert_eq!(cmd, "ssh");
+        assert!(args.contains(&"ConnectTimeout=2"), "replica fetch should bound ssh connection time: {args:?}");
+        assert!(
+            args.last().is_some_and(|arg| arg.starts_with("${SHELL:-/bin/sh} -l -c ") && arg.contains("exec flotilla")),
+            "replica fetch should pass one remote command through the remote login shell: {args:?}"
+        );
+        self.outputs.lock().expect("outputs mutex").pop_front().ok_or_else(|| "no queued output".to_string())
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn fleet_list_reports_store_backed_local_sessions_with_authority() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_adopted_checkout_for_convoy(&daemon, "convoy-a").await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert!(response.replicas.is_empty());
+    assert_eq!(response.rows.len(), 1);
+    let row = &response.rows[0];
+    assert_eq!(row.convoy, "convoy-a");
+    assert_eq!(row.vessel, env_ref);
+    assert_eq!(row.authority.as_deref(), Some("adopted"));
+    assert_eq!(row.crew, "implement/coder");
+    assert_eq!(row.crew_state, "running");
+    assert_eq!(row.host, daemon.host_name);
+    assert_eq!(row.staleness, FleetStaleness::Local);
+
+    let snapshot = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot should succeed");
+    assert_eq!(snapshot.host, daemon.host_name);
+    assert_eq!(snapshot.rows, response.rows);
+}
+
+#[tokio::test]
+async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let last_sync = Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1);
+    daemon.fleet_replica_cache.write().await.insert(HostName::new("feta"), FleetReplicaCacheEntry {
+        rows: vec![FleetListRow {
+            convoy: "convoy-remote".to_string(),
+            vessel: "remote-env".to_string(),
+            authority: None,
+            crew: "implement/coder".to_string(),
+            crew_state: "running".to_string(),
+            host: HostName::new("feta"),
+            staleness: FleetStaleness::Local,
+        }],
+        last_sync: Some(last_sync),
+        generation: Some("gen-1".to_string()),
+        last_error: Some("connection refused".to_string()),
+    });
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.rows.len(), 1);
+    assert!(matches!(
+        &response.rows[0].staleness,
+        FleetStaleness::Unreachable { last_sync: Some(sync), ref message } if *sync == last_sync && message == "connection refused"
+    ));
+    assert_eq!(response.replicas.len(), 1);
+    assert_eq!(response.replicas[0].host, HostName::new("feta"));
+    assert!(!response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].last_sync, Some(last_sync));
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-1"));
+    assert_eq!(response.replicas[0].message.as_deref(), Some("connection refused"));
+}
+
+#[tokio::test]
+async fn replica_refresh_replaces_rows_when_generation_changes() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let first = FleetReplicaSnapshot {
+        host: HostName::new("feta"),
+        generation: Some("gen-1".to_string()),
+        rows: vec![FleetListRow {
+            convoy: "old-convoy".to_string(),
+            vessel: "old-env".to_string(),
+            authority: None,
+            crew: "implement/coder".to_string(),
+            crew_state: "running".to_string(),
+            host: HostName::new("feta"),
+            staleness: FleetStaleness::Local,
+        }],
+        namespaces: vec![],
+    };
+    let second = FleetReplicaSnapshot {
+        host: HostName::new("feta"),
+        generation: Some("gen-2".to_string()),
+        rows: vec![FleetListRow {
+            convoy: "new-convoy".to_string(),
+            vessel: "new-env".to_string(),
+            authority: Some("adopted".to_string()),
+            crew: "reviewer".to_string(),
+            crew_state: "stopped".to_string(),
+            host: HostName::new("feta"),
+            staleness: FleetStaleness::Local,
+        }],
+        namespaces: vec![],
+    };
+    let runner = Arc::new(QueuedOutputRunner::new(vec![
+        CommandOutput { stdout: serde_json::to_string(&first).expect("serialize first snapshot"), stderr: String::new(), success: true },
+        CommandOutput { stdout: serde_json::to_string(&second).expect("serialize second snapshot"), stderr: String::new(), success: true },
+    ]));
+    let mut discovery =
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new())));
+    discovery.runner = runner;
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+
+    daemon.refresh_fleet_replicas_once().await.expect("first refresh should succeed");
+    daemon.refresh_fleet_replicas_once().await.expect("second refresh should succeed");
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(response.rows[0].convoy, "new-convoy");
+    assert_eq!(response.rows[0].authority.as_deref(), Some("adopted"));
+    assert!(matches!(&response.rows[0].staleness, FleetStaleness::Fresh { .. }));
+    assert_eq!(response.replicas.len(), 1);
+    assert!(response.replicas[0].reachable);
+    assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-2"));
 }
 
 #[test]
