@@ -39,6 +39,7 @@ use crate::{
     environment_manager::EnvironmentManager,
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
+    hop_chain::remote::ssh_resolver_from_config,
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
@@ -2001,7 +2002,7 @@ impl InProcessDaemon {
             0 => Err(format!("no attach target matching '{reference}'")),
             1 => {
                 let (_label, session) = matches.remove(0);
-                self.attach_command_for_session(&session).await
+                self.attach_command_for_session(reference, &session).await
             }
             _ => {
                 let mut labels: Vec<_> = matches.into_iter().map(|(label, _)| label).collect();
@@ -2014,6 +2015,7 @@ impl InProcessDaemon {
 
     async fn attach_command_for_session(
         &self,
+        reference: &str,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
     ) -> Result<String, String> {
         let namespace = self.provisioning_namespace().await;
@@ -2030,8 +2032,38 @@ impl InProcessDaemon {
             .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
         let target_host = self.target_host_for_resource_ref(host_ref);
+        if target_host != self.host_name {
+            return self.recursive_attach_command_for_remote(&target_host, reference).await;
+        }
+
+        self.local_attach_command_for_session(session, &environment).await
+    }
+
+    async fn recursive_attach_command_for_remote(&self, target_host: &HostName, reference: &str) -> Result<String, String> {
+        let next_hop = self.host_registry.next_hop_host_for_target_host(target_host).await?.unwrap_or_else(|| target_host.clone());
+        if next_hop == self.host_name {
+            return Err(format!("unreachable next hop for host '{target_host}': route points back to local host"));
+        }
+
+        let resolver = ssh_resolver_from_config(self.config.base_path())?;
+        let command = vec![
+            flotilla_protocol::arg::Arg::Literal("flotilla".to_string()),
+            flotilla_protocol::arg::Arg::Literal("attach".to_string()),
+            flotilla_protocol::arg::Arg::Quoted(reference.to_string()),
+        ];
+        let args = resolver
+            .one_hop_command_args(&next_hop, command)
+            .map_err(|err| format!("unreachable next hop '{next_hop}' for host '{target_host}': {err}"))?;
+        Ok(flotilla_protocol::arg::flatten(&args, 0))
+    }
+
+    async fn local_attach_command_for_session(
+        &self,
+        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+    ) -> Result<String, String> {
         let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        let registry = self.registry_for_resource_environment(&environment, cwd.as_path()).await?;
+        let registry = self.registry_for_resource_environment(environment, cwd.as_path()).await?;
         let pool = registry
             .terminal_pools
             .get(&session.spec.pool)
@@ -2040,19 +2072,26 @@ impl InProcessDaemon {
         let session_name =
             session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
         let attach_args = pool.attach_args(session_name, &session.spec.command, &cwd, &Vec::new())?;
-        let command = ResolvedPaneCommand { role: session.spec.role.clone(), args: attach_args };
-        let environment_id = environment.spec.docker.as_ref().map(|_| EnvironmentId::new(session.spec.env_ref.clone()));
-        let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
-        let resolved = executor::workspace::resolve_prepared_commands_via_hop_chain(
-            &target_host,
-            cwd.as_path(),
-            &[command],
-            self.config.base_path().as_path(),
-            &self.host_name,
-            environment_id.as_ref(),
-            container_name,
-        )?;
-        resolved.into_iter().next().map(|(_, command)| command).ok_or_else(|| "attach command resolution produced no command".to_string())
+        if environment.spec.docker.is_some() {
+            let command = ResolvedPaneCommand { role: session.spec.role.clone(), args: attach_args };
+            let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
+            let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
+            let resolved = executor::workspace::resolve_prepared_commands_via_hop_chain(
+                &self.host_name,
+                cwd.as_path(),
+                &[command],
+                self.config.base_path().as_path(),
+                &self.host_name,
+                Some(&environment_id),
+                container_name,
+            )?;
+            return resolved
+                .into_iter()
+                .next()
+                .map(|(_, command)| command)
+                .ok_or_else(|| "attach command resolution produced no command".to_string());
+        }
+        Ok(flotilla_protocol::arg::flatten(&attach_args, 0))
     }
 
     fn target_host_for_resource_ref(&self, host_ref: &str) -> HostName {

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId,
-    EnvironmentStatus, HostPath, ImageId, Issue, RepoSelector,
+    EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, RepoSelector, SystemInfo, ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoyPhase,
@@ -106,6 +106,58 @@ async fn create_local_attach_environment(daemon: &InProcessDaemon) -> String {
         .await
         .expect("environment should be created");
     env_name
+}
+
+async fn create_remote_attach_environment(daemon: &InProcessDaemon, host: &str) -> String {
+    let env_name = format!("host-direct-{host}");
+    daemon
+        .resource_backend()
+        .using::<ResourceEnvironment>("flotilla")
+        .create(&empty_input_meta(&env_name), &ResourceEnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host.to_string(), repo_default_dir: "/tmp".to_string() }),
+            docker: None,
+        })
+        .await
+        .expect("remote environment should be created");
+    env_name
+}
+
+fn write_attach_hosts_config(config_base: &Path, hosts: &[(&str, &str, Option<&str>)]) {
+    let mut toml = "[ssh]\nmultiplex = false\n".to_string();
+    for (label, hostname, user) in hosts {
+        toml.push_str(&format!(
+            "\n[hosts.{label}]\nhostname = \"{hostname}\"\nexpected_host_name = \"{label}\"\ndaemon_socket = \"/tmp/flotilla.sock\"\n"
+        ));
+        if let Some(user) = user {
+            toml.push_str(&format!("user = \"{user}\"\n"));
+        }
+    }
+    std::fs::write(config_base.join("hosts.toml"), toml).expect("write hosts config");
+}
+
+async fn publish_attach_host_summary(daemon: &InProcessDaemon, node_name: &str, host_name: &str) {
+    daemon
+        .host_registry
+        .publish_peer_summary(
+            HostSummary {
+                environment_id: EnvironmentId::host(HostId::new(format!("{node_name}-{host_name}-host"))),
+                host_name: Some(HostName::new(host_name)),
+                node: node(node_name),
+                system: SystemInfo {
+                    home_dir: Some(PathBuf::from("/home/test")),
+                    os: Some("linux".to_string()),
+                    arch: Some("aarch64".to_string()),
+                    cpu_count: Some(4),
+                    memory_total_mb: Some(8192),
+                    environment: HostEnvironment::BareMetal,
+                },
+                inventory: ToolInventory::default(),
+                providers: vec![],
+                environments: vec![],
+            },
+            &|_| {},
+        )
+        .await;
 }
 
 async fn create_running_attach_session(
@@ -222,6 +274,107 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
         .expect("attach query should execute");
 
     assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach cleat-session-1".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_remote_attach_environment(&daemon, "feta").await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "remote-provider-session",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the next host over SSH: {command}");
+    assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
+    assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
+    assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
+    assert!(!command.contains("remote-provider-session"), "remote hop must not include terminal-provider attach args: {command}");
+    assert_eq!(command.matches("flotilla attach").count(), 1, "command should contain exactly one recursive attach invocation: {command}");
+}
+
+#[tokio::test]
+async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    publish_attach_host_summary(&daemon, "feta", "feta").await;
+    publish_attach_host_summary(&daemon, "gouda", "gouda").await;
+    daemon
+        .set_topology_routes(vec![TopologyRoute {
+            target: node("gouda"),
+            next_hop: node("feta"),
+            direct: false,
+            connected: true,
+            fallbacks: vec![],
+        }])
+        .await;
+
+    let env_ref = create_remote_attach_environment(&daemon, "gouda").await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "gouda-provider-session",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the routed next hop: {command}");
+    assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
+    assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach on the next hop: {command}");
+    assert!(!command.contains("gouda.local"), "command should not try to jump directly to the final host: {command}");
+    assert!(!command.contains("gouda-provider-session"), "command should not embed final terminal-provider attach args: {command}");
 }
 
 #[tokio::test]
@@ -347,6 +500,111 @@ async fn attach_query_reports_no_matching_reference() {
         .expect("attach query should execute");
 
     assert_eq!(result, CommandValue::Error { message: "no attach target matching 'missing'".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_reports_unreachable_next_hop_for_remote_session_without_host_config() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_remote_attach_environment(&daemon, "missing-host").await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::Error { message } = result else {
+        panic!("expected unreachable next-hop error, got {result:?}");
+    };
+    assert!(message.contains("unreachable next hop 'missing-host'"), "message should identify the unreachable next hop: {message}");
+    assert!(message.contains("unknown remote host"), "message should include the host config lookup failure: {message}");
+}
+
+#[tokio::test]
+async fn attach_query_reports_route_that_points_back_to_local_host() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    publish_attach_host_summary(&daemon, "feta", "feta").await;
+    daemon
+        .set_topology_routes(vec![TopologyRoute {
+            target: node("feta"),
+            next_hop: NodeInfo::new(daemon.node_id().clone(), "local"),
+            direct: false,
+            connected: true,
+            fallbacks: vec![],
+        }])
+        .await;
+
+    let env_ref = create_remote_attach_environment(&daemon, "feta").await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::Error {
+        message: "unreachable next hop for host 'feta': route points back to local host".to_string()
+    });
+}
+
+#[tokio::test]
+async fn attach_query_reports_ambiguous_routed_host_name() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    publish_attach_host_summary(&daemon, "feta-a", "feta").await;
+    publish_attach_host_summary(&daemon, "feta-b", "feta").await;
+
+    let env_ref = create_remote_attach_environment(&daemon, "feta").await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::Error { message: "host name 'feta' matches multiple routed nodes".to_string() });
 }
 
 #[tokio::test]

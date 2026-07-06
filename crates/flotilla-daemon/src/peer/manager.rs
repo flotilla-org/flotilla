@@ -1284,17 +1284,16 @@ impl PeerManager {
         let mut routes: Vec<_> = self
             .routes
             .iter()
-            .map(|(target, route)| TopologyRoute {
-                target: self.node_info_for(target),
-                next_hop: self.node_info_for(&route.primary.next_hop),
-                direct: route.primary.next_hop == *target,
-                connected: self.route_hop_is_live(&route.primary),
-                fallbacks: route
-                    .fallbacks
-                    .iter()
-                    .filter(|hop| self.route_hop_is_live(hop))
-                    .map(|hop| self.node_info_for(&hop.next_hop))
-                    .collect(),
+            .map(|(target, route)| {
+                let mut fallbacks: Vec<_> = route.fallbacks.iter().filter(|hop| self.route_hop_is_live(hop)).collect();
+                fallbacks.sort_by_key(|hop| std::cmp::Reverse(hop.learned_epoch));
+                TopologyRoute {
+                    target: self.node_info_for(target),
+                    next_hop: self.node_info_for(&route.primary.next_hop),
+                    direct: route.primary.next_hop == *target,
+                    connected: self.route_hop_is_live(&route.primary),
+                    fallbacks: fallbacks.into_iter().map(|hop| self.node_info_for(&hop.next_hop)).collect(),
+                }
             })
             .collect();
         routes.sort_by(|a, b| a.target.node_id.cmp(&b.target.node_id));
