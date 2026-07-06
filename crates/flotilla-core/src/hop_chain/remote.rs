@@ -81,6 +81,25 @@ impl SshRemoteHopResolver {
         args.push(Arg::Quoted(info.target.clone()));
         args
     }
+
+    /// Build a single SSH hop that runs `command` on `host`.
+    ///
+    /// Unlike `resolve_wrap`, this intentionally does not inspect or wrap an
+    /// already-resolved inner action. Store-backed recursive attach uses this
+    /// to emit one next-hop command and lets the next daemon resolve the
+    /// following hop locally. The command still runs through a login shell so
+    /// user-installed tools such as `flotilla` under `~/.cargo/bin` are found.
+    pub fn one_hop_command_args(&self, host: &HostName, command: Vec<Arg>) -> Result<Vec<Arg>, String> {
+        let info = self.ssh_info(host)?;
+        let mut ssh_args = self.ssh_prefix_args(&info);
+        ssh_args.push(Arg::NestedCommand(vec![
+            Arg::Literal("${SHELL:-/bin/sh}".into()),
+            Arg::Literal("-l".into()),
+            Arg::Literal("-c".into()),
+            Arg::NestedCommand(command),
+        ]));
+        Ok(ssh_args)
+    }
 }
 
 impl RemoteHopResolver for SshRemoteHopResolver {

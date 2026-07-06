@@ -162,6 +162,50 @@ impl HostRegistry {
         build_topology(&self.local_node, &routes, &configured)
     }
 
+    pub(crate) async fn next_hop_host_for_target_host(&self, target_host: &HostName) -> Result<Option<HostName>, String> {
+        let local_host_name = self.local_host_summary.read().await.host_name.clone().unwrap_or_else(HostName::local);
+        let hosts = self.hosts.read().await;
+        let mut host_names_by_node: HashMap<NodeId, HostName> = hosts
+            .values()
+            .filter(|state| !state.removed)
+            .filter_map(|state| {
+                state.summary.as_ref().and_then(|summary| summary.host_name.clone()).map(|host| (state.node_id.clone(), host))
+            })
+            .collect();
+        host_names_by_node.insert(self.local_node.node_id.clone(), local_host_name);
+
+        let mut target_nodes: Vec<_> =
+            host_names_by_node.iter().filter_map(|(node, host)| (host == target_host).then_some(node.clone())).collect();
+        target_nodes.sort();
+        target_nodes.dedup();
+
+        let target_node = match target_nodes.as_slice() {
+            [] => return Ok(None),
+            [node] => node,
+            _ => return Err(format!("host name '{target_host}' matches multiple routed nodes")),
+        };
+
+        let routes = self.topology_routes.read().await;
+        let Some(route) = routes.iter().find(|route| route.target.node_id == *target_node) else {
+            return Ok(None);
+        };
+        let next_hop_node = if route.connected {
+            &route.next_hop.node_id
+        } else if let Some(fallback) = route.fallbacks.first() {
+            // PeerManager emits fallbacks most-recently learned first, matching
+            // its route promotion policy.
+            &fallback.node_id
+        } else {
+            return Err(format!("unreachable next hop for host '{target_host}'"));
+        };
+
+        host_names_by_node
+            .get(next_hop_node)
+            .cloned()
+            .ok_or_else(|| format!("unreachable next hop for host '{target_host}': no host summary for node {next_hop_node}"))
+            .map(Some)
+    }
+
     pub(crate) async fn replay_host_events(&self, last_seen: &HashMap<StreamKey, u64>) -> Vec<DaemonEvent> {
         let configured = self.configured_peers.read().await.clone();
         let node_connectivity = self.node_connectivity.read().await.clone();

@@ -868,6 +868,52 @@ async fn accepted_snapshot_refreshes_route_primary_to_live_hop() {
 }
 
 #[tokio::test]
+async fn topology_routes_sort_fallbacks_by_most_recently_learned() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let relay_a_generation =
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-a"), MockPeerSender::discard(), ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+    let relay_b_generation =
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-b"), MockPeerSender::discard(), ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+    let relay_c_generation =
+        accepted_generation(mgr.activate_connection(NodeId::new("relay-c"), MockPeerSender::discard(), ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+
+    mgr.routes.insert(NodeId::new("target"), RouteState {
+        primary: RouteHop { next_hop: NodeId::new("relay-a"), next_hop_generation: relay_a_generation, learned_epoch: 30 },
+        fallbacks: vec![
+            RouteHop { next_hop: NodeId::new("relay-b"), next_hop_generation: relay_b_generation, learned_epoch: 10 },
+            RouteHop { next_hop: NodeId::new("relay-c"), next_hop_generation: relay_c_generation, learned_epoch: 20 },
+        ],
+        candidates: Vec::new(),
+    });
+
+    let route = mgr
+        .topology_routes()
+        .into_iter()
+        .find(|route| route.target.node_id == NodeId::new("target"))
+        .expect("target route should be exposed");
+
+    assert_eq!(route.fallbacks.iter().map(|node| node.node_id.clone()).collect::<Vec<_>>(), vec![
+        NodeId::new("relay-c"),
+        NodeId::new("relay-b"),
+    ]);
+}
+
+#[tokio::test]
 async fn disconnect_peer_keeps_unrelated_pending_resync_requests() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
     let _ = accepted_generation(mgr.activate_connection(NodeId::new("target"), MockPeerSender::discard(), ConnectionMeta {
