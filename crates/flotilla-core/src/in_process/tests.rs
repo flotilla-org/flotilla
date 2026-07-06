@@ -246,6 +246,53 @@ async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &s
         .expect("adopted checkout should be ready");
 }
 
+#[test]
+fn fleet_replica_ssh_args_wraps_snapshot_command_in_remote_login_shell() {
+    let remote = crate::config::RemoteHostConfig {
+        hostname: "feta.local".to_string(),
+        expected_host_name: "feta".to_string(),
+        expected_node_id: None,
+        user: Some("alice".to_string()),
+        daemon_socket: "/tmp/flotilla.sock".to_string(),
+        ssh_multiplex: None,
+    };
+
+    let args = fleet_replica_ssh_args(&remote, false);
+
+    assert_eq!(&args[..5], ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=2"]);
+    assert_eq!(args[5], "-o");
+    assert_eq!(args[6], "ConnectionAttempts=1");
+    assert_eq!(args[7], "alice@feta.local");
+    assert_eq!(args.len(), 9);
+
+    let remote_command = args.last().expect("remote command arg");
+    assert!(remote_command.starts_with("${SHELL:-/bin/sh} -l -c "), "remote command should start with login shell: {remote_command}");
+    assert!(remote_command.contains("exec flotilla --socket"), "remote command should execute flotilla: {remote_command}");
+    assert!(remote_command.contains("/tmp/flotilla.sock"), "remote command should include socket: {remote_command}");
+    assert!(remote_command.contains("replica-snapshot"), "remote command should include hidden subcommand: {remote_command}");
+    assert!(!args.iter().any(|arg| arg == "&&"), "shell operators must not be separate SSH argv elements: {args:?}");
+}
+
+#[test]
+fn fleet_replica_ssh_args_preserves_multiplex_options() {
+    let remote = crate::config::RemoteHostConfig {
+        hostname: "feta.local".to_string(),
+        expected_host_name: "feta".to_string(),
+        expected_node_id: None,
+        user: None,
+        daemon_socket: "/tmp/flotilla.sock".to_string(),
+        ssh_multiplex: None,
+    };
+
+    let args = fleet_replica_ssh_args(&remote, true);
+
+    assert!(args.windows(2).any(|window| window == ["-o", "ControlMaster=auto"]));
+    assert!(args.windows(2).any(|window| window == ["-o", "ControlPath=/tmp/flotilla-ssh-%C"]));
+    assert!(args.windows(2).any(|window| window == ["-o", "ControlPersist=60"]));
+    assert_eq!(args[13], "feta.local");
+    assert!(args[14].starts_with("${SHELL:-/bin/sh} -l -c "));
+}
+
 struct QueuedOutputRunner {
     outputs: Mutex<VecDeque<CommandOutput>>,
 }
@@ -268,9 +315,10 @@ impl CommandRunner for QueuedOutputRunner {
 
     async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
         assert_eq!(cmd, "ssh");
+        assert!(args.contains(&"ConnectTimeout=2"), "replica fetch should bound ssh connection time: {args:?}");
         assert!(
-            args.contains(&"${SHELL:-/bin/sh}") && args.windows(2).any(|window| window == ["-l", "-c"]),
-            "replica fetch should run through the remote login shell: {args:?}"
+            args.last().is_some_and(|arg| arg.starts_with("${SHELL:-/bin/sh} -l -c ") && arg.contains("exec flotilla")),
+            "replica fetch should pass one remote command through the remote login shell: {args:?}"
         );
         self.outputs.lock().expect("outputs mutex").pop_front().ok_or_else(|| "no queued output".to_string())
     }

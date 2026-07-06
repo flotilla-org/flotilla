@@ -16,11 +16,13 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    qualified_path::QualifiedPath, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow,
-    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse,
-    HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse, StreamKey, SystemInfo,
-    ToolInventory, TopologyResponse, TopologyRoute,
+    arg::{flatten, Arg},
+    qualified_path::QualifiedPath,
+    Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
+    FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
+    NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo, RepoProvidersResponse,
+    RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse, StreamKey, SystemInfo, ToolInventory,
+    TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Checkout as ResourceCheckout,
@@ -278,7 +280,15 @@ fn ssh_destination(remote: &RemoteHostConfig) -> String {
 }
 
 fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<String> {
-    let mut args = vec!["-T".to_string(), "-o".to_string(), "BatchMode=yes".to_string()];
+    let mut args = vec![
+        "-T".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        format!("ConnectTimeout={}", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()),
+        "-o".to_string(),
+        "ConnectionAttempts=1".to_string(),
+    ];
     if multiplex {
         args.extend([
             "-o".to_string(),
@@ -290,17 +300,24 @@ fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<Str
         ]);
     }
     args.push(ssh_destination(remote));
-    args.push("${SHELL:-/bin/sh}".to_string());
-    args.push("-l".to_string());
-    args.push("-c".to_string());
-    args.push(format!(
-        "cd / && exec {} {} {} {} {}",
-        flotilla_protocol::arg::shell_quote("flotilla"),
-        flotilla_protocol::arg::shell_quote("--socket"),
-        flotilla_protocol::arg::shell_quote(remote.daemon_socket.as_str()),
-        flotilla_protocol::arg::shell_quote("--json"),
-        flotilla_protocol::arg::shell_quote("replica-snapshot"),
-    ));
+    let snapshot_command = vec![
+        Arg::Literal("cd".to_string()),
+        Arg::Quoted("/".to_string()),
+        Arg::Literal("&&".to_string()),
+        Arg::Literal("exec".to_string()),
+        Arg::Literal("flotilla".to_string()),
+        Arg::Literal("--socket".to_string()),
+        Arg::Quoted(remote.daemon_socket.clone()),
+        Arg::Literal("--json".to_string()),
+        Arg::Quoted("replica-snapshot".to_string()),
+    ];
+    let login_wrapper = vec![
+        Arg::Literal("${SHELL:-/bin/sh}".to_string()),
+        Arg::Literal("-l".to_string()),
+        Arg::Literal("-c".to_string()),
+        Arg::NestedCommand(snapshot_command),
+    ];
+    args.push(flatten(&login_wrapper, 0));
     args
 }
 
