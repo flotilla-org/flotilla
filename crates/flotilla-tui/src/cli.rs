@@ -3,9 +3,9 @@ use std::{collections::HashMap, path::Path};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandValue, DaemonEvent, EnvironmentInfo, EnvironmentStatus, HostProvidersResponse,
-    HostStatusResponse, NodeInfo, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse, StatusResponse,
-    StreamKey, TopologyResponse,
+    output::OutputFormat, Command, CommandValue, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetListResponse, FleetStaleness,
+    HostProvidersResponse, HostStatusResponse, NodeInfo, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
+    StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -242,6 +242,67 @@ fn format_topology_human(response: &TopologyResponse) -> String {
     out
 }
 
+fn format_fleet_staleness(staleness: &FleetStaleness) -> String {
+    match staleness {
+        FleetStaleness::Local => "local".to_string(),
+        FleetStaleness::Fresh { last_sync } => format!("fresh ({})", last_sync.format("%H:%M:%S")),
+        FleetStaleness::Stale { last_sync } => format!("stale ({})", last_sync.format("%H:%M:%S")),
+        FleetStaleness::Unreachable { last_sync, message } => match last_sync {
+            Some(last_sync) => format!("unreachable ({}, {})", last_sync.format("%H:%M:%S"), message),
+            None => format!("unreachable ({message})"),
+        },
+    }
+}
+
+fn format_fleet_list_human(response: &FleetListResponse) -> String {
+    let mut out = String::new();
+    if response.rows.is_empty() {
+        out.push_str("No crew sessions found.\n");
+    } else {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.set_header(vec!["Convoy", "Vessel", "Crew", "State", "Host", "Staleness"]);
+        for row in &response.rows {
+            let vessel = match &row.authority {
+                Some(authority) => format!("{} ({authority})", row.vessel),
+                None => row.vessel.clone(),
+            };
+            table.add_row(vec![
+                Cell::new(&row.convoy),
+                Cell::new(vessel),
+                Cell::new(&row.crew),
+                Cell::new(&row.crew_state),
+                Cell::new(row.host.as_str()),
+                Cell::new(format_fleet_staleness(&row.staleness)),
+            ]);
+        }
+        out.push_str(&table.to_string());
+        out.push('\n');
+    }
+
+    if response.replicas.iter().any(|replica| !replica.reachable) {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.set_header(vec!["Replica", "Status", "Last Sync", "Generation"]);
+        for replica in &response.replicas {
+            if replica.reachable {
+                continue;
+            }
+            table.add_row(vec![
+                Cell::new(replica.host.as_str()),
+                Cell::new(replica.message.as_deref().unwrap_or("unreachable")),
+                Cell::new(replica.last_sync.map(|ts| ts.to_rfc3339()).unwrap_or_else(|| "-".to_string())),
+                Cell::new(replica.generation.as_deref().unwrap_or("-")),
+            ]);
+        }
+        out.push_str("\nReplica status:\n");
+        out.push_str(&table.to_string());
+        out.push('\n');
+    }
+
+    out
+}
+
 /// Extract a short display name from a repo path (last path component).
 /// Falls back to the full path display for root or non-UTF-8 paths,
 /// matching `flotilla_core::model::repo_name`.
@@ -298,6 +359,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
+        CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
+        CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
         CommandValue::ImageEnsured { image } => format!("image ensured: {image}"),
         CommandValue::EnvironmentCreated { env_id } => format!("environment created: {env_id}"),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),

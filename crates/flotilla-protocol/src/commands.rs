@@ -6,7 +6,10 @@ use crate::{
     arg::Arg,
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
-    query::{HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse},
+    query::{
+        FleetListResponse, FleetReplicaSnapshot, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse,
+        RepoProvidersResponse, RepoWorkResponse,
+    },
     AttachableSetId, RepoIdentity,
 };
 #[cfg(test)]
@@ -232,6 +235,8 @@ pub enum CommandAction {
     QueryHostProviders {
         target_environment_id: crate::EnvironmentId,
     },
+    QueryFleetList {},
+    QueryFleetReplicaSnapshot {},
 }
 
 impl CommandAction {
@@ -245,6 +250,8 @@ impl CommandAction {
                 | CommandAction::QueryHostList {}
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
+                | CommandAction::QueryFleetList {}
+                | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::Attach { .. }
                 | CommandAction::QueryIssues { .. }
                 | CommandAction::QueryIssueFetchByIds { .. }
@@ -291,6 +298,8 @@ impl Command {
             CommandAction::QueryHostList {} => "query host list",
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
+            CommandAction::QueryFleetList {} => "query fleet list",
+            CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
         }
     }
 }
@@ -349,6 +358,8 @@ pub enum CommandValue {
     HostList(Box<HostListResponse>),
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
+    FleetList(Box<FleetListResponse>),
+    FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),
     ImageEnsured {
         image: crate::ImageId,
     },
@@ -404,8 +415,8 @@ mod tests {
     use crate::{
         arg::Arg,
         query::{
-            HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse,
-            RepoWorkResponse,
+            FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse,
+            HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
         },
         test_helpers::assert_json_roundtrip,
         AttachableSetId, HostEnvironment, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity, SystemInfo,
@@ -616,6 +627,8 @@ mod tests {
                 action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
             Command {
                 node_id: None,
                 provisioning_target: None,
@@ -798,6 +811,38 @@ mod tests {
                     environments: vec![],
                 },
                 visible_environments: vec![],
+            })),
+            CommandValue::FleetList(Box::new(FleetListResponse {
+                rows: vec![FleetListRow {
+                    convoy: "convoy-a".into(),
+                    vessel: "vessel-a".into(),
+                    authority: Some("adopted".into()),
+                    crew: "implement/main".into(),
+                    crew_state: "running".into(),
+                    host: crate::HostName::new("desktop"),
+                    staleness: FleetStaleness::Local,
+                }],
+                replicas: vec![FleetReplicaStatus {
+                    host: crate::HostName::new("feta"),
+                    reachable: false,
+                    last_sync: None,
+                    generation: None,
+                    message: Some("not synced".into()),
+                }],
+            })),
+            CommandValue::FleetReplicaSnapshot(Box::new(FleetReplicaSnapshot {
+                host: crate::HostName::new("desktop"),
+                generation: Some("7".into()),
+                rows: vec![FleetListRow {
+                    convoy: "convoy-a".into(),
+                    vessel: "vessel-a".into(),
+                    authority: None,
+                    crew: "main".into(),
+                    crew_state: "exited".into(),
+                    host: crate::HostName::new("desktop"),
+                    staleness: FleetStaleness::Local,
+                }],
+                namespaces: vec![],
             })),
             CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
             CommandValue::EnvironmentCreated { env_id: crate::EnvironmentId::new("env-1") },

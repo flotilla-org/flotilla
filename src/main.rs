@@ -56,11 +56,16 @@ enum SubCommand {
     Watch,
     /// Show the daemon's current multi-host routing view
     Topology,
+    /// List convoy vessels and crew sessions
+    Ls,
     /// Attach to a running convoy crew session
     Attach {
         /// Convoy, task, role, terminal session, or unique prefix
         reference: String,
     },
+    /// Emit this host's store-backed fleet replica snapshot
+    #[command(hide = true)]
+    ReplicaSnapshot,
     /// Receive agent hook events (called by agent hook systems)
     Hook {
         /// Agent harness name (e.g. claude-code, codex, gemini)
@@ -179,7 +184,9 @@ async fn main() -> Result<()> {
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
+        Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
         Some(SubCommand::Attach { reference }) => run_attach(&cli, &reference, format).await,
+        Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
 
@@ -392,6 +399,35 @@ async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<
         },
         CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
         other => Err(color_eyre::eyre::eyre!("unexpected attach response: {other:?}")),
+    }
+}
+
+async fn run_fleet_list(cli: &Cli, format: OutputFormat) -> Result<()> {
+    run_control_command(
+        cli,
+        Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
+        format,
+    )
+    .await
+}
+
+async fn run_replica_snapshot(cli: &Cli) -> Result<()> {
+    reset_sigpipe();
+    let daemon = connect_daemon(cli).await?;
+    let result = daemon
+        .execute_query(
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e))?;
+    match result {
+        CommandValue::FleetReplicaSnapshot(snapshot) => {
+            println!("{}", flotilla_protocol::output::json_pretty(&*snapshot));
+            Ok(())
+        }
+        CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
+        other => Err(color_eyre::eyre::eyre!("unexpected replica snapshot response: {other:?}")),
     }
 }
 
@@ -898,6 +934,12 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--json"]).expect("topology json should parse");
         assert!(matches!(cli.command, Some(SubCommand::Topology)));
         assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_ls_subcommand() {
+        let cli = Cli::try_parse_from(["flotilla", "ls"]).expect("ls cli should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Ls)));
     }
 
     #[test]

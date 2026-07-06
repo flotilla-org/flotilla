@@ -14,11 +14,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    qualified_path::QualifiedPath, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName,
-    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse,
-    StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    qualified_path::QualifiedPath, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow,
+    FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse,
+    HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo,
+    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse, StreamKey, SystemInfo,
+    ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Checkout as ResourceCheckout,
@@ -33,7 +35,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{ConfigStore, StaticEnvironmentConfig},
+    config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::DaemonHandle,
     environment_manager::EnvironmentManager,
@@ -248,6 +250,71 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>)
         (Some(convoy), None, Some(role)) => format!("{convoy}/{role} ({session_name})"),
         (Some(convoy), None, None) => format!("{convoy} ({session_name})"),
         _ => session_name.to_string(),
+    }
+}
+
+fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
+    match phase {
+        Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
+        Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),
+        Some(ResourceTerminalSessionPhase::Stopped) => "stopped".to_string(),
+    }
+}
+
+fn resource_environment_host_ref(environment: &flotilla_resources::ResourceObject<ResourceEnvironment>) -> Option<&str> {
+    environment
+        .spec
+        .host_direct
+        .as_ref()
+        .map(|spec| spec.host_ref.as_str())
+        .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+}
+
+fn ssh_destination(remote: &RemoteHostConfig) -> String {
+    match remote.user.as_deref() {
+        Some(user) if !user.is_empty() => format!("{user}@{}", remote.hostname),
+        _ => remote.hostname.clone(),
+    }
+}
+
+fn fleet_replica_ssh_args(remote: &RemoteHostConfig, multiplex: bool) -> Vec<String> {
+    let mut args = vec!["-T".to_string(), "-o".to_string(), "BatchMode=yes".to_string()];
+    if multiplex {
+        args.extend([
+            "-o".to_string(),
+            "ControlMaster=auto".to_string(),
+            "-o".to_string(),
+            "ControlPath=/tmp/flotilla-ssh-%C".to_string(),
+            "-o".to_string(),
+            "ControlPersist=60".to_string(),
+        ]);
+    }
+    args.push(ssh_destination(remote));
+    args.push("${SHELL:-/bin/sh}".to_string());
+    args.push("-l".to_string());
+    args.push("-c".to_string());
+    args.push(format!(
+        "cd / && exec {} {} {} {} {}",
+        flotilla_protocol::arg::shell_quote("flotilla"),
+        flotilla_protocol::arg::shell_quote("--socket"),
+        flotilla_protocol::arg::shell_quote(remote.daemon_socket.as_str()),
+        flotilla_protocol::arg::shell_quote("--json"),
+        flotilla_protocol::arg::shell_quote("replica-snapshot"),
+    ));
+    args
+}
+
+fn replica_staleness(entry: &FleetReplicaCacheEntry, now: DateTime<Utc>) -> FleetStaleness {
+    if let Some(message) = &entry.last_error {
+        return FleetStaleness::Unreachable { last_sync: entry.last_sync, message: message.clone() };
+    }
+    let Some(last_sync) = entry.last_sync else {
+        return FleetStaleness::Unreachable { last_sync: None, message: "replica has never synced".to_string() };
+    };
+    if now.signed_duration_since(last_sync).num_seconds() > FLEET_REPLICA_FRESH_SECS {
+        FleetStaleness::Stale { last_sync }
+    } else {
+        FleetStaleness::Fresh { last_sync }
     }
 }
 
@@ -614,6 +681,14 @@ fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
     ids.into_iter().collect()
 }
 
+#[derive(Debug, Clone)]
+struct FleetReplicaCacheEntry {
+    rows: Vec<FleetListRow>,
+    last_sync: Option<DateTime<Utc>>,
+    generation: Option<String>,
+    last_error: Option<String>,
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -666,12 +741,15 @@ pub struct InProcessDaemon {
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
     provisioning_namespace: RwLock<String>,
+    fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
 /// is called. Matches `RuntimeOptions::namespace`'s default so tests that construct
 /// the daemon directly hit the same namespace the runtime uses.
 pub const DEFAULT_PROVISIONING_NAMESPACE: &str = "flotilla";
+const FLEET_REPLICA_FRESH_SECS: i64 = 90;
+const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl InProcessDaemon {
     /// Create a new in-process daemon tracking the given repo paths.
@@ -796,6 +874,7 @@ impl InProcessDaemon {
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             namespace_projection_state: RwLock::new(NamespaceProjectionState::new()),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
+            fleet_replica_cache: RwLock::new(HashMap::new()),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -1973,6 +2052,182 @@ impl InProcessDaemon {
         Ok(response)
     }
 
+    pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {
+        let namespace = self.provisioning_namespace().await;
+        let (rows, generation) = self.local_fleet_rows(&namespace).await?;
+        let namespaces = self.namespace_projection_state().await.all_snapshots().await;
+        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, namespaces })
+    }
+
+    pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
+        let namespace = self.provisioning_namespace().await;
+        let (mut rows, _generation) = self.local_fleet_rows(&namespace).await?;
+        let mut replicas = Vec::new();
+        let now = Utc::now();
+        let configured_hosts = self.config.load_hosts().map(|hosts| hosts.hosts).unwrap_or_default();
+        let cache = self.fleet_replica_cache.read().await;
+
+        for (label, remote) in configured_hosts {
+            let host = HostName::new(remote.expected_host_name);
+            match cache.get(&host) {
+                Some(entry) => {
+                    let staleness = replica_staleness(entry, now);
+                    rows.extend(entry.rows.iter().cloned().map(|mut row| {
+                        row.staleness = staleness.clone();
+                        row
+                    }));
+                    replicas.push(FleetReplicaStatus {
+                        host,
+                        reachable: entry.last_error.is_none(),
+                        last_sync: entry.last_sync,
+                        generation: entry.generation.clone(),
+                        message: entry.last_error.clone(),
+                    });
+                }
+                None => {
+                    replicas.push(FleetReplicaStatus {
+                        host,
+                        reachable: false,
+                        last_sync: None,
+                        generation: None,
+                        message: Some(format!("replica source '{label}' has not synced yet")),
+                    });
+                }
+            }
+        }
+
+        rows.sort_by(|left, right| {
+            (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
+                &right.convoy,
+                right.host.as_str(),
+                &right.vessel,
+                &right.crew,
+            ))
+        });
+        replicas.sort_by(|left, right| left.host.as_str().cmp(right.host.as_str()));
+        Ok(FleetListResponse { rows, replicas })
+    }
+
+    pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {
+        let hosts = self.config.load_hosts()?;
+        let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
+        for (label, remote) in &hosts.hosts {
+            let host = HostName::new(remote.expected_host_name.clone());
+            let multiplex = hosts.resolved_ssh_multiplex(label);
+            let result = self.fetch_fleet_replica_snapshot(remote, multiplex, Arc::clone(&runner)).await;
+            match result {
+                Ok(snapshot) => {
+                    let now = Utc::now();
+                    let snapshot_host = snapshot.host;
+                    let generation = snapshot.generation;
+                    let rows = snapshot.rows.into_iter().map(|mut row| {
+                        row.host = snapshot_host.clone();
+                        row.staleness = FleetStaleness::Fresh { last_sync: now };
+                        row
+                    });
+                    self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
+                        rows: rows.collect(),
+                        last_sync: Some(now),
+                        generation,
+                        last_error: None,
+                    });
+                }
+                Err(message) => {
+                    let mut cache = self.fleet_replica_cache.write().await;
+                    cache.entry(host).and_modify(|entry| entry.last_error = Some(message.clone())).or_insert_with(|| {
+                        FleetReplicaCacheEntry { rows: Vec::new(), last_sync: None, generation: None, last_error: Some(message) }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_fleet_replica_snapshot(
+        &self,
+        remote: &RemoteHostConfig,
+        multiplex: bool,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<FleetReplicaSnapshot, String> {
+        let args = fleet_replica_ssh_args(remote, multiplex);
+        let arg_refs: Vec<_> = args.iter().map(String::as_str).collect();
+        let output =
+            tokio::time::timeout(FLEET_REPLICA_REFRESH_TIMEOUT, runner.run_output("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Noop))
+                .await
+                .map_err(|_| format!("replica snapshot timed out after {}s", FLEET_REPLICA_REFRESH_TIMEOUT.as_secs()))?
+                .map_err(|err| format!("replica snapshot ssh failed: {err}"))?;
+        if !output.success {
+            let message = if output.stderr.trim().is_empty() { output.stdout.trim() } else { output.stderr.trim() };
+            return Err(format!("replica snapshot command failed: {message}"));
+        }
+        serde_json::from_str(output.stdout.trim()).map_err(|err| format!("replica snapshot parse failed: {err}"))
+    }
+
+    async fn local_fleet_rows(&self, namespace: &str) -> Result<(Vec<FleetListRow>, Option<String>), String> {
+        let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
+        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+
+        let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
+        let environment_map: HashMap<_, _> = environments
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .map(|environment| (environment.metadata.name.clone(), environment))
+            .collect();
+        let mut authority_by_convoy = HashMap::new();
+        for checkout in checkouts.list().await.map_err(|err| err.to_string())?.items {
+            let Some(convoy) = checkout.metadata.labels.get(CONVOY_LABEL).cloned() else {
+                continue;
+            };
+            let authority = checkout
+                .metadata
+                .lifecycle_authority()
+                .map_err(|err| err.to_string())?
+                .map(|authority| authority.as_label_value().to_string());
+            if authority.is_some() {
+                authority_by_convoy.insert(convoy, authority);
+            }
+        }
+
+        let mut rows = Vec::new();
+        for session in session_list.items {
+            let labels = &session.metadata.labels;
+            let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
+            let task = labels.get(TASK_LABEL).cloned();
+            let role = labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
+            let crew = match task {
+                Some(task) => format!("{task}/{role}"),
+                None => role,
+            };
+            let host = environment_map
+                .get(&session.spec.env_ref)
+                .and_then(|environment| resource_environment_host_ref(environment))
+                .map(|host_ref| self.target_host_for_resource_ref(host_ref))
+                .unwrap_or_else(|| self.host_name.clone());
+            rows.push(FleetListRow {
+                convoy: convoy.clone(),
+                vessel: session.spec.env_ref.clone(),
+                authority: authority_by_convoy.get(&convoy).cloned().flatten(),
+                crew,
+                crew_state: session_status_label(session.status.as_ref().map(|status| status.phase)),
+                host,
+                staleness: FleetStaleness::Local,
+            });
+        }
+        rows.sort_by(|left, right| {
+            (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
+                &right.convoy,
+                right.host.as_str(),
+                &right.vessel,
+                &right.crew,
+            ))
+        });
+        Ok((rows, session_list.generation))
+    }
+
     pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<String, String> {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
@@ -2908,6 +3163,14 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
+            CommandAction::QueryFleetList {} => match self.fleet_list_internal().await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryFleetReplicaSnapshot {} => match self.fleet_replica_snapshot_internal().await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetReplicaSnapshot(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
             CommandAction::Attach { reference } => match self.resolve_attach_command_internal(reference).await {
                 Ok(command) => Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command }),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),

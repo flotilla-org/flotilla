@@ -133,7 +133,9 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::RepoWork(_)
         | CommandValue::HostList(_)
         | CommandValue::HostStatus(_)
-        | CommandValue::HostProviders(_) => {
+        | CommandValue::HostProviders(_)
+        | CommandValue::FleetList(_)
+        | CommandValue::FleetReplicaSnapshot(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }
         CommandValue::ImageEnsured { .. } | CommandValue::EnvironmentCreated { .. } | CommandValue::EnvironmentSpecRead { .. } => {

@@ -373,7 +373,7 @@ mod command_result_human {
 
     use flotilla_protocol::{
         commands::{CheckoutStatus, CommandValue},
-        HostName, NodeId, PreparedWorkspace,
+        FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostName, NodeId, PreparedWorkspace,
     };
 
     use crate::cli::format_command_result;
@@ -490,6 +490,38 @@ mod command_result_human {
     #[test]
     fn cancelled() {
         assert_eq!(format_command_result(&CommandValue::Cancelled), "cancelled");
+    }
+
+    #[test]
+    fn fleet_list() {
+        let result = CommandValue::FleetList(Box::new(FleetListResponse {
+            rows: vec![FleetListRow {
+                convoy: "convoy-a".into(),
+                vessel: "env-a".into(),
+                authority: Some("adopted".into()),
+                crew: "implement/coder".into(),
+                crew_state: "running".into(),
+                host: HostName::new("feta"),
+                staleness: FleetStaleness::Unreachable { last_sync: None, message: "connection refused".into() },
+            }],
+            replicas: vec![FleetReplicaStatus {
+                host: HostName::new("feta"),
+                reachable: false,
+                last_sync: None,
+                generation: Some("gen-1".into()),
+                message: Some("connection refused".into()),
+            }],
+        }));
+
+        let output = format_command_result(&result);
+
+        assert!(output.contains("Convoy"));
+        assert!(output.contains("convoy-a"));
+        assert!(output.contains("env-a (adopted)"));
+        assert!(output.contains("implement/coder"));
+        assert!(output.contains("unreachable"));
+        assert!(output.contains("Replica status"));
+        assert!(output.contains("connection refused"));
     }
 
     #[test]
