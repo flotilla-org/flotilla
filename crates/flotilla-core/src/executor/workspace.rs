@@ -320,7 +320,7 @@ fn workspace_attach_request_from_config(config: crate::providers::types::Workspa
 ///
 /// For each `ResolvedPaneCommand`, builds a `HopPlan` via `HopPlanBuilder::build_for_prepared_command`,
 /// resolves it with `SshRemoteHopResolver` + `AlwaysWrap`, and flattens the resulting `Command` to a string.
-fn resolve_prepared_commands_via_hop_chain(
+pub(crate) fn resolve_prepared_commands_via_hop_chain(
     target_host: &HostName,
     checkout_path: &Path,
     commands: &[ResolvedPaneCommand],

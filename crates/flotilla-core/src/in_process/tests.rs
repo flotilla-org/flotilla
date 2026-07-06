@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    path::Path,
     sync::{Arc, OnceLock},
 };
 
@@ -11,7 +12,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoyPhase,
-    ConvoySpec, ConvoyStatus, InputMeta, LifecycleAuthority, TaskPhase, TaskState,
+    ConvoySpec, ConvoyStatus, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec,
+    InputMeta, LifecycleAuthority, TaskPhase, TaskState, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL, TASK_WORKSPACE_LABEL,
 };
 
 use super::*;
@@ -23,7 +27,10 @@ use crate::{
     model::RepoModel,
     providers::{
         discovery::{
-            test_support::{fake_discovery, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner},
+            test_support::{
+                fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner,
+                FakeDiscoveryProviders, FakeTerminalPool,
+            },
             EnvironmentAssertion, EnvironmentBag,
         },
         environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
@@ -62,6 +69,10 @@ fn empty_input_meta(name: &str) -> InputMeta {
     }
 }
 
+fn input_meta_with_labels(name: &str, labels: BTreeMap<String, String>) -> InputMeta {
+    InputMeta { labels, ..empty_input_meta(name) }
+}
+
 async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -74,6 +85,82 @@ async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<D
     })
     .await
     .expect("timeout waiting for command result")
+}
+
+async fn new_attach_test_daemon(config_base: &Path) -> Arc<InProcessDaemon> {
+    let terminal_pool = Arc::new(FakeTerminalPool::new());
+    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(terminal_pool));
+    InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::local()).await
+}
+
+async fn create_local_attach_environment(daemon: &InProcessDaemon) -> String {
+    let host_id = daemon.local_host_id().expect("daemon should have a local host id");
+    let env_name = format!("host-direct-{host_id}");
+    daemon
+        .resource_backend()
+        .using::<ResourceEnvironment>("flotilla")
+        .create(&empty_input_meta(&env_name), &ResourceEnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
+            docker: None,
+        })
+        .await
+        .expect("environment should be created");
+    env_name
+}
+
+async fn create_running_attach_session(
+    daemon: &InProcessDaemon,
+    env_ref: &str,
+    name: &str,
+    session_id: &str,
+    convoy: &str,
+    task: &str,
+    role: &str,
+) {
+    create_running_attach_session_with_pool(daemon, env_ref, name, session_id, convoy, task, role, "fake-terminals").await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_running_attach_session_with_pool(
+    daemon: &InProcessDaemon,
+    env_ref: &str,
+    name: &str,
+    session_id: &str,
+    convoy: &str,
+    task: &str,
+    role: &str,
+    pool: &str,
+) {
+    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let created = terminals
+        .create(
+            &input_meta_with_labels(
+                name,
+                BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), convoy.to_string()),
+                    (TASK_LABEL.to_string(), task.to_string()),
+                    (TASK_WORKSPACE_LABEL.to_string(), format!("{convoy}-{task}")),
+                    (ROLE_LABEL.to_string(), role.to_string()),
+                ]),
+            ),
+            &ResourceTerminalSessionSpec {
+                env_ref: env_ref.to_string(),
+                role: role.to_string(),
+                command: "bash".to_string(),
+                cwd: "/repo".to_string(),
+                pool: pool.to_string(),
+            },
+        )
+        .await
+        .expect("terminal session should be created");
+    terminals
+        .update_status(name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("terminal session should be running");
 }
 
 #[test]
@@ -99,6 +186,228 @@ fn choose_event_uses_delta_for_non_initial_changes() {
         changes: vec![flotilla_protocol::Change::Branch { key: "feature/x".into(), op: flotilla_protocol::EntryOp::Removed }],
     };
     assert!(matches!(choose_event(snapshot, non_empty), DaemonEvent::RepoDelta(_)));
+}
+
+#[tokio::test]
+async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "cleat-session-1",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach cleat-session-1".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_prefers_exact_reference_over_prefix_matches() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "session-exact",
+        "convoy-a",
+        "implement",
+        "coder",
+    )
+    .await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-alpha-implement-coder",
+        "session-prefix",
+        "convoy-alpha",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach session-exact".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_rejects_ambiguous_prefix() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-alpha-implement-coder",
+        "session-alpha",
+        "convoy-alpha",
+        "implement",
+        "coder",
+    )
+    .await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-amber-implement-coder",
+        "session-amber",
+        "convoy-amber",
+        "implement",
+        "coder",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::Error { message } = result else {
+        panic!("expected ambiguous attach error, got {result:?}");
+    };
+    assert!(message.contains("ambiguous"), "message should explain ambiguity: {message}");
+    assert!(message.contains("convoy-alpha/implement/coder"), "message should include first candidate: {message}");
+    assert!(message.contains("convoy-amber/implement/coder"), "message should include second candidate: {message}");
+}
+
+#[tokio::test]
+async fn attach_query_reports_no_matching_reference() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "missing".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::Error { message: "no attach target matching 'missing'".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_rejects_empty_reference() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::Error { message: "attach reference is required".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_errors_when_recorded_terminal_pool_is_unavailable() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session_with_pool(
+        &daemon,
+        &env_ref,
+        "terminal-convoy-a-implement-coder",
+        "session-a",
+        "convoy-a",
+        "implement",
+        "coder",
+        "missing-terminals",
+    )
+    .await;
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::Error { message: format!("terminal pool missing-terminals unavailable for environment {env_ref}") });
 }
 
 #[test]

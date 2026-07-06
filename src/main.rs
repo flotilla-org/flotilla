@@ -56,6 +56,11 @@ enum SubCommand {
     Watch,
     /// Show the daemon's current multi-host routing view
     Topology,
+    /// Attach to a running convoy crew session
+    Attach {
+        /// Convoy, task, role, terminal session, or unique prefix
+        reference: String,
+    },
     /// Receive agent hook events (called by agent hook systems)
     Hook {
         /// Agent harness name (e.g. claude-code, codex, gemini)
@@ -174,6 +179,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
+        Some(SubCommand::Attach { reference }) => run_attach(&cli, &reference, format).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
 
@@ -358,6 +364,55 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
     flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+}
+
+async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<()> {
+    reset_sigpipe();
+    let daemon = connect_daemon(cli).await?;
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: reference.to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!(e))?;
+
+    match result {
+        CommandValue::AttachCommandResolved { command } => match format {
+            OutputFormat::Json => {
+                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { command }));
+                Ok(())
+            }
+            OutputFormat::Human => exec_attach_command(&command),
+        },
+        CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
+        other => Err(color_eyre::eyre::eyre!("unexpected attach response: {other:?}")),
+    }
+}
+
+#[cfg(unix)]
+fn exec_attach_command(command: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    Err(std::process::Command::new("sh").arg("-lc").arg(command).exec().into())
+}
+
+#[cfg(not(unix))]
+fn exec_attach_command(command: &str) -> Result<()> {
+    let status = std::process::Command::new("sh").arg("-lc").arg(command).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!(
+            "attach command exited with status {}",
+            status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
+        ))
+    }
 }
 
 async fn resolve_host_target(cli: &Cli, subject: &HostName) -> Result<(EnvironmentId, flotilla_protocol::NodeId)> {
@@ -843,6 +898,12 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--json"]).expect("topology json should parse");
         assert!(matches!(cli.command, Some(SubCommand::Topology)));
         assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_attach_subcommand() {
+        let cli = Cli::try_parse_from(["flotilla", "attach", "convoy-a/implement/coder"]).expect("attach cli should parse");
+        assert!(matches!(cli.command, Some(SubCommand::Attach { reference }) if reference == "convoy-a/implement/coder"));
     }
 
     #[test]

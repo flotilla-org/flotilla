@@ -17,15 +17,16 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::QualifiedPath, Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, HostListResponse, HostName,
     HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, StatusResponse, StreamKey,
-    SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse,
+    StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Checkout as ResourceCheckout,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
-    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, ResourceBackend,
-    ResourceError, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec,
+    ResourceBackend, ResourceError, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL, TASK_WORKSPACE_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -205,6 +206,48 @@ fn fallback_repo_identity(path: &Path) -> flotilla_protocol::RepoIdentity {
 
 fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
+}
+
+fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) -> Vec<String> {
+    let mut refs = vec![session_name.to_string()];
+
+    let convoy = labels.get(CONVOY_LABEL);
+    let task = labels.get(TASK_LABEL);
+    let role = labels.get(ROLE_LABEL);
+    let task_workspace = labels.get(TASK_WORKSPACE_LABEL);
+
+    if let Some(convoy) = convoy {
+        refs.push(convoy.clone());
+    }
+    if let Some(task_workspace) = task_workspace {
+        refs.push(task_workspace.clone());
+    }
+    if let (Some(convoy), Some(task)) = (convoy, task) {
+        refs.push(format!("{convoy}/{task}"));
+    }
+    if let (Some(convoy), Some(task), Some(role)) = (convoy, task, role) {
+        refs.push(format!("{convoy}/{task}/{role}"));
+    }
+    if let (Some(task_workspace), Some(role)) = (task_workspace, role) {
+        refs.push(format!("{task_workspace}/{role}"));
+    }
+    if let Some(role) = role {
+        refs.push(role.clone());
+    }
+
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>) -> String {
+    match (labels.get(CONVOY_LABEL), labels.get(TASK_LABEL), labels.get(ROLE_LABEL)) {
+        (Some(convoy), Some(task), Some(role)) => format!("{convoy}/{task}/{role} ({session_name})"),
+        (Some(convoy), Some(task), None) => format!("{convoy}/{task} ({session_name})"),
+        (Some(convoy), None, Some(role)) => format!("{convoy}/{role} ({session_name})"),
+        (Some(convoy), None, None) => format!("{convoy} ({session_name})"),
+        _ => session_name.to_string(),
+    }
 }
 
 fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTemplateSpec, String> {
@@ -1929,6 +1972,128 @@ impl InProcessDaemon {
         Ok(response)
     }
 
+    pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<String, String> {
+        if reference.trim().is_empty() {
+            return Err("attach reference is required".to_string());
+        }
+
+        let namespace = self.provisioning_namespace().await;
+        let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace);
+        let sessions = terminal_sessions.list().await.map_err(|err| err.to_string())?.items;
+        let mut exact = Vec::new();
+        let mut prefix = Vec::new();
+
+        for session in sessions {
+            if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
+                continue;
+            }
+            let refs = attach_reference_keys(&session.metadata.name, &session.metadata.labels);
+            let label = attach_reference_label(&session.metadata.name, &session.metadata.labels);
+            if refs.iter().any(|candidate| candidate == reference) {
+                exact.push((label, session));
+            } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
+                prefix.push((label, session));
+            }
+        }
+
+        let mut matches = if exact.is_empty() { prefix } else { exact };
+        match matches.len() {
+            0 => Err(format!("no attach target matching '{reference}'")),
+            1 => {
+                let (_label, session) = matches.remove(0);
+                self.attach_command_for_session(&session).await
+            }
+            _ => {
+                let mut labels: Vec<_> = matches.into_iter().map(|(label, _)| label).collect();
+                labels.sort();
+                labels.dedup();
+                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
+            }
+        }
+    }
+
+    async fn attach_command_for_session(
+        &self,
+        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+    ) -> Result<String, String> {
+        let namespace = self.provisioning_namespace().await;
+        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
+        let environment = environments
+            .get(&session.spec.env_ref)
+            .await
+            .map_err(|err| format!("environment {} lookup failed: {err}", session.spec.env_ref))?;
+        let host_ref = environment
+            .spec
+            .host_direct
+            .as_ref()
+            .map(|spec| spec.host_ref.as_str())
+            .or_else(|| environment.spec.docker.as_ref().map(|spec| spec.host_ref.as_str()))
+            .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
+        let target_host = self.target_host_for_resource_ref(host_ref);
+        let cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
+        let registry = self.registry_for_resource_environment(&environment, cwd.as_path()).await?;
+        let pool = registry
+            .terminal_pools
+            .get(&session.spec.pool)
+            .map(|(_, pool)| Arc::clone(pool))
+            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
+        let session_name =
+            session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
+        let attach_args = pool.attach_args(session_name, &session.spec.command, &cwd, &Vec::new())?;
+        let command = ResolvedPaneCommand { role: session.spec.role.clone(), args: attach_args };
+        let environment_id = environment.spec.docker.as_ref().map(|_| EnvironmentId::new(session.spec.env_ref.clone()));
+        let container_name = environment.status.as_ref().and_then(|status| status.docker_container_id.as_deref());
+        let resolved = executor::workspace::resolve_prepared_commands_via_hop_chain(
+            &target_host,
+            cwd.as_path(),
+            &[command],
+            self.config.base_path().as_path(),
+            &self.host_name,
+            environment_id.as_ref(),
+            container_name,
+        )?;
+        resolved.into_iter().next().map(|(_, command)| command).ok_or_else(|| "attach command resolution produced no command".to_string())
+    }
+
+    fn target_host_for_resource_ref(&self, host_ref: &str) -> HostName {
+        if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_ref) {
+            self.host_name.clone()
+        } else {
+            HostName::new(host_ref)
+        }
+    }
+
+    async fn registry_for_resource_environment(
+        &self,
+        environment: &flotilla_resources::ResourceObject<ResourceEnvironment>,
+        cwd: &Path,
+    ) -> Result<Arc<crate::providers::registry::ProviderRegistry>, String> {
+        let environment_id = if let Some(host_direct) = environment.spec.host_direct.as_ref() {
+            if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_direct.host_ref) {
+                self.local_environment_id.clone()
+            } else {
+                EnvironmentId::new(environment.metadata.name.clone())
+            }
+        } else {
+            EnvironmentId::new(environment.metadata.name.clone())
+        };
+
+        if let Some(registry) = self.environment_registry_for_environment(&environment_id) {
+            return Ok(registry);
+        }
+
+        discover_repo_for_environment(
+            &self.environment_manager,
+            &self.discovery,
+            &self.config,
+            &self.local_environment_id,
+            &environment_id,
+            cwd,
+        )
+        .await
+        .map(|result| Arc::new(result.registry))
+    }
+
     async fn refresh_local_host_summary(&self) -> HostSummary {
         let summary = crate::host_summary::build_local_host_summary(
             &self.node_id,
@@ -2704,6 +2869,10 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
+            CommandAction::Attach { reference } => match self.resolve_attach_command_internal(reference).await {
+                Ok(command) => Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command }),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
             CommandAction::QueryIssues { repo, params, page, count } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
                 let service = self.get_issue_query_service(&repo_path).await?;
