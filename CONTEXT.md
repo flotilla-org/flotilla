@@ -60,8 +60,9 @@ on some host, hosting a **Crew**; materialised to satisfy a
 provisioned (Managed), **adopted** (an existing worktree, per **Lifecycle
 Authority**), kept *warm* between Legs, or revisited by later Legs in loopy
 workflows (e.g. a main dev vessel that fans out to platform-test vessels and
-collates results across iterations). The Crew aboard the Vessels are the
-dramatis personae; the Legs are the script.
+collates results across iterations). A Vessel may also be **free-floating** —
+attached to no Convoy at all — e.g. housing a **PersistentAgent**. The Crew
+aboard the Vessels are the dramatis personae; the Legs are the script.
 _Avoid_: Task, TaskWorkspace, workspace, container.
 
 **Hull**:
@@ -217,11 +218,44 @@ attach), with its own availability rules, resolving to a control-plane command.
 The reusable action model shared by all **Surfaces**.
 _Avoid_: Command (the resolved wire form), keybinding, button.
 
+**PersistentAgent**:
+The resource kind for a long-lived agent that operates the fleet rather than
+writing code. One kind for all roles (role is a label); its spec carries a
+charter, a scope (its island's namespace), a **VesselRequirement** for its
+residency, and a **memory ref**. A reconciler keeps it materialised — today a
+**free-floating Vessel** running a harness; later possibly a direct agent loop
+(a different materialisation, not a different concept).
+_Avoid_: Meta-agent-as-a-kind (Meta-agent is the concept, this is the resource),
+Officer, bot, daemon.
+
+**Governor**:
+The **PersistentAgent** role stewarding an **Island**: reads its repos but does
+not edit source or raise its own PRs; maintains issues and docs; watches
+upstreams; launches convoys for its own project only. Frontier-class Governors
+may orchestrate simple convoys directly, spinning up a **Bosun** for complex
+ones. The aspiration is instilled stewardship — improving quality, looking out
+for updates.
+_Avoid_: Repo bot, maintainer-agent.
+
+**Bosun**:
+The **PersistentAgent** role scoped to a single **Convoy**: the orchestrating
+agent (ADR 0008) that chivvies it along — continuation, unsticking, rewind —
+issuing **VesselRequirements** and routing information between crews.
+_Avoid_: Orchestrator (generic), pipeline runner.
+
+**Agent Memory**:
+A **PersistentAgent**'s durable state: a *directory that survives
+re-materialisation*, referenced from its spec and materialised into whatever
+the agent inhabits. Backing is deliberately pluggable — local filesystem (the
+solo-machine starter), a git repo (e.g. the lab hub), object storage (the
+enterprise destination). Never the island repo itself.
+_Avoid_: Scratch space (it is durable), transcript (that is the harness's).
+
 **Meta-agent**:
-A persistent agent that operates the fleet rather than writing code — allocation
-(Quartermaster), accounting (Purser), stewardship (Governor), presentation
-(Yeoman), discipline/continuation (Bosun). A future layer above observer +
-control plane.
+The concept of a persistent agent that operates the fleet rather than writing
+code — stewardship (Governor), convoy-driving (Bosun), allocation
+(Quartermaster), accounting (Purser), presentation (Yeoman). Realised as
+**PersistentAgent** resources; Governor and Bosun arrive first.
 _Avoid_: Bot, assistant.
 
 ## External Collaborators
