@@ -125,6 +125,12 @@ enum VisitState {
     Visited,
 }
 
+pub(crate) struct TemplateToken<'a> {
+    pub(crate) open: usize,
+    pub(crate) text: &'a str,
+    pub(crate) end: Option<usize>,
+}
+
 pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     let declared_inputs = collect_inputs(spec, &mut errors);
@@ -267,6 +273,17 @@ fn validate_template_text(
     declared_inputs: &BTreeSet<String>,
     errors: &mut Vec<ValidationError>,
 ) {
+    visit_template_tokens(text, |token| match token.end {
+        Some(_) => validate_token(token.text, location, declared_inputs, errors),
+        None => {
+            if is_owned_token(token.text) {
+                push_error(errors, ValidationError::MalformedInterpolation { location: location.clone(), text: token.text.to_string() });
+            }
+        }
+    });
+}
+
+pub(crate) fn visit_template_tokens<'a>(text: &'a str, mut visit: impl FnMut(TemplateToken<'a>)) {
     let mut search_from = 0;
     while let Some(open_offset) = text[search_from..].find("{{") {
         let open = search_from + open_offset;
@@ -274,14 +291,12 @@ fn validate_template_text(
         match text[token_start..].find("}}") {
             Some(close_offset) => {
                 let token_end = token_start + close_offset;
-                validate_token(&text[token_start..token_end], location, declared_inputs, errors);
-                search_from = token_end + 2;
+                let end = token_end + 2;
+                visit(TemplateToken { open, text: &text[token_start..token_end], end: Some(end) });
+                search_from = end;
             }
             None => {
-                let token = &text[token_start..];
-                if is_owned_token(token) {
-                    push_error(errors, ValidationError::MalformedInterpolation { location: location.clone(), text: token.to_string() });
-                }
+                visit(TemplateToken { open, text: &text[token_start..], end: None });
                 break;
             }
         }

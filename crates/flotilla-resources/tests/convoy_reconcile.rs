@@ -11,8 +11,8 @@ use flotilla_resources::{
     canonicalize_repo_url,
     controller::{Actuation, Reconciler},
     controller_patches, reconcile, repo_key, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, InMemoryBackend,
-    InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, TaskPhase, TaskWorkspace, TaskWorkspacePhase,
-    TaskWorkspaceSpec, TaskWorkspaceStatus, ValidationError, WorkflowTemplate, CONVOY_LABEL, TASK_LABEL,
+    InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ProcessSource, ResourceBackend, TaskPhase, TaskWorkspace,
+    TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, ValidationError, WorkflowTemplate, CONVOY_LABEL, TASK_LABEL,
 };
 
 async fn reconcile_once_with_resources(
@@ -189,6 +189,25 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
 
     assert_eq!(outcome.patch, Some(expected_patch));
     assert!(outcome.events.is_empty());
+}
+
+#[test]
+fn bootstrap_interpolates_tool_process_commands() {
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
+    let mut template = tool_only_workflow_template_object("review-and-fix");
+    if let ProcessSource::Tool { command } = &mut template.spec.tasks[0].processes[0].source {
+        *command = "printf '{{workflow.namespace}}/{{workflow.name}}/{{inputs.feature}}/{{inputs.branch}}/{{.metadata.name}}'".to_string();
+    }
+
+    let outcome = reconcile(&convoy, Some(&template), timestamp(10));
+
+    let Some(ConvoyStatusPatch::Bootstrap { workflow_snapshot, .. }) = outcome.patch else {
+        panic!("expected bootstrap patch");
+    };
+    let ProcessSource::Tool { command } = &workflow_snapshot.tasks[0].processes[0].source else {
+        panic!("expected tool process");
+    };
+    assert_eq!(command, "printf 'flotilla/convoy-a/Retry logic/fix-retry-logic/{{.metadata.name}}'");
 }
 
 #[test]
