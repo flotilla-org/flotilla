@@ -16,8 +16,8 @@ use crate::{
     resource::ResourceObject,
     status_patch::StatusPatch,
     task_workspace::{TaskWorkspace, TaskWorkspacePhase},
-    workflow_template::{validate, ValidationError, WorkflowTemplate},
-    InputMeta, OwnerReference, PlacementStatus, Resource, ResourceError, TypedResolver,
+    workflow_template::{validate, visit_template_tokens, ProcessDefinition, ProcessSource, ValidationError, WorkflowTemplate},
+    InputMeta, InputValue, OwnerReference, PlacementStatus, Resource, ResourceError, TypedResolver,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -259,7 +259,7 @@ fn bootstrap_outcome(
         .tasks
         .iter()
         .flat_map(|task| task.processes.iter())
-        .any(|process| matches!(process.source, crate::ProcessSource::Agent { .. }))
+        .any(|process| matches!(process.source, ProcessSource::Agent { .. }))
     {
         return InternalReconcileOutcome {
             patch: Some(controller_patches::fail_init(ConvoyPhase::Failed, STAGE_4A_AGENT_MESSAGE.to_string(), now)),
@@ -283,7 +283,11 @@ fn bootstrap_outcome(
             .spec
             .tasks
             .iter()
-            .map(|task| SnapshotTask { name: task.name.clone(), depends_on: task.depends_on.clone(), processes: task.processes.clone() })
+            .map(|task| SnapshotTask {
+                name: task.name.clone(),
+                depends_on: task.depends_on.clone(),
+                processes: task.processes.iter().map(|process| instantiate_process(convoy, process)).collect(),
+            })
             .collect(),
     };
     let tasks = template
@@ -313,6 +317,61 @@ fn bootstrap_outcome(
         )),
         actuations: Vec::new(),
         events: Vec::new(),
+    }
+}
+
+fn instantiate_process(convoy: &ResourceObject<Convoy>, process: &ProcessDefinition) -> ProcessDefinition {
+    let mut process = process.clone();
+    match &mut process.source {
+        ProcessSource::Agent { prompt, .. } => {
+            if let Some(prompt) = prompt {
+                *prompt = interpolate_template_text(convoy, prompt);
+            }
+        }
+        ProcessSource::Tool { command } => {
+            *command = interpolate_template_text(convoy, command);
+        }
+    }
+    process
+}
+
+fn interpolate_template_text(convoy: &ResourceObject<Convoy>, text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut search_from = 0;
+    visit_template_tokens(text, |token| {
+        output.push_str(&text[search_from..token.open]);
+        match token.end {
+            Some(end) => {
+                if let Some(value) = interpolation_value(convoy, token.text) {
+                    output.push_str(&value);
+                } else {
+                    output.push_str(&text[token.open..end]);
+                }
+                search_from = end;
+            }
+            None => {
+                output.push_str(&text[token.open..]);
+                search_from = text.len();
+            }
+        }
+    });
+    output.push_str(&text[search_from..]);
+    output
+}
+
+fn interpolation_value(convoy: &ResourceObject<Convoy>, token: &str) -> Option<String> {
+    let segments = token.split('.').collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["inputs", input_name] => convoy.spec.inputs.get(*input_name).map(input_value_string),
+        ["workflow", "name"] => Some(convoy.metadata.name.clone()),
+        ["workflow", "namespace"] => Some(convoy.metadata.namespace.clone()),
+        _ => None,
+    }
+}
+
+fn input_value_string(value: &InputValue) -> String {
+    match value {
+        InputValue::String(value) => value.clone(),
     }
 }
 
