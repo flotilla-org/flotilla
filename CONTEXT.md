@@ -31,22 +31,52 @@ set" / "new branch" framing.
 _Avoid_: Job, pipeline, attachable set.
 
 **Leg**:
-A workflow stage within a **Convoy** — one node of its DAG. A Leg executes
-aboard a **Vessel** and is completed explicitly, not by process exit. Often
-implicit: a trivial convoy has a single implicit Leg, and Legs may stay out of
-the UX until workflow patterns settle.
+The *control side* of a **Convoy** — a broad (often implicit) phase of the
+workflow: the script, not the cast. A Leg carries the prompts and information
+routing given to promptable **Crew**, and is materialised by **zero or more
+Vessels** (e.g. one test Leg fanning across four platforms). Completed
+explicitly, not by process exit. Legs may stay out of the UX until workflow
+patterns settle; ad-hoc communication outside the script is not prohibited.
 _Avoid_: Task (retired — it conflated stage with placement; code types such as
 `TaskSummary`/`TaskWorkspace` keep the old name until renamed opportunistically),
 Step, pod.
 
+**VesselRequirement**:
+A declaration that a **Vessel** matching some abstract requirements (platform,
+capabilities, sandbox quality, affinity) must exist for a **Leg** — the runtime
+primitive placement resolution works on, and the fan-out unit (one requirement
+may materialise several Vessels). Authored by any orchestrator: a workflow
+template, an **orchestrating agent** (tool call), or a human (CLI pins / the
+picker). Templates carry abstract requirements only; launch-time **pins**
+(host=X, reuse hull Y, adopt this checkout) and fleet-level **PlacementPolicy**
+preferences merge at resolution (pins > requirements > policy preferences;
+unsatisfiable = loud failure, no silent fallback).
+_Avoid_: placement (the act, not the declaration), recipe, target.
+
 **Vessel**:
-The placement unit a **Leg** executes aboard — an (environment + checkout) unit
-on some host, hosting a **Crew**. Its lifecycle is independent of Legs: it may be
+The placement unit work executes aboard — an (environment + checkout) unit
+on some host, hosting a **Crew**; materialised to satisfy a
+**VesselRequirement**. Its lifecycle is independent of Legs: it may be
 provisioned (Managed), **adopted** (an existing worktree, per **Lifecycle
 Authority**), kept *warm* between Legs, or revisited by later Legs in loopy
 workflows (e.g. a main dev vessel that fans out to platform-test vessels and
-collates results across iterations).
+collates results across iterations). The Crew aboard the Vessels are the
+dramatis personae; the Legs are the script.
 _Avoid_: Task, TaskWorkspace, workspace, container.
+
+**Hull**:
+An allocated but **uncrewed** Vessel-precursor: an **Environment** plus an
+established filesystem/checkout, no processes yet. **Vessel = Hull + Crew.**
+(Portfolio-defined term; see the project-map glossary.)
+_Avoid_: empty vessel, workspace, berth.
+
+**Clyde**:
+(Future extraction; portfolio-defined.) A per-host service owning the full
+lifecycle of **Hulls**: given Vessel requirements it allocates, maintains, and
+tears down the backing Hull. Flotilla's vessel reconciliation trends toward
+"tell Clyde the desired state." Boundary edges (token install, agent config,
+network setup) deliberately unpinned.
+_Avoid_: Astillero (renamed 2026-07-06), sandbox aggregator.
 
 **Crew**:
 The set of **Processes** (agents and terminals, typically a cleat pool) running
