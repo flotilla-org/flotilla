@@ -397,7 +397,16 @@ async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<
             }
             OutputFormat::Human => exec_attach_command(&command),
         },
-        CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
+        CommandValue::Error { message } => match format {
+            OutputFormat::Json => {
+                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::Error { message: message.clone() }));
+                Err(color_eyre::eyre::eyre!(message))
+            }
+            OutputFormat::Human => {
+                eprintln!("{message}");
+                std::process::exit(1);
+            }
+        },
         other => Err(color_eyre::eyre::eyre!("unexpected attach response: {other:?}")),
     }
 }

@@ -255,6 +255,27 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>)
     }
 }
 
+fn fleet_row_attach_reference_keys(row: &FleetListRow) -> Vec<String> {
+    let mut refs = vec![row.convoy.clone(), row.vessel.clone(), row.crew.clone()];
+    if row.crew != "-" {
+        refs.push(format!("{}/{}", row.convoy, row.crew));
+        if let Some((_task, role)) = row.crew.rsplit_once('/') {
+            refs.push(role.to_string());
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
+    if row.crew == "-" {
+        format!("{} ({})", row.convoy, row.host)
+    } else {
+        format!("{}/{} ({})", row.convoy, row.crew, row.host)
+    }
+}
+
 fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     match phase {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
@@ -2250,6 +2271,20 @@ impl InProcessDaemon {
             return Err("attach reference is required".to_string());
         }
 
+        enum AttachMatch {
+            Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
+            Replica { host: HostName },
+        }
+
+        impl AttachMatch {
+            async fn resolve(self, daemon: &InProcessDaemon, reference: &str) -> Result<String, String> {
+                match self {
+                    Self::Local(session) => daemon.attach_command_for_session(reference, &session).await,
+                    Self::Replica { host } => daemon.recursive_attach_command_for_remote(&host, reference).await,
+                }
+            }
+        }
+
         let namespace = self.provisioning_namespace().await;
         let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace);
         let sessions = terminal_sessions.list().await.map_err(|err| err.to_string())?.items;
@@ -2263,18 +2298,43 @@ impl InProcessDaemon {
             let refs = attach_reference_keys(&session.metadata.name, &session.metadata.labels);
             let label = attach_reference_label(&session.metadata.name, &session.metadata.labels);
             if refs.iter().any(|candidate| candidate == reference) {
-                exact.push((label, session));
+                exact.push((label, AttachMatch::Local(Box::new(session))));
             } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
-                prefix.push((label, session));
+                prefix.push((label, AttachMatch::Local(Box::new(session))));
             }
         }
+
+        let configured_replica_hosts: HashSet<HostName> = self
+            .config
+            .load_hosts()
+            .map(|hosts| hosts.hosts.into_values().map(|remote| HostName::new(remote.expected_host_name)).collect())
+            .unwrap_or_default();
+        let cache = self.fleet_replica_cache.read().await;
+        for host in configured_replica_hosts {
+            if let Some(entry) = cache.get(&host) {
+                for row in &entry.rows {
+                    if row.crew_state != "running" {
+                        continue;
+                    }
+                    let refs = fleet_row_attach_reference_keys(row);
+                    let label = fleet_row_attach_reference_label(row);
+                    let target = AttachMatch::Replica { host: row.host.clone() };
+                    if refs.iter().any(|candidate| candidate == reference) {
+                        exact.push((label, target));
+                    } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
+                        prefix.push((label, target));
+                    }
+                }
+            }
+        }
+        drop(cache);
 
         let mut matches = if exact.is_empty() { prefix } else { exact };
         match matches.len() {
             0 => Err(format!("no attach target matching '{reference}'")),
             1 => {
-                let (_label, session) = matches.remove(0);
-                self.attach_command_for_session(reference, &session).await
+                let (_label, target) = matches.remove(0);
+                target.resolve(self, reference).await
             }
             _ => {
                 let mut labels: Vec<_> = matches.into_iter().map(|(label, _)| label).collect();

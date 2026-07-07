@@ -564,6 +564,115 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
 }
 
 #[tokio::test]
+async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    daemon.fleet_replica_cache.write().await.insert(HostName::new("feta"), FleetReplicaCacheEntry {
+        rows: vec![FleetListRow {
+            convoy: "convoy-a".to_string(),
+            vessel: "remote-env".to_string(),
+            authority: None,
+            crew: "implement/coder".to_string(),
+            crew_state: "running".to_string(),
+            host: HostName::new("feta"),
+            staleness: FleetStaleness::Stale { last_sync: Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1) },
+        }],
+        last_sync: Some(Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1)),
+        generation: Some("gen-1".to_string()),
+        last_error: Some("connection refused".to_string()),
+    });
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the replica host over SSH: {command}");
+    assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
+    assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
+    assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "bare role should resolve through the replica host: {command}");
+    assert!(command.contains("flotilla attach"), "bare role should recursively invoke flotilla attach: {command}");
+    assert!(command.contains("coder"), "command should preserve the original bare role reference: {command}");
+}
+
+#[tokio::test]
+async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    daemon.fleet_replica_cache.write().await.insert(HostName::new("removed"), FleetReplicaCacheEntry {
+        rows: vec![FleetListRow {
+            convoy: "convoy-a".to_string(),
+            vessel: "removed-env".to_string(),
+            authority: None,
+            crew: "implement/coder".to_string(),
+            crew_state: "running".to_string(),
+            host: HostName::new("removed"),
+            staleness: FleetStaleness::Fresh { last_sync: Utc::now() },
+        }],
+        last_sync: Some(Utc::now()),
+        generation: Some("gen-1".to_string()),
+        last_error: None,
+    });
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "removed-env".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::Error { message } = result else {
+        panic!("expected attach error, got {result:?}");
+    };
+    assert_eq!(message, "no attach target matching 'removed-env'");
+}
+
+#[tokio::test]
 async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
