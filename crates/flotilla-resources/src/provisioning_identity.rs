@@ -12,9 +12,15 @@ pub fn canonicalize_repo_url(url: &str) -> Result<String, String> {
         let without_user = rest.strip_prefix("git@").unwrap_or(rest);
         format!("https://{without_user}")
     } else if let Some((user_host, path)) = trimmed.split_once(':') {
-        if !trimmed.contains("://") && user_host.contains('@') {
+        if !trimmed.contains("://") && !user_host.contains('/') && !user_host.is_empty() && !path.is_empty() {
             let host = user_host.rsplit_once('@').map(|(_, host)| host).unwrap_or(user_host);
-            format!("https://{host}/{path}")
+            if host.is_empty() {
+                trimmed.to_string()
+            } else {
+                // This intentionally accepts ssh-config aliases. The resulting identity
+                // is local to that alias; #645 tracks the broader repo-identity wrinkle.
+                format!("https://{host}/{path}")
+            }
         } else {
             trimmed.to_string()
         }
@@ -98,6 +104,10 @@ mod tests {
             "https://github.com/flotilla-org/flotilla"
         );
         assert_eq!(
+            canonicalize_repo_url("forgejo-manchego:robert/dinghy.git").expect("ssh alias canonicalization"),
+            "https://forgejo-manchego/robert/dinghy"
+        );
+        assert_eq!(
             canonicalize_repo_url("ssh://git@GitHub.com/flotilla-org/flotilla/").expect("ssh url canonicalization"),
             "https://github.com/flotilla-org/flotilla"
         );
@@ -105,6 +115,14 @@ mod tests {
             canonicalize_repo_url("https://GitHub.com/flotilla-org/flotilla.git").expect("https canonicalization"),
             "https://github.com/flotilla-org/flotilla"
         );
+    }
+
+    #[test]
+    fn rejects_degenerate_scp_like_repo_urls() {
+        assert!(canonicalize_repo_url(":robert/dinghy.git").is_err());
+        assert!(canonicalize_repo_url("git@:robert/dinghy.git").is_err());
+        assert!(canonicalize_repo_url("forgejo-manchego:").is_err());
+        assert!(canonicalize_repo_url("forgejo/alias:robert/dinghy.git").is_err());
     }
 
     #[test]
