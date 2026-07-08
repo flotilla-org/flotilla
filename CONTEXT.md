@@ -82,8 +82,9 @@ _Avoid_: Astillero (renamed 2026-07-06), sandbox aggregator.
 **Crew**:
 The set of **Processes** (agents and terminals, typically a cleat pool) running
 aboard a **Vessel** for a **Leg** — the thing one attaches to. The Hull carries
-what any crew would find aboard; the Crew launch carries who is aboard, what
-they may do, and why they are here (identity, **Stance**, model, **Brief**).
+what any crew would find aboard; the Crew launch carries who is aboard and why
+they are here (identity, model, **Brief**) — operating under the Vessel's shared
+**Stance**.
 _Avoid_: Attachable set, session group.
 
 **AgentAdapter**:
