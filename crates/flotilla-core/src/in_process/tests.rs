@@ -634,6 +634,62 @@ async fn replica_refresh_reports_crewless_convoys_from_namespace_snapshots() {
     assert!(matches!(row.staleness, FleetStaleness::Fresh { .. }));
 }
 
+#[tokio::test]
+async fn replica_refresh_dedupes_crewless_rows_already_present_in_snapshot_rows() {
+    use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase as WireConvoyPhase, ConvoySummary, NamespaceSnapshot};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let summary = ConvoySummary {
+        id: ConvoyId::new("flotilla", "remote-failed"),
+        namespace: "flotilla".into(),
+        name: "remote-failed".into(),
+        workflow_ref: "scratch".into(),
+        phase: WireConvoyPhase::Failed,
+        message: Some("missing input 'topic'".into()),
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: true,
+    };
+    let snapshot = FleetReplicaSnapshot {
+        host: HostName::new("feta"),
+        generation: Some("gen-1".to_string()),
+        rows: vec![FleetListRow {
+            convoy: "remote-failed".to_string(),
+            vessel: "-".to_string(),
+            authority: None,
+            crew: "-".to_string(),
+            crew_state: "failed: missing input 'topic'".to_string(),
+            host: HostName::new("feta"),
+            staleness: FleetStaleness::Local,
+        }],
+        namespaces: vec![NamespaceSnapshot { seq: 3, namespace: "flotilla".into(), convoys: vec![summary] }],
+    };
+    let runner = Arc::new(QueuedOutputRunner::new(vec![CommandOutput {
+        stdout: serde_json::to_string(&snapshot).expect("serialize snapshot"),
+        stderr: String::new(),
+        success: true,
+    }]));
+    let mut discovery =
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new())));
+    discovery.runner = runner;
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+
+    daemon.refresh_fleet_replicas_once().await.expect("refresh should succeed");
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(response.rows[0].convoy, "remote-failed");
+    assert_eq!(response.rows[0].crew, "-");
+}
+
 #[test]
 fn choose_event_uses_delta_for_non_initial_changes() {
     let repo = PathBuf::from("/tmp/repo");
