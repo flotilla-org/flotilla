@@ -422,7 +422,10 @@ async fn run_fleet_list(cli: &Cli, format: OutputFormat) -> Result<()> {
 
 async fn run_replica_snapshot(cli: &Cli) -> Result<()> {
     reset_sigpipe();
-    let daemon = connect_daemon(cli).await?;
+    let socket_path = cli.socket_path();
+    let daemon = flotilla_tui::socket::SocketDaemon::connect(&socket_path)
+        .await
+        .map_err(|e| color_eyre::eyre::eyre!("cannot connect to daemon at {}: {e}", socket_path.display()))?;
     let result = daemon
         .execute_query(
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
@@ -929,7 +932,7 @@ mod tests {
         qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState, ProvisioningTarget,
     };
 
-    use super::{provisioning_target_for_environment, select_host_target, Cli, SubCommand};
+    use super::{provisioning_target_for_environment, run_replica_snapshot, select_host_target, Cli, SubCommand};
 
     #[test]
     fn cli_parses_topology_subcommand() {
@@ -949,6 +952,31 @@ mod tests {
     fn cli_parses_ls_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "ls"]).expect("ls cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Ls)));
+    }
+
+    #[tokio::test]
+    async fn replica_snapshot_does_not_spawn_daemon_when_socket_is_missing() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "flotilla-replica-snapshot-no-spawn-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock after epoch").as_nanos()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("create test dir");
+        let config_dir = test_dir.join("config");
+        let socket = test_dir.join("missing.sock");
+        let cli = Cli::try_parse_from([
+            "flotilla",
+            "--config-dir",
+            config_dir.to_str().expect("config dir utf8"),
+            "--socket",
+            socket.to_str().expect("socket utf8"),
+            "replica-snapshot",
+        ])
+        .expect("replica snapshot cli should parse");
+
+        let err = run_replica_snapshot(&cli).await.expect_err("missing socket should fail");
+
+        assert!(err.to_string().contains("cannot connect to daemon"), "unexpected error: {err}");
+        std::fs::remove_dir_all(&test_dir).expect("remove test dir");
     }
 
     #[test]
