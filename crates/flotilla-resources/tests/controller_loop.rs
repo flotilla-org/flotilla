@@ -12,7 +12,7 @@ use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
     ApiPaths, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, TaskWorkspace, TaskWorkspaceSpec,
+    ResourceError, ResourceObject, TaskWorkspace, TaskWorkspaceSpec, TypedResolver,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::timeout};
@@ -106,6 +106,42 @@ impl Reconciler for FinalizingReconciler {
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         self.finalized.lock().expect("finalized lock").push(obj.metadata.name.clone());
         Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+#[derive(Clone)]
+struct DeletingFinalizerReconciler {
+    finalized: Arc<Mutex<Vec<String>>>,
+    primaries: TypedResolver<PrimaryResource>,
+}
+
+impl Reconciler for DeletingFinalizerReconciler {
+    type Resource = PrimaryResource;
+    type Dependencies = ();
+
+    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Dependencies,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        self.finalized.lock().expect("finalized lock").push(obj.metadata.name.clone());
+        match self.primaries.delete(&obj.metadata.name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
@@ -455,6 +491,59 @@ async fn controller_loop_runs_finalizer_and_deletes_resource_after_finalizer_com
     .expect("finalizer should run and then the deleting resource should disappear");
 
     assert!(matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_survives_notfound_when_removing_finalizer() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let meta = resource_meta()
+        .name("alpha")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call();
+    primaries.create(&meta, &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let finalized = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: DeletingFinalizerReconciler { finalized: Arc::clone(&finalized), primaries: primaries.clone() },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let finalized_alpha = finalized.lock().expect("finalized lock").iter().any(|name| name == "alpha");
+            if finalized_alpha && matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alpha should be finalized and removed by the racing delete");
+
+    primaries.create(&primary_meta("beta"), &PrimarySpec { value: "two".to_string() }).await.expect("beta create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let object = primaries.get("beta").await.expect("beta should still exist");
+            if object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller loop should continue after finalizer removal NotFound");
 
     harness.shutdown().await;
 }
