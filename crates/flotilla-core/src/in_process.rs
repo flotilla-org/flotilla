@@ -2213,6 +2213,8 @@ impl InProcessDaemon {
                             row
                         })
                         .collect();
+                    // Replica rows from current daemons already include crewless rows via local_fleet_rows.
+                    // Keep the namespace payload as a secondary source for direct snapshots; existing rows win.
                     append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.namespaces, &snapshot_host, staleness);
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
                         rows,
