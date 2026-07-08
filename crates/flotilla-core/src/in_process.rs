@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
+    namespace::{ConvoyPhase, ConvoySummary, NamespaceSnapshot},
     qualified_path::QualifiedPath,
     Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
     FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
@@ -281,6 +282,49 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
         Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),
         Some(ResourceTerminalSessionPhase::Stopped) => "stopped".to_string(),
+    }
+}
+
+fn convoy_state_label(convoy: &ConvoySummary) -> String {
+    let phase = match convoy.phase {
+        ConvoyPhase::Pending => "pending",
+        ConvoyPhase::Active => "active",
+        ConvoyPhase::Completed => "completed",
+        ConvoyPhase::Failed => "failed",
+        ConvoyPhase::Cancelled => "cancelled",
+    };
+    match convoy.message.as_deref().filter(|message| !message.trim().is_empty()) {
+        Some(message) => format!("{phase}: {message}"),
+        None => phase.to_string(),
+    }
+}
+
+fn append_crewless_convoy_rows(
+    rows: &mut Vec<FleetListRow>,
+    target_namespace: &str,
+    namespaces: &[NamespaceSnapshot],
+    host: &HostName,
+    staleness: FleetStaleness,
+) {
+    let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
+    for snapshot in namespaces {
+        if snapshot.namespace != target_namespace {
+            continue;
+        }
+        for convoy in &snapshot.convoys {
+            if !convoys_with_crew.insert(convoy.name.clone()) {
+                continue;
+            }
+            rows.push(FleetListRow {
+                convoy: convoy.name.clone(),
+                vessel: "-".to_string(),
+                authority: None,
+                crew: "-".to_string(),
+                crew_state: convoy_state_label(convoy),
+                host: host.clone(),
+                staleness: staleness.clone(),
+            });
+        }
     }
 }
 
@@ -2148,6 +2192,7 @@ impl InProcessDaemon {
 
     pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {
         let hosts = self.config.load_hosts()?;
+        let namespace = self.provisioning_namespace().await;
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
         for (label, remote) in &hosts.hosts {
             let host = HostName::new(remote.expected_host_name.clone());
@@ -2158,13 +2203,21 @@ impl InProcessDaemon {
                     let now = Utc::now();
                     let snapshot_host = snapshot.host;
                     let generation = snapshot.generation;
-                    let rows = snapshot.rows.into_iter().map(|mut row| {
-                        row.host = snapshot_host.clone();
-                        row.staleness = FleetStaleness::Fresh { last_sync: now };
-                        row
-                    });
+                    let staleness = FleetStaleness::Fresh { last_sync: now };
+                    let mut rows: Vec<_> = snapshot
+                        .rows
+                        .into_iter()
+                        .map(|mut row| {
+                            row.host = snapshot_host.clone();
+                            row.staleness = staleness.clone();
+                            row
+                        })
+                        .collect();
+                    // Replica rows from current daemons already include crewless rows via local_fleet_rows.
+                    // Keep the namespace payload as a secondary source for direct snapshots; existing rows win.
+                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.namespaces, &snapshot_host, staleness);
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
-                        rows: rows.collect(),
+                        rows,
                         last_sync: Some(now),
                         generation,
                         last_error: None,
@@ -2255,6 +2308,8 @@ impl InProcessDaemon {
                 staleness: FleetStaleness::Local,
             });
         }
+        let namespaces = self.namespace_projection_state().await.all_snapshots().await;
+        append_crewless_convoy_rows(&mut rows, namespace, &namespaces, &self.host_name, FleetStaleness::Local);
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
                 &right.convoy,
