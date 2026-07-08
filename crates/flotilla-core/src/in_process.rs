@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
+    namespace::{ConvoyPhase, ConvoySummary, NamespaceSnapshot},
     qualified_path::QualifiedPath,
     Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
     FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
@@ -284,13 +285,13 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     }
 }
 
-fn convoy_state_label(convoy: &flotilla_protocol::namespace::ConvoySummary) -> String {
+fn convoy_state_label(convoy: &ConvoySummary) -> String {
     let phase = match convoy.phase {
-        flotilla_protocol::namespace::ConvoyPhase::Pending => "pending",
-        flotilla_protocol::namespace::ConvoyPhase::Active => "active",
-        flotilla_protocol::namespace::ConvoyPhase::Completed => "completed",
-        flotilla_protocol::namespace::ConvoyPhase::Failed => "failed",
-        flotilla_protocol::namespace::ConvoyPhase::Cancelled => "cancelled",
+        ConvoyPhase::Pending => "pending",
+        ConvoyPhase::Active => "active",
+        ConvoyPhase::Completed => "completed",
+        ConvoyPhase::Failed => "failed",
+        ConvoyPhase::Cancelled => "cancelled",
     };
     match convoy.message.as_deref().filter(|message| !message.trim().is_empty()) {
         Some(message) => format!("{phase}: {message}"),
@@ -300,13 +301,17 @@ fn convoy_state_label(convoy: &flotilla_protocol::namespace::ConvoySummary) -> S
 
 fn append_crewless_convoy_rows(
     rows: &mut Vec<FleetListRow>,
-    namespaces: &[flotilla_protocol::namespace::NamespaceSnapshot],
+    target_namespace: &str,
+    namespaces: &[NamespaceSnapshot],
     host: &HostName,
     staleness: FleetStaleness,
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
-    for namespace in namespaces {
-        for convoy in &namespace.convoys {
+    for snapshot in namespaces {
+        if snapshot.namespace != target_namespace {
+            continue;
+        }
+        for convoy in &snapshot.convoys {
             if !convoys_with_crew.insert(convoy.name.clone()) {
                 continue;
             }
@@ -2187,6 +2192,7 @@ impl InProcessDaemon {
 
     pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {
         let hosts = self.config.load_hosts()?;
+        let namespace = self.provisioning_namespace().await;
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
         for (label, remote) in &hosts.hosts {
             let host = HostName::new(remote.expected_host_name.clone());
@@ -2207,7 +2213,7 @@ impl InProcessDaemon {
                             row
                         })
                         .collect();
-                    append_crewless_convoy_rows(&mut rows, &snapshot.namespaces, &snapshot_host, staleness);
+                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.namespaces, &snapshot_host, staleness);
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
                         rows,
                         last_sync: Some(now),
@@ -2301,7 +2307,7 @@ impl InProcessDaemon {
             });
         }
         let namespaces = self.namespace_projection_state().await.all_snapshots().await;
-        append_crewless_convoy_rows(&mut rows, &namespaces, &self.host_name, FleetStaleness::Local);
+        append_crewless_convoy_rows(&mut rows, namespace, &namespaces, &self.host_name, FleetStaleness::Local);
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
                 &right.convoy,

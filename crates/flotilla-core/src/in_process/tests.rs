@@ -389,6 +389,24 @@ async fn fleet_list_reports_local_crewless_failed_convoys() {
         let view = namespaces.entry("flotilla".into()).or_default();
         view.convoys.insert(summary.id.clone(), summary);
         view.seq = 1;
+
+        let leaked = ConvoySummary {
+            id: ConvoyId::new("other", "other-failed"),
+            namespace: "other".into(),
+            name: "other-failed".into(),
+            workflow_ref: "scratch".into(),
+            phase: WireConvoyPhase::Failed,
+            message: Some("wrong namespace".into()),
+            repo_hint: None,
+            tasks: vec![],
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: None,
+            initializing: true,
+        };
+        let other = namespaces.entry("other".into()).or_default();
+        other.convoys.insert(leaked.id.clone(), leaked);
+        other.seq = 1;
     }
 
     let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
@@ -401,6 +419,50 @@ async fn fleet_list_reports_local_crewless_failed_convoys() {
     assert_eq!(row.crew_state, "failed: missing input 'topic'");
     assert_eq!(row.host, daemon.host_name);
     assert_eq!(row.staleness, FleetStaleness::Local);
+}
+
+#[tokio::test]
+async fn fleet_list_does_not_add_crewless_row_when_convoy_has_crew() {
+    use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase as WireConvoyPhase, ConvoySummary};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+
+    let projection_state = daemon.namespace_projection_state().await;
+    let summary = ConvoySummary {
+        id: ConvoyId::new("flotilla", "convoy-a"),
+        namespace: "flotilla".into(),
+        name: "convoy-a".into(),
+        workflow_ref: "scratch".into(),
+        phase: WireConvoyPhase::Active,
+        message: None,
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: false,
+    };
+    {
+        let mut namespaces = projection_state.write().await;
+        let view = namespaces.entry("flotilla".into()).or_default();
+        view.convoys.insert(summary.id.clone(), summary);
+        view.seq = 1;
+    }
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(response.rows[0].convoy, "convoy-a");
+    assert_eq!(response.rows[0].crew, "implement/coder");
+    assert_eq!(response.rows[0].crew_state, "running");
 }
 
 #[tokio::test]
@@ -525,11 +587,29 @@ async fn replica_refresh_reports_crewless_convoys_from_namespace_snapshots() {
         observed_workflow_ref: None,
         initializing: true,
     };
+    let leaked = ConvoySummary {
+        id: ConvoyId::new("other", "other-failed"),
+        namespace: "other".into(),
+        name: "other-failed".into(),
+        workflow_ref: "scratch".into(),
+        phase: WireConvoyPhase::Failed,
+        message: Some("wrong namespace".into()),
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: true,
+    };
     let snapshot = FleetReplicaSnapshot {
         host: HostName::new("feta"),
         generation: Some("gen-1".to_string()),
         rows: vec![],
-        namespaces: vec![NamespaceSnapshot { seq: 3, namespace: "flotilla".into(), convoys: vec![summary] }],
+        namespaces: vec![NamespaceSnapshot { seq: 3, namespace: "flotilla".into(), convoys: vec![summary] }, NamespaceSnapshot {
+            seq: 3,
+            namespace: "other".into(),
+            convoys: vec![leaked],
+        }],
     };
     let runner = Arc::new(QueuedOutputRunner::new(vec![CommandOutput {
         stdout: serde_json::to_string(&snapshot).expect("serialize snapshot"),
