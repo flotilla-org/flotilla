@@ -360,6 +360,50 @@ async fn fleet_list_reports_store_backed_local_sessions_with_authority() {
 }
 
 #[tokio::test]
+async fn fleet_list_reports_local_crewless_failed_convoys() {
+    use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase as WireConvoyPhase, ConvoySummary};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let projection_state = daemon.namespace_projection_state().await;
+    let summary = ConvoySummary {
+        id: ConvoyId::new("flotilla", "convoy-failed"),
+        namespace: "flotilla".into(),
+        name: "convoy-failed".into(),
+        workflow_ref: "scratch".into(),
+        phase: WireConvoyPhase::Failed,
+        message: Some("missing input 'topic'".into()),
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: true,
+    };
+    {
+        let mut namespaces = projection_state.write().await;
+        let view = namespaces.entry("flotilla".into()).or_default();
+        view.convoys.insert(summary.id.clone(), summary);
+        view.seq = 1;
+    }
+
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.rows.len(), 1);
+    let row = &response.rows[0];
+    assert_eq!(row.convoy, "convoy-failed");
+    assert_eq!(row.vessel, "-");
+    assert_eq!(row.crew, "-");
+    assert_eq!(row.crew_state, "failed: missing input 'topic'");
+    assert_eq!(row.host, daemon.host_name);
+    assert_eq!(row.staleness, FleetStaleness::Local);
+}
+
+#[tokio::test]
 async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
@@ -455,6 +499,59 @@ async fn replica_refresh_replaces_rows_when_generation_changes() {
     assert_eq!(response.replicas.len(), 1);
     assert!(response.replicas[0].reachable);
     assert_eq!(response.replicas[0].generation.as_deref(), Some("gen-2"));
+}
+
+#[tokio::test]
+async fn replica_refresh_reports_crewless_convoys_from_namespace_snapshots() {
+    use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase as WireConvoyPhase, ConvoySummary, NamespaceSnapshot};
+
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+
+    let summary = ConvoySummary {
+        id: ConvoyId::new("flotilla", "remote-failed"),
+        namespace: "flotilla".into(),
+        name: "remote-failed".into(),
+        workflow_ref: "scratch".into(),
+        phase: WireConvoyPhase::Failed,
+        message: Some("missing input 'topic'".into()),
+        repo_hint: None,
+        tasks: vec![],
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: None,
+        initializing: true,
+    };
+    let snapshot = FleetReplicaSnapshot {
+        host: HostName::new("feta"),
+        generation: Some("gen-1".to_string()),
+        rows: vec![],
+        namespaces: vec![NamespaceSnapshot { seq: 3, namespace: "flotilla".into(), convoys: vec![summary] }],
+    };
+    let runner = Arc::new(QueuedOutputRunner::new(vec![CommandOutput {
+        stdout: serde_json::to_string(&snapshot).expect("serialize snapshot"),
+        stderr: String::new(),
+        success: true,
+    }]));
+    let mut discovery =
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new())));
+    discovery.runner = runner;
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+
+    daemon.refresh_fleet_replicas_once().await.expect("refresh should succeed");
+    let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
+
+    assert_eq!(response.rows.len(), 1);
+    let row = &response.rows[0];
+    assert_eq!(row.convoy, "remote-failed");
+    assert_eq!(row.vessel, "-");
+    assert_eq!(row.crew, "-");
+    assert_eq!(row.crew_state, "failed: missing input 'topic'");
+    assert_eq!(row.host, HostName::new("feta"));
+    assert!(matches!(row.staleness, FleetStaleness::Fresh { .. }));
 }
 
 #[test]

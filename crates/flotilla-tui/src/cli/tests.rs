@@ -525,6 +525,28 @@ mod command_result_human {
     }
 
     #[test]
+    fn fleet_list_shows_crewless_failed_convoy() {
+        let result = CommandValue::FleetList(Box::new(FleetListResponse {
+            rows: vec![FleetListRow {
+                convoy: "convoy-failed".into(),
+                vessel: "-".into(),
+                authority: None,
+                crew: "-".into(),
+                crew_state: "failed: missing input 'topic'".into(),
+                host: HostName::new("kiwi"),
+                staleness: FleetStaleness::Local,
+            }],
+            replicas: vec![],
+        }));
+
+        let output = format_command_result(&result);
+
+        assert!(!output.contains("No crew sessions found."));
+        assert!(output.contains("convoy-failed"));
+        assert!(output.contains("failed: missing input 'topic'"));
+    }
+
+    #[test]
     fn prepared_workspace_is_internal_step_result() {
         let result = CommandValue::PreparedWorkspace(PreparedWorkspace {
             label: "feat".into(),
