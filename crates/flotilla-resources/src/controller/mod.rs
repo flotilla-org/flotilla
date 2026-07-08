@@ -399,7 +399,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                     {
                         reconciler.run_finalizer(&object).await?;
                         let meta = InputMeta::from(&object.metadata).without_finalizer(finalizer_name);
-                        primary.update(&meta, &object.metadata.resource_version, &object.spec).await?;
+                        match primary.update(&meta, &object.metadata.resource_version, &object.spec).await {
+                            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                            Err(err) => return Err(err),
+                        }
                         continue;
                     }
                 }
