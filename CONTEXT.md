@@ -81,8 +81,41 @@ _Avoid_: Astillero (renamed 2026-07-06), sandbox aggregator.
 
 **Crew**:
 The set of **Processes** (agents and terminals, typically a cleat pool) running
-aboard a **Vessel** for a **Leg** — the thing one attaches to.
+aboard a **Vessel** for a **Leg** — the thing one attaches to. The Hull carries
+what any crew would find aboard; the Crew launch carries who is aboard and why
+they are here (identity, model, **Brief**) — operating under the Vessel's shared
+**Stance**.
 _Avoid_: Attachable set, session group.
+
+**AgentAdapter**:
+The single per-harness definition (claude, codex, pi) of everything Flotilla
+knows about that harness: config templates, skill mirror paths, credential
+file formats, launch synthesis, resume/re-prompt mechanics. Consumed in two
+phases — hull-prep (at rest) and crew-launch (runtime). Verbs: prepare,
+launch, deliver_brief, re_prompt, stance.
+_Avoid_: Provider (that is the Fleet Observer's word), driver, plugin.
+
+**CrewSpec**:
+The normalised, harness-agnostic declaration of one crew member — role, agent
+selector, model tier, brief ref, skills, credential names — that a Leg's
+script writes and an **AgentAdapter** realises. Selector fields are
+requirements (ADR 0007 pattern): tier lookup now, capability-label matching
+later, possibly agentic resolution eventually.
+_Avoid_: Launch config, agent args.
+
+**Stance**:
+The declared permission/sandbox posture of a **Vessel**, shared by all crew
+aboard — `trusted`, `workspace-write`, or `contained`. A floor of confinement,
+realised **walls-first** (environment sandbox; wrapper sandbox on host-direct)
+with harness flags as fallback; under-realization fails loudly, extra
+confinement is recorded as effective stance.
+_Avoid_: Permission mode, sandbox flag (those are harness spellings).
+
+**Brief**:
+The per-crew-member statement of why they are here — a durable file in the
+vessel workspace (also delivered agent-natively). Accumulated briefs on a
+revisited vessel are the script as executed, per character.
+_Avoid_: Prompt (the delivery mechanism), task description.
 
 **Process**:
 A running program aboard a **Vessel**, as a member of its **Crew**, resolved to
