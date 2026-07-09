@@ -63,6 +63,13 @@ pub struct ProcessSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegCompletionTarget {
+    pub convoy: String,
+    pub leg: String,
+    pub host: HostName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TaskSummary {
     pub name: String,
     pub depends_on: Vec<String>,
@@ -71,13 +78,14 @@ pub struct TaskSummary {
     pub host: Option<HostName>,
     pub checkout: Option<CheckoutRef>,
     pub workspace_ref: Option<String>,
+    pub completion_target: Option<LegCompletionTarget>,
     pub ready_at: Option<Timestamp>,
     pub started_at: Option<Timestamp>,
     pub finished_at: Option<Timestamp>,
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct ConvoySummary {
     pub id: ConvoyId,
     pub namespace: String,
@@ -102,7 +110,7 @@ pub struct ConvoyFixtureSnapshot {
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct ConvoyFixtureDelta {
     pub seq: u64,
     pub namespace: String,

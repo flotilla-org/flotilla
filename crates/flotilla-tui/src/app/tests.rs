@@ -1286,8 +1286,11 @@ fn resolve_environment_target_accepts_non_host_environment_identity_directly() {
 // -- Panel snapshot / delta handling --
 
 fn legacy_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_protocol::panel::PanelRow {
-    use flotilla_protocol::panel::{
-        ConvoyPhase, ConvoySummary, CrewMemberSummary, LegPhase, LegSummary, PanelRow, PanelRowData, ResourceRef, RowIntent,
+    use std::collections::BTreeMap;
+
+    use flotilla_protocol::{
+        panel::{PanelRow, PanelValue, ResourceRef, RowIntent},
+        HostName,
     };
 
     let resource = ResourceRef::new("flotilla.work/v1", "Convoy", &convoy.namespace, &convoy.name);
@@ -1295,66 +1298,102 @@ fn legacy_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_pro
         .tasks
         .into_iter()
         .map(|task| {
+            let host = task.host.clone().unwrap_or_else(HostName::local);
             let mut intents = Vec::new();
-            if let Some(workspace_ref) = task.workspace_ref {
-                intents.push(RowIntent::workspace("attach", workspace_ref));
+            if let Some(workspace_ref) = task.workspace_ref.clone() {
+                intents.push(RowIntent::vessel("attach", workspace_ref, host.clone()));
             }
-            intents.push(RowIntent::leg("complete-leg", &convoy.name, &task.name));
+            if let Some(target) = task.completion_target.clone() {
+                intents.push(RowIntent::leg("complete-leg", &convoy.namespace, target.convoy, target.leg, target.host));
+            }
+            let mut values = BTreeMap::from([
+                ("name".to_string(), PanelValue::String(task.name.clone())),
+                (
+                    "phase".to_string(),
+                    PanelValue::String(
+                        match task.phase {
+                            crate::convoy_model::TaskPhase::Pending => "pending",
+                            crate::convoy_model::TaskPhase::Ready => "ready",
+                            crate::convoy_model::TaskPhase::Launching => "launching",
+                            crate::convoy_model::TaskPhase::Running => "running",
+                            crate::convoy_model::TaskPhase::Completed => "completed",
+                            crate::convoy_model::TaskPhase::Failed => "failed",
+                            crate::convoy_model::TaskPhase::Cancelled => "cancelled",
+                        }
+                        .to_string(),
+                    ),
+                ),
+                (
+                    "crew".to_string(),
+                    PanelValue::List(
+                        task.processes
+                            .into_iter()
+                            .map(|process| {
+                                PanelValue::Map(BTreeMap::from([
+                                    ("role".to_string(), PanelValue::String(process.role)),
+                                    ("command_preview".to_string(), PanelValue::String(process.command_preview)),
+                                ]))
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]);
+            if let Some(host) = task.host {
+                values.insert("host".to_string(), PanelValue::Host(host));
+            }
+            if let Some(checkout) = task.checkout {
+                values.insert("checkout".to_string(), PanelValue::Checkout(checkout));
+            }
+            for (key, value) in [("ready_at", task.ready_at), ("started_at", task.started_at), ("finished_at", task.finished_at)] {
+                if let Some(value) = value {
+                    values.insert(key.to_string(), PanelValue::Timestamp(value));
+                }
+            }
+            if let Some(message) = task.message {
+                values.insert("message".to_string(), PanelValue::String(message));
+            }
             PanelRow {
                 resource: resource.subresource(format!("legs/{}", task.name)),
-                data: PanelRowData::Leg(LegSummary {
-                    name: task.name,
-                    phase: match task.phase {
-                        crate::convoy_model::TaskPhase::Pending => LegPhase::Pending,
-                        crate::convoy_model::TaskPhase::Ready => LegPhase::Ready,
-                        crate::convoy_model::TaskPhase::Launching => LegPhase::Launching,
-                        crate::convoy_model::TaskPhase::Running => LegPhase::Running,
-                        crate::convoy_model::TaskPhase::Completed => LegPhase::Completed,
-                        crate::convoy_model::TaskPhase::Failed => LegPhase::Failed,
-                        crate::convoy_model::TaskPhase::Cancelled => LegPhase::Cancelled,
-                    },
-                    crew: task
-                        .processes
-                        .into_iter()
-                        .map(|process| CrewMemberSummary { role: process.role, command_preview: process.command_preview })
-                        .collect(),
-                    host: task.host,
-                    checkout: task.checkout,
-                    ready_at: task.ready_at,
-                    started_at: task.started_at,
-                    finished_at: task.finished_at,
-                    message: task.message,
-                }),
+                values,
                 intents,
                 children: vec![],
                 depends_on: task.depends_on.iter().map(|name| resource.subresource(format!("legs/{name}"))).collect(),
             }
         })
         .collect();
-    PanelRow {
-        resource,
-        data: PanelRowData::Convoy(ConvoySummary {
-            namespace: convoy.namespace,
-            name: convoy.name,
-            workflow_ref: convoy.workflow_ref,
-            phase: match convoy.phase {
-                crate::convoy_model::ConvoyPhase::Pending => ConvoyPhase::Pending,
-                crate::convoy_model::ConvoyPhase::Active => ConvoyPhase::Active,
-                crate::convoy_model::ConvoyPhase::Completed => ConvoyPhase::Completed,
-                crate::convoy_model::ConvoyPhase::Failed => ConvoyPhase::Failed,
-                crate::convoy_model::ConvoyPhase::Cancelled => ConvoyPhase::Cancelled,
-            },
-            message: convoy.message,
-            repo_hint: convoy.repo_hint,
-            started_at: convoy.started_at,
-            finished_at: convoy.finished_at,
-            observed_workflow_ref: convoy.observed_workflow_ref,
-            initializing: convoy.initializing,
-        }),
-        intents: vec![],
-        children,
-        depends_on: vec![],
+    let mut values = BTreeMap::from([
+        ("name".to_string(), PanelValue::String(convoy.name)),
+        ("workflow_ref".to_string(), PanelValue::String(convoy.workflow_ref)),
+        (
+            "phase".to_string(),
+            PanelValue::String(
+                match convoy.phase {
+                    crate::convoy_model::ConvoyPhase::Pending => "pending",
+                    crate::convoy_model::ConvoyPhase::Active => "active",
+                    crate::convoy_model::ConvoyPhase::Completed => "completed",
+                    crate::convoy_model::ConvoyPhase::Failed => "failed",
+                    crate::convoy_model::ConvoyPhase::Cancelled => "cancelled",
+                }
+                .to_string(),
+            ),
+        ),
+        ("initializing".to_string(), PanelValue::Bool(convoy.initializing)),
+    ]);
+    if let Some(message) = convoy.message {
+        values.insert("message".to_string(), PanelValue::String(message));
     }
+    if let Some(repo) = convoy.repo_hint {
+        values.insert("repo".to_string(), PanelValue::String(repo.0));
+    }
+    for (key, value) in [("started_at", convoy.started_at), ("finished_at", convoy.finished_at)] {
+        if let Some(value) = value {
+            values.insert(key.to_string(), PanelValue::Timestamp(value));
+        }
+    }
+    if let Some(workflow_ref) = convoy.observed_workflow_ref {
+        values.insert("observed_workflow_ref".to_string(), PanelValue::String(workflow_ref));
+    }
+    PanelRow { resource, values, intents: vec![], children, depends_on: vec![] }
 }
 
 fn panel_snapshot_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnapshot>) -> flotilla_protocol::DaemonEvent {
@@ -1407,7 +1446,7 @@ fn test_convoy(
 }
 
 #[test]
-fn app_applies_namespace_snapshot() {
+fn app_applies_panel_snapshot() {
     use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
 
     let mut app = stub_app();
@@ -1424,7 +1463,29 @@ fn app_applies_namespace_snapshot() {
 }
 
 #[test]
-fn app_applies_namespace_delta() {
+fn empty_panel_snapshot_clears_convoy_selection() {
+    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
+
+    let mut app = stub_app();
+    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![test_convoy("flotilla", "x", ConvoyPhase::Active, false)],
+    })));
+    assert!(app.selected_convoy_id().is_some());
+
+    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+        seq: 2,
+        namespace: "flotilla".into(),
+        convoys: vec![],
+    })));
+
+    assert!(app.convoys("flotilla").is_empty());
+    assert!(app.selected_convoy_id().is_none());
+}
+
+#[test]
+fn app_applies_panel_delta() {
     use crate::convoy_model::{ConvoyFixtureDelta, ConvoyFixtureSnapshot, ConvoyPhase};
 
     let mut app = stub_app();
@@ -1893,6 +1954,11 @@ fn convoy_with_tasks(name: &str, tasks: &[&str]) -> crate::convoy_model::ConvoyS
             host: None,
             checkout: None,
             workspace_ref: None,
+            completion_target: Some(crate::convoy_model::LegCompletionTarget {
+                convoy: name.to_string(),
+                leg: (*t).to_string(),
+                host: HostName::local(),
+            }),
             ready_at: None,
             started_at: None,
             finished_at: None,
@@ -2144,6 +2210,75 @@ fn x_then_enter_dispatches_convoy_task_complete() {
     }
 }
 
+#[test]
+fn x_then_enter_routes_remote_convoy_task_complete_to_its_host() {
+    let mut app = stub_app();
+    insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
+    let mut convoy = convoy_with_tasks("remote-convoy", &["implement"]);
+    convoy.tasks[0].completion_target.as_mut().expect("completion target").host = HostName::new("feta");
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('x')));
+    app.handle_key(key(KeyCode::Enter));
+
+    let cmd = app.proto_commands.take_next().expect("expected remote completion command");
+    assert_eq!(cmd.0.node_id, Some(NodeId::new("node-feta-peer")));
+}
+
+#[test]
+fn x_uses_complete_intent_target_instead_of_display_fields() {
+    let mut app = stub_app();
+    let mut convoy = convoy_with_tasks("display-convoy", &["display-leg"]);
+    convoy.tasks[0].completion_target = Some(crate::convoy_model::LegCompletionTarget {
+        convoy: "target-convoy".into(),
+        leg: "target-leg".into(),
+        host: HostName::local(),
+    });
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('x')));
+
+    let palette = app
+        .screen
+        .modal_stack
+        .last()
+        .expect("modal pushed")
+        .as_any()
+        .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
+        .expect("top modal is CommandPaletteWidget");
+    assert_eq!(palette.input_value(), "convoy target-convoy leg target-leg complete ");
+}
+
+#[test]
+fn x_rejects_complete_intent_for_unknown_remote_host() {
+    let mut app = stub_app();
+    let mut convoy = convoy_with_tasks("remote-convoy", &["implement"]);
+    convoy.tasks[0].completion_target.as_mut().expect("completion target").host = HostName::new("missing-host");
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('x')));
+
+    assert!(!app.screen.has_modal());
+    assert_eq!(app.model.status_message.as_deref(), Some("host 'missing-host' is not connected"));
+}
+
+#[test]
+fn x_is_unavailable_without_complete_intent() {
+    let mut app = stub_app();
+    let mut convoy = convoy_with_tasks("alpha", &["implement"]);
+    convoy.tasks[0].completion_target = None;
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('x')));
+
+    assert!(!app.screen.has_modal());
+    assert_eq!(app.model.status_message.as_deref(), Some("completion unavailable for leg 'implement'"));
+}
+
 // -- Convoy task attach (`a`) --
 
 fn convoy_with_task_workspace_refs(name: &str, tasks: &[(&str, Option<&str>)]) -> crate::convoy_model::ConvoySummary {
@@ -2158,6 +2293,11 @@ fn convoy_with_task_workspace_refs(name: &str, tasks: &[(&str, Option<&str>)]) -
             host: None,
             checkout: None,
             workspace_ref: ws.map(str::to_string),
+            completion_target: Some(crate::convoy_model::LegCompletionTarget {
+                convoy: name.to_string(),
+                leg: (*t).to_string(),
+                host: HostName::local(),
+            }),
             ready_at: None,
             started_at: None,
             finished_at: None,
@@ -2188,6 +2328,35 @@ fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
         other => panic!("expected SelectWorkspace, got {other:?}"),
     }
     assert!(app.model.status_message.is_none(), "no status message when workspace_ref is present");
+}
+
+#[test]
+fn a_on_remote_task_routes_select_workspace_to_its_host() {
+    let mut app = stub_app();
+    insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
+    let mut convoy = convoy_with_task_workspace_refs("alpha", &[("implement", Some("ws://remote"))]);
+    convoy.tasks[0].host = Some(HostName::new("feta"));
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('a')));
+
+    let cmd = app.proto_commands.take_next().expect("expected remote SelectWorkspace command");
+    assert_eq!(cmd.0.node_id, Some(NodeId::new("node-feta-peer")));
+}
+
+#[test]
+fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
+    let mut app = stub_app();
+    let mut convoy = convoy_with_task_workspace_refs("alpha", &[("implement", Some("ws://remote"))]);
+    convoy.tasks[0].host = Some(HostName::new("missing-host"));
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.ui.is_convoys = true;
+    app.handle_key(key(KeyCode::Char('l')));
+    app.handle_key(key(KeyCode::Char('a')));
+
+    assert!(app.proto_commands.take_next().is_none());
+    assert_eq!(app.model.status_message.as_deref(), Some("host 'missing-host' is not connected"));
 }
 
 #[test]

@@ -1,13 +1,10 @@
 //! Resource-store and fleet-replica Aggregator for surface panel streams.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use flotilla_core::aggregator_projection::{AggregatorProjectionState, CONVOY_PANEL_ID};
 use flotilla_protocol::{
-    panel::{
-        ConvoyPhase as WireConvoyPhase, ConvoySummary, CrewMemberSummary, LegPhase as WireLegPhase, LegSummary, PanelDelta, PanelId,
-        PanelRow, PanelRowData, PanelRowsDelta, ResourceRef, RowIntent,
-    },
+    panel::{IntentTarget, PanelDelta, PanelId, PanelRow, PanelRowsDelta, PanelValue, ResourceRef, RowIntent},
     DaemonEvent, FleetReplicaSnapshot, HostName,
 };
 use flotilla_resources::{
@@ -19,6 +16,7 @@ use tokio::sync::broadcast;
 
 type PresentationKey = (String, String, String);
 
+#[derive(bon::Builder)]
 pub struct Aggregator {
     state: AggregatorProjectionState,
     local_host: HostName,
@@ -38,7 +36,7 @@ impl Aggregator {
         durable_presentations: TypedResolver<Presentation>,
         observed_convoys: TypedResolver<Convoy>,
         observed_presentations: TypedResolver<Presentation>,
-        mut replica_rx: broadcast::Receiver<FleetReplicaSnapshot>,
+        mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) {
         let Some(mut durable_convoy_stream) = self.list_and_watch_convoys(durable_convoys).await else { return };
         let Some(mut durable_presentation_stream) = self.list_and_watch_presentations(durable_presentations).await else { return };
@@ -68,7 +66,7 @@ impl Aggregator {
                     None => break,
                 },
                 replica = replica_rx.recv() => match replica {
-                    Ok(snapshot) => self.apply_replica_snapshot(snapshot).await,
+                    Ok(snapshots) => self.apply_replica_cache(snapshots).await,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "aggregator lagged behind fleet replica refreshes");
                     }
@@ -164,8 +162,8 @@ impl Aggregator {
             let mut view = self.state.write().await;
             let Some(row) = view.local_rows.get_mut(&reference) else { return };
             for child in &mut row.children {
-                let PanelRowData::Leg(leg) = &child.data else { continue };
-                child.intents = self.intents_for_leg(namespace, convoy, &leg.name);
+                let Some(leg) = child.values.get("name").and_then(PanelValue::as_str) else { continue };
+                child.intents = self.intents_for_leg(namespace, convoy, leg);
             }
             let changed = row.clone();
             view.seq = view.seq.saturating_add(1);
@@ -240,6 +238,62 @@ impl Aggregator {
         }
     }
 
+    pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
+        let mut replacements = HashMap::new();
+        for snapshot in snapshots {
+            let host = snapshot.host;
+            let mut rows = HashMap::new();
+            if let Some(panel) = snapshot
+                .panels
+                .into_iter()
+                .find(|panel| panel.tab.id == "convoys")
+                .and_then(|snapshot| snapshot.tab.panels.into_iter().find(|panel| panel.id.as_str() == CONVOY_PANEL_ID))
+            {
+                for mut row in panel.rows {
+                    set_row_host(&mut row, &host);
+                    rows.insert(row.resource.clone(), row);
+                }
+            }
+            replacements.insert(host, rows);
+        }
+
+        let (changed, removed, full_snapshot) = {
+            let mut view = self.state.write().await;
+            let previous = std::mem::take(&mut view.replica_rows);
+            let changed = replacements
+                .iter()
+                .flat_map(|(host, rows)| {
+                    let prior = previous.get(host);
+                    rows.iter()
+                        .filter(move |(reference, row)| prior.and_then(|prior| prior.get(*reference)) != Some(*row))
+                        .map(|(_, row)| row.clone())
+                })
+                .collect::<Vec<_>>();
+            let removed = previous
+                .iter()
+                .flat_map(|(host, rows)| {
+                    let replacement = replacements.get(host);
+                    rows.keys()
+                        .filter(move |reference| replacement.is_none_or(|replacement| !replacement.contains_key(*reference)))
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            view.replica_rows = replacements;
+            if changed.is_empty() && removed.is_empty() {
+                return;
+            }
+            view.seq = view.seq.saturating_add(1);
+            (changed, removed, view.snapshot())
+        };
+
+        if self.emitted_initial_snapshot {
+            self.emit_delta(changed, removed).await;
+        } else {
+            self.emitted_initial_snapshot = true;
+            let _ = self.event_tx.send(DaemonEvent::PanelSnapshot(Box::new(full_snapshot)));
+        }
+    }
+
     async fn emit_delta(&self, changed: Vec<PanelRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.snapshot().await.seq;
         let _ = self.event_tx.send(DaemonEvent::PanelDelta(Box::new(PanelDelta {
@@ -256,9 +310,9 @@ impl Aggregator {
     fn intents_for_leg(&self, namespace: &str, convoy: &str, leg: &str) -> Vec<RowIntent> {
         let mut intents = Vec::new();
         if let Some(workspace_ref) = self.presentation_workspaces.get(&(namespace.to_string(), convoy.to_string(), leg.to_string())) {
-            intents.push(RowIntent::workspace("attach", workspace_ref));
+            intents.push(RowIntent::vessel("attach", workspace_ref, self.local_host.clone()));
         }
-        intents.push(RowIntent::leg("complete-leg", convoy, leg));
+        intents.push(RowIntent::leg("complete-leg", namespace, convoy, leg, self.local_host.clone()));
         intents
     }
 
@@ -279,22 +333,20 @@ impl Aggregator {
                     .collect()
             })
             .unwrap_or_default();
-        let mut summary = ConvoySummary {
-            namespace: namespace.clone(),
-            name: name.clone(),
-            workflow_ref: convoy.spec.workflow_ref.clone(),
-            phase: wire_convoy_phase(status.map(|status| status.phase).unwrap_or_default()),
-            message: status.and_then(|status| status.message.clone()),
-            repo_hint: None,
-            started_at: status.and_then(|status| status.started_at),
-            finished_at: status.and_then(|status| status.finished_at),
-            observed_workflow_ref: status.and_then(|status| status.observed_workflow_ref.clone()),
-            initializing: status.map(|status| status.workflow_snapshot.is_none()).unwrap_or(true),
-        };
+        let mut values = BTreeMap::from([
+            ("name".to_string(), PanelValue::String(name.clone())),
+            ("workflow_ref".to_string(), PanelValue::String(convoy.spec.workflow_ref.clone())),
+            ("phase".to_string(), PanelValue::String(convoy_phase_label(status.map(|status| status.phase).unwrap_or_default()).into())),
+            ("initializing".to_string(), PanelValue::Bool(status.map(|status| status.workflow_snapshot.is_none()).unwrap_or(true))),
+        ]);
+        insert_optional_string(&mut values, "message", status.and_then(|status| status.message.clone()));
+        insert_optional_timestamp(&mut values, "started_at", status.and_then(|status| status.started_at));
+        insert_optional_timestamp(&mut values, "finished_at", status.and_then(|status| status.finished_at));
+        insert_optional_string(&mut values, "observed_workflow_ref", status.and_then(|status| status.observed_workflow_ref.clone()));
         if let Some(repo) = convoy.metadata.labels.get(flotilla_resources::REPO_LABEL) {
-            summary.repo_hint = Some(flotilla_protocol::RepoKey(repo.clone()));
+            values.insert("repo".to_string(), PanelValue::String(repo.clone()));
         }
-        PanelRow { resource, data: PanelRowData::Convoy(summary), intents: Vec::new(), children, depends_on: Vec::new() }
+        PanelRow { resource, values, intents: Vec::new(), children, depends_on: Vec::new() }
     }
 
     fn summarize_leg(&self, convoy_ref: &ResourceRef, definition: &SnapshotTask, state: Option<&TaskState>) -> PanelRow {
@@ -307,23 +359,27 @@ impl Aggregator {
                     ProcessSource::Tool { command } => command.clone(),
                     ProcessSource::Agent { selector, prompt } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
                 };
-                CrewMemberSummary { role: process.role.clone(), command_preview }
+                PanelValue::Map(BTreeMap::from([
+                    ("role".to_string(), PanelValue::String(process.role.clone())),
+                    ("command_preview".to_string(), PanelValue::String(command_preview)),
+                ]))
             })
             .collect();
-        let summary = LegSummary {
-            name: definition.name.clone(),
-            phase: state.map(|state| wire_leg_phase(state.phase)).unwrap_or(WireLegPhase::Pending),
-            crew,
-            host: None,
-            checkout: None,
-            ready_at: state.and_then(|state| state.ready_at),
-            started_at: state.and_then(|state| state.started_at),
-            finished_at: state.and_then(|state| state.finished_at),
-            message: state.and_then(|state| state.message.clone()),
-        };
+        let mut values = BTreeMap::from([
+            ("name".to_string(), PanelValue::String(definition.name.clone())),
+            (
+                "phase".to_string(),
+                PanelValue::String(leg_phase_label(state.map(|state| state.phase).unwrap_or(ResourceLegPhase::Pending)).into()),
+            ),
+            ("crew".to_string(), PanelValue::List(crew)),
+        ]);
+        insert_optional_timestamp(&mut values, "ready_at", state.and_then(|state| state.ready_at));
+        insert_optional_timestamp(&mut values, "started_at", state.and_then(|state| state.started_at));
+        insert_optional_timestamp(&mut values, "finished_at", state.and_then(|state| state.finished_at));
+        insert_optional_string(&mut values, "message", state.and_then(|state| state.message.clone()));
         let depends_on = definition.depends_on.iter().map(|name| convoy_ref.subresource(format!("legs/{name}"))).collect();
         let intents = self.intents_for_leg(&convoy_ref.namespace, &convoy_ref.name, &definition.name);
-        PanelRow { resource, data: PanelRowData::Leg(summary), intents, children: Vec::new(), depends_on }
+        PanelRow { resource, values, intents, children: Vec::new(), depends_on }
     }
 }
 
@@ -341,30 +397,49 @@ fn set_row_host(row: &mut PanelRow, host: &HostName) {
     for dependency in &mut row.depends_on {
         dependency.host = Some(host.clone());
     }
+    for intent in &mut row.intents {
+        match &mut intent.target {
+            IntentTarget::Vessel { host: intent_host, .. } | IntentTarget::Leg { host: intent_host, .. } => {
+                *intent_host = host.clone();
+            }
+        }
+    }
     for child in &mut row.children {
         set_row_host(child, host);
     }
 }
 
-fn wire_convoy_phase(phase: ResourceConvoyPhase) -> WireConvoyPhase {
+fn convoy_phase_label(phase: ResourceConvoyPhase) -> &'static str {
     match phase {
-        ResourceConvoyPhase::Pending => WireConvoyPhase::Pending,
-        ResourceConvoyPhase::Active => WireConvoyPhase::Active,
-        ResourceConvoyPhase::Completed => WireConvoyPhase::Completed,
-        ResourceConvoyPhase::Failed => WireConvoyPhase::Failed,
-        ResourceConvoyPhase::Cancelled => WireConvoyPhase::Cancelled,
+        ResourceConvoyPhase::Pending => "pending",
+        ResourceConvoyPhase::Active => "active",
+        ResourceConvoyPhase::Completed => "completed",
+        ResourceConvoyPhase::Failed => "failed",
+        ResourceConvoyPhase::Cancelled => "cancelled",
     }
 }
 
-fn wire_leg_phase(phase: ResourceLegPhase) -> WireLegPhase {
+fn leg_phase_label(phase: ResourceLegPhase) -> &'static str {
     match phase {
-        ResourceLegPhase::Pending => WireLegPhase::Pending,
-        ResourceLegPhase::Ready => WireLegPhase::Ready,
-        ResourceLegPhase::Launching => WireLegPhase::Launching,
-        ResourceLegPhase::Running => WireLegPhase::Running,
-        ResourceLegPhase::Completed => WireLegPhase::Completed,
-        ResourceLegPhase::Failed => WireLegPhase::Failed,
-        ResourceLegPhase::Cancelled => WireLegPhase::Cancelled,
+        ResourceLegPhase::Pending => "pending",
+        ResourceLegPhase::Ready => "ready",
+        ResourceLegPhase::Launching => "launching",
+        ResourceLegPhase::Running => "running",
+        ResourceLegPhase::Completed => "completed",
+        ResourceLegPhase::Failed => "failed",
+        ResourceLegPhase::Cancelled => "cancelled",
+    }
+}
+
+fn insert_optional_string(values: &mut BTreeMap<String, PanelValue>, key: &str, value: Option<String>) {
+    if let Some(value) = value {
+        values.insert(key.to_string(), PanelValue::String(value));
+    }
+}
+
+fn insert_optional_timestamp(values: &mut BTreeMap<String, PanelValue>, key: &str, value: Option<chrono::DateTime<chrono::Utc>>) {
+    if let Some(value) = value {
+        values.insert(key.to_string(), PanelValue::Timestamp(value));
     }
 }
 
@@ -383,7 +458,10 @@ mod tests {
         let convoy = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name).on_host(host.clone());
         let row = PanelRow {
             resource: convoy,
-            data: PanelRowData::Convoy(ConvoySummary::active("flotilla", name, "wf")),
+            values: BTreeMap::from([
+                ("name".to_string(), PanelValue::String(name.to_string())),
+                ("phase".to_string(), PanelValue::String("active".to_string())),
+            ]),
             intents: vec![],
             children: vec![],
             depends_on: vec![],
@@ -417,6 +495,23 @@ mod tests {
         assert_eq!(delta.panels[0].removed[0].name, "old");
 
         let snapshot = state.snapshot().await;
-        assert!(snapshot.tab.panels[0].rows.iter().any(|row| matches!(&row.data, PanelRowData::Convoy(convoy) if convoy.name == "new")));
+        assert!(snapshot.tab.panels[0].rows.iter().any(|row| row.values.get("name").and_then(PanelValue::as_str) == Some("new")));
+    }
+
+    #[tokio::test]
+    async fn complete_replica_cache_removes_hosts_missing_from_next_refresh() {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+
+        aggregator.apply_replica_cache(vec![remote_snapshot("feta", "generation-1", "feta-convoy")]).await;
+        assert!(matches!(rx.recv().await.expect("initial event"), DaemonEvent::PanelSnapshot(_)));
+
+        aggregator.apply_replica_cache(Vec::new()).await;
+        let DaemonEvent::PanelDelta(delta) = rx.recv().await.expect("removal event") else { panic!("expected panel delta") };
+        assert!(delta.panels[0].changed.is_empty());
+        assert_eq!(delta.panels[0].removed.len(), 1);
+        assert_eq!(delta.panels[0].removed[0].name, "feta-convoy");
+        assert!(state.snapshot().await.tab.panels[0].rows.is_empty());
     }
 }

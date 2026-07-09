@@ -721,7 +721,9 @@ fn spawn_aggregator_task(daemon: Arc<InProcessDaemon>, namespace: String, state:
     let local_host = daemon.host_name().clone();
     let event_tx = daemon.event_sender();
     tokio::spawn(async move {
-        Aggregator::new(state, local_host, event_tx)
+        let mut aggregator = Aggregator::new(state, local_host, event_tx);
+        aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
+        aggregator
             .run(
                 durable.clone().using::<Convoy>(&namespace),
                 durable.using::<Presentation>(&namespace),

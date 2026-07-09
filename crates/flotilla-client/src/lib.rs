@@ -551,18 +551,18 @@ fn handle_event(
             let _ = event_tx.send(event);
         }
         DaemonEvent::PanelSnapshot(snap) => {
-            local_seqs.write().unwrap().insert(StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq);
+            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::PanelDelta(delta) => {
             let tab = delta.tab_id.clone();
             let seq = delta.seq;
             let stream_key = StreamKey::Panel { tab: tab.clone() };
-            let local_seq = local_seqs.read().unwrap().get(&stream_key).copied();
+            let local_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
 
             match local_seq {
                 Some(ls) if seq == ls + 1 => {
-                    local_seqs.write().unwrap().insert(stream_key, seq);
+                    local_seqs.write().expect("sequence lock poisoned").insert(stream_key, seq);
                     debug!(%tab, %seq, "applied panel delta");
                     let _ = event_tx.send(event);
                 }

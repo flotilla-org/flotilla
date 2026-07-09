@@ -9,7 +9,7 @@ use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{panel::PanelRowData, DaemonEvent, HostName, StreamKey};
+use flotilla_protocol::{panel::PanelValue, DaemonEvent, HostName, StreamKey};
 use flotilla_resources::{ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -91,8 +91,7 @@ async fn aggregator_emits_panel_events() {
 
     let rows = &found.tab.panels[0].rows;
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the snapshot");
-    let PanelRowData::Convoy(convoy) = &rows[0].data else { panic!("expected convoy row") };
-    assert_eq!(convoy.name, "test-convoy-1");
+    assert_eq!(rows[0].values.get("name").and_then(PanelValue::as_str), Some("test-convoy-1"));
 }
 
 /// Verifies the causal chain:
@@ -176,7 +175,7 @@ async fn replay_since_returns_panel_events_after_seq() {
 
     let snap = panel_snap.expect("expected a PanelSnapshot for convoy tab in replay response");
     assert!(
-        snap.tab.panels[0].rows.iter().any(|row| matches!(&row.data, PanelRowData::Convoy(convoy) if convoy.name == "convoy-b")),
+        snap.tab.panels[0].rows.iter().any(|row| row.values.get("name").and_then(PanelValue::as_str) == Some("convoy-b")),
         "replay snapshot must contain convoy-b"
     );
 }

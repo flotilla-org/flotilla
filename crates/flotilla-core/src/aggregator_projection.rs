@@ -54,9 +54,9 @@ fn panel_snapshot(seq: u64, rows: Vec<PanelRow>) -> PanelSnapshot {
                 scope: PanelScope::Fleet,
                 columns: vec![
                     PanelColumn::new("name", "Convoy", PanelField::Name),
-                    PanelColumn::new("workflow", "Workflow", PanelField::Workflow),
+                    PanelColumn::new("workflow_ref", "Workflow", PanelField::Workflow),
                     PanelColumn::new("phase", "State", PanelField::Phase),
-                    PanelColumn::new("repository", "Repository", PanelField::Repository),
+                    PanelColumn::new("repo", "Repository", PanelField::Repository),
                 ],
                 intents: vec![
                     IntentDefinition::new("attach", "Attach", IntentKind::Attach),

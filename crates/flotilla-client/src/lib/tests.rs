@@ -881,13 +881,13 @@ async fn handle_event_panel_snapshot_updates_local_seq_and_forwards() {
 
     let event = event_rx.try_recv().expect("should receive PanelSnapshot");
     assert!(matches!(event, DaemonEvent::PanelSnapshot(_)));
-    assert_eq!(local_seqs.read().unwrap().get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(5));
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(5));
 }
 
 #[tokio::test]
 async fn handle_event_panel_delta_happy_path_applies_and_forwards() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    local_seqs.write().unwrap().insert(StreamKey::Panel { tab: "convoys".into() }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Panel { tab: "convoys".into() }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
@@ -905,14 +905,14 @@ async fn handle_event_panel_delta_happy_path_applies_and_forwards() {
 
     let event = event_rx.try_recv().expect("should receive PanelDelta");
     assert!(matches!(event, DaemonEvent::PanelDelta(_)));
-    assert_eq!(local_seqs.read().unwrap().get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(2));
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(2));
 }
 
 #[tokio::test]
 async fn handle_event_panel_delta_seq_gap_triggers_recovery() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     // Local seq is 1, but incoming delta seq is 3 — seq 2 was dropped.
-    local_seqs.write().unwrap().insert(StreamKey::Panel { tab: "convoys".into() }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Panel { tab: "convoys".into() }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (session, pending, next_id, server) = event_harness();

@@ -321,7 +321,7 @@ fn convoy_leg_completions(convoy_id: &str, partial: &str, namespaces: &crate::ap
     // Single-namespace MVP: search the "flotilla" namespace.
     let lower = partial.to_lowercase();
     let Some(model) = namespaces.get("flotilla") else { return vec![] };
-    let Some(convoy) = model.convoys.values().find(|c| c.id.name() == convoy_id) else { return vec![] };
+    let Some(convoy) = model.convoys.values().find(|convoy| convoy.name == convoy_id) else { return vec![] };
     convoy
         .tasks
         .iter()
@@ -815,6 +815,7 @@ mod tests {
                     host: None,
                     checkout: None,
                     workspace_ref: None,
+                    completion_target: None,
                     ready_at: None,
                     started_at: None,
                     finished_at: None,

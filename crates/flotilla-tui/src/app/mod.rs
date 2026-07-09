@@ -11,7 +11,7 @@ pub(crate) mod test_support;
 pub mod ui_state;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -21,7 +21,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
-    panel::{IntentTarget, PanelRow, PanelRowData, ResourceRef},
+    panel::{IntentTarget, PanelRow, PanelValue, ResourceRef, Timestamp},
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
     ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
     WorkItemIdentity,
@@ -365,70 +365,121 @@ fn panel_convoy_id(resource: &ResourceRef) -> crate::convoy_model::ConvoyId {
 }
 
 fn panel_row_to_convoy(row: &PanelRow) -> Option<crate::convoy_model::ConvoySummary> {
-    let PanelRowData::Convoy(convoy) = &row.data else { return None };
+    if row.resource.kind != "Convoy" || row.resource.subresource.is_some() {
+        return None;
+    }
+    let name = panel_string(&row.values, "name")?;
     let tasks = row
         .children
         .iter()
         .filter_map(|child| {
-            let PanelRowData::Leg(leg) = &child.data else { return None };
-            let workspace_ref = child.intents.iter().find_map(|intent| match &intent.target {
-                IntentTarget::Workspace { workspace_ref } => Some(workspace_ref.clone()),
+            let name = panel_string(&child.values, "name")?;
+            let vessel_target = child.intents.iter().find_map(|intent| match &intent.target {
+                IntentTarget::Vessel { attach_ref, host } => Some((attach_ref.clone(), host.clone())),
                 IntentTarget::Leg { .. } => None,
             });
+            let completion_target = child.intents.iter().find_map(|intent| match &intent.target {
+                IntentTarget::Leg { convoy, leg, host, .. } if intent.intent_id == "complete-leg" => {
+                    Some(crate::convoy_model::LegCompletionTarget { convoy: convoy.clone(), leg: leg.clone(), host: host.clone() })
+                }
+                IntentTarget::Leg { .. } | IntentTarget::Vessel { .. } => None,
+            });
+            let workspace_ref = vessel_target.as_ref().map(|(attach_ref, _)| attach_ref.clone());
+            let intent_host = vessel_target.map(|(_, host)| host);
             Some(crate::convoy_model::TaskSummary {
-                name: leg.name.clone(),
+                name: name.to_string(),
                 depends_on: child
                     .depends_on
                     .iter()
                     .filter_map(|reference| reference.subresource.as_deref()?.strip_prefix("legs/").map(str::to_string))
                     .collect(),
-                phase: match leg.phase {
-                    flotilla_protocol::panel::LegPhase::Pending => crate::convoy_model::TaskPhase::Pending,
-                    flotilla_protocol::panel::LegPhase::Ready => crate::convoy_model::TaskPhase::Ready,
-                    flotilla_protocol::panel::LegPhase::Launching => crate::convoy_model::TaskPhase::Launching,
-                    flotilla_protocol::panel::LegPhase::Running => crate::convoy_model::TaskPhase::Running,
-                    flotilla_protocol::panel::LegPhase::Completed => crate::convoy_model::TaskPhase::Completed,
-                    flotilla_protocol::panel::LegPhase::Failed => crate::convoy_model::TaskPhase::Failed,
-                    flotilla_protocol::panel::LegPhase::Cancelled => crate::convoy_model::TaskPhase::Cancelled,
-                },
-                processes: leg
-                    .crew
-                    .iter()
-                    .map(|member| crate::convoy_model::ProcessSummary {
-                        role: member.role.clone(),
-                        command_preview: member.command_preview.clone(),
-                    })
-                    .collect(),
-                host: leg.host.clone(),
-                checkout: leg.checkout.clone(),
+                phase: task_phase(panel_string(&child.values, "phase")?),
+                processes: panel_crew(&child.values),
+                host: intent_host.or_else(|| panel_host(&child.values, "host")).or_else(|| child.resource.host.clone()),
+                checkout: panel_checkout(&child.values, "checkout"),
                 workspace_ref,
-                ready_at: leg.ready_at,
-                started_at: leg.started_at,
-                finished_at: leg.finished_at,
-                message: leg.message.clone(),
+                completion_target,
+                ready_at: panel_timestamp(&child.values, "ready_at"),
+                started_at: panel_timestamp(&child.values, "started_at"),
+                finished_at: panel_timestamp(&child.values, "finished_at"),
+                message: panel_string(&child.values, "message").map(str::to_string),
             })
         })
         .collect();
     Some(crate::convoy_model::ConvoySummary {
         id: panel_convoy_id(&row.resource),
-        namespace: convoy.namespace.clone(),
-        name: convoy.name.clone(),
-        workflow_ref: convoy.workflow_ref.clone(),
-        phase: match convoy.phase {
-            flotilla_protocol::panel::ConvoyPhase::Pending => crate::convoy_model::ConvoyPhase::Pending,
-            flotilla_protocol::panel::ConvoyPhase::Active => crate::convoy_model::ConvoyPhase::Active,
-            flotilla_protocol::panel::ConvoyPhase::Completed => crate::convoy_model::ConvoyPhase::Completed,
-            flotilla_protocol::panel::ConvoyPhase::Failed => crate::convoy_model::ConvoyPhase::Failed,
-            flotilla_protocol::panel::ConvoyPhase::Cancelled => crate::convoy_model::ConvoyPhase::Cancelled,
-        },
-        message: convoy.message.clone(),
-        repo_hint: convoy.repo_hint.clone(),
+        namespace: row.resource.namespace.clone(),
+        name: name.to_string(),
+        workflow_ref: panel_string(&row.values, "workflow_ref").unwrap_or_default().to_string(),
+        phase: convoy_phase(panel_string(&row.values, "phase")?),
+        message: panel_string(&row.values, "message").map(str::to_string),
+        repo_hint: panel_string(&row.values, "repo").map(|repo| flotilla_protocol::RepoKey(repo.to_string())),
         tasks,
-        started_at: convoy.started_at,
-        finished_at: convoy.finished_at,
-        observed_workflow_ref: convoy.observed_workflow_ref.clone(),
-        initializing: convoy.initializing,
+        started_at: panel_timestamp(&row.values, "started_at"),
+        finished_at: panel_timestamp(&row.values, "finished_at"),
+        observed_workflow_ref: panel_string(&row.values, "observed_workflow_ref").map(str::to_string),
+        initializing: row.values.get("initializing").and_then(PanelValue::as_bool).unwrap_or(false),
     })
+}
+
+fn panel_string<'a>(values: &'a BTreeMap<String, PanelValue>, key: &str) -> Option<&'a str> {
+    values.get(key).and_then(PanelValue::as_str)
+}
+
+fn panel_timestamp(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<Timestamp> {
+    match values.get(key) {
+        Some(PanelValue::Timestamp(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn panel_host(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<HostName> {
+    match values.get(key) {
+        Some(PanelValue::Host(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn panel_checkout(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<flotilla_protocol::CheckoutRef> {
+    match values.get(key) {
+        Some(PanelValue::Checkout(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn panel_crew(values: &BTreeMap<String, PanelValue>) -> Vec<crate::convoy_model::ProcessSummary> {
+    let Some(PanelValue::List(crew)) = values.get("crew") else { return Vec::new() };
+    crew.iter()
+        .filter_map(|member| {
+            let PanelValue::Map(member) = member else { return None };
+            Some(crate::convoy_model::ProcessSummary {
+                role: panel_string(member, "role")?.to_string(),
+                command_preview: panel_string(member, "command_preview").unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn task_phase(phase: &str) -> crate::convoy_model::TaskPhase {
+    match phase {
+        "ready" => crate::convoy_model::TaskPhase::Ready,
+        "launching" => crate::convoy_model::TaskPhase::Launching,
+        "running" => crate::convoy_model::TaskPhase::Running,
+        "completed" => crate::convoy_model::TaskPhase::Completed,
+        "failed" => crate::convoy_model::TaskPhase::Failed,
+        "cancelled" => crate::convoy_model::TaskPhase::Cancelled,
+        _ => crate::convoy_model::TaskPhase::Pending,
+    }
+}
+
+fn convoy_phase(phase: &str) -> crate::convoy_model::ConvoyPhase {
+    match phase {
+        "active" => crate::convoy_model::ConvoyPhase::Active,
+        "completed" => crate::convoy_model::ConvoyPhase::Completed,
+        "failed" => crate::convoy_model::ConvoyPhase::Failed,
+        "cancelled" => crate::convoy_model::ConvoyPhase::Cancelled,
+        _ => crate::convoy_model::ConvoyPhase::Pending,
+    }
 }
 
 /// Log provider errors and format them into a status message.
@@ -1250,8 +1301,11 @@ impl App {
             }
             DaemonEvent::PanelSnapshot(snapshot) => {
                 let Some(panel) = snapshot.tab.panels.iter().find(|panel| panel.id.as_str() == "convoys") else { return };
+                let mut touched: Vec<_> = self.namespaces.keys().cloned().collect();
+                if touched.is_empty() {
+                    touched.push("flotilla".to_string());
+                }
                 self.namespaces.clear();
-                let mut touched = Vec::new();
                 for row in &panel.rows {
                     let Some(convoy) = panel_row_to_convoy(row) else { continue };
                     let namespace = convoy.namespace.clone();

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
-    panel::{ConvoyPhase, ConvoySummary, PanelRowData, PanelSnapshot},
+    panel::{PanelSnapshot, PanelValue},
     qualified_path::QualifiedPath,
     Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
     FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
@@ -285,15 +285,9 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     }
 }
 
-fn convoy_state_label(convoy: &ConvoySummary) -> String {
-    let phase = match convoy.phase {
-        ConvoyPhase::Pending => "pending",
-        ConvoyPhase::Active => "active",
-        ConvoyPhase::Completed => "completed",
-        ConvoyPhase::Failed => "failed",
-        ConvoyPhase::Cancelled => "cancelled",
-    };
-    match convoy.message.as_deref().filter(|message| !message.trim().is_empty()) {
+fn convoy_state_label(values: &BTreeMap<String, PanelValue>) -> String {
+    let phase = values.get("phase").and_then(PanelValue::as_str).unwrap_or("unknown");
+    match values.get("message").and_then(PanelValue::as_str).filter(|message| !message.trim().is_empty()) {
         Some(message) => format!("{phase}: {message}"),
         None => phase.to_string(),
     }
@@ -309,19 +303,19 @@ fn append_crewless_convoy_rows(
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
     for snapshot in panels {
         for row in snapshot.tab.panels.iter().flat_map(|panel| &panel.rows) {
-            let PanelRowData::Convoy(convoy) = &row.data else { continue };
-            if convoy.namespace != target_namespace {
+            if row.resource.kind != "Convoy" || row.resource.namespace != target_namespace {
                 continue;
             }
-            if !convoys_with_crew.insert(convoy.name.clone()) {
+            let Some(name) = row.values.get("name").and_then(PanelValue::as_str) else { continue };
+            if !convoys_with_crew.insert(name.to_string()) {
                 continue;
             }
             rows.push(FleetListRow {
-                convoy: convoy.name.clone(),
+                convoy: name.to_string(),
                 vessel: "-".to_string(),
                 authority: None,
                 crew: "-".to_string(),
-                crew_state: convoy_state_label(convoy),
+                crew_state: convoy_state_label(&row.values),
                 host: host.clone(),
                 staleness: staleness.clone(),
             });
@@ -767,6 +761,7 @@ fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
 #[derive(Debug, Clone)]
 struct FleetReplicaCacheEntry {
     rows: Vec<FleetListRow>,
+    panels: Vec<PanelSnapshot>,
     last_sync: Option<DateTime<Utc>>,
     generation: Option<String>,
     last_error: Option<String>,
@@ -821,7 +816,7 @@ pub struct InProcessDaemon {
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
     provisioning_namespace: RwLock<String>,
     fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
-    fleet_replica_tx: broadcast::Sender<FleetReplicaSnapshot>,
+    fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
@@ -1086,8 +1081,22 @@ impl InProcessDaemon {
         self.aggregator_projection_state.read().await.clone()
     }
 
-    pub fn subscribe_fleet_replicas(&self) -> broadcast::Receiver<FleetReplicaSnapshot> {
+    pub fn subscribe_fleet_replicas(&self) -> broadcast::Receiver<Vec<FleetReplicaSnapshot>> {
         self.fleet_replica_tx.subscribe()
+    }
+
+    pub async fn cached_fleet_replica_snapshots(&self) -> Vec<FleetReplicaSnapshot> {
+        self.fleet_replica_cache
+            .read()
+            .await
+            .iter()
+            .map(|(host, entry)| FleetReplicaSnapshot {
+                host: host.clone(),
+                generation: entry.generation.clone(),
+                rows: entry.rows.clone(),
+                panels: entry.panels.clone(),
+            })
+            .collect()
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -2195,16 +2204,21 @@ impl InProcessDaemon {
         let hosts = self.config.load_hosts()?;
         let namespace = self.provisioning_namespace().await;
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
+        let configured: HashSet<_> = hosts.hosts.values().map(|remote| HostName::new(remote.expected_host_name.clone())).collect();
+        {
+            let mut cache = self.fleet_replica_cache.write().await;
+            cache.retain(|host, _| configured.contains(host));
+        }
         for (label, remote) in &hosts.hosts {
             let host = HostName::new(remote.expected_host_name.clone());
             let multiplex = hosts.resolved_ssh_multiplex(label);
             let result = self.fetch_fleet_replica_snapshot(remote, multiplex, Arc::clone(&runner)).await;
             match result {
                 Ok(snapshot) => {
-                    let _ = self.fleet_replica_tx.send(snapshot.clone());
                     let now = Utc::now();
                     let snapshot_host = snapshot.host;
                     let generation = snapshot.generation;
+                    let panels = snapshot.panels.clone();
                     let staleness = FleetStaleness::Fresh { last_sync: now };
                     let mut rows: Vec<_> = snapshot
                         .rows
@@ -2220,6 +2234,7 @@ impl InProcessDaemon {
                     append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.panels, &snapshot_host, staleness);
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
                         rows,
+                        panels,
                         last_sync: Some(now),
                         generation,
                         last_error: None,
@@ -2228,11 +2243,18 @@ impl InProcessDaemon {
                 Err(message) => {
                     let mut cache = self.fleet_replica_cache.write().await;
                     cache.entry(host).and_modify(|entry| entry.last_error = Some(message.clone())).or_insert_with(|| {
-                        FleetReplicaCacheEntry { rows: Vec::new(), last_sync: None, generation: None, last_error: Some(message) }
+                        FleetReplicaCacheEntry {
+                            rows: Vec::new(),
+                            panels: Vec::new(),
+                            last_sync: None,
+                            generation: None,
+                            last_error: Some(message),
+                        }
                     });
                 }
             }
         }
+        let _ = self.fleet_replica_tx.send(self.cached_fleet_replica_snapshots().await);
         Ok(())
     }
 

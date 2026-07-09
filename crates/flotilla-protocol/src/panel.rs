@@ -10,7 +10,7 @@ use crate::{
     snapshot::{CheckoutRef, RepoKey},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
 pub struct ResourceRef {
     pub api_version: String,
     pub kind: String,
@@ -43,6 +43,34 @@ impl ResourceRef {
         let mut reference = self.clone();
         reference.subresource = Some(subresource.into());
         reference
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PanelValue {
+    String(String),
+    Bool(bool),
+    Timestamp(DateTime<Utc>),
+    Host(HostName),
+    Checkout(CheckoutRef),
+    List(Vec<PanelValue>),
+    Map(BTreeMap<String, PanelValue>),
+}
+
+impl PanelValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            _ => None,
+        }
     }
 }
 
@@ -98,8 +126,7 @@ pub enum PanelField {
     Workflow,
     Repository,
     Message,
-    Host,
-    Checkout,
+    Vessel,
     Crew,
     Custom(String),
 }
@@ -140,8 +167,8 @@ impl IntentDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IntentTarget {
-    Workspace { workspace_ref: String },
-    Leg { convoy: String, leg: String },
+    Vessel { attach_ref: String, host: HostName },
+    Leg { namespace: String, convoy: String, leg: String, host: HostName },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,114 +178,30 @@ pub struct RowIntent {
 }
 
 impl RowIntent {
-    pub fn workspace(intent_id: impl Into<String>, workspace_ref: impl Into<String>) -> Self {
-        Self { intent_id: intent_id.into(), target: IntentTarget::Workspace { workspace_ref: workspace_ref.into() } }
+    pub fn vessel(intent_id: impl Into<String>, attach_ref: impl Into<String>, host: HostName) -> Self {
+        Self { intent_id: intent_id.into(), target: IntentTarget::Vessel { attach_ref: attach_ref.into(), host } }
     }
 
-    pub fn leg(intent_id: impl Into<String>, convoy: impl Into<String>, leg: impl Into<String>) -> Self {
-        Self { intent_id: intent_id.into(), target: IntentTarget::Leg { convoy: convoy.into(), leg: leg.into() } }
+    pub fn leg(
+        intent_id: impl Into<String>,
+        namespace: impl Into<String>,
+        convoy: impl Into<String>,
+        leg: impl Into<String>,
+        host: HostName,
+    ) -> Self {
+        Self {
+            intent_id: intent_id.into(),
+            target: IntentTarget::Leg { namespace: namespace.into(), convoy: convoy.into(), leg: leg.into(), host },
+        }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConvoyPhase {
-    Pending,
-    Active,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LegPhase {
-    Pending,
-    Ready,
-    Launching,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
 }
 
 pub type Timestamp = DateTime<Utc>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrewMemberSummary {
-    pub role: String,
-    pub command_preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegSummary {
-    pub name: String,
-    pub phase: LegPhase,
-    pub crew: Vec<CrewMemberSummary>,
-    pub host: Option<HostName>,
-    pub checkout: Option<CheckoutRef>,
-    pub ready_at: Option<Timestamp>,
-    pub started_at: Option<Timestamp>,
-    pub finished_at: Option<Timestamp>,
-    pub message: Option<String>,
-}
-
-impl LegSummary {
-    pub fn new(name: impl Into<String>, phase: LegPhase) -> Self {
-        Self {
-            name: name.into(),
-            phase,
-            crew: Vec::new(),
-            host: None,
-            checkout: None,
-            ready_at: None,
-            started_at: None,
-            finished_at: None,
-            message: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvoySummary {
-    pub namespace: String,
-    pub name: String,
-    pub workflow_ref: String,
-    pub phase: ConvoyPhase,
-    pub message: Option<String>,
-    pub repo_hint: Option<RepoKey>,
-    pub started_at: Option<Timestamp>,
-    pub finished_at: Option<Timestamp>,
-    pub observed_workflow_ref: Option<String>,
-    pub initializing: bool,
-}
-
-impl ConvoySummary {
-    pub fn active(namespace: impl Into<String>, name: impl Into<String>, workflow_ref: impl Into<String>) -> Self {
-        Self {
-            namespace: namespace.into(),
-            name: name.into(),
-            workflow_ref: workflow_ref.into(),
-            phase: ConvoyPhase::Active,
-            message: None,
-            repo_hint: None,
-            started_at: None,
-            finished_at: None,
-            observed_workflow_ref: None,
-            initializing: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum PanelRowData {
-    Convoy(ConvoySummary),
-    Leg(LegSummary),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PanelRow {
     pub resource: ResourceRef,
-    pub data: PanelRowData,
+    pub values: BTreeMap<String, PanelValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intents: Vec<RowIntent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -267,7 +210,7 @@ pub struct PanelRow {
     pub depends_on: Vec<ResourceRef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PanelView {
     pub id: PanelId,
     pub title: String,

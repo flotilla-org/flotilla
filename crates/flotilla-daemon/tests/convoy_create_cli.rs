@@ -7,7 +7,7 @@ use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{panel::PanelRowData, Command, CommandAction, CommandValue, DaemonEvent, HostName};
+use flotilla_protocol::{panel::PanelValue, Command, CommandAction, CommandValue, DaemonEvent, HostName};
 use flotilla_resources::{Convoy, ConvoyPhase, InMemoryBackend, ResourceBackend, SqliteBackend, WorkflowTemplate};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -239,21 +239,18 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let event = tokio::time::timeout(remaining, rx.recv()).await.expect("timed out waiting for panel event").expect("recv");
         match event {
-            DaemonEvent::PanelSnapshot(snapshot)
-                if snapshot.tab.panels.iter().flat_map(|panel| &panel.rows).any(
-                    |row| matches!(&row.data, PanelRowData::Convoy(convoy) if convoy.name == "sqlite-scratch" && !convoy.initializing),
-                ) =>
-            {
+            DaemonEvent::PanelSnapshot(snapshot) if snapshot.tab.panels.iter().flat_map(|panel| &panel.rows).any(sqlite_scratch_ready) => {
                 break;
             }
-            DaemonEvent::PanelDelta(delta)
-                if delta.panels.iter().flat_map(|panel| &panel.changed).any(
-                    |row| matches!(&row.data, PanelRowData::Convoy(convoy) if convoy.name == "sqlite-scratch" && !convoy.initializing),
-                ) =>
-            {
+            DaemonEvent::PanelDelta(delta) if delta.panels.iter().flat_map(|panel| &panel.changed).any(sqlite_scratch_ready) => {
                 break;
             }
             _ => {}
         }
     }
+}
+
+fn sqlite_scratch_ready(row: &flotilla_protocol::panel::PanelRow) -> bool {
+    row.values.get("name").and_then(PanelValue::as_str) == Some("sqlite-scratch")
+        && !row.values.get("initializing").and_then(PanelValue::as_bool).unwrap_or(true)
 }

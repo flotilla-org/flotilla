@@ -1305,6 +1305,7 @@ name = "flotilla-daemon"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bon",
  "chrono",
  "flotilla-client",
  "flotilla-controllers",
@@ -1331,6 +1332,7 @@ dependencies = [
 name = "flotilla-protocol"
 version = "0.1.0"
 dependencies = [
+ "bon",
  "chrono",
  "gethostname",
  "indexmap",
@@ -1382,6 +1384,7 @@ name = "flotilla-tui"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bon",
  "catppuccin",
  "clap",
  "color-eyre",

@@ -544,9 +544,11 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
 
 #[test]
 fn panel_stream_round_trips_a_resource_backed_leg_dag() {
+    use std::collections::BTreeMap;
+
     use crate::panel::{
-        IntentDefinition, IntentKind, LegPhase, LegSummary, PanelColumn, PanelField, PanelId, PanelRow, PanelRowData, PanelScope,
-        PanelSnapshot, PanelSource, PanelView, ResourceRef, RowIntent, TabView,
+        IntentDefinition, IntentKind, PanelColumn, PanelField, PanelId, PanelRow, PanelScope, PanelSnapshot, PanelSource, PanelValue,
+        PanelView, ResourceRef, RowIntent, TabView,
     };
 
     let convoy_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "fix-bug-123");
@@ -563,19 +565,31 @@ fn panel_stream_round_trips_a_resource_backed_leg_dag() {
         intents: vec![attach.clone(), complete.clone()],
         rows: vec![PanelRow {
             resource: convoy_ref,
-            data: PanelRowData::Convoy(crate::panel::ConvoySummary::active("flotilla", "fix-bug-123", "review-and-fix")),
+            values: BTreeMap::from([
+                ("name".into(), PanelValue::String("fix-bug-123".into())),
+                ("phase".into(), PanelValue::String("active".into())),
+            ]),
             intents: vec![],
             children: vec![
                 PanelRow {
                     resource: implement_ref.clone(),
-                    data: PanelRowData::Leg(LegSummary::new("implement", LegPhase::Running)),
-                    intents: vec![RowIntent::workspace("attach", "ws-1"), RowIntent::leg("complete-leg", "fix-bug-123", "implement")],
+                    values: BTreeMap::from([
+                        ("name".into(), PanelValue::String("implement".into())),
+                        ("phase".into(), PanelValue::String("running".into())),
+                    ]),
+                    intents: vec![
+                        RowIntent::vessel("attach", "ws-1", HostName::new("local")),
+                        RowIntent::leg("complete-leg", "flotilla", "fix-bug-123", "implement", HostName::new("local")),
+                    ],
                     children: vec![],
                     depends_on: vec![],
                 },
                 PanelRow {
                     resource: review_ref,
-                    data: PanelRowData::Leg(LegSummary::new("review", LegPhase::Pending)),
+                    values: BTreeMap::from([
+                        ("name".into(), PanelValue::String("review".into())),
+                        ("phase".into(), PanelValue::String("pending".into())),
+                    ]),
                     intents: vec![],
                     children: vec![],
                     depends_on: vec![implement_ref],

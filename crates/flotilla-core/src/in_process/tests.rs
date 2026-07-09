@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    panel::{ConvoyPhase as WireConvoyPhase, ConvoySummary, PanelRow, PanelRowData, PanelSnapshot, ResourceRef},
+    panel::{PanelRow, PanelSnapshot, PanelValue, ResourceRef},
     qualified_path::{HostId, QualifiedPath},
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId,
     EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, RepoSelector, SystemInfo, ToolInventory, TopologyRoute,
@@ -41,21 +41,19 @@ use crate::{
     },
 };
 
-fn convoy_panel_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Option<&str>) -> PanelRow {
+fn convoy_panel_row(namespace: &str, name: &str, phase: &str, message: Option<&str>) -> PanelRow {
+    let mut values = BTreeMap::from([
+        ("name".to_string(), PanelValue::String(name.to_string())),
+        ("workflow_ref".to_string(), PanelValue::String("scratch".to_string())),
+        ("phase".to_string(), PanelValue::String(phase.to_string())),
+        ("initializing".to_string(), PanelValue::Bool(true)),
+    ]);
+    if let Some(message) = message {
+        values.insert("message".to_string(), PanelValue::String(message.to_string()));
+    }
     PanelRow {
         resource: ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name),
-        data: PanelRowData::Convoy(ConvoySummary {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            workflow_ref: "scratch".to_string(),
-            phase,
-            message: message.map(str::to_string),
-            repo_hint: None,
-            started_at: None,
-            finished_at: None,
-            observed_workflow_ref: None,
-            initializing: true,
-        }),
+        values,
         intents: vec![],
         children: vec![],
         depends_on: vec![],
@@ -405,8 +403,8 @@ async fn fleet_list_reports_local_crewless_failed_convoys() {
 
     let daemon = new_attach_test_daemon(&config_base).await;
     set_local_convoy_panel(&daemon, 1, vec![
-        convoy_panel_row("flotilla", "convoy-failed", WireConvoyPhase::Failed, Some("missing input 'topic'")),
-        convoy_panel_row("other", "other-failed", WireConvoyPhase::Failed, Some("wrong namespace")),
+        convoy_panel_row("flotilla", "convoy-failed", "failed", Some("missing input 'topic'")),
+        convoy_panel_row("other", "other-failed", "failed", Some("wrong namespace")),
     ])
     .await;
 
@@ -434,7 +432,7 @@ async fn fleet_list_does_not_add_crewless_row_when_convoy_has_crew() {
     create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
         .await;
 
-    set_local_convoy_panel(&daemon, 1, vec![convoy_panel_row("flotilla", "convoy-a", WireConvoyPhase::Active, None)]).await;
+    set_local_convoy_panel(&daemon, 1, vec![convoy_panel_row("flotilla", "convoy-a", "active", None)]).await;
 
     let response = daemon.fleet_list_internal().await.expect("fleet list should succeed");
 
@@ -464,6 +462,7 @@ async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
             host: HostName::new("feta"),
             staleness: FleetStaleness::Local,
         }],
+        panels: vec![],
         last_sync: Some(last_sync),
         generation: Some("gen-1".to_string()),
         last_error: Some("connection refused".to_string()),
@@ -555,8 +554,8 @@ async fn replica_refresh_reports_crewless_convoys_from_panel_snapshots() {
         generation: Some("gen-1".to_string()),
         rows: vec![],
         panels: vec![convoy_panel_snapshot(3, vec![
-            convoy_panel_row("flotilla", "remote-failed", WireConvoyPhase::Failed, Some("missing input 'topic'")),
-            convoy_panel_row("other", "other-failed", WireConvoyPhase::Failed, Some("wrong namespace")),
+            convoy_panel_row("flotilla", "remote-failed", "failed", Some("missing input 'topic'")),
+            convoy_panel_row("other", "other-failed", "failed", Some("wrong namespace")),
         ])],
     };
     let runner = Arc::new(QueuedOutputRunner::new(vec![CommandOutput {
@@ -605,7 +604,7 @@ async fn replica_refresh_dedupes_crewless_rows_already_present_in_snapshot_rows(
         panels: vec![convoy_panel_snapshot(3, vec![convoy_panel_row(
             "flotilla",
             "remote-failed",
-            WireConvoyPhase::Failed,
+            "failed",
             Some("missing input 'topic'"),
         )])],
     };
@@ -752,6 +751,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
             host: HostName::new("feta"),
             staleness: FleetStaleness::Stale { last_sync: Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1) },
         }],
+        panels: vec![],
         last_sync: Some(Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1)),
         generation: Some("gen-1".to_string()),
         last_error: Some("connection refused".to_string()),
@@ -818,6 +818,7 @@ async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
             host: HostName::new("removed"),
             staleness: FleetStaleness::Fresh { last_sync: Utc::now() },
         }],
+        panels: vec![],
         last_sync: Some(Utc::now()),
         generation: Some("gen-1".to_string()),
         last_error: None,
@@ -2178,7 +2179,7 @@ async fn replay_since_reads_panel_snapshot_from_aggregator_state() {
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
 
-    set_local_convoy_panel(&daemon, 7, vec![convoy_panel_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
+    set_local_convoy_panel(&daemon, 7, vec![convoy_panel_row("flotilla", "convoy-1", "active", None)]).await;
 
     let events = daemon.replay_since(&HashMap::new()).await.expect("replay_since should succeed");
     let snap = events
@@ -2189,7 +2190,7 @@ async fn replay_since_reads_panel_snapshot_from_aggregator_state() {
         })
         .expect("expected PanelSnapshot in replay output");
     assert_eq!(snap.seq, 7);
-    assert!(matches!(&snap.tab.panels[0].rows[0].data, PanelRowData::Convoy(convoy) if convoy.name == "convoy-1"));
+    assert_eq!(snap.tab.panels[0].rows[0].values.get("name").and_then(PanelValue::as_str), Some("convoy-1"));
 }
 
 #[tokio::test]
@@ -2202,7 +2203,7 @@ async fn replay_since_skips_panel_when_last_seen_matches_seq() {
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
 
-    set_local_convoy_panel(&daemon, 7, vec![convoy_panel_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
+    set_local_convoy_panel(&daemon, 7, vec![convoy_panel_row("flotilla", "convoy-1", "active", None)]).await;
 
     let mut last_seen = HashMap::new();
     last_seen.insert(StreamKey::Panel { tab: "convoys".into() }, 7);
@@ -2224,7 +2225,7 @@ async fn replay_since_resends_snapshot_when_client_seq_is_ahead() {
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
 
-    set_local_convoy_panel(&daemon, 2, vec![convoy_panel_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
+    set_local_convoy_panel(&daemon, 2, vec![convoy_panel_row("flotilla", "convoy-1", "active", None)]).await;
 
     // Client's last_seen is ahead of the daemon's seq — simulates daemon restart.
     let mut last_seen = HashMap::new();

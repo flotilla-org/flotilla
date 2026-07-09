@@ -999,8 +999,7 @@ mod tests {
 
     #[test]
     fn cli_parses_convoy_noun() {
-        let cli =
-            Cli::try_parse_from(["flotilla", "convoy", "convoy-a", "task", "implement", "complete"]).expect("convoy cli should parse");
+        let cli = Cli::try_parse_from(["flotilla", "convoy", "convoy-a", "leg", "implement", "complete"]).expect("convoy cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Convoy(_))));
     }
 
