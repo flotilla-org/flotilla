@@ -9,7 +9,8 @@ use super::{
 use crate::{
     canonicalize_repo_url,
     controller::{
-        delete_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler, SecondaryWatch,
+        delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler,
+        SecondaryWatch,
     },
     labels::{CONVOY_LABEL, TASK_LABEL},
     presentation::{Presentation, PresentationSpec},
@@ -140,10 +141,10 @@ impl Reconciler for ConvoyReconciler {
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         let selector = BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())]);
         if let Some(presentations) = &self.presentations {
-            delete_matching(presentations, &selector).await?;
+            delete_lifecycle_owned_matching(presentations, &selector).await?;
         }
         if let Some(task_workspaces) = &self.task_workspaces {
-            delete_matching(task_workspaces, &selector).await?;
+            delete_lifecycle_owned_matching(task_workspaces, &selector).await?;
         }
         Ok(())
     }

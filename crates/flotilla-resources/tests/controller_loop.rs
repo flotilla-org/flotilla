@@ -209,6 +209,10 @@ fn primary_meta(name: &str) -> InputMeta {
     resource_meta().name(name).call()
 }
 
+fn primary_meta_with_authority(name: &str, authority: LifecycleAuthority) -> InputMeta {
+    primary_meta(name).with_lifecycle_authority(authority)
+}
+
 fn secondary_meta(name: &str, primary: &str) -> InputMeta {
     resource_meta().name(name).labels([("flotilla.work/primary".to_string(), primary.to_string())].into_iter().collect()).call()
 }
@@ -577,6 +581,135 @@ async fn controller_loop_adds_finalizer_to_managed_resources() {
     })
     .await
     .expect("controller should attach its finalizer");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_skips_reconcile_for_observed_and_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries
+        .create(&primary_meta_with_authority("a-adopted", LifecycleAuthority::Adopted), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("adopted primary create should succeed");
+    primaries
+        .create(&primary_meta_with_authority("b-observed", LifecycleAuthority::Observed), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("observed primary create should succeed");
+    primaries.create(&primary_meta("z-managed"), &PrimarySpec { value: "three".to_string() }).await.expect("managed create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "z-managed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("managed primary should reconcile");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reconciled.lock().expect("reconciled lock").as_slice(), &["z-managed".to_string()]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_does_not_add_finalizers_to_observed_or_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries
+        .create(&primary_meta_with_authority("a-adopted", LifecycleAuthority::Adopted), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("adopted primary create should succeed");
+    primaries
+        .create(&primary_meta_with_authority("b-observed", LifecycleAuthority::Observed), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("observed primary create should succeed");
+    primaries.create(&primary_meta("z-managed"), &PrimarySpec { value: "three".to_string() }).await.expect("managed create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::new(Mutex::new(Vec::new())) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let object = primaries.get("z-managed").await.expect("managed primary get should succeed");
+            if object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller should attach its finalizer to managed primary");
+
+    assert!(primaries.get("a-adopted").await.expect("adopted primary get should succeed").metadata.finalizers.is_empty());
+    assert!(primaries.get("b-observed").await.expect("observed primary get should succeed").metadata.finalizers.is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_removes_existing_adopted_finalizer_without_running_teardown() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let meta = resource_meta()
+        .name("a-adopted")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call()
+        .with_lifecycle_authority(LifecycleAuthority::Adopted);
+    primaries.create(&meta, &PrimarySpec { value: "one".to_string() }).await.expect("adopted primary create should succeed");
+
+    let finalized = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::clone(&finalized) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(primaries.get("a-adopted").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted primary should be unblocked without teardown");
+
+    assert!(finalized.lock().expect("finalized lock").is_empty());
 
     harness.shutdown().await;
 }

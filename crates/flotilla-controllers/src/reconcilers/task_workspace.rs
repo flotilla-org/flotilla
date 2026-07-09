@@ -3,7 +3,9 @@ use std::{collections::BTreeMap, marker::PhantomData};
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
-    controller::{Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{
+        delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
+    },
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
     FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority,
@@ -492,23 +494,6 @@ impl Reconciler for TaskWorkspaceReconciler {
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/task-workspace-teardown")
     }
-}
-
-async fn delete_lifecycle_owned_matching<T: Resource>(
-    resolver: &TypedResolver<T>,
-    selector: &BTreeMap<String, String>,
-) -> Result<(), ResourceError> {
-    let listed = resolver.list_matching_labels(selector).await?;
-    for object in listed.items {
-        if matches!(object.metadata.lifecycle_authority()?, Some(LifecycleAuthority::Observed | LifecycleAuthority::Adopted)) {
-            continue;
-        }
-        match resolver.delete(&object.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
 }
 
 fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, String> {
