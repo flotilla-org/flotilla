@@ -587,6 +587,41 @@ fn handle_event(
                 }
             }
         }
+        DaemonEvent::PanelSnapshot(snap) => {
+            local_seqs.write().unwrap().insert(StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq);
+            let _ = event_tx.send(event);
+        }
+        DaemonEvent::PanelDelta(delta) => {
+            let tab = delta.tab_id.clone();
+            let seq = delta.seq;
+            let stream_key = StreamKey::Panel { tab: tab.clone() };
+            let local_seq = local_seqs.read().unwrap().get(&stream_key).copied();
+
+            match local_seq {
+                Some(ls) if seq == ls + 1 => {
+                    local_seqs.write().unwrap().insert(stream_key, seq);
+                    debug!(%tab, %seq, "applied panel delta");
+                    let _ = event_tx.send(event);
+                }
+                _ => {
+                    if let Some(ls) = local_seq {
+                        warn!(%tab, local_seq = ls, %seq, "panel seq gap, requesting replay");
+                    } else {
+                        warn!(%tab, %seq, "received panel delta for unknown tab, requesting replay");
+                    }
+
+                    let local_seqs = Arc::clone(local_seqs);
+                    let event_tx = event_tx.clone();
+                    let session = Arc::clone(session);
+                    let pending = Arc::clone(pending);
+                    let next_id = Arc::clone(next_id);
+
+                    tokio::spawn(async move {
+                        recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
+                    });
+                }
+            }
+        }
         DaemonEvent::RepoTracked(_)
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
@@ -661,6 +696,20 @@ async fn recover_from_gap(
                             }
                             DaemonEvent::NamespaceDelta(delta) => {
                                 let key = StreamKey::Namespace { name: delta.namespace.clone() };
+                                let current = seqs.get(&key).copied().unwrap_or(0);
+                                if delta.seq >= current {
+                                    seqs.insert(key, delta.seq);
+                                }
+                            }
+                            DaemonEvent::PanelSnapshot(snap) => {
+                                let key = StreamKey::Panel { tab: snap.tab.id.clone() };
+                                let current = seqs.get(&key).copied().unwrap_or(0);
+                                if snap.seq >= current {
+                                    seqs.insert(key, snap.seq);
+                                }
+                            }
+                            DaemonEvent::PanelDelta(delta) => {
+                                let key = StreamKey::Panel { tab: delta.tab_id.clone() };
                                 let current = seqs.get(&key).copied().unwrap_or(0);
                                 if delta.seq >= current {
                                     seqs.insert(key, delta.seq);
@@ -767,6 +816,8 @@ impl DaemonHandle for SocketDaemon {
                     DaemonEvent::HostRemoved { environment_id, seq } => (StreamKey::Host { environment_id: environment_id.clone() }, *seq),
                     DaemonEvent::NamespaceSnapshot(snap) => (StreamKey::Namespace { name: snap.namespace.clone() }, snap.seq),
                     DaemonEvent::NamespaceDelta(delta) => (StreamKey::Namespace { name: delta.namespace.clone() }, delta.seq),
+                    DaemonEvent::PanelSnapshot(snap) => (StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq),
+                    DaemonEvent::PanelDelta(delta) => (StreamKey::Panel { tab: delta.tab_id.clone() }, delta.seq),
                     DaemonEvent::RepoTracked(_)
                     | DaemonEvent::RepoUntracked { .. }
                     | DaemonEvent::CommandStarted { .. }

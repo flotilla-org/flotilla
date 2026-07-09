@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
+    aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::DaemonHandle,
@@ -819,11 +820,13 @@ pub struct InProcessDaemon {
     /// broadcast-driven mirror that had correctness seams under lag and
     /// delta-before-snapshot races.  Set by the daemon runtime at startup.
     namespace_projection_state: RwLock<NamespaceProjectionState>,
+    aggregator_projection_state: RwLock<AggregatorProjectionState>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
     provisioning_namespace: RwLock<String>,
     fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
+    fleet_replica_tx: broadcast::Sender<FleetReplicaSnapshot>,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
@@ -929,6 +932,7 @@ impl InProcessDaemon {
         )
         .await;
 
+        let (fleet_replica_tx, _) = broadcast::channel(32);
         let daemon = Arc::new(Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
@@ -955,8 +959,10 @@ impl InProcessDaemon {
             resource_backend,
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             namespace_projection_state: RwLock::new(NamespaceProjectionState::new()),
+            aggregator_projection_state: RwLock::new(AggregatorProjectionState::new()),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
+            fleet_replica_tx,
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -1087,6 +1093,18 @@ impl InProcessDaemon {
 
     pub async fn namespace_projection_state(&self) -> NamespaceProjectionState {
         self.namespace_projection_state.read().await.clone()
+    }
+
+    pub async fn set_aggregator_projection_state(&self, state: AggregatorProjectionState) {
+        *self.aggregator_projection_state.write().await = state;
+    }
+
+    pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
+        self.aggregator_projection_state.read().await.clone()
+    }
+
+    pub fn subscribe_fleet_replicas(&self) -> broadcast::Receiver<FleetReplicaSnapshot> {
+        self.fleet_replica_tx.subscribe()
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -2138,7 +2156,8 @@ impl InProcessDaemon {
         let namespace = self.provisioning_namespace().await;
         let (rows, generation) = self.local_fleet_rows(&namespace).await?;
         let namespaces = self.namespace_projection_state().await.all_snapshots().await;
-        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, namespaces })
+        let panels = vec![self.aggregator_projection_state().await.local_snapshot().await];
+        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, namespaces, panels })
     }
 
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
@@ -2200,6 +2219,7 @@ impl InProcessDaemon {
             let result = self.fetch_fleet_replica_snapshot(remote, multiplex, Arc::clone(&runner)).await;
             match result {
                 Ok(snapshot) => {
+                    let _ = self.fleet_replica_tx.send(snapshot.clone());
                     let now = Utc::now();
                     let snapshot_host = snapshot.host;
                     let generation = snapshot.generation;
@@ -3394,6 +3414,12 @@ impl DaemonHandle for InProcessDaemon {
             if !up_to_date {
                 events.push(DaemonEvent::NamespaceSnapshot(Box::new(snap)));
             }
+        }
+
+        let panel_snapshot = self.aggregator_projection_state().await.snapshot().await;
+        let panel_key = StreamKey::Panel { tab: panel_snapshot.tab.id.clone() };
+        if !last_seen.get(&panel_key).is_some_and(|&seq| seq == panel_snapshot.seq) {
+            events.push(DaemonEvent::PanelSnapshot(Box::new(panel_snapshot)));
         }
 
         Ok(events)

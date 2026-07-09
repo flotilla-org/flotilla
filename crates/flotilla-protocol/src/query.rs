@@ -140,6 +140,8 @@ pub struct FleetReplicaSnapshot {
     pub rows: Vec<FleetListRow>,
     #[serde(default)]
     pub namespaces: Vec<NamespaceSnapshot>,
+    #[serde(default)]
+    pub panels: Vec<crate::panel::PanelSnapshot>,
 }
 
 // --- host / topology ---

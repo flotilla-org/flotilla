@@ -13,9 +13,9 @@ use flotilla_controllers::reconcilers::{
     TerminalRuntimeState, TerminalSessionReconciler,
 };
 use flotilla_core::{
+    aggregator_projection::AggregatorProjectionState,
     config::ConfigStore,
     in_process::InProcessDaemon,
-    namespace_projection::NamespaceProjectionState,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -39,7 +39,7 @@ use tracing::warn;
 
 use crate::{
     supervisor::{supervise, ControllerSupervision},
-    ConvoyProjection,
+    Aggregator,
 };
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
@@ -89,8 +89,8 @@ impl DaemonRuntime {
             daemon.set_daemon_socket_path(path.clone()).await;
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
-        let namespace_projection_state = NamespaceProjectionState::new();
-        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let aggregator_projection_state = AggregatorProjectionState::new();
+        daemon.set_aggregator_projection_state(aggregator_projection_state.clone()).await;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
@@ -118,7 +118,7 @@ impl DaemonRuntime {
                 &options.namespace,
                 options.controller_resync_interval,
                 options.controller_supervision.clone(),
-                namespace_projection_state,
+                aggregator_projection_state,
             ));
         }
 
@@ -503,9 +503,12 @@ fn spawn_controller_loops(
     namespace: &str,
     controller_resync_interval: Duration,
     supervision: ControllerSupervision,
-    namespace_projection_state: NamespaceProjectionState,
+    aggregator_projection_state: AggregatorProjectionState,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
+    let observed_backend = state.daemon.observed_resource_backend();
+    let replica_rx = state.daemon.subscribe_fleet_replicas();
+    let local_host = state.daemon.host_name().clone();
     let namespace_string = namespace.to_string();
     vec![
         tokio::spawn({
@@ -716,8 +719,14 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let event_tx = state.daemon.event_sender();
             async move {
-                ConvoyProjection::new(namespace_projection_state, event_tx)
-                    .run(backend.clone().using::<Convoy>(&namespace_string), backend.using::<Presentation>(&namespace_string))
+                Aggregator::new(aggregator_projection_state, local_host, event_tx)
+                    .run(
+                        backend.clone().using::<Convoy>(&namespace_string),
+                        backend.using::<Presentation>(&namespace_string),
+                        observed_backend.clone().using::<Convoy>(&namespace_string),
+                        observed_backend.using::<Presentation>(&namespace_string),
+                        replica_rx,
+                    )
                     .await;
             }
         }),
@@ -1068,14 +1077,14 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let namespace_projection_state = NamespaceProjectionState::new();
-        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let aggregator_projection_state = AggregatorProjectionState::new();
+        daemon.set_aggregator_projection_state(aggregator_projection_state.clone()).await;
         let controller_handles = spawn_controller_loops(
             Arc::clone(&state),
             NAMESPACE,
             Duration::from_millis(25),
             ControllerSupervision::default(),
-            namespace_projection_state,
+            aggregator_projection_state,
         );
 
         backend
@@ -1358,14 +1367,14 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let namespace_projection_state = NamespaceProjectionState::new();
-        daemon.set_namespace_projection_state(namespace_projection_state.clone()).await;
+        let aggregator_projection_state = AggregatorProjectionState::new();
+        daemon.set_aggregator_projection_state(aggregator_projection_state.clone()).await;
         let controller_handles = spawn_controller_loops(
             Arc::clone(&state),
             NAMESPACE,
             Duration::from_millis(25),
             ControllerSupervision::default(),
-            namespace_projection_state,
+            aggregator_projection_state,
         );
 
         backend

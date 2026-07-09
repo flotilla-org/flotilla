@@ -1,4 +1,6 @@
+mod aggregator;
 mod convoy_projection;
+pub use aggregator::Aggregator;
 pub use convoy_projection::ConvoyProjection;
 
 pub mod cli;
