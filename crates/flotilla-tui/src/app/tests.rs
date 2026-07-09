@@ -1357,16 +1357,18 @@ fn legacy_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_pro
     }
 }
 
-fn panel_snapshot_event(snapshot: Box<crate::convoy_model::ConvoyFixtureSnapshot>) -> flotilla_protocol::DaemonEvent {
+fn panel_snapshot_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnapshot>) -> flotilla_protocol::DaemonEvent {
+    let snapshot = snapshot.as_ref().clone();
     let mut panel = flotilla_core::aggregator_projection::AggregatorView::default().snapshot();
     panel.seq = snapshot.seq;
     panel.tab.panels[0].rows = snapshot.convoys.into_iter().map(legacy_convoy_row).collect();
     flotilla_protocol::DaemonEvent::PanelSnapshot(Box::new(panel))
 }
 
-fn panel_delta_event(delta: Box<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
+fn panel_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
     use flotilla_protocol::panel::{PanelDelta, PanelId, PanelRowsDelta, ResourceRef};
 
+    let delta = delta.as_ref().clone();
     flotilla_protocol::DaemonEvent::PanelDelta(Box::new(PanelDelta {
         seq: delta.seq,
         tab_id: "convoys".to_string(),

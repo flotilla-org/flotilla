@@ -3388,7 +3388,7 @@ impl DaemonHandle for InProcessDaemon {
 
         let panel_snapshot = self.aggregator_projection_state().await.snapshot().await;
         let panel_key = StreamKey::Panel { tab: panel_snapshot.tab.id.clone() };
-        if !last_seen.get(&panel_key).is_some_and(|&seq| seq == panel_snapshot.seq) {
+        if last_seen.get(&panel_key).is_none_or(|&seq| seq != panel_snapshot.seq) {
             events.push(DaemonEvent::PanelSnapshot(Box::new(panel_snapshot)));
         }
 
