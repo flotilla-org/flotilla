@@ -1,0 +1,111 @@
+//! TUI-local model used by the established convoy widgets.
+//!
+//! The daemon wire contract is the generic panel model. This adapter model is
+//! intentionally surface-owned and may evolve with the ratatui presentation.
+
+use flotilla_protocol::{CheckoutRef, HostName, RepoKey};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConvoyId(String);
+
+impl ConvoyId {
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self(format!("{}/{}", namespace.into(), name.into()))
+    }
+
+    pub fn parse(value: impl AsRef<str>) -> Result<Self, String> {
+        let value = value.as_ref();
+        if !value.contains('/') {
+            return Err(format!("convoy id missing '/' separator: {value}"));
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn namespace(&self) -> &str {
+        self.0.split_once('/').map(|(namespace, _)| namespace).expect("ConvoyId always contains '/'")
+    }
+
+    pub fn name(&self) -> &str {
+        self.0.split_once('/').map(|(_, name)| name).expect("ConvoyId always contains '/'")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvoyPhase {
+    Pending,
+    Active,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPhase {
+    Pending,
+    Ready,
+    Launching,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+pub type Timestamp = flotilla_protocol::panel::Timestamp;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSummary {
+    pub role: String,
+    pub command_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSummary {
+    pub name: String,
+    pub depends_on: Vec<String>,
+    pub phase: TaskPhase,
+    pub processes: Vec<ProcessSummary>,
+    pub host: Option<HostName>,
+    pub checkout: Option<CheckoutRef>,
+    pub workspace_ref: Option<String>,
+    pub ready_at: Option<Timestamp>,
+    pub started_at: Option<Timestamp>,
+    pub finished_at: Option<Timestamp>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoySummary {
+    pub id: ConvoyId,
+    pub namespace: String,
+    pub name: String,
+    pub workflow_ref: String,
+    pub phase: ConvoyPhase,
+    pub message: Option<String>,
+    pub repo_hint: Option<RepoKey>,
+    pub tasks: Vec<TaskSummary>,
+    pub started_at: Option<Timestamp>,
+    pub finished_at: Option<Timestamp>,
+    pub observed_workflow_ref: Option<String>,
+    pub initializing: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoyFixtureSnapshot {
+    pub seq: u64,
+    pub namespace: String,
+    pub convoys: Vec<ConvoySummary>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoyFixtureDelta {
+    pub seq: u64,
+    pub namespace: String,
+    pub changed: Vec<ConvoySummary>,
+    pub removed: Vec<ConvoyId>,
+}

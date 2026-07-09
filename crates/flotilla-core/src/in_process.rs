@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
-    namespace::{ConvoyPhase, ConvoySummary, NamespaceSnapshot},
+    panel::{ConvoyPhase, ConvoySummary, PanelRowData, PanelSnapshot},
     qualified_path::QualifiedPath,
     Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
     FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
@@ -52,7 +52,6 @@ use crate::{
     },
     host_registry::HostCounts,
     model::{provider_names_from_registry, repo_name, RepoModel},
-    namespace_projection::NamespaceProjectionState,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         discovery::{discover_providers, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag},
@@ -303,16 +302,17 @@ fn convoy_state_label(convoy: &ConvoySummary) -> String {
 fn append_crewless_convoy_rows(
     rows: &mut Vec<FleetListRow>,
     target_namespace: &str,
-    namespaces: &[NamespaceSnapshot],
+    panels: &[PanelSnapshot],
     host: &HostName,
     staleness: FleetStaleness,
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
-    for snapshot in namespaces {
-        if snapshot.namespace != target_namespace {
-            continue;
-        }
-        for convoy in &snapshot.convoys {
+    for snapshot in panels {
+        for row in snapshot.tab.panels.iter().flat_map(|panel| &panel.rows) {
+            let PanelRowData::Convoy(convoy) = &row.data else { continue };
+            if convoy.namespace != target_namespace {
+                continue;
+            }
             if !convoys_with_crew.insert(convoy.name.clone()) {
                 continue;
             }
@@ -815,11 +815,6 @@ pub struct InProcessDaemon {
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
     observed_resource_backend: ResourceBackend,
-    /// Shared with `ConvoyProjection` (in flotilla-daemon): the projection is the
-    /// sole writer, the daemon reads here for `replay_since`.  Replaces an earlier
-    /// broadcast-driven mirror that had correctness seams under lag and
-    /// delta-before-snapshot races.  Set by the daemon runtime at startup.
-    namespace_projection_state: RwLock<NamespaceProjectionState>,
     aggregator_projection_state: RwLock<AggregatorProjectionState>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
@@ -958,7 +953,6 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
             resource_backend,
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
-            namespace_projection_state: RwLock::new(NamespaceProjectionState::new()),
             aggregator_projection_state: RwLock::new(AggregatorProjectionState::new()),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
@@ -1074,7 +1068,7 @@ impl InProcessDaemon {
     }
 
     /// Override the provisioning namespace used for daemon-side resource lookups
-    /// (e.g. `ConvoyTaskComplete`). Called by the daemon runtime at startup with
+    /// (e.g. `ConvoyLegComplete`). Called by the daemon runtime at startup with
     /// `RuntimeOptions::namespace`.
     pub async fn set_provisioning_namespace(&self, namespace: String) {
         *self.provisioning_namespace.write().await = namespace;
@@ -1082,17 +1076,6 @@ impl InProcessDaemon {
 
     pub async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().await.clone()
-    }
-
-    /// Install the shared namespace state that `ConvoyProjection` (in flotilla-daemon)
-    /// will write into.  `replay_since` reads from the same state.  Called by the daemon
-    /// runtime at startup before the projection is spawned.
-    pub async fn set_namespace_projection_state(&self, state: NamespaceProjectionState) {
-        *self.namespace_projection_state.write().await = state;
-    }
-
-    pub async fn namespace_projection_state(&self) -> NamespaceProjectionState {
-        self.namespace_projection_state.read().await.clone()
     }
 
     pub async fn set_aggregator_projection_state(&self, state: AggregatorProjectionState) {
@@ -1814,7 +1797,7 @@ impl InProcessDaemon {
     }
 
     /// Return a clone of the broadcast sender so background tasks (e.g.
-    /// `ConvoyProjection`) can emit events into the daemon-wide event bus.
+    /// the Aggregator) can emit events into the daemon-wide event bus.
     pub fn event_sender(&self) -> broadcast::Sender<DaemonEvent> {
         self.event_tx.clone()
     }
@@ -2155,9 +2138,8 @@ impl InProcessDaemon {
     pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {
         let namespace = self.provisioning_namespace().await;
         let (rows, generation) = self.local_fleet_rows(&namespace).await?;
-        let namespaces = self.namespace_projection_state().await.all_snapshots().await;
         let panels = vec![self.aggregator_projection_state().await.local_snapshot().await];
-        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, namespaces, panels })
+        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, panels })
     }
 
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
@@ -2234,8 +2216,8 @@ impl InProcessDaemon {
                         })
                         .collect();
                     // Replica rows from current daemons already include crewless rows via local_fleet_rows.
-                    // Keep the namespace payload as a secondary source for direct snapshots; existing rows win.
-                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.namespaces, &snapshot_host, staleness);
+                    // Keep panel rows as a secondary source for direct snapshots; existing rows win.
+                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.panels, &snapshot_host, staleness);
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
                         rows,
                         last_sync: Some(now),
@@ -2278,8 +2260,10 @@ impl InProcessDaemon {
         let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
         let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let observed_checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
 
         let session_list = terminal_sessions.list().await.map_err(|err| err.to_string())?;
+        let observed_generation = observed_checkouts.list().await.map_err(|err| err.to_string())?.generation;
         let environment_map: HashMap<_, _> = environments
             .list()
             .await
@@ -2328,8 +2312,8 @@ impl InProcessDaemon {
                 staleness: FleetStaleness::Local,
             });
         }
-        let namespaces = self.namespace_projection_state().await.all_snapshots().await;
-        append_crewless_convoy_rows(&mut rows, namespace, &namespaces, &self.host_name, FleetStaleness::Local);
+        let panels = vec![self.aggregator_projection_state().await.local_snapshot().await];
+        append_crewless_convoy_rows(&mut rows, namespace, &panels, &self.host_name, FleetStaleness::Local);
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
                 &right.convoy,
@@ -2338,7 +2322,7 @@ impl InProcessDaemon {
                 &right.crew,
             ))
         });
-        Ok((rows, session_list.generation))
+        Ok((rows, observed_generation))
     }
 
     pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<String, String> {
@@ -2698,7 +2682,7 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyTaskComplete { convoy, task, message } = &command.action {
+        if let flotilla_protocol::CommandAction::ConvoyLegComplete { convoy, leg, message } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -2712,14 +2696,14 @@ impl InProcessDaemon {
             let result = match convoys.get(convoy).await {
                 Ok(current) => match current.status.as_ref() {
                     None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },
-                    Some(status) if !status.tasks.contains_key(task) => {
-                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain task {task}") }
+                    Some(status) if !status.tasks.contains_key(leg) => {
+                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain leg {leg}") }
                     }
                     Some(_) => {
                         match apply_resource_status_patch(
                             &convoys,
                             convoy,
-                            &convoy_external_patches::mark_task_completed(task.clone(), chrono::Utc::now(), message.clone()),
+                            &convoy_external_patches::mark_task_completed(leg.clone(), chrono::Utc::now(), message.clone()),
                         )
                         .await
                         {
@@ -3399,20 +3383,6 @@ impl DaemonHandle for InProcessDaemon {
                     // Client has never seen this repo — send full snapshot
                     events.push(DaemonEvent::RepoSnapshot(Box::new((**snapshot).clone())));
                 }
-            }
-        }
-
-        // Emit namespace events by reading directly from the projection's authoritative
-        // state.  No mirror, no lag — see [`NamespaceProjectionState`] for the rationale.
-        let projection_state = self.namespace_projection_state.read().await.clone();
-        for snap in projection_state.all_snapshots().await {
-            let stream_key = StreamKey::Namespace { name: snap.namespace.clone() };
-            // `==`, not `>=`: if a client's `last_seen` is ahead of the daemon's current
-            // seq (e.g. after a daemon restart that resets in-memory seq to 0), we still
-            // want to resend a full snapshot rather than treat the client as up-to-date.
-            let up_to_date = last_seen.get(&stream_key).is_some_and(|&seq| seq == snap.seq);
-            if !up_to_date {
-                events.push(DaemonEvent::NamespaceSnapshot(Box::new(snap)));
             }
         }
 

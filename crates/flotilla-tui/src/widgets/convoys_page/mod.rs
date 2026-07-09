@@ -8,7 +8,6 @@ mod glyphs;
 mod list;
 
 pub use detail::ConvoyDetail;
-use flotilla_protocol::namespace::{ConvoyId, ConvoySummary};
 pub use list::ConvoyList;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -16,6 +15,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+
+use crate::convoy_model::{ConvoyId, ConvoySummary};
 
 pub struct ConvoysPage<'a> {
     pub convoys: Vec<&'a ConvoySummary>,

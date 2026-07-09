@@ -1,5 +1,5 @@
 //! End-to-end test: Convoy resource creation flows through InProcessDaemon →
-//! ConvoyProjection → NamespaceSnapshot broadcast → App.convoys("flotilla").
+//! Aggregator → PanelSnapshot broadcast → App.convoys("flotilla").
 //!
 //! The test subscribes the TUI App directly to the daemon's broadcast channel
 //! and polls app.convoys() — no real socket needed.
@@ -16,8 +16,8 @@ use flotilla_core::{
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend, SnapshotTask,
-    TaskPhase, TaskState, WorkflowSnapshot,
+    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, Presentation, PresentationSpec,
+    PresentationStatus, ResourceBackend, SnapshotTask, TaskPhase, TaskState, WorkflowSnapshot, CONVOY_LABEL, TASK_LABEL,
 };
 use flotilla_tui::{app::App, theme::Theme};
 
@@ -88,8 +88,7 @@ async fn tui_shows_convoys_from_daemon() {
         app.handle_daemon_event(event);
     }
 
-    // Create a Convoy resource — ConvoyProjection should pick it up and broadcast
-    // a NamespaceSnapshot that the App will ingest via drain_daemon_events below.
+    // Create a Convoy resource — the Aggregator should broadcast a panel snapshot.
     let convoys = backend.using::<Convoy>("flotilla");
     convoys.create(&convoy_meta("my-convoy"), &convoy_spec("my-workflow")).await.expect("create convoy");
 
@@ -125,7 +124,7 @@ async fn tui_shows_convoys_from_daemon() {
 }
 
 #[tokio::test]
-async fn x_then_enter_completes_task_via_palette() {
+async fn x_then_enter_completes_leg_via_palette() {
     use std::collections::BTreeMap;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -149,7 +148,7 @@ async fn x_then_enter_completes_task_via_palette() {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
-        start_controllers: true,
+        start_controllers: false,
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
@@ -163,7 +162,7 @@ async fn x_then_enter_completes_task_via_palette() {
         app.handle_daemon_event(event);
     }
 
-    // Create a convoy and bootstrap its status so it has a task ready for completion.
+    // Create a convoy and bootstrap its status so it has a leg ready for completion.
     let convoys = backend.using::<Convoy>("flotilla");
     convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix")).await.expect("create convoy");
 
@@ -185,6 +184,27 @@ async fn x_then_enter_completes_task_via_palette() {
     .await
     .expect("bootstrap convoy");
 
+    let mut presentation_meta = convoy_meta("fix-bug-123-implement");
+    presentation_meta.labels.insert(CONVOY_LABEL.to_string(), "fix-bug-123".to_string());
+    presentation_meta.labels.insert(TASK_LABEL.to_string(), "implement".to_string());
+    let presentations = backend.using::<Presentation>("flotilla");
+    let presentation = presentations
+        .create(&presentation_meta, &PresentationSpec {
+            convoy_ref: "fix-bug-123".to_string(),
+            presentation_policy_ref: "default".to_string(),
+            name: "implement".to_string(),
+            process_selector: BTreeMap::new(),
+        })
+        .await
+        .expect("create presentation");
+    presentations
+        .update_status("fix-bug-123-implement", &presentation.metadata.resource_version, &PresentationStatus {
+            observed_workspace_ref: Some("ws-implement".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("publish workspace reference");
+
     // Drain events until the convoy's task appears in the App.
     let drain = |app: &mut App, daemon_rx: &mut tokio::sync::broadcast::Receiver<flotilla_protocol::DaemonEvent>| loop {
         match daemon_rx.try_recv() {
@@ -198,11 +218,33 @@ async fn x_then_enter_completes_task_via_palette() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         drain(&mut app, &mut daemon_rx);
-        if app.convoys("flotilla").iter().any(|c| !c.tasks.is_empty()) {
+        if app.convoys("flotilla").iter().any(|convoy| !convoy.tasks.is_empty()) {
             break;
         }
         if Instant::now() >= deadline {
             panic!("timed out waiting for convoy task to appear in app: {:?}", app.convoys("flotilla"));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let presentation = presentations.get("fix-bug-123-implement").await.expect("presentation should still exist");
+    presentations
+        .update_status("fix-bug-123-implement", &presentation.metadata.resource_version, &PresentationStatus {
+            observed_workspace_ref: Some("ws-implement".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("republish workspace reference after leg is visible");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        drain(&mut app, &mut daemon_rx);
+        if app.convoys("flotilla").iter().any(|convoy| convoy.tasks.iter().any(|leg| leg.workspace_ref.as_deref() == Some("ws-implement")))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for attach intent: {:?}", app.convoys("flotilla"));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -218,9 +260,10 @@ async fn x_then_enter_completes_task_via_palette() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
     }
 
-    app.handle_key(key('l')); // drill into task focus
+    app.handle_key(key('l')); // drill into leg focus
+    assert_eq!(app.convoys("flotilla")[0].tasks[0].workspace_ref.as_deref(), Some("ws-implement"));
     app.handle_key(key('x')); // open palette pre-filled
-    app.handle_key(enter()); // confirm — dispatch ConvoyTaskComplete
+    app.handle_key(enter()); // confirm — dispatch ConvoyLegComplete
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;
@@ -230,13 +273,13 @@ async fn x_then_enter_completes_task_via_palette() {
     }
     assert!(took_one, "expected at least one command to be dispatched after Enter");
 
-    // Wait for TaskPhase::Completed to land back in the app via NamespaceDelta.
+    // Wait for completion to land back in the app via PanelDelta.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         drain(&mut app, &mut daemon_rx);
         if let Some(c) = app.convoys("flotilla").first() {
             if let Some(t) = c.tasks.iter().find(|t| t.name == "implement") {
-                if t.phase == flotilla_protocol::namespace::TaskPhase::Completed {
+                if t.phase == flotilla_tui::convoy_model::TaskPhase::Completed {
                     break;
                 }
             }

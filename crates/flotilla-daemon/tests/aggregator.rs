@@ -96,10 +96,10 @@ async fn aggregator_emits_panel_events() {
 }
 
 /// Verifies the causal chain:
-///   1. Create convoy A  → NamespaceSnapshot arrives; record cursor seq.
-///   2. Create convoy B  → NamespaceDelta arrives.
+///   1. Create convoy A  → PanelSnapshot arrives; record cursor seq.
+///   2. Create convoy B  → PanelDelta arrives.
 ///   3. ReplaySince with the cursor from step 1 → response must include at
-///      least one NamespaceSnapshot or NamespaceDelta for namespace "flotilla"
+///      least one PanelSnapshot or PanelDelta for the convoy tab
 ///      that reflects convoy B.
 #[tokio::test]
 async fn replay_since_returns_panel_events_after_seq() {

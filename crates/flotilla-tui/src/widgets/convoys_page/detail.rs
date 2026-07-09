@@ -1,6 +1,5 @@
 //! Right-pane convoy detail widget.
 
-use flotilla_protocol::namespace::ConvoySummary;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -11,6 +10,7 @@ use ratatui::{
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::glyphs::{convoy_glyph, task_glyph};
+use crate::convoy_model::ConvoySummary;
 
 pub struct ConvoyDetail<'a> {
     pub convoy: &'a ConvoySummary,
@@ -72,10 +72,10 @@ impl<'a> ConvoyDetail<'a> {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, TaskPhase, TaskSummary};
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
+    use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, TaskPhase, TaskSummary};
 
     fn multi_task_convoy() -> ConvoySummary {
         ConvoySummary {

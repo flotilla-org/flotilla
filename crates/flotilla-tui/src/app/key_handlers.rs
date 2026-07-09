@@ -61,8 +61,8 @@ impl App {
                     self.exit_convoy_tasks_focus();
                 }
             }
-            Action::CompleteConvoyTask if self.ui.is_convoys => self.open_complete_convoy_task_palette(),
-            Action::AttachConvoyTask if self.ui.is_convoys => self.attach_selected_convoy_task(),
+            Action::CompleteConvoyLeg if self.ui.is_convoys => self.open_complete_convoy_leg_palette(),
+            Action::AttachConvoyLeg if self.ui.is_convoys => self.attach_selected_convoy_task(),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
@@ -405,15 +405,15 @@ impl App {
         }
     }
 
-    /// Open the command palette pre-filled with `convoy <id> task <task> complete `.
-    /// No-op when no convoy or task is selected. Convoy ids and task names are
+    /// Open the command palette pre-filled with `convoy <id> leg <leg> complete `.
+    /// No-op when no convoy or leg is selected. Convoy ids and leg names are
     /// arbitrary strings (no validation), so they are routed through the
     /// palette's quoting helper to round-trip whitespace and special characters.
-    pub(super) fn open_complete_convoy_task_palette(&mut self) {
+    pub(super) fn open_complete_convoy_leg_palette(&mut self) {
         let Some(convoy) = self.selected_convoy_summary("flotilla") else { return };
         let Some(task) = self.convoys_ui.selected_task.as_ref() else { return };
         let prefill = format!(
-            "convoy {} task {} complete ",
+            "convoy {} leg {} complete ",
             crate::palette::quote_palette_token(&convoy.name),
             crate::palette::quote_palette_token(task),
         );

@@ -100,6 +100,7 @@ impl DaemonRuntime {
         let mut tasks = vec![
             spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
+            spawn_aggregator_task(Arc::clone(&daemon), options.namespace.clone(), aggregator_projection_state),
         ];
 
         if options.start_controllers {
@@ -118,7 +119,6 @@ impl DaemonRuntime {
                 &options.namespace,
                 options.controller_resync_interval,
                 options.controller_supervision.clone(),
-                aggregator_projection_state,
             ));
         }
 
@@ -503,12 +503,8 @@ fn spawn_controller_loops(
     namespace: &str,
     controller_resync_interval: Duration,
     supervision: ControllerSupervision,
-    aggregator_projection_state: AggregatorProjectionState,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
-    let observed_backend = state.daemon.observed_resource_backend();
-    let replica_rx = state.daemon.subscribe_fleet_replicas();
-    let local_host = state.daemon.host_name().clone();
     let namespace_string = namespace.to_string();
     vec![
         tokio::spawn({
@@ -715,22 +711,26 @@ fn spawn_controller_loops(
                 .await;
             }
         }),
-        tokio::spawn({
-            let namespace_string = namespace_string.clone();
-            let event_tx = state.daemon.event_sender();
-            async move {
-                Aggregator::new(aggregator_projection_state, local_host, event_tx)
-                    .run(
-                        backend.clone().using::<Convoy>(&namespace_string),
-                        backend.using::<Presentation>(&namespace_string),
-                        observed_backend.clone().using::<Convoy>(&namespace_string),
-                        observed_backend.using::<Presentation>(&namespace_string),
-                        replica_rx,
-                    )
-                    .await;
-            }
-        }),
     ]
+}
+
+fn spawn_aggregator_task(daemon: Arc<InProcessDaemon>, namespace: String, state: AggregatorProjectionState) -> JoinHandle<()> {
+    let durable = daemon.resource_backend();
+    let observed = daemon.observed_resource_backend();
+    let replica_rx = daemon.subscribe_fleet_replicas();
+    let local_host = daemon.host_name().clone();
+    let event_tx = daemon.event_sender();
+    tokio::spawn(async move {
+        Aggregator::new(state, local_host, event_tx)
+            .run(
+                durable.clone().using::<Convoy>(&namespace),
+                durable.using::<Presentation>(&namespace),
+                observed.clone().using::<Convoy>(&namespace),
+                observed.using::<Presentation>(&namespace),
+                replica_rx,
+            )
+            .await;
+    })
 }
 
 struct DockerControllerRuntime {
@@ -1077,15 +1077,8 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let aggregator_projection_state = AggregatorProjectionState::new();
-        daemon.set_aggregator_projection_state(aggregator_projection_state.clone()).await;
-        let controller_handles = spawn_controller_loops(
-            Arc::clone(&state),
-            NAMESPACE,
-            Duration::from_millis(25),
-            ControllerSupervision::default(),
-            aggregator_projection_state,
-        );
+        let controller_handles =
+            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), ControllerSupervision::default());
 
         backend
             .clone()
@@ -1147,9 +1140,9 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyTaskComplete {
+                action: CommandAction::ConvoyLegComplete {
                     convoy: "convoy-a".to_string(),
-                    task: "implement".to_string(),
+                    leg: "implement".to_string(),
                     message: Some("done".to_string()),
                 },
             })
@@ -1367,15 +1360,8 @@ mod tests {
             Some(ExecutionEnvironmentPath::new(&repo)),
             profile.host_direct_environment_name(),
         ));
-        let aggregator_projection_state = AggregatorProjectionState::new();
-        daemon.set_aggregator_projection_state(aggregator_projection_state.clone()).await;
-        let controller_handles = spawn_controller_loops(
-            Arc::clone(&state),
-            NAMESPACE,
-            Duration::from_millis(25),
-            ControllerSupervision::default(),
-            aggregator_projection_state,
-        );
+        let controller_handles =
+            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(25), ControllerSupervision::default());
 
         backend
             .clone()
@@ -1436,9 +1422,9 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyTaskComplete {
+                action: CommandAction::ConvoyLegComplete {
                     convoy: "convoy-adopted".to_string(),
-                    task: "implement".to_string(),
+                    leg: "implement".to_string(),
                     message: Some("done".to_string()),
                 },
             })

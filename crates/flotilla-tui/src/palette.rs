@@ -281,11 +281,11 @@ pub fn palette_completions(
         return verb_completions(&noun_name, "");
     }
 
-    // `convoy <id> task <Tab>` and `convoy <id> task <partial>`: complete with
+    // `convoy <id> leg <Tab>` and `convoy <id> leg <partial>`: complete with
     // task names from the named convoy. The clap tree treats the task subject as
     // a free-form positional and would otherwise return nothing. Past the task
     // subject we fall through to the clap walker for verbs (`complete` etc.).
-    if noun_name == "convoy" && tokens.len() >= 3 && tokens[2] == "task" {
+    if noun_name == "convoy" && tokens.len() >= 3 && tokens[2] == "leg" {
         // tokens[1] is the raw whitespace-split token: convoy ids that contain
         // whitespace (and would have been double-quoted by `quote_palette_token`)
         // won't look up correctly here, since `palette_completions` uses
@@ -295,10 +295,10 @@ pub fn palette_completions(
         // command itself dispatches correctly even when completions don't fire.
         let convoy_id = tokens[1];
         if tokens.len() == 3 && trailing_space {
-            return convoy_task_completions(convoy_id, "", namespaces);
+            return convoy_leg_completions(convoy_id, "", namespaces);
         }
         if tokens.len() == 4 && !trailing_space {
-            return convoy_task_completions(convoy_id, tokens[3], namespaces);
+            return convoy_leg_completions(convoy_id, tokens[3], namespaces);
         }
     }
 
@@ -316,8 +316,8 @@ pub fn palette_completions(
     vec![]
 }
 
-/// Task-name completions for `convoy <id> task <Tab>` / partial.
-fn convoy_task_completions(convoy_id: &str, partial: &str, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
+/// Task-name completions for `convoy <id> leg <Tab>` / partial.
+fn convoy_leg_completions(convoy_id: &str, partial: &str, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
     // Single-namespace MVP: search the "flotilla" namespace.
     let lower = partial.to_lowercase();
     let Some(model) = namespaces.get("flotilla") else { return vec![] };
@@ -796,7 +796,7 @@ mod tests {
     use crate::app::test_builders::repo_info;
 
     fn namespaces_with_convoy(name: &str, tasks: &[&str]) -> crate::app::NamespaceMap {
-        use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase, ConvoySummary, TaskPhase, TaskSummary};
+        use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, TaskPhase, TaskSummary};
         let convoy = ConvoySummary {
             id: ConvoyId::new("flotilla", name),
             namespace: "flotilla".into(),
@@ -1111,7 +1111,7 @@ mod tests {
     fn convoy_task_names_listed_after_task_keyword() {
         let model = empty_model();
         let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
-        let completions = palette_completions("convoy fix-bug-123 task ", &model, &namespaces, true);
+        let completions = palette_completions("convoy fix-bug-123 leg ", &model, &namespaces, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"implement"), "expected 'implement' in {values:?}");
         assert!(values.contains(&"review"), "expected 'review' in {values:?}");
@@ -1121,7 +1121,7 @@ mod tests {
     fn convoy_task_names_filter_by_partial() {
         let model = empty_model();
         let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
-        let completions = palette_completions("convoy fix-bug-123 task imp", &model, &namespaces, true);
+        let completions = palette_completions("convoy fix-bug-123 leg imp", &model, &namespaces, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert_eq!(values, vec!["implement"]);
     }
@@ -1130,7 +1130,7 @@ mod tests {
     fn convoy_task_complete_verb_completes_after_task_subject() {
         let model = empty_model();
         let namespaces = namespaces_with_convoy("fix-bug-123", &["implement"]);
-        let completions = palette_completions("convoy fix-bug-123 task implement ", &model, &namespaces, true);
+        let completions = palette_completions("convoy fix-bug-123 leg implement ", &model, &namespaces, true);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"complete"), "expected 'complete' verb in {values:?}");
     }

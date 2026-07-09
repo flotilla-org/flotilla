@@ -7,7 +7,7 @@ use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
+use flotilla_protocol::{panel::PanelRowData, Command, CommandAction, CommandValue, DaemonEvent, HostName};
 use flotilla_resources::{Convoy, ConvoyPhase, InMemoryBackend, ResourceBackend, SqliteBackend, WorkflowTemplate};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -237,17 +237,19 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let event = tokio::time::timeout(remaining, rx.recv()).await.expect("timed out waiting for namespace event").expect("recv");
+        let event = tokio::time::timeout(remaining, rx.recv()).await.expect("timed out waiting for panel event").expect("recv");
         match event {
-            DaemonEvent::NamespaceSnapshot(snapshot)
-                if snapshot.namespace == "flotilla"
-                    && snapshot.convoys.iter().any(|convoy| convoy.name == "sqlite-scratch" && !convoy.initializing) =>
+            DaemonEvent::PanelSnapshot(snapshot)
+                if snapshot.tab.panels.iter().flat_map(|panel| &panel.rows).any(
+                    |row| matches!(&row.data, PanelRowData::Convoy(convoy) if convoy.name == "sqlite-scratch" && !convoy.initializing),
+                ) =>
             {
                 break;
             }
-            DaemonEvent::NamespaceDelta(delta)
-                if delta.namespace == "flotilla"
-                    && delta.changed.iter().any(|convoy| convoy.name == "sqlite-scratch" && !convoy.initializing) =>
+            DaemonEvent::PanelDelta(delta)
+                if delta.panels.iter().flat_map(|panel| &panel.changed).any(
+                    |row| matches!(&row.data, PanelRowData::Convoy(convoy) if convoy.name == "sqlite-scratch" && !convoy.initializing),
+                ) =>
             {
                 break;
             }

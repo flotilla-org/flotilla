@@ -394,7 +394,6 @@ mod tests {
             host,
             generation: Some(generation.to_string()),
             rows: Vec::<FleetListRow>::new(),
-            namespaces: vec![],
             panels: vec![PanelSnapshot {
                 seq: 1,
                 tab: TabView { id: "convoys".to_string(), title: "Convoys".to_string(), panels: vec![panel] },

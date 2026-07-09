@@ -149,9 +149,9 @@ pub enum CommandAction {
     GenerateBranchName {
         issue_keys: Vec<String>,
     },
-    ConvoyTaskComplete {
+    ConvoyLegComplete {
         convoy: String,
-        task: String,
+        leg: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -280,7 +280,7 @@ impl Command {
             CommandAction::LinkIssuesToChangeRequest { .. } => "Linking issues...",
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
-            CommandAction::ConvoyTaskComplete { .. } => "Completing convoy task...",
+            CommandAction::ConvoyLegComplete { .. } => "Completing convoy leg...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectCreate { .. } => "Creating project...",
@@ -553,9 +553,9 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyTaskComplete {
+                action: CommandAction::ConvoyLegComplete {
                     convoy: "convoy-a".into(),
-                    task: "implement".into(),
+                    leg: "implement".into(),
                     message: Some("done".into()),
                 },
             },
@@ -842,7 +842,7 @@ mod tests {
                     host: crate::HostName::new("desktop"),
                     staleness: FleetStaleness::Local,
                 }],
-                namespaces: vec![],
+                panels: vec![],
             })),
             CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
             CommandValue::EnvironmentCreated { env_id: crate::EnvironmentId::new("env-1") },
