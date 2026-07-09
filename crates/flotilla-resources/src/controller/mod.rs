@@ -259,17 +259,11 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::DeletePresentation { name } => {
                 let resolver = backend.using::<crate::Presentation>(namespace);
-                match resolver.delete(&name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                    Err(err) => Err(err),
-                }
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
             Actuation::DeleteTaskWorkspace { name } => {
                 let resolver = backend.using::<crate::TaskWorkspace>(namespace);
-                match resolver.delete(&name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                    Err(err) => Err(err),
-                }
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
         }
     }
@@ -278,6 +272,21 @@ impl<R: Reconciler> ControllerLoop<R> {
         meta.set_lifecycle_authority(LifecycleAuthority::Managed);
         match resolver.create(&meta, &spec).await {
             Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn delete_if_lifecycle_owned<T: Resource>(resolver: &TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
+        let object = match resolver.get(name).await {
+            Ok(object) => object,
+            Err(ResourceError::NotFound { .. }) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
+            return Ok(());
+        }
+        match resolver.delete(name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -384,9 +393,11 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Err(ResourceError::NotFound { .. }) => continue,
                     Err(err) => return Err(err),
                 };
+                let lifecycle_owned = is_lifecycle_owned(object.metadata.lifecycle_authority()?);
                 if let Some(finalizer_name) = reconciler.finalizer_name() {
                     if object.metadata.deletion_timestamp.is_none()
                         && object.metadata.finalizers.iter().all(|finalizer| finalizer != finalizer_name)
+                        && lifecycle_owned
                     {
                         let meta = InputMeta::from(&object.metadata).with_added_finalizer(finalizer_name);
                         // A racing writer may win between get() and update(); rely on the resulting
@@ -397,7 +408,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                     if object.metadata.deletion_timestamp.is_some()
                         && object.metadata.finalizers.iter().any(|finalizer| finalizer == finalizer_name)
                     {
-                        reconciler.run_finalizer(&object).await?;
+                        if lifecycle_owned {
+                            reconciler.run_finalizer(&object).await?;
+                        }
                         let meta = InputMeta::from(&object.metadata).without_finalizer(finalizer_name);
                         match primary.update(&meta, &object.metadata.resource_version, &object.spec).await {
                             Ok(_) | Err(ResourceError::NotFound { .. }) => {}
@@ -407,6 +420,9 @@ impl<R: Reconciler> ControllerLoop<R> {
                     }
                 }
                 if object.metadata.deletion_timestamp.is_some() {
+                    continue;
+                }
+                if !lifecycle_owned {
                     continue;
                 }
                 let deps = reconciler.fetch_dependencies(&object).await?;
@@ -465,12 +481,24 @@ impl<R: Reconciler> ControllerLoop<R> {
     }
 }
 
-/// List every resource matching `selector` and delete it, swallowing `NotFound` from
-/// races with concurrent deletes. Used by cascading-teardown reconcilers (TaskWorkspace,
-/// Convoy) to garbage-collect their owned children before the finalizer is removed.
-pub async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
+fn is_lifecycle_owned(authority: Option<LifecycleAuthority>) -> bool {
+    !matches!(authority, Some(LifecycleAuthority::Observed | LifecycleAuthority::Adopted))
+}
+
+/// List every resource matching `selector` and delete only lifecycle-owned children.
+///
+/// `Observed` and `Adopted` children may be referenced by a managed parent but their
+/// lifecycle belongs outside the parent reconciler, so cascading teardown must not
+/// delete them.
+pub async fn delete_lifecycle_owned_matching<T: Resource>(
+    resolver: &TypedResolver<T>,
+    selector: &BTreeMap<String, String>,
+) -> Result<(), ResourceError> {
     let listed = resolver.list_matching_labels(selector).await?;
     for object in listed.items {
+        if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
+            continue;
+        }
         match resolver.delete(&object.metadata.name).await {
             Ok(()) | Err(ResourceError::NotFound { .. }) => {}
             Err(err) => return Err(err),

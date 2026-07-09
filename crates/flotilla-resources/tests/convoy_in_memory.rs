@@ -6,8 +6,8 @@ use common::{
 };
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyPhase, ConvoyReconciler, InMemoryBackend,
-    InputMeta, Presentation, PresentationSpec, ResourceBackend, ResourceError, TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatus,
-    WorkflowTemplate, CONVOY_LABEL, TASK_LABEL,
+    InputMeta, LifecycleAuthority, Presentation, PresentationSpec, ResourceBackend, ResourceError, TaskWorkspace, TaskWorkspacePhase,
+    TaskWorkspaceStatus, WorkflowTemplate, CONVOY_LABEL, TASK_LABEL,
 };
 use tokio::time::{timeout, Duration};
 
@@ -308,6 +308,96 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
         )
         .await
         .expect("presentation create should succeed");
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-adopted".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "adopted".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &flotilla_resources::TaskWorkspaceSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                task: "adopted".to_string(),
+                placement_policy_ref: "laptop-docker".to_string(),
+                adopted_checkout_ref: None,
+            },
+        )
+        .await
+        .expect("adopted task workspace create should succeed");
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-observed".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "observed".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Observed),
+            &flotilla_resources::TaskWorkspaceSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                task: "observed".to_string(),
+                placement_policy_ref: "laptop-docker".to_string(),
+                adopted_checkout_ref: None,
+            },
+        )
+        .await
+        .expect("observed task workspace create should succeed");
+    presentations
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-adopted".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "adopted".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &PresentationSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "adopted".to_string(),
+                process_selector: [
+                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
+                    (TASK_LABEL.to_string(), "adopted".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("adopted presentation create should succeed");
+    presentations
+        .create(
+            &InputMeta::builder()
+                .name("convoy-delete-observed".to_string())
+                .labels(
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "observed".to_string())]
+                        .into_iter()
+                        .collect(),
+                )
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Observed),
+            &PresentationSpec {
+                convoy_ref: "convoy-delete".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "observed".to_string(),
+                process_selector: [
+                    (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
+                    (TASK_LABEL.to_string(), "observed".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("observed presentation create should succeed");
 
     let loop_task = tokio::spawn(
         ControllerLoop {
@@ -348,7 +438,48 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
         }
     })
     .await
-    .expect("convoy finalizer should delete presentation and task workspaces");
+    .expect("convoy finalizer should delete managed presentation and task workspace");
+
+    assert_eq!(
+        workspaces
+            .get("convoy-delete-adopted")
+            .await
+            .expect("adopted task workspace should remain")
+            .metadata
+            .lifecycle_authority()
+            .expect("authority label should parse"),
+        Some(LifecycleAuthority::Adopted)
+    );
+    assert_eq!(
+        workspaces
+            .get("convoy-delete-observed")
+            .await
+            .expect("observed task workspace should remain")
+            .metadata
+            .lifecycle_authority()
+            .expect("authority label should parse"),
+        Some(LifecycleAuthority::Observed)
+    );
+    assert_eq!(
+        presentations
+            .get("convoy-delete-adopted")
+            .await
+            .expect("adopted presentation should remain")
+            .metadata
+            .lifecycle_authority()
+            .expect("authority label should parse"),
+        Some(LifecycleAuthority::Adopted)
+    );
+    assert_eq!(
+        presentations
+            .get("convoy-delete-observed")
+            .await
+            .expect("observed presentation should remain")
+            .metadata
+            .lifecycle_authority()
+            .expect("authority label should parse"),
+        Some(LifecycleAuthority::Observed)
+    );
 
     loop_task.abort();
 }

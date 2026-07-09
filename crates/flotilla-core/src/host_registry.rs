@@ -210,7 +210,7 @@ impl HostRegistry {
         let configured = self.configured_peers.read().await.clone();
         let node_connectivity = self.node_connectivity.read().await.clone();
         let mut events = Vec::new();
-        for (_environment_id, state) in self.hosts.read().await.iter() {
+        for state in self.hosts.read().await.values() {
             let environment_id = state.environment_id.clone();
             let stream_key = StreamKey::Host { environment_id: environment_id.clone() };
             let up_to_date = last_seen.get(&stream_key).is_some_and(|seq| *seq == state.seq);

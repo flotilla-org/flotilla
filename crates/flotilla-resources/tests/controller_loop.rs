@@ -177,6 +177,7 @@ impl flotilla_resources::controller::SecondaryWatch for RestartingSecondaryWatch
 #[derive(Clone)]
 struct ActuatingReconciler {
     actuation: Actuation,
+    reconciled: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl Reconciler for ActuatingReconciler {
@@ -189,10 +190,13 @@ impl Reconciler for ActuatingReconciler {
 
     fn reconcile(
         &self,
-        _obj: &ResourceObject<Self::Resource>,
+        obj: &ResourceObject<Self::Resource>,
         _deps: &Self::Dependencies,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
+        if let Some(reconciled) = &self.reconciled {
+            reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        }
         ReconcileOutcome::with_actuations(None, vec![self.actuation.clone()])
     }
 
@@ -207,6 +211,10 @@ impl Reconciler for ActuatingReconciler {
 
 fn primary_meta(name: &str) -> InputMeta {
     resource_meta().name(name).call()
+}
+
+fn primary_meta_with_authority(name: &str, authority: LifecycleAuthority) -> InputMeta {
+    primary_meta(name).with_lifecycle_authority(authority)
 }
 
 fn secondary_meta(name: &str, primary: &str) -> InputMeta {
@@ -581,6 +589,135 @@ async fn controller_loop_adds_finalizer_to_managed_resources() {
     harness.shutdown().await;
 }
 
+#[tokio::test]
+async fn controller_loop_skips_reconcile_for_observed_and_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries
+        .create(&primary_meta_with_authority("a-adopted", LifecycleAuthority::Adopted), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("adopted primary create should succeed");
+    primaries
+        .create(&primary_meta_with_authority("b-observed", LifecycleAuthority::Observed), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("observed primary create should succeed");
+    primaries.create(&primary_meta("z-managed"), &PrimarySpec { value: "three".to_string() }).await.expect("managed create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "z-managed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("managed primary should reconcile");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(reconciled.lock().expect("reconciled lock").as_slice(), &["z-managed".to_string()]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_does_not_add_finalizers_to_observed_or_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries
+        .create(&primary_meta_with_authority("a-adopted", LifecycleAuthority::Adopted), &PrimarySpec { value: "one".to_string() })
+        .await
+        .expect("adopted primary create should succeed");
+    primaries
+        .create(&primary_meta_with_authority("b-observed", LifecycleAuthority::Observed), &PrimarySpec { value: "two".to_string() })
+        .await
+        .expect("observed primary create should succeed");
+    primaries.create(&primary_meta("z-managed"), &PrimarySpec { value: "three".to_string() }).await.expect("managed create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::new(Mutex::new(Vec::new())) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let object = primaries.get("z-managed").await.expect("managed primary get should succeed");
+            if object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller should attach its finalizer to managed primary");
+
+    assert!(primaries.get("a-adopted").await.expect("adopted primary get should succeed").metadata.finalizers.is_empty());
+    assert!(primaries.get("b-observed").await.expect("observed primary get should succeed").metadata.finalizers.is_empty());
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_removes_existing_adopted_finalizer_without_running_teardown() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let meta = resource_meta()
+        .name("a-adopted")
+        .finalizers(vec!["flotilla.work/test-finalizer".to_string()])
+        .deletion_timestamp(chrono::Utc::now())
+        .call()
+        .with_lifecycle_authority(LifecycleAuthority::Adopted);
+    primaries.create(&meta, &PrimarySpec { value: "one".to_string() }).await.expect("adopted primary create should succeed");
+
+    let finalized = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: FinalizingReconciler { finalized: Arc::clone(&finalized) },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(primaries.get("a-adopted").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adopted primary should be unblocked without teardown");
+
+    assert!(finalized.lock().expect("finalized lock").is_empty());
+
+    harness.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn secondary_watch_restart_is_backed_off() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -634,6 +771,7 @@ async fn controller_loop_applies_create_presentation_actuation() {
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: ActuatingReconciler {
+                reconciled: None,
                 actuation: Actuation::CreatePresentation {
                     meta: resource_meta().name("alpha-presentation").call(),
                     spec: PresentationSpec {
@@ -698,7 +836,10 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         ControllerLoop {
             primary: primaries.clone(),
             secondaries: Vec::new(),
-            reconciler: ActuatingReconciler { actuation: Actuation::DeletePresentation { name: "alpha-presentation".to_string() } },
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeletePresentation { name: "alpha-presentation".to_string() },
+                reconciled: None,
+            },
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -723,7 +864,10 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         ControllerLoop {
             primary: primaries,
             secondaries: Vec::new(),
-            reconciler: ActuatingReconciler { actuation: Actuation::DeleteTaskWorkspace { name: "alpha-task".to_string() } },
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeleteTaskWorkspace { name: "alpha-task".to_string() },
+                reconciled: None,
+            },
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -742,6 +886,98 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
     .expect("delete task workspace actuation should remove the resource");
 
     task_workspaces.delete("alpha-task").await.expect_err("resource should already be gone");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let presentations = backend.clone().using::<Presentation>("flotilla");
+    let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    presentations
+        .create(
+            &resource_meta().name("adopted-presentation").call().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &PresentationSpec {
+                convoy_ref: "alpha".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "alpha".to_string(),
+                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    task_workspaces
+        .create(&resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed), &TaskWorkspaceSpec {
+            convoy_ref: "alpha".to_string(),
+            task: "implement".to_string(),
+            placement_policy_ref: "local".to_string(),
+            adopted_checkout_ref: None,
+        })
+        .await
+        .expect("task workspace create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeletePresentation { name: "adopted-presentation".to_string() },
+                reconciled: Some(Arc::clone(&reconciled)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete presentation actuation should run");
+    let presentation = presentations.get("adopted-presentation").await.expect("adopted presentation should remain");
+    assert_eq!(presentation.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Adopted));
+
+    harness.shutdown().await;
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeleteTaskWorkspace { name: "observed-task".to_string() },
+                reconciled: Some(Arc::clone(&reconciled)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete task workspace actuation should run");
+    let task_workspace = task_workspaces.get("observed-task").await.expect("observed task workspace should remain");
+    assert_eq!(task_workspace.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
 
     harness.shutdown().await;
 }

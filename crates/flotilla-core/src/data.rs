@@ -357,10 +357,9 @@ fn group_to_work_item(providers: &ProviderData, group: &CorrelatedGroup, group_i
         (CorrelatedAnchor::ChangeRequest(key), None, session_key.clone())
     } else if let Some(key) = session_key.clone() {
         (CorrelatedAnchor::Session(key), None, None)
-    } else if let Some(key) = agent_key.clone() {
-        (CorrelatedAnchor::Agent(key), None, None)
     } else {
-        return None;
+        let key = agent_key.clone()?;
+        (CorrelatedAnchor::Agent(key), None, None)
     };
 
     let branch = group.branch().map(|s| s.to_string());
