@@ -177,6 +177,7 @@ impl flotilla_resources::controller::SecondaryWatch for RestartingSecondaryWatch
 #[derive(Clone)]
 struct ActuatingReconciler {
     actuation: Actuation,
+    reconciled: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl Reconciler for ActuatingReconciler {
@@ -189,10 +190,13 @@ impl Reconciler for ActuatingReconciler {
 
     fn reconcile(
         &self,
-        _obj: &ResourceObject<Self::Resource>,
+        obj: &ResourceObject<Self::Resource>,
         _deps: &Self::Dependencies,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
+        if let Some(reconciled) = &self.reconciled {
+            reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        }
         ReconcileOutcome::with_actuations(None, vec![self.actuation.clone()])
     }
 
@@ -767,6 +771,7 @@ async fn controller_loop_applies_create_presentation_actuation() {
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: ActuatingReconciler {
+                reconciled: None,
                 actuation: Actuation::CreatePresentation {
                     meta: resource_meta().name("alpha-presentation").call(),
                     spec: PresentationSpec {
@@ -831,7 +836,10 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         ControllerLoop {
             primary: primaries.clone(),
             secondaries: Vec::new(),
-            reconciler: ActuatingReconciler { actuation: Actuation::DeletePresentation { name: "alpha-presentation".to_string() } },
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeletePresentation { name: "alpha-presentation".to_string() },
+                reconciled: None,
+            },
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -856,7 +864,10 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         ControllerLoop {
             primary: primaries,
             secondaries: Vec::new(),
-            reconciler: ActuatingReconciler { actuation: Actuation::DeleteTaskWorkspace { name: "alpha-task".to_string() } },
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeleteTaskWorkspace { name: "alpha-task".to_string() },
+                reconciled: None,
+            },
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -875,6 +886,98 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
     .expect("delete task workspace actuation should remove the resource");
 
     task_workspaces.delete("alpha-task").await.expect_err("resource should already be gone");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resources() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let presentations = backend.clone().using::<Presentation>("flotilla");
+    let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+    presentations
+        .create(
+            &resource_meta().name("adopted-presentation").call().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &PresentationSpec {
+                convoy_ref: "alpha".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "alpha".to_string(),
+                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
+            },
+        )
+        .await
+        .expect("presentation create should succeed");
+    task_workspaces
+        .create(&resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed), &TaskWorkspaceSpec {
+            convoy_ref: "alpha".to_string(),
+            task: "implement".to_string(),
+            placement_policy_ref: "local".to_string(),
+            adopted_checkout_ref: None,
+        })
+        .await
+        .expect("task workspace create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeletePresentation { name: "adopted-presentation".to_string() },
+                reconciled: Some(Arc::clone(&reconciled)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete presentation actuation should run");
+    let presentation = presentations.get("adopted-presentation").await.expect("adopted presentation should remain");
+    assert_eq!(presentation.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Adopted));
+
+    harness.shutdown().await;
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: Vec::new(),
+            reconciler: ActuatingReconciler {
+                actuation: Actuation::DeleteTaskWorkspace { name: "observed-task".to_string() },
+                reconciled: Some(Arc::clone(&reconciled)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete task workspace actuation should run");
+    let task_workspace = task_workspaces.get("observed-task").await.expect("observed task workspace should remain");
+    assert_eq!(task_workspace.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
 
     harness.shutdown().await;
 }

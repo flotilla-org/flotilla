@@ -259,17 +259,11 @@ impl<R: Reconciler> ControllerLoop<R> {
             }
             Actuation::DeletePresentation { name } => {
                 let resolver = backend.using::<crate::Presentation>(namespace);
-                match resolver.delete(&name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                    Err(err) => Err(err),
-                }
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
             Actuation::DeleteTaskWorkspace { name } => {
                 let resolver = backend.using::<crate::TaskWorkspace>(namespace);
-                match resolver.delete(&name).await {
-                    Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
-                    Err(err) => Err(err),
-                }
+                Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
         }
     }
@@ -278,6 +272,21 @@ impl<R: Reconciler> ControllerLoop<R> {
         meta.set_lifecycle_authority(LifecycleAuthority::Managed);
         match resolver.create(&meta, &spec).await {
             Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn delete_if_lifecycle_owned<T: Resource>(resolver: &TypedResolver<T>, name: &str) -> Result<(), ResourceError> {
+        let object = match resolver.get(name).await {
+            Ok(object) => object,
+            Err(ResourceError::NotFound { .. }) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if !is_lifecycle_owned(object.metadata.lifecycle_authority()?) {
+            return Ok(());
+        }
+        match resolver.delete(name).await {
+            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(err) => Err(err),
         }
     }
@@ -474,19 +483,6 @@ impl<R: Reconciler> ControllerLoop<R> {
 
 fn is_lifecycle_owned(authority: Option<LifecycleAuthority>) -> bool {
     !matches!(authority, Some(LifecycleAuthority::Observed | LifecycleAuthority::Adopted))
-}
-
-/// List every resource matching `selector` and delete it, swallowing `NotFound` from
-/// races with concurrent deletes.
-pub async fn delete_matching<T: Resource>(resolver: &TypedResolver<T>, selector: &BTreeMap<String, String>) -> Result<(), ResourceError> {
-    let listed = resolver.list_matching_labels(selector).await?;
-    for object in listed.items {
-        match resolver.delete(&object.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
 }
 
 /// List every resource matching `selector` and delete only lifecycle-owned children.
