@@ -21,6 +21,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
+    panel::{IntentTarget, PanelRow, PanelRowData, ResourceRef},
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
     ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
     WorkItemIdentity,
@@ -352,6 +353,81 @@ pub fn filter_convoys_by_str<'a>(
     let f = filter.to_lowercase();
     convoys.into_iter().filter(move |c| {
         f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
+    })
+}
+
+fn panel_convoy_id(resource: &ResourceRef) -> flotilla_protocol::namespace::ConvoyId {
+    let name = match &resource.host {
+        Some(host) => format!("{}@{}", resource.name, host.as_str()),
+        None => resource.name.clone(),
+    };
+    flotilla_protocol::namespace::ConvoyId::new(&resource.namespace, name)
+}
+
+fn panel_row_to_convoy(row: &PanelRow) -> Option<flotilla_protocol::namespace::ConvoySummary> {
+    let PanelRowData::Convoy(convoy) = &row.data else { return None };
+    let tasks = row
+        .children
+        .iter()
+        .filter_map(|child| {
+            let PanelRowData::Leg(leg) = &child.data else { return None };
+            let workspace_ref = child.intents.iter().find_map(|intent| match &intent.target {
+                IntentTarget::Workspace { workspace_ref } => Some(workspace_ref.clone()),
+                IntentTarget::Leg { .. } => None,
+            });
+            Some(flotilla_protocol::namespace::TaskSummary {
+                name: leg.name.clone(),
+                depends_on: child
+                    .depends_on
+                    .iter()
+                    .filter_map(|reference| reference.subresource.as_deref()?.strip_prefix("legs/").map(str::to_string))
+                    .collect(),
+                phase: match leg.phase {
+                    flotilla_protocol::panel::LegPhase::Pending => flotilla_protocol::namespace::TaskPhase::Pending,
+                    flotilla_protocol::panel::LegPhase::Ready => flotilla_protocol::namespace::TaskPhase::Ready,
+                    flotilla_protocol::panel::LegPhase::Launching => flotilla_protocol::namespace::TaskPhase::Launching,
+                    flotilla_protocol::panel::LegPhase::Running => flotilla_protocol::namespace::TaskPhase::Running,
+                    flotilla_protocol::panel::LegPhase::Completed => flotilla_protocol::namespace::TaskPhase::Completed,
+                    flotilla_protocol::panel::LegPhase::Failed => flotilla_protocol::namespace::TaskPhase::Failed,
+                    flotilla_protocol::panel::LegPhase::Cancelled => flotilla_protocol::namespace::TaskPhase::Cancelled,
+                },
+                processes: leg
+                    .crew
+                    .iter()
+                    .map(|member| flotilla_protocol::namespace::ProcessSummary {
+                        role: member.role.clone(),
+                        command_preview: member.command_preview.clone(),
+                    })
+                    .collect(),
+                host: leg.host.clone(),
+                checkout: leg.checkout.clone(),
+                workspace_ref,
+                ready_at: leg.ready_at,
+                started_at: leg.started_at,
+                finished_at: leg.finished_at,
+                message: leg.message.clone(),
+            })
+        })
+        .collect();
+    Some(flotilla_protocol::namespace::ConvoySummary {
+        id: panel_convoy_id(&row.resource),
+        namespace: convoy.namespace.clone(),
+        name: convoy.name.clone(),
+        workflow_ref: convoy.workflow_ref.clone(),
+        phase: match convoy.phase {
+            flotilla_protocol::panel::ConvoyPhase::Pending => flotilla_protocol::namespace::ConvoyPhase::Pending,
+            flotilla_protocol::panel::ConvoyPhase::Active => flotilla_protocol::namespace::ConvoyPhase::Active,
+            flotilla_protocol::panel::ConvoyPhase::Completed => flotilla_protocol::namespace::ConvoyPhase::Completed,
+            flotilla_protocol::panel::ConvoyPhase::Failed => flotilla_protocol::namespace::ConvoyPhase::Failed,
+            flotilla_protocol::panel::ConvoyPhase::Cancelled => flotilla_protocol::namespace::ConvoyPhase::Cancelled,
+        },
+        message: convoy.message.clone(),
+        repo_hint: convoy.repo_hint.clone(),
+        tasks,
+        started_at: convoy.started_at,
+        finished_at: convoy.finished_at,
+        observed_workflow_ref: convoy.observed_workflow_ref.clone(),
+        initializing: convoy.initializing,
     })
 }
 
@@ -1193,6 +1269,51 @@ impl App {
                 }
                 entry.last_seq = delta.seq;
                 self.refresh_convoy_selection(&namespace);
+            }
+            DaemonEvent::PanelSnapshot(snapshot) => {
+                let Some(panel) = snapshot.tab.panels.iter().find(|panel| panel.id.as_str() == "convoys") else { return };
+                self.namespaces.clear();
+                let mut touched = Vec::new();
+                for row in &panel.rows {
+                    let Some(convoy) = panel_row_to_convoy(row) else { continue };
+                    let namespace = convoy.namespace.clone();
+                    let entry = self.namespaces.entry(namespace.clone()).or_default();
+                    entry.convoys.insert(convoy.id.clone(), convoy);
+                    entry.last_seq = snapshot.seq;
+                    if !touched.contains(&namespace) {
+                        touched.push(namespace);
+                    }
+                }
+                for namespace in touched {
+                    self.refresh_convoy_selection(&namespace);
+                }
+            }
+            DaemonEvent::PanelDelta(delta) => {
+                let Some(panel) = delta.panels.iter().find(|panel| panel.panel_id.as_str() == "convoys") else { return };
+                let mut touched = Vec::new();
+                for row in &panel.changed {
+                    let Some(convoy) = panel_row_to_convoy(row) else { continue };
+                    let namespace = convoy.namespace.clone();
+                    let entry = self.namespaces.entry(namespace.clone()).or_default();
+                    entry.convoys.insert(convoy.id.clone(), convoy);
+                    entry.last_seq = delta.seq;
+                    if !touched.contains(&namespace) {
+                        touched.push(namespace);
+                    }
+                }
+                for removed in &panel.removed {
+                    let namespace = removed.namespace.clone();
+                    if let Some(entry) = self.namespaces.get_mut(&namespace) {
+                        entry.convoys.shift_remove(&panel_convoy_id(removed));
+                        entry.last_seq = delta.seq;
+                    }
+                    if !touched.contains(&namespace) {
+                        touched.push(namespace);
+                    }
+                }
+                for namespace in touched {
+                    self.refresh_convoy_selection(&namespace);
+                }
             }
         }
     }
