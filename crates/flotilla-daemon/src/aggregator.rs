@@ -8,8 +8,9 @@ use flotilla_protocol::{
     DaemonEvent, FleetReplicaSnapshot, HostName,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, Presentation, ProcessSource, Resource, ResourceList, ResourceObject,
-    SnapshotTask, TaskPhase as ResourceLegPhase, TaskState, TypedResolver, WatchEvent, WatchStart, CONVOY_LABEL, TASK_LABEL,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, Presentation, ProcessSource, Resource, ResourceList,
+    ResourceObject, SnapshotTask, TaskPhase as ResourceLegPhase, TaskState, TypedResolver, WatchEvent, WatchStart, CONVOY_LABEL,
+    TASK_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -321,6 +322,8 @@ impl Aggregator {
         let name = &convoy.metadata.name;
         let resource = self.convoy_ref(namespace, name);
         let status = convoy.status.as_ref();
+        let phase = status.map(|status| status.phase).unwrap_or_default();
+        let initializing = convoy_is_initializing(status);
         let children = status
             .and_then(|status| status.workflow_snapshot.as_ref())
             .map(|snapshot| {
@@ -336,8 +339,8 @@ impl Aggregator {
         let mut values = BTreeMap::from([
             ("name".to_string(), PanelValue::String(name.clone())),
             ("workflow_ref".to_string(), PanelValue::String(convoy.spec.workflow_ref.clone())),
-            ("phase".to_string(), PanelValue::String(convoy_phase_label(status.map(|status| status.phase).unwrap_or_default()).into())),
-            ("initializing".to_string(), PanelValue::Bool(status.map(|status| status.workflow_snapshot.is_none()).unwrap_or(true))),
+            ("phase".to_string(), PanelValue::String(convoy_phase_label(phase).into())),
+            ("initializing".to_string(), PanelValue::Bool(initializing)),
         ]);
         insert_optional_string(&mut values, "message", status.and_then(|status| status.message.clone()));
         insert_optional_timestamp(&mut values, "started_at", status.and_then(|status| status.started_at));
@@ -417,6 +420,14 @@ fn convoy_phase_label(phase: ResourceConvoyPhase) -> &'static str {
         ResourceConvoyPhase::Failed => "failed",
         ResourceConvoyPhase::Cancelled => "cancelled",
     }
+}
+
+fn convoy_phase_is_terminal(phase: ResourceConvoyPhase) -> bool {
+    matches!(phase, ResourceConvoyPhase::Completed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Cancelled)
+}
+
+fn convoy_is_initializing(status: Option<&ConvoyStatus>) -> bool {
+    status.is_none_or(|status| status.workflow_snapshot.is_none() && !convoy_phase_is_terminal(status.phase))
 }
 
 fn leg_phase_label(phase: ResourceLegPhase) -> &'static str {
@@ -513,5 +524,13 @@ mod tests {
         assert_eq!(delta.panels[0].removed.len(), 1);
         assert_eq!(delta.panels[0].removed[0].name, "feta-convoy");
         assert!(state.snapshot().await.tab.panels[0].rows.is_empty());
+    }
+
+    #[test]
+    fn terminal_convoy_without_workflow_snapshot_is_not_initializing() {
+        let status =
+            ConvoyStatus { phase: ResourceConvoyPhase::Failed, message: Some("missing input 'topic'".into()), ..Default::default() };
+
+        assert!(!convoy_is_initializing(Some(&status)));
     }
 }

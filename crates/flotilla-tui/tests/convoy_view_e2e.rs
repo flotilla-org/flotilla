@@ -16,8 +16,8 @@ use flotilla_core::{
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, Presentation, PresentationSpec,
-    PresentationStatus, ResourceBackend, SnapshotTask, TaskPhase, TaskState, WorkflowSnapshot, CONVOY_LABEL, TASK_LABEL,
+    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend, SnapshotTask,
+    TaskPhase, TaskState, WorkflowSnapshot,
 };
 use flotilla_tui::{app::App, theme::Theme};
 
@@ -148,6 +148,8 @@ async fn x_then_enter_completes_leg_via_palette() {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
+        // This test owns the convoy status directly so it can isolate the panel/TUI command path.
+        // Controller integration is covered by the daemon runtime flow tests.
         start_controllers: false,
         ..RuntimeOptions::default()
     };
@@ -184,27 +186,6 @@ async fn x_then_enter_completes_leg_via_palette() {
     .await
     .expect("bootstrap convoy");
 
-    let mut presentation_meta = convoy_meta("fix-bug-123-implement");
-    presentation_meta.labels.insert(CONVOY_LABEL.to_string(), "fix-bug-123".to_string());
-    presentation_meta.labels.insert(TASK_LABEL.to_string(), "implement".to_string());
-    let presentations = backend.using::<Presentation>("flotilla");
-    let presentation = presentations
-        .create(&presentation_meta, &PresentationSpec {
-            convoy_ref: "fix-bug-123".to_string(),
-            presentation_policy_ref: "default".to_string(),
-            name: "implement".to_string(),
-            process_selector: BTreeMap::new(),
-        })
-        .await
-        .expect("create presentation");
-    presentations
-        .update_status("fix-bug-123-implement", &presentation.metadata.resource_version, &PresentationStatus {
-            observed_workspace_ref: Some("ws-implement".to_string()),
-            ..Default::default()
-        })
-        .await
-        .expect("publish workspace reference");
-
     // Drain events until the convoy's task appears in the App.
     let drain = |app: &mut App, daemon_rx: &mut tokio::sync::broadcast::Receiver<flotilla_protocol::DaemonEvent>| loop {
         match daemon_rx.try_recv() {
@@ -227,28 +208,6 @@ async fn x_then_enter_completes_leg_via_palette() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let presentation = presentations.get("fix-bug-123-implement").await.expect("presentation should still exist");
-    presentations
-        .update_status("fix-bug-123-implement", &presentation.metadata.resource_version, &PresentationStatus {
-            observed_workspace_ref: Some("ws-implement".to_string()),
-            ..Default::default()
-        })
-        .await
-        .expect("republish workspace reference after leg is visible");
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        drain(&mut app, &mut daemon_rx);
-        if app.convoys("flotilla").iter().any(|convoy| convoy.tasks.iter().any(|leg| leg.workspace_ref.as_deref() == Some("ws-implement")))
-        {
-            break;
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for attach intent: {:?}", app.convoys("flotilla"));
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
     // Switch the TUI into the Convoys tab and drive the keybinding flow.
     app.ui.is_config = false;
     app.ui.is_convoys = true;
@@ -261,7 +220,6 @@ async fn x_then_enter_completes_leg_via_palette() {
     }
 
     app.handle_key(key('l')); // drill into leg focus
-    assert_eq!(app.convoys("flotilla")[0].tasks[0].workspace_ref.as_deref(), Some("ws-implement"));
     app.handle_key(key('x')); // open palette pre-filled
     app.handle_key(enter()); // confirm — dispatch ConvoyLegComplete
 

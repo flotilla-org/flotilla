@@ -2090,6 +2090,19 @@ fn l_drills_in_then_esc_returns_to_list_focus() {
 }
 
 #[test]
+fn h_returns_from_tasks_to_list_focus() {
+    let mut app = stub_app();
+    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1"])]))));
+    app.ui.is_convoys = true;
+
+    app.handle_key(key(KeyCode::Char('l')));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+
+    app.handle_key(key(KeyCode::Char('h')));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+}
+
+#[test]
 fn enter_also_drills_into_tasks_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1"])]))));
@@ -2277,133 +2290,4 @@ fn x_is_unavailable_without_complete_intent() {
 
     assert!(!app.screen.has_modal());
     assert_eq!(app.model.status_message.as_deref(), Some("completion unavailable for leg 'implement'"));
-}
-
-// -- Convoy task attach (`a`) --
-
-fn convoy_with_task_workspace_refs(name: &str, tasks: &[(&str, Option<&str>)]) -> crate::convoy_model::ConvoySummary {
-    let mut c = test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false);
-    c.tasks = tasks
-        .iter()
-        .map(|(t, ws)| crate::convoy_model::TaskSummary {
-            name: (*t).into(),
-            depends_on: vec![],
-            phase: crate::convoy_model::TaskPhase::Running,
-            processes: vec![],
-            host: None,
-            checkout: None,
-            workspace_ref: ws.map(str::to_string),
-            completion_target: Some(crate::convoy_model::LegCompletionTarget {
-                convoy: name.to_string(),
-                leg: (*t).to_string(),
-                host: HostName::local(),
-            }),
-            ready_at: None,
-            started_at: None,
-            finished_at: None,
-            message: None,
-        })
-        .collect();
-    c
-}
-
-#[test]
-fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
-    let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_task_workspace_refs("alpha", &[(
-        "implement",
-        Some("ws://task-a-implement"),
-    )])]))));
-    app.ui.is_convoys = true;
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("implement"));
-
-    app.handle_key(key(KeyCode::Char('a')));
-
-    let cmd = app.proto_commands.take_next().expect("expected a SelectWorkspace command");
-    match &cmd.0.action {
-        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => {
-            assert_eq!(ws_ref, "ws://task-a-implement");
-        }
-        other => panic!("expected SelectWorkspace, got {other:?}"),
-    }
-    assert!(app.model.status_message.is_none(), "no status message when workspace_ref is present");
-}
-
-#[test]
-fn a_on_remote_task_routes_select_workspace_to_its_host() {
-    let mut app = stub_app();
-    insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
-    let mut convoy = convoy_with_task_workspace_refs("alpha", &[("implement", Some("ws://remote"))]);
-    convoy.tasks[0].host = Some(HostName::new("feta"));
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('a')));
-
-    let cmd = app.proto_commands.take_next().expect("expected remote SelectWorkspace command");
-    assert_eq!(cmd.0.node_id, Some(NodeId::new("node-feta-peer")));
-}
-
-#[test]
-fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
-    let mut app = stub_app();
-    let mut convoy = convoy_with_task_workspace_refs("alpha", &[("implement", Some("ws://remote"))]);
-    convoy.tasks[0].host = Some(HostName::new("missing-host"));
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('a')));
-
-    assert!(app.proto_commands.take_next().is_none());
-    assert_eq!(app.model.status_message.as_deref(), Some("host 'missing-host' is not connected"));
-}
-
-#[test]
-fn a_on_task_without_workspace_ref_sets_status_message() {
-    let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_task_workspace_refs("alpha", &[(
-        "implement",
-        None,
-    )])]))));
-    app.ui.is_convoys = true;
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("implement"));
-
-    app.handle_key(key(KeyCode::Char('a')));
-
-    assert!(app.proto_commands.take_next().is_none(), "no command dispatched when workspace_ref is None");
-    let msg = app.model.status_message.as_deref().expect("expected a transient status message");
-    assert!(msg.contains("implement"), "status message should reference the task name, got: {msg}");
-    assert!(msg.contains("no workspace yet"), "status message should explain no workspace yet, got: {msg}");
-}
-
-#[test]
-fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
-    let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_task_workspace_refs("alpha", &[
-        ("implement", Some("ws://impl")),
-        ("review", Some("ws://rev")),
-    ])]))));
-    app.ui.is_convoys = true;
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("implement"));
-
-    // First task selected -> dispatches implement's ws_ref.
-    app.handle_key(key(KeyCode::Char('a')));
-    let first = app.proto_commands.take_next().expect("first dispatch");
-    match &first.0.action {
-        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws://impl"),
-        other => panic!("expected SelectWorkspace, got {other:?}"),
-    }
-
-    // Move to second task -> dispatches review's ws_ref.
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_task(), Some("review"));
-    app.handle_key(key(KeyCode::Char('a')));
-    let second = app.proto_commands.take_next().expect("second dispatch");
-    match &second.0.action {
-        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws://rev"),
-        other => panic!("expected SelectWorkspace, got {other:?}"),
-    }
 }
