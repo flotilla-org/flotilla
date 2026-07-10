@@ -130,7 +130,7 @@ pub struct RenderContext<'a> {
     /// Per-namespace convoy model, keyed by namespace string.
     pub namespaces: &'a crate::app::NamespaceMap,
     /// Currently selected convoy id for the Convoys tab.
-    pub convoys_selected: Option<flotilla_protocol::namespace::ConvoyId>,
+    pub convoys_selected: Option<crate::convoy_model::ConvoyId>,
     /// Currently selected task name within the selected convoy, if any.
     pub convoys_selected_task: Option<&'a str>,
     /// Which pane (list / tasks) currently has focus on the Convoys tab.
@@ -140,7 +140,7 @@ pub struct RenderContext<'a> {
     /// Pre-filtered convoy list for the Convoys tab.
     /// Produced once by `App` via `visible_convoys("flotilla")` so the filter
     /// lives in a single place and `screen.rs` can consume it directly.
-    pub convoys: Vec<&'a flotilla_protocol::namespace::ConvoySummary>,
+    pub convoys: Vec<&'a crate::convoy_model::ConvoySummary>,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.

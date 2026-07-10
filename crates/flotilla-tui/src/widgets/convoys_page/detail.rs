@@ -1,6 +1,5 @@
 //! Right-pane convoy detail widget.
 
-use flotilla_protocol::namespace::ConvoySummary;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -11,6 +10,7 @@ use ratatui::{
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
 use super::glyphs::{convoy_glyph, task_glyph};
+use crate::convoy_model::ConvoySummary;
 
 pub struct ConvoyDetail<'a> {
     pub convoy: &'a ConvoySummary,
@@ -37,10 +37,22 @@ impl<'a> ConvoyDetail<'a> {
         // Body: task tree OR initializing placeholder
         let body_block = Block::default().borders(Borders::ALL).border_style(border_style).title(" Tasks ");
         let body_area = chunks[1];
-        if self.convoy.initializing {
-            let p = Paragraph::new("initializing…").block(body_block);
-            f.render_widget(p, body_area);
+        let body_inner = body_block.inner(body_area);
+        f.render_widget(body_block, body_area);
+        if self.convoy.initializing && !self.convoy.phase.is_terminal() {
+            f.render_widget(Paragraph::new("initializing…"), body_inner);
             return;
+        }
+
+        let (message_area, tree_area) = if self.convoy.message.is_some() {
+            let areas =
+                Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(0)]).split(body_inner);
+            (Some(areas[0]), areas[1])
+        } else {
+            (None, body_inner)
+        };
+        if let (Some(area), Some(message)) = (message_area, self.convoy.message.as_deref()) {
+            f.render_widget(Paragraph::new(format!("{}: {message}", self.convoy.phase.label())), area);
         }
 
         let items: Vec<TreeItem<String>> = self
@@ -62,20 +74,17 @@ impl<'a> ConvoyDetail<'a> {
         if let Some(name) = self.selected_task {
             state.select(vec![name.to_string()]);
         }
-        let tree = Tree::new(&items)
-            .expect("unique task names")
-            .block(body_block)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        f.render_stateful_widget(tree, body_area, &mut state);
+        let tree = Tree::new(&items).expect("unique task names").highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        f.render_stateful_widget(tree, tree_area, &mut state);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::namespace::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, TaskPhase, TaskSummary};
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
+    use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, TaskPhase, TaskSummary};
 
     fn multi_task_convoy() -> ConvoySummary {
         ConvoySummary {
@@ -95,6 +104,7 @@ mod tests {
                     host: None,
                     checkout: None,
                     workspace_ref: None,
+                    completion_target: None,
                     ready_at: None,
                     started_at: None,
                     finished_at: None,
@@ -108,6 +118,7 @@ mod tests {
                     host: None,
                     checkout: None,
                     workspace_ref: None,
+                    completion_target: None,
                     ready_at: None,
                     started_at: None,
                     finished_at: None,
@@ -161,5 +172,25 @@ mod tests {
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn terminal_failure_is_not_masked_by_initializing_placeholder() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("create terminal");
+        let mut convoy = multi_task_convoy();
+        convoy.phase = ConvoyPhase::Failed;
+        convoy.message = Some("missing input 'topic'".into());
+        convoy.initializing = true;
+        convoy.tasks.clear();
+
+        terminal
+            .draw(|f| {
+                ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
+            })
+            .expect("render convoy detail");
+
+        let rendered: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+        assert!(!rendered.contains("initializing"), "terminal failure was masked: {rendered}");
+        assert!(rendered.contains("missing input 'topic'"), "failure message was not rendered: {rendered}");
     }
 }

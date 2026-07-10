@@ -50,6 +50,7 @@ pub struct CommandPaletteWidget {
     /// The work item that was selected when the contextual palette was opened.
     /// Used by tui_dispatch for SubjectHost/ProviderHost resolution.
     source_item: Option<WorkItem>,
+    target_node_id: Option<NodeId>,
 }
 
 impl Default for CommandPaletteWidget {
@@ -60,18 +61,43 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self { input: Input::default(), entries: palette::all_entries(), selected: 0, scroll_top: 0, source_item: None }
+        Self {
+            input: Input::default(),
+            entries: palette::all_entries(),
+            selected: 0,
+            scroll_top: 0,
+            source_item: None,
+            target_node_id: None,
+        }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, entries: palette::all_entries(), selected, scroll_top, source_item: None }
+        Self { input, entries: palette::all_entries(), selected, scroll_top, source_item: None, target_node_id: None }
     }
 
     /// Create a palette widget with a pre-filled input string (cursor at end)
     /// and the work item that was selected when the palette was opened.
     pub fn with_prefill(text: impl AsRef<str>, item: Option<WorkItem>) -> Self {
-        Self { input: Input::from(text.as_ref()), entries: palette::all_entries(), selected: 0, scroll_top: 0, source_item: item }
+        Self {
+            input: Input::from(text.as_ref()),
+            entries: palette::all_entries(),
+            selected: 0,
+            scroll_top: 0,
+            source_item: item,
+            target_node_id: None,
+        }
+    }
+
+    pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
+        Self {
+            input: Input::from(text.as_ref()),
+            entries: palette::all_entries(),
+            selected: 0,
+            scroll_top: 0,
+            source_item: None,
+            target_node_id,
+        }
     }
 
     /// Current input text (for tests / introspection).
@@ -198,7 +224,10 @@ impl CommandPaletteWidget {
             &ctx.my_node_id,
             ctx.active_repo_is_remote_only,
         ) {
-            Ok(command) => {
+            Ok(mut command) => {
+                if command.node_id.is_none() {
+                    command.node_id.clone_from(&self.target_node_id);
+                }
                 ctx.commands.push(command);
             }
             Err(err) => {

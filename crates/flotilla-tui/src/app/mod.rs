@@ -11,7 +11,7 @@ pub(crate) mod test_support;
 pub mod ui_state;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -21,6 +21,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
+    panel::{IntentTarget, PanelRow, PanelValue, ResourceRef, Timestamp},
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
     ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
     WorkItemIdentity,
@@ -263,10 +264,10 @@ impl TuiModel {
 pub type NamespaceMap = HashMap<String, NamespaceModel>;
 
 /// Per-namespace convoy state tracked by the TUI. Populated from
-/// `DaemonEvent::NamespaceSnapshot` and updated by `DaemonEvent::NamespaceDelta`.
+/// `DaemonEvent::PanelSnapshot` and updated by `DaemonEvent::PanelDelta`.
 #[derive(Default)]
 pub struct NamespaceModel {
-    pub convoys: IndexMap<flotilla_protocol::namespace::ConvoyId, flotilla_protocol::namespace::ConvoySummary>,
+    pub convoys: IndexMap<crate::convoy_model::ConvoyId, crate::convoy_model::ConvoySummary>,
     pub last_seq: u64,
 }
 
@@ -283,7 +284,7 @@ pub enum ConvoysFocus {
 /// UI state for the Convoys tab.
 #[derive(Default)]
 pub struct ConvoysUiState {
-    pub selected: Option<flotilla_protocol::namespace::ConvoyId>,
+    pub selected: Option<crate::convoy_model::ConvoyId>,
     /// Name of the selected task within `selected`. Cleared when the convoy
     /// selection changes; clamped against the convoy's task list on every
     /// snapshot/delta apply.
@@ -346,13 +347,139 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
 /// field-level borrows rather than going through `App::visible_convoys` (which
 /// borrows all of `self`).
 pub fn filter_convoys_by_str<'a>(
-    convoys: impl IntoIterator<Item = &'a flotilla_protocol::namespace::ConvoySummary>,
+    convoys: impl IntoIterator<Item = &'a crate::convoy_model::ConvoySummary>,
     filter: &str,
-) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> {
+) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> {
     let f = filter.to_lowercase();
     convoys.into_iter().filter(move |c| {
         f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
     })
+}
+
+fn panel_convoy_id(resource: &ResourceRef) -> crate::convoy_model::ConvoyId {
+    let name = match &resource.host {
+        Some(host) => format!("{}@{}", resource.name, host.as_str()),
+        None => resource.name.clone(),
+    };
+    crate::convoy_model::ConvoyId::new(&resource.namespace, name)
+}
+
+fn panel_row_to_convoy(row: &PanelRow) -> Option<crate::convoy_model::ConvoySummary> {
+    if row.resource.kind != "Convoy" || row.resource.subresource.is_some() {
+        return None;
+    }
+    let name = panel_string(&row.values, "name")?;
+    let tasks = row
+        .children
+        .iter()
+        .filter_map(|child| {
+            let name = panel_string(&child.values, "name")?;
+            let vessel_target = child.intents.iter().find_map(|intent| match &intent.target {
+                IntentTarget::Vessel { attach_ref, host } => Some((attach_ref.clone(), host.clone())),
+                IntentTarget::Leg { .. } => None,
+            });
+            let completion_target = child.intents.iter().find_map(|intent| match &intent.target {
+                IntentTarget::Leg { convoy, leg, host, .. } if intent.intent_id == "complete-leg" => {
+                    Some(crate::convoy_model::LegCompletionTarget { convoy: convoy.clone(), leg: leg.clone(), host: host.clone() })
+                }
+                IntentTarget::Leg { .. } | IntentTarget::Vessel { .. } => None,
+            });
+            let workspace_ref = vessel_target.as_ref().map(|(attach_ref, _)| attach_ref.clone());
+            let intent_host = vessel_target.map(|(_, host)| host);
+            Some(crate::convoy_model::TaskSummary {
+                name: name.to_string(),
+                depends_on: child
+                    .depends_on
+                    .iter()
+                    .filter_map(|reference| reference.subresource.as_deref()?.strip_prefix("legs/").map(str::to_string))
+                    .collect(),
+                phase: task_phase(panel_string(&child.values, "phase")?),
+                processes: panel_crew(&child.values),
+                host: intent_host.or_else(|| panel_host(&child.values, "host")).or_else(|| child.resource.host.clone()),
+                checkout: panel_checkout(&child.values, "checkout"),
+                workspace_ref,
+                completion_target,
+                ready_at: panel_timestamp(&child.values, "ready_at"),
+                started_at: panel_timestamp(&child.values, "started_at"),
+                finished_at: panel_timestamp(&child.values, "finished_at"),
+                message: panel_string(&child.values, "message").map(str::to_string),
+            })
+        })
+        .collect();
+    Some(crate::convoy_model::ConvoySummary {
+        id: panel_convoy_id(&row.resource),
+        namespace: row.resource.namespace.clone(),
+        name: name.to_string(),
+        workflow_ref: panel_string(&row.values, "workflow_ref").unwrap_or_default().to_string(),
+        phase: convoy_phase(panel_string(&row.values, "phase")?),
+        message: panel_string(&row.values, "message").map(str::to_string),
+        repo_hint: panel_string(&row.values, "repo").map(|repo| flotilla_protocol::RepoKey(repo.to_string())),
+        tasks,
+        started_at: panel_timestamp(&row.values, "started_at"),
+        finished_at: panel_timestamp(&row.values, "finished_at"),
+        observed_workflow_ref: panel_string(&row.values, "observed_workflow_ref").map(str::to_string),
+        initializing: row.values.get("initializing").and_then(PanelValue::as_bool).unwrap_or(false),
+    })
+}
+
+fn panel_string<'a>(values: &'a BTreeMap<String, PanelValue>, key: &str) -> Option<&'a str> {
+    values.get(key).and_then(PanelValue::as_str)
+}
+
+fn panel_timestamp(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<Timestamp> {
+    match values.get(key) {
+        Some(PanelValue::Timestamp(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn panel_host(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<HostName> {
+    match values.get(key) {
+        Some(PanelValue::Host(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn panel_checkout(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<flotilla_protocol::CheckoutRef> {
+    match values.get(key) {
+        Some(PanelValue::Checkout(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn panel_crew(values: &BTreeMap<String, PanelValue>) -> Vec<crate::convoy_model::ProcessSummary> {
+    let Some(PanelValue::List(crew)) = values.get("crew") else { return Vec::new() };
+    crew.iter()
+        .filter_map(|member| {
+            let PanelValue::Map(member) = member else { return None };
+            Some(crate::convoy_model::ProcessSummary {
+                role: panel_string(member, "role")?.to_string(),
+                command_preview: panel_string(member, "command_preview").unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn task_phase(phase: &str) -> crate::convoy_model::TaskPhase {
+    match phase {
+        "ready" => crate::convoy_model::TaskPhase::Ready,
+        "launching" => crate::convoy_model::TaskPhase::Launching,
+        "running" => crate::convoy_model::TaskPhase::Running,
+        "completed" => crate::convoy_model::TaskPhase::Completed,
+        "failed" => crate::convoy_model::TaskPhase::Failed,
+        "cancelled" => crate::convoy_model::TaskPhase::Cancelled,
+        _ => crate::convoy_model::TaskPhase::Pending,
+    }
+}
+
+fn convoy_phase(phase: &str) -> crate::convoy_model::ConvoyPhase {
+    match phase {
+        "active" => crate::convoy_model::ConvoyPhase::Active,
+        "completed" => crate::convoy_model::ConvoyPhase::Completed,
+        "failed" => crate::convoy_model::ConvoyPhase::Failed,
+        "cancelled" => crate::convoy_model::ConvoyPhase::Cancelled,
+        _ => crate::convoy_model::ConvoyPhase::Pending,
+    }
 }
 
 /// Log provider errors and format them into a status message.
@@ -401,7 +528,7 @@ pub struct App {
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
     /// Per-namespace convoy state. Keyed by namespace string. Populated from
-    /// `DaemonEvent::NamespaceSnapshot` / `NamespaceDelta`.
+    /// `DaemonEvent::PanelSnapshot` / `PanelDelta`.
     pub namespaces: HashMap<String, NamespaceModel>,
     /// Convoys tab UI state (selection, filter).
     pub convoys_ui: ConvoysUiState,
@@ -1172,27 +1299,53 @@ impl App {
                     self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }
             }
-            DaemonEvent::NamespaceSnapshot(snap) => {
-                let namespace = snap.namespace.clone();
-                let entry = self.namespaces.entry(namespace.clone()).or_default();
-                entry.convoys.clear();
-                for convoy in snap.convoys.iter() {
-                    entry.convoys.insert(convoy.id.clone(), convoy.clone());
+            DaemonEvent::PanelSnapshot(snapshot) => {
+                let Some(panel) = snapshot.tab.panels.iter().find(|panel| panel.id.as_str() == "convoys") else { return };
+                let mut touched: Vec<_> = self.namespaces.keys().cloned().collect();
+                if touched.is_empty() {
+                    touched.push("flotilla".to_string());
                 }
-                entry.last_seq = snap.seq;
-                self.refresh_convoy_selection(&namespace);
+                self.namespaces.clear();
+                for row in &panel.rows {
+                    let Some(convoy) = panel_row_to_convoy(row) else { continue };
+                    let namespace = convoy.namespace.clone();
+                    let entry = self.namespaces.entry(namespace.clone()).or_default();
+                    entry.convoys.insert(convoy.id.clone(), convoy);
+                    entry.last_seq = snapshot.seq;
+                    if !touched.contains(&namespace) {
+                        touched.push(namespace);
+                    }
+                }
+                for namespace in touched {
+                    self.refresh_convoy_selection(&namespace);
+                }
             }
-            DaemonEvent::NamespaceDelta(delta) => {
-                let namespace = delta.namespace.clone();
-                let entry = self.namespaces.entry(namespace.clone()).or_default();
-                for convoy in delta.changed.iter() {
-                    entry.convoys.insert(convoy.id.clone(), convoy.clone());
+            DaemonEvent::PanelDelta(delta) => {
+                let Some(panel) = delta.panels.iter().find(|panel| panel.panel_id.as_str() == "convoys") else { return };
+                let mut touched = Vec::new();
+                for row in &panel.changed {
+                    let Some(convoy) = panel_row_to_convoy(row) else { continue };
+                    let namespace = convoy.namespace.clone();
+                    let entry = self.namespaces.entry(namespace.clone()).or_default();
+                    entry.convoys.insert(convoy.id.clone(), convoy);
+                    entry.last_seq = delta.seq;
+                    if !touched.contains(&namespace) {
+                        touched.push(namespace);
+                    }
                 }
-                for id in delta.removed.iter() {
-                    entry.convoys.shift_remove(id);
+                for removed in &panel.removed {
+                    let namespace = removed.namespace.clone();
+                    if let Some(entry) = self.namespaces.get_mut(&namespace) {
+                        entry.convoys.shift_remove(&panel_convoy_id(removed));
+                        entry.last_seq = delta.seq;
+                    }
+                    if !touched.contains(&namespace) {
+                        touched.push(namespace);
+                    }
                 }
-                entry.last_seq = delta.seq;
-                self.refresh_convoy_selection(&namespace);
+                for namespace in touched {
+                    self.refresh_convoy_selection(&namespace);
+                }
             }
         }
     }
@@ -1438,12 +1591,12 @@ impl App {
     }
 
     /// Returns convoys for the given namespace in insertion order.
-    pub fn convoys(&self, namespace: &str) -> Vec<&flotilla_protocol::namespace::ConvoySummary> {
+    pub fn convoys(&self, namespace: &str) -> Vec<&crate::convoy_model::ConvoySummary> {
         self.namespaces.get(namespace).map(|m| m.convoys.values().collect()).unwrap_or_default()
     }
 
     /// Returns the selected convoy id for the Convoys tab, if any.
-    pub fn selected_convoy_id(&self) -> Option<&flotilla_protocol::namespace::ConvoyId> {
+    pub fn selected_convoy_id(&self) -> Option<&crate::convoy_model::ConvoyId> {
         self.convoys_ui.selected.as_ref()
     }
 
@@ -1510,13 +1663,13 @@ impl App {
         }
     }
 
-    fn selected_convoy_summary<'a>(&'a self, namespace: &str) -> Option<&'a flotilla_protocol::namespace::ConvoySummary> {
+    fn selected_convoy_summary<'a>(&'a self, namespace: &str) -> Option<&'a crate::convoy_model::ConvoySummary> {
         let id = self.convoys_ui.selected.as_ref()?;
         self.namespaces.get(namespace)?.convoys.get(id)
     }
 
     /// Switch focus to the task tree, defaulting to the first task if none selected.
-    /// No-op when no convoy is selected or the convoy has no tasks.
+    /// No-op when no convoy is selected or the convoy has no legs.
     pub fn enter_convoy_tasks_focus(&mut self, namespace: &str) {
         let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
         if convoy.tasks.is_empty() {
@@ -1535,7 +1688,7 @@ impl App {
     }
 
     /// Move task selection within the selected convoy by `delta` (positive = down).
-    /// Clamps at both ends. No-op when no tasks are visible.
+    /// Clamps at both ends. No-op when no legs are visible.
     pub fn convoy_tasks_select_delta(&mut self, namespace: &str, delta: isize) {
         let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
         if convoy.tasks.is_empty() {
@@ -1557,7 +1710,7 @@ impl App {
         // support will need a namespace scoping concept on ConvoysUiState —
         // see issue #589 (arbitrary tabs).
         let prior_selected = self.convoys_ui.selected.clone();
-        let ids: Vec<flotilla_protocol::namespace::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
+        let ids: Vec<crate::convoy_model::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
         if ids.is_empty() {
             self.convoys_ui.selected = None;
             self.reset_convoy_task_state();
@@ -1582,7 +1735,7 @@ impl App {
 
     /// Iterate over convoys in the given namespace, filtered by the active
     /// filter string (case-insensitive substring match on name and repo_hint).
-    pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a flotilla_protocol::namespace::ConvoySummary> + 'a {
+    pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> + 'a {
         filter_convoys_by_str(self.convoys(namespace), &self.convoys_ui.filter)
     }
 

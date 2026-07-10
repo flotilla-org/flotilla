@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    namespace::NamespaceSnapshot,
     snapshot::{ProviderError, WorkItem},
     EnvironmentInfo, HostName, HostSummary, NodeInfo, PeerConnectionState,
 };
@@ -139,7 +138,7 @@ pub struct FleetReplicaSnapshot {
     pub generation: Option<String>,
     pub rows: Vec<FleetListRow>,
     #[serde(default)]
-    pub namespaces: Vec<NamespaceSnapshot>,
+    pub panels: Vec<crate::panel::PanelSnapshot>,
 }
 
 // --- host / topology ---

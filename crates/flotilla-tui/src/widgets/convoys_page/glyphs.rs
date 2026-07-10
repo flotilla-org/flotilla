@@ -1,7 +1,8 @@
-//! Status glyphs + colour mapping for convoy / task phases.
+//! Status glyphs + colour mapping for convoy / leg phases.
 
-use flotilla_protocol::namespace::{ConvoyPhase, TaskPhase};
 use ratatui::style::{Color, Modifier, Style};
+
+use crate::convoy_model::{ConvoyPhase, TaskPhase};
 
 pub struct Glyph {
     pub symbol: &'static str,

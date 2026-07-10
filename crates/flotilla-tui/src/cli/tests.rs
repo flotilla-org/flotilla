@@ -929,60 +929,66 @@ mod query_event_formatting {
     }
 }
 
-mod namespace_event_formatting {
+mod panel_event_formatting {
     use flotilla_protocol::{
-        namespace::{NamespaceDelta, NamespaceSnapshot},
+        panel::{PanelDelta, PanelRowsDelta, PanelSnapshot, TabView},
         DaemonEvent,
     };
 
     use crate::cli::format_event_human;
 
     #[test]
-    fn namespace_snapshot_formatting() {
-        let snap = NamespaceSnapshot { seq: 7, namespace: "flotilla".into(), convoys: vec![] };
-        let event = DaemonEvent::NamespaceSnapshot(Box::new(snap));
+    fn panel_snapshot_formatting() {
+        let snap = PanelSnapshot { seq: 7, tab: TabView { id: "convoys".into(), title: "Convoys".into(), panels: vec![] } };
+        let event = DaemonEvent::PanelSnapshot(Box::new(snap));
         let line = format_event_human(&event);
-        assert!(line.contains("[namespace]"), "should have namespace tag");
-        assert!(line.contains("flotilla"), "should include namespace name");
+        assert!(line.contains("[panel]"), "should have panel tag");
+        assert!(line.contains("convoys"), "should include tab id");
         assert!(line.contains("seq 7"), "should include seq number");
-        assert!(line.contains("0 convoys"), "should count convoys");
+        assert!(line.contains("0 rows"), "should count rows");
     }
 
     #[test]
-    fn namespace_delta_formatting() {
-        use flotilla_protocol::namespace::ConvoyId;
-        let delta = NamespaceDelta {
+    fn panel_delta_formatting() {
+        use flotilla_protocol::panel::{PanelId, ResourceRef};
+        let delta = PanelDelta {
             seq: 12,
-            namespace: "flotilla".into(),
-            changed: vec![],
-            removed: vec![ConvoyId::new("flotilla", "old-convoy")],
+            tab_id: "convoys".into(),
+            panels: vec![PanelRowsDelta {
+                panel_id: PanelId::new("convoys"),
+                changed: vec![],
+                removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
+            }],
         };
-        let event = DaemonEvent::NamespaceDelta(Box::new(delta));
+        let event = DaemonEvent::PanelDelta(Box::new(delta));
         let line = format_event_human(&event);
-        assert!(line.contains("[namespace]"), "should have namespace tag");
-        assert!(line.contains("flotilla"), "should include namespace name");
+        assert!(line.contains("[panel]"), "should have panel tag");
+        assert!(line.contains("convoys"), "should include tab id");
         assert!(line.contains("seq 12") || line.contains("12"), "should include seq number");
         assert!(line.contains("0 changed"), "should show changed count");
         assert!(line.contains("1 removed"), "should show removed count");
     }
 }
 
-mod watch_dedupe_namespace {
+mod watch_dedupe_panel {
     use std::collections::HashMap;
 
     use flotilla_protocol::{
-        namespace::{NamespaceDelta, NamespaceSnapshot},
+        panel::{PanelDelta, PanelSnapshot, TabView},
         DaemonEvent, StreamKey,
     };
 
     use crate::cli::event_stream_seq;
 
-    fn ns_snapshot(namespace: &str, seq: u64) -> DaemonEvent {
-        DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot { seq, namespace: namespace.into(), convoys: vec![] }))
+    fn panel_snapshot(tab: &str, seq: u64) -> DaemonEvent {
+        DaemonEvent::PanelSnapshot(Box::new(PanelSnapshot {
+            seq,
+            tab: TabView { id: tab.into(), title: "Convoys".into(), panels: vec![] },
+        }))
     }
 
-    fn ns_delta(namespace: &str, seq: u64) -> DaemonEvent {
-        DaemonEvent::NamespaceDelta(Box::new(NamespaceDelta { seq, namespace: namespace.into(), changed: vec![], removed: vec![] }))
+    fn panel_delta(tab: &str, seq: u64) -> DaemonEvent {
+        DaemonEvent::PanelDelta(Box::new(PanelDelta { seq, tab_id: tab.into(), panels: vec![] }))
     }
 
     /// Simulate the run_watch dedup logic: build replay_seqs from a slice of
@@ -1008,34 +1014,34 @@ mod watch_dedupe_namespace {
     }
 
     #[test]
-    fn event_stream_seq_returns_namespace_key_for_snapshot() {
-        let event = ns_snapshot("flotilla", 5);
+    fn event_stream_seq_returns_panel_key_for_snapshot() {
+        let event = panel_snapshot("convoys", 5);
         let result = event_stream_seq(&event);
-        assert_eq!(result, Some((StreamKey::Namespace { name: "flotilla".into() }, 5)));
+        assert_eq!(result, Some((StreamKey::Panel { tab: "convoys".into() }, 5)));
     }
 
     #[test]
-    fn event_stream_seq_returns_namespace_key_for_delta() {
-        let event = ns_delta("flotilla", 9);
+    fn event_stream_seq_returns_panel_key_for_delta() {
+        let event = panel_delta("convoys", 9);
         let result = event_stream_seq(&event);
-        assert_eq!(result, Some((StreamKey::Namespace { name: "flotilla".into() }, 9)));
+        assert_eq!(result, Some((StreamKey::Panel { tab: "convoys".into() }, 9)));
     }
 
     #[test]
-    fn duplicate_seq_namespace_delta_is_suppressed() {
+    fn duplicate_seq_panel_delta_is_suppressed() {
         // A delta arrives in replay at seq=5; the broadcast channel then delivers
         // the same event again (seq=5). The live duplicate must be suppressed.
-        let replay = [ns_delta("flotilla", 5)];
-        let live = [ns_delta("flotilla", 5)];
+        let replay = [panel_delta("convoys", 5)];
+        let live = [panel_delta("convoys", 5)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert!(printed.is_empty(), "duplicate-seq delta should be suppressed by dedup, but {} event(s) were printed", printed.len());
     }
 
     #[test]
-    fn newer_seq_namespace_delta_is_printed() {
+    fn newer_seq_panel_delta_is_printed() {
         // Replay has seq=5; a genuinely new delta (seq=6) must pass through.
-        let replay = [ns_delta("flotilla", 5)];
-        let live = [ns_delta("flotilla", 6)];
+        let replay = [panel_delta("convoys", 5)];
+        let live = [panel_delta("convoys", 6)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert_eq!(printed.len(), 1, "new-seq delta should pass dedup filter");
     }
@@ -1044,18 +1050,18 @@ mod watch_dedupe_namespace {
     fn snapshot_replay_suppresses_same_seq_live_snapshot() {
         // Replay delivers a full namespace snapshot at seq=3; the broadcast
         // buffer then delivers that same snapshot — must be suppressed.
-        let replay = [ns_snapshot("flotilla", 3)];
-        let live = [ns_snapshot("flotilla", 3)];
+        let replay = [panel_snapshot("convoys", 3)];
+        let live = [panel_snapshot("convoys", 3)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert!(printed.is_empty(), "duplicate-seq snapshot should be suppressed");
     }
 
     #[test]
-    fn different_namespace_events_are_not_cross_suppressed() {
+    fn different_panel_events_are_not_cross_suppressed() {
         // Replay has "flotilla" at seq=5; a live delta for "other" at seq=5
         // should still be printed (different StreamKey).
-        let replay = [ns_delta("flotilla", 5)];
-        let live = [ns_delta("other", 5)];
+        let replay = [panel_delta("convoys", 5)];
+        let live = [panel_delta("checkouts", 5)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert_eq!(printed.len(), 1, "events for different namespaces should not suppress each other");
     }
@@ -1063,8 +1069,8 @@ mod watch_dedupe_namespace {
     #[test]
     fn older_seq_live_event_is_suppressed() {
         // Replay has seq=10; if a stale live event with seq=8 arrives, suppress it.
-        let replay = [ns_snapshot("flotilla", 10)];
-        let live = [ns_delta("flotilla", 8)];
+        let replay = [panel_snapshot("convoys", 10)];
+        let live = [panel_delta("convoys", 8)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert!(printed.is_empty(), "stale live event (seq < replay_seq) should be suppressed");
     }

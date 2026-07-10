@@ -1,6 +1,6 @@
-//! Integration test: ConvoyProjection wired into DaemonRuntime.
+//! Integration test: Aggregator wired into DaemonRuntime.
 //!
-//! Verifies that creating a Convoy resource causes a NamespaceSnapshot event to
+//! Verifies that creating a Convoy resource causes a PanelSnapshot event to
 //! reach subscribed clients through the daemon's broadcast event bus.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
@@ -9,7 +9,7 @@ use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{DaemonEvent, HostName, StreamKey};
+use flotilla_protocol::{panel::PanelValue, DaemonEvent, HostName, StreamKey};
 use flotilla_resources::{ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -42,7 +42,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
 }
 
 #[tokio::test]
-async fn convoy_projection_emits_namespace_events() {
+async fn aggregator_emits_panel_events() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
@@ -69,16 +69,16 @@ async fn convoy_projection_emits_namespace_events() {
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
 
-    // Create a Convoy resource — the projection should pick it up via the watch
-    // stream and emit a NamespaceSnapshot for "flotilla".
+    // Create a Convoy resource — the Aggregator should pick it up via the watch
+    // stream and emit a PanelSnapshot for the default convoy tab.
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
     convoys.create(&convoy_meta("test-convoy-1"), &convoy_spec("my-workflow")).await.expect("create convoy");
 
-    // Wait for a NamespaceSnapshot for the "flotilla" namespace.
+    // Wait for the convoy panel snapshot.
     let found = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::NamespaceSnapshot(snap)) if snap.namespace == "flotilla" => {
+                Ok(DaemonEvent::PanelSnapshot(snap)) if snap.tab.id == "convoys" => {
                     return snap;
                 }
                 Ok(_) => continue,
@@ -87,21 +87,21 @@ async fn convoy_projection_emits_namespace_events() {
         }
     })
     .await
-    .expect("timed out waiting for NamespaceSnapshot for 'flotilla' namespace");
+    .expect("timed out waiting for PanelSnapshot for convoy tab");
 
-    assert_eq!(found.namespace, "flotilla");
-    assert_eq!(found.convoys.len(), 1, "expected exactly one convoy in the snapshot");
-    assert_eq!(found.convoys[0].name, "test-convoy-1");
+    let rows = &found.tab.panels[0].rows;
+    assert_eq!(rows.len(), 1, "expected exactly one convoy in the snapshot");
+    assert_eq!(rows[0].values.get("name").and_then(PanelValue::as_str), Some("test-convoy-1"));
 }
 
 /// Verifies the causal chain:
-///   1. Create convoy A  → NamespaceSnapshot arrives; record cursor seq.
-///   2. Create convoy B  → NamespaceDelta arrives.
+///   1. Create convoy A  → PanelSnapshot arrives; record cursor seq.
+///   2. Create convoy B  → PanelDelta arrives.
 ///   3. ReplaySince with the cursor from step 1 → response must include at
-///      least one NamespaceSnapshot or NamespaceDelta for namespace "flotilla"
+///      least one PanelSnapshot or PanelDelta for the convoy tab
 ///      that reflects convoy B.
 #[tokio::test]
-async fn replay_since_returns_namespace_events_after_seq() {
+async fn replay_since_returns_panel_events_after_seq() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
 
@@ -129,54 +129,53 @@ async fn replay_since_returns_namespace_events_after_seq() {
 
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
 
-    // Step 1: Create convoy A and wait for the NamespaceSnapshot.
+    // Step 1: Create convoy A and wait for the PanelSnapshot.
     convoys.create(&convoy_meta("convoy-a"), &convoy_spec("wf-a")).await.expect("create convoy-a");
 
     let snapshot_after_a = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::NamespaceSnapshot(snap)) if snap.namespace == "flotilla" => return snap,
+                Ok(DaemonEvent::PanelSnapshot(snap)) if snap.tab.id == "convoys" => return snap,
                 Ok(_) => continue,
                 Err(err) => panic!("recv error waiting for snapshot: {err}"),
             }
         }
     })
     .await
-    .expect("timed out waiting for NamespaceSnapshot after convoy-a");
+    .expect("timed out waiting for PanelSnapshot after convoy-a");
 
     let cursor_seq = snapshot_after_a.seq;
     assert!(cursor_seq > 0, "snapshot seq must be positive");
 
-    // Step 2: Create convoy B and wait for the NamespaceDelta.
+    // Step 2: Create convoy B and wait for the PanelDelta.
     convoys.create(&convoy_meta("convoy-b"), &convoy_spec("wf-b")).await.expect("create convoy-b");
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::NamespaceDelta(delta)) if delta.namespace == "flotilla" => return delta,
+                Ok(DaemonEvent::PanelDelta(delta)) if delta.tab_id == "convoys" => return delta,
                 Ok(_) => continue,
                 Err(err) => panic!("recv error waiting for delta: {err}"),
             }
         }
     })
     .await
-    .expect("timed out waiting for NamespaceDelta after convoy-b");
+    .expect("timed out waiting for PanelDelta after convoy-b");
 
     // Step 3: ReplaySince with the cursor from step 1.
-    let cursors = std::collections::HashMap::from([(StreamKey::Namespace { name: "flotilla".to_string() }, cursor_seq)]);
+    let cursors = std::collections::HashMap::from([(StreamKey::Panel { tab: "convoys".to_string() }, cursor_seq)]);
     let replay_events = daemon.replay_since(&cursors).await.expect("replay_since");
 
-    // The replay must include a NamespaceSnapshot for "flotilla" that contains convoy-b
+    // The replay must include a PanelSnapshot for the convoy tab that contains convoy-b
     // (because the seq advanced past cursor_seq, so the full snapshot is re-sent).
-    let namespace_snap = replay_events.iter().find_map(|e| match e {
-        DaemonEvent::NamespaceSnapshot(snap) if snap.namespace == "flotilla" => Some(snap),
+    let panel_snap = replay_events.iter().find_map(|e| match e {
+        DaemonEvent::PanelSnapshot(snap) if snap.tab.id == "convoys" => Some(snap),
         _ => None,
     });
 
-    let snap = namespace_snap.expect("expected a NamespaceSnapshot for 'flotilla' in replay response");
+    let snap = panel_snap.expect("expected a PanelSnapshot for convoy tab in replay response");
     assert!(
-        snap.convoys.iter().any(|c| c.name == "convoy-b"),
-        "replay snapshot for 'flotilla' must contain convoy-b; got: {:?}",
-        snap.convoys.iter().map(|c| &c.name).collect::<Vec<_>>()
+        snap.tab.panels[0].rows.iter().any(|row| row.values.get("name").and_then(PanelValue::as_str) == Some("convoy-b")),
+        "replay snapshot must contain convoy-b"
     );
 }

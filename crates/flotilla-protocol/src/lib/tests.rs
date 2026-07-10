@@ -543,25 +543,68 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
 }
 
 #[test]
-fn stream_key_namespace_round_trips() {
-    let key = StreamKey::Namespace { name: "flotilla".into() };
-    let encoded = serde_json::to_string(&key).unwrap();
-    let decoded: StreamKey = serde_json::from_str(&encoded).unwrap();
-    assert_eq!(decoded, key);
-}
+fn panel_stream_round_trips_a_resource_backed_leg_dag() {
+    use std::collections::BTreeMap;
 
-#[test]
-fn daemon_event_namespace_snapshot_round_trips() {
-    use crate::namespace::NamespaceSnapshot;
+    use crate::panel::{
+        IntentDefinition, IntentKind, PanelColumn, PanelField, PanelId, PanelRow, PanelScope, PanelSnapshot, PanelSource, PanelValue,
+        PanelView, ResourceRef, RowIntent, TabView,
+    };
 
-    let event = DaemonEvent::NamespaceSnapshot(Box::new(NamespaceSnapshot { seq: 1, namespace: "flotilla".into(), convoys: vec![] }));
-    let encoded = serde_json::to_string(&event).unwrap();
-    let decoded: DaemonEvent = serde_json::from_str(&encoded).unwrap();
-    match decoded {
-        DaemonEvent::NamespaceSnapshot(snap) => {
-            assert_eq!(snap.namespace, "flotilla");
-            assert_eq!(snap.seq, 1);
-        }
-        other => panic!("expected NamespaceSnapshot, got {other:?}"),
-    }
+    let convoy_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "fix-bug-123");
+    let implement_ref = convoy_ref.subresource("legs/implement");
+    let review_ref = convoy_ref.subresource("legs/review");
+    let attach = IntentDefinition::new("attach", "Attach", IntentKind::Attach);
+    let complete = IntentDefinition::new("complete-leg", "Complete leg", IntentKind::CompleteLeg);
+    let panel = PanelView {
+        id: PanelId::new("convoys"),
+        title: "Convoys".into(),
+        source: PanelSource::resource("flotilla.work/v1", "Convoy"),
+        scope: PanelScope::Fleet,
+        columns: vec![PanelColumn::new("name", "Convoy", PanelField::Name), PanelColumn::new("phase", "State", PanelField::Phase)],
+        intents: vec![attach.clone(), complete.clone()],
+        rows: vec![PanelRow {
+            resource: convoy_ref,
+            values: BTreeMap::from([
+                ("name".into(), PanelValue::String("fix-bug-123".into())),
+                ("phase".into(), PanelValue::String("active".into())),
+            ]),
+            intents: vec![],
+            children: vec![
+                PanelRow {
+                    resource: implement_ref.clone(),
+                    values: BTreeMap::from([
+                        ("name".into(), PanelValue::String("implement".into())),
+                        ("phase".into(), PanelValue::String("running".into())),
+                    ]),
+                    intents: vec![
+                        RowIntent::vessel("attach", "ws-1", HostName::new("local")),
+                        RowIntent::leg("complete-leg", "flotilla", "fix-bug-123", "implement", HostName::new("local")),
+                    ],
+                    children: vec![],
+                    depends_on: vec![],
+                },
+                PanelRow {
+                    resource: review_ref,
+                    values: BTreeMap::from([
+                        ("name".into(), PanelValue::String("review".into())),
+                        ("phase".into(), PanelValue::String("pending".into())),
+                    ]),
+                    intents: vec![],
+                    children: vec![],
+                    depends_on: vec![implement_ref],
+                },
+            ],
+            depends_on: vec![],
+        }],
+    };
+    let snapshot = PanelSnapshot { seq: 7, tab: TabView { id: "convoys".into(), title: "Convoys".into(), panels: vec![panel] } };
+    let event = DaemonEvent::PanelSnapshot(Box::new(snapshot));
+
+    let encoded = serde_json::to_string(&event).expect("serialize panel snapshot");
+    let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize panel snapshot");
+    let DaemonEvent::PanelSnapshot(snapshot) = decoded else { panic!("expected PanelSnapshot") };
+    assert_eq!(snapshot.seq, 7);
+    assert_eq!(snapshot.tab.panels[0].rows[0].children[1].depends_on, vec![snapshot.tab.panels[0].rows[0].children[0].resource.clone()]);
+    assert_eq!(StreamKey::Panel { tab: "convoys".into() }, StreamKey::Panel { tab: snapshot.tab.id.clone() });
 }

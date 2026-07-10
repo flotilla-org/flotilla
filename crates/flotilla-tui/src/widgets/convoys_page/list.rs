@@ -1,6 +1,5 @@
 //! Left-pane convoy list widget.
 
-use flotilla_protocol::namespace::{ConvoyId, ConvoySummary};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -10,6 +9,7 @@ use ratatui::{
 };
 
 use super::glyphs::convoy_glyph;
+use crate::convoy_model::{ConvoyId, ConvoySummary};
 
 pub struct ConvoyList<'a> {
     pub convoys: &'a [&'a ConvoySummary],
@@ -44,10 +44,10 @@ impl<'a> ConvoyList<'a> {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::namespace::{ConvoyPhase, ConvoySummary};
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
+    use crate::convoy_model::{ConvoyPhase, ConvoySummary};
 
     fn sample(name: &str, phase: ConvoyPhase) -> ConvoySummary {
         ConvoySummary {

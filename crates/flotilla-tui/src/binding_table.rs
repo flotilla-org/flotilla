@@ -29,7 +29,7 @@ pub enum BindingModeId {
     Convoys,
     /// Inner focus on the Convoys tab — the task tree on the right pane.
     /// Composed with `TabPage`. `j/k` navigate tasks; `esc` returns to the
-    /// convoy list; `x` opens the palette pre-filled to complete the task.
+    /// convoy list; `x` opens the palette pre-filled to complete the leg.
     ConvoyTasks,
     Help,
     ActionMenu,
@@ -151,13 +151,13 @@ pub static BINDINGS: &[Binding] = &[
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
     // ── ConvoyTasks (inner focus: task tree) ──
-    // j/k/up/down come from Shared. esc comes from Shared (Dismiss). left mirrors esc as the
-    // arrow-style synonym for "back to the convoy list" — the app dispatches Dismiss in Tasks
-    // focus to return to the list.
+    // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to
+    // enter the task tree; the app dispatches Dismiss in Tasks focus to return to the list.
+    b(BindingModeId::ConvoyTasks, "h", Action::Dismiss),
     b(BindingModeId::ConvoyTasks, "left", Action::Dismiss),
     hk(BindingModeId::ConvoyTasks, "esc", "ESC", Action::Dismiss, "List"),
-    h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyTask, "Complete"),
-    h(BindingModeId::ConvoyTasks, "a", Action::AttachConvoyTask, "Attach"),
+    h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyLeg, "Complete"),
+    h(BindingModeId::ConvoyTasks, "a", Action::AttachConvoyLeg, "Attach"),
     h(BindingModeId::ConvoyTasks, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),

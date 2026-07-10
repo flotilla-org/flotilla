@@ -1,5 +1,5 @@
-mod convoy_projection;
-pub use convoy_projection::ConvoyProjection;
+mod aggregator;
+pub use aggregator::Aggregator;
 
 pub mod cli;
 pub mod peer;

@@ -1,5 +1,5 @@
 //! End-to-end test: Convoy resource creation flows through InProcessDaemon →
-//! ConvoyProjection → NamespaceSnapshot broadcast → App.convoys("flotilla").
+//! Aggregator → PanelSnapshot broadcast → App.convoys("flotilla").
 //!
 //! The test subscribes the TUI App directly to the daemon's broadcast channel
 //! and polls app.convoys() — no real socket needed.
@@ -88,8 +88,7 @@ async fn tui_shows_convoys_from_daemon() {
         app.handle_daemon_event(event);
     }
 
-    // Create a Convoy resource — ConvoyProjection should pick it up and broadcast
-    // a NamespaceSnapshot that the App will ingest via drain_daemon_events below.
+    // Create a Convoy resource — the Aggregator should broadcast a panel snapshot.
     let convoys = backend.using::<Convoy>("flotilla");
     convoys.create(&convoy_meta("my-convoy"), &convoy_spec("my-workflow")).await.expect("create convoy");
 
@@ -125,7 +124,7 @@ async fn tui_shows_convoys_from_daemon() {
 }
 
 #[tokio::test]
-async fn x_then_enter_completes_task_via_palette() {
+async fn x_then_enter_completes_leg_via_palette() {
     use std::collections::BTreeMap;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -149,7 +148,9 @@ async fn x_then_enter_completes_task_via_palette() {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
         controller_resync_interval: Duration::from_secs(300),
-        start_controllers: true,
+        // This test owns the convoy status directly so it can isolate the panel/TUI command path.
+        // Controller integration is covered by the daemon runtime flow tests.
+        start_controllers: false,
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
@@ -163,7 +164,7 @@ async fn x_then_enter_completes_task_via_palette() {
         app.handle_daemon_event(event);
     }
 
-    // Create a convoy and bootstrap its status so it has a task ready for completion.
+    // Create a convoy and bootstrap its status so it has a leg ready for completion.
     let convoys = backend.using::<Convoy>("flotilla");
     convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix")).await.expect("create convoy");
 
@@ -198,7 +199,7 @@ async fn x_then_enter_completes_task_via_palette() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         drain(&mut app, &mut daemon_rx);
-        if app.convoys("flotilla").iter().any(|c| !c.tasks.is_empty()) {
+        if app.convoys("flotilla").iter().any(|convoy| !convoy.tasks.is_empty()) {
             break;
         }
         if Instant::now() >= deadline {
@@ -218,9 +219,9 @@ async fn x_then_enter_completes_task_via_palette() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
     }
 
-    app.handle_key(key('l')); // drill into task focus
+    app.handle_key(key('l')); // drill into leg focus
     app.handle_key(key('x')); // open palette pre-filled
-    app.handle_key(enter()); // confirm — dispatch ConvoyTaskComplete
+    app.handle_key(enter()); // confirm — dispatch ConvoyLegComplete
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;
@@ -230,13 +231,13 @@ async fn x_then_enter_completes_task_via_palette() {
     }
     assert!(took_one, "expected at least one command to be dispatched after Enter");
 
-    // Wait for TaskPhase::Completed to land back in the app via NamespaceDelta.
+    // Wait for completion to land back in the app via PanelDelta.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         drain(&mut app, &mut daemon_rx);
         if let Some(c) = app.convoys("flotilla").first() {
             if let Some(t) = c.tasks.iter().find(|t| t.name == "implement") {
-                if t.phase == flotilla_protocol::namespace::TaskPhase::Completed {
+                if t.phase == flotilla_tui::convoy_model::TaskPhase::Completed {
                     break;
                 }
             }

@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod aggregator_projection;
 pub mod attachable;
 pub mod config;
 pub mod convert;
@@ -14,7 +15,6 @@ pub mod host_summary;
 pub mod in_process;
 pub mod merge;
 pub mod model;
-pub mod namespace_projection;
 pub mod path_context;
 pub mod path_policy;
 pub mod provider_data;

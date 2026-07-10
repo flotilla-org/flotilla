@@ -441,17 +441,14 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
         DaemonEvent::HostRemoved { environment_id, seq } => {
             format!("[host]     {environment_id}: removed (seq {seq})")
         }
-        DaemonEvent::NamespaceSnapshot(snap) => {
-            format!("[namespace] {}: full snapshot (seq {}, {} convoys)", snap.namespace, snap.seq, snap.convoys.len())
+        DaemonEvent::PanelSnapshot(snapshot) => {
+            let row_count: usize = snapshot.tab.panels.iter().map(|panel| panel.rows.len()).sum();
+            format!("[panel]     {}: full snapshot (seq {}, {} rows)", snapshot.tab.id, snapshot.seq, row_count)
         }
-        DaemonEvent::NamespaceDelta(delta) => {
-            format!(
-                "[namespace] {}: delta (seq {}, {} changed, {} removed)",
-                delta.namespace,
-                delta.seq,
-                delta.changed.len(),
-                delta.removed.len()
-            )
+        DaemonEvent::PanelDelta(delta) => {
+            let changed: usize = delta.panels.iter().map(|panel| panel.changed.len()).sum();
+            let removed: usize = delta.panels.iter().map(|panel| panel.removed.len()).sum();
+            format!("[panel]     {}: delta (seq {}, {} changed, {} removed)", delta.tab_id, delta.seq, changed, removed)
         }
     }
 }
@@ -463,8 +460,8 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
         DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq)),
         DaemonEvent::HostRemoved { environment_id, seq } => Some((StreamKey::Host { environment_id: environment_id.clone() }, *seq)),
-        DaemonEvent::NamespaceSnapshot(snap) => Some((StreamKey::Namespace { name: snap.namespace.clone() }, snap.seq)),
-        DaemonEvent::NamespaceDelta(delta) => Some((StreamKey::Namespace { name: delta.namespace.clone() }, delta.seq)),
+        DaemonEvent::PanelSnapshot(snapshot) => Some((StreamKey::Panel { tab: snapshot.tab.id.clone() }, snapshot.seq)),
+        DaemonEvent::PanelDelta(delta) => Some((StreamKey::Panel { tab: delta.tab_id.clone() }, delta.seq)),
         DaemonEvent::RepoTracked(_)
         | DaemonEvent::RepoUntracked { .. }
         | DaemonEvent::CommandStarted { .. }

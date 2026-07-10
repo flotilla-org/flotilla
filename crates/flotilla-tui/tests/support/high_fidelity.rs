@@ -322,8 +322,8 @@ impl HighFidelityHarness {
             DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
             DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
             DaemonEvent::HostRemoved { environment_id, .. } => format!("host_removed {environment_id}"),
-            DaemonEvent::NamespaceSnapshot(snap) => format!("namespace_snapshot ns={} seq={}", snap.namespace, snap.seq),
-            DaemonEvent::NamespaceDelta(delta) => format!("namespace_delta ns={} seq={}", delta.namespace, delta.seq),
+            DaemonEvent::PanelSnapshot(snap) => format!("panel_snapshot tab={} seq={}", snap.tab.id, snap.seq),
+            DaemonEvent::PanelDelta(delta) => format!("panel_delta tab={} seq={}", delta.tab_id, delta.seq),
         };
         self.recent_events.push(summary);
         if self.recent_events.len() > 20 {
@@ -438,8 +438,8 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
         DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),
         DaemonEvent::HostRemoved { environment_id, .. } => format!("{source}: host_removed {environment_id}"),
-        DaemonEvent::NamespaceSnapshot(snap) => format!("{source}: namespace_snapshot ns={} seq={}", snap.namespace, snap.seq),
-        DaemonEvent::NamespaceDelta(delta) => format!("{source}: namespace_delta ns={} seq={}", delta.namespace, delta.seq),
+        DaemonEvent::PanelSnapshot(snap) => format!("{source}: panel_snapshot tab={} seq={}", snap.tab.id, snap.seq),
+        DaemonEvent::PanelDelta(delta) => format!("{source}: panel_delta tab={} seq={}", delta.tab_id, delta.seq),
     };
     recent.push(summary);
     if recent.len() > 20 {

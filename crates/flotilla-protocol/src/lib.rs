@@ -6,8 +6,8 @@ pub mod framing;
 mod host;
 mod host_summary;
 pub mod issue_query;
-pub mod namespace;
 pub mod output;
+pub mod panel;
 pub mod path_context;
 pub mod peer;
 pub mod provider_data;
@@ -118,8 +118,8 @@ pub enum StreamKey {
     Repo { identity: RepoIdentity },
     #[serde(rename = "host")]
     Host { environment_id: EnvironmentId },
-    #[serde(rename = "namespace")]
-    Namespace { name: String },
+    #[serde(rename = "panel")]
+    Panel { tab: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,13 +272,10 @@ pub enum DaemonEvent {
     /// Node stream tombstone — sent when a previously visible node disappears.
     #[serde(rename = "host_removed")]
     HostRemoved { environment_id: EnvironmentId, seq: u64 },
-    /// Full snapshot for a namespace (convoy) stream — sent on initial connect,
-    /// after seq gaps, or when a delta would exceed the full snapshot size.
-    #[serde(rename = "namespace_snapshot")]
-    NamespaceSnapshot(Box<crate::namespace::NamespaceSnapshot>),
-    /// Incremental delta for a namespace (convoy) stream.
-    #[serde(rename = "namespace_delta")]
-    NamespaceDelta(Box<crate::namespace::NamespaceDelta>),
+    #[serde(rename = "panel_snapshot")]
+    PanelSnapshot(Box<crate::panel::PanelSnapshot>),
+    #[serde(rename = "panel_delta")]
+    PanelDelta(Box<crate::panel::PanelDelta>),
 }
 
 /// Peer connection state as seen by the TUI.

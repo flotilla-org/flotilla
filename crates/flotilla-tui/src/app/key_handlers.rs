@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, WorkItem};
+use flotilla_protocol::{Command, CommandAction, HostName, NodeId, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
@@ -61,8 +61,8 @@ impl App {
                     self.exit_convoy_tasks_focus();
                 }
             }
-            Action::CompleteConvoyTask if self.ui.is_convoys => self.open_complete_convoy_task_palette(),
-            Action::AttachConvoyTask if self.ui.is_convoys => self.attach_selected_convoy_task(),
+            Action::CompleteConvoyLeg if self.ui.is_convoys => self.open_complete_convoy_leg_palette(),
+            Action::AttachConvoyLeg if self.ui.is_convoys => self.attach_selected_convoy_task(),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
@@ -405,19 +405,33 @@ impl App {
         }
     }
 
-    /// Open the command palette pre-filled with `convoy <id> task <task> complete `.
-    /// No-op when no convoy or task is selected. Convoy ids and task names are
+    /// Open the command palette pre-filled with `convoy <id> leg <leg> complete `.
+    /// No-op when no convoy or leg is selected. Convoy ids and leg names are
     /// arbitrary strings (no validation), so they are routed through the
     /// palette's quoting helper to round-trip whitespace and special characters.
-    pub(super) fn open_complete_convoy_task_palette(&mut self) {
-        let Some(convoy_id) = self.convoys_ui.selected.as_ref() else { return };
+    pub(super) fn open_complete_convoy_leg_palette(&mut self) {
+        let Some(convoy) = self.selected_convoy_summary("flotilla") else { return };
         let Some(task) = self.convoys_ui.selected_task.as_ref() else { return };
+        let selected_task = task.clone();
+        let completion_target =
+            convoy.tasks.iter().find(|candidate| candidate.name == *task).and_then(|task| task.completion_target.clone());
+        let Some(completion_target) = completion_target else {
+            self.set_status_message(Some(format!("completion unavailable for leg '{selected_task}'")));
+            return;
+        };
+        let target_node_id = match self.panel_target_node(&completion_target.host) {
+            Ok(target) => target,
+            Err(message) => {
+                self.set_status_message(Some(message));
+                return;
+            }
+        };
         let prefill = format!(
-            "convoy {} task {} complete ",
-            crate::palette::quote_palette_token(convoy_id.name()),
-            crate::palette::quote_palette_token(task),
+            "convoy {} leg {} complete ",
+            crate::palette::quote_palette_token(&completion_target.convoy),
+            crate::palette::quote_palette_token(&completion_target.leg),
         );
-        let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill(prefill, None);
+        let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill_on_node(prefill, target_node_id);
         self.screen.modal_stack.push(Box::new(widget));
     }
 
@@ -425,17 +439,31 @@ impl App {
     pub(super) fn attach_selected_convoy_task(&mut self) {
         let Some(task) = self.convoys_ui.selected_task.clone() else { return };
         // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
-        let workspace_ref = self
+        let target = self
             .selected_convoy_summary("flotilla")
             .and_then(|convoy| convoy.tasks.iter().find(|t| t.name == task))
-            .and_then(|t| t.workspace_ref.clone());
-        match workspace_ref {
-            Some(ws_ref) => {
-                let cmd = self.repo_command(flotilla_protocol::CommandAction::SelectWorkspace { ws_ref });
+            .map(|task| (task.workspace_ref.clone(), task.host.clone()));
+        match target {
+            Some((Some(ws_ref), host)) => {
+                let mut cmd = self.repo_command(flotilla_protocol::CommandAction::SelectWorkspace { ws_ref });
+                cmd.node_id = match host.as_ref().map(|host| self.panel_target_node(host)).transpose() {
+                    Ok(target) => target.flatten(),
+                    Err(message) => {
+                        self.set_status_message(Some(message));
+                        return;
+                    }
+                };
                 self.proto_commands.push(cmd);
             }
-            None => self.set_status_message(Some(format!("no workspace yet for task '{task}'"))),
+            _ => self.set_status_message(Some(format!("no workspace yet for task '{task}'"))),
         }
+    }
+
+    fn panel_target_node(&self, host: &HostName) -> Result<Option<NodeId>, String> {
+        if host == &HostName::local() {
+            return Ok(None);
+        }
+        self.model.node_id_for_host(host).cloned().map(Some).ok_or_else(|| format!("host '{}' is not connected", host.as_str()))
     }
 
     pub(super) fn open_action_menu(&mut self) {

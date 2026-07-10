@@ -1933,7 +1933,7 @@ async fn teleport_session_uses_session_as_name_when_no_branch() {
 #[tokio::test]
 async fn daemon_level_commands_return_error() {
     let daemon_commands = vec![
-        CommandAction::ConvoyTaskComplete { convoy: "convoy-a".to_string(), task: "implement".to_string(), message: None },
+        CommandAction::ConvoyLegComplete { convoy: "convoy-a".to_string(), leg: "implement".to_string(), message: None },
         CommandAction::TrackRepoPath { path: PathBuf::from("/repo") },
         CommandAction::UntrackRepo { repo: RepoSelector::Path(PathBuf::from("/repo")) },
         CommandAction::Refresh { repo: None },

@@ -5,6 +5,7 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
+bon = { workspace = true }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-commands = { path = "../flotilla-commands" }
 flotilla-core = { path = "../flotilla-core" }

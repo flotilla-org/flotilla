@@ -21,8 +21,8 @@ pub struct ConvoyNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ConvoyVerb {
-    /// Manage convoy tasks
-    Task(ConvoyTaskNoun),
+    /// Manage convoy legs
+    Leg(ConvoyLegNoun),
     /// Create a convoy from a workflow template
     Create {
         /// Workflow template to instantiate
@@ -62,19 +62,19 @@ fn resolve_adopted_checkout(path: PathBuf) -> Result<Box<PathBuf>, String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
-pub struct ConvoyTaskNoun {
-    /// Task name
+pub struct ConvoyLegNoun {
+    /// Leg name
     pub subject: String,
 
     #[command(subcommand)]
-    pub verb: ConvoyTaskVerb,
+    pub verb: ConvoyLegVerb,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
-pub enum ConvoyTaskVerb {
-    /// Mark a convoy task complete
+pub enum ConvoyLegVerb {
+    /// Mark a convoy leg complete
     Complete {
-        /// Optional completion message recorded on the task
+        /// Optional completion message recorded on the leg
         #[arg(long)]
         message: Option<String>,
     },
@@ -83,13 +83,13 @@ pub enum ConvoyTaskVerb {
 impl ConvoyNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
-            ConvoyVerb::Task(task) => match task.verb {
-                ConvoyTaskVerb::Complete { message } => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Leg(leg) => match leg.verb {
+                ConvoyLegVerb::Complete { message } => Ok(Resolved::NeedsContext {
                     command: Command {
                         node_id: None,
                         provisioning_target: None,
                         context_repo: None,
-                        action: CommandAction::ConvoyTaskComplete { convoy: self.subject, task: task.subject, message },
+                        action: CommandAction::ConvoyLegComplete { convoy: self.subject, leg: leg.subject, message },
                     },
                     repo: RepoContext::None,
                     host: HostResolution::Local,
@@ -124,10 +124,10 @@ impl std::fmt::Display for ConvoyNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "convoy {}", self.subject)?;
         match &self.verb {
-            ConvoyVerb::Task(task) => {
-                write!(f, " task {}", task.subject)?;
-                match &task.verb {
-                    ConvoyTaskVerb::Complete { message } => {
+            ConvoyVerb::Leg(leg) => {
+                write!(f, " leg {}", leg.subject)?;
+                match &leg.verb {
+                    ConvoyLegVerb::Complete { message } => {
                         write!(f, " complete")?;
                         if let Some(message) = message {
                             write!(f, " --message {message}")?;
@@ -178,14 +178,14 @@ mod tests {
     }
 
     #[test]
-    fn convoy_task_complete_resolves() {
-        let resolved = parse(&["convoy", "convoy-a", "task", "implement", "complete"]).resolve().expect("resolve");
+    fn convoy_leg_complete_resolves() {
+        let resolved = parse(&["convoy", "convoy-a", "leg", "implement", "complete"]).resolve().expect("resolve");
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyTaskComplete { convoy: "convoy-a".into(), task: "implement".into(), message: None },
+                action: CommandAction::ConvoyLegComplete { convoy: "convoy-a".into(), leg: "implement".into(), message: None },
             },
             repo: RepoContext::None,
             host: HostResolution::Local,
@@ -193,16 +193,16 @@ mod tests {
     }
 
     #[test]
-    fn convoy_task_complete_with_message_resolves() {
-        let resolved = parse(&["convoy", "convoy-a", "task", "implement", "complete", "--message", "done"]).resolve().expect("resolve");
+    fn convoy_leg_complete_with_message_resolves() {
+        let resolved = parse(&["convoy", "convoy-a", "leg", "implement", "complete", "--message", "done"]).resolve().expect("resolve");
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyTaskComplete {
+                action: CommandAction::ConvoyLegComplete {
                     convoy: "convoy-a".into(),
-                    task: "implement".into(),
+                    leg: "implement".into(),
                     message: Some("done".into()),
                 },
             },
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn round_trip_complete() {
-        assert_round_trip::<ConvoyNoun>(&["convoy", "convoy-a", "task", "implement", "complete"]);
+        assert_round_trip::<ConvoyNoun>(&["convoy", "convoy-a", "leg", "implement", "complete"]);
     }
 
     #[test]
