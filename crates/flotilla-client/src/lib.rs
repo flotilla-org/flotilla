@@ -465,7 +465,7 @@ fn handle_event(
             debug!(repo_identity = %snap.repo_identity, repo = ?snap.repo, seq = snap.seq, "received full snapshot");
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
-            local_seqs.write().unwrap().insert(StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq);
+            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::RepoDelta(delta) => {
@@ -477,12 +477,12 @@ fn handle_event(
             let stream_key = StreamKey::Repo { identity: repo_identity.clone() };
 
             // Check seq under sync lock, then spawn only if recovery needed.
-            let local_seq = local_seqs.read().unwrap().get(&stream_key).copied();
+            let local_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
 
             match local_seq {
                 Some(ls) if prev_seq == ls => {
                     // Happy path: apply delta (sync lock, no spawn needed)
-                    local_seqs.write().unwrap().insert(stream_key, seq);
+                    local_seqs.write().expect("sequence lock poisoned").insert(stream_key, seq);
                     debug!(repo_identity = %repo_identity, repo = ?repo, %prev_seq, %seq, "applied delta");
                     let _ = event_tx.send(event);
                 }
@@ -520,7 +520,7 @@ fn handle_event(
                         // Only re-process deltas that are genuinely ahead.
                         let buffered = recovering.lock().unwrap().remove(&repo_identity).unwrap_or_default();
                         let stream_key = StreamKey::Repo { identity: repo_identity };
-                        let recovered_seq = local_seqs.read().unwrap().get(&stream_key).copied();
+                        let recovered_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
                         for buffered_event in buffered {
                             let dominated = match &buffered_event {
                                 DaemonEvent::RepoDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
@@ -538,16 +538,16 @@ fn handle_event(
         }
         DaemonEvent::RepoUntracked { repo_identity, .. } => {
             // Sync lock: evict before dispatching
-            local_seqs.write().unwrap().remove(&StreamKey::Repo { identity: repo_identity.clone() });
+            local_seqs.write().expect("sequence lock poisoned").remove(&StreamKey::Repo { identity: repo_identity.clone() });
             let _ = event_tx.send(event);
         }
         DaemonEvent::HostRemoved { environment_id, seq } => {
-            local_seqs.write().unwrap().insert(StreamKey::Host { environment_id: environment_id.clone() }, *seq);
+            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Host { environment_id: environment_id.clone() }, *seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::HostSnapshot(snap) => {
             let stream_key = StreamKey::Host { environment_id: snap.environment_id.clone() };
-            local_seqs.write().unwrap().insert(stream_key, snap.seq);
+            local_seqs.write().expect("sequence lock poisoned").insert(stream_key, snap.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::PanelSnapshot(snap) => {
@@ -605,7 +605,7 @@ async fn recover_from_gap(
     next_id: &AtomicU64,
 ) {
     let last_seen = {
-        let seqs = local_seqs.read().unwrap();
+        let seqs = local_seqs.read().expect("sequence lock poisoned");
         seqs.clone()
     };
 
@@ -619,7 +619,7 @@ async fn recover_from_gap(
                 // Update seqs monotonically — a live event may have advanced
                 // a repo's seq while this replay was in flight.
                 {
-                    let mut seqs = local_seqs.write().unwrap();
+                    let mut seqs = local_seqs.write().expect("sequence lock poisoned");
                     for event in &events {
                         match event {
                             DaemonEvent::RepoSnapshot(snap) => {
@@ -756,7 +756,7 @@ impl DaemonHandle for SocketDaemon {
         // Use monotonic update: a live event processed between subscribe and
         // replay_since may have already advanced the seq further.
         {
-            let mut seqs = self.local_seqs.write().unwrap();
+            let mut seqs = self.local_seqs.write().expect("sequence lock poisoned");
             for event in &events {
                 let (stream_key, seq) = match event {
                     DaemonEvent::RepoSnapshot(snap) => (StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq),

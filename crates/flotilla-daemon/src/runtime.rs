@@ -100,7 +100,12 @@ impl DaemonRuntime {
         let mut tasks = vec![
             spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
-            spawn_aggregator_task(Arc::clone(&daemon), options.namespace.clone(), aggregator_projection_state),
+            spawn_aggregator_task(
+                Arc::clone(&daemon),
+                options.namespace.clone(),
+                aggregator_projection_state,
+                options.controller_supervision.clone(),
+            ),
         ];
 
         if options.start_controllers {
@@ -714,24 +719,36 @@ fn spawn_controller_loops(
     ]
 }
 
-fn spawn_aggregator_task(daemon: Arc<InProcessDaemon>, namespace: String, state: AggregatorProjectionState) -> JoinHandle<()> {
+fn spawn_aggregator_task(
+    daemon: Arc<InProcessDaemon>,
+    namespace: String,
+    state: AggregatorProjectionState,
+    supervision: ControllerSupervision,
+) -> JoinHandle<()> {
     let durable = daemon.resource_backend();
     let observed = daemon.observed_resource_backend();
-    let replica_rx = daemon.subscribe_fleet_replicas();
-    let local_host = daemon.host_name().clone();
-    let event_tx = daemon.event_sender();
     tokio::spawn(async move {
-        let mut aggregator = Aggregator::new(state, local_host, event_tx);
-        aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
-        aggregator
-            .run(
-                durable.clone().using::<Convoy>(&namespace),
-                durable.using::<Presentation>(&namespace),
-                observed.clone().using::<Convoy>(&namespace),
-                observed.using::<Presentation>(&namespace),
-                replica_rx,
-            )
-            .await;
+        supervise("aggregator", supervision, move || {
+            let daemon = Arc::clone(&daemon);
+            let durable = durable.clone();
+            let observed = observed.clone();
+            let namespace = namespace.clone();
+            let state = state.clone();
+            async move {
+                let mut aggregator = Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender());
+                aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
+                aggregator
+                    .run(
+                        durable.clone().using::<Convoy>(&namespace),
+                        durable.using::<Presentation>(&namespace),
+                        observed.clone().using::<Convoy>(&namespace),
+                        observed.using::<Presentation>(&namespace),
+                        daemon.subscribe_fleet_replicas(),
+                    )
+                    .await
+            }
+        })
+        .await;
     })
 }
 

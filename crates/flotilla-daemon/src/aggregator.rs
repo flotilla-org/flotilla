@@ -8,9 +8,9 @@ use flotilla_protocol::{
     DaemonEvent, FleetReplicaSnapshot, HostName,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, Presentation, ProcessSource, Resource, ResourceList,
-    ResourceObject, SnapshotTask, TaskPhase as ResourceLegPhase, TaskState, TypedResolver, WatchEvent, WatchStart, CONVOY_LABEL,
-    TASK_LABEL,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, Presentation, ProcessSource, Resource, ResourceError,
+    ResourceList, ResourceObject, SnapshotTask, TaskPhase as ResourceLegPhase, TaskState, TypedResolver, WatchEvent, WatchStart,
+    CONVOY_LABEL, TASK_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -38,88 +38,69 @@ impl Aggregator {
         observed_convoys: TypedResolver<Convoy>,
         observed_presentations: TypedResolver<Presentation>,
         mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
-    ) {
-        let Some(mut durable_convoy_stream) = self.list_and_watch_convoys(durable_convoys).await else { return };
-        let Some(mut durable_presentation_stream) = self.list_and_watch_presentations(durable_presentations).await else { return };
-        let Some(mut observed_convoy_stream) = self.list_and_watch_convoys(observed_convoys).await else { return };
-        let Some(mut observed_presentation_stream) = self.list_and_watch_presentations(observed_presentations).await else { return };
+    ) -> Result<(), ResourceError> {
+        let mut durable_convoy_stream = self.list_and_watch_convoys(durable_convoys).await?;
+        let mut durable_presentation_stream = self.list_and_watch_presentations(durable_presentations).await?;
+        let mut observed_convoy_stream = self.list_and_watch_convoys(observed_convoys).await?;
+        let mut observed_presentation_stream = self.list_and_watch_presentations(observed_presentations).await?;
 
         loop {
             tokio::select! {
                 event = durable_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event(event).await,
-                    Some(Err(err)) => tracing::error!(%err, "aggregator durable convoy watch failed"),
-                    None => break,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
                 },
                 event = durable_presentation_stream.next() => match event {
                     Some(Ok(event)) => self.apply_presentation_event(event).await,
-                    Some(Err(err)) => tracing::error!(%err, "aggregator durable presentation watch failed"),
-                    None => break,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable presentation watch ended")),
                 },
                 event = observed_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event(event).await,
-                    Some(Err(err)) => tracing::error!(%err, "aggregator observed convoy watch failed"),
-                    None => break,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator observed convoy watch ended")),
                 },
                 event = observed_presentation_stream.next() => match event {
                     Some(Ok(event)) => self.apply_presentation_event(event).await,
-                    Some(Err(err)) => tracing::error!(%err, "aggregator observed presentation watch failed"),
-                    None => break,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator observed presentation watch ended")),
                 },
                 replica = replica_rx.recv() => match replica {
                     Ok(snapshots) => self.apply_replica_cache(snapshots).await,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "aggregator lagged behind fleet replica refreshes");
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(ResourceError::other("aggregator fleet replica channel closed"));
+                    }
                 },
             }
         }
     }
 
-    async fn list_and_watch_convoys(&mut self, resolver: TypedResolver<Convoy>) -> Option<flotilla_resources::WatchStream<Convoy>> {
-        let listed = match resolver.list().await {
-            Ok(listed) => listed,
-            Err(err) => {
-                tracing::error!(%err, "aggregator failed to list convoys");
-                return None;
-            }
-        };
+    async fn list_and_watch_convoys(
+        &mut self,
+        resolver: TypedResolver<Convoy>,
+    ) -> Result<flotilla_resources::WatchStream<Convoy>, ResourceError> {
+        let listed = resolver.list().await?;
         let start = watch_start(&listed);
         for convoy in listed.items {
             self.apply_convoy_event(WatchEvent::Added(convoy)).await;
         }
-        match resolver.watch(start).await {
-            Ok(stream) => Some(stream),
-            Err(err) => {
-                tracing::error!(%err, "aggregator failed to watch convoys");
-                None
-            }
-        }
+        resolver.watch(start).await
     }
 
     async fn list_and_watch_presentations(
         &mut self,
         resolver: TypedResolver<Presentation>,
-    ) -> Option<flotilla_resources::WatchStream<Presentation>> {
-        let listed = match resolver.list().await {
-            Ok(listed) => listed,
-            Err(err) => {
-                tracing::error!(%err, "aggregator failed to list presentations");
-                return None;
-            }
-        };
+    ) -> Result<flotilla_resources::WatchStream<Presentation>, ResourceError> {
+        let listed = resolver.list().await?;
         let start = watch_start(&listed);
         for presentation in listed.items {
             self.apply_presentation_event(WatchEvent::Added(presentation)).await;
         }
-        match resolver.watch(start).await {
-            Ok(stream) => Some(stream),
-            Err(err) => {
-                tracing::error!(%err, "aggregator failed to watch presentations");
-                None
-            }
-        }
+        resolver.watch(start).await
     }
 
     fn apply_presentation(&mut self, presentation: &ResourceObject<Presentation>) -> Option<(String, String)> {
@@ -203,39 +184,6 @@ impl Aggregator {
                 };
                 self.emit_delta(Vec::new(), vec![removed]).await;
             }
-        }
-    }
-
-    pub async fn apply_replica_snapshot(&mut self, snapshot: FleetReplicaSnapshot) {
-        let host = snapshot.host;
-        let Some(panel_snapshot) = snapshot.panels.into_iter().find(|panel| panel.tab.id == "convoys") else { return };
-        let Some(panel) = panel_snapshot.tab.panels.into_iter().find(|panel| panel.id.as_str() == CONVOY_PANEL_ID) else { return };
-        let mut replacement = HashMap::new();
-        for mut row in panel.rows {
-            set_row_host(&mut row, &host);
-            replacement.insert(row.resource.clone(), row);
-        }
-
-        let (changed, removed, full_snapshot) = {
-            let mut view = self.state.write().await;
-            let previous = view.replica_rows.remove(&host).unwrap_or_default();
-            let changed: Vec<_> =
-                replacement.iter().filter(|(reference, row)| previous.get(*reference) != Some(*row)).map(|(_, row)| row.clone()).collect();
-            let removed: Vec<_> = previous.keys().filter(|reference| !replacement.contains_key(*reference)).cloned().collect();
-            if changed.is_empty() && removed.is_empty() {
-                view.replica_rows.insert(host, replacement);
-                return;
-            }
-            view.replica_rows.insert(host, replacement);
-            view.seq = view.seq.saturating_add(1);
-            (changed, removed, view.snapshot())
-        };
-
-        if self.emitted_initial_snapshot {
-            self.emit_delta(changed, removed).await;
-        } else {
-            self.emitted_initial_snapshot = true;
-            let _ = self.event_tx.send(DaemonEvent::PanelSnapshot(Box::new(full_snapshot)));
         }
     }
 
@@ -461,6 +409,7 @@ mod tests {
         panel::{PanelSnapshot, TabView},
         FleetListRow,
     };
+    use flotilla_resources::{InMemoryBackend, ResourceBackend};
 
     use super::*;
 
@@ -496,10 +445,10 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(8);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
 
-        aggregator.apply_replica_snapshot(remote_snapshot("feta", "generation-1", "old")).await;
+        aggregator.apply_replica_cache(vec![remote_snapshot("feta", "generation-1", "old")]).await;
         assert!(matches!(rx.recv().await.expect("initial event"), DaemonEvent::PanelSnapshot(_)));
 
-        aggregator.apply_replica_snapshot(remote_snapshot("feta", "generation-2", "new")).await;
+        aggregator.apply_replica_cache(vec![remote_snapshot("feta", "generation-2", "new")]).await;
         let DaemonEvent::PanelDelta(delta) = rx.recv().await.expect("replacement event") else { panic!("expected panel delta") };
         assert_eq!(delta.panels[0].changed.len(), 1);
         assert_eq!(delta.panels[0].removed.len(), 1);
@@ -524,6 +473,27 @@ mod tests {
         assert_eq!(delta.panels[0].removed.len(), 1);
         assert_eq!(delta.panels[0].removed[0].name, "feta-convoy");
         assert!(state.snapshot().await.tab.panels[0].rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_replica_channel_causes_run_to_restart() {
+        let durable = ResourceBackend::InMemory(InMemoryBackend::default());
+        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+        let (event_tx, _) = broadcast::channel(8);
+        let (replica_tx, replica_rx) = broadcast::channel(1);
+        drop(replica_tx);
+
+        let result = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .run(
+                durable.clone().using::<Convoy>("flotilla"),
+                durable.using::<Presentation>("flotilla"),
+                observed.clone().using::<Convoy>("flotilla"),
+                observed.using::<Presentation>("flotilla"),
+                replica_rx,
+            )
+            .await;
+
+        assert!(result.expect_err("closed channel should stop the run").to_string().contains("replica channel closed"));
     }
 
     #[test]
