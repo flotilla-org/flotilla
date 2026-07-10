@@ -22,13 +22,14 @@ pub struct Aggregator {
     state: AggregatorProjectionState,
     local_host: HostName,
     presentation_workspaces: HashMap<PresentationKey, String>,
+    bootstrapping: bool,
     emitted_initial_snapshot: bool,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl Aggregator {
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { state, local_host, presentation_workspaces: HashMap::new(), emitted_initial_snapshot: false, event_tx }
+        Self { state, local_host, presentation_workspaces: HashMap::new(), bootstrapping: false, emitted_initial_snapshot: false, event_tx }
     }
 
     pub async fn run(
@@ -39,10 +40,21 @@ impl Aggregator {
         observed_presentations: TypedResolver<Presentation>,
         mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
+        self.bootstrapping = true;
+        {
+            let mut view = self.state.write().await;
+            if !view.local_rows.is_empty() {
+                view.local_rows.clear();
+                view.seq = view.seq.saturating_add(1);
+            }
+        }
         let mut durable_convoy_stream = self.list_and_watch_convoys(durable_convoys).await?;
         let mut durable_presentation_stream = self.list_and_watch_presentations(durable_presentations).await?;
         let mut observed_convoy_stream = self.list_and_watch_convoys(observed_convoys).await?;
         let mut observed_presentation_stream = self.list_and_watch_presentations(observed_presentations).await?;
+        self.bootstrapping = false;
+        self.emitted_initial_snapshot = true;
+        let _ = self.event_tx.send(DaemonEvent::PanelSnapshot(Box::new(self.state.snapshot().await)));
 
         loop {
             tokio::select! {
@@ -151,7 +163,9 @@ impl Aggregator {
             view.seq = view.seq.saturating_add(1);
             changed
         };
-        self.emit_delta(vec![changed], Vec::new()).await;
+        if !self.bootstrapping {
+            self.emit_delta(vec![changed], Vec::new()).await;
+        }
     }
 
     pub async fn apply_convoy_event(&mut self, event: WatchEvent<Convoy>) {
@@ -165,6 +179,9 @@ impl Aggregator {
                     view.seq = view.seq.saturating_add(1);
                     view.snapshot()
                 };
+                if self.bootstrapping {
+                    return;
+                }
                 if self.emitted_initial_snapshot {
                     self.emit_delta(vec![row], Vec::new()).await;
                 } else {
@@ -476,14 +493,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_replica_channel_causes_run_to_restart() {
+    async fn restart_relist_removes_local_rows_missing_from_stores() {
         let durable = ResourceBackend::InMemory(InMemoryBackend::default());
         let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
-        let (event_tx, _) = broadcast::channel(8);
+        let state = AggregatorProjectionState::new();
+        let stale_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "deleted-during-outage");
+        state.write().await.local_rows.insert(stale_ref.clone(), PanelRow {
+            resource: stale_ref,
+            values: BTreeMap::from([("name".into(), PanelValue::String("deleted-during-outage".into()))]),
+            intents: Vec::new(),
+            children: Vec::new(),
+            depends_on: Vec::new(),
+        });
+        let (event_tx, mut event_rx) = broadcast::channel(8);
         let (replica_tx, replica_rx) = broadcast::channel(1);
         drop(replica_tx);
 
-        let result = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+        let result = Aggregator::new(state.clone(), HostName::new("local"), event_tx)
             .run(
                 durable.clone().using::<Convoy>("flotilla"),
                 durable.using::<Presentation>("flotilla"),
@@ -494,6 +520,11 @@ mod tests {
             .await;
 
         assert!(result.expect_err("closed channel should stop the run").to_string().contains("replica channel closed"));
+        let DaemonEvent::PanelSnapshot(snapshot) = event_rx.recv().await.expect("relist snapshot") else {
+            panic!("expected relist snapshot");
+        };
+        assert!(snapshot.tab.panels[0].rows.is_empty());
+        assert!(state.snapshot().await.tab.panels[0].rows.is_empty());
     }
 
     #[test]

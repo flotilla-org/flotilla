@@ -62,6 +62,7 @@ impl App {
                 }
             }
             Action::CompleteConvoyLeg if self.ui.is_convoys => self.open_complete_convoy_leg_palette(),
+            Action::AttachConvoyLeg if self.ui.is_convoys => self.attach_selected_convoy_task(),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
@@ -432,6 +433,30 @@ impl App {
         );
         let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill_on_node(prefill, target_node_id);
         self.screen.modal_stack.push(Box::new(widget));
+    }
+
+    /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
+    pub(super) fn attach_selected_convoy_task(&mut self) {
+        let Some(task) = self.convoys_ui.selected_task.clone() else { return };
+        // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
+        let target = self
+            .selected_convoy_summary("flotilla")
+            .and_then(|convoy| convoy.tasks.iter().find(|t| t.name == task))
+            .map(|task| (task.workspace_ref.clone(), task.host.clone()));
+        match target {
+            Some((Some(ws_ref), host)) => {
+                let mut cmd = self.repo_command(flotilla_protocol::CommandAction::SelectWorkspace { ws_ref });
+                cmd.node_id = match host.as_ref().map(|host| self.panel_target_node(host)).transpose() {
+                    Ok(target) => target.flatten(),
+                    Err(message) => {
+                        self.set_status_message(Some(message));
+                        return;
+                    }
+                };
+                self.proto_commands.push(cmd);
+            }
+            _ => self.set_status_message(Some(format!("no workspace yet for task '{task}'"))),
+        }
     }
 
     fn panel_target_node(&self, host: &HostName) -> Result<Option<NodeId>, String> {

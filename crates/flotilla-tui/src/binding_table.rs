@@ -157,6 +157,7 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::ConvoyTasks, "left", Action::Dismiss),
     hk(BindingModeId::ConvoyTasks, "esc", "ESC", Action::Dismiss, "List"),
     h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyLeg, "Complete"),
+    h(BindingModeId::ConvoyTasks, "a", Action::AttachConvoyLeg, "Attach"),
     h(BindingModeId::ConvoyTasks, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
