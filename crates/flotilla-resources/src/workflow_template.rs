@@ -136,8 +136,8 @@ pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>>
     let declared_inputs = collect_inputs(spec, &mut errors);
     let vessels_by_name = collect_vessels(spec, &mut errors);
 
-    for task in &spec.vessels {
-        validate_vessel(task, &declared_inputs, &vessels_by_name, &mut errors);
+    for vessel in &spec.vessels {
+        validate_vessel(vessel, &declared_inputs, &vessels_by_name, &mut errors);
     }
     validate_cycles(&vessels_by_name, &mut errors);
 
@@ -160,36 +160,36 @@ fn collect_inputs(spec: &WorkflowTemplateSpec, errors: &mut Vec<ValidationError>
 
 fn collect_vessels<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) -> BTreeMap<String, &'a VesselRequirement> {
     let mut vessels_by_name = BTreeMap::new();
-    for task in &spec.vessels {
-        if vessels_by_name.insert(task.name.clone(), task).is_some() {
-            push_error(errors, ValidationError::DuplicateVesselName { name: task.name.clone() });
+    for vessel in &spec.vessels {
+        if vessels_by_name.insert(vessel.name.clone(), vessel).is_some() {
+            push_error(errors, ValidationError::DuplicateVesselName { name: vessel.name.clone() });
         }
     }
     vessels_by_name
 }
 
 fn validate_vessel(
-    task: &VesselRequirement,
+    vessel: &VesselRequirement,
     declared_inputs: &BTreeSet<String>,
     vessels_by_name: &BTreeMap<String, &VesselRequirement>,
     errors: &mut Vec<ValidationError>,
 ) {
     let mut roles = BTreeSet::new();
-    for dependency in &task.depends_on {
+    for dependency in &vessel.depends_on {
         if !vessels_by_name.contains_key(dependency) {
-            push_error(errors, ValidationError::UnknownDependency { vessel: task.name.clone(), missing: dependency.clone() });
+            push_error(errors, ValidationError::UnknownDependency { vessel: vessel.name.clone(), missing: dependency.clone() });
         }
     }
 
-    for process in &task.crew {
+    for process in &vessel.crew {
         if !roles.insert(process.role.clone()) {
-            push_error(errors, ValidationError::DuplicateRoleInVessel { vessel: task.name.clone(), role: process.role.clone() });
+            push_error(errors, ValidationError::DuplicateRoleInVessel { vessel: vessel.name.clone(), role: process.role.clone() });
         }
 
         for key in process.labels.keys() {
             if key.starts_with(crate::labels::RESERVED_PREFIX) {
                 push_error(errors, ValidationError::ReservedLabelKey {
-                    vessel: task.name.clone(),
+                    vessel: vessel.name.clone(),
                     role: process.role.clone(),
                     key: key.clone(),
                 });
@@ -201,7 +201,11 @@ fn validate_vessel(
                 if let Some(prompt) = prompt {
                     validate_template_text(
                         prompt,
-                        &InterpolationLocation { vessel: task.name.clone(), role: process.role.clone(), field: InterpolationField::Prompt },
+                        &InterpolationLocation {
+                            vessel: vessel.name.clone(),
+                            role: process.role.clone(),
+                            field: InterpolationField::Prompt,
+                        },
                         declared_inputs,
                         errors,
                     );
@@ -209,7 +213,7 @@ fn validate_vessel(
             }
             CrewSource::Tool { command } => validate_template_text(
                 command,
-                &InterpolationLocation { vessel: task.name.clone(), role: process.role.clone(), field: InterpolationField::Command },
+                &InterpolationLocation { vessel: vessel.name.clone(), role: process.role.clone(), field: InterpolationField::Command },
                 declared_inputs,
                 errors,
             ),
@@ -242,8 +246,8 @@ fn visit_vessel(
     states.insert(vessel_name.to_string(), VisitState::Visiting);
     stack.push(vessel_name.to_string());
 
-    if let Some(task) = vessels_by_name.get(vessel_name) {
-        let mut dependencies = task.depends_on.iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some(vessel) = vessels_by_name.get(vessel_name) {
+        let mut dependencies = vessel.depends_on.iter().map(String::as_str).collect::<Vec<_>>();
         dependencies.sort_unstable();
         for dependency in dependencies {
             if !vessels_by_name.contains_key(dependency) {

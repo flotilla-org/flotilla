@@ -305,7 +305,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
         ],
     });
     status.work.insert("verify".to_string(), pending_task_state());
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Completed;
+    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Complete;
     status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(8));
     status.work.get_mut("verify").expect("verify").phase = WorkPhase::Running;
     status.work.get_mut("verify").expect("verify").started_at = Some(timestamp(9));
@@ -315,7 +315,7 @@ fn fan_in_waits_until_all_dependencies_complete() {
     let first = reconcile(&convoy, None, timestamp(20));
     assert_eq!(first.patch, Some(controller_patches::roll_up_phase(ConvoyPhase::Active, Some(timestamp(20)), None)));
 
-    status.work.get_mut("verify").expect("verify").phase = WorkPhase::Completed;
+    status.work.get_mut("verify").expect("verify").phase = WorkPhase::Complete;
     status.work.get_mut("verify").expect("verify").finished_at = Some(timestamp(10));
     status.phase = ConvoyPhase::Active;
 
@@ -355,7 +355,7 @@ fn all_completed_rolls_up_to_completed() {
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Active;
     for task in status.work.values_mut() {
-        task.phase = WorkPhase::Completed;
+        task.phase = WorkPhase::Complete;
         task.finished_at = Some(timestamp(12));
     }
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
@@ -371,7 +371,7 @@ fn terminal_completed_convoy_reconciles_to_noop() {
     status.phase = ConvoyPhase::Completed;
     status.finished_at = Some(timestamp(40));
     for task in status.work.values_mut() {
-        task.phase = WorkPhase::Completed;
+        task.phase = WorkPhase::Complete;
         task.finished_at = Some(timestamp(12));
     }
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
@@ -465,7 +465,7 @@ fn fail_fast_emits_phase_and_task_phase_change_events() {
 #[test]
 fn roll_up_to_active_emits_phase_change_event() {
     let mut status = bootstrapped_convoy_status();
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Completed;
+    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Complete;
     status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(8));
     status.work.get_mut("review").expect("review").phase = WorkPhase::Running;
     status.work.get_mut("review").expect("review").started_at = Some(timestamp(9));
@@ -494,7 +494,7 @@ fn workflow_ref_change_after_init_fails_defensively() {
 #[test]
 fn snapshot_state_allows_advancement_without_template() {
     let mut status = bootstrapped_convoy_status();
-    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Completed;
+    status.work.get_mut("implement").expect("implement").phase = WorkPhase::Complete;
     status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(12));
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
 
@@ -687,7 +687,7 @@ async fn completed_convoy_emits_presentation_and_workspace_deletes() {
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
     for task in status.work.values_mut() {
-        task.phase = WorkPhase::Completed;
+        task.phase = WorkPhase::Complete;
         task.finished_at = Some(timestamp(19));
     }
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
@@ -730,7 +730,7 @@ async fn terminal_completed_convoy_still_emits_cleanup_actuations() {
     status.phase = ConvoyPhase::Completed;
     status.finished_at = Some(timestamp(20));
     for task in status.work.values_mut() {
-        task.phase = WorkPhase::Completed;
+        task.phase = WorkPhase::Complete;
         task.finished_at = Some(timestamp(19));
     }
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
@@ -765,7 +765,7 @@ async fn terminal_completed_convoy_without_observed_presentation_does_not_emit_s
     status.phase = ConvoyPhase::Completed;
     status.finished_at = Some(timestamp(20));
     for task in status.work.values_mut() {
-        task.phase = WorkPhase::Completed;
+        task.phase = WorkPhase::Complete;
         task.finished_at = Some(timestamp(19));
     }
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
@@ -872,7 +872,7 @@ async fn one_task_completed_deletes_only_that_presentation() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
-    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Completed;
+    status.work.get_mut("implement").expect("implement task").phase = WorkPhase::Complete;
     status.work.get_mut("implement").expect("implement task").finished_at = Some(timestamp(19));
     status.work.get_mut("review").expect("review task").phase = WorkPhase::Running;
     status.work.get_mut("review").expect("review task").started_at = Some(timestamp(18));

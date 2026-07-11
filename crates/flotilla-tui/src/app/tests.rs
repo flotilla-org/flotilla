@@ -1324,7 +1324,7 @@ fn legacy_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_pro
                             crate::convoy_model::WorkPhase::Ready => "ready",
                             crate::convoy_model::WorkPhase::Launching => "launching",
                             crate::convoy_model::WorkPhase::Running => "running",
-                            crate::convoy_model::WorkPhase::Completed => "completed",
+                            crate::convoy_model::WorkPhase::Complete => "complete",
                             crate::convoy_model::WorkPhase::Failed => "failed",
                             crate::convoy_model::WorkPhase::Cancelled => "cancelled",
                         }
@@ -1556,7 +1556,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     let mut terminal = Terminal::new(backend).expect("terminal");
 
     let convoys_selected = app.convoys_ui.selected.clone();
-    let convoys_selected_task = app.convoys_ui.selected_task.clone();
+    let convoys_selected_vessel = app.convoys_ui.selected_vessel.clone();
     let convoys_focus = app.convoys_ui.focus;
     let convoy_filter = app.convoys_ui.filter.clone();
     terminal
@@ -1572,7 +1572,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
                 in_flight: &app.in_flight,
                 namespaces: &app.namespaces,
                 convoys_selected,
-                convoys_selected_task: convoys_selected_task.as_deref(),
+                convoys_selected_vessel: convoys_selected_vessel.as_deref(),
                 convoys_focus,
                 convoy_filter: &convoy_filter,
                 convoys,
@@ -2041,7 +2041,7 @@ fn switching_convoys_resets_task_state_and_focus() {
 }
 
 #[test]
-fn delta_removing_selected_task_clamps_to_none_and_drops_focus() {
+fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
@@ -2060,7 +2060,7 @@ fn delta_removing_selected_task_clamps_to_none_and_drops_focus() {
         removed: vec![],
     })));
 
-    assert_eq!(app.selected_convoy_task(), None, "selected_task is reset when it disappears from the convoy");
+    assert_eq!(app.selected_convoy_task(), None, "selected_vessel is reset when it disappears from the convoy");
     assert_eq!(
         app.convoys_focus(),
         crate::app::ConvoysFocus::List,
@@ -2069,7 +2069,7 @@ fn delta_removing_selected_task_clamps_to_none_and_drops_focus() {
 }
 
 #[test]
-fn exit_tasks_focus_keeps_selected_task() {
+fn exit_tasks_focus_keeps_selected_vessel() {
     let mut app = stub_app();
     app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_tasks("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
@@ -2079,7 +2079,7 @@ fn exit_tasks_focus_keeps_selected_task() {
     app.exit_convoy_vessels_focus();
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-    assert_eq!(app.selected_convoy_task(), Some("t2"), "selected_task survives exit so re-entering picks up the same row");
+    assert_eq!(app.selected_convoy_task(), Some("t2"), "selected_vessel survives exit so re-entering picks up the same row");
 }
 
 #[test]

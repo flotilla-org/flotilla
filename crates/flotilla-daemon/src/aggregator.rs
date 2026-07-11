@@ -402,7 +402,7 @@ fn work_phase_label(phase: ResourceWorkPhase) -> &'static str {
         ResourceWorkPhase::Ready => "ready",
         ResourceWorkPhase::Launching => "launching",
         ResourceWorkPhase::Running => "running",
-        ResourceWorkPhase::Completed => "completed",
+        ResourceWorkPhase::Complete => "complete",
         ResourceWorkPhase::Failed => "failed",
         ResourceWorkPhase::Cancelled => "cancelled",
     }

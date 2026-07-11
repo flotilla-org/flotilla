@@ -78,8 +78,8 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     let final_convoy = convoys.get("convoy-a").await.expect("final convoy get should succeed");
     let final_status = final_convoy.status.expect("convoy status");
     assert_eq!(final_status.phase, ConvoyPhase::Completed);
-    assert_eq!(final_status.work["implement"].phase, flotilla_resources::WorkPhase::Completed);
-    assert_eq!(final_status.work["review"].phase, flotilla_resources::WorkPhase::Completed);
+    assert_eq!(final_status.work["implement"].phase, flotilla_resources::WorkPhase::Complete);
+    assert_eq!(final_status.work["review"].phase, flotilla_resources::WorkPhase::Complete);
 }
 
 #[tokio::test]

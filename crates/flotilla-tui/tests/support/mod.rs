@@ -187,7 +187,7 @@ impl TestHarness {
                     in_flight: &self.in_flight,
                     namespaces: &empty_namespaces,
                     convoys_selected: None,
-                    convoys_selected_task: None,
+                    convoys_selected_vessel: None,
                     convoys_focus: flotilla_tui::app::ConvoysFocus::List,
                     convoy_filter: "",
                     convoys: vec![],

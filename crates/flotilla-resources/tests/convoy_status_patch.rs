@@ -88,7 +88,7 @@ fn advance_work_to_ready_updates_only_selected_tasks() {
         work: BTreeMap::from([
             ("implement".to_string(), pending_task()),
             ("review".to_string(), WorkState {
-                phase: WorkPhase::Completed,
+                phase: WorkPhase::Complete,
                 ready_at: Some(ts(5)),
                 started_at: Some(ts(6)),
                 finished_at: Some(ts(7)),
@@ -108,7 +108,7 @@ fn advance_work_to_ready_updates_only_selected_tasks() {
 
     assert_eq!(status.work["implement"].phase, WorkPhase::Ready);
     assert_eq!(status.work["implement"].ready_at, Some(ts(10)));
-    assert_eq!(status.work["review"].phase, WorkPhase::Completed);
+    assert_eq!(status.work["review"].phase, WorkPhase::Complete);
     assert_eq!(status.message.as_deref(), Some("keep"));
 }
 
@@ -156,7 +156,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
 #[test]
 fn roll_up_phase_only_touches_convoy_level_fields() {
     let review = WorkState {
-        phase: WorkPhase::Completed,
+        phase: WorkPhase::Complete,
         ready_at: Some(ts(10)),
         started_at: Some(ts(11)),
         finished_at: Some(ts(12)),
@@ -207,7 +207,7 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
     patch.apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Active);
-    assert_eq!(status.work["review"].phase, WorkPhase::Completed);
+    assert_eq!(status.work["review"].phase, WorkPhase::Complete);
     assert_eq!(status.work["review"].finished_at, Some(ts(50)));
     assert_eq!(status.work["review"].message.as_deref(), Some("done"));
 }

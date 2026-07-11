@@ -9,12 +9,12 @@ use ratatui::{
 };
 use tui_tree_widget::{Tree, TreeItem, TreeState};
 
-use super::glyphs::{convoy_glyph, task_glyph};
+use super::glyphs::{convoy_glyph, work_glyph};
 use crate::convoy_model::ConvoySummary;
 
 pub struct ConvoyDetail<'a> {
     pub convoy: &'a ConvoySummary,
-    pub selected_task: Option<&'a str>,
+    pub selected_vessel: Option<&'a str>,
     pub focused: bool,
 }
 
@@ -60,17 +60,17 @@ impl<'a> ConvoyDetail<'a> {
             .vessels
             .iter()
             .map(|t| {
-                let g = task_glyph(t.phase);
+                let g = work_glyph(t.phase);
                 let label = Line::from(vec![Span::styled(g.symbol, g.style), Span::raw(format!(" {} ({} proc)", t.name, t.crew.len()))]);
                 TreeItem::new_leaf(t.name.clone(), label)
             })
             .collect();
 
-        // TreeState is built from `selected_task` on every render. Selection lives
+        // TreeState is built from `selected_vessel` on every render. Selection lives
         // in `ConvoysUiState` (the source of truth); expansion isn't needed because
         // tasks render as flat leaves today. Lift TreeState if we get nested tasks.
         let mut state = TreeState::default();
-        if let Some(name) = self.selected_task {
+        if let Some(name) = self.selected_vessel {
             state.select(vec![name.to_string()]);
         }
         let tree = Tree::new(&items).expect("unique task names").highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -137,19 +137,19 @@ mod tests {
         let convoy = multi_task_convoy();
         terminal
             .draw(|f| {
-                ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
+                ConvoyDetail { convoy: &convoy, selected_vessel: None, focused: false }.render(f, f.area());
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
     }
 
     #[test]
-    fn convoy_detail_with_selected_task_renders() {
+    fn convoy_detail_with_selected_vessel_renders() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         let convoy = multi_task_convoy();
         terminal
             .draw(|f| {
-                ConvoyDetail { convoy: &convoy, selected_task: Some("review"), focused: true }.render(f, f.area());
+                ConvoyDetail { convoy: &convoy, selected_vessel: Some("review"), focused: true }.render(f, f.area());
             })
             .unwrap();
         let rendered: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
@@ -167,7 +167,7 @@ mod tests {
         convoy.vessels.clear();
         terminal
             .draw(|f| {
-                ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
+                ConvoyDetail { convoy: &convoy, selected_vessel: None, focused: false }.render(f, f.area());
             })
             .unwrap();
         insta::assert_snapshot!(terminal.backend());
@@ -184,7 +184,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
+                ConvoyDetail { convoy: &convoy, selected_vessel: None, focused: false }.render(f, f.area());
             })
             .expect("render convoy detail");
 

@@ -2103,7 +2103,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
     assert_eq!(result, CommandValue::Ok);
     let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status should exist");
-    assert_eq!(status.work["implement"].phase, WorkPhase::Completed);
+    assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
     assert_eq!(status.work["implement"].message.as_deref(), Some("done"));
 }
 
@@ -2328,7 +2328,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
     assert_eq!(result, CommandValue::Ok);
     let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status should exist");
-    assert_eq!(status.work["implement"].phase, WorkPhase::Completed);
+    assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
 
     // The default namespace must NOT contain the convoy — completion should target
     // only the configured provisioning namespace, not the legacy hardcoded one.

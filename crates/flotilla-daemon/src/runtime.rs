@@ -1312,7 +1312,7 @@ mod tests {
                     convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Completed
-                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Completed)
+                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
                 )
             }
         })
@@ -2028,7 +2028,7 @@ mod tests {
                     convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Completed
-                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Completed)
+                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
                 )
             }
         })

@@ -145,7 +145,7 @@ mod tests {
                     in_flight: &in_flight,
                     namespaces: &empty_namespaces,
                     convoys_selected: None,
-                    convoys_selected_task: None,
+                    convoys_selected_vessel: None,
                     convoys_focus: crate::app::ConvoysFocus::List,
                     convoy_filter: "",
                     convoys: vec![],

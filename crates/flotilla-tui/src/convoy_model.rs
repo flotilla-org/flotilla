@@ -65,7 +65,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
-    Completed,
+    Complete,
     Failed,
     Cancelled,
 }

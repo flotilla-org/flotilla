@@ -411,12 +411,12 @@ impl App {
     /// palette's quoting helper to round-trip whitespace and special characters.
     pub(super) fn open_complete_convoy_work_palette(&mut self) {
         let Some(convoy) = self.selected_convoy_summary("flotilla") else { return };
-        let Some(task) = self.convoys_ui.selected_task.as_ref() else { return };
-        let selected_task = task.clone();
+        let Some(task) = self.convoys_ui.selected_vessel.as_ref() else { return };
+        let selected_vessel = task.clone();
         let completion_target =
             convoy.vessels.iter().find(|candidate| candidate.name == *task).and_then(|task| task.completion_target.clone());
         let Some(completion_target) = completion_target else {
-            self.set_status_message(Some(format!("completion unavailable for vessel '{selected_task}'")));
+            self.set_status_message(Some(format!("completion unavailable for vessel '{selected_vessel}'")));
             return;
         };
         let target_node_id = match self.panel_target_node(&completion_target.host) {
@@ -437,7 +437,7 @@ impl App {
 
     /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
     pub(super) fn attach_selected_convoy_vessel(&mut self) {
-        let Some(task) = self.convoys_ui.selected_task.clone() else { return };
+        let Some(task) = self.convoys_ui.selected_vessel.clone() else { return };
         // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
         let target = self
             .selected_convoy_summary("flotilla")

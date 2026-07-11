@@ -101,7 +101,7 @@ pub enum WorkPhase {
     Ready,
     Launching,
     Running,
-    Completed,
+    Complete,
     Failed,
     Cancelled,
 }
@@ -224,7 +224,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkWorkCompleted { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
-                    state.phase = WorkPhase::Completed;
+                    state.phase = WorkPhase::Complete;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }

@@ -134,13 +134,13 @@ impl Reconciler for VesselReconciler {
             Err(message) => return Ok(VesselDeps::failed(message)),
         };
 
-        let (task_index, task) = match convoy
+        let (vessel_index, requirement) = match convoy
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
             .and_then(|snapshot| snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == obj.spec.vessel_name))
         {
-            Some((task_index, task)) => (task_index, task),
+            Some((vessel_index, requirement)) => (vessel_index, requirement),
             None => return Ok(VesselDeps::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
         };
 
@@ -402,17 +402,17 @@ impl Reconciler for VesselReconciler {
             }
         };
 
-        let first_agent_index = task.crew.iter().position(|process| matches!(process.source, CrewSource::Agent { .. }));
+        let first_agent_index = requirement.crew.iter().position(|process| matches!(process.source, CrewSource::Agent { .. }));
         let mut terminal_refs = Vec::new();
-        for (process_index, process) in task.crew.iter().enumerate() {
-            let should_start = matches!(process.source, CrewSource::Tool { .. }) || first_agent_index == Some(process_index);
+        for (crew_index, process) in requirement.crew.iter().enumerate() {
+            let should_start = matches!(process.source, CrewSource::Tool { .. }) || first_agent_index == Some(crew_index);
             let identity = TerminalSessionIdentity::builder()
                 .vessel_ref(obj.metadata.name.clone())
                 .convoy(obj.spec.convoy_ref.clone())
                 .vessel(obj.spec.vessel_name.clone())
                 .role(process.role.clone())
-                .vessel_index(task_index)
-                .crew_index(process_index)
+                .vessel_index(vessel_index)
+                .crew_index(crew_index)
                 .labels(process.labels.clone())
                 .build();
             let terminal_name = identity.name();
@@ -449,7 +449,7 @@ impl Reconciler for VesselReconciler {
                                 convoy: obj.spec.convoy_ref.clone(),
                                 vessel_ref: obj.metadata.name.clone(),
                             };
-                            let members = task
+                            let members = requirement
                                 .crew
                                 .iter()
                                 .enumerate()

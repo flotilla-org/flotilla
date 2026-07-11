@@ -328,7 +328,7 @@ impl InteractiveWidget for Screen {
             ConvoysPage {
                 convoys: ctx.convoys.clone(),
                 selected,
-                selected_task: ctx.convoys_selected_task,
+                selected_vessel: ctx.convoys_selected_vessel,
                 focus: ctx.convoys_focus,
                 filter: ctx.convoy_filter,
             }

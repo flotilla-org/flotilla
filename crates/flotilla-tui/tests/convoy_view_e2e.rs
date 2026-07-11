@@ -124,7 +124,7 @@ async fn tui_shows_convoys_from_daemon() {
 }
 
 #[tokio::test]
-async fn x_then_enter_completes_leg_via_palette() {
+async fn x_then_enter_completes_work_via_palette() {
     use std::collections::BTreeMap;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -237,7 +237,7 @@ async fn x_then_enter_completes_leg_via_palette() {
         drain(&mut app, &mut daemon_rx);
         if let Some(c) = app.convoys("flotilla").first() {
             if let Some(t) = c.vessels.iter().find(|t| t.name == "implement") {
-                if t.phase == flotilla_tui::convoy_model::WorkPhase::Completed {
+                if t.phase == flotilla_tui::convoy_model::WorkPhase::Complete {
                     break;
                 }
             }
