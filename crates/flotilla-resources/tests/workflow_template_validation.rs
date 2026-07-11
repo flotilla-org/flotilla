@@ -68,12 +68,12 @@ vessels:
 }
 
 #[test]
-fn validate_rejects_duplicate_task_names() {
+fn validate_rejects_duplicate_vessel_names() {
     let mut spec = valid_workflow_template_spec();
     spec.vessels.push(spec.vessels[0].clone());
 
     let errors = validate(&spec).expect_err("validation should fail");
-    assert_has_error(&errors, &ValidationError::DuplicateTaskName { name: "implement".to_string() });
+    assert_has_error(&errors, &ValidationError::DuplicateVesselName { name: "implement".to_string() });
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn validate_rejects_duplicate_role_names_within_task() {
     spec.vessels[0].crew.push(duplicate_process);
 
     let errors = validate(&spec).expect_err("validation should fail");
-    assert_has_error(&errors, &ValidationError::DuplicateRoleInTask { task: "implement".to_string(), role: "coder".to_string() });
+    assert_has_error(&errors, &ValidationError::DuplicateRoleInVessel { vessel: "implement".to_string(), role: "coder".to_string() });
 }
 
 #[test]

@@ -345,7 +345,7 @@ fn failed_task_triggers_fail_fast() {
         Some(controller_patches::fail_convoy(
             [("review".to_string(), timestamp(30))].into_iter().collect(),
             timestamp(30),
-            Some("task failure detected".to_string())
+            Some("work failure detected".to_string())
         ))
     );
 }

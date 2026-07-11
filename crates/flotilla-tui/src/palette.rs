@@ -282,9 +282,9 @@ pub fn palette_completions(
     }
 
     // `convoy <id> work <Tab>` and `convoy <id> work <partial>`: complete with
-    // task names from the named convoy. The clap tree treats the task subject as
-    // a free-form positional and would otherwise return nothing. Past the task
-    // subject we fall through to the clap walker for verbs (`complete` etc.).
+    // vessel names from the named convoy. The clap tree treats the vessel subject
+    // as a free-form positional and would otherwise return nothing. Past the
+    // vessel subject we fall through to the clap walker for verbs (`complete` etc.).
     if noun_name == "convoy" && tokens.len() >= 3 && tokens[2] == "work" {
         // tokens[1] is the raw whitespace-split token: convoy ids that contain
         // whitespace (and would have been double-quoted by `quote_palette_token`)
@@ -295,10 +295,10 @@ pub fn palette_completions(
         // command itself dispatches correctly even when completions don't fire.
         let convoy_id = tokens[1];
         if tokens.len() == 3 && trailing_space {
-            return convoy_leg_completions(convoy_id, "", namespaces);
+            return convoy_vessel_completions(convoy_id, "", namespaces);
         }
         if tokens.len() == 4 && !trailing_space {
-            return convoy_leg_completions(convoy_id, tokens[3], namespaces);
+            return convoy_vessel_completions(convoy_id, tokens[3], namespaces);
         }
     }
 
@@ -317,7 +317,7 @@ pub fn palette_completions(
 }
 
 /// Vessel-name completions for `convoy <id> work <Tab>` / partial.
-fn convoy_leg_completions(convoy_id: &str, partial: &str, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
+fn convoy_vessel_completions(convoy_id: &str, partial: &str, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
     // Single-namespace MVP: search the "flotilla" namespace.
     let lower = partial.to_lowercase();
     let Some(model) = namespaces.get("flotilla") else { return vec![] };
@@ -795,7 +795,7 @@ mod tests {
 
     use crate::app::test_builders::repo_info;
 
-    fn namespaces_with_convoy(name: &str, tasks: &[&str]) -> crate::app::NamespaceMap {
+    fn namespaces_with_convoy(name: &str, vessels: &[&str]) -> crate::app::NamespaceMap {
         use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
         let convoy = ConvoySummary {
             id: ConvoyId::new("flotilla", name),
@@ -805,7 +805,7 @@ mod tests {
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
-            vessels: tasks
+            vessels: vessels
                 .iter()
                 .map(|t| VesselSummary {
                     name: (*t).into(),
@@ -1109,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn convoy_task_names_listed_after_task_keyword() {
+    fn convoy_vessel_names_listed_after_work_keyword() {
         let model = empty_model();
         let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
         let completions = palette_completions("convoy fix-bug-123 work ", &model, &namespaces, true);
@@ -1119,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn convoy_task_names_filter_by_partial() {
+    fn convoy_vessel_names_filter_by_partial() {
         let model = empty_model();
         let namespaces = namespaces_with_convoy("fix-bug-123", &["implement", "review"]);
         let completions = palette_completions("convoy fix-bug-123 work imp", &model, &namespaces, true);
@@ -1128,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn convoy_task_complete_verb_completes_after_task_subject() {
+    fn convoy_work_complete_verb_completes_after_vessel_subject() {
         let model = empty_model();
         let namespaces = namespaces_with_convoy("fix-bug-123", &["implement"]);
         let completions = palette_completions("convoy fix-bug-123 work implement ", &model, &namespaces, true);

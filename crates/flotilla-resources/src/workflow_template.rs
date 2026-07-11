@@ -60,8 +60,8 @@ pub struct Selector {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    DuplicateTaskName { name: String },
-    DuplicateRoleInTask { task: String, role: String },
+    DuplicateVesselName { name: String },
+    DuplicateRoleInVessel { vessel: String, role: String },
     ReservedLabelKey { vessel: String, role: String, key: String },
     UnknownDependency { vessel: String, missing: String },
     DependencyCycle { cycle: Vec<String> },
@@ -102,8 +102,8 @@ impl std::fmt::Display for InterpolationLocation {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValidationError::DuplicateTaskName { name } => write!(f, "duplicate task name `{name}`"),
-            ValidationError::DuplicateRoleInTask { task, role } => write!(f, "duplicate role `{role}` in task `{task}`"),
+            ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
+            ValidationError::DuplicateRoleInVessel { vessel, role } => write!(f, "duplicate role `{role}` in vessel `{vessel}`"),
             ValidationError::ReservedLabelKey { vessel, role, key } => {
                 write!(f, "reserved label key `{key}` on vessel `{vessel}` role `{role}`")
             }
@@ -134,12 +134,12 @@ pub(crate) struct TemplateToken<'a> {
 pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     let declared_inputs = collect_inputs(spec, &mut errors);
-    let tasks_by_name = collect_tasks(spec, &mut errors);
+    let vessels_by_name = collect_vessels(spec, &mut errors);
 
     for task in &spec.vessels {
-        validate_task(task, &declared_inputs, &tasks_by_name, &mut errors);
+        validate_vessel(task, &declared_inputs, &vessels_by_name, &mut errors);
     }
-    validate_cycles(&tasks_by_name, &mut errors);
+    validate_cycles(&vessels_by_name, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -158,32 +158,32 @@ fn collect_inputs(spec: &WorkflowTemplateSpec, errors: &mut Vec<ValidationError>
     declared_inputs
 }
 
-fn collect_tasks<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) -> BTreeMap<String, &'a VesselRequirement> {
-    let mut tasks_by_name = BTreeMap::new();
+fn collect_vessels<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) -> BTreeMap<String, &'a VesselRequirement> {
+    let mut vessels_by_name = BTreeMap::new();
     for task in &spec.vessels {
-        if tasks_by_name.insert(task.name.clone(), task).is_some() {
-            push_error(errors, ValidationError::DuplicateTaskName { name: task.name.clone() });
+        if vessels_by_name.insert(task.name.clone(), task).is_some() {
+            push_error(errors, ValidationError::DuplicateVesselName { name: task.name.clone() });
         }
     }
-    tasks_by_name
+    vessels_by_name
 }
 
-fn validate_task(
+fn validate_vessel(
     task: &VesselRequirement,
     declared_inputs: &BTreeSet<String>,
-    tasks_by_name: &BTreeMap<String, &VesselRequirement>,
+    vessels_by_name: &BTreeMap<String, &VesselRequirement>,
     errors: &mut Vec<ValidationError>,
 ) {
     let mut roles = BTreeSet::new();
     for dependency in &task.depends_on {
-        if !tasks_by_name.contains_key(dependency) {
+        if !vessels_by_name.contains_key(dependency) {
             push_error(errors, ValidationError::UnknownDependency { vessel: task.name.clone(), missing: dependency.clone() });
         }
     }
 
     for process in &task.crew {
         if !roles.insert(process.role.clone()) {
-            push_error(errors, ValidationError::DuplicateRoleInTask { task: task.name.clone(), role: process.role.clone() });
+            push_error(errors, ValidationError::DuplicateRoleInVessel { vessel: task.name.clone(), role: process.role.clone() });
         }
 
         for key in process.labels.keys() {
@@ -217,36 +217,36 @@ fn validate_task(
     }
 }
 
-fn validate_cycles(tasks_by_name: &BTreeMap<String, &VesselRequirement>, errors: &mut Vec<ValidationError>) {
+fn validate_cycles(vessels_by_name: &BTreeMap<String, &VesselRequirement>, errors: &mut Vec<ValidationError>) {
     let mut states = BTreeMap::new();
     let mut stack = Vec::new();
 
-    for task_name in tasks_by_name.keys() {
-        visit_task(task_name, tasks_by_name, &mut states, &mut stack, errors);
+    for vessel_name in vessels_by_name.keys() {
+        visit_vessel(vessel_name, vessels_by_name, &mut states, &mut stack, errors);
     }
 }
 
-fn visit_task(
-    task_name: &str,
-    tasks_by_name: &BTreeMap<String, &VesselRequirement>,
+fn visit_vessel(
+    vessel_name: &str,
+    vessels_by_name: &BTreeMap<String, &VesselRequirement>,
     states: &mut BTreeMap<String, VisitState>,
     stack: &mut Vec<String>,
     errors: &mut Vec<ValidationError>,
 ) {
-    match states.get(task_name) {
+    match states.get(vessel_name) {
         Some(VisitState::Visited) => return,
         None => {}
         Some(VisitState::Visiting) => unreachable!("cycle detection handles visiting dependencies before recursion"),
     }
 
-    states.insert(task_name.to_string(), VisitState::Visiting);
-    stack.push(task_name.to_string());
+    states.insert(vessel_name.to_string(), VisitState::Visiting);
+    stack.push(vessel_name.to_string());
 
-    if let Some(task) = tasks_by_name.get(task_name) {
+    if let Some(task) = vessels_by_name.get(vessel_name) {
         let mut dependencies = task.depends_on.iter().map(String::as_str).collect::<Vec<_>>();
         dependencies.sort_unstable();
         for dependency in dependencies {
-            if !tasks_by_name.contains_key(dependency) {
+            if !vessels_by_name.contains_key(dependency) {
                 continue;
             }
 
@@ -259,12 +259,12 @@ fn visit_task(
                 continue;
             }
 
-            visit_task(dependency, tasks_by_name, states, stack, errors);
+            visit_vessel(dependency, vessels_by_name, states, stack, errors);
         }
     }
 
     stack.pop();
-    states.insert(task_name.to_string(), VisitState::Visited);
+    states.insert(vessel_name.to_string(), VisitState::Visited);
 }
 
 fn validate_template_text(
@@ -392,12 +392,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_duplicate_task_names() {
+    fn validate_rejects_duplicate_vessel_names() {
         let mut spec = valid_spec();
         spec.vessels.push(spec.vessels[0].clone());
 
-        let errors = validate(&spec).expect_err("duplicate task names should fail");
-        assert!(errors.contains(&ValidationError::DuplicateTaskName { name: "implement".to_string() }));
+        let errors = validate(&spec).expect_err("duplicate vessel names should fail");
+        assert!(errors.contains(&ValidationError::DuplicateVesselName { name: "implement".to_string() }));
     }
 
     #[test]
@@ -408,7 +408,7 @@ mod tests {
             .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "cargo test".to_string() }).build());
 
         let errors = validate(&spec).expect_err("duplicate role names should fail");
-        assert!(errors.contains(&ValidationError::DuplicateRoleInTask { task: "implement".to_string(), role: "coder".to_string() }));
+        assert!(errors.contains(&ValidationError::DuplicateRoleInVessel { vessel: "implement".to_string(), role: "coder".to_string() }));
     }
 
     #[test]

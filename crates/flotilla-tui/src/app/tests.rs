@@ -2192,7 +2192,7 @@ fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
 }
 
 #[test]
-fn x_prefill_quotes_task_names_with_whitespace() {
+fn x_prefill_quotes_vessel_names_with_whitespace() {
     let mut app = stub_app();
     app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_tasks("fix-bug-123", &["fix my bug"])]))));
     app.ui.is_convoys = true;

@@ -9,7 +9,7 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
-    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceLegPhase, WorkState, CONVOY_LABEL,
+    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL,
     VESSEL_LABEL,
 };
 use futures::StreamExt;
@@ -338,7 +338,7 @@ impl Aggregator {
             ("name".to_string(), PanelValue::String(definition.name.clone())),
             (
                 "phase".to_string(),
-                PanelValue::String(leg_phase_label(state.map(|state| state.phase).unwrap_or(ResourceLegPhase::Pending)).into()),
+                PanelValue::String(work_phase_label(state.map(|state| state.phase).unwrap_or(ResourceWorkPhase::Pending)).into()),
             ),
             ("crew".to_string(), PanelValue::List(crew)),
         ]);
@@ -396,15 +396,15 @@ fn convoy_is_initializing(status: Option<&ConvoyStatus>) -> bool {
     status.is_none_or(|status| status.workflow_snapshot.is_none() && !convoy_phase_is_terminal(status.phase))
 }
 
-fn leg_phase_label(phase: ResourceLegPhase) -> &'static str {
+fn work_phase_label(phase: ResourceWorkPhase) -> &'static str {
     match phase {
-        ResourceLegPhase::Pending => "pending",
-        ResourceLegPhase::Ready => "ready",
-        ResourceLegPhase::Launching => "launching",
-        ResourceLegPhase::Running => "running",
-        ResourceLegPhase::Completed => "completed",
-        ResourceLegPhase::Failed => "failed",
-        ResourceLegPhase::Cancelled => "cancelled",
+        ResourceWorkPhase::Pending => "pending",
+        ResourceWorkPhase::Ready => "ready",
+        ResourceWorkPhase::Launching => "launching",
+        ResourceWorkPhase::Running => "running",
+        ResourceWorkPhase::Completed => "completed",
+        ResourceWorkPhase::Failed => "failed",
+        ResourceWorkPhase::Cancelled => "cancelled",
     }
 }
 

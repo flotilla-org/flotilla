@@ -386,7 +386,7 @@ fn fail_fast_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option
     }
 
     Some(InternalReconcileOutcome {
-        patch: Some(controller_patches::fail_convoy(cancelled_work, now, Some("task failure detected".to_string()))),
+        patch: Some(controller_patches::fail_convoy(cancelled_work, now, Some("work failure detected".to_string()))),
         actuations: Vec::new(),
         events,
     })
@@ -654,7 +654,7 @@ fn workspace_failure_message(workspace: &ResourceObject<Vessel>) -> String {
         .status
         .as_ref()
         .and_then(|status| status.message.clone())
-        .unwrap_or_else(|| format!("task workspace {} failed", workspace.metadata.name))
+        .unwrap_or_else(|| format!("vessel {} failed", workspace.metadata.name))
 }
 
 fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {

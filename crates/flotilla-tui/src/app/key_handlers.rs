@@ -455,7 +455,7 @@ impl App {
                 };
                 self.proto_commands.push(cmd);
             }
-            _ => self.set_status_message(Some(format!("no workspace yet for task '{task}'"))),
+            _ => self.set_status_message(Some(format!("no workspace yet for vessel '{task}'"))),
         }
     }
 
