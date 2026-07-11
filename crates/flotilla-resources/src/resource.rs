@@ -121,6 +121,10 @@ impl ObjectMeta {
         self.labels.get(AUTHORITY_LABEL).map(|value| LifecycleAuthority::from_label_value(value)).transpose()
     }
 
+    pub fn is_pending_finalization(&self) -> bool {
+        !self.finalizers.is_empty() && self.deletion_timestamp.is_some()
+    }
+
     pub fn set_lifecycle_authority(&mut self, authority: LifecycleAuthority) {
         self.labels.insert(AUTHORITY_LABEL.to_string(), authority.as_label_value().to_string());
     }

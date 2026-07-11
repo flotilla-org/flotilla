@@ -302,6 +302,9 @@ impl InMemoryBackend {
         self.with_store_mut::<T, _>(namespace, |store| {
             let existing = store.objects.get(name).cloned().ok_or_else(|| ResourceError::not_found(name))?;
             let mut object = Self::decode_object::<T>(existing)?;
+            if object.metadata.is_pending_finalization() {
+                return Ok(());
+            }
             let version = store.allocate_version();
             object.metadata.resource_version = version.to_string();
             if !object.metadata.finalizers.is_empty() && object.metadata.deletion_timestamp.is_none() {

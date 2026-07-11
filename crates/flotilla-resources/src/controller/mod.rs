@@ -231,6 +231,13 @@ pub struct ControllerLoop<R: Reconciler> {
 impl<R: Reconciler> ControllerLoop<R> {
     const WATCH_RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
+    async fn write_tolerating_not_found<T>(write: impl Future<Output = Result<T, ResourceError>>) -> Result<(), ResourceError> {
+        match write.await {
+            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn apply_actuation(backend: &ResourceBackend, namespace: &str, actuation: Actuation) -> Result<(), ResourceError> {
         match actuation {
             Actuation::CreateEnvironment { meta, spec } => {
@@ -400,9 +407,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                         && lifecycle_owned
                     {
                         let meta = InputMeta::from(&object.metadata).with_added_finalizer(finalizer_name);
-                        // A racing writer may win between get() and update(); rely on the resulting
-                        // watch event to requeue the object and retry finalizer attachment.
-                        primary.update(&meta, &object.metadata.resource_version, &object.spec).await?;
+                        Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec)).await?;
                         continue;
                     }
                     if object.metadata.deletion_timestamp.is_some()
@@ -412,10 +417,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                             reconciler.run_finalizer(&object).await?;
                         }
                         let meta = InputMeta::from(&object.metadata).without_finalizer(finalizer_name);
-                        match primary.update(&meta, &object.metadata.resource_version, &object.spec).await {
-                            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
-                            Err(err) => return Err(err),
-                        }
+                        Self::write_tolerating_not_found(primary.update(&meta, &object.metadata.resource_version, &object.spec)).await?;
                         continue;
                     }
                 }
@@ -431,7 +433,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                     Self::apply_actuation(&primary.backend, &primary.namespace, actuation).await?;
                 }
                 if let Some(patch) = outcome.patch {
-                    apply_status_patch(&primary, &name, &patch).await?;
+                    Self::write_tolerating_not_found(apply_status_patch(&primary, &name, &patch)).await?;
                 }
                 continue;
             }

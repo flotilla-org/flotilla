@@ -194,6 +194,46 @@ pub async fn assert_delete_emits_event<F: ResourceContractFixture>() {
     assert_delete_emits_event_with_backend::<F>(in_memory_backend()).await;
 }
 
+pub async fn assert_repeated_delete_with_pending_finalizers_is_noop_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
+    let finalizer = "flotilla.work/test-finalizer";
+    let mut meta = F::meta("alpha");
+    meta.finalizers = vec![finalizer.to_string()];
+    let created = resolver.create(&meta, &F::spec()).await.expect("create should succeed");
+    let mut watch = resolver.watch(WatchStart::FromVersion(created.metadata.resource_version.clone())).await.expect("watch should start");
+
+    resolver.delete("alpha").await.expect("first delete should mark the object for deletion");
+    let marked = timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("first delete should emit an event")
+        .expect("watch should yield an item")
+        .expect("watch event should decode");
+    let WatchEvent::Modified(marked) = marked else { panic!("first delete should mark the object as modified") };
+    assert_eq!(marked.metadata.finalizers, vec![finalizer.to_string()]);
+    assert!(marked.metadata.deletion_timestamp.is_some(), "first delete should set the deletion timestamp");
+
+    resolver.delete("alpha").await.expect("repeated delete should be idempotent while finalizers are pending");
+    let still_marked = resolver.get("alpha").await.expect("pending finalizer should keep the object present");
+    assert_eq!(still_marked.metadata.resource_version, marked.metadata.resource_version);
+    assert_eq!(still_marked.metadata.finalizers, vec![finalizer.to_string()]);
+    assert!(still_marked.metadata.deletion_timestamp.is_some());
+    assert!(timeout(Duration::from_millis(100), watch.next()).await.is_err(), "repeated delete should not emit an event");
+
+    let cleared_meta = InputMeta::from(&marked.metadata).without_finalizer(finalizer);
+    let removed = resolver
+        .update(&cleared_meta, &marked.metadata.resource_version, &marked.spec)
+        .await
+        .expect("clearing the finalizer should succeed");
+    let deleted = timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("clearing the finalizer should emit a deleted event")
+        .expect("watch should yield an item")
+        .expect("watch event should decode");
+    let WatchEvent::Deleted(deleted) = deleted else { panic!("clearing the finalizer should delete the object") };
+    assert_eq!(deleted.metadata.resource_version, removed.metadata.resource_version);
+    assert!(matches!(resolver.get("alpha").await, Err(ResourceError::NotFound { .. })));
+}
+
 pub async fn assert_watch_from_version_replays_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
     let resolver = resolver::<F>(backend, "flotilla");
     resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");

@@ -5,14 +5,18 @@ use common::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
         assert_delete_emits_event_with_backend, assert_identical_status_update_is_noop_with_backend,
         assert_identical_update_is_noop_with_backend, assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
-        assert_stale_resource_version_conflicts_with_backend, assert_store_diagnostics_report_retained_events_with_backend,
-        assert_watch_from_version_replays_with_backend, assert_watch_now_semantics_with_backend,
-        assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
+        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend, assert_stale_resource_version_conflicts_with_backend,
+        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays_with_backend,
+        assert_watch_now_semantics_with_backend, assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
-    convoy_meta, convoy_spec,
+    convoy_meta, convoy_spec, TestLoopHarness,
 };
-use flotilla_resources::{Convoy, EventRetention, ResourceBackend, SqliteBackend, WatchEvent, WatchStart};
+use flotilla_controllers::reconcilers::TaskWorkspaceReconciler;
+use flotilla_resources::{
+    controller::ControllerLoop, Convoy, EventRetention, InputMeta, ResourceBackend, ResourceError, SqliteBackend, TaskWorkspace,
+    TaskWorkspaceSpec, TerminalSession, TerminalSessionSource, TerminalSessionSpec, WatchEvent, WatchStart, TASK_WORKSPACE_LABEL,
+};
 use futures::StreamExt;
 use rstest::rstest;
 use tempfile::tempdir;
@@ -55,6 +59,13 @@ async fn identical_status_update_preserves_resource_version_and_emits_no_event(#
 #[tokio::test]
 async fn delete_emits_deleted_event(#[case] _fixture: ConvoyFixture) {
     assert_delete_emits_event_with_backend::<ConvoyFixture>(backend()).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn repeated_delete_is_noop_while_finalizers_are_pending(#[case] _fixture: ConvoyFixture) {
+    assert_repeated_delete_with_pending_finalizers_is_noop_with_backend::<ConvoyFixture>(backend()).await;
 }
 
 #[rstest]
@@ -145,6 +156,81 @@ async fn objects_and_resource_versions_survive_restart() {
         .await
         .expect("update should succeed after restart");
     assert_eq!(updated.metadata.resource_version, "2");
+}
+
+#[tokio::test]
+async fn pending_task_workspace_converges_after_sqlite_restart_and_repeated_delete() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
+    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let terminals = backend.clone().using::<TerminalSession>("flotilla");
+    workspaces
+        .create(
+            &InputMeta::builder()
+                .name("convoy-restart-implement".to_string())
+                .finalizers(vec!["flotilla.work/task-workspace-teardown".to_string()])
+                .build(),
+            &TaskWorkspaceSpec {
+                convoy_ref: "convoy-restart".to_string(),
+                task: "implement".to_string(),
+                placement_policy_ref: "policy-restart".to_string(),
+                adopted_checkout_ref: None,
+            },
+        )
+        .await
+        .expect("workspace create should succeed");
+    terminals
+        .create(
+            &InputMeta::builder()
+                .name("terminal-convoy-restart-implement-coder".to_string())
+                .labels([(TASK_WORKSPACE_LABEL.to_string(), "convoy-restart-implement".to_string())].into_iter().collect())
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct-01HXYZ".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("terminal child should be created");
+    workspaces.delete("convoy-restart-implement").await.expect("first delete should mark the workspace");
+    drop(terminals);
+    drop(workspaces);
+    drop(backend);
+
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
+    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let terminals = backend.clone().using::<TerminalSession>("flotilla");
+    workspaces.delete("convoy-restart-implement").await.expect("restart cleanup should not hard-delete the pending workspace");
+    let pending = workspaces.get("convoy-restart-implement").await.expect("pending workspace should survive the repeated delete");
+    assert!(pending.metadata.deletion_timestamp.is_some());
+    assert_eq!(pending.metadata.finalizers, vec!["flotilla.work/task-workspace-teardown".to_string()]);
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: workspaces.clone(),
+            secondaries: Vec::new(),
+            reconciler: TaskWorkspaceReconciler::new(backend.clone(), "flotilla"),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let workspaces = workspaces.clone();
+            let terminals = terminals.clone();
+            async move {
+                matches!(workspaces.get("convoy-restart-implement").await, Err(ResourceError::NotFound { .. }))
+                    && matches!(terminals.get("terminal-convoy-restart-implement-coder").await, Err(ResourceError::NotFound { .. }))
+            }
+        })
+        .await;
+    harness.shutdown().await;
 }
 
 #[test]
