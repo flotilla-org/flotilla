@@ -296,7 +296,7 @@ fn daemon_event_command_finished_roundtrip() {
         node_id: NodeId::new("desktop"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repo: Some(PathBuf::from("/tmp/repo")),
-        result: CommandValue::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/tmp/repo/feat-x") },
+        result: CommandValue::CheckoutCreated { branch: "feat-x".into(), path: qp("/tmp/repo/feat-x") },
     };
     let json = serde_json::to_string(&event).expect("serialize");
     let decoded: DaemonEvent = serde_json::from_str(&json).expect("deserialize");
@@ -309,7 +309,7 @@ fn daemon_event_command_finished_roundtrip() {
             match result {
                 CommandValue::CheckoutCreated { branch, path } => {
                     assert_eq!(branch, "feat-x");
-                    assert_eq!(path, PathBuf::from("/tmp/repo/feat-x"));
+                    assert_eq!(path, qp("/tmp/repo/feat-x"));
                 }
                 other => panic!("expected CheckoutCreated, got {:?}", other),
             }

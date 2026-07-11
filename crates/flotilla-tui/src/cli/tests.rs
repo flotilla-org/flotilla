@@ -373,6 +373,7 @@ mod command_result_human {
 
     use flotilla_protocol::{
         commands::{CheckoutStatus, CommandValue},
+        qualified_path::{HostId, QualifiedPath},
         CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostName, NodeId,
         PreparedWorkspace,
     };
@@ -427,7 +428,8 @@ mod command_result_human {
 
     #[test]
     fn checkout_created() {
-        let result = CommandValue::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/tmp/wt") };
+        let result =
+            CommandValue::CheckoutCreated { branch: "feat-new".into(), path: QualifiedPath::host(HostId::new("host-a"), "/tmp/wt") };
         let output = format_command_result(&result);
         assert!(output.contains("checkout created"), "should say checkout created");
         assert!(output.contains("feat-new"), "should include branch name");

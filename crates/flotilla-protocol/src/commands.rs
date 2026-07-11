@@ -333,7 +333,7 @@ pub enum CommandValue {
     },
     CheckoutCreated {
         branch: String,
-        path: PathBuf,
+        path: QualifiedPath,
     },
     CheckoutRemoved {
         branch: String,
@@ -724,7 +724,10 @@ mod tests {
             CommandValue::RepoTracked { path: PathBuf::from("/new/repo"), resolved_from: None },
             CommandValue::RepoUntracked { path: PathBuf::from("/old/repo") },
             CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")] },
-            CommandValue::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/repos/project/wt-1") },
+            CommandValue::CheckoutCreated {
+                branch: "feat-new".into(),
+                path: QualifiedPath::host(HostId::new("host-a"), "/repos/project/wt-1"),
+            },
             CommandValue::CheckoutRemoved { branch: "feat-old".into() },
             CommandValue::TerminalPrepared {
                 repo_identity: repo_identity(),
@@ -929,7 +932,7 @@ mod tests {
 
     #[test]
     fn command_result_uses_snake_case_tag() {
-        let result = CommandValue::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
+        let result = CommandValue::CheckoutCreated { branch: "x".into(), path: QualifiedPath::host(HostId::new("host-a"), "/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("checkout_created"));
     }
