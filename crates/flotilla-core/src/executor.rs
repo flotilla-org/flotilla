@@ -14,8 +14,9 @@ use std::{
 };
 
 use flotilla_protocol::{
-    arg::Arg, qualified_path::QualifiedPath, CheckoutTarget, Command, CommandAction, CommandValue, HostName, NodeId, PreparedWorkspace,
-    ResolvedPaneCommand,
+    arg::Arg,
+    qualified_path::{PathQualifier, QualifiedPath},
+    CheckoutTarget, Command, CommandAction, CommandValue, HostName, NodeId, PreparedWorkspace, ResolvedPaneCommand,
 };
 use tracing::{debug, error, info};
 
@@ -79,20 +80,21 @@ struct CheckoutFlow<'a> {
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
     local_host: &'a HostName,
+    new_checkout_qualifier: PathQualifier,
     /// When true, skip host-side validation and de-duplication.
     /// Environment checkouts delegate validation to `CloneCheckoutManager`.
     is_environment: bool,
 }
 
 impl<'a> CheckoutFlow<'a> {
-    fn existing_checkout_path(&self) -> Option<ExecutionEnvironmentPath> {
+    fn existing_checkout_path(&self) -> Option<QualifiedPath> {
         if self.is_environment {
             // Environment namespaces are independent — host checkouts don't apply
             return None;
         }
         self.providers_data.checkouts.iter().find_map(|(hp, co)| {
             if checkout_is_local_owned(hp, self.local_host) && co.branch == self.branch {
-                Some(ExecutionEnvironmentPath::new(&hp.path))
+                Some(hp.clone())
             } else {
                 None
             }
@@ -106,7 +108,7 @@ impl<'a> CheckoutFlow<'a> {
             if matches!(self.intent, CheckoutIntent::FreshBranch) {
                 return Err(format!("branch already exists: {}", self.branch));
             }
-            return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path: path.into_path_buf() });
+            return Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path });
         }
 
         // In environment context, skip host-side branch validation — the
@@ -117,7 +119,10 @@ impl<'a> CheckoutFlow<'a> {
         }
 
         let path = checkout_service.create_checkout(self.repo_root, self.branch, self.create_branch).await?;
-        Ok(CommandValue::CheckoutCreated { branch: self.branch.to_string(), path: path.into_path_buf() })
+        Ok(CommandValue::CheckoutCreated {
+            branch: self.branch.to_string(),
+            path: QualifiedPath { qualifier: self.new_checkout_qualifier.clone(), path: path.into_path_buf() },
+        })
     }
 }
 
@@ -309,6 +314,7 @@ pub async fn build_plan(
 
         // Daemon-level commands should not reach build_plan.
         CommandAction::ConvoyLegComplete { .. }
+        | CommandAction::CrewHandoff { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::WorkflowTemplateApply { .. }
         | CommandAction::ProjectCreate { .. }
@@ -321,6 +327,7 @@ pub async fn build_plan(
         | CommandAction::QueryRepoWork { .. }
         | CommandAction::QueryHostList {}
         | CommandAction::QueryFleetList {}
+        | CommandAction::QueryCrewList { .. }
         | CommandAction::QueryFleetReplicaSnapshot {}
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }
@@ -649,7 +656,9 @@ impl StepResolver for ExecutorStepResolver {
                 let repo_root = prior
                     .iter()
                     .find_map(|o| match o {
-                        StepOutcome::CompletedWith(CommandValue::CheckoutCreated { path, .. }) => Some(ExecutionEnvironmentPath::new(path)),
+                        StepOutcome::CompletedWith(CommandValue::CheckoutCreated { path, .. }) => {
+                            Some(ExecutionEnvironmentPath::new(&path.path))
+                        }
                         _ => None,
                     })
                     .unwrap_or_else(|| ExecutionEnvironmentPath::new("/workspace"));
@@ -675,11 +684,15 @@ impl StepResolver for ExecutorStepResolver {
                     registry: effective_registry.as_ref(),
                     providers_data: effective_providers_data.as_ref(),
                     local_host: &self.local_host,
+                    new_checkout_qualifier: context_environment_id.as_ref().map_or_else(
+                        || PathQualifier::Host(self.environment_manager.local_host_id().clone()),
+                        |env_id| PathQualifier::Environment(env_id.clone()),
+                    ),
                     is_environment: context_environment_id.is_some(),
                 };
                 let result = checkout_flow.checkout_created_result().await?;
                 if let CommandValue::CheckoutCreated { ref path, .. } = result {
-                    info!(checkout_path = %path.display(), "created checkout");
+                    info!(checkout_path = %path, "created checkout");
                 }
                 Ok(StepOutcome::CompletedWith(result))
             }
@@ -782,7 +795,7 @@ impl StepResolver for ExecutorStepResolver {
                 } else {
                     prior.iter().find_map(|o| match o {
                         StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch, path }) => {
-                            Some((ExecutionEnvironmentPath::new(path), branch.clone(), None))
+                            Some((ExecutionEnvironmentPath::new(&path.path), branch.clone(), Some(path.clone())))
                         }
                         _ => None,
                     })

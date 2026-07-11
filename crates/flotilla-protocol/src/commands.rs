@@ -7,8 +7,8 @@ use crate::{
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
     query::{
-        FleetListResponse, FleetReplicaSnapshot, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse,
-        RepoProvidersResponse, RepoWorkResponse,
+        CrewCommandContext, CrewListResponse, FleetListResponse, FleetReplicaSnapshot, HostListResponse, HostProvidersResponse,
+        HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
     },
     AttachableSetId, RepoIdentity,
 };
@@ -155,6 +155,11 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    CrewHandoff {
+        context: CrewCommandContext,
+        target: String,
+        message: String,
+    },
     ConvoyCreate {
         name: String,
         workflow_ref: String,
@@ -236,6 +241,9 @@ pub enum CommandAction {
         target_environment_id: crate::EnvironmentId,
     },
     QueryFleetList {},
+    QueryCrewList {
+        context: CrewCommandContext,
+    },
     QueryFleetReplicaSnapshot {},
 }
 
@@ -251,6 +259,7 @@ impl CommandAction {
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
                 | CommandAction::QueryFleetList {}
+                | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::Attach { .. }
                 | CommandAction::QueryIssues { .. }
@@ -281,6 +290,7 @@ impl Command {
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyLegComplete { .. } => "Completing convoy leg...",
+            CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectCreate { .. } => "Creating project...",
@@ -299,6 +309,7 @@ impl Command {
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
             CommandAction::QueryFleetList {} => "query fleet list",
+            CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
         }
     }
@@ -322,7 +333,7 @@ pub enum CommandValue {
     },
     CheckoutCreated {
         branch: String,
-        path: PathBuf,
+        path: QualifiedPath,
     },
     CheckoutRemoved {
         branch: String,
@@ -359,6 +370,7 @@ pub enum CommandValue {
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
     FleetList(Box<FleetListResponse>),
+    CrewList(Box<CrewListResponse>),
     FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),
     ImageEnsured {
         image: crate::ImageId,
@@ -415,8 +427,9 @@ mod tests {
     use crate::{
         arg::Arg,
         query::{
-            FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse,
-            HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
+            CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness,
+            HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoDetailResponse, RepoProvidersResponse,
+            RepoWorkResponse,
         },
         test_helpers::assert_json_roundtrip,
         AttachableSetId, HostEnvironment, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity, SystemInfo,
@@ -563,6 +576,16 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
+                action: CommandAction::CrewHandoff {
+                    context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                    target: "reviewer".into(),
+                    message: "review this".into(),
+                },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
                 action: CommandAction::ConvoyCreate {
                     name: "my-convoy".into(),
                     workflow_ref: "scratch".into(),
@@ -628,6 +651,14 @@ mod tests {
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryCrewList {
+                    context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                },
+            },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
             Command {
                 node_id: None,
@@ -693,7 +724,10 @@ mod tests {
             CommandValue::RepoTracked { path: PathBuf::from("/new/repo"), resolved_from: None },
             CommandValue::RepoUntracked { path: PathBuf::from("/old/repo") },
             CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")] },
-            CommandValue::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/repos/project/wt-1") },
+            CommandValue::CheckoutCreated {
+                branch: "feat-new".into(),
+                path: QualifiedPath::host(HostId::new("host-a"), "/repos/project/wt-1"),
+            },
             CommandValue::CheckoutRemoved { branch: "feat-old".into() },
             CommandValue::TerminalPrepared {
                 repo_identity: repo_identity(),
@@ -830,6 +864,19 @@ mod tests {
                     message: Some("not synced".into()),
                 }],
             })),
+            CommandValue::CrewList(Box::new(CrewListResponse {
+                convoy: "convoy-a".into(),
+                vessel: "convoy-a-implement".into(),
+                leg: "implement".into(),
+                members: vec![CrewListMember {
+                    role: "coder".into(),
+                    kind: "agent".into(),
+                    state: "active".into(),
+                    adapter: Some("codex".into()),
+                    model: None,
+                    stance: Some("trusted-implicit".into()),
+                }],
+            })),
             CommandValue::FleetReplicaSnapshot(Box::new(FleetReplicaSnapshot {
                 host: crate::HostName::new("desktop"),
                 generation: Some("7".into()),
@@ -885,7 +932,7 @@ mod tests {
 
     #[test]
     fn command_result_uses_snake_case_tag() {
-        let result = CommandValue::CheckoutCreated { branch: "x".into(), path: PathBuf::from("/tmp/x") };
+        let result = CommandValue::CheckoutCreated { branch: "x".into(), path: QualifiedPath::host(HostId::new("host-a"), "/tmp/x") };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json.get("kind").and_then(|v| v.as_str()), Some("checkout_created"));
     }

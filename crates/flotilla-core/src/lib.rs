@@ -1,3 +1,4 @@
+pub mod agent_adapter;
 pub mod agents;
 pub mod aggregator_projection;
 pub mod attachable;

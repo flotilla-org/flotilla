@@ -12,6 +12,41 @@ use crate::{
 /// "change_request"). Inner key: provider name. Value: healthy.
 pub type ProviderHealthMap = HashMap<String, HashMap<String, bool>>;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewCommandContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewListResponse {
+    pub convoy: String,
+    pub vessel: String,
+    pub leg: String,
+    pub members: Vec<CrewListMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewListMember {
+    pub role: String,
+    pub kind: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stance: Option<String>,
+}
+
 // --- status ---
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

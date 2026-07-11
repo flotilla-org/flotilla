@@ -13,6 +13,7 @@ use flotilla_controllers::reconcilers::{
     TerminalRuntimeState, TerminalSessionReconciler,
 };
 use flotilla_core::{
+    agent_adapter::{AgentLaunchRequest, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
     config::ConfigStore,
     in_process::InProcessDaemon,
@@ -21,6 +22,7 @@ use flotilla_core::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, ProvisionedMount},
         registry::ProviderRegistry,
+        terminal::TerminalPool,
         vcs::{CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
@@ -31,7 +33,7 @@ use flotilla_resources::{
     ConvoyReconciler, DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError,
-    ResourceObject, TaskDefinition, TaskWorkspace, WorkflowTemplate, WorkflowTemplateSpec,
+    ResourceObject, TaskDefinition, TaskWorkspace, TerminalSessionSource, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -936,13 +938,83 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .or_else(|| registry.terminal_pools.preferred().cloned())
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", spec.pool, spec.env_ref))?;
 
-        pool.ensure_session(name, &spec.command, &ExecutionEnvironmentPath::new(&spec.cwd), &Vec::new()).await?;
+        let cwd = ExecutionEnvironmentPath::new(&spec.cwd);
+        let (command, env, crew, initial_message) = match &spec.source {
+            TerminalSessionSource::Tool { command } => (command.clone(), Vec::new(), None, None),
+            TerminalSessionSource::Agent { selector, brief, context, message } => {
+                let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
+                let adapter = registry
+                    .agent_adapters
+                    .get(&requirement.adapter)
+                    .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+                adapter.prepare(&cwd, brief).await?;
+                let plan = adapter.launch(&AgentLaunchRequest {
+                    role: spec.role.clone(),
+                    model: requirement.model.clone(),
+                    brief: brief.clone(),
+                })?;
+                let crew_id = uuid::Uuid::new_v4().to_string();
+                let crew = flotilla_resources::CrewSessionStatus::builder()
+                    .id(crew_id.clone())
+                    .adapter(requirement.adapter)
+                    .maybe_model(requirement.model)
+                    .stance(plan.stance)
+                    .build();
+                let mut env = plan.env;
+                env.extend([
+                    ("FLOTILLA_CREW_ID".to_string(), crew_id),
+                    ("FLOTILLA_CONVOY".to_string(), context.convoy.clone()),
+                    ("FLOTILLA_VESSEL".to_string(), context.vessel.clone()),
+                    ("FLOTILLA_CREW_ROLE".to_string(), spec.role.clone()),
+                    ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
+                ]);
+                (plan.command, env, Some(crew), message.clone())
+            }
+        };
+
+        if matches!(spec.source, TerminalSessionSource::Agent { .. }) {
+            self.state.active_sessions.lock().await.remove(name);
+            if pool.list_sessions().await?.iter().any(|session| session.session_name == name) {
+                pool.kill_session(name).await?;
+            }
+        }
+        pool.ensure_session(name, &command, &cwd, &env).await?;
+        let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
+        if let Some(message) = initial_message {
+            if let Err(err) = pool.deliver(name, &message.text, true).await {
+                let _ = pool.kill_session(name).await;
+                return Err(format!("deliver initial crew message: {err}"));
+            }
+        }
         self.state
             .active_sessions
             .lock()
             .await
             .insert(name.to_string(), ActiveSession { env_ref: spec.env_ref.clone(), pool: spec.pool.clone() });
-        Ok(TerminalRuntimeState { session_id: name.to_string(), pid: None, started_at: Utc::now() })
+        Ok(TerminalRuntimeState::builder()
+            .session_id(name.to_string())
+            .maybe_pid(None)
+            .started_at(Utc::now())
+            .maybe_crew(crew)
+            .launch_command(command)
+            .maybe_delivered_message_id(delivered_message_id)
+            .build())
+    }
+
+    async fn session_is_running(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
+        let pool = self.pool_for_spec(spec)?;
+        if !pool.tracks_session_liveness() {
+            return Ok(true);
+        }
+        let running = pool.list_sessions().await?.iter().any(|session| session.session_name == session_id);
+        if !running {
+            self.state.active_sessions.lock().await.remove(session_id);
+        }
+        Ok(running)
+    }
+
+    async fn deliver_message(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec, message: &str) -> Result<(), String> {
+        self.pool_for_spec(spec)?.deliver(session_id, message, true).await
     }
 
     async fn kill_session(&self, session_id: &str) -> Result<(), String> {
@@ -969,6 +1041,16 @@ impl TerminalControllerRuntime {
             .daemon
             .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
             .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
+    }
+
+    fn pool_for_spec(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Arc<dyn TerminalPool>, String> {
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        registry
+            .terminal_pools
+            .get(&spec.pool)
+            .map(|(_, pool)| Arc::clone(pool))
+            .or_else(|| registry.terminal_pools.preferred().cloned())
+            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", spec.pool, spec.env_ref))
     }
 }
 
@@ -1018,12 +1100,16 @@ mod tests {
         config::ConfigStore,
         daemon::DaemonHandle,
         in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
-        providers::discovery::{test_support::git_process_discovery, EnvironmentAssertion, EnvironmentBag},
+        providers::discovery::{
+            test_support::{fake_discovery_with_provider_set, git_process_discovery, FakeDiscoveryProviders, FakeTerminalPool},
+            EnvironmentAssertion, EnvironmentBag,
+        },
     };
-    use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent};
+    use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
     use flotilla_resources::{
         Checkout as ResourceCheckout, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, LifecycleAuthority, PlacementPolicy,
-        ProcessDefinition, ProcessSource, SqliteBackend, TaskDefinition, TaskPhase, TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
+        ProcessDefinition, ProcessSource, Selector, SqliteBackend, TaskDefinition, TaskPhase, TerminalSession, TerminalSessionPhase,
+        TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -1083,6 +1169,25 @@ mod tests {
         std::fs::create_dir_all(config.state_dir()).expect("state dir");
         let backend = ResourceBackend::Sqlite(SqliteBackend::open(config.state_dir().join("resources.sqlite")).expect("sqlite backend"));
         daemon_with_backend(tracked_repos, config, backend).await
+    }
+
+    async fn crew_daemon(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
+        let pool = Arc::new(FakeTerminalPool::new());
+        let discovery = fake_discovery_with_provider_set(
+            FakeDiscoveryProviders::new()
+                .with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
+        );
+        let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        daemon
+            .replace_local_environment_bag_for_test(
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", "/Users/tester"))
+                    .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
+                    .with(EnvironmentAssertion::binary("codex", "/tools/codex"))
+                    .with(EnvironmentAssertion::binary("claude", "/tools/claude")),
+            )
+            .expect("crew environment bag");
+        (daemon, pool)
     }
 
     async fn run_stage4a_flow_reaches_running_and_completes_convoy(
@@ -1392,6 +1497,428 @@ mod tests {
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
         run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo).await;
+    }
+
+    #[tokio::test]
+    async fn starting_agent_replaces_a_pool_session_left_by_a_previous_daemon_runtime() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            config,
+            local_registry,
+            None,
+            profile.host_id.clone(),
+            None,
+            profile.host_direct_environment_name(),
+        ));
+        let session_name = "terminal-demo-implement-coder";
+        pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession {
+            session_name: session_name.to_string(),
+            status: flotilla_protocol::TerminalStatus::Running,
+            command: Some("old codex process with stale crew identity".to_string()),
+            working_directory: Some(ExecutionEnvironmentPath::new("/repo")),
+        }])
+        .await;
+        let runtime = TerminalControllerRuntime { state };
+        let spec = flotilla_resources::TerminalSessionSpec {
+            env_ref: profile.host_direct_environment_name(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "coding".to_string() },
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".to_string(),
+                    content: "Implement the issue.".to_string(),
+                },
+                context: flotilla_resources::TerminalCrewContext {
+                    namespace: NAMESPACE.to_string(),
+                    convoy: "demo".to_string(),
+                    vessel: "demo-implement".to_string(),
+                },
+                message: None,
+            },
+            cwd: "/repo".to_string(),
+            pool: "fake-terminals".to_string(),
+        };
+
+        let launched = runtime.ensure_session(session_name, &spec).await.expect("replace stale session");
+
+        assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
+        assert_eq!(pool.ensured.lock().await.len(), 1, "the fresh agent command must actually be launched");
+        assert!(launched.crew.is_some(), "the replacement gets a fresh crew identity");
+    }
+
+    #[tokio::test]
+    async fn crew_provisioning_runs_coder_reviewer_handoffs_and_rejects_unknown_capabilities() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = TestGitRepo::init(temp.path().join("repo"))
+            .with_initial_commit()
+            .with_origin("git@github.com:flotilla-org/flotilla.git")
+            .path()
+            .to_path_buf();
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        assert!(local_registry.agent_adapters.get("codex").is_some());
+        assert!(local_registry.agent_adapters.get("claude-code").is_some());
+        let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+        let backend = daemon.resource_backend();
+
+        register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("startup resources");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile).await.expect("host heartbeat");
+        let state = Arc::new(ControllerRuntimeState::new(
+            Arc::clone(&daemon),
+            Arc::clone(&config),
+            local_registry,
+            None,
+            profile.host_id.clone(),
+            Some(ExecutionEnvironmentPath::new(&repo)),
+            profile.host_direct_environment_name(),
+        ));
+        let controller_handles =
+            spawn_controller_loops(Arc::clone(&state), NAMESPACE, Duration::from_millis(20), ControllerSupervision::default());
+
+        backend
+            .clone()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(
+                &empty_meta("crew-workflow"),
+                &WorkflowTemplateSpec::builder()
+                    .inputs(Vec::new())
+                    .tasks(vec![TaskDefinition::builder()
+                        .name("implement".to_string())
+                        .processes(vec![
+                            ProcessDefinition::builder()
+                                .role("coder".to_string())
+                                .source(ProcessSource::Agent {
+                                    selector: Selector { capability: "coding".to_string() },
+                                    prompt: Some(
+                                        "Implement issue 668 without leaking this full brief into the launch command.".to_string(),
+                                    ),
+                                })
+                                .build(),
+                            ProcessDefinition::builder()
+                                .role("reviewer".to_string())
+                                .source(ProcessSource::Agent {
+                                    selector: Selector { capability: "review".to_string() },
+                                    prompt: Some("Review the coder's work.".to_string()),
+                                })
+                                .build(),
+                            ProcessDefinition::builder()
+                                .role("watcher".to_string())
+                                .source(ProcessSource::Tool { command: "cargo test --watch".to_string() })
+                                .build(),
+                        ])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("crew workflow");
+
+        let mut rx = daemon.subscribe();
+        let create_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "crew-convoy".to_string(),
+                    workflow_ref: "crew-workflow".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                    r#ref: Some("main".to_string()),
+                    project_ref: None,
+                    placement_policy: Some(profile.host_direct_policy_name()),
+                    adopted_checkout: Some(Box::new(repo.clone())),
+                },
+            })
+            .await
+            .expect("create crew convoy");
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "crew-convoy".to_string() });
+
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                matches!(
+                    convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).as_ref(),
+                    Some(status)
+                        if status.phase == ConvoyPhase::Active
+                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
+                )
+            }
+        })
+        .await;
+
+        let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
+        let coder = terminals
+            .list()
+            .await
+            .expect("terminal list")
+            .items
+            .into_iter()
+            .find(|session| session.spec.role == "coder")
+            .expect("coder session");
+        let coder_id = coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("coder identity").id.clone();
+        assert_eq!(coder.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("codex"));
+        assert!(terminals.list().await.expect("terminal list").items.iter().any(|session| session.spec.role == "watcher"));
+        assert!(terminals.list().await.expect("terminal list").items.iter().all(|session| session.spec.role != "reviewer"));
+        let ensured = pool.ensured.lock().await;
+        let coder_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-coder")).expect("coder launch");
+        assert!(coder_launch.command.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!coder_launch.command.contains("without leaking this full brief"));
+        assert!(coder_launch.env_vars.iter().any(|(key, value)| key == "FLOTILLA_CREW_ID" && value == &coder_id));
+        drop(ensured);
+
+        let crew_context = CrewCommandContext { crew_id: Some(coder_id.clone()), ..Default::default() };
+        let crew_list = daemon
+            .execute_query(
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryCrewList { context: crew_context.clone() },
+                },
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("crew list");
+        let CommandValue::CrewList(crew_list) = crew_list else { panic!("expected crew list") };
+        assert_eq!(crew_list.members.iter().map(|member| (member.role.as_str(), member.state.as_str())).collect::<Vec<_>>(), vec![
+            ("coder", "active"),
+            ("reviewer", "latent"),
+            ("watcher", "active")
+        ]);
+
+        let mut rx = daemon.subscribe();
+        let handoff_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewHandoff {
+                    context: crew_context,
+                    target: "reviewer".to_string(),
+                    message: "Review commit abc123".to_string(),
+                },
+            })
+            .await
+            .expect("handoff reviewer");
+        assert_eq!(wait_for_command_result(&mut rx, handoff_id).await, CommandValue::Ok);
+        wait_until(|| {
+            let terminals = terminals.clone();
+            async move {
+                terminals
+                    .list()
+                    .await
+                    .ok()
+                    .and_then(|list| list.items.into_iter().find(|session| session.spec.role == "reviewer"))
+                    .and_then(|session| session.status)
+                    .is_some_and(|status| status.phase == TerminalSessionPhase::Running)
+            }
+        })
+        .await;
+        let reviewer = terminals
+            .list()
+            .await
+            .expect("terminal list")
+            .items
+            .into_iter()
+            .find(|session| session.spec.role == "reviewer")
+            .expect("reviewer session");
+        let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("reviewer identity").id.clone();
+        assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("claude-code"));
+        assert!(pool
+            .delivered
+            .lock()
+            .await
+            .iter()
+            .any(|(session, text, submit)| session.ends_with("-reviewer") && text == "Review commit abc123" && *submit));
+
+        let mut rx = daemon.subscribe();
+        let hand_back_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewHandoff {
+                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
+                    target: "coder".to_string(),
+                    message: "Address the review findings".to_string(),
+                },
+            })
+            .await
+            .expect("hand back to coder");
+        assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
+        assert!(pool
+            .delivered
+            .lock()
+            .await
+            .iter()
+            .any(|(session, text, submit)| session.ends_with("-coder") && text == "Address the review findings" && *submit));
+
+        pool.remove_session(&coder.metadata.name).await;
+        wait_until(|| {
+            let terminals = terminals.clone();
+            let name = coder.metadata.name.clone();
+            async move {
+                terminals
+                    .get(&name)
+                    .await
+                    .ok()
+                    .and_then(|session| session.status)
+                    .is_some_and(|status| status.phase == TerminalSessionPhase::Stopped)
+            }
+        })
+        .await;
+        assert!(matches!(
+            convoys.get("crew-convoy").await.expect("crew convoy").status.and_then(|status| status.tasks.get("implement").cloned()),
+            Some(task) if task.phase == TaskPhase::Running
+        ));
+        let stopped_list = daemon
+            .execute_query(
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::QueryCrewList {
+                        context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
+                    },
+                },
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("stopped crew list");
+        let CommandValue::CrewList(stopped_list) = stopped_list else { panic!("expected stopped crew list") };
+        assert_eq!(stopped_list.members.iter().find(|member| member.role == "coder").map(|member| member.state.as_str()), Some("stopped"));
+        let mut rx = daemon.subscribe();
+        let revive_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewHandoff {
+                    context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
+                    target: "coder".to_string(),
+                    message: "Resume after review".to_string(),
+                },
+            })
+            .await
+            .expect("revive coder");
+        assert_eq!(wait_for_command_result(&mut rx, revive_id).await, CommandValue::Ok);
+        wait_until(|| {
+            let terminals = terminals.clone();
+            let name = coder.metadata.name.clone();
+            let old_id = coder_id.clone();
+            async move {
+                terminals
+                    .get(&name)
+                    .await
+                    .ok()
+                    .and_then(|session| session.status)
+                    .and_then(|status| status.crew)
+                    .is_some_and(|crew| crew.id != old_id)
+            }
+        })
+        .await;
+
+        let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
+        assert!(attach.contains("attach terminal-crew-convoy-implement-coder"));
+
+        let mut rx = daemon.subscribe();
+        let complete_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyLegComplete {
+                    convoy: "crew-convoy".to_string(),
+                    leg: "implement".to_string(),
+                    message: Some("human accepted the crew's work".to_string()),
+                },
+            })
+            .await
+            .expect("complete crew leg");
+        assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                convoys
+                    .get("crew-convoy")
+                    .await
+                    .ok()
+                    .and_then(|convoy| convoy.status)
+                    .is_some_and(|status| status.phase == ConvoyPhase::Completed)
+            }
+        })
+        .await;
+
+        backend
+            .clone()
+            .using::<WorkflowTemplate>(NAMESPACE)
+            .create(
+                &empty_meta("unknown-capability"),
+                &WorkflowTemplateSpec::builder()
+                    .inputs(Vec::new())
+                    .tasks(vec![TaskDefinition::builder()
+                        .name("implement".to_string())
+                        .processes(vec![ProcessDefinition::builder()
+                            .role("architect".to_string())
+                            .source(ProcessSource::Agent { selector: Selector { capability: "architect".to_string() }, prompt: None })
+                            .build()])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("unknown capability workflow");
+        let mut rx = daemon.subscribe();
+        let create_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "unknown-convoy".to_string(),
+                    workflow_ref: "unknown-capability".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".to_string()),
+                    r#ref: Some("main".to_string()),
+                    project_ref: None,
+                    placement_policy: Some(profile.host_direct_policy_name()),
+                    adopted_checkout: Some(Box::new(repo)),
+                },
+            })
+            .await
+            .expect("create unknown convoy");
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "unknown-convoy".to_string() });
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                convoys
+                    .get("unknown-convoy")
+                    .await
+                    .ok()
+                    .and_then(|convoy| convoy.status)
+                    .is_some_and(|status| status.phase == ConvoyPhase::Failed)
+            }
+        })
+        .await;
+        let failed = convoys.get("unknown-convoy").await.expect("unknown convoy").status.expect("unknown status");
+        assert_eq!(failed.tasks.get("implement").and_then(|task| task.message.as_deref()), Some("unknown agent capability `architect`"));
+
+        for handle in controller_handles {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     #[tokio::test]

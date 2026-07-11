@@ -12,8 +12,10 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
-    provider_data::Issue, qualified_path::HostId, Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId,
-    NodeInfo, ProvisioningTarget, RepoSelector, WorkItemIdentity,
+    provider_data::Issue,
+    qualified_path::{HostId, QualifiedPath},
+    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId, NodeInfo, ProvisioningTarget, RepoSelector,
+    WorkItemIdentity,
 };
 use tempfile::tempdir;
 use test_support::*;
@@ -1023,7 +1025,10 @@ fn local_checkout_created_does_not_queue_workspace() {
         node_id: NodeId::new("my-desktop"),
         repo_identity,
         repo: Some(repo_path),
-        result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/tmp/repo/wt-feat") },
+        result: CommandValue::CheckoutCreated {
+            branch: "feat".into(),
+            path: QualifiedPath::host(HostId::new("local-host"), "/tmp/repo/wt-feat"),
+        },
     });
 
     assert!(app.proto_commands.take_next().is_none(), "workspace creation is now handled by checkout plan, not TUI");
@@ -1043,7 +1048,10 @@ fn remote_checkout_created_does_not_queue_workspace() {
         node_id: NodeId::new("remote-a"),
         repo_identity,
         repo: Some(repo_path),
-        result: CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/remote/wt-feat") },
+        result: CommandValue::CheckoutCreated {
+            branch: "feat".into(),
+            path: QualifiedPath::host(HostId::new("remote-host"), "/remote/wt-feat"),
+        },
     });
 
     assert!(app.proto_commands.take_next().is_none(), "remote checkout should not auto-create local workspace");

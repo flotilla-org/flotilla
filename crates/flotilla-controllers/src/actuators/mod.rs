@@ -8,7 +8,7 @@ use flotilla_core::{
         vcs::{CloneInspection, CloneProvisioner},
     },
 };
-use flotilla_resources::{DockerEnvironmentSpec, FreshCloneCheckoutSpec, TerminalSessionSpec};
+use flotilla_resources::{DockerEnvironmentSpec, FreshCloneCheckoutSpec, TerminalSessionSource, TerminalSessionSpec};
 
 pub struct CloneActuator {
     provisioner: Arc<dyn CloneProvisioner>,
@@ -61,7 +61,10 @@ impl TerminalActuator {
 
     pub async fn ensure_session(&self, name: &str, spec: &TerminalSessionSpec, env_vars: &[(String, String)]) -> Result<(), String> {
         let env_vars = env_vars.to_vec();
-        self.pool.ensure_session(name, &spec.command, &ExecutionEnvironmentPath::new(spec.cwd.clone()), &env_vars).await
+        let TerminalSessionSource::Tool { command } = &spec.source else {
+            return Err("agent sessions require an AgentAdapter-aware runtime".to_string());
+        };
+        self.pool.ensure_session(name, command, &ExecutionEnvironmentPath::new(spec.cwd.clone()), &env_vars).await
     }
 }
 

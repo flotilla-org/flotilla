@@ -93,7 +93,14 @@ struct FakeTerminalRuntime;
 #[async_trait]
 impl TerminalRuntime for FakeTerminalRuntime {
     async fn ensure_session(&self, name: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalRuntimeState, String> {
-        Ok(TerminalRuntimeState { session_id: format!("session-{name}"), pid: Some(42), started_at: Utc::now() })
+        Ok(TerminalRuntimeState {
+            session_id: format!("session-{name}"),
+            pid: Some(42),
+            started_at: Utc::now(),
+            crew: None,
+            launch_command: "bash".to_string(),
+            delivered_message_id: None,
+        })
     }
 
     async fn kill_session(&self, _session_id: &str) -> Result<(), String> {
@@ -352,7 +359,7 @@ async fn terminal_session_controller_marks_session_running() {
         .create(&controller_meta().name("term-a").call(), &flotilla_resources::TerminalSessionSpec {
             env_ref: "host-direct-01HXYZ".to_string(),
             role: "coder".to_string(),
-            command: "cargo test".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/workspace".to_string(),
             pool: "cleat".to_string(),
         })
@@ -411,7 +418,7 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
             &flotilla_resources::TerminalSessionSpec {
                 env_ref: "host-direct-01HXYZ".to_string(),
                 role: "coder".to_string(),
-                command: "cargo test".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/Users/alice/dev/flotilla-repos/convoy-a".to_string(),
                 pool: "cleat".to_string(),
             },
@@ -425,6 +432,9 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
                 session_id: "term-a".to_string(),
                 pid: Some(42),
                 started_at: Utc::now(),
+                crew: None,
+                launch_command: "cargo test".to_string(),
+                delivered_message_id: None,
             }
             .apply(&mut status);
             status
@@ -565,7 +575,7 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
             &flotilla_resources::TerminalSessionSpec {
                 env_ref: "host-direct-01HXYZ".to_string(),
                 role: "coder".to_string(),
-                command: "cargo test".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),
                 pool: "cleat".to_string(),
             },

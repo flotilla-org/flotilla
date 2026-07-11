@@ -61,7 +61,9 @@ pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, NoStatusPatch, StatusPatch};
 pub use task_workspace::{TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TaskWorkspaceStatusPatch};
 pub use terminal_session::{
-    InnerCommandStatus, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    terminal_session_attach_target, CrewSessionStatus, InnerCommandStatus, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession, TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
 };
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
 pub use workflow_template::{

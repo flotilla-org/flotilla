@@ -5,8 +5,9 @@ use common::{owner_reference, resource_meta};
 use flotilla_resources::{
     Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, ResourceBackend, TaskWorkspace,
-    TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus,
+    HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, ResourceBackend, Selector, TaskWorkspace,
+    TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource,
+    TerminalSessionSpec,
 };
 
 fn placement_meta(name: &str) -> flotilla_resources::InputMeta {
@@ -127,6 +128,29 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
 fn host_direct_environment_spec_is_constructible() {
     let _ = Host;
     let _ = HostDirectEnvironmentSpec { host_ref: "01HXYZ".to_string(), repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string() };
+}
+
+#[tokio::test]
+async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief() {
+    let resolver = ResourceBackend::InMemory(InMemoryBackend::default()).using::<TerminalSession>("flotilla");
+    let spec = TerminalSessionSpec {
+        env_ref: "host-direct-dinghy".into(),
+        role: "coder".into(),
+        source: TerminalSessionSource::Agent {
+            selector: Selector { capability: "coding".into() },
+            brief: TerminalBrief {
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "You are coder in convoy demo.\n\nImplement the change.".into(),
+            },
+            context: TerminalCrewContext { namespace: "flotilla".into(), convoy: "demo".into(), vessel: "demo-implement".into() },
+            message: None,
+        },
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+    };
+
+    let created = resolver.create(&resource_meta().name("demo-implement-coder").call(), &spec).await.expect("create session");
+    assert_eq!(created.spec.source, spec.source);
 }
 
 #[test]

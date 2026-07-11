@@ -66,11 +66,22 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
     let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
     let stopped_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
 
-    TerminalSessionStatusPatch::MarkRunning { session_id: "abc123".to_string(), pid: Some(12345), started_at }.apply(&mut status);
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "abc123".to_string(),
+        pid: Some(12345),
+        started_at,
+        crew: None,
+        launch_command: "bash".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
     TerminalSessionStatusPatch::MarkRunning {
         session_id: "abc123".to_string(),
         pid: Some(12345),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+        crew: None,
+        launch_command: "bash".to_string(),
+        delivered_message_id: None,
     }
     .apply(&mut status);
     assert_eq!(status.phase, TerminalSessionPhase::Running);
@@ -97,8 +108,26 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
     assert_eq!(status.inner_exit_code, Some(1));
     assert_eq!(status.stopped_at, Some(stopped_at));
 
-    TerminalSessionStatusPatch::MarkFailed { message: "still stopped".to_string(), stopped_at: None }.apply(&mut status);
+    TerminalSessionStatusPatch::MarkFailed { message: "failed after stop".to_string(), stopped_at: None }.apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Failed);
     assert_eq!(status.stopped_at, Some(stopped_at), "a later patch without a timestamp must not erase the transition time");
+}
+
+#[test]
+fn terminal_session_failure_is_distinct_from_a_stopped_crew_member_and_can_restart() {
+    let mut status = TerminalSessionStatus::default();
+
+    TerminalSessionStatusPatch::MarkFailed { message: "unknown agent capability `architect`".to_string(), stopped_at: Some(Utc::now()) }
+        .apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Failed);
+    assert_eq!(status.message.as_deref(), Some("unknown agent capability `architect`"));
+
+    TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Starting);
+    assert_eq!(status.session_id, None);
+    assert_eq!(status.started_at, None);
+    assert_eq!(status.stopped_at, None);
+    assert_eq!(status.message, None);
 }
 
 #[test]

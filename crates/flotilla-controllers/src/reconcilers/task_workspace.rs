@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
+use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{
@@ -9,10 +10,9 @@ use flotilla_resources::{
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
     FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority,
-    OwnerReference, PlacementPolicy, PlacementPolicySpec, ProcessDefinition, ProcessSource, Resource, ResourceBackend, ResourceError,
-    ResourceObject, TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSpec, TypedResolver, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL,
-    TASK_WORKSPACE_LABEL,
+    OwnerReference, PlacementPolicy, PlacementPolicySpec, ProcessSource, Resource, ResourceBackend, ResourceError, ResourceObject,
+    TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSpec, TypedResolver, TASK_WORKSPACE_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -26,6 +26,7 @@ pub struct TaskWorkspaceReconciler {
     clones: TypedResolver<Clone>,
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
+    namespace: String,
 }
 
 impl TaskWorkspaceReconciler {
@@ -37,6 +38,7 @@ impl TaskWorkspaceReconciler {
             clones: backend.clone().using::<Clone>(namespace),
             checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.using::<TerminalSession>(namespace),
+            namespace: namespace.to_string(),
         }
     }
 
@@ -406,23 +408,27 @@ impl Reconciler for TaskWorkspaceReconciler {
             }
         };
 
+        let first_agent_index = task.processes.iter().position(|process| matches!(process.source, ProcessSource::Agent { .. }));
         let mut terminal_refs = Vec::new();
         for (process_index, process) in task.processes.iter().enumerate() {
-            let command = match &process.source {
-                ProcessSource::Tool { command } => command.clone(),
-                ProcessSource::Agent { .. } => {
-                    return Ok(TaskWorkspaceDeps::failed(format!(
-                        "task {} contains agent process {}; Stage 4a supports tool processes only",
-                        obj.spec.task, process.role
-                    )))
-                }
-            };
-
-            let terminal_name = terminal_name(&obj.metadata.name, &process.role);
-            terminal_refs.push(terminal_name.clone());
+            let should_start = matches!(process.source, ProcessSource::Tool { .. }) || first_agent_index == Some(process_index);
+            let identity = TerminalSessionIdentity::builder()
+                .vessel(obj.metadata.name.clone())
+                .convoy(obj.spec.convoy_ref.clone())
+                .leg(obj.spec.task.clone())
+                .role(process.role.clone())
+                .task_index(task_index)
+                .process_index(process_index)
+                .labels(process.labels.clone())
+                .build();
+            let terminal_name = identity.name();
             match self.terminal_sessions.get(&terminal_name).await {
                 Ok(existing) => {
-                    if existing.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Stopped) {
+                    terminal_refs.push(terminal_name.clone());
+                    let phase = existing.status.as_ref().map(|status| status.phase);
+                    if phase == Some(TerminalSessionPhase::Failed)
+                        || (phase == Some(TerminalSessionPhase::Stopped) && matches!(process.source, ProcessSource::Tool { .. }))
+                    {
                         let message = existing
                             .status
                             .as_ref()
@@ -430,17 +436,54 @@ impl Reconciler for TaskWorkspaceReconciler {
                             .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
                         return Ok(TaskWorkspaceDeps::failed(message));
                     }
-                    if existing.status.as_ref().map(|status| status.phase) != Some(TerminalSessionPhase::Running) {
+                    if phase == Some(TerminalSessionPhase::Stopped) {
+                        continue;
+                    }
+                    if should_start && phase != Some(TerminalSessionPhase::Running) {
                         return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {
+                    if !should_start {
+                        continue;
+                    }
+                    let source = match &process.source {
+                        ProcessSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },
+                        ProcessSource::Agent { selector, prompt } => {
+                            let context = flotilla_resources::TerminalCrewContext {
+                                namespace: self.namespace.clone(),
+                                convoy: obj.spec.convoy_ref.clone(),
+                                vessel: obj.metadata.name.clone(),
+                            };
+                            let members = task
+                                .processes
+                                .iter()
+                                .enumerate()
+                                .map(|(index, member)| CrewBriefMember {
+                                    role: member.role.clone(),
+                                    state: if matches!(member.source, ProcessSource::Tool { .. }) || first_agent_index == Some(index) {
+                                        "active"
+                                    } else {
+                                        "latent"
+                                    }
+                                    .to_string(),
+                                    is_agent: matches!(member.source, ProcessSource::Agent { .. }),
+                                })
+                                .collect::<Vec<_>>();
+                            flotilla_resources::TerminalSessionSource::Agent {
+                                selector: selector.clone(),
+                                brief: build_crew_brief(&context, &obj.spec.task, &process.role, prompt.as_deref(), &members),
+                                context,
+                                message: None,
+                            }
+                        }
+                    };
                     actuations.push(Actuation::CreateTerminalSession {
-                        meta: owned_child_meta(&terminal_name, obj, build_session_labels(obj, process, task_index, process_index)),
+                        meta: identity.input_meta(),
                         spec: TerminalSessionSpec {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),
-                            command,
+                            source,
                             cwd: strategy.terminal_cwd(&checkout_ready_path),
                             pool: strategy.pool().to_string(),
                         },
@@ -548,10 +591,6 @@ fn checkout_name(task_workspace_name: &str) -> String {
     format!("checkout-{task_workspace_name}")
 }
 
-fn terminal_name(task_workspace_name: &str, role: &str) -> String {
-    format!("terminal-{task_workspace_name}-{role}")
-}
-
 fn checkout_target_path(repo_default_dir: &str, repo_slug: &str, task_workspace_name: &str) -> String {
     format!("{}/{}.{}", repo_default_dir.trim_end_matches('/'), repo_slug, task_workspace_name)
 }
@@ -568,22 +607,6 @@ fn owned_child_meta(name: &str, workspace: &ResourceObject<TaskWorkspace>, mut e
             controller: true,
         }])
         .build()
-}
-
-fn build_session_labels(
-    workspace: &ResourceObject<TaskWorkspace>,
-    process: &ProcessDefinition,
-    task_index: usize,
-    process_index: usize,
-) -> BTreeMap<String, String> {
-    let mut labels = process.labels.clone();
-    labels.insert(TASK_WORKSPACE_LABEL.to_string(), workspace.metadata.name.clone());
-    labels.insert(ROLE_LABEL.to_string(), process.role.clone());
-    labels.insert(CONVOY_LABEL.to_string(), workspace.spec.convoy_ref.clone());
-    labels.insert(TASK_LABEL.to_string(), workspace.spec.task.clone());
-    labels.insert(TASK_ORDINAL_LABEL.to_string(), format!("{task_index:03}"));
-    labels.insert(PROCESS_ORDINAL_LABEL.to_string(), format!("{process_index:03}"));
-    labels
 }
 
 impl PlacementStrategy {

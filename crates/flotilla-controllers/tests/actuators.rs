@@ -123,7 +123,7 @@ async fn terminal_actuator_uses_literal_command_and_cwd() {
     let spec = TerminalSessionSpec {
         env_ref: "env-a".to_string(),
         role: "coder".to_string(),
-        command: "cargo test".to_string(),
+        source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
         cwd: "/workspace".to_string(),
         pool: "cleat".to_string(),
     };
