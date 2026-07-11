@@ -40,7 +40,7 @@ fn desc(name: &str) -> ProviderDescriptor {
 use async_trait::async_trait;
 use flotilla_protocol::{
     arg::Arg,
-    qualified_path::HostId,
+    qualified_path::{HostId, QualifiedPath},
     test_support::{TestCheckout, TestIssue, TestSession},
     CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, NodeId, PreparedTerminalCommand,
     RepoSelector, ResolvedPaneCommand, TerminalStatus,
@@ -2422,7 +2422,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         runner,
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: cb,
-        attachable_store: attachable,
+        attachable_store: attachable.clone(),
         daemon_socket_path: None,
         local_node_id: local_node_id(),
         local_host: lh.clone(),
@@ -2441,6 +2441,11 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         calls.iter().any(|c| c.starts_with("create_workspace") || c.starts_with("select_workspace")),
         "should create or select workspace from prior outcome: {calls:?}"
     );
+
+    let expected_checkout = QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat-x");
+    let store = attachable.lock().expect("attachable store lock");
+    let matching_sets = store.sets_for_checkout(&expected_checkout);
+    assert_eq!(matching_sets.len(), 1, "new checkout should create one attachable set with its stable qualified path");
 }
 
 #[tokio::test]
@@ -2561,7 +2566,10 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         _ => panic!("expected steps"),
     };
 
-    assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat-x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+    assert_eq!(result, CommandValue::CheckoutCreated {
+        branch: "feat-x".into(),
+        path: QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat-x"),
+    });
 }
 
 #[tokio::test]
@@ -3261,8 +3269,10 @@ async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() 
         environment_manager: empty_environment_manager().await,
     };
 
-    let prior =
-        vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat".into(), path: PathBuf::from("/repo/wt-feat") })];
+    let prior = vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
+        branch: "feat".into(),
+        path: QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat"),
+    })];
     let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: None };
     let context = StepExecutionContext::Host(local_node_id());
     let outcome = resolver.resolve("create workspace", &context, action, &prior).await;
@@ -3621,7 +3631,7 @@ async fn executor_step_resolver_prepare_workspace_uses_manager_container_name_fo
 
     let prior = vec![StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
         branch: "feat".into(),
-        path: PathBuf::from("/workspace/wt-feat"),
+        path: QualifiedPath::environment(env_id.clone(), "/workspace/wt-feat"),
     })];
     let action = StepAction::PrepareWorkspace { label: "feat".into(), checkout_path: None, display_host: Some(HostName::new("feta")) };
     let context = StepExecutionContext::Environment(local_node_id(), env_id.clone());
@@ -3630,6 +3640,7 @@ async fn executor_step_resolver_prepare_workspace_uses_manager_container_name_fo
     match outcome {
         Ok(StepOutcome::Produced(CommandValue::PreparedWorkspace(prepared))) => {
             assert_eq!(prepared.display_host, Some(HostName::new("feta")));
+            assert_eq!(prepared.checkout_key, Some(QualifiedPath::environment(env_id.clone(), "/workspace/wt-feat")));
             assert_eq!(prepared.environment_id, Some(env_id));
             assert_eq!(prepared.container_name.as_deref(), Some("mock-container"));
         }
