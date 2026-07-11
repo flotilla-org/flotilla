@@ -3282,6 +3282,7 @@ async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() 
             assert_eq!(prepared.target_node_id, local_node_id());
             assert_eq!(prepared.display_host, None);
             assert_eq!(prepared.checkout_path, PathBuf::from("/repo/wt-feat"));
+            assert_eq!(prepared.checkout_key, Some(QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat")));
             assert!(!prepared.prepared_commands.is_empty(), "default workspace template should produce commands");
         }
         other => panic!("expected PreparedWorkspace outcome, got {other:?}"),
