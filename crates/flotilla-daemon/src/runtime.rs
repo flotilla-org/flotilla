@@ -489,10 +489,22 @@ fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) 
 
 async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id).await?;
-    let hosts = daemon.resource_backend().using::<Host>(namespace);
+    let backend = daemon.resource_backend();
+    let hosts = backend.using::<Host>(namespace);
     let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
     let summary = daemon.local_host_summary().await;
-    let status = HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true };
+    let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
+    if let Some(diagnostics) = resource_store.filter(|diagnostics| !diagnostics.event_log_within_retention()) {
+        warn!(
+            event_count = diagnostics.event_count,
+            object_count = diagnostics.object_count,
+            store_count = diagnostics.store_count,
+            max_retained_events = diagnostics.max_retained_events,
+            "resource event log exceeds retention bound",
+        );
+    }
+    let status =
+        HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true, resource_store };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map(|_| ()).map_err(|err| err.to_string())
 }
 
@@ -1244,6 +1256,10 @@ mod tests {
         assert!(status.ready, "heartbeat should mark host ready");
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
         assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
+        assert!(
+            status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
+            "heartbeat should report a bounded resource event log"
+        );
 
         heartbeat.abort();
         let _ = heartbeat.await;

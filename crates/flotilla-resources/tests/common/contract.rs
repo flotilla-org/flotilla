@@ -135,6 +135,40 @@ pub async fn assert_stale_resource_version_conflicts<F: ResourceContractFixture>
     assert_stale_resource_version_conflicts_with_backend::<F>(in_memory_backend()).await;
 }
 
+pub async fn assert_identical_update_is_noop_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
+    let meta = F::meta("alpha");
+    let spec = F::spec();
+    let created = resolver.create(&meta, &spec).await.expect("create should succeed");
+    let mut watch = resolver.watch(WatchStart::FromVersion(created.metadata.resource_version.clone())).await.expect("watch should succeed");
+
+    let unchanged = resolver.update(&meta, &created.metadata.resource_version, &spec).await.expect("identical update should succeed");
+
+    assert_eq!(unchanged.metadata.resource_version, created.metadata.resource_version);
+    assert!(timeout(Duration::from_millis(100), watch.next()).await.is_err(), "identical update should not emit a watch event");
+}
+
+pub async fn assert_identical_status_update_is_noop_with_backend<F: ResourceContractFixture>(backend: ResourceBackend)
+where
+    <F::Resource as Resource>::Status: Default,
+{
+    let resolver = resolver::<F>(backend, "flotilla");
+    let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
+    let status = <F::Resource as Resource>::Status::default();
+    let status_written =
+        resolver.update_status("alpha", &created.metadata.resource_version, &status).await.expect("initial status update should succeed");
+    let mut watch =
+        resolver.watch(WatchStart::FromVersion(status_written.metadata.resource_version.clone())).await.expect("watch should succeed");
+
+    let unchanged = resolver
+        .update_status("alpha", &status_written.metadata.resource_version, &status)
+        .await
+        .expect("identical status update should succeed");
+
+    assert_eq!(unchanged.metadata.resource_version, status_written.metadata.resource_version);
+    assert!(timeout(Duration::from_millis(100), watch.next()).await.is_err(), "identical status update should not emit a watch event");
+}
+
 pub async fn assert_delete_emits_event_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
     let resolver = resolver::<F>(backend, "flotilla");
     let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
@@ -221,6 +255,57 @@ pub async fn assert_watch_now_semantics_with_backend<F: ResourceContractFixture>
 
 pub async fn assert_watch_now_semantics<F: ResourceContractFixture>() {
     assert_watch_now_semantics_with_backend::<F>(in_memory_backend()).await;
+}
+
+pub async fn assert_watch_retention_expires_only_versions_below_floor_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
+    let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
+    let second = resolver
+        .update(&F::meta("alpha"), &created.metadata.resource_version, &F::updated_spec())
+        .await
+        .expect("first update should succeed");
+    let third =
+        resolver.update(&F::meta("alpha"), &second.metadata.resource_version, &F::spec()).await.expect("second update should succeed");
+    let fourth = resolver
+        .update(&F::meta("alpha"), &third.metadata.resource_version, &F::updated_spec())
+        .await
+        .expect("third update should succeed");
+
+    let mut retained = resolver
+        .watch(WatchStart::FromVersion(second.metadata.resource_version.clone()))
+        .await
+        .expect("watch at compaction floor should succeed");
+    for expected_version in [&third.metadata.resource_version, &fourth.metadata.resource_version] {
+        let event = retained.next().await.expect("retained event").expect("retained event should decode");
+        let WatchEvent::Modified(object) = event else { panic!("expected retained modified event") };
+        assert_eq!(&object.metadata.resource_version, expected_version);
+    }
+
+    let expired = resolver
+        .watch(WatchStart::FromVersion(created.metadata.resource_version.clone()))
+        .await
+        .expect_err("watch below compaction floor should expire");
+    assert_eq!(expired, ResourceError::WatchExpired {
+        requested_version: created.metadata.resource_version,
+        compacted_through: second.metadata.resource_version,
+    });
+}
+
+pub async fn assert_store_diagnostics_report_retained_events_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend.clone(), "flotilla");
+    let first = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
+    let second = resolver
+        .update(&F::meta("alpha"), &first.metadata.resource_version, &F::updated_spec())
+        .await
+        .expect("first update should succeed");
+    resolver.update(&F::meta("alpha"), &second.metadata.resource_version, &F::spec()).await.expect("second update should succeed");
+
+    let diagnostics = backend.diagnostics().await.expect("diagnostics should succeed").expect("embedded backend should report diagnostics");
+    assert_eq!(diagnostics.object_count, 1);
+    assert_eq!(diagnostics.event_count, 2);
+    assert_eq!(diagnostics.store_count, 1);
+    assert_eq!(diagnostics.max_retained_events, 2);
+    assert!(diagnostics.event_log_within_retention());
 }
 
 pub async fn assert_namespace_isolation_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {

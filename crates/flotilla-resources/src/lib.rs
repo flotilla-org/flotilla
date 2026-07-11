@@ -14,6 +14,7 @@ mod presentation;
 mod project;
 mod provisioning_identity;
 mod resource;
+mod retention;
 mod sqlite;
 mod status_patch;
 mod task_workspace;
@@ -55,6 +56,7 @@ pub use resource::{
     api_version, ApiPaths, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, K8sWatchEvent, ObjectMeta,
     OwnerReference, Resource, ResourceObject,
 };
+pub use retention::{EventRetention, ResourceStoreDiagnostics};
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, NoStatusPatch, StatusPatch};
 pub use task_workspace::{TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TaskWorkspaceStatusPatch};

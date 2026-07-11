@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch};
+use crate::{resource::define_resource, retention::ResourceStoreDiagnostics, status_patch::StatusPatch};
 
 define_resource!(Host, "hosts", HostSpec, HostStatus, HostStatusPatch);
 
@@ -18,6 +18,8 @@ pub struct HostStatus {
     pub heartbeat_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_store: Option<ResourceStoreDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

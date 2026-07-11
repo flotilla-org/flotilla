@@ -73,20 +73,22 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.phase = TerminalSessionPhase::Running;
                 status.session_id = Some(session_id.clone());
                 status.pid = *pid;
-                status.started_at = Some(*started_at);
+                status.started_at.get_or_insert(*started_at);
                 status.inner_command_status = Some(InnerCommandStatus::Running);
                 status.message = None;
             }
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
-                status.stopped_at = Some(*stopped_at);
+                status.stopped_at.get_or_insert(*stopped_at);
                 status.inner_command_status = *inner_command_status;
                 status.inner_exit_code = *inner_exit_code;
                 status.message = message.clone();
             }
             Self::MarkFailed { message, stopped_at } => {
                 status.phase = TerminalSessionPhase::Stopped;
-                status.stopped_at = *stopped_at;
+                if let Some(stopped_at) = stopped_at {
+                    status.stopped_at.get_or_insert(*stopped_at);
+                }
                 status.message = Some(message.clone());
             }
         }

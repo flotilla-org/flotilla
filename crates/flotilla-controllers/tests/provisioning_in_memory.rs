@@ -203,11 +203,20 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
         .await;
 
     let workspace = workspaces.get("workspace-a").await.expect("workspace get should succeed");
+    let ready_resource_version = workspace.metadata.resource_version.clone();
     let status = workspace.status.expect("workspace status should be present");
     assert_eq!(status.phase, TaskWorkspacePhase::Ready);
     assert_eq!(status.environment_ref.as_deref(), Some("host-direct-01HXYZ"));
     assert_eq!(status.checkout_ref.as_deref(), Some("checkout-workspace-a"));
     assert_eq!(status.terminal_session_refs, vec!["terminal-workspace-a-coder".to_string()]);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let steady = workspaces.get("workspace-a").await.expect("ready workspace should remain readable");
+    assert_eq!(
+        steady.metadata.resource_version, ready_resource_version,
+        "steady-state reconciliation must not create new resource versions"
+    );
+    assert_eq!(steady.status.expect("steady workspace status").ready_at, status.ready_at);
 
     harness.shutdown().await;
 }
@@ -725,6 +734,7 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
             capabilities: Default::default(),
             heartbeat_at: Some(Utc::now()),
             ready: true,
+            resource_store: None,
         })
         .await
         .expect("host status update should succeed");

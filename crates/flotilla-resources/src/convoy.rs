@@ -178,45 +178,47 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.observed_workflows = Some(observed_workflows.clone());
                 status.tasks = tasks.clone();
                 status.phase = *phase;
-                status.started_at = *started_at;
+                if let Some(started_at) = started_at {
+                    status.started_at.get_or_insert(*started_at);
+                }
             }
             Self::FailInit { phase, message, finished_at } => {
                 status.phase = *phase;
                 status.message = Some(message.clone());
-                status.finished_at = Some(*finished_at);
+                status.finished_at.get_or_insert(*finished_at);
             }
             Self::AdvanceTasksToReady { ready } => {
                 for (task, ready_at) in ready {
                     if let Some(state) = status.tasks.get_mut(task) {
                         state.phase = TaskPhase::Ready;
-                        state.ready_at = Some(*ready_at);
+                        state.ready_at.get_or_insert(*ready_at);
                     }
                 }
             }
             Self::FailConvoy { cancelled_tasks, finished_at, message } => {
                 status.phase = ConvoyPhase::Failed;
-                status.finished_at = Some(*finished_at);
+                status.finished_at.get_or_insert(*finished_at);
                 status.message = message.clone();
                 for (task, cancelled_at) in cancelled_tasks {
                     if let Some(state) = status.tasks.get_mut(task) {
                         state.phase = TaskPhase::Cancelled;
-                        state.finished_at = Some(*cancelled_at);
+                        state.finished_at.get_or_insert(*cancelled_at);
                     }
                 }
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 status.phase = *phase;
                 if let Some(started_at) = started_at {
-                    status.started_at = Some(*started_at);
+                    status.started_at.get_or_insert(*started_at);
                 }
                 if let Some(finished_at) = finished_at {
-                    status.finished_at = Some(*finished_at);
+                    status.finished_at.get_or_insert(*finished_at);
                 }
             }
             Self::TaskLaunching { task, started_at, placement } => {
                 if let Some(state) = status.tasks.get_mut(task) {
                     state.phase = TaskPhase::Launching;
-                    state.started_at = Some(*started_at);
+                    state.started_at.get_or_insert(*started_at);
                     state.placement = Some(placement.clone());
                 }
             }
@@ -228,21 +230,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::MarkTaskCompleted { task, finished_at, message } => {
                 if let Some(state) = status.tasks.get_mut(task) {
                     state.phase = TaskPhase::Completed;
-                    state.finished_at = Some(*finished_at);
+                    state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }
             }
             Self::MarkTaskFailed { task, finished_at, message } => {
                 if let Some(state) = status.tasks.get_mut(task) {
                     state.phase = TaskPhase::Failed;
-                    state.finished_at = Some(*finished_at);
+                    state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
                 }
             }
             Self::MarkTaskCancelled { task, finished_at } => {
                 if let Some(state) = status.tasks.get_mut(task) {
                     state.phase = TaskPhase::Cancelled;
-                    state.finished_at = Some(*finished_at);
+                    state.finished_at.get_or_insert(*finished_at);
                 }
             }
         }

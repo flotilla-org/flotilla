@@ -60,7 +60,7 @@ impl StatusPatch<TaskWorkspaceStatus> for TaskWorkspaceStatusPatch {
                 status.phase = TaskWorkspacePhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
-                status.started_at = Some(*started_at);
+                status.started_at.get_or_insert(*started_at);
                 status.message = None;
             }
             Self::MarkReady { environment_ref, checkout_ref, terminal_session_refs, ready_at } => {
@@ -68,7 +68,7 @@ impl StatusPatch<TaskWorkspaceStatus> for TaskWorkspaceStatusPatch {
                 status.environment_ref = environment_ref.clone();
                 status.checkout_ref = checkout_ref.clone();
                 status.terminal_session_refs = terminal_session_refs.clone();
-                status.ready_at = Some(*ready_at);
+                status.ready_at.get_or_insert(*ready_at);
                 status.message = None;
             }
             Self::MarkTearingDown => {

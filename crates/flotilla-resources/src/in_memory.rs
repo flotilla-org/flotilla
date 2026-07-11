@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use crate::{
     error::ResourceError,
     resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
+    retention::{EventRetention, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -20,6 +21,7 @@ type StoreKey = (String, String, String, String);
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
     generation: Option<String>,
+    event_retention: EventRetention,
 }
 
 #[derive(Debug)]
@@ -27,8 +29,8 @@ struct ResourceStore {
     objects: HashMap<String, Value>,
     next_version: u64,
     watchers: Vec<mpsc::UnboundedSender<StoredEvent>>,
-    // TODO: compact the event log if this backend starts serving long-lived scenarios.
     event_log: Vec<StoredEvent>,
+    compacted_through: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +58,14 @@ impl ResourceStore {
         version
     }
 
-    fn push_event(&mut self, event: StoredEvent) {
+    fn push_event(&mut self, event: StoredEvent, retention: EventRetention) {
+        let excess = self.event_log.len().saturating_add(1).saturating_sub(retention.max_events_per_store());
+        if excess > 0 {
+            if let Some(last_removed) = self.event_log.get(excess - 1) {
+                self.compacted_through = last_removed.version;
+            }
+            self.event_log.drain(..excess);
+        }
         self.event_log.push(event.clone());
         self.watchers.retain(|watcher| watcher.send(event.clone()).is_ok());
     }
@@ -64,13 +73,28 @@ impl ResourceStore {
 
 impl Default for ResourceStore {
     fn default() -> Self {
-        Self { objects: HashMap::new(), next_version: 1, watchers: Vec::new(), event_log: Vec::new() }
+        Self { objects: HashMap::new(), next_version: 1, watchers: Vec::new(), event_log: Vec::new(), compacted_through: 0 }
     }
 }
 
 impl InMemoryBackend {
     pub fn observed() -> Self {
-        Self { stores: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()) }
+        Self { stores: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()), event_retention: EventRetention::default() }
+    }
+
+    pub fn with_event_retention(event_retention: EventRetention) -> Self {
+        Self { stores: Arc::default(), generation: None, event_retention }
+    }
+
+    pub fn observed_with_event_retention(event_retention: EventRetention) -> Self {
+        Self { stores: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()), event_retention }
+    }
+
+    pub(crate) async fn diagnostics(&self) -> Result<ResourceStoreDiagnostics, ResourceError> {
+        let stores = self.stores.lock().await;
+        let object_count = stores.values().map(|store| store.objects.len() as u64).sum();
+        let event_count = stores.values().map(|store| store.event_log.len() as u64).sum();
+        Ok(ResourceStoreDiagnostics::new(object_count, event_count, stores.len() as u64, self.event_retention))
     }
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {
@@ -199,7 +223,7 @@ impl InMemoryBackend {
 
             let encoded = Self::encode_object(&object)?;
             store.objects.insert(meta.name.clone(), encoded.clone());
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Added, object: encoded });
+            store.push_event(StoredEvent { version, kind: StoredEventKind::Added, object: encoded }, self.event_retention);
             Ok(object)
         })
         .await
@@ -218,6 +242,9 @@ impl InMemoryBackend {
             if object.metadata.resource_version != resource_version {
                 return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
             }
+            if object.matches_update(meta, spec)? {
+                return Ok(object);
+            }
 
             let version = store.allocate_version();
             object.metadata.resource_version = version.to_string();
@@ -231,10 +258,10 @@ impl InMemoryBackend {
             let encoded = Self::encode_object(&object)?;
             if object.metadata.deletion_timestamp.is_some() && object.metadata.finalizers.is_empty() {
                 store.objects.remove(&meta.name);
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded });
+                store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
             } else {
                 store.objects.insert(meta.name.clone(), encoded.clone());
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded });
+                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
             }
             Ok(object)
         })
@@ -254,6 +281,9 @@ impl InMemoryBackend {
             if object.metadata.resource_version != resource_version {
                 return Err(ResourceError::conflict(name, "stale resourceVersion"));
             }
+            if object.matches_status(status)? {
+                return Ok(object);
+            }
 
             let version = store.allocate_version();
             object.metadata.resource_version = version.to_string();
@@ -261,7 +291,7 @@ impl InMemoryBackend {
 
             let encoded = Self::encode_object(&object)?;
             store.objects.insert(name.to_string(), encoded.clone());
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded });
+            store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
             Ok(object)
         })
         .await
@@ -277,13 +307,13 @@ impl InMemoryBackend {
                 object.metadata.deletion_timestamp = Some(Utc::now());
                 let encoded = Self::encode_object(&object)?;
                 store.objects.insert(name.to_string(), encoded.clone());
-                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded });
+                store.push_event(StoredEvent { version, kind: StoredEventKind::Modified, object: encoded }, self.event_retention);
                 return Ok(());
             }
 
             let encoded = Self::encode_object(&object)?;
             store.objects.remove(name);
-            store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded });
+            store.push_event(StoredEvent { version, kind: StoredEventKind::Deleted, object: encoded }, self.event_retention);
             Ok(())
         })
         .await
@@ -322,6 +352,12 @@ impl InMemoryBackend {
                     )
                 }
             };
+            if replay_from.is_some_and(|version| version < store.compacted_through) {
+                return Err(ResourceError::WatchExpired {
+                    requested_version: replay_from.expect("checked replay version").to_string(),
+                    compacted_through: store.compacted_through.to_string(),
+                });
+            }
             let replay = match replay_from {
                 Some(version) => store.event_log.iter().filter(|event| event.version > version).cloned().collect(),
                 None => Vec::new(),
