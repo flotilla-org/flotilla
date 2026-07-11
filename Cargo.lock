@@ -1270,6 +1270,7 @@ name = "flotilla-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bon",
  "bytes",
  "chrono",
  "color-eyre",

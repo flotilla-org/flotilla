@@ -22,7 +22,6 @@ use crate::{
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
-const STAGE_4A_AGENT_MESSAGE: &str = "Stage 4a supports tool processes only; agent processes require selector resolution (Stage 4b).";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
@@ -252,20 +251,6 @@ fn bootstrap_outcome(
             )),
             actuations: Vec::new(),
             events: vec![ConvoyEvent::TemplateInvalid { name: template.metadata.name.clone(), errors }],
-        };
-    }
-
-    if template
-        .spec
-        .tasks
-        .iter()
-        .flat_map(|task| task.processes.iter())
-        .any(|process| matches!(process.source, ProcessSource::Agent { .. }))
-    {
-        return InternalReconcileOutcome {
-            patch: Some(controller_patches::fail_init(ConvoyPhase::Failed, STAGE_4A_AGENT_MESSAGE.to_string(), now)),
-            actuations: Vec::new(),
-            events: Vec::new(),
         };
     }
 

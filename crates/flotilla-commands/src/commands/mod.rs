@@ -2,6 +2,7 @@ pub mod agent;
 pub mod checkout;
 pub mod convoy;
 pub mod cr;
+pub mod crew;
 pub mod environment;
 pub mod host;
 pub mod issue;

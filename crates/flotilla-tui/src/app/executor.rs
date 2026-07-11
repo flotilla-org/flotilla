@@ -135,6 +135,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::HostStatus(_)
         | CommandValue::HostProviders(_)
         | CommandValue::FleetList(_)
+        | CommandValue::CrewList(_)
         | CommandValue::FleetReplicaSnapshot(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }

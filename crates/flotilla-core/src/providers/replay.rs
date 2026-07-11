@@ -492,8 +492,16 @@ impl CommandRunner for ReplayRunner {
         Ok(CommandOutput { stdout: stdout.unwrap_or_default(), stderr: stderr.unwrap_or_default(), success: exit_code == 0 })
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
+        self.run(cmd, args, cwd, label).await
+    }
+
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
         true
+    }
+
+    async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -724,11 +732,37 @@ impl CommandRunner for RecordingRunner {
         result
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        let result = self.inner.run_with_input(cmd, args, cwd, label, input).await;
+
+        let request = ChannelRequest::Command { cmd, args };
+        let default = DefaultLabeler.label_for(&request);
+        let explicit = explicit_label(label, &default);
+        let (stdout, stderr, exit_code) = match &result {
+            Ok(out) => (Some(out.clone()), None, 0),
+            Err(err) => (None, Some(err.clone()), 1),
+        };
+        self.session.record(Interaction::Command {
+            label: explicit,
+            cmd: cmd.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            cwd: cwd.to_string_lossy().to_string(),
+            stdout,
+            stderr,
+            exit_code,
+        });
+        result
+    }
+
     /// Delegates to the real runner without recording. `ReplayRunner::exists()`
     /// always returns `true`, so the recording/replay asymmetry is intentional:
     /// `exists()` gates capability checks, not provider data.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.inner.exists(cmd, args).await
+    }
+
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        self.inner.write_file(path, content).await
     }
 }
 

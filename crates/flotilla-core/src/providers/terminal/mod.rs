@@ -25,6 +25,10 @@ pub struct TerminalSession {
 /// No store, no identity management — the `TerminalManager` handles those concerns.
 #[async_trait]
 pub trait TerminalPool: Send + Sync {
+    fn tracks_session_liveness(&self) -> bool {
+        false
+    }
+
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String>;
     async fn ensure_session(
         &self,
@@ -58,4 +62,10 @@ pub trait TerminalPool: Send + Sync {
     }
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String>;
+
+    /// Deliver text to a running session. This trait grows only for concrete
+    /// flotilla consumers; it is not intended to mirror a pool backend's API.
+    async fn deliver(&self, _session_name: &str, _text: &str, _submit: bool) -> Result<(), String> {
+        Err("terminal pool does not support delivery".to_string())
+    }
 }

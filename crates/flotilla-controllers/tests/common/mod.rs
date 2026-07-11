@@ -288,7 +288,7 @@ pub async fn create_stopped_terminal(
         .create(&meta(&fixture.name), &TerminalSessionSpec {
             env_ref: fixture.env_ref,
             role: fixture.role,
-            command: fixture.command,
+            source: flotilla_resources::TerminalSessionSource::Tool { command: fixture.command.clone() },
             cwd: fixture.cwd,
             pool: fixture.pool,
         })
@@ -304,6 +304,9 @@ pub async fn create_stopped_terminal(
             inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
             inner_exit_code: Some(1),
             message: Some(fixture.message),
+            crew: None,
+            launch_command: Some(fixture.command),
+            delivered_message_id: None,
         })
         .await
         .expect("terminal status update should succeed");

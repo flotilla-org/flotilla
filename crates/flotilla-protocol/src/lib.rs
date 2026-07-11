@@ -89,9 +89,10 @@ pub use provider_data::{
     WorkingTreeStatus, Workspace,
 };
 pub use query::{
-    DiscoveryEntry, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListEntry,
-    HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse,
-    RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
+    FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap,
+    ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse,
+    TopologyRoute, UnmetRequirementInfo,
 };
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +108,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.

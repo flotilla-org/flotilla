@@ -8,16 +8,19 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     panel::{PanelRow, PanelSnapshot, PanelValue, ResourceRef},
     qualified_path::{HostId, QualifiedPath},
-    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId,
-    EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, RepoSelector, SystemInfo, ToolInventory, TopologyRoute,
+    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent,
+    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, RepoSelector, SystemInfo, ToolInventory,
+    TopologyRoute,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Environment as ResourceEnvironment,
     EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, TaskPhase, TaskState, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL, TASK_WORKSPACE_LABEL,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ProcessDefinition, ProcessSource, Selector, SnapshotTask, TaskPhase, TaskState,
+    TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, WorkflowSnapshot,
+    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
 };
 
 use super::*;
@@ -124,9 +127,16 @@ async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<D
 }
 
 async fn new_attach_test_daemon(config_base: &Path) -> Arc<InProcessDaemon> {
+    new_attach_test_daemon_with_pool(config_base).await.0
+}
+
+async fn new_attach_test_daemon_with_pool(config_base: &Path) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
     let terminal_pool = Arc::new(FakeTerminalPool::new());
-    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(terminal_pool));
-    InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::local()).await
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn crate::providers::terminal::TerminalPool>),
+    );
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::local()).await;
+    (daemon, terminal_pool)
 }
 
 async fn create_local_attach_environment(daemon: &InProcessDaemon) -> String {
@@ -234,7 +244,7 @@ async fn create_running_attach_session_with_pool(
             &ResourceTerminalSessionSpec {
                 env_ref: env_ref.to_string(),
                 role: role.to_string(),
-                command: "bash".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
                 pool: pool.to_string(),
             },
@@ -279,6 +289,250 @@ async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &s
         })
         .await
         .expect("adopted checkout should be ready");
+}
+
+async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy = convoys
+        .create(&empty_input_meta("demo"), &ConvoySpec {
+            workflow_ref: "coding-review".into(),
+            inputs: BTreeMap::new(),
+            placement_policy: None,
+            repository: None,
+            r#ref: None,
+            project_ref: None,
+            adopted_checkout_ref: None,
+        })
+        .await
+        .expect("create convoy");
+    let processes = vec![
+        ProcessDefinition::builder()
+            .role("coder".to_string())
+            .source(ProcessSource::Agent {
+                selector: Selector { capability: "coding".into() },
+                prompt: Some("Implement the change.".into()),
+            })
+            .build(),
+        ProcessDefinition::builder()
+            .role("reviewer".to_string())
+            .source(ProcessSource::Agent { selector: Selector { capability: "review".into() }, prompt: Some("Review the change.".into()) })
+            .build(),
+    ];
+    convoys
+        .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
+            workflow_snapshot: Some(WorkflowSnapshot {
+                tasks: vec![SnapshotTask { name: "prepare".into(), depends_on: Vec::new(), processes: Vec::new() }, SnapshotTask {
+                    name: "implement".into(),
+                    depends_on: Vec::new(),
+                    processes,
+                }],
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("update convoy status");
+
+    let workspaces = daemon.resource_backend().using::<TaskWorkspace>("flotilla");
+    let workspace = workspaces
+        .create(
+            &input_meta_with_labels(
+                "demo-implement",
+                BTreeMap::from([(CONVOY_LABEL.into(), "demo".into()), (TASK_LABEL.into(), "implement".into())]),
+            ),
+            &TaskWorkspaceSpec {
+                convoy_ref: "demo".into(),
+                task: "implement".into(),
+                placement_policy_ref: "host-direct".into(),
+                adopted_checkout_ref: None,
+            },
+        )
+        .await
+        .expect("create workspace");
+    workspaces
+        .update_status("demo-implement", &workspace.metadata.resource_version, &TaskWorkspaceStatus {
+            phase: TaskWorkspacePhase::Ready,
+            environment_ref: Some(env_ref.into()),
+            terminal_session_refs: vec!["terminal-demo-implement-coder".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("update workspace status");
+
+    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let coder = terminals
+        .create(
+            &input_meta_with_labels(
+                "terminal-demo-implement-coder",
+                BTreeMap::from([
+                    (CONVOY_LABEL.into(), "demo".into()),
+                    (TASK_LABEL.into(), "implement".into()),
+                    (TASK_WORKSPACE_LABEL.into(), "demo-implement".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                ]),
+            ),
+            &ResourceTerminalSessionSpec {
+                env_ref: env_ref.into(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "coding".into() },
+                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into() },
+                    context: TerminalCrewContext { namespace: "flotilla".into(), convoy: "demo".into(), vessel: "demo-implement".into() },
+                    message: None,
+                },
+                cwd: "/repo".into(),
+                pool: "fake-terminals".into(),
+            },
+        )
+        .await
+        .expect("create coder session");
+    terminals
+        .update_status("terminal-demo-implement-coder", &coder.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            session_id: Some("session-coder".into()),
+            crew: Some(flotilla_resources::CrewSessionStatus {
+                id: "crew-coder".into(),
+                adapter: "codex".into(),
+                model: None,
+                stance: "trusted-implicit".into(),
+            }),
+            launch_command: Some("codex".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("run coder session");
+}
+
+#[tokio::test]
+async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    let context = CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() };
+
+    let response = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryCrewList { context: context.clone() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("crew list query");
+    let CommandValue::CrewList(response) = response else { panic!("expected crew list") };
+    assert_eq!(response.members.iter().map(|member| (member.role.as_str(), member.state.as_str())).collect::<Vec<_>>(), vec![
+        ("coder", "active"),
+        ("reviewer", "latent")
+    ]);
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewHandoff { context, target: "reviewer".into(), message: "Review commit abc123".into() },
+        })
+        .await
+        .expect("handoff command");
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    let reviewer = daemon
+        .resource_backend()
+        .using::<ResourceTerminalSession>("flotilla")
+        .get("terminal-demo-implement-reviewer")
+        .await
+        .expect("reviewer session should be defined");
+    assert!(
+        matches!(reviewer.spec.source, TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Review commit abc123")
+    );
+    assert_eq!(reviewer.metadata.labels.get(TASK_ORDINAL_LABEL).map(String::as_str), Some("001"));
+    assert_eq!(reviewer.metadata.labels.get(PROCESS_ORDINAL_LABEL).map(String::as_str), Some("001"));
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewHandoff {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                target: "reviewer".into(),
+                message: "Use the amended commit".into(),
+            },
+        })
+        .await
+        .expect("handoff while reviewer is starting");
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    let reviewer = daemon
+        .resource_backend()
+        .using::<ResourceTerminalSession>("flotilla")
+        .get("terminal-demo-implement-reviewer")
+        .await
+        .expect("reviewer session should still exist");
+    assert!(matches!(
+        reviewer.spec.source,
+        TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Use the amended commit"
+    ));
+
+    let explicit_context = CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".into()),
+        convoy: Some("demo".into()),
+        vessel: Some("demo-implement".into()),
+        role: Some("reviewer".into()),
+    };
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewHandoff {
+                context: explicit_context.clone(),
+                target: "coder".into(),
+                message: "Address the review findings".into(),
+            },
+        })
+        .await
+        .expect("handoff to active coder");
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert_eq!(terminal_pool.delivered.lock().await.as_slice(), &[(
+        "session-coder".to_string(),
+        "Address the review findings".to_string(),
+        true
+    )]);
+
+    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let coder = terminals.get("terminal-demo-implement-coder").await.expect("coder");
+    terminals
+        .update_status("terminal-demo-implement-coder", &coder.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Stopped,
+            session_id: Some("session-coder".into()),
+            crew: coder.status.as_ref().and_then(|status| status.crew.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("stop coder");
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewHandoff { context: explicit_context, target: "coder".into(), message: "Resume after review".into() },
+        })
+        .await
+        .expect("revive coder");
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    let coder = terminals.get("terminal-demo-implement-coder").await.expect("restarting coder");
+    assert_eq!(coder.status.expect("coder status").phase, ResourceTerminalSessionPhase::Starting);
+    assert!(
+        matches!(coder.spec.source, TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Resume after review")
+    );
 }
 
 #[test]
@@ -685,6 +939,73 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
         .expect("attach query should execute");
 
     assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach cleat-session-1".to_string() });
+}
+
+#[tokio::test]
+async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    let sessions = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let created = sessions
+        .create(
+            &input_meta_with_labels(
+                "terminal-convoy-a-implement-coder",
+                BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+                    (TASK_LABEL.to_string(), "implement".to_string()),
+                    (TASK_WORKSPACE_LABEL.to_string(), "convoy-a-implement".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]),
+            ),
+            &ResourceTerminalSessionSpec {
+                env_ref,
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector { capability: "coding".to_string() },
+                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into() },
+                    context: TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "convoy-a".into(),
+                        vessel: "convoy-a-implement".into(),
+                    },
+                    message: None,
+                },
+                cwd: "/repo".to_string(),
+                pool: "fake-terminals".to_string(),
+            },
+        )
+        .await
+        .expect("starting agent session");
+    sessions
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            session_id: Some("agent-session".to_string()),
+            launch_command: None,
+            ..Default::default()
+        })
+        .await
+        .expect("malformed running status");
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    assert_eq!(result, CommandValue::Error {
+        message: "agent terminal session terminal-convoy-a-implement-coder has no recorded launch command".to_string()
+    });
 }
 
 #[tokio::test]

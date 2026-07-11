@@ -1,17 +1,119 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch};
+use crate::{
+    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, Resource, ResourceObject, Selector, TaskWorkspace,
+    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+};
 
 define_resource!(TerminalSession, "terminalsessions", TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch);
+
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+pub struct TerminalSessionIdentity {
+    pub vessel: String,
+    pub convoy: String,
+    pub leg: String,
+    pub role: String,
+    pub task_index: usize,
+    pub process_index: usize,
+    #[builder(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl TerminalSessionIdentity {
+    pub fn name(&self) -> String {
+        format!("terminal-{}-{}", self.vessel, self.role)
+    }
+
+    pub fn input_meta(&self) -> InputMeta {
+        let mut labels = self.labels.clone();
+        labels.extend([
+            (CONVOY_LABEL.to_string(), self.convoy.clone()),
+            (TASK_LABEL.to_string(), self.leg.clone()),
+            (TASK_WORKSPACE_LABEL.to_string(), self.vessel.clone()),
+            (ROLE_LABEL.to_string(), self.role.clone()),
+            (TASK_ORDINAL_LABEL.to_string(), format!("{:03}", self.task_index)),
+            (PROCESS_ORDINAL_LABEL.to_string(), format!("{:03}", self.process_index)),
+        ]);
+        InputMeta::builder()
+            .name(self.name())
+            .labels(labels)
+            .owner_references(vec![OwnerReference {
+                api_version: format!("{}/{}", TaskWorkspace::API_PATHS.group, TaskWorkspace::API_PATHS.version),
+                kind: TaskWorkspace::API_PATHS.kind.to_string(),
+                name: self.vessel.clone(),
+                controller: true,
+            }])
+            .build()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSessionAttachTarget<'a> {
+    pub session_id: &'a str,
+    pub launch_command: &'a str,
+}
+
+pub fn terminal_session_attach_target(session: &ResourceObject<TerminalSession>) -> Result<TerminalSessionAttachTarget<'_>, String> {
+    let status = session
+        .status
+        .as_ref()
+        .filter(|status| status.phase == TerminalSessionPhase::Running)
+        .ok_or_else(|| format!("terminal session {} is not running and cannot be attached", session.metadata.name))?;
+    let session_id =
+        status.session_id.as_deref().ok_or_else(|| format!("running terminal session {} has no session id", session.metadata.name))?;
+    let launch_command = status.launch_command.as_deref().or(match &session.spec.source {
+        TerminalSessionSource::Tool { command } => Some(command.as_str()),
+        TerminalSessionSource::Agent { .. } => None,
+    });
+    let launch_command =
+        launch_command.ok_or_else(|| format!("agent terminal session {} has no recorded launch command", session.metadata.name))?;
+    Ok(TerminalSessionAttachTarget { session_id, launch_command })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSessionSpec {
     pub env_ref: String,
     pub role: String,
-    pub command: String,
+    pub source: TerminalSessionSource,
     pub cwd: String,
     pub pool: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TerminalSessionSource {
+    Tool {
+        command: String,
+    },
+    Agent {
+        selector: Selector,
+        brief: TerminalBrief,
+        context: TerminalCrewContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<TerminalCrewMessage>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalBrief {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCrewContext {
+    pub namespace: String,
+    pub convoy: String,
+    pub vessel: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCrewMessage {
+    pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +122,7 @@ pub enum TerminalSessionPhase {
     Starting,
     Running,
     Stopped,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,14 +148,36 @@ pub struct TerminalSessionStatus {
     pub inner_exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crew: Option<CrewSessionStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewSessionStatus {
+    pub id: String,
+    pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub stance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSessionStatusPatch {
+    MarkStarting,
     MarkRunning {
         session_id: String,
         pid: Option<i64>,
         started_at: DateTime<Utc>,
+        crew: Option<CrewSessionStatus>,
+        launch_command: String,
+        delivered_message_id: Option<String>,
+    },
+    MarkMessageDelivered {
+        message_id: String,
     },
     MarkStopped {
         stopped_at: DateTime<Utc>,
@@ -69,14 +194,21 @@ pub enum TerminalSessionStatusPatch {
 impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
     fn apply(&self, status: &mut TerminalSessionStatus) {
         match self {
-            Self::MarkRunning { session_id, pid, started_at } => {
+            Self::MarkStarting => {
+                *status = TerminalSessionStatus::default();
+            }
+            Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.phase = TerminalSessionPhase::Running;
                 status.session_id = Some(session_id.clone());
                 status.pid = *pid;
                 status.started_at = Some(*started_at);
                 status.inner_command_status = Some(InnerCommandStatus::Running);
                 status.message = None;
+                status.crew = crew.clone();
+                status.launch_command = Some(launch_command.clone());
+                status.delivered_message_id = delivered_message_id.clone();
             }
+            Self::MarkMessageDelivered { message_id } => status.delivered_message_id = Some(message_id.clone()),
             Self::MarkStopped { stopped_at, inner_command_status, inner_exit_code, message } => {
                 status.phase = TerminalSessionPhase::Stopped;
                 status.stopped_at = Some(*stopped_at);
@@ -85,7 +217,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.message = message.clone();
             }
             Self::MarkFailed { message, stopped_at } => {
-                status.phase = TerminalSessionPhase::Stopped;
+                status.phase = TerminalSessionPhase::Failed;
                 status.stopped_at = *stopped_at;
                 status.message = Some(message.clone());
             }

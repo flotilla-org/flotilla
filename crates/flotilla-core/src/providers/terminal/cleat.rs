@@ -48,6 +48,10 @@ impl CleatTerminalPool {
 
 #[async_trait]
 impl TerminalPool for CleatTerminalPool {
+    fn tracks_session_liveness(&self) -> bool {
+        true
+    }
+
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
         let output = run!(self.runner, &self.binary, &["list", "--json"], Path::new("/"))?;
         let sessions = Self::parse_list_output(&output)?;
@@ -126,6 +130,15 @@ impl TerminalPool for CleatTerminalPool {
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
         run!(self.runner, &self.binary, &["kill", session_name], Path::new("/"))?;
+        Ok(())
+    }
+
+    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
+        let mut args = vec!["send", session_name, text];
+        if submit {
+            args.push("--submit");
+        }
+        run!(self.runner, &self.binary, &args, Path::new("/"))?;
         Ok(())
     }
 }
@@ -239,6 +252,18 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);
+    }
+
+    #[tokio::test]
+    async fn deliver_submits_text_to_the_existing_session() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+
+        pool.deliver("reviewer-session", "Please review commit abc123", true).await.expect("deliver message");
+
+        let calls = runner.calls();
+        assert_eq!(calls[0].0, "cleat");
+        assert_eq!(calls[0].1, vec!["send", "reviewer-session", "Please review commit abc123", "--submit"]);
     }
 
     // ── attach_args tests ──────────────────────────────────────────

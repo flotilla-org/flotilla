@@ -513,17 +513,20 @@ fn snapshot_state_allows_advancement_without_template() {
 }
 
 #[test]
-fn bootstrap_rejects_agent_processes_in_stage_4a() {
+fn bootstrap_preserves_agent_processes_for_runtime_resolution() {
     let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), None);
     let template = valid_workflow_template_object("review-and-fix");
 
     let outcome = reconcile(&convoy, Some(&template), timestamp(10));
 
-    assert!(matches!(
-        outcome.patch,
-        Some(ConvoyStatusPatch::FailInit { phase: ConvoyPhase::Failed, ref message, .. })
-            if message == "Stage 4a supports tool processes only; agent processes require selector resolution (Stage 4b)."
-    ));
+    let Some(ConvoyStatusPatch::Bootstrap { workflow_snapshot, .. }) = outcome.patch else {
+        panic!("agent workflow should bootstrap");
+    };
+    let ProcessSource::Agent { selector, prompt } = &workflow_snapshot.tasks[0].processes[0].source else {
+        panic!("agent source should survive in the workflow snapshot");
+    };
+    assert_eq!(selector.capability, "code");
+    assert_eq!(prompt.as_deref(), Some("Convoy convoy-a - implement Retry logic on branch fix-retry-logic."));
 }
 
 #[tokio::test]

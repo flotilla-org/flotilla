@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use std::{
     fs,
     path::{Path, PathBuf},
