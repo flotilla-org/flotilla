@@ -41,8 +41,8 @@ pub use host::{Host, HostSpec, HostStatus, HostStatusPatch};
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
 pub use labels::{
-    LifecycleAuthority, AUTHORITY_LABEL, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, TASK_LABEL,
-    TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    LifecycleAuthority, AUTHORITY_LABEL, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL,
+    TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
 };
 pub use placement_policy::{
     DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,

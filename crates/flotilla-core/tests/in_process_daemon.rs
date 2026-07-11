@@ -40,6 +40,10 @@ use flotilla_protocol::{
     Issue, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory,
     TopologyRoute, WorkItemKind,
 };
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec,
+    REPO_KEY_LABEL, REPO_LABEL,
+};
 use tokio::sync::Notify;
 
 struct FixedRemoteHostDetector {
@@ -1631,6 +1635,105 @@ async fn local_direct_repo_refresh_stamps_discovered_checkout_environment_id() {
     let checkout =
         snapshot.providers.checkouts.values().find(|checkout| checkout.branch == "main").expect("local checkout should be present");
     assert_eq!(checkout.environment_id.as_ref(), Some(daemon.local_environment_id()));
+}
+
+#[tokio::test]
+async fn repo_refresh_reconciles_observed_checkouts() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    let feature_path = temp.path().join("feature");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone())
+        .branch("main", true)
+        .checkout("main")
+        .is_main(true)
+        .path(&repo)
+        .build()
+        .checkout("feature")
+        .path(&feature_path)
+        .build()
+        .build();
+    let mut discovery = fake_vcs_discovery(Arc::clone(&state));
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    let first = observed.list().await.expect("observed checkout list should succeed");
+    assert_eq!(first.items.len(), 2);
+
+    let main = first
+        .items
+        .iter()
+        .find(|checkout| matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.is_main))
+        .expect("main observed checkout should exist");
+    let feature = first
+        .items
+        .iter()
+        .find(|checkout| matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if !spec.is_main))
+        .expect("feature observed checkout should exist");
+    let feature_name = feature.metadata.name.clone();
+    let feature_path_string = feature_path.to_string_lossy().to_string();
+    let repo_key = main.metadata.labels.get(REPO_KEY_LABEL).expect("observed checkout should carry a repo key").clone();
+    assert_eq!(main.metadata.labels.get(REPO_LABEL).map(String::as_str), Some("github-com-owner-repo"));
+    assert_eq!(main.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
+    match &main.spec {
+        ResourceCheckoutSpec::Observed(spec) => assert_eq!(spec.repo_ref, "github-com-owner-repo"),
+        other => panic!("expected observed checkout spec, got {other:?}"),
+    }
+
+    {
+        let mut state = state.write().expect("fake VCS state should not be poisoned");
+        let feature = state.checkouts.iter_mut().find(|(_, checkout)| checkout.branch == "feature").expect("feature checkout");
+        feature.1.branch = "feature-renamed".to_string();
+        state.checkouts.retain(|(_, checkout)| checkout.branch != "main");
+    }
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    let second = observed.list().await.expect("updated observed checkout list should succeed");
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].metadata.name, feature_name, "checkout identity should follow its stable path");
+    match &second.items[0].spec {
+        ResourceCheckoutSpec::Observed(ObservedCheckoutSpec { r#ref, path, repo_ref, is_main }) => {
+            assert_eq!(r#ref, "feature-renamed");
+            assert_eq!(path, &feature_path_string);
+            assert_eq!(repo_ref, "github-com-owner-repo");
+            assert!(!is_main);
+        }
+        other => panic!("expected observed checkout spec, got {other:?}"),
+    }
+
+    observed
+        .create(
+            &InputMeta::builder()
+                .name("adopted-checkout-feature".to_string())
+                .labels(std::collections::BTreeMap::from([
+                    (flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string()),
+                    (REPO_KEY_LABEL.to_string(), repo_key),
+                ]))
+                .build(),
+            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "feature-renamed".to_string(),
+                path: feature_path_string,
+                repo_ref: "github-com-owner-repo".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("adopted checkout should be creatable");
+
+    {
+        let mut state = state.write().expect("fake VCS state should not be poisoned");
+        state.checkouts.clear();
+    }
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    let third = observed.list().await.expect("final observed checkout list should succeed");
+    assert_eq!(third.items.len(), 1, "adopted checkout must not be deleted by observed reconciliation");
+    assert_eq!(third.items[0].metadata.name, "adopted-checkout-feature");
 }
 
 #[tokio::test]
