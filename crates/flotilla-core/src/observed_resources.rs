@@ -64,8 +64,8 @@ pub async fn reconcile_checkouts(
 }
 
 fn canonical_repo_url(identity: &RepoIdentity) -> Result<String, String> {
-    if identity.authority == "unknown" {
-        return Err("cannot derive observed checkout identity from an unknown repository remote".to_string());
+    if matches!(identity.authority.as_str(), "local" | "unknown") {
+        return Err("cannot derive observed checkout identity without a recognized repository remote".to_string());
     }
     canonicalize_repo_url(&format!("https://{}/{}", identity.authority, identity.path.trim_start_matches('/')))
 }
@@ -130,6 +130,13 @@ mod tests {
     #[test]
     fn canonical_repo_url_rejects_unknown_repo_identity() {
         let identity = RepoIdentity { authority: "unknown".to_string(), path: "not-a-remote".to_string() };
+
+        assert!(canonical_repo_url(&identity).is_err());
+    }
+
+    #[test]
+    fn canonical_repo_url_rejects_local_path_identity() {
+        let identity = RepoIdentity { authority: "local".to_string(), path: "/Users/alice/dev/project".to_string() };
 
         assert!(canonical_repo_url(&identity).is_err());
     }
