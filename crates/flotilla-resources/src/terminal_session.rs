@@ -4,46 +4,48 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, Resource, ResourceObject, Selector, TaskWorkspace,
-    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, Resource, ResourceObject, Selector, Vessel,
+    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 define_resource!(TerminalSession, "terminalsessions", TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch);
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TerminalSessionIdentity {
-    pub vessel: String,
+    /// The Vessel resource name (unique in the namespace, e.g. `conv-implement`).
+    pub vessel_ref: String,
     pub convoy: String,
-    pub leg: String,
+    /// The within-convoy vessel name (the requirement / work key, e.g. `implement`).
+    pub vessel: String,
     pub role: String,
-    pub task_index: usize,
-    pub process_index: usize,
+    pub vessel_index: usize,
+    pub crew_index: usize,
     #[builder(default)]
     pub labels: BTreeMap<String, String>,
 }
 
 impl TerminalSessionIdentity {
     pub fn name(&self) -> String {
-        format!("terminal-{}-{}", self.vessel, self.role)
+        format!("terminal-{}-{}", self.vessel_ref, self.role)
     }
 
     pub fn input_meta(&self) -> InputMeta {
         let mut labels = self.labels.clone();
         labels.extend([
             (CONVOY_LABEL.to_string(), self.convoy.clone()),
-            (TASK_LABEL.to_string(), self.leg.clone()),
-            (TASK_WORKSPACE_LABEL.to_string(), self.vessel.clone()),
+            (VESSEL_LABEL.to_string(), self.vessel.clone()),
+            (VESSEL_REF_LABEL.to_string(), self.vessel_ref.clone()),
             (ROLE_LABEL.to_string(), self.role.clone()),
-            (TASK_ORDINAL_LABEL.to_string(), format!("{:03}", self.task_index)),
-            (PROCESS_ORDINAL_LABEL.to_string(), format!("{:03}", self.process_index)),
+            (VESSEL_ORDINAL_LABEL.to_string(), format!("{:03}", self.vessel_index)),
+            (CREW_ORDINAL_LABEL.to_string(), format!("{:03}", self.crew_index)),
         ]);
         InputMeta::builder()
             .name(self.name())
             .labels(labels)
             .owner_references(vec![OwnerReference {
-                api_version: format!("{}/{}", TaskWorkspace::API_PATHS.group, TaskWorkspace::API_PATHS.version),
-                kind: TaskWorkspace::API_PATHS.kind.to_string(),
-                name: self.vessel.clone(),
+                api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
+                kind: Vessel::API_PATHS.kind.to_string(),
+                name: self.vessel_ref.clone(),
                 controller: true,
             }])
             .build()
@@ -107,7 +109,8 @@ pub struct TerminalBrief {
 pub struct TerminalCrewContext {
     pub namespace: String,
     pub convoy: String,
-    pub vessel: String,
+    /// The Vessel resource name.
+    pub vessel_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

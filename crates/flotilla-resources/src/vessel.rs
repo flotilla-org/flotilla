@@ -3,19 +3,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch};
 
-define_resource!(TaskWorkspace, "taskworkspaces", TaskWorkspaceSpec, TaskWorkspaceStatus, TaskWorkspaceStatusPatch);
+define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskWorkspaceSpec {
+pub struct VesselSpec {
     pub convoy_ref: String,
-    pub task: String,
+    /// The within-convoy vessel name (the requirement / work key, e.g. `implement`).
+    pub vessel_name: String,
     pub placement_policy_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted_checkout_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskWorkspacePhase {
+pub enum VesselPhase {
     #[default]
     Pending,
     Provisioning,
@@ -25,8 +26,8 @@ pub enum TaskWorkspacePhase {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskWorkspaceStatus {
-    pub phase: TaskWorkspacePhase,
+pub struct VesselStatus {
+    pub phase: VesselPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,25 +47,25 @@ pub struct TaskWorkspaceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskWorkspaceStatusPatch {
+pub enum VesselStatusPatch {
     MarkProvisioning { observed_policy_ref: String, observed_policy_version: String, started_at: DateTime<Utc> },
     MarkReady { environment_ref: Option<String>, checkout_ref: Option<String>, terminal_session_refs: Vec<String>, ready_at: DateTime<Utc> },
     MarkTearingDown,
     MarkFailed { message: String },
 }
 
-impl StatusPatch<TaskWorkspaceStatus> for TaskWorkspaceStatusPatch {
-    fn apply(&self, status: &mut TaskWorkspaceStatus) {
+impl StatusPatch<VesselStatus> for VesselStatusPatch {
+    fn apply(&self, status: &mut VesselStatus) {
         match self {
             Self::MarkProvisioning { observed_policy_ref, observed_policy_version, started_at } => {
-                status.phase = TaskWorkspacePhase::Provisioning;
+                status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
                 status.observed_policy_version = Some(observed_policy_version.clone());
                 status.started_at.get_or_insert(*started_at);
                 status.message = None;
             }
             Self::MarkReady { environment_ref, checkout_ref, terminal_session_refs, ready_at } => {
-                status.phase = TaskWorkspacePhase::Ready;
+                status.phase = VesselPhase::Ready;
                 status.environment_ref = environment_ref.clone();
                 status.checkout_ref = checkout_ref.clone();
                 status.terminal_session_refs = terminal_session_refs.clone();
@@ -72,10 +73,10 @@ impl StatusPatch<TaskWorkspaceStatus> for TaskWorkspaceStatusPatch {
                 status.message = None;
             }
             Self::MarkTearingDown => {
-                status.phase = TaskWorkspacePhase::TearingDown;
+                status.phase = VesselPhase::TearingDown;
             }
             Self::MarkFailed { message } => {
-                status.phase = TaskWorkspacePhase::Failed;
+                status.phase = VesselPhase::Failed;
                 status.message = Some(message.clone());
             }
         }

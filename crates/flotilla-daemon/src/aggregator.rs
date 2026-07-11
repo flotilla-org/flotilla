@@ -8,9 +8,9 @@ use flotilla_protocol::{
     DaemonEvent, FleetReplicaSnapshot, HostName,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, Presentation, ProcessSource, Resource, ResourceError,
-    ResourceList, ResourceObject, SnapshotTask, TaskPhase as ResourceLegPhase, TaskState, TypedResolver, WatchEvent, WatchStart,
-    CONVOY_LABEL, TASK_LABEL,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
+    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceLegPhase, WorkState, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -118,8 +118,8 @@ impl Aggregator {
     fn apply_presentation(&mut self, presentation: &ResourceObject<Presentation>) -> Option<(String, String)> {
         let namespace = presentation.metadata.namespace.clone();
         let convoy = presentation.metadata.labels.get(CONVOY_LABEL)?.clone();
-        let leg = presentation.metadata.labels.get(TASK_LABEL)?.clone();
-        let key = (namespace.clone(), convoy.clone(), leg);
+        let vessel = presentation.metadata.labels.get(VESSEL_LABEL)?.clone();
+        let key = (namespace.clone(), convoy.clone(), vessel);
         match presentation.status.as_ref().and_then(|status| status.observed_workspace_ref.clone()) {
             Some(workspace_ref) => {
                 self.presentation_workspaces.insert(key, workspace_ref);
@@ -137,9 +137,9 @@ impl Aggregator {
             WatchEvent::Deleted(presentation) => {
                 let namespace = presentation.metadata.namespace.clone();
                 let convoy = presentation.metadata.labels.get(CONVOY_LABEL).cloned();
-                let leg = presentation.metadata.labels.get(TASK_LABEL).cloned();
-                if let (Some(convoy), Some(leg)) = (convoy, leg) {
-                    self.presentation_workspaces.remove(&(namespace.clone(), convoy.clone(), leg));
+                let vessel = presentation.metadata.labels.get(VESSEL_LABEL).cloned();
+                if let (Some(convoy), Some(vessel)) = (convoy, vessel) {
+                    self.presentation_workspaces.remove(&(namespace.clone(), convoy.clone(), vessel));
                     Some((namespace, convoy))
                 } else {
                     None
@@ -156,8 +156,8 @@ impl Aggregator {
             let mut view = self.state.write().await;
             let Some(row) = view.local_rows.get_mut(&reference) else { return };
             for child in &mut row.children {
-                let Some(leg) = child.values.get("name").and_then(PanelValue::as_str) else { continue };
-                child.intents = self.intents_for_leg(namespace, convoy, leg);
+                let Some(vessel) = child.values.get("name").and_then(PanelValue::as_str) else { continue };
+                child.intents = self.intents_for_vessel(namespace, convoy, vessel);
             }
             let changed = row.clone();
             view.seq = view.seq.saturating_add(1);
@@ -273,12 +273,13 @@ impl Aggregator {
         ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
     }
 
-    fn intents_for_leg(&self, namespace: &str, convoy: &str, leg: &str) -> Vec<RowIntent> {
+    fn intents_for_vessel(&self, namespace: &str, convoy: &str, vessel: &str) -> Vec<RowIntent> {
+        let attach_ref = self.presentation_workspaces.get(&(namespace.to_string(), convoy.to_string(), vessel.to_string())).cloned();
         let mut intents = Vec::new();
-        if let Some(workspace_ref) = self.presentation_workspaces.get(&(namespace.to_string(), convoy.to_string(), leg.to_string())) {
-            intents.push(RowIntent::vessel("attach", workspace_ref, self.local_host.clone()));
+        if let Some(attach_ref) = attach_ref.clone() {
+            intents.push(RowIntent::vessel("attach", namespace, convoy, vessel, self.local_host.clone(), Some(attach_ref)));
         }
-        intents.push(RowIntent::leg("complete-leg", namespace, convoy, leg, self.local_host.clone()));
+        intents.push(RowIntent::vessel("complete-work", namespace, convoy, vessel, self.local_host.clone(), None));
         intents
     }
 
@@ -293,10 +294,10 @@ impl Aggregator {
             .and_then(|status| status.workflow_snapshot.as_ref())
             .map(|snapshot| {
                 snapshot
-                    .tasks
+                    .vessels
                     .iter()
                     .map(|definition| {
-                        self.summarize_leg(&resource, definition, status.and_then(|status| status.tasks.get(&definition.name)))
+                        self.summarize_vessel(&resource, definition, status.and_then(|status| status.work.get(&definition.name)))
                     })
                     .collect()
             })
@@ -317,15 +318,15 @@ impl Aggregator {
         PanelRow { resource, values, intents: Vec::new(), children, depends_on: Vec::new() }
     }
 
-    fn summarize_leg(&self, convoy_ref: &ResourceRef, definition: &SnapshotTask, state: Option<&TaskState>) -> PanelRow {
-        let resource = convoy_ref.subresource(format!("legs/{}", definition.name));
+    fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> PanelRow {
+        let resource = convoy_ref.subresource(format!("vessels/{}", definition.name));
         let crew = definition
-            .processes
+            .crew
             .iter()
             .map(|process| {
                 let command_preview = match &process.source {
-                    ProcessSource::Tool { command } => command.clone(),
-                    ProcessSource::Agent { selector, prompt } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
+                    CrewSource::Tool { command } => command.clone(),
+                    CrewSource::Agent { selector, prompt } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
                 };
                 PanelValue::Map(BTreeMap::from([
                     ("role".to_string(), PanelValue::String(process.role.clone())),
@@ -345,8 +346,8 @@ impl Aggregator {
         insert_optional_timestamp(&mut values, "started_at", state.and_then(|state| state.started_at));
         insert_optional_timestamp(&mut values, "finished_at", state.and_then(|state| state.finished_at));
         insert_optional_string(&mut values, "message", state.and_then(|state| state.message.clone()));
-        let depends_on = definition.depends_on.iter().map(|name| convoy_ref.subresource(format!("legs/{name}"))).collect();
-        let intents = self.intents_for_leg(&convoy_ref.namespace, &convoy_ref.name, &definition.name);
+        let depends_on = definition.depends_on.iter().map(|name| convoy_ref.subresource(format!("vessels/{name}"))).collect();
+        let intents = self.intents_for_vessel(&convoy_ref.namespace, &convoy_ref.name, &definition.name);
         PanelRow { resource, values, intents, children: Vec::new(), depends_on }
     }
 }
@@ -367,7 +368,7 @@ fn set_row_host(row: &mut PanelRow, host: &HostName) {
     }
     for intent in &mut row.intents {
         match &mut intent.target {
-            IntentTarget::Vessel { host: intent_host, .. } | IntentTarget::Leg { host: intent_host, .. } => {
+            IntentTarget::Vessel { host: intent_host, .. } => {
                 *intent_host = host.clone();
             }
         }

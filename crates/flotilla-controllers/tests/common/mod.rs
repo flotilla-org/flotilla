@@ -5,11 +5,11 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, DockerCheckoutStrategy, DockerEnvironmentSpec,
+    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
     DockerPerTaskPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ProcessDefinition,
-    ProcessSource, ResourceBackend, SnapshotTask, TaskWorkspace, TaskWorkspaceSpec, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSpec, TerminalSessionStatus, WorkflowSnapshot,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
+    WorkflowSnapshot,
 };
 use tokio::{
     task::JoinHandle,
@@ -43,7 +43,7 @@ pub fn labeled_meta(name: &str, labels: impl IntoIterator<Item = (String, String
     controller_meta().name(name).labels(labels.into_iter().collect()).call()
 }
 
-pub fn task_workspace_meta(name: &str, repo_url: &str) -> InputMeta {
+pub fn vessel_meta(name: &str, repo_url: &str) -> InputMeta {
     let canonical_repo = canonicalize_repo_url(repo_url).expect("repo URL should canonicalize");
     controller_meta().name(name).labels([("flotilla.work/repo-key".to_string(), repo_key(&canonical_repo))].into_iter().collect()).call()
 }
@@ -72,12 +72,12 @@ pub async fn create_convoy_with_single_task(
     convoys
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
-                tasks: vec![SnapshotTask {
+                vessels: vec![VesselRequirement {
                     name: task.to_string(),
                     depends_on: Vec::new(),
-                    processes: vec![ProcessDefinition::builder()
+                    crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
-                        .source(ProcessSource::Tool { command: "cargo test".to_string() })
+                        .source(CrewSource::Tool { command: "cargo test".to_string() })
                         .build()],
                 }],
             }),
@@ -96,12 +96,12 @@ pub async fn create_workspace(
     task: &str,
     placement_policy_ref: &str,
     repo_url: &str,
-) -> flotilla_resources::ResourceObject<TaskWorkspace> {
-    let workspaces = backend.clone().using::<TaskWorkspace>(namespace);
+) -> flotilla_resources::ResourceObject<Vessel> {
+    let workspaces = backend.clone().using::<Vessel>(namespace);
     workspaces
-        .create(&task_workspace_meta(name, repo_url), &TaskWorkspaceSpec {
+        .create(&vessel_meta(name, repo_url), &VesselSpec {
             convoy_ref: convoy_ref.to_string(),
-            task: task.to_string(),
+            vessel_name: task.to_string(),
             placement_policy_ref: placement_policy_ref.to_string(),
             adopted_checkout_ref: None,
         })

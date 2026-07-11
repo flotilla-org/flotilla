@@ -125,16 +125,16 @@ async fn convoy_controller_roundtrip_and_cel_validation() -> Result<(), Box<dyn 
     apply_status_patch(
         &convoys,
         &created.metadata.name,
-        &external_patches::mark_task_completed("implement".to_string(), chrono::Utc::now(), Some("implemented".to_string())),
+        &external_patches::mark_work_completed("implement".to_string(), chrono::Utc::now(), Some("implemented".to_string())),
     )
     .await?;
     let ready_review = reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;
-    assert!(matches!(ready_review, Some(flotilla_resources::ConvoyStatusPatch::AdvanceTasksToReady { .. })));
+    assert!(matches!(ready_review, Some(flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. })));
 
     apply_status_patch(
         &convoys,
         &created.metadata.name,
-        &external_patches::mark_task_completed("review".to_string(), chrono::Utc::now(), Some("reviewed".to_string())),
+        &external_patches::mark_work_completed("review".to_string(), chrono::Utc::now(), Some("reviewed".to_string())),
     )
     .await?;
     let completed = reconcile_once(&convoys, &templates, &created.metadata.name, chrono::Utc::now()).await?;

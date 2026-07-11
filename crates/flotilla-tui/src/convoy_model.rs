@@ -60,7 +60,7 @@ impl ConvoyPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskPhase {
+pub enum WorkPhase {
     Pending,
     Ready,
     Launching,
@@ -79,22 +79,22 @@ pub struct ProcessSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegCompletionTarget {
+pub struct WorkCompletionTarget {
     pub convoy: String,
-    pub leg: String,
+    pub vessel: String,
     pub host: HostName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-pub struct TaskSummary {
+pub struct VesselSummary {
     pub name: String,
     pub depends_on: Vec<String>,
-    pub phase: TaskPhase,
-    pub processes: Vec<ProcessSummary>,
+    pub phase: WorkPhase,
+    pub crew: Vec<ProcessSummary>,
     pub host: Option<HostName>,
     pub checkout: Option<CheckoutRef>,
     pub workspace_ref: Option<String>,
-    pub completion_target: Option<LegCompletionTarget>,
+    pub completion_target: Option<WorkCompletionTarget>,
     pub ready_at: Option<Timestamp>,
     pub started_at: Option<Timestamp>,
     pub finished_at: Option<Timestamp>,
@@ -110,7 +110,7 @@ pub struct ConvoySummary {
     pub phase: ConvoyPhase,
     pub message: Option<String>,
     pub repo_hint: Option<RepoKey>,
-    pub tasks: Vec<TaskSummary>,
+    pub vessels: Vec<VesselSummary>,
     pub started_at: Option<Timestamp>,
     pub finished_at: Option<Timestamp>,
     pub observed_workflow_ref: Option<String>,

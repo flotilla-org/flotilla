@@ -37,8 +37,10 @@ routing given to promptable **Crew**, and is materialised by **zero or more
 Vessels** (e.g. one test Leg fanning across four platforms). Completed
 explicitly, not by process exit. Legs may stay out of the UX until workflow
 patterns settle; ad-hoc communication outside the script is not prohibited.
-_Avoid_: Task (retired — it conflated stage with placement; code types such as
-`TaskSummary`/`TaskWorkspace` keep the old name until renamed opportunistically),
+_Avoid_: Task (retired — it conflated stage with placement; the task-era code
+types were renamed in #680: `TaskWorkspace`→`Vessel`, `TaskState`→`WorkState`,
+`SnapshotTask`/`TaskDefinition`→`VesselRequirement`; "leg" appears nowhere in
+code — reserved until Legs materialise, likely as phases of crew activity),
 Step, pod.
 
 **VesselRequirement**:

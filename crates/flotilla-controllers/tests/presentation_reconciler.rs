@@ -28,8 +28,8 @@ use flotilla_protocol::arg::Arg;
 use flotilla_resources::{
     controller::Reconciler, Environment, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec,
     HostSpec, HostStatus, HostStatusPatch, Presentation, PresentationSpec, PresentationStatus, PresentationStatusPatch, ResourceBackend,
-    StatusPatch, TerminalSession, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL,
-    PROCESS_ORDINAL_LABEL, TASK_ORDINAL_LABEL,
+    StatusPatch, TerminalSession, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL,
+    VESSEL_ORDINAL_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -175,8 +175,8 @@ async fn first_apply_marks_presentation_active() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -189,8 +189,8 @@ async fn first_apply_marks_presentation_active() {
 
     let plan = runtime.apply_calls.lock().expect("apply calls lock").clone();
     assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].processes.len(), 1);
-    assert_eq!(plan[0].processes[0].attach_command, "attach term-a");
+    assert_eq!(plan[0].crew.len(), 1);
+    assert_eq!(plan[0].crew[0].attach_command, "attach term-a");
     assert!(matches!(
         outcome.patch,
         Some(PresentationStatusPatch::MarkActive { ref presentation_manager, ref workspace_ref, .. })
@@ -209,8 +209,8 @@ async fn presentation_uses_running_sessions_and_ignores_stopped_crew() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -220,8 +220,8 @@ async fn presentation_uses_running_sessions_and_ignores_stopped_crew() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "001".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "001".to_string()),
         ]),
     )
     .await;
@@ -234,8 +234,8 @@ async fn presentation_uses_running_sessions_and_ignores_stopped_crew() {
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
     assert_eq!(apply_calls.len(), 1);
-    assert_eq!(apply_calls[0].processes.len(), 1);
-    assert_eq!(apply_calls[0].processes[0].attach_command, "attach term-running");
+    assert_eq!(apply_calls[0].crew.len(), 1);
+    assert_eq!(apply_calls[0].crew[0].attach_command, "attach term-running");
 }
 
 #[tokio::test]
@@ -249,8 +249,8 @@ async fn unchanged_world_is_a_no_op() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -283,8 +283,8 @@ async fn sorted_session_determinism_uses_task_and_process_ordinals() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "001".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "001".to_string()),
         ]),
     )
     .await;
@@ -294,8 +294,8 @@ async fn sorted_session_determinism_uses_task_and_process_ordinals() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -306,7 +306,7 @@ async fn sorted_session_determinism_uses_task_and_process_ordinals() {
     reconciler.fetch_dependencies(&presentation).await.expect("deps should load");
 
     let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
-    assert_eq!(apply_calls[0].processes.iter().map(|process| process.attach_command.as_str()).collect::<Vec<_>>(), vec![
+    assert_eq!(apply_calls[0].crew.iter().map(|process| process.attach_command.as_str()).collect::<Vec<_>>(), vec![
         "attach term-a",
         "attach term-b"
     ]);
@@ -348,8 +348,8 @@ async fn retry_from_clean_slate_clears_previous_workspace_before_retry() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -405,8 +405,8 @@ async fn unknown_policy_fails_without_runtime_invocation() {
         "env-a",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -461,8 +461,8 @@ async fn working_directory_fallback_is_separate_from_session_cwd() {
         "docker-env",
         BTreeMap::from([
             (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
         ]),
     )
     .await;
@@ -476,8 +476,8 @@ async fn working_directory_fallback_is_separate_from_session_cwd() {
     let plan = &apply_calls[0];
     assert_eq!(plan.presentation_local_cwd.as_path(), dirs::home_dir().expect("home dir").as_path());
     assert_ne!(plan.presentation_local_cwd.as_path(), PathBuf::from("/workspace/repo").as_path());
-    assert!(plan.processes[0].attach_command.contains("/workspace/repo"));
-    assert!(plan.processes[0].attach_command.contains("container-docker-env"));
+    assert!(plan.crew[0].attach_command.contains("/workspace/repo"));
+    assert!(plan.crew[0].attach_command.contains("container-docker-env"));
 }
 
 #[tokio::test]
@@ -503,7 +503,7 @@ async fn provider_runtime_replaces_across_managers() {
         .apply(&PresentationPlan {
             policy: "default".to_string(),
             name: "convoy-a".to_string(),
-            processes: vec![resolved_process("main", "attach term-a")],
+            crew: vec![resolved_process("main", "attach term-a")],
             presentation_local_cwd: flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"),
             previous: Some(flotilla_controllers::reconcilers::PreviousWorkspace {
                 presentation_manager: "old".to_string(),
@@ -543,7 +543,7 @@ async fn provider_runtime_returns_retry_from_clean_slate_after_delete_then_creat
         .apply(&PresentationPlan {
             policy: "default".to_string(),
             name: "convoy-a".to_string(),
-            processes: vec![resolved_process("main", "attach term-a")],
+            crew: vec![resolved_process("main", "attach term-a")],
             presentation_local_cwd: flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"),
             previous: Some(flotilla_controllers::reconcilers::PreviousWorkspace {
                 presentation_manager: "old".to_string(),

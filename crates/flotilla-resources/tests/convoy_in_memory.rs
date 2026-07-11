@@ -6,8 +6,8 @@ use common::{
 };
 use flotilla_resources::{
     apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyPhase, ConvoyReconciler, InMemoryBackend,
-    InputMeta, LifecycleAuthority, Presentation, PresentationSpec, ResourceBackend, ResourceError, TaskWorkspace, TaskWorkspacePhase,
-    TaskWorkspaceStatus, WorkflowTemplate, CONVOY_LABEL, TASK_LABEL,
+    InputMeta, LifecycleAuthority, Presentation, PresentationSpec, ResourceBackend, ResourceError, Vessel, VesselPhase, VesselStatus,
+    WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
 };
 use tokio::time::{timeout, Duration};
 
@@ -51,23 +51,23 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     assert!(matches!(bootstrap, flotilla_resources::ConvoyStatusPatch::Bootstrap { .. }));
 
     let ready_implement = reconcile_once(&convoys, &templates, "convoy-a", timestamp(11)).await.expect("ready patch after bootstrap");
-    assert!(matches!(ready_implement, flotilla_resources::ConvoyStatusPatch::AdvanceTasksToReady { .. }));
+    assert!(matches!(ready_implement, flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. }));
 
     apply_status_patch(
         &convoys,
         "convoy-a",
-        &external_patches::mark_task_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
+        &external_patches::mark_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
     )
     .await
     .expect("implement completion should succeed");
 
     let ready_review = reconcile_once(&convoys, &templates, "convoy-a", timestamp(13)).await.expect("review should become ready");
-    assert!(matches!(ready_review, flotilla_resources::ConvoyStatusPatch::AdvanceTasksToReady { .. }));
+    assert!(matches!(ready_review, flotilla_resources::ConvoyStatusPatch::AdvanceWorkToReady { .. }));
 
     apply_status_patch(
         &convoys,
         "convoy-a",
-        &external_patches::mark_task_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
+        &external_patches::mark_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
     )
     .await
     .expect("review completion should succeed");
@@ -78,8 +78,8 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     let final_convoy = convoys.get("convoy-a").await.expect("final convoy get should succeed");
     let final_status = final_convoy.status.expect("convoy status");
     assert_eq!(final_status.phase, ConvoyPhase::Completed);
-    assert_eq!(final_status.tasks["implement"].phase, flotilla_resources::TaskPhase::Completed);
-    assert_eq!(final_status.tasks["review"].phase, flotilla_resources::TaskPhase::Completed);
+    assert_eq!(final_status.work["implement"].phase, flotilla_resources::WorkPhase::Completed);
+    assert_eq!(final_status.work["review"].phase, flotilla_resources::WorkPhase::Completed);
 }
 
 #[tokio::test]
@@ -113,7 +113,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: Vec::new(),
-            reconciler: ConvoyReconciler::new(templates.clone()).with_task_workspaces(backend.clone().using::<TaskWorkspace>("flotilla")),
+            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(backend.clone().using::<Vessel>("flotilla")),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -127,7 +127,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
                 tokio::task::yield_now().await;
                 continue;
             };
-            if status.tasks.get("implement").is_some_and(|task| task.phase == flotilla_resources::TaskPhase::Ready) {
+            if status.work.get("implement").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Ready) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -139,7 +139,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
     apply_status_patch(
         &convoys,
         "convoy-loop",
-        &external_patches::mark_task_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
+        &external_patches::mark_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
     )
     .await
     .expect("implement completion should succeed");
@@ -148,7 +148,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
         loop {
             let convoy = convoys.get("convoy-loop").await.expect("convoy get should succeed");
             let status = convoy.status.expect("convoy status");
-            if status.tasks.get("review").is_some_and(|task| task.phase == flotilla_resources::TaskPhase::Ready) {
+            if status.work.get("review").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Ready) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -160,7 +160,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
     apply_status_patch(
         &convoys,
         "convoy-loop",
-        &external_patches::mark_task_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
+        &external_patches::mark_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
     )
     .await
     .expect("review completion should succeed");
@@ -182,11 +182,11 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
 }
 
 #[tokio::test]
-async fn controller_loop_advances_task_via_task_workspace_secondary_watch() {
+async fn controller_loop_advances_task_via_vessel_secondary_watch() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let workspaces = backend.clone().using::<Vessel>("flotilla");
 
     let template = tool_only_workflow_template_object("review-and-fix");
     templates.create(&workflow_template_meta(&template.metadata.name), &template.spec).await.expect("template create should succeed");
@@ -196,7 +196,7 @@ async fn controller_loop_advances_task_via_task_workspace_secondary_watch() {
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::secondary_watches(),
-            reconciler: ConvoyReconciler::new(templates.clone()).with_task_workspaces(workspaces.clone()),
+            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(workspaces.clone()),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
@@ -216,8 +216,8 @@ async fn controller_loop_advances_task_via_task_workspace_secondary_watch() {
 
     let workspace = workspaces.get("convoy-stage4a-implement").await.expect("workspace get should succeed");
     workspaces
-        .update_status("convoy-stage4a-implement", &workspace.metadata.resource_version, &TaskWorkspaceStatus {
-            phase: TaskWorkspacePhase::Ready,
+        .update_status("convoy-stage4a-implement", &workspace.metadata.resource_version, &VesselStatus {
+            phase: VesselPhase::Ready,
             message: None,
             observed_policy_ref: Some("laptop-docker".to_string()),
             observed_policy_version: Some("17".to_string()),
@@ -237,7 +237,7 @@ async fn controller_loop_advances_task_via_task_workspace_secondary_watch() {
                 tokio::task::yield_now().await;
                 continue;
             };
-            if status.tasks.get("implement").is_some_and(|task| task.phase == flotilla_resources::TaskPhase::Running) {
+            if status.work.get("implement").is_some_and(|task| task.phase == flotilla_resources::WorkPhase::Running) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -250,10 +250,10 @@ async fn controller_loop_advances_task_via_task_workspace_secondary_watch() {
 }
 
 #[tokio::test]
-async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
+async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let workspaces = backend.clone().using::<Vessel>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
 
     let created =
@@ -261,8 +261,8 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
-    status.tasks.get_mut("implement").expect("implement").phase = flotilla_resources::TaskPhase::Running;
-    status.tasks.get_mut("implement").expect("implement").started_at = Some(timestamp(18));
+    status.work.get_mut("implement").expect("implement").phase = flotilla_resources::WorkPhase::Running;
+    status.work.get_mut("implement").expect("implement").started_at = Some(timestamp(18));
     convoys.update_status("convoy-delete", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
 
     workspaces
@@ -270,14 +270,14 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             &InputMeta::builder()
                 .name("convoy-delete-implement".to_string())
                 .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "implement".to_string())]
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]
                         .into_iter()
                         .collect(),
                 )
                 .build(),
-            &flotilla_resources::TaskWorkspaceSpec {
+            &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-delete".to_string(),
-                task: "implement".to_string(),
+                vessel_name: "implement".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
                 adopted_checkout_ref: None,
             },
@@ -289,7 +289,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             &InputMeta::builder()
                 .name("convoy-delete-implement".to_string())
                 .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "implement".to_string())]
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]
                         .into_iter()
                         .collect(),
                 )
@@ -300,7 +300,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
                 name: "implement".to_string(),
                 process_selector: [
                     (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (TASK_LABEL.to_string(), "implement".to_string()),
+                    (VESSEL_LABEL.to_string(), "implement".to_string()),
                 ]
                 .into_iter()
                 .collect(),
@@ -313,15 +313,15 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             &InputMeta::builder()
                 .name("convoy-delete-adopted".to_string())
                 .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "adopted".to_string())]
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "adopted".to_string())]
                         .into_iter()
                         .collect(),
                 )
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Adopted),
-            &flotilla_resources::TaskWorkspaceSpec {
+            &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-delete".to_string(),
-                task: "adopted".to_string(),
+                vessel_name: "adopted".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
                 adopted_checkout_ref: None,
             },
@@ -333,15 +333,15 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             &InputMeta::builder()
                 .name("convoy-delete-observed".to_string())
                 .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "observed".to_string())]
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "observed".to_string())]
                         .into_iter()
                         .collect(),
                 )
                 .build()
                 .with_lifecycle_authority(LifecycleAuthority::Observed),
-            &flotilla_resources::TaskWorkspaceSpec {
+            &flotilla_resources::VesselSpec {
                 convoy_ref: "convoy-delete".to_string(),
-                task: "observed".to_string(),
+                vessel_name: "observed".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
                 adopted_checkout_ref: None,
             },
@@ -353,7 +353,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             &InputMeta::builder()
                 .name("convoy-delete-adopted".to_string())
                 .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "adopted".to_string())]
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "adopted".to_string())]
                         .into_iter()
                         .collect(),
                 )
@@ -365,7 +365,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
                 name: "adopted".to_string(),
                 process_selector: [
                     (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (TASK_LABEL.to_string(), "adopted".to_string()),
+                    (VESSEL_LABEL.to_string(), "adopted".to_string()),
                 ]
                 .into_iter()
                 .collect(),
@@ -378,7 +378,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             &InputMeta::builder()
                 .name("convoy-delete-observed".to_string())
                 .labels(
-                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (TASK_LABEL.to_string(), "observed".to_string())]
+                    [(CONVOY_LABEL.to_string(), "convoy-delete".to_string()), (VESSEL_LABEL.to_string(), "observed".to_string())]
                         .into_iter()
                         .collect(),
                 )
@@ -390,7 +390,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
                 name: "observed".to_string(),
                 process_selector: [
                     (CONVOY_LABEL.to_string(), "convoy-delete".to_string()),
-                    (TASK_LABEL.to_string(), "observed".to_string()),
+                    (VESSEL_LABEL.to_string(), "observed".to_string()),
                 ]
                 .into_iter()
                 .collect(),
@@ -404,7 +404,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::secondary_watches(),
             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla"))
-                .with_task_workspaces(workspaces.clone())
+                .with_vessels(workspaces.clone())
                 .with_presentations(presentations.clone()),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
@@ -488,7 +488,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_task_workspaces() {
 async fn controller_loop_creates_one_presentation_per_active_task() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let convoys = backend.clone().using::<Convoy>("flotilla");
-    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let workspaces = backend.clone().using::<Vessel>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
     let templates = backend.clone().using::<WorkflowTemplate>("flotilla");
 
@@ -497,19 +497,17 @@ async fn controller_loop_creates_one_presentation_per_active_task() {
     let mut status = bootstrapped_tool_only_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.started_at = Some(timestamp(18));
-    status.tasks.get_mut("implement").expect("implement task").phase = flotilla_resources::TaskPhase::Running;
-    status.tasks.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
-    status.tasks.get_mut("review").expect("review task").phase = flotilla_resources::TaskPhase::Ready;
-    status.tasks.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
+    status.work.get_mut("implement").expect("implement task").phase = flotilla_resources::WorkPhase::Running;
+    status.work.get_mut("implement").expect("implement task").started_at = Some(timestamp(18));
+    status.work.get_mut("review").expect("review task").phase = flotilla_resources::WorkPhase::Ready;
+    status.work.get_mut("review").expect("review task").ready_at = Some(timestamp(18));
     convoys.update_status("convoy-multi", &created.metadata.resource_version, &status).await.expect("convoy status update should succeed");
 
     let loop_task = tokio::spawn(
         ControllerLoop {
             primary: convoys.clone(),
             secondaries: ConvoyReconciler::secondary_watches(),
-            reconciler: ConvoyReconciler::new(templates.clone())
-                .with_task_workspaces(workspaces.clone())
-                .with_presentations(presentations.clone()),
+            reconciler: ConvoyReconciler::new(templates.clone()).with_vessels(workspaces.clone()).with_presentations(presentations.clone()),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
@@ -530,13 +528,13 @@ async fn controller_loop_creates_one_presentation_per_active_task() {
     .map(|(implement, review)| {
         assert_eq!(implement.spec.name, "implement");
         assert_eq!(implement.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
-        assert_eq!(implement.spec.process_selector.get(TASK_LABEL).map(String::as_str), Some("implement"));
-        assert_eq!(implement.metadata.labels.get(TASK_LABEL).map(String::as_str), Some("implement"));
+        assert_eq!(implement.spec.process_selector.get(VESSEL_LABEL).map(String::as_str), Some("implement"));
+        assert_eq!(implement.metadata.labels.get(VESSEL_LABEL).map(String::as_str), Some("implement"));
 
         assert_eq!(review.spec.name, "review");
         assert_eq!(review.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
-        assert_eq!(review.spec.process_selector.get(TASK_LABEL).map(String::as_str), Some("review"));
-        assert_eq!(review.metadata.labels.get(TASK_LABEL).map(String::as_str), Some("review"));
+        assert_eq!(review.spec.process_selector.get(VESSEL_LABEL).map(String::as_str), Some("review"));
+        assert_eq!(review.metadata.labels.get(VESSEL_LABEL).map(String::as_str), Some("review"));
     })
     .expect("controller loop should create one presentation per active task");
 

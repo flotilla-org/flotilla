@@ -65,11 +65,11 @@ spec:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
                   properties:
-                    tasks:
+                    vessels:
                       type: array
                       items:
                         type: object
-                        required: [name, processes]
+                        required: [name, crew]
                         properties:
                           name:
                             type: string
@@ -78,7 +78,7 @@ spec:
                             type: array
                             items:
                               type: string
-                          processes:
+                          crew:
                             type: array
                             items:
                               type: object
@@ -91,7 +91,7 @@ spec:
                 finished_at:
                   type: string
                   format: date-time
-                tasks:
+                work:
                   type: object
                   additionalProperties:
                     type: object

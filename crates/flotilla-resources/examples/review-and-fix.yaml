@@ -9,9 +9,9 @@ spec:
       description: Brief description of the feature to implement
     - name: branch
       description: Target git branch
-  tasks:
+  vessels:
     - name: implement
-      processes:
+      crew:
         - role: coder
           selector:
             capability: code
@@ -23,7 +23,7 @@ spec:
     - name: review
       depends_on:
         - implement
-      processes:
+      crew:
         - role: reviewer
           selector:
             capability: code-review

@@ -1,14 +1,14 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: taskworkspaces.flotilla.work
+  name: vessels.flotilla.work
 spec:
   group: flotilla.work
   scope: Namespaced
   names:
-    plural: taskworkspaces
-    singular: taskworkspace
-    kind: TaskWorkspace
+    plural: vessels
+    singular: vessel
+    kind: Vessel
   versions:
     - name: v1
       served: true
@@ -19,9 +19,9 @@ spec:
         - name: Convoy
           type: string
           jsonPath: .spec.convoy_ref
-        - name: Task
+        - name: Vessel
           type: string
-          jsonPath: .spec.task
+          jsonPath: .spec.vessel_name
         - name: Phase
           type: string
           jsonPath: .status.phase

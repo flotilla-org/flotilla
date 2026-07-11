@@ -12,7 +12,7 @@ use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
     ApiPaths, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, TaskWorkspace, TaskWorkspaceSpec, TypedResolver,
+    ResourceError, ResourceObject, TypedResolver, Vessel, VesselSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::timeout};
@@ -810,7 +810,7 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let primaries = backend.clone().using::<PrimaryResource>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
-    let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
     presentations
         .create(&resource_meta().name("alpha-presentation").call(), &PresentationSpec {
@@ -821,10 +821,10 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         })
         .await
         .expect("presentation create should succeed");
-    task_workspaces
-        .create(&resource_meta().name("alpha-task").call(), &TaskWorkspaceSpec {
+    vessels
+        .create(&resource_meta().name("alpha-task").call(), &VesselSpec {
             convoy_ref: "alpha".to_string(),
-            task: "implement".to_string(),
+            vessel_name: "implement".to_string(),
             placement_policy_ref: "local".to_string(),
             adopted_checkout_ref: None,
         })
@@ -864,10 +864,7 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
         ControllerLoop {
             primary: primaries,
             secondaries: Vec::new(),
-            reconciler: ActuatingReconciler {
-                actuation: Actuation::DeleteTaskWorkspace { name: "alpha-task".to_string() },
-                reconciled: None,
-            },
+            reconciler: ActuatingReconciler { actuation: Actuation::DeleteVessel { name: "alpha-task".to_string() }, reconciled: None },
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -876,7 +873,7 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
 
     timeout(Duration::from_secs(1), async {
         loop {
-            if matches!(task_workspaces.get("alpha-task").await, Err(ResourceError::NotFound { .. })) {
+            if matches!(vessels.get("alpha-task").await, Err(ResourceError::NotFound { .. })) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -885,7 +882,7 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
     .await
     .expect("delete task workspace actuation should remove the resource");
 
-    task_workspaces.delete("alpha-task").await.expect_err("resource should already be gone");
+    vessels.delete("alpha-task").await.expect_err("resource should already be gone");
 
     harness.shutdown().await;
 }
@@ -895,7 +892,7 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let primaries = backend.clone().using::<PrimaryResource>("flotilla");
     let presentations = backend.clone().using::<Presentation>("flotilla");
-    let task_workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
     presentations
         .create(
@@ -909,10 +906,10 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
         )
         .await
         .expect("presentation create should succeed");
-    task_workspaces
-        .create(&resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed), &TaskWorkspaceSpec {
+    vessels
+        .create(&resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed), &VesselSpec {
             convoy_ref: "alpha".to_string(),
-            task: "implement".to_string(),
+            vessel_name: "implement".to_string(),
             placement_policy_ref: "local".to_string(),
             adopted_checkout_ref: None,
         })
@@ -957,7 +954,7 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
             primary: primaries,
             secondaries: Vec::new(),
             reconciler: ActuatingReconciler {
-                actuation: Actuation::DeleteTaskWorkspace { name: "observed-task".to_string() },
+                actuation: Actuation::DeleteVessel { name: "observed-task".to_string() },
                 reconciled: Some(Arc::clone(&reconciled)),
             },
             resync_interval: Duration::from_secs(60),
@@ -976,8 +973,8 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
     })
     .await
     .expect("delete task workspace actuation should run");
-    let task_workspace = task_workspaces.get("observed-task").await.expect("observed task workspace should remain");
-    assert_eq!(task_workspace.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
+    let vessel = vessels.get("observed-task").await.expect("observed task workspace should remain");
+    assert_eq!(vessel.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
 
     harness.shutdown().await;
 }

@@ -27,11 +27,17 @@ Recipes are a strict subset: a fully-pinned requirement.
   a hand-authored request with pins). The old AttachableSet-era
   `ProvisioningTarget` picker collapses into pins; env-reuse (`=env_id`)
   becomes an affinity requirement.
-- **Fan-out**: one requirement may materialise several Vessels
-  (`forall: platform in …`). The platform matrix belongs on the **Project**
-  (what this island targets), keeping templates fleet-portable and runs
-  reproducible; fleet-derived ranges ("everywhere we can, min N") are a
-  designed-for later resolver expression.
+- **Fan-out** *(amended 2026-07-11, #680 grill)*: **one requirement ↔ one
+  Vessel (at a time) is an invariant** — the requirement is the unit of
+  placement resolution, **not** the fan-out unit. Fan-out is *authored*: an
+  orchestrating agent calling commands, or an embedded script (possibly
+  staged/graph-building), emits several concrete requirements with unique
+  names (`test[linux-x86]`, `test[darwin-arm64]`). Any future declarative
+  expansion construct is a real new type, never a field on
+  `VesselRequirement` that consumers must statefully ignore. The platform
+  matrix still belongs on the **Project** (what this island targets), keeping
+  templates fleet-portable and runs reproducible; fleet-derived ranges
+  ("everywhere we can, min N") are a designed-for later resolver expression.
 - **Requirements describe the Hull**; crew-side selectors
   (`capability: code` → concrete agent) are a separate axis resolved the same
   requirements-first way (v1: simple lookup).

@@ -57,12 +57,11 @@ impl<'a> ConvoyDetail<'a> {
 
         let items: Vec<TreeItem<String>> = self
             .convoy
-            .tasks
+            .vessels
             .iter()
             .map(|t| {
                 let g = task_glyph(t.phase);
-                let label =
-                    Line::from(vec![Span::styled(g.symbol, g.style), Span::raw(format!(" {} ({} proc)", t.name, t.processes.len()))]);
+                let label = Line::from(vec![Span::styled(g.symbol, g.style), Span::raw(format!(" {} ({} proc)", t.name, t.crew.len()))]);
                 TreeItem::new_leaf(t.name.clone(), label)
             })
             .collect();
@@ -84,7 +83,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, TaskPhase, TaskSummary};
+    use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, VesselSummary, WorkPhase};
 
     fn multi_task_convoy() -> ConvoySummary {
         ConvoySummary {
@@ -95,12 +94,12 @@ mod tests {
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
-            tasks: vec![
-                TaskSummary {
+            vessels: vec![
+                VesselSummary {
                     name: "implement".into(),
                     depends_on: vec![],
-                    phase: TaskPhase::Running,
-                    processes: vec![ProcessSummary { role: "coder".into(), command_preview: "claude".into() }],
+                    phase: WorkPhase::Running,
+                    crew: vec![ProcessSummary { role: "coder".into(), command_preview: "claude".into() }],
                     host: None,
                     checkout: None,
                     workspace_ref: None,
@@ -110,11 +109,11 @@ mod tests {
                     finished_at: None,
                     message: None,
                 },
-                TaskSummary {
+                VesselSummary {
                     name: "review".into(),
                     depends_on: vec!["implement".into()],
-                    phase: TaskPhase::Pending,
-                    processes: vec![ProcessSummary { role: "reviewer".into(), command_preview: "claude".into() }],
+                    phase: WorkPhase::Pending,
+                    crew: vec![ProcessSummary { role: "reviewer".into(), command_preview: "claude".into() }],
                     host: None,
                     checkout: None,
                     workspace_ref: None,
@@ -165,7 +164,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
         let mut convoy = multi_task_convoy();
         convoy.initializing = true;
-        convoy.tasks.clear();
+        convoy.vessels.clear();
         terminal
             .draw(|f| {
                 ConvoyDetail { convoy: &convoy, selected_task: None, focused: false }.render(f, f.area());
@@ -181,7 +180,7 @@ mod tests {
         convoy.phase = ConvoyPhase::Failed;
         convoy.message = Some("missing input 'topic'".into());
         convoy.initializing = true;
-        convoy.tasks.clear();
+        convoy.vessels.clear();
 
         terminal
             .draw(|f| {

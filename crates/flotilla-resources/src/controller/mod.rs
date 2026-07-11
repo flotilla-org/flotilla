@@ -20,8 +20,8 @@ use crate::{
     labels::LifecycleAuthority,
     presentation::PresentationSpec,
     resource::{InputMeta, Resource, ResourceObject},
-    task_workspace::TaskWorkspaceSpec,
     terminal_session::TerminalSessionSpec,
+    vessel::VesselSpec,
     watch::{WatchEvent, WatchStart},
 };
 
@@ -73,10 +73,10 @@ pub enum Actuation {
     CreateClone { meta: InputMeta, spec: CloneSpec },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
     CreateTerminalSession { meta: InputMeta, spec: TerminalSessionSpec },
-    CreateTaskWorkspace { meta: InputMeta, spec: TaskWorkspaceSpec },
+    CreateVessel { meta: InputMeta, spec: VesselSpec },
     CreatePresentation { meta: InputMeta, spec: PresentationSpec },
     DeletePresentation { name: String },
-    DeleteTaskWorkspace { name: String },
+    DeleteVessel { name: String },
 }
 
 pub trait SecondaryWatch: Send + Sync {
@@ -249,8 +249,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::TerminalSession>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
             }
-            Actuation::CreateTaskWorkspace { meta, spec } => {
-                let resolver = backend.using::<crate::TaskWorkspace>(namespace);
+            Actuation::CreateVessel { meta, spec } => {
+                let resolver = backend.using::<crate::Vessel>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await
             }
             Actuation::CreatePresentation { meta, spec } => {
@@ -261,8 +261,8 @@ impl<R: Reconciler> ControllerLoop<R> {
                 let resolver = backend.using::<crate::Presentation>(namespace);
                 Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
-            Actuation::DeleteTaskWorkspace { name } => {
-                let resolver = backend.using::<crate::TaskWorkspace>(namespace);
+            Actuation::DeleteVessel { name } => {
+                let resolver = backend.using::<crate::Vessel>(namespace);
                 Self::delete_if_lifecycle_owned(&resolver, &name).await
             }
         }

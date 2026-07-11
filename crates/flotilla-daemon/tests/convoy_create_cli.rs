@@ -83,8 +83,8 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
     let templates = backend.using::<WorkflowTemplate>("flotilla");
     let scratch = templates.get("scratch").await.expect("scratch template should be seeded");
     assert_eq!(scratch.metadata.name, "scratch");
-    assert_eq!(scratch.spec.tasks.len(), 1);
-    assert_eq!(scratch.spec.tasks[0].name, "work");
+    assert_eq!(scratch.spec.vessels.len(), 1);
+    assert_eq!(scratch.spec.vessels[0].name, "work");
 }
 
 #[tokio::test]
@@ -140,15 +140,15 @@ async fn workflow_template_apply_creates_then_updates() {
             context_repo: None,
             action: CommandAction::WorkflowTemplateApply {
                 name: "custom".into(),
-                spec_yaml: "tasks:\n  - name: only\n    processes:\n      - role: shell\n        command: 'echo first'\n".into(),
+                spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo first'\n".into(),
             },
         })
         .await
         .expect("execute create");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::WorkflowTemplateApplied { name: "custom".into() });
     let v1 = templates.get("custom").await.expect("template should exist");
-    let v1_command = match &v1.spec.tasks[0].processes[0].source {
-        flotilla_resources::ProcessSource::Tool { command } => command.clone(),
+    let v1_command = match &v1.spec.vessels[0].crew[0].source {
+        flotilla_resources::CrewSource::Tool { command } => command.clone(),
         _ => panic!("expected tool process"),
     };
     assert_eq!(v1_command, "echo first");
@@ -161,15 +161,15 @@ async fn workflow_template_apply_creates_then_updates() {
             context_repo: None,
             action: CommandAction::WorkflowTemplateApply {
                 name: "custom".into(),
-                spec_yaml: "tasks:\n  - name: only\n    processes:\n      - role: shell\n        command: 'echo updated'\n".into(),
+                spec_yaml: "vessels:\n  - name: only\n    crew:\n      - role: shell\n        command: 'echo updated'\n".into(),
             },
         })
         .await
         .expect("execute update");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::WorkflowTemplateApplied { name: "custom".into() });
     let v2 = templates.get("custom").await.expect("template should still exist");
-    let v2_command = match &v2.spec.tasks[0].processes[0].source {
-        flotilla_resources::ProcessSource::Tool { command } => command.clone(),
+    let v2_command = match &v2.spec.vessels[0].crew[0].source {
+        flotilla_resources::CrewSource::Tool { command } => command.clone(),
         _ => panic!("expected tool process"),
     };
     assert_eq!(v2_command, "echo updated");

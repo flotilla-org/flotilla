@@ -317,7 +317,7 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
             Cell::new(member.stance.as_deref().unwrap_or("-")),
         ]);
     }
-    format!("Convoy: {}  Vessel: {}  Leg: {}\n{}\n", response.convoy, response.vessel, response.leg, table)
+    format!("Convoy: {}  Vessel: {} ({})\n{}\n", response.convoy, response.vessel, response.vessel_ref, table)
 }
 
 /// Extract a short display name from a repo path (last path component).

@@ -16,8 +16,8 @@ use flotilla_core::{
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{
-    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend, SnapshotTask,
-    TaskPhase, TaskState, WorkflowSnapshot,
+    apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend,
+    VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_tui::{app::App, theme::Theme};
 
@@ -164,20 +164,20 @@ async fn x_then_enter_completes_leg_via_palette() {
         app.handle_daemon_event(event);
     }
 
-    // Create a convoy and bootstrap its status so it has a leg ready for completion.
+    // Create a convoy and bootstrap its status so it has work ready for completion.
     let convoys = backend.using::<Convoy>("flotilla");
     convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix")).await.expect("create convoy");
 
     let mut tasks = BTreeMap::new();
-    tasks.insert("implement".to_string(), TaskState {
-        phase: TaskPhase::Pending,
+    tasks.insert("implement".to_string(), WorkState {
+        phase: WorkPhase::Pending,
         ready_at: None,
         started_at: None,
         finished_at: None,
         message: None,
         placement: None,
     });
-    let snapshot = WorkflowSnapshot { tasks: vec![SnapshotTask { name: "implement".into(), depends_on: vec![], processes: vec![] }] };
+    let snapshot = WorkflowSnapshot { vessels: vec![VesselRequirement { name: "implement".into(), depends_on: vec![], crew: vec![] }] };
     apply_status_patch(
         &convoys,
         "fix-bug-123",
@@ -199,7 +199,7 @@ async fn x_then_enter_completes_leg_via_palette() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         drain(&mut app, &mut daemon_rx);
-        if app.convoys("flotilla").iter().any(|convoy| !convoy.tasks.is_empty()) {
+        if app.convoys("flotilla").iter().any(|convoy| !convoy.vessels.is_empty()) {
             break;
         }
         if Instant::now() >= deadline {
@@ -219,9 +219,9 @@ async fn x_then_enter_completes_leg_via_palette() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
     }
 
-    app.handle_key(key('l')); // drill into leg focus
+    app.handle_key(key('l')); // drill into vessel focus
     app.handle_key(key('x')); // open palette pre-filled
-    app.handle_key(enter()); // confirm — dispatch ConvoyLegComplete
+    app.handle_key(enter()); // confirm — dispatch ConvoyWorkComplete
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;
@@ -236,8 +236,8 @@ async fn x_then_enter_completes_leg_via_palette() {
     loop {
         drain(&mut app, &mut daemon_rx);
         if let Some(c) = app.convoys("flotilla").first() {
-            if let Some(t) = c.tasks.iter().find(|t| t.name == "implement") {
-                if t.phase == flotilla_tui::convoy_model::TaskPhase::Completed {
+            if let Some(t) = c.vessels.iter().find(|t| t.name == "implement") {
+                if t.phase == flotilla_tui::convoy_model::WorkPhase::Completed {
                     break;
                 }
             }

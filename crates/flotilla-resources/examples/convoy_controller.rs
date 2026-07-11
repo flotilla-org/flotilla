@@ -1,12 +1,12 @@
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use flotilla_controllers::reconcilers::{
-    HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TaskWorkspaceReconciler,
+    HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, VesselReconciler,
 };
 use flotilla_core::{path_context::DaemonHostPath, providers::registry::ProviderRegistry, HostName};
 use flotilla_resources::{
-    controller::ControllerLoop, ensure_crd, ensure_namespace, Convoy, ConvoyReconciler, HttpBackend, Presentation, ResourceBackend,
-    TaskWorkspace, WorkflowTemplate,
+    controller::ControllerLoop, ensure_crd, ensure_namespace, Convoy, ConvoyReconciler, HttpBackend, Presentation, ResourceBackend, Vessel,
+    WorkflowTemplate,
 };
 use tracing::info;
 
@@ -41,13 +41,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_namespace(&backend, &namespace).await?;
     ensure_crd(&backend, include_str!("../src/crds/workflow_template.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../src/crds/convoy.crd.yaml")).await?;
-    ensure_crd(&backend, include_str!("../src/crds/task_workspace.crd.yaml")).await?;
+    ensure_crd(&backend, include_str!("../src/crds/vessel.crd.yaml")).await?;
     ensure_crd(&backend, include_str!("../src/crds/presentation.crd.yaml")).await?;
 
     let backend = ResourceBackend::Http(backend);
     let convoys = backend.clone().using::<Convoy>(&namespace);
     let templates = backend.clone().using::<WorkflowTemplate>(&namespace);
-    let task_workspaces = backend.clone().using::<TaskWorkspace>(&namespace);
+    let vessels = backend.clone().using::<Vessel>(&namespace);
     let presentations = backend.clone().using::<Presentation>(&namespace);
     let empty_registry = Arc::new(ProviderRegistry::new());
     let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
@@ -57,9 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::try_join!(
         async {
             ControllerLoop {
-                primary: task_workspaces,
-                secondaries: TaskWorkspaceReconciler::secondary_watches(),
-                reconciler: TaskWorkspaceReconciler::new(backend.clone(), &namespace),
+                primary: vessels,
+                secondaries: VesselReconciler::secondary_watches(),
+                reconciler: VesselReconciler::new(backend.clone(), &namespace),
                 resync_interval: Duration::from_secs(60),
                 backend: backend.clone(),
             }
@@ -92,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 primary: convoys,
                 secondaries: ConvoyReconciler::secondary_watches(),
                 reconciler: ConvoyReconciler::new(templates)
-                    .with_task_workspaces(convoy_backend.clone().using::<TaskWorkspace>(&namespace))
+                    .with_vessels(convoy_backend.clone().using::<Vessel>(&namespace))
                     .with_presentations(convoy_backend.clone().using::<Presentation>(&namespace)),
                 resync_interval: Duration::from_secs(60),
                 backend: convoy_backend,

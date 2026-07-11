@@ -1,8 +1,8 @@
-//! Status glyphs + colour mapping for convoy / leg phases.
+//! Status glyphs + colour mapping for convoy / work phases.
 
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::convoy_model::{ConvoyPhase, TaskPhase};
+use crate::convoy_model::{ConvoyPhase, WorkPhase};
 
 pub struct Glyph {
     pub symbol: &'static str,
@@ -19,14 +19,14 @@ pub fn convoy_glyph(phase: ConvoyPhase) -> Glyph {
     }
 }
 
-pub fn task_glyph(phase: TaskPhase) -> Glyph {
+pub fn task_glyph(phase: WorkPhase) -> Glyph {
     match phase {
-        TaskPhase::Pending => Glyph { symbol: "○", style: Style::default().add_modifier(Modifier::DIM) },
-        TaskPhase::Ready => Glyph { symbol: "◐", style: Style::default().fg(Color::Yellow) },
-        TaskPhase::Launching => Glyph { symbol: "◑", style: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) },
-        TaskPhase::Running => Glyph { symbol: "●", style: Style::default().fg(Color::Green) },
-        TaskPhase::Completed => Glyph { symbol: "✓", style: Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) },
-        TaskPhase::Failed => Glyph { symbol: "✗", style: Style::default().fg(Color::Red) },
-        TaskPhase::Cancelled => Glyph { symbol: "⊘", style: Style::default().fg(Color::Red).add_modifier(Modifier::DIM) },
+        WorkPhase::Pending => Glyph { symbol: "○", style: Style::default().add_modifier(Modifier::DIM) },
+        WorkPhase::Ready => Glyph { symbol: "◐", style: Style::default().fg(Color::Yellow) },
+        WorkPhase::Launching => Glyph { symbol: "◑", style: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) },
+        WorkPhase::Running => Glyph { symbol: "●", style: Style::default().fg(Color::Green) },
+        WorkPhase::Completed => Glyph { symbol: "✓", style: Style::default().fg(Color::Green).add_modifier(Modifier::BOLD) },
+        WorkPhase::Failed => Glyph { symbol: "✗", style: Style::default().fg(Color::Red) },
+        WorkPhase::Cancelled => Glyph { symbol: "⊘", style: Style::default().fg(Color::Red).add_modifier(Modifier::DIM) },
     }
 }

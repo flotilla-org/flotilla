@@ -29,7 +29,7 @@ pub enum BindingModeId {
     Convoys,
     /// Inner focus on the Convoys tab — the task tree on the right pane.
     /// Composed with `TabPage`. `j/k` navigate tasks; `esc` returns to the
-    /// convoy list; `x` opens the palette pre-filled to complete the leg.
+    /// convoy list; `x` opens the palette pre-filled to complete the work.
     ConvoyTasks,
     Help,
     ActionMenu,
@@ -156,8 +156,8 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::ConvoyTasks, "h", Action::Dismiss),
     b(BindingModeId::ConvoyTasks, "left", Action::Dismiss),
     hk(BindingModeId::ConvoyTasks, "esc", "ESC", Action::Dismiss, "List"),
-    h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyLeg, "Complete"),
-    h(BindingModeId::ConvoyTasks, "a", Action::AttachConvoyLeg, "Attach"),
+    h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyWork, "Complete"),
+    h(BindingModeId::ConvoyTasks, "a", Action::AttachConvoyVessel, "Attach"),
     h(BindingModeId::ConvoyTasks, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),

@@ -6,19 +6,18 @@ use chrono::Utc;
 use common::{
     create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
-    labeled_meta, meta, task_workspace_meta, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
+    labeled_meta, meta, vessel_meta, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
-use flotilla_controllers::reconcilers::TaskWorkspaceReconciler;
+use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec,
+    CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicySpec, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError, Selector, SnapshotTask,
-    TaskWorkspace, TaskWorkspaceSpec, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL,
-    TASK_WORKSPACE_LABEL,
+    ObservedCheckoutSpec, PlacementPolicySpec, ResourceBackend, ResourceError, Selector, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkflowSnapshot,
+    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -33,13 +32,13 @@ async fn missing_placement_policy_marks_workspace_failed() {
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", REPO_URL, GIT_REF).await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-missing", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
     assert!(matches!(
         outcome.patch,
-        Some(flotilla_resources::TaskWorkspaceStatusPatch::MarkFailed { ref message })
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
             if message.contains("placement policy policy-missing not found")
     ));
 }
@@ -56,7 +55,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-b", "convoy-b", "implement", "policy-a", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -93,7 +92,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-c", "convoy-c", "implement", "policy-worktree", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
     assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateCheckout { .. })));
@@ -116,7 +115,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
             .build(),
     )
     .await;
-    let current = backend.clone().using::<TaskWorkspace>(NAMESPACE).get("workspace-c").await.expect("workspace get should succeed");
+    let current = backend.clone().using::<Vessel>(NAMESPACE).get("workspace-c").await.expect("workspace get should succeed");
     let deps = reconciler.fetch_dependencies(&current).await.expect("deps should reload");
     let outcome = reconciler.reconcile(&current, &deps, chrono::Utc::now());
 
@@ -247,13 +246,13 @@ async fn child_failure_propagates_to_workspace_failure() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-f", "convoy-f", "implement", "policy-f", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
     assert!(matches!(
         outcome.patch,
-        Some(flotilla_resources::TaskWorkspaceStatusPatch::MarkFailed { ref message }) if message == "boom"
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message }) if message == "boom"
     ));
 }
 
@@ -266,17 +265,17 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-adopted", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
         .clone()
-        .using::<TaskWorkspace>(NAMESPACE)
-        .create(&task_workspace_meta("workspace-adopted", REPO_URL), &TaskWorkspaceSpec {
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-adopted", REPO_URL), &VesselSpec {
             convoy_ref: "convoy-adopted".to_string(),
-            task: "implement".to_string(),
+            vessel_name: "implement".to_string(),
             placement_policy_ref: "policy-adopted".to_string(),
             adopted_checkout_ref: Some("adopted-checkout-convoy-adopted".to_string()),
         })
         .await
         .expect("workspace create should succeed");
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -300,17 +299,17 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     let backend = ResourceBackend::InMemory(Default::default());
     let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-crew", "implement", REPO_URL, GIT_REF).await;
     let mut status = convoy.status.expect("convoy status");
-    status.workflow_snapshot.as_mut().expect("workflow snapshot").tasks[0].processes = vec![
-        ProcessDefinition::builder()
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![
+        CrewSpec::builder()
             .role("coder".to_string())
-            .source(ProcessSource::Agent {
+            .source(CrewSource::Agent {
                 selector: Selector { capability: "coding".to_string() },
                 prompt: Some("Implement issue 668.".to_string()),
             })
             .build(),
-        ProcessDefinition::builder()
+        CrewSpec::builder()
             .role("reviewer".to_string())
-            .source(ProcessSource::Agent {
+            .source(CrewSource::Agent {
                 selector: Selector { capability: "review".to_string() },
                 prompt: Some("Review the coder's work.".to_string()),
             })
@@ -327,17 +326,17 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-crew", "/Users/alice/dev/flotilla-existing").await;
     let workspace = backend
         .clone()
-        .using::<TaskWorkspace>(NAMESPACE)
-        .create(&task_workspace_meta("workspace-crew", REPO_URL), &TaskWorkspaceSpec {
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-crew", REPO_URL), &VesselSpec {
             convoy_ref: "convoy-crew".to_string(),
-            task: "implement".to_string(),
+            vessel_name: "implement".to_string(),
             placement_policy_ref: "policy-crew".to_string(),
             adopted_checkout_ref: Some("adopted-checkout-convoy-crew".to_string()),
         })
         .await
         .expect("workspace create");
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -355,7 +354,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     assert!(brief.content.contains("flotilla crew reviewer handoff --message"));
     assert!(brief.content.ends_with("Implement issue 668.\n"));
     assert_eq!(context.namespace, NAMESPACE);
-    assert_eq!(context.vessel, "workspace-crew");
+    assert_eq!(context.vessel_ref, "workspace-crew");
     assert_eq!(message, &None);
     assert!(outcome
         .actuations
@@ -377,13 +376,13 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-observed", "convoy-observed", "implement", "policy-observed", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
     assert!(matches!(
         outcome.patch,
-        Some(flotilla_resources::TaskWorkspaceStatusPatch::MarkFailed { ref message })
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
             if message == "checkout checkout-workspace-observed is ready but has no target path"
     ));
 }
@@ -397,7 +396,7 @@ async fn run_finalizer_deletes_all_labeled_children() {
     create_labeled_checkout(&backend, NAMESPACE, "checkout-workspace-finalize", "workspace-finalize").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-finalize-coder", "workspace-finalize").await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     assert!(matches!(
@@ -422,7 +421,7 @@ async fn run_finalizer_preserves_adopted_checkout() {
     create_labeled_adopted_checkout(&backend, NAMESPACE, "checkout-workspace-adopted", "workspace-adopted").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-adopted-coder", "workspace-adopted").await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     let checkout =
@@ -441,7 +440,7 @@ async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
 
     create_labeled_environment(&backend, NAMESPACE, "env-workspace-partial", "workspace-partial").await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     assert!(matches!(
@@ -490,7 +489,7 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-labels", "convoy-labels", "review", "policy-labels", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -507,11 +506,11 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
     assert_eq!(terminal.0.labels.get("service").map(String::as_str), Some("api"));
     assert_eq!(terminal.0.labels.get("team").map(String::as_str), Some("platform"));
     assert_eq!(terminal.0.labels.get(CONVOY_LABEL).map(String::as_str), Some("convoy-labels"));
-    assert_eq!(terminal.0.labels.get(TASK_LABEL).map(String::as_str), Some("review"));
-    assert_eq!(terminal.0.labels.get(TASK_WORKSPACE_LABEL).map(String::as_str), Some("workspace-labels"));
+    assert_eq!(terminal.0.labels.get(VESSEL_LABEL).map(String::as_str), Some("review"));
+    assert_eq!(terminal.0.labels.get(VESSEL_REF_LABEL).map(String::as_str), Some("workspace-labels"));
     assert_eq!(terminal.0.labels.get(ROLE_LABEL).map(String::as_str), Some("test"));
-    assert_eq!(terminal.0.labels.get(TASK_ORDINAL_LABEL).map(String::as_str), Some("001"));
-    assert_eq!(terminal.0.labels.get(PROCESS_ORDINAL_LABEL).map(String::as_str), Some("001"));
+    assert_eq!(terminal.0.labels.get(VESSEL_ORDINAL_LABEL).map(String::as_str), Some("001"));
+    assert_eq!(terminal.0.labels.get(CREW_ORDINAL_LABEL).map(String::as_str), Some("001"));
 }
 
 async fn assert_terminal_cwd_for_strategy(
@@ -563,7 +562,7 @@ async fn assert_terminal_cwd_for_strategy(
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, workspace_name, "convoy-cwd", "implement", "policy-cwd", REPO_URL).await;
 
-    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -623,35 +622,35 @@ async fn create_convoy_with_labeled_processes(
     convoys
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
-                tasks: vec![
-                    SnapshotTask {
+                vessels: vec![
+                    VesselRequirement {
                         name: "implement".to_string(),
                         depends_on: Vec::new(),
-                        processes: vec![ProcessDefinition::builder()
+                        crew: vec![CrewSpec::builder()
                             .role("coder".to_string())
-                            .source(ProcessSource::Tool { command: "cargo fmt --check".to_string() })
+                            .source(CrewSource::Tool { command: "cargo fmt --check".to_string() })
                             .build()],
                     },
-                    SnapshotTask {
+                    VesselRequirement {
                         name: "review".to_string(),
                         depends_on: vec!["implement".to_string()],
-                        processes: vec![
-                            ProcessDefinition::builder()
+                        crew: vec![
+                            CrewSpec::builder()
                                 .role("build".to_string())
-                                .source(ProcessSource::Tool { command: "cargo check".to_string() })
+                                .source(CrewSource::Tool { command: "cargo check".to_string() })
                                 .build(),
-                            ProcessDefinition::builder()
+                            CrewSpec::builder()
                                 .role("test".to_string())
-                                .source(ProcessSource::Tool { command: "cargo test".to_string() })
+                                .source(CrewSource::Tool { command: "cargo test".to_string() })
                                 .labels(BTreeMap::from([
                                     ("service".to_string(), "api".to_string()),
                                     ("team".to_string(), "platform".to_string()),
                                     (CONVOY_LABEL.to_string(), "wrong-convoy".to_string()),
-                                    (TASK_LABEL.to_string(), "wrong-task".to_string()),
-                                    (TASK_WORKSPACE_LABEL.to_string(), "wrong-workspace".to_string()),
+                                    (VESSEL_LABEL.to_string(), "wrong-task".to_string()),
+                                    (VESSEL_REF_LABEL.to_string(), "wrong-workspace".to_string()),
                                     (ROLE_LABEL.to_string(), "wrong-role".to_string()),
-                                    (TASK_ORDINAL_LABEL.to_string(), "999".to_string()),
-                                    (PROCESS_ORDINAL_LABEL.to_string(), "999".to_string()),
+                                    (VESSEL_ORDINAL_LABEL.to_string(), "999".to_string()),
+                                    (CREW_ORDINAL_LABEL.to_string(), "999".to_string()),
                                 ]))
                                 .build(),
                         ],
@@ -710,7 +709,7 @@ async fn create_labeled_environment(backend: &ResourceBackend, namespace: &str, 
     backend
         .clone()
         .using::<Environment>(namespace)
-        .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &EnvironmentSpec {
+        .create(&labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]), &EnvironmentSpec {
             host_direct: Some(HostDirectEnvironmentSpec {
                 host_ref: HOST_REF.to_string(),
                 repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
@@ -726,7 +725,7 @@ async fn create_labeled_checkout(backend: &ResourceBackend, namespace: &str, nam
         .clone()
         .using::<Checkout>(namespace)
         .create(
-            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]),
+            &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]),
             &CheckoutSpec::Worktree(worktree_checkout_spec(
                 &host_direct_env_name(),
                 GIT_REF,
@@ -743,7 +742,7 @@ async fn create_labeled_adopted_checkout(backend: &ResourceBackend, namespace: &
         .clone()
         .using::<Checkout>(namespace)
         .create(
-            &labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())])
+            &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())])
                 .with_lifecycle_authority(LifecycleAuthority::Adopted),
             &CheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: GIT_REF.to_string(),
@@ -810,7 +809,7 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
     backend
         .clone()
         .using::<TerminalSession>(namespace)
-        .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &TerminalSessionSpec {
+        .create(&labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]), &TerminalSessionSpec {
             env_ref: host_direct_env_name(),
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },

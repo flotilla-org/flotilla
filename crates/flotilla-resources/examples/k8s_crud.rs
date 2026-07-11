@@ -32,8 +32,8 @@ fn load_workflow_spec() -> Result<WorkflowTemplateSpec, Box<dyn std::error::Erro
 
 fn updated_workflow_spec() -> WorkflowTemplateSpec {
     let mut spec = load_workflow_spec().expect("sample workflow should parse");
-    if let flotilla_resources::ProcessSource::Tool { command } = &mut spec.tasks[0].processes[1].source {
-        *command = "cargo check --all-targets".to_string();
+    if let flotilla_resources::CrewSource::Tool { command } = &mut spec.vessels[0].crew[1].source {
+        "cargo check --all-targets".clone_into(command);
     }
     spec
 }
@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
-            tasks: Default::default(),
+            work: Default::default(),
             message: None,
             started_at: None,
             finished_at: None,

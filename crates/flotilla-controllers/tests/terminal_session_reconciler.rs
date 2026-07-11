@@ -84,7 +84,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
                 context: flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),
-                    vessel: "demo-implement".into(),
+                    vessel_ref: "demo-implement".into(),
                 },
                 message: None,
             },
@@ -147,7 +147,7 @@ async fn a_message_queued_during_startup_is_delivered_after_the_session_becomes_
                 context: flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),
-                    vessel: "demo-review".into(),
+                    vessel_ref: "demo-review".into(),
                 },
                 message: Some(flotilla_resources::TerminalCrewMessage {
                     id: "message-new".into(),

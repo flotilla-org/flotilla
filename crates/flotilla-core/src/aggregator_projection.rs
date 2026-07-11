@@ -60,7 +60,7 @@ fn panel_snapshot(seq: u64, rows: Vec<PanelRow>) -> PanelSnapshot {
                 ],
                 intents: vec![
                     IntentDefinition::new("attach", "Attach", IntentKind::Attach),
-                    IntentDefinition::new("complete-leg", "Complete leg", IntentKind::CompleteLeg),
+                    IntentDefinition::new("complete-work", "Complete work", IntentKind::CompleteWork),
                 ],
                 rows,
             }],

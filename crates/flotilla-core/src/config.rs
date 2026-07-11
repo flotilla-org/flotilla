@@ -131,7 +131,7 @@ pub struct KeysConfig {
     #[serde(default)]
     pub convoys: HashMap<String, String>,
     #[serde(default)]
-    pub convoy_tasks: HashMap<String, String>,
+    pub convoy_vessels: HashMap<String, String>,
     #[serde(default)]
     pub action_menu: HashMap<String, String>,
     #[serde(default)]

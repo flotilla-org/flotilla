@@ -313,7 +313,7 @@ pub async fn build_plan(
         }])),
 
         // Daemon-level commands should not reach build_plan.
-        CommandAction::ConvoyLegComplete { .. }
+        CommandAction::ConvoyWorkComplete { .. }
         | CommandAction::CrewHandoff { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::WorkflowTemplateApply { .. }

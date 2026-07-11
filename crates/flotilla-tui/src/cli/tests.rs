@@ -553,8 +553,8 @@ mod command_result_human {
     fn crew_list_shows_defined_and_runtime_state() {
         let result = CommandValue::CrewList(Box::new(CrewListResponse {
             convoy: "convoy-a".into(),
-            vessel: "convoy-a-implement".into(),
-            leg: "implement".into(),
+            vessel_ref: "convoy-a-implement".into(),
+            vessel: "implement".into(),
             members: vec![
                 CrewListMember {
                     role: "coder".into(),

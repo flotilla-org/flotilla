@@ -28,13 +28,12 @@ use flotilla_protocol::{
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, terminal_session_attach_target,
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CrewSource,
     Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ProcessSource, Project, ProjectRepositorySpec, ProjectSpec,
-    Resource, ResourceBackend, ResourceError, TaskWorkspace, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL,
-    TASK_WORKSPACE_LABEL,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, Resource,
+    ResourceBackend, ResourceError, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -221,15 +220,15 @@ fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) 
     let mut refs = vec![session_name.to_string()];
 
     let convoy = labels.get(CONVOY_LABEL);
-    let task = labels.get(TASK_LABEL);
+    let task = labels.get(VESSEL_LABEL);
     let role = labels.get(ROLE_LABEL);
-    let task_workspace = labels.get(TASK_WORKSPACE_LABEL);
+    let vessel = labels.get(VESSEL_REF_LABEL);
 
     if let Some(convoy) = convoy {
         refs.push(convoy.clone());
     }
-    if let Some(task_workspace) = task_workspace {
-        refs.push(task_workspace.clone());
+    if let Some(vessel) = vessel {
+        refs.push(vessel.clone());
     }
     if let (Some(convoy), Some(task)) = (convoy, task) {
         refs.push(format!("{convoy}/{task}"));
@@ -237,8 +236,8 @@ fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) 
     if let (Some(convoy), Some(task), Some(role)) = (convoy, task, role) {
         refs.push(format!("{convoy}/{task}/{role}"));
     }
-    if let (Some(task_workspace), Some(role)) = (task_workspace, role) {
-        refs.push(format!("{task_workspace}/{role}"));
+    if let (Some(vessel), Some(role)) = (vessel, role) {
+        refs.push(format!("{vessel}/{role}"));
     }
     if let Some(role) = role {
         refs.push(role.clone());
@@ -250,7 +249,7 @@ fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) 
 }
 
 fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>) -> String {
-    match (labels.get(CONVOY_LABEL), labels.get(TASK_LABEL), labels.get(ROLE_LABEL)) {
+    match (labels.get(CONVOY_LABEL), labels.get(VESSEL_LABEL), labels.get(ROLE_LABEL)) {
         (Some(convoy), Some(task), Some(role)) => format!("{convoy}/{task}/{role} ({session_name})"),
         (Some(convoy), Some(task), None) => format!("{convoy}/{task} ({session_name})"),
         (Some(convoy), None, Some(role)) => format!("{convoy}/{role} ({session_name})"),
@@ -775,8 +774,8 @@ struct FleetReplicaCacheEntry {
 struct ResolvedCrewContext {
     namespace: String,
     convoy: String,
+    vessel_ref: String,
     vessel: String,
-    leg: String,
     caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
 }
 
@@ -793,8 +792,12 @@ fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::Resource
 
 fn handoff_crew_brief(context: &ResolvedCrewContext, target: &str, prompt: Option<&str>, members: &[CrewListMember]) -> TerminalBrief {
     crate::agent_adapter::build_crew_brief(
-        &TerminalCrewContext { namespace: context.namespace.clone(), convoy: context.convoy.clone(), vessel: context.vessel.clone() },
-        &context.leg,
+        &TerminalCrewContext {
+            namespace: context.namespace.clone(),
+            convoy: context.convoy.clone(),
+            vessel_ref: context.vessel_ref.clone(),
+        },
+        &context.vessel,
         target,
         prompt,
         &members
@@ -1125,7 +1128,7 @@ impl InProcessDaemon {
     }
 
     /// Override the provisioning namespace used for daemon-side resource lookups
-    /// (e.g. `ConvoyLegComplete`). Called by the daemon runtime at startup with
+    /// (e.g. `ConvoyWorkComplete`). Called by the daemon runtime at startup with
     /// `RuntimeOptions::namespace`.
     pub async fn set_provisioning_namespace(&self, namespace: String) {
         *self.provisioning_namespace.write().await = namespace;
@@ -2289,48 +2292,49 @@ impl InProcessDaemon {
                 .into_iter()
                 .find(|session| session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id))
                 .ok_or_else(|| format!("unknown FLOTILLA_CREW_ID `{crew_id}`"))?;
-            let (convoy, vessel) = match &session.spec.source {
-                TerminalSessionSource::Agent { context, .. } => (context.convoy.clone(), context.vessel.clone()),
+            let (convoy, vessel_ref) = match &session.spec.source {
+                TerminalSessionSource::Agent { context, .. } => (context.convoy.clone(), context.vessel_ref.clone()),
                 TerminalSessionSource::Tool { .. } => {
                     return Err(format!("crew identity `{crew_id}` belongs to a non-agent process"));
                 }
             };
-            return self.resolved_crew_context(namespace, convoy, vessel, Some(session)).await;
+            return self.resolved_crew_context(namespace, convoy, vessel_ref, Some(session)).await;
         }
 
         let convoy = requested
             .convoy
             .clone()
-            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel, and --role".to_string())?;
-        let vessel = requested
-            .vessel
+            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role".to_string())?;
+        let vessel_ref = requested
+            .vessel_ref
             .clone()
-            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel, and --role".to_string())?;
-        let role =
-            requested.role.clone().ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel, and --role".to_string())?;
+            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role".to_string())?;
+        let role = requested
+            .role
+            .clone()
+            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role".to_string())?;
         let caller = session_list.into_iter().find(|session| {
-            session.spec.role == role && session.metadata.labels.get(TASK_WORKSPACE_LABEL).map(String::as_str) == Some(vessel.as_str())
+            session.spec.role == role && session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str) == Some(vessel_ref.as_str())
         });
-        self.resolved_crew_context(namespace, convoy, vessel, caller).await
+        self.resolved_crew_context(namespace, convoy, vessel_ref, caller).await
     }
 
     async fn resolved_crew_context(
         &self,
         namespace: String,
         convoy: String,
-        vessel: String,
+        vessel_ref: String,
         caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
     ) -> Result<ResolvedCrewContext, String> {
-        let workspace =
-            self.resource_backend.clone().using::<TaskWorkspace>(&namespace).get(&vessel).await.map_err(|err| err.to_string())?;
+        let workspace = self.resource_backend.clone().using::<Vessel>(&namespace).get(&vessel_ref).await.map_err(|err| err.to_string())?;
         if workspace.spec.convoy_ref != convoy {
-            return Err(format!("vessel `{vessel}` does not belong to convoy `{convoy}`"));
+            return Err(format!("vessel `{vessel_ref}` does not belong to convoy `{convoy}`"));
         }
         Ok(ResolvedCrewContext::builder()
             .namespace(namespace)
             .convoy(convoy)
-            .vessel(vessel)
-            .leg(workspace.spec.task)
+            .vessel_ref(vessel_ref)
+            .vessel(workspace.spec.vessel_name)
             .maybe_caller_session(caller_session)
             .build())
     }
@@ -2343,11 +2347,11 @@ impl InProcessDaemon {
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .and_then(|snapshot| snapshot.tasks.iter().find(|task| task.name == context.leg))
-            .ok_or_else(|| format!("leg `{}` is missing from convoy `{}`", context.leg, context.convoy))?;
+            .and_then(|snapshot| snapshot.vessels.iter().find(|vessel| vessel.name == context.vessel))
+            .ok_or_else(|| format!("vessel `{}` is missing from convoy `{}`", context.vessel, context.convoy))?;
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let by_role: HashMap<_, _> = sessions
-            .list_matching_labels(&BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), context.vessel.clone())]))
+            .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
             .await
             .map_err(|err| err.to_string())?
             .items
@@ -2355,7 +2359,7 @@ impl InProcessDaemon {
             .map(|session| (session.spec.role.clone(), session))
             .collect();
         let members = task
-            .processes
+            .crew
             .iter()
             .map(|process| {
                 let session = by_role.get(&process.role);
@@ -2364,13 +2368,13 @@ impl InProcessDaemon {
                     Some(ResourceTerminalSessionPhase::Running) => "active",
                     Some(ResourceTerminalSessionPhase::Stopped) => "stopped",
                     Some(ResourceTerminalSessionPhase::Failed) => "failed",
-                    None if matches!(process.source, ProcessSource::Agent { .. }) => "latent",
+                    None if matches!(process.source, CrewSource::Agent { .. }) => "latent",
                     None => "pending",
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
                 CrewListMember::builder()
                     .role(process.role.clone())
-                    .kind(if matches!(process.source, ProcessSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
+                    .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
                     .state(state.to_string())
                     .maybe_adapter(crew.map(|crew| crew.adapter.clone()))
                     .maybe_model(crew.and_then(|crew| crew.model.clone()))
@@ -2378,7 +2382,12 @@ impl InProcessDaemon {
                     .build()
             })
             .collect();
-        Ok(CrewListResponse::builder().convoy(context.convoy).vessel(context.vessel).leg(context.leg).members(members).build())
+        Ok(CrewListResponse::builder()
+            .convoy(context.convoy)
+            .vessel_ref(context.vessel_ref)
+            .vessel(context.vessel)
+            .members(members)
+            .build())
     }
 
     pub async fn crew_handoff_internal(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
@@ -2389,26 +2398,26 @@ impl InProcessDaemon {
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .and_then(|snapshot| snapshot.tasks.iter().enumerate().find(|(_, task)| task.name == context.leg))
-            .ok_or_else(|| format!("leg `{}` is missing from convoy `{}`", context.leg, context.convoy))?;
+            .and_then(|snapshot| snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == context.vessel))
+            .ok_or_else(|| format!("vessel `{}` is missing from convoy `{}`", context.vessel, context.convoy))?;
         let (process_index, process) = task
-            .processes
+            .crew
             .iter()
             .enumerate()
             .find(|(_, process)| process.role == target)
-            .ok_or_else(|| format!("crew target `{target}` is not defined for leg `{}`", context.leg))?;
-        let ProcessSource::Agent { selector, prompt } = &process.source else {
+            .ok_or_else(|| format!("crew target `{target}` is not defined for vessel `{}`", context.vessel))?;
+        let CrewSource::Agent { selector, prompt } = &process.source else {
             return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
         };
 
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
-            .vessel(context.vessel.clone())
+            .vessel_ref(context.vessel_ref.clone())
             .convoy(context.convoy.clone())
-            .leg(context.leg.clone())
+            .vessel(context.vessel.clone())
             .role(target.to_string())
-            .task_index(task_index)
-            .process_index(process_index)
+            .vessel_index(task_index)
+            .crew_index(process_index)
             .labels(process.labels.clone())
             .build();
         let terminal_name = identity.name();
@@ -2432,13 +2441,13 @@ impl InProcessDaemon {
                     caller.clone()
                 } else {
                     sessions
-                        .list_matching_labels(&BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), context.vessel.clone())]))
+                        .list_matching_labels(&BTreeMap::from([(VESSEL_REF_LABEL.to_string(), context.vessel_ref.clone())]))
                         .await
                         .map_err(|err| err.to_string())?
                         .items
                         .into_iter()
                         .next()
-                        .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel))?
+                        .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?
                 };
                 let current = self.crew_list_internal(requested).await?;
                 let brief = handoff_crew_brief(&context, target, prompt.as_deref(), &current.members);
@@ -2449,7 +2458,11 @@ impl InProcessDaemon {
                         source: TerminalSessionSource::Agent {
                             selector: selector.clone(),
                             brief,
-                            context: TerminalCrewContext { namespace: context.namespace, convoy: context.convoy, vessel: context.vessel },
+                            context: TerminalCrewContext {
+                                namespace: context.namespace,
+                                convoy: context.convoy,
+                                vessel_ref: context.vessel_ref,
+                            },
                             message: Some(pending_crew_message(message)),
                         },
                         cwd: anchor.spec.cwd,
@@ -2600,7 +2613,7 @@ impl InProcessDaemon {
         for session in session_list.items {
             let labels = &session.metadata.labels;
             let convoy = labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
-            let task = labels.get(TASK_LABEL).cloned();
+            let task = labels.get(VESSEL_LABEL).cloned();
             let role = labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = match task {
                 Some(task) => format!("{task}/{role}"),
@@ -3013,7 +3026,7 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyLegComplete { convoy, leg, message } = &command.action {
+        if let flotilla_protocol::CommandAction::ConvoyWorkComplete { convoy, work, message } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -3027,14 +3040,14 @@ impl InProcessDaemon {
             let result = match convoys.get(convoy).await {
                 Ok(current) => match current.status.as_ref() {
                     None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },
-                    Some(status) if !status.tasks.contains_key(leg) => {
-                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain leg {leg}") }
+                    Some(status) if !status.work.contains_key(work) => {
+                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") }
                     }
                     Some(_) => {
                         match apply_resource_status_patch(
                             &convoys,
                             convoy,
-                            &convoy_external_patches::mark_task_completed(leg.clone(), chrono::Utc::now(), message.clone()),
+                            &convoy_external_patches::mark_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
                         )
                         .await
                         {

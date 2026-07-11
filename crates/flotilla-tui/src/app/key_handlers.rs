@@ -41,28 +41,28 @@ impl App {
         match action {
             Action::SelectNext if self.ui.is_convoys => match self.convoys_focus() {
                 super::ConvoysFocus::List => self.convoys_tab_select_delta(1),
-                super::ConvoysFocus::Tasks => self.convoy_tasks_select_delta("flotilla", 1),
+                super::ConvoysFocus::Tasks => self.convoy_vessels_select_delta("flotilla", 1),
             },
             Action::SelectPrev if self.ui.is_convoys => match self.convoys_focus() {
                 super::ConvoysFocus::List => self.convoys_tab_select_delta(-1),
-                super::ConvoysFocus::Tasks => self.convoy_tasks_select_delta("flotilla", -1),
+                super::ConvoysFocus::Tasks => self.convoy_vessels_select_delta("flotilla", -1),
             },
             // On the Convoys list, Confirm (enter / l / right) drills into the task tree.
             // In the task tree, Confirm is currently a no-op (task-attach lands in PR 3).
             Action::Confirm if self.ui.is_convoys => {
                 if matches!(self.convoys_focus(), super::ConvoysFocus::List) {
-                    self.enter_convoy_tasks_focus("flotilla");
+                    self.enter_convoy_vessels_focus("flotilla");
                 }
             }
             // In the task tree, Dismiss (esc / left) returns to the convoy list.
             // On the convoy list, Dismiss is a no-op (don't act on the hidden repo page).
             Action::Dismiss if self.ui.is_convoys => {
                 if matches!(self.convoys_focus(), super::ConvoysFocus::Tasks) {
-                    self.exit_convoy_tasks_focus();
+                    self.exit_convoy_vessels_focus();
                 }
             }
-            Action::CompleteConvoyLeg if self.ui.is_convoys => self.open_complete_convoy_leg_palette(),
-            Action::AttachConvoyLeg if self.ui.is_convoys => self.attach_selected_convoy_task(),
+            Action::CompleteConvoyWork if self.ui.is_convoys => self.open_complete_convoy_work_palette(),
+            Action::AttachConvoyVessel if self.ui.is_convoys => self.attach_selected_convoy_vessel(),
             Action::Confirm if !self.ui.is_config => self.action_enter(),
             Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
             Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
@@ -405,18 +405,18 @@ impl App {
         }
     }
 
-    /// Open the command palette pre-filled with `convoy <id> leg <leg> complete `.
-    /// No-op when no convoy or leg is selected. Convoy ids and leg names are
+    /// Open the command palette pre-filled with `convoy <id> work <vessel> complete `.
+    /// No-op when no convoy or vessel is selected. Convoy ids and vessel names are
     /// arbitrary strings (no validation), so they are routed through the
     /// palette's quoting helper to round-trip whitespace and special characters.
-    pub(super) fn open_complete_convoy_leg_palette(&mut self) {
+    pub(super) fn open_complete_convoy_work_palette(&mut self) {
         let Some(convoy) = self.selected_convoy_summary("flotilla") else { return };
         let Some(task) = self.convoys_ui.selected_task.as_ref() else { return };
         let selected_task = task.clone();
         let completion_target =
-            convoy.tasks.iter().find(|candidate| candidate.name == *task).and_then(|task| task.completion_target.clone());
+            convoy.vessels.iter().find(|candidate| candidate.name == *task).and_then(|task| task.completion_target.clone());
         let Some(completion_target) = completion_target else {
-            self.set_status_message(Some(format!("completion unavailable for leg '{selected_task}'")));
+            self.set_status_message(Some(format!("completion unavailable for vessel '{selected_task}'")));
             return;
         };
         let target_node_id = match self.panel_target_node(&completion_target.host) {
@@ -427,21 +427,21 @@ impl App {
             }
         };
         let prefill = format!(
-            "convoy {} leg {} complete ",
+            "convoy {} work {} complete ",
             crate::palette::quote_palette_token(&completion_target.convoy),
-            crate::palette::quote_palette_token(&completion_target.leg),
+            crate::palette::quote_palette_token(&completion_target.vessel),
         );
         let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill_on_node(prefill, target_node_id);
         self.screen.modal_stack.push(Box::new(widget));
     }
 
     /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
-    pub(super) fn attach_selected_convoy_task(&mut self) {
+    pub(super) fn attach_selected_convoy_vessel(&mut self) {
         let Some(task) = self.convoys_ui.selected_task.clone() else { return };
         // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
         let target = self
             .selected_convoy_summary("flotilla")
-            .and_then(|convoy| convoy.tasks.iter().find(|t| t.name == task))
+            .and_then(|convoy| convoy.vessels.iter().find(|t| t.name == task))
             .map(|task| (task.workspace_ref.clone(), task.host.clone()));
         match target {
             Some((Some(ws_ref), host)) => {
