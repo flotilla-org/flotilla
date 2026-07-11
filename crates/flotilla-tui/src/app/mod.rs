@@ -285,8 +285,8 @@ pub enum ConvoysFocus {
 #[derive(Default)]
 pub struct ConvoysUiState {
     pub selected: Option<crate::convoy_model::ConvoyId>,
-    /// Name of the selected task within `selected`. Cleared when the convoy
-    /// selection changes; clamped against the convoy's task list on every
+    /// Name of the selected vessel within `selected`. Cleared when the convoy
+    /// selection changes; clamped against the convoy's vessel list on every
     /// snapshot/delta apply.
     pub selected_vessel: Option<String>,
     pub focus: ConvoysFocus,
@@ -1607,7 +1607,7 @@ impl App {
         &self.convoys_ui.filter
     }
 
-    /// Returns the selected task name within the selected convoy, if any.
+    /// Returns the selected vessel name within the selected convoy, if any.
     pub fn selected_convoy_task(&self) -> Option<&str> {
         self.convoys_ui.selected_vessel.as_deref()
     }
@@ -1624,17 +1624,17 @@ impl App {
     /// - Replaces a dangling selection (removed convoy) with the first available convoy.
     /// - Sets the first convoy as the default when no selection is set yet.
     /// - Resets task focus state when the selected convoy changes.
-    /// - Clamps `selected_vessel` against the selected convoy's current task list.
+    /// - Clamps `selected_vessel` against the selected convoy's current vessel list.
     fn refresh_convoy_selection(&mut self, namespace: &str) {
         let prior_selected = self.convoys_ui.selected.clone();
         let Some(model) = self.namespaces.get(namespace) else {
             self.convoys_ui.selected = None;
-            self.reset_convoy_task_state();
+            self.reset_convoy_vessel_state();
             return;
         };
         if model.convoys.is_empty() {
             self.convoys_ui.selected = None;
-            self.reset_convoy_task_state();
+            self.reset_convoy_vessel_state();
             return;
         }
         let still_valid = self.convoys_ui.selected.as_ref().is_some_and(|id| model.convoys.contains_key(id));
@@ -1642,12 +1642,12 @@ impl App {
             self.convoys_ui.selected = Some(model.convoys.keys().next().cloned().expect("non-empty checked above"));
         }
         if self.convoys_ui.selected != prior_selected {
-            self.reset_convoy_task_state();
+            self.reset_convoy_vessel_state();
         }
         self.clamp_selected_vessel(namespace);
     }
 
-    fn reset_convoy_task_state(&mut self) {
+    fn reset_convoy_vessel_state(&mut self) {
         self.convoys_ui.selected_vessel = None;
         self.convoys_ui.focus = ConvoysFocus::List;
     }
@@ -1683,7 +1683,7 @@ impl App {
         self.convoys_ui.focus = ConvoysFocus::Vessels;
     }
 
-    /// Return focus to the convoy list. Keeps `selected_vessel` so re-entering Tasks
+    /// Return focus to the convoy list. Keeps `selected_vessel` so re-entering Vessels
     /// resumes at the same row.
     pub fn exit_convoy_vessels_focus(&mut self) {
         self.convoys_ui.focus = ConvoysFocus::List;
@@ -1715,14 +1715,14 @@ impl App {
         let ids: Vec<crate::convoy_model::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
         if ids.is_empty() {
             self.convoys_ui.selected = None;
-            self.reset_convoy_task_state();
+            self.reset_convoy_vessel_state();
             return;
         }
         let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| candidate == id)).unwrap_or(0);
         let new_idx = (current_idx as isize + delta).clamp(0, (ids.len() - 1) as isize) as usize;
         self.convoys_ui.selected = Some(ids[new_idx].clone());
         if self.convoys_ui.selected != prior_selected {
-            self.reset_convoy_task_state();
+            self.reset_convoy_vessel_state();
         }
     }
 
@@ -1751,7 +1751,7 @@ impl App {
             self.convoys_ui.selected = visible_ids.into_iter().next();
         }
         if self.convoys_ui.selected != prior_selected {
-            self.reset_convoy_task_state();
+            self.reset_convoy_vessel_state();
         }
         self.clamp_selected_vessel(namespace);
     }
