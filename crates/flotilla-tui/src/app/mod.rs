@@ -272,13 +272,13 @@ pub struct NamespaceModel {
 }
 
 /// Which pane has focus on the Convoys tab — the convoy list (left) or the
-/// task tree (right). `j/k` semantics depend on this: in `List` they move
-/// between convoys; in `Tasks` they move between tasks of the selected convoy.
+/// vessel tree (right). `j/k` semantics depend on this: in `List` they move
+/// between convoys; in `Vessels` they move between vessels of the selected convoy.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvoysFocus {
     #[default]
     List,
-    Tasks,
+    Vessels,
 }
 
 /// UI state for the Convoys tab.
@@ -1670,7 +1670,7 @@ impl App {
         self.namespaces.get(namespace)?.convoys.get(id)
     }
 
-    /// Switch focus to the task tree, defaulting to the first task if none selected.
+    /// Switch focus to the vessel tree, defaulting to the first task if none selected.
     /// No-op when no convoy is selected or the convoy has no vessels.
     pub fn enter_convoy_vessels_focus(&mut self, namespace: &str) {
         let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
@@ -1680,7 +1680,7 @@ impl App {
         if self.convoys_ui.selected_task.is_none() {
             self.convoys_ui.selected_task = Some(convoy.vessels[0].name.clone());
         }
-        self.convoys_ui.focus = ConvoysFocus::Tasks;
+        self.convoys_ui.focus = ConvoysFocus::Vessels;
     }
 
     /// Return focus to the convoy list. Keeps `selected_task` so re-entering Tasks

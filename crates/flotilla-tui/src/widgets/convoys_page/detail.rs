@@ -34,7 +34,7 @@ impl<'a> ConvoyDetail<'a> {
         .block(Block::default().borders(Borders::ALL).border_style(border_style));
         f.render_widget(header, chunks[0]);
 
-        // Body: task tree OR initializing placeholder
+        // Body: vessel tree OR initializing placeholder
         let body_block = Block::default().borders(Borders::ALL).border_style(border_style).title(" Tasks ");
         let body_area = chunks[1];
         let body_inner = body_block.inner(body_area);

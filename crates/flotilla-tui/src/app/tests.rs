@@ -1991,7 +1991,7 @@ fn enter_tasks_focus_default_selects_first_task() {
 
     app.enter_convoy_vessels_focus("flotilla");
 
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
     assert_eq!(app.selected_convoy_task(), Some("t1"));
 }
 
@@ -2031,7 +2031,7 @@ fn switching_convoys_resets_task_state_and_focus() {
     ]))));
     app.ui.is_convoys = true;
     app.enter_convoy_vessels_focus("flotilla");
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
     app.convoys_tab_select_delta(1);
 
@@ -2048,7 +2048,7 @@ fn delta_removing_selected_task_clamps_to_none_and_drops_focus() {
     app.enter_convoy_vessels_focus("flotilla");
     app.convoy_vessels_select_delta("flotilla", 1);
     assert_eq!(app.selected_convoy_task(), Some("t2"));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
     // Remove t2 via delta.
     let mut shrunk = convoy_with_tasks("alpha", &["t1"]);
@@ -2090,7 +2090,7 @@ fn l_drills_in_then_esc_returns_to_list_focus() {
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
 
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
     assert_eq!(app.selected_convoy_task(), Some("t1"));
 
     app.handle_key(key(KeyCode::Esc));
@@ -2104,7 +2104,7 @@ fn h_returns_from_tasks_to_list_focus() {
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
     app.handle_key(key(KeyCode::Char('h')));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
@@ -2117,7 +2117,7 @@ fn enter_also_drills_into_tasks_focus() {
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 }
 
 #[test]
@@ -2127,7 +2127,7 @@ fn right_and_left_arrows_navigate_focus() {
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Right));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Tasks);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
     app.handle_key(key(KeyCode::Left));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);

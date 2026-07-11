@@ -15,7 +15,7 @@ impl App {
     ///
     /// Called when the base layer widget (Normal mode_id) is on top, so that
     /// config mode gets Overview bindings, convoys mode gets Convoys bindings
-    /// (or ConvoyTasks when the user has drilled into the task tree), and
+    /// (or ConvoyVessels when the user has drilled into the vessel tree), and
     /// normal mode gets Normal bindings.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
         let mode = if self.ui.is_config {
@@ -23,7 +23,7 @@ impl App {
         } else if self.ui.is_convoys {
             let inner = match self.convoys_focus() {
                 super::ConvoysFocus::List => BindingModeId::Convoys,
-                super::ConvoysFocus::Tasks => BindingModeId::ConvoyTasks,
+                super::ConvoysFocus::Vessels => BindingModeId::ConvoyVessels,
             };
             KeyBindingMode::Composed(vec![BindingModeId::TabPage, inner])
         } else {
@@ -41,23 +41,23 @@ impl App {
         match action {
             Action::SelectNext if self.ui.is_convoys => match self.convoys_focus() {
                 super::ConvoysFocus::List => self.convoys_tab_select_delta(1),
-                super::ConvoysFocus::Tasks => self.convoy_vessels_select_delta("flotilla", 1),
+                super::ConvoysFocus::Vessels => self.convoy_vessels_select_delta("flotilla", 1),
             },
             Action::SelectPrev if self.ui.is_convoys => match self.convoys_focus() {
                 super::ConvoysFocus::List => self.convoys_tab_select_delta(-1),
-                super::ConvoysFocus::Tasks => self.convoy_vessels_select_delta("flotilla", -1),
+                super::ConvoysFocus::Vessels => self.convoy_vessels_select_delta("flotilla", -1),
             },
-            // On the Convoys list, Confirm (enter / l / right) drills into the task tree.
-            // In the task tree, Confirm is currently a no-op (task-attach lands in PR 3).
+            // On the Convoys list, Confirm (enter / l / right) drills into the vessel tree.
+            // In the vessel tree, Confirm is currently a no-op (task-attach lands in PR 3).
             Action::Confirm if self.ui.is_convoys => {
                 if matches!(self.convoys_focus(), super::ConvoysFocus::List) {
                     self.enter_convoy_vessels_focus("flotilla");
                 }
             }
-            // In the task tree, Dismiss (esc / left) returns to the convoy list.
+            // In the vessel tree, Dismiss (esc / left) returns to the convoy list.
             // On the convoy list, Dismiss is a no-op (don't act on the hidden repo page).
             Action::Dismiss if self.ui.is_convoys => {
-                if matches!(self.convoys_focus(), super::ConvoysFocus::Tasks) {
+                if matches!(self.convoys_focus(), super::ConvoysFocus::Vessels) {
                     self.exit_convoy_vessels_focus();
                 }
             }

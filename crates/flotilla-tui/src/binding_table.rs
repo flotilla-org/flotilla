@@ -27,10 +27,10 @@ pub enum BindingModeId {
     /// confirm dialog.
     TabPage,
     Convoys,
-    /// Inner focus on the Convoys tab — the task tree on the right pane.
-    /// Composed with `TabPage`. `j/k` navigate tasks; `esc` returns to the
+    /// Inner focus on the Convoys tab — the vessel tree on the right pane.
+    /// Composed with `TabPage`. `j/k` navigate vessels; `esc` returns to the
     /// convoy list; `x` opens the palette pre-filled to complete the work.
-    ConvoyTasks,
+    ConvoyVessels,
     Help,
     ActionMenu,
     DeleteConfirm,
@@ -144,21 +144,21 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Normal, "p", Action::Dispatch(Intent::OpenChangeRequest)),
     // ── Convoys (outer focus: convoy list) ──
     // j/k/up/down come from Shared (SelectNext/SelectPrev). enter comes from Shared (Confirm).
-    // l and right are vim-style and arrow-style synonyms for "drill into the task tree" — the
+    // l and right are vim-style and arrow-style synonyms for "drill into the vessel tree" — the
     // app dispatches Confirm on the Convoys list to enter task focus.
     h(BindingModeId::Convoys, "l", Action::Confirm, "Tasks"),
     b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
-    // ── ConvoyTasks (inner focus: task tree) ──
+    // ── ConvoyVessels (inner focus: vessel tree) ──
     // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to
-    // enter the task tree; the app dispatches Dismiss in Tasks focus to return to the list.
-    b(BindingModeId::ConvoyTasks, "h", Action::Dismiss),
-    b(BindingModeId::ConvoyTasks, "left", Action::Dismiss),
-    hk(BindingModeId::ConvoyTasks, "esc", "ESC", Action::Dismiss, "List"),
-    h(BindingModeId::ConvoyTasks, "x", Action::CompleteConvoyWork, "Complete"),
-    h(BindingModeId::ConvoyTasks, "a", Action::AttachConvoyVessel, "Attach"),
-    h(BindingModeId::ConvoyTasks, "r", Action::Refresh, "Refresh"),
+    // enter the vessel tree; the app dispatches Dismiss in Vessels focus to return to the list.
+    b(BindingModeId::ConvoyVessels, "h", Action::Dismiss),
+    b(BindingModeId::ConvoyVessels, "left", Action::Dismiss),
+    hk(BindingModeId::ConvoyVessels, "esc", "ESC", Action::Dismiss, "List"),
+    h(BindingModeId::ConvoyVessels, "x", Action::CompleteConvoyWork, "Complete"),
+    h(BindingModeId::ConvoyVessels, "a", Action::AttachConvoyVessel, "Attach"),
+    h(BindingModeId::ConvoyVessels, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),
