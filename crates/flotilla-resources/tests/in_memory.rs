@@ -4,12 +4,16 @@ use std::collections::BTreeMap;
 
 use common::{
     contract::{
-        assert_create_get_list_roundtrip, assert_delete_emits_event, assert_metadata_roundtrip, assert_namespace_isolation,
-        assert_stale_resource_version_conflicts, assert_watch_from_version_replays, assert_watch_now_semantics, ConvoyFixture,
+        assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip,
+        assert_delete_emits_event, assert_identical_status_update_is_noop_with_backend, assert_identical_update_is_noop_with_backend,
+        assert_metadata_roundtrip, assert_namespace_isolation, assert_stale_resource_version_conflicts,
+        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays, assert_watch_now_semantics,
+        assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
+        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
     convoy_meta, convoy_spec,
 };
-use flotilla_resources::{Convoy, InMemoryBackend, InputMeta, ResourceBackend};
+use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, InputMeta, ResourceBackend};
 use rstest::rstest;
 
 fn resolver(namespace: &str) -> flotilla_resources::TypedResolver<Convoy> {
@@ -35,6 +39,20 @@ async fn update_requires_current_resource_version(#[case] _fixture: ConvoyFixtur
 #[rstest]
 #[case(ConvoyFixture)]
 #[tokio::test]
+async fn identical_update_preserves_resource_version_and_emits_no_event(#[case] _fixture: ConvoyFixture) {
+    assert_identical_update_is_noop_with_backend::<ConvoyFixture>(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn identical_status_update_preserves_resource_version_and_emits_no_event(#[case] _fixture: ConvoyFixture) {
+    assert_identical_status_update_is_noop_with_backend::<ConvoyFixture>(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
 async fn delete_emits_deleted_event(#[case] _fixture: ConvoyFixture) {
     assert_delete_emits_event::<ConvoyFixture>().await;
 }
@@ -51,6 +69,43 @@ async fn watch_from_version_replays_gaplessly_after_list(#[case] _fixture: Convo
 #[tokio::test]
 async fn watch_now_only_sees_future_events(#[case] _fixture: ConvoyFixture) {
     assert_watch_now_semantics::<ConvoyFixture>().await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn watch_below_retention_floor_expires(#[case] _fixture: ConvoyFixture) {
+    let retention = EventRetention::new(2).expect("valid retention");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::with_event_retention(retention));
+    assert_watch_retention_expires_only_versions_below_floor_with_backend::<ConvoyFixture>(backend).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn expired_watch_consumer_relists_and_converges(#[case] _fixture: ConvoyFixture) {
+    let retention = EventRetention::new(2).expect("valid retention");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::with_event_retention(retention));
+    assert_consumer_relists_after_expired_watch_and_converges_with_backend::<ConvoyFixture>(backend).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn diagnostics_report_bounded_event_log(#[case] _fixture: ConvoyFixture) {
+    let retention = EventRetention::new(2).expect("valid retention");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::with_event_retention(retention));
+    assert_store_diagnostics_report_retained_events_with_backend::<ConvoyFixture>(backend).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn watch_only_diagnostics_match_mutation_based_stream_semantics(#[case] _fixture: ConvoyFixture) {
+    assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend::<ConvoyFixture>(ResourceBackend::InMemory(
+        InMemoryBackend::default(),
+    ))
+    .await;
 }
 
 #[rstest]
@@ -167,4 +222,31 @@ async fn observed_backend_rejects_bare_watch_resume_without_generation() {
         .expect_err("observed watch resume should require generation");
 
     assert!(matches!(err, flotilla_resources::ResourceError::Invalid { .. }));
+}
+
+#[tokio::test]
+async fn observed_backend_expires_compacted_version_within_current_generation() {
+    let retention = EventRetention::new(2).expect("valid retention");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::observed_with_event_retention(retention));
+    let resolver = backend.using::<Convoy>("flotilla");
+    let created = resolver.create(&convoy_meta("alpha"), &convoy_spec("template-a")).await.expect("create");
+    let second =
+        resolver.update(&convoy_meta("alpha"), &created.metadata.resource_version, &convoy_spec("template-b")).await.expect("first update");
+    let third =
+        resolver.update(&convoy_meta("alpha"), &second.metadata.resource_version, &convoy_spec("template-c")).await.expect("second update");
+    resolver.update(&convoy_meta("alpha"), &third.metadata.resource_version, &convoy_spec("template-d")).await.expect("third update");
+    let generation = resolver.list().await.expect("list").generation.expect("observed generation");
+
+    let err = resolver
+        .watch(flotilla_resources::WatchStart::FromVersionInGeneration {
+            generation,
+            resource_version: created.metadata.resource_version.clone(),
+        })
+        .await
+        .expect_err("compacted version should expire");
+
+    assert_eq!(err, flotilla_resources::ResourceError::WatchExpired {
+        requested_version: created.metadata.resource_version,
+        compacted_through: second.metadata.resource_version,
+    });
 }

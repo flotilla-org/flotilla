@@ -491,10 +491,23 @@ fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) 
 
 async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, profile: &LocalProvisioningProfile) -> Result<(), String> {
     ensure_host_exists(&daemon.resource_backend(), namespace, &profile.host_id).await?;
-    let hosts = daemon.resource_backend().using::<Host>(namespace);
+    let backend = daemon.resource_backend();
+    let hosts = backend.using::<Host>(namespace);
     let host = hosts.get(&profile.host_id).await.map_err(|err| err.to_string())?;
     let summary = daemon.local_host_summary().await;
-    let status = HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true };
+    let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
+    if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
+        warn!(
+            event_count = diagnostics.event_count,
+            object_count = diagnostics.object_count,
+            resource_stream_count = diagnostics.resource_stream_count,
+            max_retained_events = diagnostics.max_retained_events,
+            warnings = ?diagnostics.warnings,
+            "resource event log tripwire triggered",
+        );
+    }
+    let status =
+        HostStatus { capabilities: host_capabilities(&summary, profile), heartbeat_at: Some(Utc::now()), ready: true, resource_store };
     hosts.update_status(&profile.host_id, &host.metadata.resource_version, &status).await.map(|_| ()).map_err(|err| err.to_string())
 }
 
@@ -1259,6 +1272,25 @@ mod tests {
         let host = backend.clone().using::<Host>(NAMESPACE).get(&host_id).await.expect("host should exist after startup");
         assert!(host.status.is_some(), "startup heartbeat should publish host status");
 
+        let workspaces = backend.clone().using::<TaskWorkspace>(NAMESPACE);
+        let sqlite_path = config.state_dir().as_path().join("resources.sqlite");
+        let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut previous_idle_sample = None;
+        loop {
+            let workspace = workspaces.get("convoy-a-implement").await.expect("steady workspace should remain");
+            let sample = (
+                workspace.metadata.resource_version,
+                workspace.status.expect("steady workspace status").ready_at,
+                sqlite_path.exists().then(|| sqlite_max_event_rowid(&sqlite_path)),
+            );
+            if previous_idle_sample.as_ref() == Some(&sample) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < idle_deadline, "resource store did not reach an idle fixed point");
+            previous_idle_sample = Some(sample);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
         daemon
             .execute(Command {
                 node_id: None,
@@ -1302,6 +1334,13 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "timed out waiting for host status");
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    fn sqlite_max_event_rowid(path: &Path) -> u64 {
+        let connection = rusqlite::Connection::open(path).expect("open SQLite store for idle inspection");
+        connection
+            .query_row("SELECT COALESCE(MAX(rowid), 0) FROM resource_events", [], |row| row.get(0))
+            .expect("read maximum resource event rowid")
     }
 
     async fn wait_until<F, Fut>(mut condition: F)
@@ -1349,6 +1388,10 @@ mod tests {
         assert!(status.ready, "heartbeat should mark host ready");
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
         assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
+        assert!(
+            status.resource_store.expect("heartbeat should publish resource store diagnostics").event_log_within_retention(),
+            "heartbeat should report a bounded resource event log"
+        );
 
         heartbeat.abort();
         let _ = heartbeat.await;

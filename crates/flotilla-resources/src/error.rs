@@ -5,6 +5,7 @@ pub enum ResourceError {
     NotFound { name: String },
     Conflict { name: String, message: String },
     Invalid { message: String },
+    WatchExpired { requested_version: String, compacted_through: String },
     Unauthorized { message: String },
     Other { message: String },
 }
@@ -41,6 +42,9 @@ impl fmt::Display for ResourceError {
             Self::NotFound { name } => write!(f, "resource not found: {name}"),
             Self::Conflict { name, message } => write!(f, "resource conflict for {name}: {message}"),
             Self::Invalid { message } => write!(f, "invalid resource: {message}"),
+            Self::WatchExpired { requested_version, compacted_through } => {
+                write!(f, "watch resourceVersion {requested_version} expired; events through {compacted_through} were compacted")
+            }
             Self::Unauthorized { message } => write!(f, "unauthorized: {message}"),
             Self::Other { message } => f.write_str(message),
         }

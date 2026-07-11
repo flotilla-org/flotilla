@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 use crate::{
     error::ResourceError,
     resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
+    retention::{EventRetention, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
 };
 
@@ -27,6 +29,7 @@ pub struct SqliteBackend {
     // if controller contention shows up in practice.
     connection: Arc<Mutex<Connection>>,
     watchers: Arc<Mutex<WatchersByStore>>,
+    event_retention: EventRetention,
 }
 
 #[derive(Debug, Clone)]
@@ -63,16 +66,30 @@ impl StoredEventKind {
 
 impl SqliteBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
+        Self::open_with_event_retention(path, EventRetention::default())
+    }
+
+    pub fn open_with_event_retention(path: impl AsRef<Path>, event_retention: EventRetention) -> Result<Self, ResourceError> {
         let connection = Connection::open(path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
-        Self::from_connection(connection)
+        Self::from_connection(connection, event_retention)
     }
 
     pub fn open_in_memory() -> Result<Self, ResourceError> {
-        let connection = Connection::open_in_memory().map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
-        Self::from_connection(connection)
+        Self::open_in_memory_with_event_retention(EventRetention::default())
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, ResourceError> {
+    pub fn open_in_memory_with_event_retention(event_retention: EventRetention) -> Result<Self, ResourceError> {
+        let connection = Connection::open_in_memory().map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
+        Self::from_connection(connection, event_retention)
+    }
+
+    fn from_connection(mut connection: Connection, event_retention: EventRetention) -> Result<Self, ResourceError> {
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|err| ResourceError::other(format!("configure sqlite resource store busy timeout: {err}")))?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|err| ResourceError::other(format!("configure sqlite resource store WAL mode: {err}")))?;
         connection
             .execute_batch(
                 r#"
@@ -96,8 +113,6 @@ impl SqliteBackend {
                     PRIMARY KEY (group_name, version, kind, namespace, name)
                 );
 
-                -- TODO: add event-log pruning once watch retention requirements
-                -- are clearer for long-running embedded daemons.
                 CREATE TABLE IF NOT EXISTS resource_events (
                     group_name TEXT NOT NULL,
                     version TEXT NOT NULL,
@@ -108,10 +123,31 @@ impl SqliteBackend {
                     body_json TEXT NOT NULL,
                     PRIMARY KEY (group_name, version, kind, namespace, event_version)
                 );
+
+                CREATE TABLE IF NOT EXISTS resource_event_compaction (
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    compacted_through INTEGER NOT NULL,
+                    PRIMARY KEY (group_name, version, kind, namespace)
+                );
                 "#,
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
-        Ok(Self { connection: Arc::new(Mutex::new(connection)), watchers: Arc::new(Mutex::new(HashMap::new())) })
+        let startup_diagnostics = Self::diagnostics_from_connection(&connection, event_retention)?;
+        if !startup_diagnostics.warnings.is_empty() {
+            tracing::warn!(
+                event_count = startup_diagnostics.event_count,
+                object_count = startup_diagnostics.object_count,
+                resource_stream_count = startup_diagnostics.resource_stream_count,
+                max_retained_events = startup_diagnostics.max_retained_events,
+                warnings = ?startup_diagnostics.warnings,
+                "resource event log tripwire triggered on startup; compacting",
+            );
+        }
+        Self::compact_existing_events(&mut connection, event_retention)?;
+        Ok(Self { connection: Arc::new(Mutex::new(connection)), watchers: Arc::new(Mutex::new(HashMap::new())), event_retention })
     }
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {
@@ -124,6 +160,27 @@ impl SqliteBackend {
 
     fn lock_watchers(&self) -> Result<MutexGuard<'_, WatchersByStore>, ResourceError> {
         self.watchers.lock().map_err(|_| ResourceError::other("sqlite resource watch lock poisoned"))
+    }
+
+    pub(crate) async fn diagnostics(&self) -> Result<ResourceStoreDiagnostics, ResourceError> {
+        let connection = self.lock_connection()?;
+        Self::diagnostics_from_connection(&connection, self.event_retention)
+    }
+
+    fn diagnostics_from_connection(
+        connection: &Connection,
+        event_retention: EventRetention,
+    ) -> Result<ResourceStoreDiagnostics, ResourceError> {
+        let object_count = connection
+            .query_row("SELECT COUNT(*) FROM resource_objects", [], |row| row.get::<_, u64>(0))
+            .map_err(|err| Self::map_sqlite(err, "count sqlite resource objects"))?;
+        let event_count = connection
+            .query_row("SELECT COUNT(*) FROM resource_events", [], |row| row.get::<_, u64>(0))
+            .map_err(|err| Self::map_sqlite(err, "count sqlite resource events"))?;
+        let resource_stream_count = connection
+            .query_row("SELECT COUNT(*) FROM resource_sequences", [], |row| row.get::<_, u64>(0))
+            .map_err(|err| Self::map_sqlite(err, "count sqlite resource streams"))?;
+        Ok(ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention))
     }
 
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>
@@ -198,6 +255,7 @@ impl SqliteBackend {
         event_version: u64,
         kind: StoredEventKind,
         body_json: &str,
+        event_retention: EventRetention,
     ) -> Result<(), ResourceError> {
         tx.execute(
             r#"
@@ -207,7 +265,56 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, event_version, kind.as_str(), body_json],
         )
         .map_err(|err| Self::map_sqlite(err, "insert sqlite resource event"))?;
+        Self::compact_events(tx, key, event_version, event_retention)?;
         Ok(())
+    }
+
+    fn compact_events(
+        tx: &rusqlite::Transaction<'_>,
+        key: &StoreKey,
+        current_version: u64,
+        event_retention: EventRetention,
+    ) -> Result<(), ResourceError> {
+        let compacted_through = current_version.saturating_sub(event_retention.max_events_per_resource_stream() as u64);
+        if compacted_through == 0 {
+            return Ok(());
+        }
+        tx.execute(
+            r#"
+            DELETE FROM resource_events
+            WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND event_version <= ?5
+            "#,
+            params![key.0, key.1, key.2, key.3, compacted_through],
+        )
+        .map_err(|err| Self::map_sqlite(err, "compact sqlite resource events"))?;
+        tx.execute(
+            r#"
+            INSERT INTO resource_event_compaction (group_name, version, kind, namespace, compacted_through)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(group_name, version, kind, namespace)
+            DO UPDATE SET compacted_through = MAX(compacted_through, excluded.compacted_through)
+            "#,
+            params![key.0, key.1, key.2, key.3, compacted_through],
+        )
+        .map_err(|err| Self::map_sqlite(err, "record sqlite resource event compaction"))?;
+        Ok(())
+    }
+
+    fn compact_existing_events(connection: &mut Connection, event_retention: EventRetention) -> Result<(), ResourceError> {
+        let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event startup compaction"))?;
+        let stores = {
+            let mut statement = tx
+                .prepare("SELECT group_name, version, kind, namespace, next_version - 1 FROM resource_sequences")
+                .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource event startup compaction"))?;
+            let rows = statement
+                .query_map([], |row| Ok(((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?), row.get::<_, u64>(4)?)))
+                .map_err(|err| Self::map_sqlite(err, "query sqlite resource event startup compaction"))?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|err| Self::map_sqlite(err, "read sqlite resource event startup compaction row"))?
+        };
+        for (key, current_version) in stores {
+            Self::compact_events(&tx, &key, current_version, event_retention)?;
+        }
+        tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource event startup compaction"))
     }
 
     fn notify_watchers(&self, key: &StoreKey, event: StoredEvent) {
@@ -330,7 +437,7 @@ impl SqliteBackend {
             params![key.0, key.1, key.2, key.3, meta.name, version, body_json],
         )
         .map_err(|err| Self::map_sqlite(err, "insert sqlite resource object"))?;
-        Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json)?;
+        Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, self.event_retention)?;
         tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource create"))?;
         self.notify_watchers(&key, StoredEvent { kind: StoredEventKind::Added, object: encoded });
         Ok(object)
@@ -350,6 +457,9 @@ impl SqliteBackend {
         let mut object = existing.ok_or_else(|| ResourceError::not_found(&meta.name))?;
         if object.metadata.resource_version != resource_version {
             return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
+        }
+        if object.matches_update(meta, spec)? {
+            return Ok(object);
         }
 
         let version = Self::allocate_version(&tx, &key)?;
@@ -377,7 +487,7 @@ impl SqliteBackend {
             Self::upsert_object(&tx, &key, &meta.name, version, &body_json)?;
             StoredEventKind::Modified
         };
-        Self::insert_event(&tx, &key, version, event_kind, &body_json)?;
+        Self::insert_event(&tx, &key, version, event_kind, &body_json, self.event_retention)?;
         tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource update"))?;
         self.notify_watchers(&key, StoredEvent { kind: event_kind, object: encoded });
         Ok(object)
@@ -398,6 +508,9 @@ impl SqliteBackend {
         if object.metadata.resource_version != resource_version {
             return Err(ResourceError::conflict(name, "stale resourceVersion"));
         }
+        if object.matches_status(status)? {
+            return Ok(object);
+        }
 
         let version = Self::allocate_version(&tx, &key)?;
         object.metadata.resource_version = version.to_string();
@@ -406,7 +519,7 @@ impl SqliteBackend {
         let encoded = Self::encode_object(&object)?;
         let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
         Self::upsert_object(&tx, &key, name, version, &body_json)?;
-        Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json)?;
+        Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, self.event_retention)?;
         tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource status update"))?;
         self.notify_watchers(&key, StoredEvent { kind: StoredEventKind::Modified, object: encoded });
         Ok(object)
@@ -426,7 +539,7 @@ impl SqliteBackend {
             let encoded = Self::encode_object(&object)?;
             let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
             Self::upsert_object(&tx, &key, name, version, &body_json)?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json)?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, self.event_retention)?;
             (StoredEventKind::Modified, encoded)
         } else {
             let encoded = Self::encode_object(&object)?;
@@ -439,7 +552,7 @@ impl SqliteBackend {
                 params![key.0, key.1, key.2, key.3, name],
             )
             .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json)?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, self.event_retention)?;
             (StoredEventKind::Deleted, encoded)
         };
         tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource delete"))?;
@@ -461,11 +574,12 @@ impl SqliteBackend {
         let (sender, receiver) = mpsc::unbounded_channel();
         let replay = {
             let conn = self.lock_connection()?;
-            self.lock_watchers()?.entry(key.clone()).or_default().push(sender);
-            match replay_from {
+            let replay = match replay_from {
                 Some(version) => Self::replay_events(&conn, &key, version)?,
                 None => Vec::new(),
-            }
+            };
+            self.lock_watchers()?.entry(key.clone()).or_default().push(sender);
+            replay
         };
 
         let replay_stream = stream::iter(replay.into_iter().map(Self::decode_event::<T>));
@@ -519,6 +633,24 @@ impl SqliteBackend {
     }
 
     fn replay_events(conn: &Connection, key: &StoreKey, replay_from: u64) -> Result<Vec<StoredEvent>, ResourceError> {
+        let compacted_through = conn
+            .query_row(
+                r#"
+                SELECT compacted_through FROM resource_event_compaction
+                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
+                "#,
+                params![key.0, key.1, key.2, key.3],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(|err| Self::map_sqlite(err, "read sqlite resource event compaction floor"))?
+            .unwrap_or(0);
+        if replay_from < compacted_through {
+            return Err(ResourceError::WatchExpired {
+                requested_version: replay_from.to_string(),
+                compacted_through: compacted_through.to_string(),
+            });
+        }
         let mut statement = conn
             .prepare(
                 r#"

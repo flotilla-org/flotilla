@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use flotilla_resources::{
     CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus, CloneStatusPatch, EnvironmentPhase, EnvironmentStatus,
     EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, PresentationPhase, PresentationStatus,
@@ -63,8 +63,8 @@ fn checkout_status_patch_marks_ready_and_failed() {
 #[test]
 fn terminal_session_status_patch_marks_running_and_stopped() {
     let mut status = TerminalSessionStatus::default();
-    let started_at = Utc::now();
-    let stopped_at = Utc::now();
+    let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
+    let stopped_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
 
     TerminalSessionStatusPatch::MarkRunning {
         session_id: "abc123".to_string(),
@@ -75,9 +75,19 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
         delivered_message_id: None,
     }
     .apply(&mut status);
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "abc123".to_string(),
+        pid: Some(12345),
+        started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+        crew: None,
+        launch_command: "bash".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
     assert_eq!(status.phase, TerminalSessionPhase::Running);
     assert_eq!(status.session_id.as_deref(), Some("abc123"));
     assert_eq!(status.pid, Some(12345));
+    assert_eq!(status.started_at, Some(started_at));
 
     TerminalSessionStatusPatch::MarkStopped {
         stopped_at,
@@ -86,9 +96,21 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
         message: Some("process exited".to_string()),
     }
     .apply(&mut status);
+    TerminalSessionStatusPatch::MarkStopped {
+        stopped_at: Utc.timestamp_opt(21, 0).single().expect("timestamp"),
+        inner_command_status: Some(InnerCommandStatus::Exited),
+        inner_exit_code: Some(1),
+        message: Some("process exited".to_string()),
+    }
+    .apply(&mut status);
     assert_eq!(status.phase, TerminalSessionPhase::Stopped);
     assert_eq!(status.inner_command_status, Some(InnerCommandStatus::Exited));
     assert_eq!(status.inner_exit_code, Some(1));
+    assert_eq!(status.stopped_at, Some(stopped_at));
+
+    TerminalSessionStatusPatch::MarkFailed { message: "failed after stop".to_string(), stopped_at: None }.apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Failed);
+    assert_eq!(status.stopped_at, Some(stopped_at), "a later patch without a timestamp must not erase the transition time");
 }
 
 #[test]
@@ -111,8 +133,8 @@ fn terminal_session_failure_is_distinct_from_a_stopped_crew_member_and_can_resta
 #[test]
 fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
     let mut status = TaskWorkspaceStatus::default();
-    let started_at = Utc::now();
-    let ready_at = Utc::now();
+    let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
+    let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
 
     TaskWorkspaceStatusPatch::MarkProvisioning {
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
@@ -122,6 +144,14 @@ fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
     .apply(&mut status);
     assert_eq!(status.phase, TaskWorkspacePhase::Provisioning);
     assert_eq!(status.observed_policy_ref.as_deref(), Some("docker-on-01HXYZ"));
+
+    TaskWorkspaceStatusPatch::MarkProvisioning {
+        observed_policy_ref: "docker-on-01HXYZ".to_string(),
+        observed_policy_version: "13".to_string(),
+        started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+    }
+    .apply(&mut status);
+    assert_eq!(status.started_at, Some(started_at), "reconcile must not restamp an in-progress transition");
 
     TaskWorkspaceStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
@@ -133,6 +163,15 @@ fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.phase, TaskWorkspacePhase::Ready);
     assert_eq!(status.terminal_session_refs.len(), 2);
 
+    TaskWorkspaceStatusPatch::MarkReady {
+        environment_ref: Some("env-a".to_string()),
+        checkout_ref: Some("checkout-a".to_string()),
+        terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
+        ready_at: Utc.timestamp_opt(21, 0).single().expect("timestamp"),
+    }
+    .apply(&mut status);
+    assert_eq!(status.ready_at, Some(ready_at), "reconcile must not restamp an established Ready transition");
+
     TaskWorkspaceStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, TaskWorkspacePhase::Failed);
     assert_eq!(status.message.as_deref(), Some("clone failed"));
@@ -141,7 +180,7 @@ fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
 #[test]
 fn presentation_status_patch_marks_active_torn_down_and_failed() {
     let mut status = PresentationStatus::default();
-    let ready_at = Utc::now();
+    let ready_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
 
     PresentationStatusPatch::MarkActive {
         presentation_manager: "tmux".to_string(),
@@ -150,10 +189,18 @@ fn presentation_status_patch_marks_active_torn_down_and_failed() {
         ready_at,
     }
     .apply(&mut status);
+    PresentationStatusPatch::MarkActive {
+        presentation_manager: "tmux".to_string(),
+        workspace_ref: "ws-456".to_string(),
+        spec_hash: "hash-def".to_string(),
+        ready_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
+    }
+    .apply(&mut status);
     assert_eq!(status.phase, PresentationPhase::Active);
     assert_eq!(status.observed_presentation_manager.as_deref(), Some("tmux"));
-    assert_eq!(status.observed_workspace_ref.as_deref(), Some("ws-123"));
-    assert_eq!(status.observed_spec_hash.as_deref(), Some("hash-abc"));
+    assert_eq!(status.observed_workspace_ref.as_deref(), Some("ws-456"));
+    assert_eq!(status.observed_spec_hash.as_deref(), Some("hash-def"));
+    assert_eq!(status.ready_at, Some(ready_at), "an in-place presentation refresh is not a new Active transition");
     assert_eq!(status.message, None);
 
     PresentationStatusPatch::MarkTornDown { message: Some("create failed after replace".to_string()) }.apply(&mut status);
@@ -162,6 +209,16 @@ fn presentation_status_patch_marks_active_torn_down_and_failed() {
     assert_eq!(status.observed_workspace_ref, None);
     assert_eq!(status.observed_spec_hash, None);
     assert_eq!(status.message.as_deref(), Some("create failed after replace"));
+
+    let reactivated_at = Utc.timestamp_opt(12, 0).single().expect("timestamp");
+    PresentationStatusPatch::MarkActive {
+        presentation_manager: "tmux".to_string(),
+        workspace_ref: "ws-789".to_string(),
+        spec_hash: "hash-ghi".to_string(),
+        ready_at: reactivated_at,
+    }
+    .apply(&mut status);
+    assert_eq!(status.ready_at, Some(reactivated_at), "TornDown to Active is a new transition");
 
     PresentationStatusPatch::MarkFailed { message: "unknown policy".to_string() }.apply(&mut status);
     assert_eq!(status.phase, PresentationPhase::Failed);

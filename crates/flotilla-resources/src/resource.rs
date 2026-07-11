@@ -139,6 +139,27 @@ pub struct ResourceObject<T: Resource> {
 }
 
 impl<T: Resource> ResourceObject<T> {
+    pub(crate) fn matches_update(&self, meta: &InputMeta, spec: &T::Spec) -> Result<bool, ResourceError> {
+        let current_spec =
+            serde_json::to_value(&self.spec).map_err(|err| ResourceError::decode(format!("serialize current spec: {err}")))?;
+        let requested_spec = serde_json::to_value(spec).map_err(|err| ResourceError::decode(format!("serialize requested spec: {err}")))?;
+        Ok(self.metadata.name == meta.name
+            && self.metadata.labels == meta.labels
+            && self.metadata.annotations == meta.annotations
+            && self.metadata.owner_references == meta.owner_references
+            && self.metadata.finalizers == meta.finalizers
+            && self.metadata.deletion_timestamp == meta.deletion_timestamp
+            && current_spec == requested_spec)
+    }
+
+    pub(crate) fn matches_status(&self, status: &T::Status) -> Result<bool, ResourceError> {
+        let Some(current_status) = &self.status else { return Ok(false) };
+        let current =
+            serde_json::to_value(current_status).map_err(|err| ResourceError::decode(format!("serialize current status: {err}")))?;
+        let requested = serde_json::to_value(status).map_err(|err| ResourceError::decode(format!("serialize requested status: {err}")))?;
+        Ok(current == requested)
+    }
+
     pub fn to_k8s_object(&self) -> K8sResourceObject<T> {
         K8sResourceObject {
             api_version: api_version(T::API_PATHS),

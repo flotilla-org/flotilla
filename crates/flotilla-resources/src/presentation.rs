@@ -51,11 +51,16 @@ impl StatusPatch<PresentationStatus> for PresentationStatusPatch {
     fn apply(&self, status: &mut PresentationStatus) {
         match self {
             Self::MarkActive { presentation_manager, workspace_ref, spec_hash, ready_at } => {
+                let was_active = status.phase == PresentationPhase::Active;
                 status.phase = PresentationPhase::Active;
                 status.observed_presentation_manager = Some(presentation_manager.clone());
                 status.observed_workspace_ref = Some(workspace_ref.clone());
                 status.observed_spec_hash = Some(spec_hash.clone());
-                status.ready_at = Some(*ready_at);
+                if !was_active {
+                    status.ready_at = Some(*ready_at);
+                } else {
+                    status.ready_at.get_or_insert(*ready_at);
+                }
                 status.message = None;
             }
             Self::MarkTornDown { message } => {

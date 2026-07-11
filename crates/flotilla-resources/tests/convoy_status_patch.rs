@@ -211,3 +211,50 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
     assert_eq!(status.tasks["review"].finished_at, Some(ts(50)));
     assert_eq!(status.tasks["review"].message.as_deref(), Some("done"));
 }
+
+#[test]
+fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Pending,
+        workflow_snapshot: Some(sample_snapshot()),
+        tasks: BTreeMap::from([("implement".to_string(), pending_task())]),
+        message: None,
+        started_at: None,
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    ConvoyStatusPatch::AdvanceTasksToReady { ready: BTreeMap::from([("implement".to_string(), ts(10))]) }.apply(&mut status);
+    ConvoyStatusPatch::AdvanceTasksToReady { ready: BTreeMap::from([("implement".to_string(), ts(11))]) }.apply(&mut status);
+    assert_eq!(status.tasks["implement"].ready_at, Some(ts(10)));
+
+    ConvoyStatusPatch::TaskLaunching {
+        task: "implement".to_string(),
+        started_at: ts(20),
+        placement: flotilla_resources::PlacementStatus::default(),
+    }
+    .apply(&mut status);
+    ConvoyStatusPatch::TaskLaunching {
+        task: "implement".to_string(),
+        started_at: ts(21),
+        placement: flotilla_resources::PlacementStatus::default(),
+    }
+    .apply(&mut status);
+    assert_eq!(status.tasks["implement"].started_at, Some(ts(20)));
+
+    ConvoyStatusPatch::MarkTaskCompleted { task: "implement".to_string(), finished_at: ts(30), message: Some("done".to_string()) }
+        .apply(&mut status);
+    ConvoyStatusPatch::MarkTaskCompleted { task: "implement".to_string(), finished_at: ts(31), message: Some("still done".to_string()) }
+        .apply(&mut status);
+    assert_eq!(status.tasks["implement"].finished_at, Some(ts(30)));
+    assert_eq!(status.tasks["implement"].message.as_deref(), Some("still done"));
+
+    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(ts(40)), finished_at: None }.apply(&mut status);
+    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Active, started_at: Some(ts(41)), finished_at: None }.apply(&mut status);
+    assert_eq!(status.started_at, Some(ts(40)));
+
+    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(50)) }.apply(&mut status);
+    ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(51)) }.apply(&mut status);
+    assert_eq!(status.finished_at, Some(ts(50)));
+}

@@ -5,6 +5,7 @@ use crate::{
     http::HttpBackend,
     in_memory::InMemoryBackend,
     resource::{InputMeta, Resource, ResourceObject},
+    retention::ResourceStoreDiagnostics,
     sqlite::SqliteBackend,
     watch::{ResourceList, WatchStart, WatchStream},
 };
@@ -29,6 +30,14 @@ pub enum ResourceBackend {
 impl ResourceBackend {
     pub fn using<T: Resource>(&self, namespace: &str) -> TypedResolver<T> {
         TypedResolver { backend: self.clone(), namespace: namespace.to_string(), _marker: PhantomData }
+    }
+
+    pub async fn diagnostics(&self) -> Result<Option<ResourceStoreDiagnostics>, ResourceError> {
+        match self {
+            Self::InMemory(backend) => backend.diagnostics().await.map(Some),
+            Self::Http(_) => Ok(None),
+            Self::Sqlite(backend) => backend.diagnostics().await.map(Some),
+        }
     }
 }
 
