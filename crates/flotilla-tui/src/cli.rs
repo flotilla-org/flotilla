@@ -3,9 +3,9 @@ use std::{collections::HashMap, path::Path};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, Command, CommandValue, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetListResponse, FleetStaleness,
-    HostProvidersResponse, HostStatusResponse, NodeInfo, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
-    StatusResponse, StreamKey, TopologyResponse,
+    output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetListResponse,
+    FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse,
+    RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -303,6 +303,23 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
     out
 }
 
+fn format_crew_list_human(response: &CrewListResponse) -> String {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Role", "Kind", "State", "Adapter", "Model", "Stance"]);
+    for member in &response.members {
+        table.add_row(vec![
+            Cell::new(&member.role),
+            Cell::new(&member.kind),
+            Cell::new(&member.state),
+            Cell::new(member.adapter.as_deref().unwrap_or("-")),
+            Cell::new(member.model.as_deref().unwrap_or("-")),
+            Cell::new(member.stance.as_deref().unwrap_or("-")),
+        ]);
+    }
+    format!("Convoy: {}  Vessel: {}  Leg: {}\n{}\n", response.convoy, response.vessel, response.leg, table)
+}
+
 /// Extract a short display name from a repo path (last path component).
 /// Falls back to the full path display for root or non-UTF-8 paths,
 /// matching `flotilla_core::model::repo_name`.
@@ -360,6 +377,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
+        CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
         CommandValue::ImageEnsured { image } => format!("image ensured: {image}"),
         CommandValue::EnvironmentCreated { env_id } => format!("environment created: {env_id}"),

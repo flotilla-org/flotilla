@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME,
-    FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
+    FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 /// Command runner that executes commands on a remote host over SSH.
@@ -69,6 +69,12 @@ impl CommandRunner for SshCommandRunner {
         self.runner.run_output("ssh", &ssh_args, Path::new("/"), label).await
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        let script = self.remote_exec_script(cmd, args, cwd);
+        let ssh_args = self.ssh_shell_args(&script);
+        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), label, input).await
+    }
+
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.execute(cmd, args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
     }
@@ -84,6 +90,12 @@ impl CommandRunner for SshCommandRunner {
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
         let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         self.runner.run("ssh", &arg_refs, Path::new("/"), &ChannelLabel::Noop).await
+    }
+
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
+        let ssh_args = self.ssh_shell_args(&script);
+        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Noop, content.as_bytes()).await.map(|_| ())
     }
 }
 
@@ -102,6 +114,7 @@ mod tests {
 
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
+        inputs: Mutex<Vec<Vec<u8>>>,
         run_results: Mutex<VecDeque<Result<String, String>>>,
         run_output_result: Mutex<Option<Result<CommandOutput, String>>>,
     }
@@ -112,15 +125,29 @@ mod tests {
         }
 
         fn with_run_results(results: Vec<Result<String, String>>) -> Self {
-            Self { calls: Mutex::new(Vec::new()), run_results: Mutex::new(results.into()), run_output_result: Mutex::new(None) }
+            Self {
+                calls: Mutex::new(Vec::new()),
+                inputs: Mutex::new(Vec::new()),
+                run_results: Mutex::new(results.into()),
+                run_output_result: Mutex::new(None),
+            }
         }
 
         fn with_run_output_result(result: Result<CommandOutput, String>) -> Self {
-            Self { calls: Mutex::new(Vec::new()), run_results: Mutex::new(VecDeque::new()), run_output_result: Mutex::new(Some(result)) }
+            Self {
+                calls: Mutex::new(Vec::new()),
+                inputs: Mutex::new(Vec::new()),
+                run_results: Mutex::new(VecDeque::new()),
+                run_output_result: Mutex::new(Some(result)),
+            }
         }
 
         fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
             self.calls.lock().expect("calls mutex").clone()
+        }
+
+        fn inputs(&self) -> Vec<Vec<u8>> {
+            self.inputs.lock().expect("inputs mutex").clone()
         }
     }
 
@@ -142,6 +169,23 @@ mod tests {
                 cwd.to_path_buf(),
             ));
             self.run_output_result.lock().expect("run_output_result mutex").take().expect("run output result not configured")
+        }
+
+        async fn run_with_input(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            _label: &ChannelLabel,
+            input: &[u8],
+        ) -> Result<String, String> {
+            self.calls.lock().expect("calls mutex").push((
+                cmd.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+                cwd.to_path_buf(),
+            ));
+            self.inputs.lock().expect("inputs mutex").push(input.to_vec());
+            self.run_results.lock().expect("run_results mutex").pop_front().expect("run result not configured")
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -266,5 +310,19 @@ mod tests {
         let error = runner.run("git", &["status"], Path::new("/repo"), &ChannelLabel::Noop).await;
 
         assert_eq!(error.unwrap_err(), "ssh failed");
+    }
+
+    #[tokio::test]
+    async fn write_file_transports_content_on_stdin_not_argv() {
+        let inner = std::sync::Arc::new(RecordingRunner::with_run_result(Ok(String::new())));
+        let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
+
+        runner.write_file(Path::new("/repo/.flotilla/briefs/coder.md"), "secret assignment").await.expect("write_file");
+
+        let calls = inner.calls();
+        let args = ssh_call_args(&calls);
+        assert!(args.iter().all(|arg| !arg.contains("secret assignment")));
+        assert_eq!(inner.inputs(), vec![b"secret assignment".to_vec()]);
+        assert!(args.last().expect("remote script").contains("cat > \"$tmp\""));
     }
 }

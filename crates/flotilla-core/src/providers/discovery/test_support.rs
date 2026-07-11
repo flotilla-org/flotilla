@@ -235,6 +235,11 @@ impl CommandRunner for DiscoveryMockRunner {
         let mut files = self.files.lock().expect("lock poisoned");
         Ok(files.entry(path.to_path_buf()).or_insert_with(|| content.to_owned()).clone())
     }
+
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        self.files.lock().expect("lock poisoned").insert(path.to_path_buf(), content.to_owned());
+        Ok(())
+    }
 }
 /// Build a `DiscoveryRuntime` that uses no-op env and a minimal fake runner
 /// (only responds to `git --version`). Avoids probing ambient host tools.
@@ -701,6 +706,15 @@ impl PresentationManager for FakePresentationManager {
 pub struct FakeTerminalPool {
     pub sessions: Arc<TokioMutex<Vec<super::super::terminal::TerminalSession>>>,
     pub killed: Arc<TokioMutex<Vec<String>>>,
+    pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
+    pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
+}
+
+pub struct EnsuredTerminalSession {
+    pub session_name: String,
+    pub command: String,
+    pub cwd: ExecutionEnvironmentPath,
+    pub env_vars: super::super::terminal::TerminalEnvVars,
 }
 
 impl Default for FakeTerminalPool {
@@ -711,16 +725,29 @@ impl Default for FakeTerminalPool {
 
 impl FakeTerminalPool {
     pub fn new() -> Self {
-        Self { sessions: Arc::new(TokioMutex::new(Vec::new())), killed: Arc::new(TokioMutex::new(Vec::new())) }
+        Self {
+            sessions: Arc::new(TokioMutex::new(Vec::new())),
+            killed: Arc::new(TokioMutex::new(Vec::new())),
+            delivered: Arc::new(TokioMutex::new(Vec::new())),
+            ensured: Arc::new(TokioMutex::new(Vec::new())),
+        }
     }
 
     pub async fn add_sessions(&self, sessions: Vec<super::super::terminal::TerminalSession>) {
         self.sessions.lock().await.extend(sessions);
     }
+
+    pub async fn remove_session(&self, session_name: &str) {
+        self.sessions.lock().await.retain(|session| session.session_name != session_name);
+    }
 }
 
 #[async_trait::async_trait]
 impl TerminalPool for FakeTerminalPool {
+    fn tracks_session_liveness(&self) -> bool {
+        true
+    }
+
     async fn list_sessions(&self) -> Result<Vec<super::super::terminal::TerminalSession>, String> {
         Ok(self.sessions.lock().await.clone())
     }
@@ -730,12 +757,18 @@ impl TerminalPool for FakeTerminalPool {
         session_name: &str,
         command: &str,
         cwd: &ExecutionEnvironmentPath,
-        _env_vars: &super::super::terminal::TerminalEnvVars,
+        env_vars: &super::super::terminal::TerminalEnvVars,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
             return Ok(());
         }
+        self.ensured.lock().await.push(EnsuredTerminalSession {
+            session_name: session_name.to_string(),
+            command: command.to_string(),
+            cwd: cwd.clone(),
+            env_vars: env_vars.clone(),
+        });
         sessions.push(super::super::terminal::TerminalSession {
             session_name: session_name.to_string(),
             status: TerminalStatus::Running,
@@ -757,6 +790,12 @@ impl TerminalPool for FakeTerminalPool {
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String> {
         self.killed.lock().await.push(session_name.to_string());
+        self.sessions.lock().await.retain(|session| session.session_name != session_name);
+        Ok(())
+    }
+
+    async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
+        self.delivered.lock().await.push((session_name.to_string(), text.to_string(), submit));
         Ok(())
     }
 }

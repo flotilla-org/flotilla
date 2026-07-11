@@ -66,7 +66,15 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
     let started_at = Utc::now();
     let stopped_at = Utc::now();
 
-    TerminalSessionStatusPatch::MarkRunning { session_id: "abc123".to_string(), pid: Some(12345), started_at }.apply(&mut status);
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "abc123".to_string(),
+        pid: Some(12345),
+        started_at,
+        crew: None,
+        launch_command: "bash".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
     assert_eq!(status.phase, TerminalSessionPhase::Running);
     assert_eq!(status.session_id.as_deref(), Some("abc123"));
     assert_eq!(status.pid, Some(12345));
@@ -81,6 +89,23 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
     assert_eq!(status.phase, TerminalSessionPhase::Stopped);
     assert_eq!(status.inner_command_status, Some(InnerCommandStatus::Exited));
     assert_eq!(status.inner_exit_code, Some(1));
+}
+
+#[test]
+fn terminal_session_failure_is_distinct_from_a_stopped_crew_member_and_can_restart() {
+    let mut status = TerminalSessionStatus::default();
+
+    TerminalSessionStatusPatch::MarkFailed { message: "unknown agent capability `architect`".to_string(), stopped_at: Some(Utc::now()) }
+        .apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Failed);
+    assert_eq!(status.message.as_deref(), Some("unknown agent capability `architect`"));
+
+    TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Starting);
+    assert_eq!(status.session_id, None);
+    assert_eq!(status.started_at, None);
+    assert_eq!(status.stopped_at, None);
+    assert_eq!(status.message, None);
 }
 
 #[test]

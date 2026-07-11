@@ -374,7 +374,8 @@ mod command_result_human {
     use flotilla_protocol::{
         commands::{CheckoutStatus, CommandValue},
         qualified_path::{HostId, QualifiedPath},
-        FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostName, NodeId, PreparedWorkspace,
+        CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostName, NodeId,
+        PreparedWorkspace,
     };
 
     use crate::cli::format_command_result;
@@ -546,6 +547,42 @@ mod command_result_human {
         assert!(!output.contains("No crew sessions found."));
         assert!(output.contains("convoy-failed"));
         assert!(output.contains("failed: missing input 'topic'"));
+    }
+
+    #[test]
+    fn crew_list_shows_defined_and_runtime_state() {
+        let result = CommandValue::CrewList(Box::new(CrewListResponse {
+            convoy: "convoy-a".into(),
+            vessel: "convoy-a-implement".into(),
+            leg: "implement".into(),
+            members: vec![
+                CrewListMember {
+                    role: "coder".into(),
+                    kind: "agent".into(),
+                    state: "active".into(),
+                    adapter: Some("codex".into()),
+                    model: None,
+                    stance: Some("trusted-implicit".into()),
+                },
+                CrewListMember {
+                    role: "reviewer".into(),
+                    kind: "agent".into(),
+                    state: "latent".into(),
+                    adapter: None,
+                    model: None,
+                    stance: None,
+                },
+            ],
+        }));
+
+        let output = format_command_result(&result);
+
+        assert!(output.contains("Convoy: convoy-a"));
+        assert!(output.contains("coder"));
+        assert!(output.contains("active"));
+        assert!(output.contains("reviewer"));
+        assert!(output.contains("latent"));
+        assert!(output.contains("trusted-implicit"));
     }
 
     #[test]

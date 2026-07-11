@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner, FLOTILLA_HELPER_NAME,
-    FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
+    FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 /// A `CommandRunner` decorator that executes all commands inside a Docker container
@@ -42,6 +42,13 @@ impl CommandRunner for DockerEnvironmentRunner {
         self.inner.run_output("docker", &docker_args, Path::new("/"), label).await
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        let cwd_str = cwd.to_string_lossy();
+        let mut docker_args = vec!["exec", "-i", "-w", &cwd_str, &self.container_name, cmd];
+        docker_args.extend_from_slice(args);
+        self.inner.run_with_input("docker", &docker_args, Path::new("/"), label, input).await
+    }
+
     async fn exists(&self, cmd: &str, _args: &[&str]) -> bool {
         let docker_args = ["exec", &self.container_name, "which", cmd];
         self.inner.run("docker", &docker_args, Path::new("/"), &ChannelLabel::Noop).await.is_ok()
@@ -58,6 +65,12 @@ impl CommandRunner for DockerEnvironmentRunner {
         owned_args.extend(["sh".to_string(), "-lc".to_string(), helper_script]);
         let arg_refs: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         self.inner.run("docker", &arg_refs, Path::new("/"), &ChannelLabel::Noop).await
+    }
+
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
+        let args = ["exec", "-i", &self.container_name, "sh", "-lc", script.as_str()];
+        self.inner.run_with_input("docker", &args, Path::new("/"), &ChannelLabel::Noop, content.as_bytes()).await.map(|_| ())
     }
 }
 
@@ -103,5 +116,20 @@ mod tests {
         assert!(script.contains("exec 'flotilla-helper' 'ensure-file-if-absent'"));
         assert!(script.contains("'/app/config/shpool.toml'"));
         assert!(script.contains("'key = true\n'"));
+    }
+
+    #[tokio::test]
+    async fn write_file_keeps_content_out_of_docker_argv() {
+        let inner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
+
+        runner.write_file(Path::new("/app/.flotilla/briefs/coder.md"), "secret assignment").await.expect("write_file");
+
+        let calls = inner.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "docker");
+        assert!(calls[0].1.iter().all(|arg| !arg.contains("secret assignment")));
+        assert!(calls[0].1.contains(&"-i".to_string()));
+        assert!(calls[0].1.last().expect("write script").contains("cat > \"$tmp\""));
     }
 }

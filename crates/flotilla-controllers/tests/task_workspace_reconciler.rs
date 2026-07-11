@@ -15,9 +15,10 @@ use flotilla_resources::{
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
     DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicySpec, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError, SnapshotTask,
-    TaskWorkspace, TaskWorkspaceSpec, TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, WorkflowSnapshot,
-    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    ObservedCheckoutSpec, PlacementPolicySpec, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError, Selector, SnapshotTask,
+    TaskWorkspace, TaskWorkspaceSpec, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, WorkflowSnapshot, CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL,
+    TASK_WORKSPACE_LABEL,
 };
 use rstest::rstest;
 
@@ -292,6 +293,74 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
                     && spec.cwd == "/Users/alice/dev/flotilla-existing"
         )
     }));
+}
+
+#[tokio::test]
+async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents_remain_latent() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-crew", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").tasks[0].processes = vec![
+        ProcessDefinition::builder()
+            .role("coder".to_string())
+            .source(ProcessSource::Agent {
+                selector: Selector { capability: "coding".to_string() },
+                prompt: Some("Implement issue 668.".to_string()),
+            })
+            .build(),
+        ProcessDefinition::builder()
+            .role("reviewer".to_string())
+            .source(ProcessSource::Agent {
+                selector: Selector { capability: "review".to_string() },
+                prompt: Some("Review the coder's work.".to_string()),
+            })
+            .build(),
+    ];
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-crew", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("update convoy crew");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-crew", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-convoy-crew", "/Users/alice/dev/flotilla-existing").await;
+    let workspace = backend
+        .clone()
+        .using::<TaskWorkspace>(NAMESPACE)
+        .create(&task_workspace_meta("workspace-crew", REPO_URL), &TaskWorkspaceSpec {
+            convoy_ref: "convoy-crew".to_string(),
+            task: "implement".to_string(),
+            placement_policy_ref: "policy-crew".to_string(),
+            adopted_checkout_ref: Some("adopted-checkout-convoy-crew".to_string()),
+        })
+        .await
+        .expect("workspace create");
+
+    let reconciler = TaskWorkspaceReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    let Actuation::CreateTerminalSession { spec, .. } = outcome.actuations.first().expect("coder session actuation") else {
+        panic!("expected terminal session actuation");
+    };
+    let TerminalSessionSource::Agent { selector, brief, context, message } = &spec.source else {
+        panic!("expected structured agent launch");
+    };
+    assert_eq!(selector.capability, "coding");
+    assert_eq!(brief.path, ".flotilla/briefs/coder.md");
+    assert!(brief.content.contains("You are `coder` in convoy `convoy-crew`"));
+    assert!(brief.content.contains("- `coder`: active"));
+    assert!(brief.content.contains("- `reviewer`: latent"));
+    assert!(brief.content.contains("flotilla crew reviewer handoff --message"));
+    assert!(brief.content.ends_with("Implement issue 668.\n"));
+    assert_eq!(context.namespace, NAMESPACE);
+    assert_eq!(context.vessel, "workspace-crew");
+    assert_eq!(message, &None);
+    assert!(outcome
+        .actuations
+        .iter()
+        .all(|actuation| { !matches!(actuation, Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer") }));
 }
 
 #[tokio::test]
@@ -612,7 +681,7 @@ async fn create_running_terminal(
         .create(&meta(name), &TerminalSessionSpec {
             env_ref: env_ref.to_string(),
             role: role.to_string(),
-            command: command.to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: command.to_string() },
             cwd: cwd.to_string(),
             pool: pool.to_string(),
         })
@@ -628,6 +697,9 @@ async fn create_running_terminal(
             inner_command_status: Some(InnerCommandStatus::Running),
             inner_exit_code: None,
             message: None,
+            crew: None,
+            launch_command: Some(command.to_string()),
+            delivered_message_id: None,
         })
         .await
         .expect("terminal status update should succeed");
@@ -741,7 +813,7 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
         .create(&labeled_meta(name, [(TASK_WORKSPACE_LABEL.to_string(), workspace_name.to_string())]), &TerminalSessionSpec {
             env_ref: host_direct_env_name(),
             role: "coder".to_string(),
-            command: "cargo test".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
             pool: "cleat".to_string(),
         })

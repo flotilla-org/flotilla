@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use futures::stream;
 
 use crate::{
+    agent_adapter::AgentAdapterRegistry,
     attachable::{shared_file_backed_attachable_store, SharedAttachableStore},
     config::ConfigStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -483,6 +484,7 @@ impl FactoryRegistry {
         }
 
         let mut registry = ProviderRegistry::new();
+        registry.agent_adapters = AgentAdapterRegistry::discover(env, Arc::clone(&runner));
 
         for (desc, p) in probe_category(&self.vcs, env, config, repo_root, &runner).await {
             registry.vcs.insert(desc.implementation.clone(), desc, p);

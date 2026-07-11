@@ -162,6 +162,18 @@ pub(crate) fn helper_exec_script(helper_path: &str, subcommand: &str, args: &[&s
     Ok(parts.join(" "))
 }
 
+pub(crate) fn atomic_write_script(path: &Path, temp_suffix: &str) -> Result<String, String> {
+    let parent = path.parent().ok_or_else(|| format!("file path has no parent: {}", path.display()))?;
+    let target = path.to_string_lossy();
+    let temporary = format!("{target}.flotilla-tmp-{temp_suffix}");
+    Ok(format!(
+        "set -eu; mkdir -p {}; tmp={}; trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; mv \"$tmp\" {}; trap - EXIT",
+        flotilla_protocol::arg::shell_quote(&parent.to_string_lossy()),
+        flotilla_protocol::arg::shell_quote(&temporary),
+        flotilla_protocol::arg::shell_quote(&target),
+    ))
+}
+
 pub(crate) async fn install_managed_helper_script(
     runner: &dyn CommandRunner,
     command: &str,
@@ -202,6 +214,20 @@ pub trait CommandRunner: Send + Sync {
     /// `Err` only if the process could not be spawned at all.
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String>;
 
+    /// Run a command with bytes supplied on stdin. The input is deliberately
+    /// separate from argv so sensitive content cannot leak into process lists
+    /// or recorded command transcripts.
+    async fn run_with_input(
+        &self,
+        _cmd: &str,
+        _args: &[&str],
+        _cwd: &Path,
+        _label: &ChannelLabel,
+        _input: &[u8],
+    ) -> Result<String, String> {
+        Err("command runner does not support stdin input".to_string())
+    }
+
     /// Check if a command is available by running it.
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool;
 
@@ -209,6 +235,12 @@ pub trait CommandRunner: Send + Sync {
     /// file contents. Existing files are preserved.
     async fn ensure_file(&self, _path: &Path, content: &str) -> Result<String, String> {
         Ok(content.to_owned())
+    }
+
+    /// Atomically replace `path` with `content`. Implementations must transport
+    /// the content outside argv and command transcripts.
+    async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
+        Err("command runner does not support secure file writes".to_string())
     }
 }
 
@@ -247,6 +279,31 @@ impl CommandRunner for ProcessCommandRunner {
         })
     }
 
+    async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut child = tokio::process::Command::new(cmd)
+            .args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let mut stdin = child.stdin.take().expect("piped stdin should be available");
+        let write_input = async move {
+            stdin.write_all(input).await.map_err(|e| e.to_string())?;
+            stdin.shutdown().await.map_err(|e| e.to_string())
+        };
+        let wait_for_output = async move { child.wait_with_output().await.map_err(|e| e.to_string()) };
+        let ((), output) = tokio::try_join!(write_input, wait_for_output)?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
+    }
+
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         tokio::process::Command::new(cmd)
             .args(args)
@@ -276,6 +333,15 @@ impl CommandRunner for ProcessCommandRunner {
             }
             Err(err) => Err(format!("open {}: {err}", path.display())),
         }
+    }
+
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        let temporary = path.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, content).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
+        tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
     }
 }
 
@@ -455,8 +521,23 @@ pub(crate) mod testing {
             }
         }
 
+        async fn run_with_input(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: &Path,
+            label: &ChannelLabel,
+            _input: &[u8],
+        ) -> Result<String, String> {
+            self.run(cmd, args, cwd, label).await
+        }
+
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
             true
+        }
+
+        async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
+            Ok(())
         }
     }
 
@@ -490,6 +571,41 @@ pub(crate) mod testing {
         let on_disk = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(ensured, "existing = true\n");
         assert_eq!(on_disk, "existing = true\n");
+    }
+
+    #[tokio::test]
+    async fn process_runner_write_file_replaces_existing_contents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/brief.md");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(&path, "old brief").expect("seed file");
+
+        let runner = super::ProcessCommandRunner;
+        runner.write_file(&path, "new secret brief").await.expect("write_file");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "new secret brief");
+    }
+
+    #[tokio::test]
+    async fn process_runner_run_with_input_drains_output_while_writing_stdin() {
+        let runner = super::ProcessCommandRunner;
+        let input = vec![b'x'; 131_072];
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runner.run_with_input(
+                "sh",
+                &["-c", "dd if=/dev/zero bs=131072 count=1 2>/dev/null; cat >/dev/null"],
+                Path::new("/"),
+                &ChannelLabel::Noop,
+                &input,
+            ),
+        )
+        .await
+        .expect("stdin writing and output draining must not deadlock")
+        .expect("child command");
+
+        assert_eq!(output.len(), 131_072);
     }
 }
 

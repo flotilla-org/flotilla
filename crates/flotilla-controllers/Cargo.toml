@@ -10,6 +10,7 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+bon = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dirs = "6"
@@ -17,5 +18,4 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-bon = { workspace = true }
 rstest = { workspace = true }

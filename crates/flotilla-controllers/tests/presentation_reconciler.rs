@@ -199,6 +199,46 @@ async fn first_apply_marks_presentation_active() {
 }
 
 #[tokio::test]
+async fn presentation_uses_running_sessions_and_ignores_stopped_crew() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_host(&backend, HOST_REF).await;
+    create_ready_host_direct_env(&backend, "env-a").await;
+    create_running_terminal(
+        &backend,
+        "term-running",
+        "env-a",
+        BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+        ]),
+    )
+    .await;
+    create_running_terminal(
+        &backend,
+        "term-stopped",
+        "env-a",
+        BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+            (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (PROCESS_ORDINAL_LABEL.to_string(), "001".to_string()),
+        ]),
+    )
+    .await;
+    mark_terminal_stopped(&backend, "term-stopped").await;
+    let presentation = create_presentation(&backend, "presentation-a", "default").await;
+    let runtime = Arc::new(FakePresentationRuntime::default());
+    let reconciler = reconciler(Arc::clone(&runtime), backend.clone());
+
+    reconciler.fetch_dependencies(&presentation).await.expect("stopped crew should not prevent presentation");
+
+    let apply_calls = runtime.apply_calls.lock().expect("apply calls lock");
+    assert_eq!(apply_calls.len(), 1);
+    assert_eq!(apply_calls[0].processes.len(), 1);
+    assert_eq!(apply_calls[0].processes[0].attach_command, "attach term-running");
+}
+
+#[tokio::test]
 async fn unchanged_world_is_a_no_op() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host(&backend, HOST_REF).await;
@@ -594,15 +634,32 @@ async fn create_running_terminal(backend: &ResourceBackend, name: &str, env_ref:
         .create(&common::controller_meta().name(name).labels(labels).call(), &TerminalSessionSpec {
             env_ref: env_ref.to_string(),
             role: "main".to_string(),
-            command: "bash".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
             cwd: "/workspace/repo".to_string(),
             pool: "fake".to_string(),
         })
         .await
         .expect("session create should succeed");
     let mut status = TerminalSessionStatus::default();
-    TerminalSessionStatusPatch::MarkRunning { session_id: name.to_string(), pid: Some(42), started_at: Utc::now() }.apply(&mut status);
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: name.to_string(),
+        pid: Some(42),
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "bash".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
     sessions.update_status(name, &created.metadata.resource_version, &status).await.expect("session status update should succeed");
+}
+
+async fn mark_terminal_stopped(backend: &ResourceBackend, name: &str) {
+    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+    let session = sessions.get(name).await.expect("session get should succeed");
+    let mut status = session.status.expect("running session should have status");
+    TerminalSessionStatusPatch::MarkStopped { stopped_at: Utc::now(), inner_command_status: None, inner_exit_code: None, message: None }
+        .apply(&mut status);
+    sessions.update_status(name, &session.metadata.resource_version, &status).await.expect("session status update should succeed");
 }
 
 async fn create_presentation(backend: &ResourceBackend, name: &str, policy_ref: &str) -> flotilla_resources::ResourceObject<Presentation> {

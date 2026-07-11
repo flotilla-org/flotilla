@@ -19,19 +19,22 @@ use flotilla_protocol::{
     arg::{flatten, Arg},
     panel::{PanelSnapshot, PanelValue},
     qualified_path::QualifiedPath,
-    Command, CorrelationKey, DaemonEvent, DeltaEntry, EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
-    FleetReplicaStatus, FleetStaleness, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId,
-    NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta, RepoDetailResponse, RepoInfo, RepoProvidersResponse,
-    RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse, StreamKey, SystemInfo, ToolInventory,
-    TopologyResponse, TopologyRoute,
+    Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
+    FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
+    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
+    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse,
+    StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
-    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec,
-    ResourceBackend, ResourceError, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL, TASK_WORKSPACE_LABEL,
+    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, terminal_session_attach_target,
+    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec,
+    Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ProcessSource, Project, ProjectRepositorySpec, ProjectSpec,
+    Resource, ResourceBackend, ResourceError, TaskWorkspace, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, TASK_LABEL,
+    TASK_WORKSPACE_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -282,6 +285,7 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
         Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),
         Some(ResourceTerminalSessionPhase::Stopped) => "stopped".to_string(),
+        Some(ResourceTerminalSessionPhase::Failed) => "failed".to_string(),
     }
 }
 
@@ -765,6 +769,64 @@ struct FleetReplicaCacheEntry {
     last_sync: Option<DateTime<Utc>>,
     generation: Option<String>,
     last_error: Option<String>,
+}
+
+#[derive(bon::Builder)]
+struct ResolvedCrewContext {
+    namespace: String,
+    convoy: String,
+    vessel: String,
+    leg: String,
+    caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
+}
+
+fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::ResourceObject<T>) -> InputMeta {
+    InputMeta::builder()
+        .name(resource.metadata.name.clone())
+        .labels(resource.metadata.labels.clone())
+        .annotations(resource.metadata.annotations.clone())
+        .owner_references(resource.metadata.owner_references.clone())
+        .finalizers(resource.metadata.finalizers.clone())
+        .maybe_deletion_timestamp(resource.metadata.deletion_timestamp)
+        .build()
+}
+
+fn handoff_crew_brief(context: &ResolvedCrewContext, target: &str, prompt: Option<&str>, members: &[CrewListMember]) -> TerminalBrief {
+    crate::agent_adapter::build_crew_brief(
+        &TerminalCrewContext { namespace: context.namespace.clone(), convoy: context.convoy.clone(), vessel: context.vessel.clone() },
+        &context.leg,
+        target,
+        prompt,
+        &members
+            .iter()
+            .map(|member| crate::agent_adapter::CrewBriefMember {
+                role: member.role.clone(),
+                state: if member.role == target { "active".to_string() } else { member.state.clone() },
+                is_agent: member.kind == "agent",
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pending_crew_message(text: &str) -> TerminalCrewMessage {
+    TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
+}
+
+async fn queue_pending_crew_message(
+    sessions: &flotilla_resources::TypedResolver<ResourceTerminalSession>,
+    existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+    message: &str,
+) -> Result<(), String> {
+    let mut spec = existing.spec.clone();
+    let TerminalSessionSource::Agent { message: pending, .. } = &mut spec.source else {
+        return Err(format!("crew target `{}` is not an agent session", existing.spec.role));
+    };
+    *pending = Some(pending_crew_message(message));
+    sessions
+        .update(&input_meta_from_resource(existing), &existing.metadata.resource_version, &spec)
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
 }
 
 pub struct InProcessDaemon {
@@ -2200,6 +2262,218 @@ impl InProcessDaemon {
         Ok(FleetListResponse { rows, replicas })
     }
 
+    async fn resolve_crew_context(&self, requested: &CrewCommandContext) -> Result<ResolvedCrewContext, String> {
+        let provisioning_namespace = self.provisioning_namespace().await;
+        let namespace = requested.namespace.clone().unwrap_or_else(|| provisioning_namespace.clone());
+        if namespace != provisioning_namespace {
+            return Err(format!("crew namespace `{namespace}` is not served by this daemon"));
+        }
+        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace);
+        let session_list = sessions.list().await.map_err(|err| err.to_string())?.items;
+
+        if let Some(crew_id) = requested.crew_id.as_deref() {
+            let session = session_list
+                .into_iter()
+                .find(|session| session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id))
+                .ok_or_else(|| format!("unknown FLOTILLA_CREW_ID `{crew_id}`"))?;
+            let (convoy, vessel) = match &session.spec.source {
+                TerminalSessionSource::Agent { context, .. } => (context.convoy.clone(), context.vessel.clone()),
+                TerminalSessionSource::Tool { .. } => {
+                    return Err(format!("crew identity `{crew_id}` belongs to a non-agent process"));
+                }
+            };
+            return self.resolved_crew_context(namespace, convoy, vessel, Some(session)).await;
+        }
+
+        let convoy = requested
+            .convoy
+            .clone()
+            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel, and --role".to_string())?;
+        let vessel = requested
+            .vessel
+            .clone()
+            .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel, and --role".to_string())?;
+        let role =
+            requested.role.clone().ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel, and --role".to_string())?;
+        let caller = session_list.into_iter().find(|session| {
+            session.spec.role == role && session.metadata.labels.get(TASK_WORKSPACE_LABEL).map(String::as_str) == Some(vessel.as_str())
+        });
+        self.resolved_crew_context(namespace, convoy, vessel, caller).await
+    }
+
+    async fn resolved_crew_context(
+        &self,
+        namespace: String,
+        convoy: String,
+        vessel: String,
+        caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
+    ) -> Result<ResolvedCrewContext, String> {
+        let workspace =
+            self.resource_backend.clone().using::<TaskWorkspace>(&namespace).get(&vessel).await.map_err(|err| err.to_string())?;
+        if workspace.spec.convoy_ref != convoy {
+            return Err(format!("vessel `{vessel}` does not belong to convoy `{convoy}`"));
+        }
+        Ok(ResolvedCrewContext::builder()
+            .namespace(namespace)
+            .convoy(convoy)
+            .vessel(vessel)
+            .leg(workspace.spec.task)
+            .maybe_caller_session(caller_session)
+            .build())
+    }
+
+    pub async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
+        let context = self.resolve_crew_context(requested).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
+        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        let task = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.tasks.iter().find(|task| task.name == context.leg))
+            .ok_or_else(|| format!("leg `{}` is missing from convoy `{}`", context.leg, context.convoy))?;
+        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
+        let by_role: HashMap<_, _> = sessions
+            .list_matching_labels(&BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), context.vessel.clone())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .map(|session| (session.spec.role.clone(), session))
+            .collect();
+        let members = task
+            .processes
+            .iter()
+            .map(|process| {
+                let session = by_role.get(&process.role);
+                let state = match session.and_then(|session| session.status.as_ref().map(|status| status.phase)) {
+                    Some(ResourceTerminalSessionPhase::Starting) => "starting",
+                    Some(ResourceTerminalSessionPhase::Running) => "active",
+                    Some(ResourceTerminalSessionPhase::Stopped) => "stopped",
+                    Some(ResourceTerminalSessionPhase::Failed) => "failed",
+                    None if matches!(process.source, ProcessSource::Agent { .. }) => "latent",
+                    None => "pending",
+                };
+                let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
+                CrewListMember::builder()
+                    .role(process.role.clone())
+                    .kind(if matches!(process.source, ProcessSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
+                    .state(state.to_string())
+                    .maybe_adapter(crew.map(|crew| crew.adapter.clone()))
+                    .maybe_model(crew.and_then(|crew| crew.model.clone()))
+                    .maybe_stance(crew.map(|crew| crew.stance.clone()))
+                    .build()
+            })
+            .collect();
+        Ok(CrewListResponse::builder().convoy(context.convoy).vessel(context.vessel).leg(context.leg).members(members).build())
+    }
+
+    pub async fn crew_handoff_internal(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
+        let context = self.resolve_crew_context(requested).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
+        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        let (task_index, task) = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.workflow_snapshot.as_ref())
+            .and_then(|snapshot| snapshot.tasks.iter().enumerate().find(|(_, task)| task.name == context.leg))
+            .ok_or_else(|| format!("leg `{}` is missing from convoy `{}`", context.leg, context.convoy))?;
+        let (process_index, process) = task
+            .processes
+            .iter()
+            .enumerate()
+            .find(|(_, process)| process.role == target)
+            .ok_or_else(|| format!("crew target `{target}` is not defined for leg `{}`", context.leg))?;
+        let ProcessSource::Agent { selector, prompt } = &process.source else {
+            return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
+        };
+
+        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
+        let identity = TerminalSessionIdentity::builder()
+            .vessel(context.vessel.clone())
+            .convoy(context.convoy.clone())
+            .leg(context.leg.clone())
+            .role(target.to_string())
+            .task_index(task_index)
+            .process_index(process_index)
+            .labels(process.labels.clone())
+            .build();
+        let terminal_name = identity.name();
+        match sessions.get(&terminal_name).await {
+            Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
+                Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&existing, message).await,
+                Some(ResourceTerminalSessionPhase::Stopped) => {
+                    queue_pending_crew_message(&sessions, &existing, message).await?;
+                    apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| err.to_string())
+                }
+                Some(ResourceTerminalSessionPhase::Failed) => {
+                    Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
+                }
+                Some(ResourceTerminalSessionPhase::Starting) | None => queue_pending_crew_message(&sessions, &existing, message).await,
+            },
+            Err(ResourceError::NotFound { .. }) => {
+                let anchor = if let Some(caller) = context.caller_session.as_ref() {
+                    caller.clone()
+                } else {
+                    sessions
+                        .list_matching_labels(&BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), context.vessel.clone())]))
+                        .await
+                        .map_err(|err| err.to_string())?
+                        .items
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel))?
+                };
+                let current = self.crew_list_internal(requested).await?;
+                let brief = handoff_crew_brief(&context, target, prompt.as_deref(), &current.members);
+                sessions
+                    .create(&identity.input_meta(), &flotilla_resources::TerminalSessionSpec {
+                        env_ref: anchor.spec.env_ref,
+                        role: target.to_string(),
+                        source: TerminalSessionSource::Agent {
+                            selector: selector.clone(),
+                            brief,
+                            context: TerminalCrewContext { namespace: context.namespace, convoy: context.convoy, vessel: context.vessel },
+                            message: Some(pending_crew_message(message)),
+                        },
+                        cwd: anchor.spec.cwd,
+                        pool: anchor.spec.pool,
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| err.to_string())
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    async fn deliver_to_crew_session(
+        &self,
+        session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+        message: &str,
+    ) -> Result<(), String> {
+        let namespace = session.metadata.namespace.clone();
+        let environment = self
+            .resource_backend
+            .clone()
+            .using::<ResourceEnvironment>(&namespace)
+            .get(&session.spec.env_ref)
+            .await
+            .map_err(|err| err.to_string())?;
+        let registry = self.registry_for_resource_environment(&environment, Path::new(&session.spec.cwd)).await?;
+        let pool = registry
+            .terminal_pools
+            .get(&session.spec.pool)
+            .map(|(_, pool)| Arc::clone(pool))
+            .or_else(|| registry.terminal_pools.preferred().cloned())
+            .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
+        let session_id = session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
+        pool.deliver(session_id, message, true).await
+    }
+
     pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {
         let hosts = self.config.load_hosts()?;
         let namespace = self.provisioning_namespace().await;
@@ -2482,9 +2756,8 @@ impl InProcessDaemon {
             .get(&session.spec.pool)
             .map(|(_, pool)| Arc::clone(pool))
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
-        let session_name =
-            session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
-        let attach_args = pool.attach_args(session_name, &session.spec.command, &cwd, &Vec::new())?;
+        let attach_target = terminal_session_attach_target(session)?;
+        let attach_args = pool.attach_args(attach_target.session_id, attach_target.launch_command, &cwd, &Vec::new())?;
         if environment.spec.docker.is_some() {
             let command = ResolvedPaneCommand { role: session.spec.role.clone(), args: attach_args };
             let environment_id = EnvironmentId::new(session.spec.env_ref.clone());
@@ -2699,6 +2972,29 @@ impl InProcessDaemon {
                 node_id: self.node_id.clone(),
                 repo_identity,
                 repo: Some(repo_path),
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.crew_handoff_internal(context, target, message).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
                 result,
             });
             return Ok(id);
@@ -3323,6 +3619,10 @@ impl DaemonHandle for InProcessDaemon {
             }
             CommandAction::QueryFleetList {} => match self.fleet_list_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetList(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryFleetReplicaSnapshot {} => match self.fleet_replica_snapshot_internal().await {

@@ -23,7 +23,7 @@ use flotilla_protocol::{arg, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
-    TerminalSession, TypedResolver, CONVOY_LABEL,
+    TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -251,10 +251,9 @@ impl<R> PresentationReconciler<R> {
             .or_else(|| registry.terminal_pools.preferred().cloned())
             .ok_or_else(|| format!("terminal pool {} unavailable for environment {}", session.spec.pool, session.spec.env_ref))?;
 
-        let session_name =
-            session.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or(session.metadata.name.as_str());
         let session_cwd = ExecutionEnvironmentPath::new(&session.spec.cwd);
-        let attach_args = pool.attach_args(session_name, &session.spec.command, &session_cwd, &Vec::new())?;
+        let attach_target = flotilla_resources::terminal_session_attach_target(session)?;
+        let attach_args = pool.attach_args(attach_target.session_id, attach_target.launch_command, &session_cwd, &Vec::new())?;
         let attach_command = self.build_attach_command(session, &environment, host_ref, attach_args)?;
 
         Ok(ResolvedProcess { role: session.spec.role.clone(), labels: session.metadata.labels.clone(), attach_command })
@@ -329,7 +328,14 @@ where
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
         let listed = self.terminal_sessions.list_matching_labels(&obj.spec.process_selector).await?;
-        let mut sessions: Vec<_> = listed.items.into_iter().filter(|session| session.metadata.deletion_timestamp.is_none()).collect();
+        let mut sessions: Vec<_> = listed
+            .items
+            .into_iter()
+            .filter(|session| {
+                session.metadata.deletion_timestamp.is_none()
+                    && session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
+            })
+            .collect();
         sessions.sort_by(|left, right| session_sort_key(left).cmp(&session_sort_key(right)));
 
         let previous = previous_workspace(obj.status.as_ref());

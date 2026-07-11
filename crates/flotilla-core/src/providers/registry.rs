@@ -2,16 +2,19 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use crate::providers::{
-    ai_utility::AiUtility,
-    change_request::ChangeRequestTracker,
-    coding_agent::CloudAgentService,
-    discovery::{ProviderDescriptor, ServiceDescriptor},
-    issue_query::IssueQueryService,
-    issue_tracker::IssueProvider,
-    presentation::PresentationManager,
-    terminal::TerminalPool,
-    vcs::{CheckoutManager, CloneProvisioner, Vcs},
+use crate::{
+    agent_adapter::AgentAdapterRegistry,
+    providers::{
+        ai_utility::AiUtility,
+        change_request::ChangeRequestTracker,
+        coding_agent::CloudAgentService,
+        discovery::{ProviderDescriptor, ServiceDescriptor},
+        issue_query::IssueQueryService,
+        issue_tracker::IssueProvider,
+        presentation::PresentationManager,
+        terminal::TerminalPool,
+        vcs::{CheckoutManager, CloneProvisioner, Vcs},
+    },
 };
 
 /// Common accessors shared by all descriptor types.
@@ -152,6 +155,7 @@ impl<D, T: ?Sized> Default for TypedSet<D, T> {
 }
 
 pub struct ProviderRegistry {
+    pub agent_adapters: AgentAdapterRegistry,
     pub vcs: ProviderSet<dyn Vcs>,
     pub clone_provisioners: ProviderSet<dyn CloneProvisioner>,
     pub checkout_managers: ProviderSet<dyn CheckoutManager>,
@@ -168,6 +172,7 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self {
+            agent_adapters: AgentAdapterRegistry::default(),
             vcs: ProviderSet::new(),
             clone_provisioners: ProviderSet::new(),
             checkout_managers: ProviderSet::new(),

@@ -4,8 +4,8 @@ use clap::Subcommand;
 
 use crate::{
     commands::{
-        agent::AgentNoun, checkout::CheckoutNoun, convoy::ConvoyNoun, cr::CrNoun, environment::EnvironmentNoun, issue::IssueNoun,
-        project::ProjectNoun, repo::RepoNoun, workflow_template::WorkflowTemplateNoun, workspace::WorkspaceNoun,
+        agent::AgentNoun, checkout::CheckoutNoun, convoy::ConvoyNoun, cr::CrNoun, crew::CrewNoun, environment::EnvironmentNoun,
+        issue::IssueNoun, project::ProjectNoun, repo::RepoNoun, workflow_template::WorkflowTemplateNoun, workspace::WorkspaceNoun,
     },
     Resolved,
 };
@@ -18,6 +18,7 @@ pub enum NounCommand {
     Environment(EnvironmentNoun),
     Checkout(CheckoutNoun),
     Convoy(ConvoyNoun),
+    Crew(CrewNoun),
     Cr(CrNoun),
     Issue(IssueNoun),
     Agent(AgentNoun),
@@ -34,6 +35,7 @@ impl NounCommand {
             NounCommand::Environment(noun) => noun.resolve(),
             NounCommand::Checkout(noun) => noun.resolve(),
             NounCommand::Convoy(noun) => noun.resolve(),
+            NounCommand::Crew(noun) => noun.resolve(),
             NounCommand::Cr(noun) => noun.resolve(),
             NounCommand::Issue(noun) => noun.resolve(),
             NounCommand::Agent(noun) => noun.resolve(),
@@ -51,6 +53,7 @@ impl fmt::Display for NounCommand {
             NounCommand::Environment(noun) => write!(f, "{noun}"),
             NounCommand::Checkout(noun) => write!(f, "{noun}"),
             NounCommand::Convoy(noun) => write!(f, "{noun}"),
+            NounCommand::Crew(noun) => write!(f, "{noun}"),
             NounCommand::Cr(noun) => write!(f, "{noun}"),
             NounCommand::Issue(noun) => write!(f, "{noun}"),
             NounCommand::Agent(noun) => write!(f, "{noun}"),

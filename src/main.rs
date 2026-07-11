@@ -88,6 +88,8 @@ enum SubCommand {
     Checkout(flotilla_commands::commands::checkout::CheckoutNoun),
     /// Manage convoys
     Convoy(flotilla_commands::commands::convoy::ConvoyNoun),
+    /// Communicate with crew members
+    Crew(flotilla_commands::commands::crew::CrewNoun),
     /// Code review (alias on CrNoun itself, not duplicated here)
     Cr(flotilla_commands::commands::cr::CrNoun),
     /// Issues
@@ -194,6 +196,10 @@ async fn main() -> Result<()> {
         Some(SubCommand::Environment(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Checkout(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Convoy(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
+        Some(SubCommand::Crew(noun)) => {
+            let crew_id = std::env::var("FLOTILLA_CREW_ID").ok();
+            dispatch(noun.resolve_with_crew_id(crew_id).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
+        }
         Some(SubCommand::Cr(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Issue(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Agent(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
@@ -1001,6 +1007,16 @@ mod tests {
     fn cli_parses_convoy_noun() {
         let cli = Cli::try_parse_from(["flotilla", "convoy", "convoy-a", "leg", "implement", "complete"]).expect("convoy cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Convoy(_))));
+    }
+
+    #[test]
+    fn cli_parses_crew_list_and_handoff_grammar() {
+        let list = Cli::try_parse_from(["flotilla", "crew", "list"]).expect("crew list should parse");
+        assert!(matches!(list.command, Some(SubCommand::Crew(_))));
+
+        let handoff = Cli::try_parse_from(["flotilla", "crew", "reviewer", "handoff", "--message", "Review commit abc123"])
+            .expect("crew handoff should parse");
+        assert!(matches!(handoff.command, Some(SubCommand::Crew(_))));
     }
 
     #[test]
