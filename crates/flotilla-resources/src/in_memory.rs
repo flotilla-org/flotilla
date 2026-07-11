@@ -59,7 +59,7 @@ impl ResourceStore {
     }
 
     fn push_event(&mut self, event: StoredEvent, retention: EventRetention) {
-        let excess = self.event_log.len().saturating_add(1).saturating_sub(retention.max_events_per_store());
+        let excess = self.event_log.len().saturating_add(1).saturating_sub(retention.max_events_per_resource_stream());
         if excess > 0 {
             if let Some(last_removed) = self.event_log.get(excess - 1) {
                 self.compacted_through = last_removed.version;
@@ -94,7 +94,8 @@ impl InMemoryBackend {
         let stores = self.stores.lock().await;
         let object_count = stores.values().map(|store| store.objects.len() as u64).sum();
         let event_count = stores.values().map(|store| store.event_log.len() as u64).sum();
-        Ok(ResourceStoreDiagnostics::new(object_count, event_count, stores.len() as u64, self.event_retention))
+        let resource_stream_count = stores.values().filter(|store| store.current_version() > 0).count() as u64;
+        Ok(ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, self.event_retention))
     }
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {

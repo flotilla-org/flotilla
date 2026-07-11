@@ -1307,6 +1307,7 @@ dependencies = [
  "flotilla-transport",
  "futures",
  "indexmap",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

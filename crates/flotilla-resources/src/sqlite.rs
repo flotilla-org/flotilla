@@ -136,13 +136,14 @@ impl SqliteBackend {
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
         let startup_diagnostics = Self::diagnostics_from_connection(&connection, event_retention)?;
-        if !startup_diagnostics.event_log_within_retention() {
+        if !startup_diagnostics.warnings.is_empty() {
             tracing::warn!(
                 event_count = startup_diagnostics.event_count,
                 object_count = startup_diagnostics.object_count,
-                store_count = startup_diagnostics.store_count,
+                resource_stream_count = startup_diagnostics.resource_stream_count,
                 max_retained_events = startup_diagnostics.max_retained_events,
-                "resource event log exceeds retention bound; compacting on startup",
+                warnings = ?startup_diagnostics.warnings,
+                "resource event log tripwire triggered on startup; compacting",
             );
         }
         Self::compact_existing_events(&mut connection, event_retention)?;
@@ -176,10 +177,10 @@ impl SqliteBackend {
         let event_count = connection
             .query_row("SELECT COUNT(*) FROM resource_events", [], |row| row.get::<_, u64>(0))
             .map_err(|err| Self::map_sqlite(err, "count sqlite resource events"))?;
-        let store_count = connection
+        let resource_stream_count = connection
             .query_row("SELECT COUNT(*) FROM resource_sequences", [], |row| row.get::<_, u64>(0))
-            .map_err(|err| Self::map_sqlite(err, "count sqlite resource stores"))?;
-        Ok(ResourceStoreDiagnostics::new(object_count, event_count, store_count, event_retention))
+            .map_err(|err| Self::map_sqlite(err, "count sqlite resource streams"))?;
+        Ok(ResourceStoreDiagnostics::new(object_count, event_count, resource_stream_count, event_retention))
     }
 
     fn clone_through_serde<T>(value: &T) -> Result<T, ResourceError>
@@ -274,7 +275,7 @@ impl SqliteBackend {
         current_version: u64,
         event_retention: EventRetention,
     ) -> Result<(), ResourceError> {
-        let compacted_through = current_version.saturating_sub(event_retention.max_events_per_store() as u64);
+        let compacted_through = current_version.saturating_sub(event_retention.max_events_per_resource_stream() as u64);
         if compacted_through == 0 {
             return Ok(());
         }

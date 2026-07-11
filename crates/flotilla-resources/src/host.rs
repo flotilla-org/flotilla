@@ -10,7 +10,7 @@ define_resource!(Host, "hosts", HostSpec, HostStatus, HostStatusPatch);
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSpec {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostStatus {
     #[serde(default)]
     pub capabilities: BTreeMap<String, serde_json::Value>,

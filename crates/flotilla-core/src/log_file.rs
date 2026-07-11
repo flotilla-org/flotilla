@@ -31,7 +31,11 @@ impl SizeRotatingFile {
         fs::create_dir_all(directory)?;
         let path = directory.join(file_name);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let current_bytes = file.metadata()?.len();
+        let mut current_bytes = file.metadata()?.len();
+        if current_bytes > max_bytes {
+            file.set_len(0)?;
+            current_bytes = 0;
+        }
         Ok(Self { path, max_bytes, max_archives, file: Some(file), current_bytes })
     }
 
@@ -49,10 +53,30 @@ impl SizeRotatingFile {
     }
 
     fn rotate(&mut self) -> io::Result<()> {
-        if let Some(mut file) = self.file.take() {
-            file.flush()?;
+        let fallback =
+            self.file.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "rotating log file is unavailable"))?.try_clone()?;
+        self.file.as_mut().ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "rotating log file is unavailable"))?.flush()?;
+        drop(self.file.take());
+
+        if let Err(err) = self.rotate_files() {
+            self.restore_fallback(fallback);
+            return Err(err);
         }
 
+        match OpenOptions::new().create(true).write(true).truncate(true).open(&self.path) {
+            Ok(file) => {
+                self.file = Some(file);
+                self.current_bytes = 0;
+                Ok(())
+            }
+            Err(err) => {
+                self.restore_fallback(fallback);
+                Err(err)
+            }
+        }
+    }
+
+    fn rotate_files(&self) -> io::Result<()> {
         if self.max_archives == 0 {
             match fs::remove_file(&self.path) {
                 Ok(()) => {}
@@ -76,10 +100,12 @@ impl SizeRotatingFile {
                 fs::rename(&self.path, self.archive_path(1))?;
             }
         }
-
-        self.file = Some(OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)?);
-        self.current_bytes = 0;
         Ok(())
+    }
+
+    fn restore_fallback(&mut self, fallback: File) {
+        self.current_bytes = fallback.metadata().map_or(0, |metadata| metadata.len());
+        self.file = Some(fallback);
     }
 }
 
@@ -90,13 +116,17 @@ impl Write for SizeRotatingFile {
         }
         self.rotate_if_needed(buffer.len())?;
         let remaining = self.max_bytes.saturating_sub(self.current_bytes) as usize;
-        let written = self.file.as_mut().expect("rotating log file should always be open").write(&buffer[..buffer.len().min(remaining)])?;
+        let written = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "rotating log file is unavailable"))?
+            .write(&buffer[..buffer.len().min(remaining)])?;
         self.current_bytes = self.current_bytes.saturating_add(written as u64);
         Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.as_mut().expect("rotating log file should always be open").flush()
+        self.file.as_mut().ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "rotating log file is unavailable"))?.flush()
     }
 }
 
@@ -136,5 +166,30 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("daemon.log")).expect("current log"), b"ij");
         assert_eq!(fs::read(dir.path().join("daemon.log.1")).expect("newest archive"), b"efgh");
         assert_eq!(fs::read(dir.path().join("daemon.log.2")).expect("oldest archive"), b"abcd");
+    }
+
+    #[test]
+    fn rotation_error_keeps_current_file_usable() {
+        let dir = tempdir().expect("tempdir");
+        let mut writer = SizeRotatingFile::open(dir.path(), "daemon.log", 4, 1).expect("open rotating log");
+        writer.write_all(b"abcd").expect("fill current log");
+        fs::create_dir(dir.path().join("daemon.log.1")).expect("block archive path with directory");
+
+        writer.write_all(b"e").expect_err("rotation should report blocked archive path");
+        writer.flush().expect("failed rotation must restore the current file handle");
+
+        fs::remove_dir(dir.path().join("daemon.log.1")).expect("remove archive obstruction");
+        writer.write_all(b"f").expect("writer should recover after obstruction is removed");
+    }
+
+    #[test]
+    fn opening_an_oversized_existing_log_restores_the_size_bound() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.log");
+        fs::write(&path, b"abcdefghij").expect("seed oversized log");
+
+        let _writer = SizeRotatingFile::open(dir.path(), "daemon.log", 4, 1).expect("open rotating log");
+
+        assert!(fs::metadata(path).expect("current log metadata").len() <= 4);
     }
 }

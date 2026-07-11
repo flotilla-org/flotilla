@@ -291,6 +291,35 @@ pub async fn assert_watch_retention_expires_only_versions_below_floor_with_backe
     });
 }
 
+pub async fn assert_consumer_relists_after_expired_watch_and_converges_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
+    let resolver = resolver::<F>(backend, "flotilla");
+    let first = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
+    let second = resolver
+        .update(&F::meta("alpha"), &first.metadata.resource_version, &F::updated_spec())
+        .await
+        .expect("first update should succeed");
+    let third =
+        resolver.update(&F::meta("alpha"), &second.metadata.resource_version, &F::spec()).await.expect("second update should succeed");
+    resolver.update(&F::meta("alpha"), &third.metadata.resource_version, &F::updated_spec()).await.expect("third update should succeed");
+
+    assert!(matches!(
+        resolver.watch(WatchStart::FromVersion(first.metadata.resource_version)).await,
+        Err(ResourceError::WatchExpired { .. })
+    ));
+
+    let relisted = resolver.list().await.expect("expired consumer should relist");
+    let mut local = relisted.items.into_iter().next().expect("relisted object");
+    let mut resumed =
+        resolver.watch(WatchStart::FromVersion(relisted.resource_version)).await.expect("consumer should resume from relisted version");
+    let latest =
+        resolver.update(&F::meta("alpha"), &local.metadata.resource_version, &F::spec()).await.expect("post-relist update should succeed");
+    let event = resumed.next().await.expect("post-relist event").expect("post-relist event should decode");
+    let WatchEvent::Modified(object) = event else { panic!("expected post-relist modified event") };
+    local = object;
+
+    assert_eq!(local.metadata.resource_version, latest.metadata.resource_version);
+}
+
 pub async fn assert_store_diagnostics_report_retained_events_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
     let resolver = resolver::<F>(backend.clone(), "flotilla");
     let first = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
@@ -303,9 +332,23 @@ pub async fn assert_store_diagnostics_report_retained_events_with_backend<F: Res
     let diagnostics = backend.diagnostics().await.expect("diagnostics should succeed").expect("embedded backend should report diagnostics");
     assert_eq!(diagnostics.object_count, 1);
     assert_eq!(diagnostics.event_count, 2);
-    assert_eq!(diagnostics.store_count, 1);
+    assert_eq!(diagnostics.resource_stream_count, 1);
     assert_eq!(diagnostics.max_retained_events, 2);
     assert!(diagnostics.event_log_within_retention());
+    assert!(diagnostics.warnings.is_empty());
+}
+
+pub async fn assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend<F: ResourceContractFixture>(
+    backend: ResourceBackend,
+) {
+    let resolver = resolver::<F>(backend.clone(), "flotilla");
+    let _watch = resolver.watch(WatchStart::Now).await.expect("watch should start");
+
+    let diagnostics = backend.diagnostics().await.expect("diagnostics should succeed").expect("embedded diagnostics");
+    assert_eq!(diagnostics.object_count, 0);
+    assert_eq!(diagnostics.event_count, 0);
+    assert_eq!(diagnostics.resource_stream_count, 0);
+    assert_eq!(diagnostics.max_retained_events, 0);
 }
 
 pub async fn assert_namespace_isolation_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {

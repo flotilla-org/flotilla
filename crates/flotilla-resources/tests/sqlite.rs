@@ -2,11 +2,12 @@ mod common;
 
 use common::{
     contract::{
-        assert_create_get_list_roundtrip_with_backend, assert_delete_emits_event_with_backend,
-        assert_identical_status_update_is_noop_with_backend, assert_identical_update_is_noop_with_backend,
-        assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
+        assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
+        assert_delete_emits_event_with_backend, assert_identical_status_update_is_noop_with_backend,
+        assert_identical_update_is_noop_with_backend, assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
         assert_stale_resource_version_conflicts_with_backend, assert_store_diagnostics_report_retained_events_with_backend,
         assert_watch_from_version_replays_with_backend, assert_watch_now_semantics_with_backend,
+        assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
     convoy_meta, convoy_spec,
@@ -83,11 +84,28 @@ async fn watch_below_retention_floor_expires(#[case] _fixture: ConvoyFixture) {
 #[rstest]
 #[case(ConvoyFixture)]
 #[tokio::test]
+async fn expired_watch_consumer_relists_and_converges(#[case] _fixture: ConvoyFixture) {
+    let retention = EventRetention::new(2).expect("valid retention");
+    let backend =
+        ResourceBackend::Sqlite(SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"));
+    assert_consumer_relists_after_expired_watch_and_converges_with_backend::<ConvoyFixture>(backend).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
 async fn diagnostics_report_bounded_event_log(#[case] _fixture: ConvoyFixture) {
     let retention = EventRetention::new(2).expect("valid retention");
     let backend =
         ResourceBackend::Sqlite(SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"));
     assert_store_diagnostics_report_retained_events_with_backend::<ConvoyFixture>(backend).await;
+}
+
+#[rstest]
+#[case(ConvoyFixture)]
+#[tokio::test]
+async fn watch_only_diagnostics_match_mutation_based_stream_semantics(#[case] _fixture: ConvoyFixture) {
+    assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend::<ConvoyFixture>(backend()).await;
 }
 
 #[rstest]
