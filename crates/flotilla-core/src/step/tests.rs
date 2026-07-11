@@ -1,5 +1,6 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
+use flotilla_protocol::qualified_path::{HostId, QualifiedPath};
 use tokio::sync::{Mutex, Notify};
 
 use super::*;
@@ -254,7 +255,10 @@ async fn skipped_step_continues() {
 async fn completed_with_overrides_result() {
     let (cancel, tx) = setup();
     let resolver = TestResolver::new(vec![
-        Ok(StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") })),
+        Ok(StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
+            branch: "feat/x".into(),
+            path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x"),
+        })),
         Ok(StepOutcome::Completed),
     ]);
     let plan = StepPlan::new(vec![make_step("step-a"), make_step("step-b")]);
@@ -270,7 +274,10 @@ async fn completed_with_overrides_result() {
         &resolver,
     )
     .await;
-    assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+    assert_eq!(result, CommandValue::CheckoutCreated {
+        branch: "feat/x".into(),
+        path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x"),
+    });
 }
 
 #[tokio::test]
@@ -340,7 +347,10 @@ async fn produced_does_not_override_final_result() {
 async fn later_failure_preserves_earlier_completed_with() {
     let (cancel, tx) = setup();
     let resolver = TestResolver::new(vec![
-        Ok(StepOutcome::CompletedWith(CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") })),
+        Ok(StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
+            branch: "feat/x".into(),
+            path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x"),
+        })),
         Err("workspace failed".into()),
     ]);
     let plan = StepPlan::new(vec![make_step("step-a"), make_step("step-b")]);
@@ -356,7 +366,10 @@ async fn later_failure_preserves_earlier_completed_with() {
         &resolver,
     )
     .await;
-    assert_eq!(result, CommandValue::CheckoutCreated { branch: "feat/x".into(), path: PathBuf::from("/repo/wt-feat-x") });
+    assert_eq!(result, CommandValue::CheckoutCreated {
+        branch: "feat/x".into(),
+        path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x"),
+    });
 }
 
 #[tokio::test]

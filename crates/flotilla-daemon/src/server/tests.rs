@@ -19,11 +19,11 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
-    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
-    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId, NodeInfo,
-    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, RepoIdentity, RepoSelector,
-    Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey,
-    VectorClock, PROTOCOL_VERSION,
+    qualified_path::QualifiedPath, AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget,
+    Command, CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary,
+    Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData,
+    RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
+    StepStatus, StreamKey, VectorClock, PROTOCOL_VERSION,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
@@ -1072,14 +1072,14 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
         .complete_remote_step(request_id, NodeId::new("feta"), vec![
             StepOutcome::CompletedWith(CommandValue::CheckoutCreated {
                 branch: "feat-workspace-local".into(),
-                path: PathBuf::from("/srv/feta/repo/wt-feat-workspace-local"),
+                path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
             }),
             StepOutcome::Produced(CommandValue::PreparedWorkspace(PreparedWorkspace {
                 label: "feat-workspace-local@feta".into(),
                 target_node_id: NodeId::new("feta"),
                 display_host: Some(HostName::new("feta")),
                 checkout_path: PathBuf::from("/srv/feta/repo/wt-feat-workspace-local"),
-                checkout_key: None,
+                checkout_key: Some(QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local")),
                 attachable_set_id: None,
                 environment_id: None,
                 container_name: None,
@@ -1124,7 +1124,7 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
 
     assert_eq!(finished, CommandValue::CheckoutCreated {
         branch: "feat-workspace-local".into(),
-        path: PathBuf::from("/srv/feta/repo/wt-feat-workspace-local"),
+        path: QualifiedPath::from_host_name(&HostName::new("feta"), "/srv/feta/repo/wt-feat-workspace-local"),
     });
 
     let created_workspaces = workspace_manager.workspaces.lock().await.clone();
@@ -1852,7 +1852,7 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
     match checkout_result {
         CommandValue::CheckoutCreated { branch, path } => {
             assert_eq!(branch, "feat-remote");
-            assert!(path.ends_with("repo.feat-remote"), "unexpected checkout path: {}", path.display());
+            assert!(path.path.ends_with("repo.feat-remote"), "unexpected checkout path: {path}");
         }
         other => panic!("expected checkout creation, got {other:?}"),
     };

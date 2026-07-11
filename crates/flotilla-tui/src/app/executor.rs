@@ -165,7 +165,11 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::{arg::Arg, CheckoutStatus, NodeId, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity};
+    use flotilla_protocol::{
+        arg::Arg,
+        qualified_path::{HostId, QualifiedPath},
+        CheckoutStatus, NodeId, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity,
+    };
 
     use super::*;
     use crate::app::{test_support::stub_app, ui_state::BranchInputKind};
@@ -244,7 +248,10 @@ mod tests {
     #[test]
     fn checkout_created_does_not_set_status_message() {
         let mut app = stub_app();
-        handle_result(CommandValue::CheckoutCreated { branch: "feat-new".into(), path: PathBuf::from("/tmp/wt") }, &mut app);
+        handle_result(
+            CommandValue::CheckoutCreated { branch: "feat-new".into(), path: QualifiedPath::host(HostId::new("host-a"), "/tmp/wt") },
+            &mut app,
+        );
         assert!(app.model.status_message.is_none());
         assert!(app.proto_commands.take_next().is_none());
     }
