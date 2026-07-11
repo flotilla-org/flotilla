@@ -1561,6 +1561,19 @@ impl InProcessDaemon {
             updates.push((identity, last_local_providers, re_snapshot));
         }
 
+        let namespace = self.provisioning_namespace().await;
+        for (identity, local_providers, snapshot) in &updates {
+            if snapshot.errors.iter().any(|error| error.category == "checkouts") {
+                warn!(repo = %identity.path, "skipping observed checkout reconciliation after checkout discovery failed");
+                continue;
+            }
+            if let Err(error) =
+                crate::observed_resources::reconcile_checkouts(&self.observed_resource_backend, &namespace, identity, local_providers).await
+            {
+                warn!(repo = %identity.path, %error, "failed to reconcile observed checkouts");
+            }
+        }
+
         // Apply updates under write lock and broadcast
         let mut repos = self.repos.write().await;
         for (identity, last_local_providers, re_snapshot) in updates {
