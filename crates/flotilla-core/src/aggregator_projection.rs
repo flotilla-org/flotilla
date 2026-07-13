@@ -1,76 +1,74 @@
 //! Shared Aggregator state used for replay and fleet-replica export.
+//!
+//! [`QueryProjection`] is the query-agnostic core: rows keyed by
+//! [`ResourceRef`] (local plus per-replica-host), one contiguous sequence
+//! counter per query. Each named query instantiates it with that query's
+//! typed row.
 
 use std::{collections::HashMap, sync::Arc};
 
 use flotilla_protocol::{
-    panel::{
-        IntentDefinition, IntentKind, PanelColumn, PanelField, PanelId, PanelRow, PanelScope, PanelSnapshot, PanelSource, PanelView,
-        ResourceRef, TabView,
-    },
-    HostName,
+    result_set::{ConvoyRow, QueryId, ResultSet, Rows},
+    HostName, ResourceRef,
 };
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
-pub const CONVOY_TAB_ID: &str = "convoys";
-pub const CONVOY_PANEL_ID: &str = "convoys";
+/// A typed row of some named query's result set.
+pub trait QueryRow: Clone {
+    fn resource(&self) -> &ResourceRef;
+    fn into_rows(rows: Vec<Self>) -> Rows;
+}
 
-#[derive(Default, Debug, Clone)]
-pub struct AggregatorView {
-    pub local_rows: HashMap<ResourceRef, PanelRow>,
-    pub replica_rows: HashMap<HostName, HashMap<ResourceRef, PanelRow>>,
+impl QueryRow for ConvoyRow {
+    fn resource(&self) -> &ResourceRef {
+        &self.resource
+    }
+
+    fn into_rows(rows: Vec<Self>) -> Rows {
+        Rows::Convoys(rows)
+    }
+}
+
+/// Incrementally-maintained result set of one named query.
+#[derive(Debug, Clone)]
+pub struct QueryProjection<R> {
+    pub local_rows: HashMap<ResourceRef, R>,
+    pub replica_rows: HashMap<HostName, HashMap<ResourceRef, R>>,
     pub seq: u64,
 }
 
-impl AggregatorView {
-    pub fn snapshot(&self) -> PanelSnapshot {
-        let mut rows: Vec<_> = self.local_rows.values().chain(self.replica_rows.values().flat_map(|rows| rows.values())).cloned().collect();
-        rows.sort_by(|left, right| {
-            (&left.resource.namespace, &left.resource.name, &left.resource.host).cmp(&(
-                &right.resource.namespace,
-                &right.resource.name,
-                &right.resource.host,
-            ))
-        });
-        panel_snapshot(self.seq, rows)
-    }
-
-    pub fn local_snapshot(&self) -> PanelSnapshot {
-        let mut rows: Vec<_> = self.local_rows.values().cloned().collect();
-        rows.sort_by(|left, right| (&left.resource.namespace, &left.resource.name).cmp(&(&right.resource.namespace, &right.resource.name)));
-        panel_snapshot(self.seq, rows)
+impl<R> Default for QueryProjection<R> {
+    fn default() -> Self {
+        Self { local_rows: HashMap::new(), replica_rows: HashMap::new(), seq: 0 }
     }
 }
 
-fn panel_snapshot(seq: u64, rows: Vec<PanelRow>) -> PanelSnapshot {
-    PanelSnapshot {
-        seq,
-        tab: TabView {
-            id: CONVOY_TAB_ID.to_string(),
-            title: "Convoys".to_string(),
-            panels: vec![PanelView {
-                id: PanelId::new(CONVOY_PANEL_ID),
-                title: "Convoys".to_string(),
-                source: PanelSource::resource("flotilla.work/v1", "Convoy"),
-                scope: PanelScope::Fleet,
-                columns: vec![
-                    PanelColumn::new("name", "Convoy", PanelField::Name),
-                    PanelColumn::new("workflow_ref", "Workflow", PanelField::Workflow),
-                    PanelColumn::new("phase", "State", PanelField::Phase),
-                    PanelColumn::new("repo", "Repository", PanelField::Repository),
-                ],
-                intents: vec![
-                    IntentDefinition::new("attach", "Attach", IntentKind::Attach),
-                    IntentDefinition::new("complete-work", "Complete work", IntentKind::CompleteWork),
-                ],
-                rows,
-            }],
-        },
+impl<R: QueryRow> QueryProjection<R> {
+    /// Full fleet-merged result set: local rows ∪ every replica's rows.
+    pub fn result_set(&self) -> ResultSet {
+        let rows = self.local_rows.values().chain(self.replica_rows.values().flat_map(|rows| rows.values())).cloned().collect();
+        self.to_result_set(rows)
+    }
+
+    /// Local rows only — what this host contributes to federated query union.
+    pub fn local_result_set(&self) -> ResultSet {
+        let rows = self.local_rows.values().cloned().collect();
+        self.to_result_set(rows)
+    }
+
+    fn to_result_set(&self, mut rows: Vec<R>) -> ResultSet {
+        rows.sort_by(|left, right| {
+            let left = left.resource();
+            let right = right.resource();
+            (&left.namespace, &left.name, &left.host).cmp(&(&right.namespace, &right.name, &right.host))
+        });
+        ResultSet { seq: self.seq, rows: R::into_rows(rows) }
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct AggregatorProjectionState {
-    inner: Arc<RwLock<AggregatorView>>,
+    convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
 }
 
 impl AggregatorProjectionState {
@@ -78,15 +76,38 @@ impl AggregatorProjectionState {
         Self::default()
     }
 
-    pub async fn write(&self) -> RwLockWriteGuard<'_, AggregatorView> {
-        self.inner.write().await
+    pub async fn write(&self) -> RwLockWriteGuard<'_, QueryProjection<ConvoyRow>> {
+        self.convoys.write().await
     }
 
-    pub async fn snapshot(&self) -> PanelSnapshot {
-        self.inner.read().await.snapshot()
+    pub async fn result_set(&self) -> ResultSet {
+        self.convoys.read().await.result_set()
     }
 
-    pub async fn local_snapshot(&self) -> PanelSnapshot {
-        self.inner.read().await.local_snapshot()
+    pub async fn seq(&self) -> u64 {
+        self.convoys.read().await.seq
+    }
+
+    pub async fn local_result_set(&self) -> ResultSet {
+        self.convoys.read().await.local_result_set()
+    }
+
+    /// This host's local result sets across all named queries, in the order
+    /// of [`QueryId::ALL`].
+    pub async fn local_result_sets(&self) -> Vec<ResultSet> {
+        let mut result_sets = Vec::with_capacity(QueryId::ALL.len());
+        for query in QueryId::ALL {
+            result_sets.push(match query {
+                QueryId::Convoys => self.local_result_set().await,
+            });
+        }
+        result_sets
+    }
+
+    /// The current fleet-merged result set for one named query.
+    pub async fn result_set_for(&self, query: QueryId) -> ResultSet {
+        match query {
+            QueryId::Convoys => self.result_set().await,
+        }
     }
 }

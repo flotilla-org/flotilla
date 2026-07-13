@@ -89,6 +89,10 @@ impl DaemonHandle for StubDaemon {
         Ok(vec![])
     }
 
+    async fn subscribe_queries(&self, _queries: &[flotilla_protocol::QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        Ok(vec![])
+    }
+
     async fn get_status(&self) -> Result<StatusResponse, String> {
         Ok(StatusResponse { repos: vec![] })
     }

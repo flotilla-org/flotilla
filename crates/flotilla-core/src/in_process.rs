@@ -17,13 +17,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
-    panel::{PanelSnapshot, PanelValue},
     qualified_path::QualifiedPath,
+    result_set::{ConvoyRow, ResultSet, Rows},
     Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
     FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, RepoDelta,
-    RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse,
-    StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, QueryCursor,
+    RepoDelta, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand,
+    StatusResponse, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, terminal_session_attach_target,
@@ -288,37 +288,36 @@ fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     }
 }
 
-fn convoy_state_label(values: &BTreeMap<String, PanelValue>) -> String {
-    let phase = values.get("phase").and_then(PanelValue::as_str).unwrap_or("unknown");
-    match values.get("message").and_then(PanelValue::as_str).filter(|message| !message.trim().is_empty()) {
-        Some(message) => format!("{phase}: {message}"),
-        None => phase.to_string(),
+fn convoy_state_label(row: &ConvoyRow) -> String {
+    match row.message.as_deref().filter(|message| !message.trim().is_empty()) {
+        Some(message) => format!("{}: {message}", row.phase),
+        None => row.phase.to_string(),
     }
 }
 
 fn append_crewless_convoy_rows(
     rows: &mut Vec<FleetListRow>,
     target_namespace: &str,
-    panels: &[PanelSnapshot],
+    result_sets: &[ResultSet],
     host: &HostName,
     staleness: FleetStaleness,
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
-    for snapshot in panels {
-        for row in snapshot.tab.panels.iter().flat_map(|panel| &panel.rows) {
-            if row.resource.kind != "Convoy" || row.resource.namespace != target_namespace {
+    for result_set in result_sets {
+        let Rows::Convoys(convoys) = &result_set.rows;
+        for row in convoys {
+            if row.resource.namespace != target_namespace {
                 continue;
             }
-            let Some(name) = row.values.get("name").and_then(PanelValue::as_str) else { continue };
-            if !convoys_with_crew.insert(name.to_string()) {
+            if !convoys_with_crew.insert(row.name.clone()) {
                 continue;
             }
             rows.push(FleetListRow {
-                convoy: name.to_string(),
+                convoy: row.name.clone(),
                 vessel: "-".to_string(),
                 authority: None,
                 crew: "-".to_string(),
-                crew_state: convoy_state_label(&row.values),
+                crew_state: convoy_state_label(row),
                 host: host.clone(),
                 staleness: staleness.clone(),
             });
@@ -764,7 +763,7 @@ fn collect_linked_issue_ids(providers: &ProviderData) -> Vec<String> {
 #[derive(Debug, Clone)]
 struct FleetReplicaCacheEntry {
     rows: Vec<FleetListRow>,
-    panels: Vec<PanelSnapshot>,
+    result_sets: Vec<ResultSet>,
     last_sync: Option<DateTime<Utc>>,
     generation: Option<String>,
     last_error: Option<String>,
@@ -1159,7 +1158,7 @@ impl InProcessDaemon {
                 host: host.clone(),
                 generation: entry.generation.clone(),
                 rows: entry.rows.clone(),
-                panels: entry.panels.clone(),
+                result_sets: entry.result_sets.clone(),
             })
             .collect()
     }
@@ -2225,8 +2224,8 @@ impl InProcessDaemon {
     pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {
         let namespace = self.provisioning_namespace().await;
         let (rows, generation) = self.local_fleet_rows(&namespace).await?;
-        let panels = vec![self.aggregator_projection_state().await.local_snapshot().await];
-        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, panels })
+        let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
+        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, result_sets })
     }
 
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
@@ -2518,7 +2517,7 @@ impl InProcessDaemon {
                     let now = Utc::now();
                     let snapshot_host = snapshot.host;
                     let generation = snapshot.generation;
-                    let panels = snapshot.panels.clone();
+                    let result_sets = snapshot.result_sets.clone();
                     let staleness = FleetStaleness::Fresh { last_sync: now };
                     let mut rows: Vec<_> = snapshot
                         .rows
@@ -2530,11 +2529,11 @@ impl InProcessDaemon {
                         })
                         .collect();
                     // Replica rows from current daemons already include crewless rows via local_fleet_rows.
-                    // Keep panel rows as a secondary source for direct snapshots; existing rows win.
-                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.panels, &snapshot_host, staleness);
+                    // Keep result-set rows as a secondary source for direct snapshots; existing rows win.
+                    append_crewless_convoy_rows(&mut rows, &namespace, &snapshot.result_sets, &snapshot_host, staleness);
                     self.fleet_replica_cache.write().await.insert(host, FleetReplicaCacheEntry {
                         rows,
-                        panels,
+                        result_sets,
                         last_sync: Some(now),
                         generation,
                         last_error: None,
@@ -2545,7 +2544,7 @@ impl InProcessDaemon {
                     cache.entry(host).and_modify(|entry| entry.last_error = Some(message.clone())).or_insert_with(|| {
                         FleetReplicaCacheEntry {
                             rows: Vec::new(),
-                            panels: Vec::new(),
+                            result_sets: Vec::new(),
                             last_sync: None,
                             generation: None,
                             last_error: Some(message),
@@ -2634,8 +2633,8 @@ impl InProcessDaemon {
                 staleness: FleetStaleness::Local,
             });
         }
-        let panels = vec![self.aggregator_projection_state().await.local_snapshot().await];
-        append_crewless_convoy_rows(&mut rows, namespace, &panels, &self.host_name, FleetStaleness::Local);
+        let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
+        append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
         rows.sort_by(|left, right| {
             (&left.convoy, left.host.as_str(), &left.vessel, &left.crew).cmp(&(
                 &right.convoy,
@@ -3734,12 +3733,18 @@ impl DaemonHandle for InProcessDaemon {
             }
         }
 
-        let panel_snapshot = self.aggregator_projection_state().await.snapshot().await;
-        let panel_key = StreamKey::Panel { tab: panel_snapshot.tab.id.clone() };
-        if last_seen.get(&panel_key).is_none_or(|&seq| seq != panel_snapshot.seq) {
-            events.push(DaemonEvent::PanelSnapshot(Box::new(panel_snapshot)));
-        }
+        Ok(events)
+    }
 
+    async fn subscribe_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        let state = self.aggregator_projection_state().await;
+        let mut events = Vec::new();
+        for cursor in queries {
+            let result_set = state.result_set_for(cursor.query).await;
+            if cursor.since.is_none_or(|seq| seq != result_set.seq) {
+                events.push(DaemonEvent::ResultSet(Box::new(result_set)));
+            }
+        }
         Ok(events)
     }
 

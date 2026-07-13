@@ -543,68 +543,62 @@ fn step_roundtrip_covers_prepare_and_attach_workspace_actions() {
 }
 
 #[test]
-fn panel_stream_round_trips_a_resource_backed_leg_dag() {
-    use std::collections::BTreeMap;
-
-    use crate::panel::{
-        IntentDefinition, IntentKind, PanelColumn, PanelField, PanelId, PanelRow, PanelScope, PanelSnapshot, PanelSource, PanelValue,
-        PanelView, ResourceRef, RowIntent, TabView,
+fn result_set_round_trips_a_resource_backed_vessel_dag() {
+    use crate::{
+        resource_ref::ResourceRef,
+        result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultSet, Rows, VesselRow, WorkPhase},
     };
 
     let convoy_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "fix-bug-123");
     let implement_ref = convoy_ref.subresource("vessels/implement");
     let review_ref = convoy_ref.subresource("vessels/review");
-    let attach = IntentDefinition::new("attach", "Attach", IntentKind::Attach);
-    let complete = IntentDefinition::new("complete-work", "Complete work", IntentKind::CompleteWork);
-    let panel = PanelView {
-        id: PanelId::new("convoys"),
-        title: "Convoys".into(),
-        source: PanelSource::resource("flotilla.work/v1", "Convoy"),
-        scope: PanelScope::Fleet,
-        columns: vec![PanelColumn::new("name", "Convoy", PanelField::Name), PanelColumn::new("phase", "State", PanelField::Phase)],
-        intents: vec![attach.clone(), complete.clone()],
-        rows: vec![PanelRow {
-            resource: convoy_ref,
-            values: BTreeMap::from([
-                ("name".into(), PanelValue::String("fix-bug-123".into())),
-                ("phase".into(), PanelValue::String("active".into())),
-            ]),
-            intents: vec![],
-            children: vec![
-                PanelRow {
-                    resource: implement_ref.clone(),
-                    values: BTreeMap::from([
-                        ("name".into(), PanelValue::String("implement".into())),
-                        ("phase".into(), PanelValue::String("running".into())),
-                    ]),
-                    intents: vec![
-                        RowIntent::vessel("attach", "flotilla", "fix-bug-123", "implement", HostName::new("local"), Some("ws-1".into())),
-                        RowIntent::vessel("complete-work", "flotilla", "fix-bug-123", "implement", HostName::new("local"), None),
-                    ],
-                    children: vec![],
-                    depends_on: vec![],
-                },
-                PanelRow {
-                    resource: review_ref,
-                    values: BTreeMap::from([
-                        ("name".into(), PanelValue::String("review".into())),
-                        ("phase".into(), PanelValue::String("pending".into())),
-                    ]),
-                    intents: vec![],
-                    children: vec![],
-                    depends_on: vec![implement_ref],
-                },
-            ],
-            depends_on: vec![],
-        }],
-    };
-    let snapshot = PanelSnapshot { seq: 7, tab: TabView { id: "convoys".into(), title: "Convoys".into(), panels: vec![panel] } };
-    let event = DaemonEvent::PanelSnapshot(Box::new(snapshot));
+    let implement = VesselRow::builder()
+        .resource(implement_ref)
+        .name("implement")
+        .phase(WorkPhase::Running)
+        .crew(vec![CrewMemberSummary { role: "coder".into(), command_preview: "fix the bug".into() }])
+        .host(HostName::new("local"))
+        .attach("ws-1".to_string())
+        .build();
+    let review = VesselRow::builder()
+        .resource(review_ref)
+        .name("review")
+        .phase(WorkPhase::Pending)
+        .depends_on(vec!["implement".into()])
+        .host(HostName::new("local"))
+        .build();
+    let row = ConvoyRow::builder()
+        .resource(convoy_ref)
+        .name("fix-bug-123")
+        .workflow_ref("fix-bug")
+        .phase(ConvoyPhase::Active)
+        .vessels(vec![implement, review])
+        .build();
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]) }));
 
-    let encoded = serde_json::to_string(&event).expect("serialize panel snapshot");
-    let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize panel snapshot");
-    let DaemonEvent::PanelSnapshot(snapshot) = decoded else { panic!("expected PanelSnapshot") };
-    assert_eq!(snapshot.seq, 7);
-    assert_eq!(snapshot.tab.panels[0].rows[0].children[1].depends_on, vec![snapshot.tab.panels[0].rows[0].children[0].resource.clone()]);
-    assert_eq!(StreamKey::Panel { tab: "convoys".into() }, StreamKey::Panel { tab: snapshot.tab.id.clone() });
+    let encoded = serde_json::to_string(&event).expect("serialize result set");
+    let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize result set");
+    let DaemonEvent::ResultSet(result_set) = decoded else { panic!("expected ResultSet") };
+    assert_eq!(result_set.seq, 7);
+    assert_eq!(result_set.query(), QueryId::Convoys);
+    let rows = result_set.rows.as_convoys().expect("convoy rows");
+    assert_eq!(rows[0].vessels[1].depends_on, vec![rows[0].vessels[0].name.clone()]);
+    assert!(rows[0].vessels[0].attach.is_some(), "presentation join surfaces as attach capability");
+    assert!(rows[0].vessels[1].attach.is_none());
+    assert!(rows[0].vessels[1].complete_work);
+    assert_eq!(StreamKey::Query { query: QueryId::Convoys }, StreamKey::Query { query: result_set.query() });
+}
+
+#[test]
+fn subscribe_queries_request_round_trips_cursors() {
+    use crate::result_set::QueryId;
+
+    let request = Request::SubscribeQueries {
+        queries: vec![QueryCursor { query: QueryId::Convoys, since: Some(41) }, QueryCursor { query: QueryId::Convoys, since: None }],
+    };
+    let encoded = serde_json::to_string(&request).expect("serialize subscribe request");
+    assert!(encoded.contains("\"subscribe_queries\""));
+    assert!(encoded.contains("\"convoys\""));
+    let decoded: Request = serde_json::from_str(&encoded).expect("deserialize subscribe request");
+    assert_eq!(decoded, request);
 }

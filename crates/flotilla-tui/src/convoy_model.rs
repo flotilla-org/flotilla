@@ -1,9 +1,10 @@
 //! TUI-local model used by the established convoy widgets.
 //!
-//! The daemon wire contract is the generic panel model. This adapter model is
-//! intentionally surface-owned and may evolve with the ratatui presentation.
+//! The daemon wire contract is the typed convoys query result set
+//! ([`flotilla_protocol::result_set`]). This adapter model is intentionally
+//! surface-owned and may evolve with the ratatui presentation.
 
-use flotilla_protocol::{CheckoutRef, HostName, RepoKey};
+use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, RepoKey, ResourceRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConvoyId(String);
@@ -11,6 +12,16 @@ pub struct ConvoyId(String);
 impl ConvoyId {
     pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
         Self(format!("{}/{}", namespace.into(), name.into()))
+    }
+
+    /// Row identity for a convoy resource: `namespace/name`, with the origin
+    /// host appended (`name@host`) for fleet-merged rows.
+    pub fn for_resource(resource: &ResourceRef) -> Self {
+        let name = match &resource.host {
+            Some(host) => format!("{}@{}", resource.name, host.as_str()),
+            None => resource.name.clone(),
+        };
+        Self::new(&resource.namespace, name)
     }
 
     pub fn parse(value: impl AsRef<str>) -> Result<Self, String> {
@@ -43,6 +54,18 @@ pub enum ConvoyPhase {
     Cancelled,
 }
 
+impl From<wire::ConvoyPhase> for ConvoyPhase {
+    fn from(phase: wire::ConvoyPhase) -> Self {
+        match phase {
+            wire::ConvoyPhase::Pending => Self::Pending,
+            wire::ConvoyPhase::Active => Self::Active,
+            wire::ConvoyPhase::Completed => Self::Completed,
+            wire::ConvoyPhase::Failed => Self::Failed,
+            wire::ConvoyPhase::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
@@ -70,7 +93,21 @@ pub enum WorkPhase {
     Cancelled,
 }
 
-pub type Timestamp = flotilla_protocol::panel::Timestamp;
+impl From<wire::WorkPhase> for WorkPhase {
+    fn from(phase: wire::WorkPhase) -> Self {
+        match phase {
+            wire::WorkPhase::Pending => Self::Pending,
+            wire::WorkPhase::Ready => Self::Ready,
+            wire::WorkPhase::Launching => Self::Launching,
+            wire::WorkPhase::Running => Self::Running,
+            wire::WorkPhase::Complete => Self::Complete,
+            wire::WorkPhase::Failed => Self::Failed,
+            wire::WorkPhase::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+pub type Timestamp = flotilla_protocol::result_set::Timestamp;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSummary {
@@ -115,6 +152,52 @@ pub struct ConvoySummary {
     pub finished_at: Option<Timestamp>,
     pub observed_workflow_ref: Option<String>,
     pub initializing: bool,
+}
+
+impl From<&wire::ConvoyRow> for ConvoySummary {
+    fn from(row: &wire::ConvoyRow) -> Self {
+        Self {
+            id: ConvoyId::for_resource(&row.resource),
+            namespace: row.resource.namespace.clone(),
+            name: row.name.clone(),
+            workflow_ref: row.workflow_ref.clone(),
+            phase: row.phase.into(),
+            message: row.message.clone(),
+            repo_hint: row.repo.clone(),
+            vessels: row.vessels.iter().map(|vessel| vessel_summary(row, vessel)).collect(),
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            observed_workflow_ref: row.observed_workflow_ref.clone(),
+            initializing: row.initializing,
+        }
+    }
+}
+
+fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSummary {
+    let crew = vessel
+        .crew
+        .iter()
+        .map(|member| ProcessSummary { role: member.role.clone(), command_preview: member.command_preview.clone() })
+        .collect();
+    VesselSummary {
+        name: vessel.name.clone(),
+        depends_on: vessel.depends_on.clone(),
+        phase: vessel.phase.into(),
+        crew,
+        host: Some(vessel.host.clone()),
+        // The convoys query does not yet expose checkout allocation.
+        checkout: None,
+        workspace_ref: vessel.attach.clone(),
+        completion_target: vessel.complete_work.then(|| WorkCompletionTarget {
+            convoy: row.name.clone(),
+            vessel: vessel.name.clone(),
+            host: vessel.host.clone(),
+        }),
+        ready_at: vessel.ready_at,
+        started_at: vessel.started_at,
+        finished_at: vessel.finished_at,
+        message: vessel.message.clone(),
+    }
 }
 
 #[cfg(test)]

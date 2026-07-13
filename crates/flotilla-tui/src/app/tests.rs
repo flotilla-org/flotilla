@@ -1291,143 +1291,100 @@ fn resolve_environment_target_accepts_non_host_environment_identity_directly() {
     assert_eq!(target, ProvisioningTarget::ExistingEnvironment { host: host_name, env_id: nested_env });
 }
 
-// -- Panel snapshot / delta handling --
+// -- Result set / delta handling --
 
-fn legacy_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_protocol::panel::PanelRow {
-    use std::collections::BTreeMap;
+fn wire_convoy_phase(phase: crate::convoy_model::ConvoyPhase) -> flotilla_protocol::result_set::ConvoyPhase {
+    use flotilla_protocol::result_set::ConvoyPhase as Wire;
+    match phase {
+        crate::convoy_model::ConvoyPhase::Pending => Wire::Pending,
+        crate::convoy_model::ConvoyPhase::Active => Wire::Active,
+        crate::convoy_model::ConvoyPhase::Completed => Wire::Completed,
+        crate::convoy_model::ConvoyPhase::Failed => Wire::Failed,
+        crate::convoy_model::ConvoyPhase::Cancelled => Wire::Cancelled,
+    }
+}
 
+fn wire_work_phase(phase: crate::convoy_model::WorkPhase) -> flotilla_protocol::result_set::WorkPhase {
+    use flotilla_protocol::result_set::WorkPhase as Wire;
+    match phase {
+        crate::convoy_model::WorkPhase::Pending => Wire::Pending,
+        crate::convoy_model::WorkPhase::Ready => Wire::Ready,
+        crate::convoy_model::WorkPhase::Launching => Wire::Launching,
+        crate::convoy_model::WorkPhase::Running => Wire::Running,
+        crate::convoy_model::WorkPhase::Complete => Wire::Complete,
+        crate::convoy_model::WorkPhase::Failed => Wire::Failed,
+        crate::convoy_model::WorkPhase::Cancelled => Wire::Cancelled,
+    }
+}
+
+fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_protocol::result_set::ConvoyRow {
     use flotilla_protocol::{
-        panel::{PanelRow, PanelValue, ResourceRef, RowIntent},
-        HostName,
+        result_set::{ConvoyRow, CrewMemberSummary, VesselRow},
+        HostName, ResourceRef,
     };
 
     let resource = ResourceRef::new("flotilla.work/v1", "Convoy", &convoy.namespace, &convoy.name);
-    let children = convoy
+    let vessels = convoy
         .vessels
         .into_iter()
         .map(|task| {
-            let host = task.host.clone().unwrap_or_else(HostName::local);
-            let mut intents = Vec::new();
-            if let Some(workspace_ref) = task.workspace_ref.clone() {
-                intents.push(RowIntent::vessel("attach", &convoy.namespace, &convoy.name, &task.name, host.clone(), Some(workspace_ref)));
-            }
-            if let Some(target) = task.completion_target.clone() {
-                intents.push(RowIntent::vessel("complete-work", &convoy.namespace, target.convoy, target.vessel, target.host, None));
-            }
-            let mut values = BTreeMap::from([
-                ("name".to_string(), PanelValue::String(task.name.clone())),
-                (
-                    "phase".to_string(),
-                    PanelValue::String(
-                        match task.phase {
-                            crate::convoy_model::WorkPhase::Pending => "pending",
-                            crate::convoy_model::WorkPhase::Ready => "ready",
-                            crate::convoy_model::WorkPhase::Launching => "launching",
-                            crate::convoy_model::WorkPhase::Running => "running",
-                            crate::convoy_model::WorkPhase::Complete => "complete",
-                            crate::convoy_model::WorkPhase::Failed => "failed",
-                            crate::convoy_model::WorkPhase::Cancelled => "cancelled",
-                        }
-                        .to_string(),
-                    ),
-                ),
-                (
-                    "crew".to_string(),
-                    PanelValue::List(
-                        task.crew
-                            .into_iter()
-                            .map(|process| {
-                                PanelValue::Map(BTreeMap::from([
-                                    ("role".to_string(), PanelValue::String(process.role)),
-                                    ("command_preview".to_string(), PanelValue::String(process.command_preview)),
-                                ]))
-                            })
-                            .collect(),
-                    ),
-                ),
-            ]);
-            if let Some(host) = task.host {
-                values.insert("host".to_string(), PanelValue::Host(host));
-            }
-            if let Some(checkout) = task.checkout {
-                values.insert("checkout".to_string(), PanelValue::Checkout(checkout));
-            }
-            for (key, value) in [("ready_at", task.ready_at), ("started_at", task.started_at), ("finished_at", task.finished_at)] {
-                if let Some(value) = value {
-                    values.insert(key.to_string(), PanelValue::Timestamp(value));
-                }
-            }
-            if let Some(message) = task.message {
-                values.insert("message".to_string(), PanelValue::String(message));
-            }
-            PanelRow {
-                resource: resource.subresource(format!("vessels/{}", task.name)),
-                values,
-                intents,
-                children: vec![],
-                depends_on: task.depends_on.iter().map(|name| resource.subresource(format!("vessels/{name}"))).collect(),
-            }
+            let crew = task
+                .crew
+                .into_iter()
+                .map(|process| CrewMemberSummary { role: process.role, command_preview: process.command_preview })
+                .collect();
+            VesselRow::builder()
+                .resource(resource.subresource(format!("vessels/{}", task.name)))
+                .name(&task.name)
+                .phase(wire_work_phase(task.phase))
+                .crew(crew)
+                .maybe_ready_at(task.ready_at)
+                .maybe_started_at(task.started_at)
+                .maybe_finished_at(task.finished_at)
+                .maybe_message(task.message)
+                .depends_on(task.depends_on)
+                .host(task.host.unwrap_or_else(HostName::local))
+                .maybe_attach(task.workspace_ref)
+                .complete_work(task.completion_target.is_some())
+                .build()
         })
         .collect();
-    let mut values = BTreeMap::from([
-        ("name".to_string(), PanelValue::String(convoy.name)),
-        ("workflow_ref".to_string(), PanelValue::String(convoy.workflow_ref)),
-        (
-            "phase".to_string(),
-            PanelValue::String(
-                match convoy.phase {
-                    crate::convoy_model::ConvoyPhase::Pending => "pending",
-                    crate::convoy_model::ConvoyPhase::Active => "active",
-                    crate::convoy_model::ConvoyPhase::Completed => "completed",
-                    crate::convoy_model::ConvoyPhase::Failed => "failed",
-                    crate::convoy_model::ConvoyPhase::Cancelled => "cancelled",
-                }
-                .to_string(),
-            ),
-        ),
-        ("initializing".to_string(), PanelValue::Bool(convoy.initializing)),
-    ]);
-    if let Some(message) = convoy.message {
-        values.insert("message".to_string(), PanelValue::String(message));
-    }
-    if let Some(repo) = convoy.repo_hint {
-        values.insert("repo".to_string(), PanelValue::String(repo.0));
-    }
-    for (key, value) in [("started_at", convoy.started_at), ("finished_at", convoy.finished_at)] {
-        if let Some(value) = value {
-            values.insert(key.to_string(), PanelValue::Timestamp(value));
-        }
-    }
-    if let Some(workflow_ref) = convoy.observed_workflow_ref {
-        values.insert("observed_workflow_ref".to_string(), PanelValue::String(workflow_ref));
-    }
-    PanelRow { resource, values, intents: vec![], children, depends_on: vec![] }
+    ConvoyRow::builder()
+        .resource(resource)
+        .name(convoy.name)
+        .workflow_ref(convoy.workflow_ref)
+        .phase(wire_convoy_phase(convoy.phase))
+        .initializing(convoy.initializing)
+        .maybe_message(convoy.message)
+        .maybe_repo(convoy.repo_hint)
+        .maybe_started_at(convoy.started_at)
+        .maybe_finished_at(convoy.finished_at)
+        .maybe_observed_workflow_ref(convoy.observed_workflow_ref)
+        .vessels(vessels)
+        .build()
 }
 
-fn panel_snapshot_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnapshot>) -> flotilla_protocol::DaemonEvent {
+fn result_set_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnapshot>) -> flotilla_protocol::DaemonEvent {
+    use flotilla_protocol::result_set::{ResultSet, Rows};
+
     let snapshot = snapshot.as_ref().clone();
-    let mut panel = flotilla_core::aggregator_projection::AggregatorView::default().snapshot();
-    panel.seq = snapshot.seq;
-    panel.tab.panels[0].rows = snapshot.convoys.into_iter().map(legacy_convoy_row).collect();
-    flotilla_protocol::DaemonEvent::PanelSnapshot(Box::new(panel))
+    flotilla_protocol::DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: snapshot.seq,
+        rows: Rows::Convoys(snapshot.convoys.into_iter().map(wire_convoy_row).collect()),
+    }))
 }
 
-fn panel_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
-    use flotilla_protocol::panel::{PanelDelta, PanelId, PanelRowsDelta, ResourceRef};
+fn result_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
+    use flotilla_protocol::{
+        result_set::{ResultDelta, Rows},
+        ResourceRef,
+    };
 
     let delta = delta.as_ref().clone();
-    flotilla_protocol::DaemonEvent::PanelDelta(Box::new(PanelDelta {
+    flotilla_protocol::DaemonEvent::ResultDelta(Box::new(ResultDelta {
         seq: delta.seq,
-        tab_id: "convoys".to_string(),
-        panels: vec![PanelRowsDelta {
-            panel_id: PanelId::new("convoys"),
-            changed: delta.changed.into_iter().map(legacy_convoy_row).collect(),
-            removed: delta
-                .removed
-                .into_iter()
-                .map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name()))
-                .collect(),
-        }],
+        changed: Rows::Convoys(delta.changed.into_iter().map(wire_convoy_row).collect()),
+        removed: delta.removed.into_iter().map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name())).collect(),
     }))
 }
 
@@ -1460,7 +1417,7 @@ fn app_applies_panel_snapshot() {
     let mut app = stub_app();
     let convoy = test_convoy("flotilla", "x", ConvoyPhase::Active, false);
 
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![convoy],
@@ -1475,18 +1432,14 @@ fn empty_panel_snapshot_clears_convoy_selection() {
     use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
 
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![test_convoy("flotilla", "x", ConvoyPhase::Active, false)],
     })));
     assert!(app.selected_convoy_id().is_some());
 
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 2,
-        namespace: "flotilla".into(),
-        convoys: vec![],
-    })));
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot { seq: 2, namespace: "flotilla".into(), convoys: vec![] })));
 
     assert!(app.convoys("flotilla").is_empty());
     assert!(app.selected_convoy_id().is_none());
@@ -1499,7 +1452,7 @@ fn app_applies_panel_delta() {
     let mut app = stub_app();
     let convoy = test_convoy("flotilla", "x", ConvoyPhase::Pending, true);
 
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![convoy.clone()],
@@ -1509,7 +1462,7 @@ fn app_applies_panel_delta() {
     let mut modified = convoy.clone();
     modified.phase = ConvoyPhase::Active;
     modified.initializing = false;
-    app.handle_daemon_event(panel_delta_event(Box::new(ConvoyFixtureDelta {
+    app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
         seq: 2,
         namespace: "flotilla".into(),
         changed: vec![modified],
@@ -1518,7 +1471,7 @@ fn app_applies_panel_delta() {
     assert_eq!(app.convoys("flotilla")[0].phase, ConvoyPhase::Active);
 
     // Remove via delta
-    app.handle_daemon_event(panel_delta_event(Box::new(ConvoyFixtureDelta {
+    app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
         seq: 3,
         namespace: "flotilla".into(),
         changed: vec![],
@@ -1541,7 +1494,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     let mut app = stub_app();
 
     // Feed a namespace snapshot with one convoy named "demo".
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![test_convoy("flotilla", "demo", ConvoyPhase::Active, false)],
@@ -1601,7 +1554,7 @@ fn convoys_tab_select_next_advances_selection() {
     use crate::keymap::Action;
 
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
     app.ui.is_config = false;
     app.ui.is_convoys = true;
 
@@ -1626,7 +1579,7 @@ fn convoys_tab_select_next_advances_selection() {
 #[test]
 fn convoys_tab_select_prev_moves_back() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
     app.ui.is_config = false;
     app.ui.is_convoys = true;
 
@@ -1649,7 +1602,7 @@ fn delta_removing_selected_convoy_reselects_to_adjacent() {
     use crate::convoy_model::{ConvoyFixtureDelta, ConvoyFixtureSnapshot, ConvoyId};
 
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![
@@ -1666,7 +1619,7 @@ fn delta_removing_selected_convoy_reselects_to_adjacent() {
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
 
     // Delta removes "b"
-    app.handle_daemon_event(panel_delta_event(Box::new(ConvoyFixtureDelta {
+    app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
         seq: 2,
         namespace: "flotilla".into(),
         changed: vec![],
@@ -1686,7 +1639,7 @@ fn delta_removing_all_convoys_clears_selection() {
     use crate::convoy_model::{ConvoyFixtureDelta, ConvoyFixtureSnapshot, ConvoyId};
 
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![test_convoy("flotilla", "a", crate::convoy_model::ConvoyPhase::Active, false)],
@@ -1696,7 +1649,7 @@ fn delta_removing_all_convoys_clears_selection() {
 
     assert!(app.selected_convoy_id().is_some(), "should have a selection after snapshot");
 
-    app.handle_daemon_event(panel_delta_event(Box::new(ConvoyFixtureDelta {
+    app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
         seq: 2,
         namespace: "flotilla".into(),
         changed: vec![],
@@ -1730,7 +1683,7 @@ fn convoy_filter_narrows_visible_convoys() {
         }
     }
 
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
@@ -1789,7 +1742,7 @@ fn convoy_filter_matches_repo_hint() {
         initializing: false,
     };
 
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![c1, c2],
@@ -1807,7 +1760,7 @@ fn convoy_filter_invalidates_hidden_selection() {
     use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
 
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![
@@ -1849,7 +1802,7 @@ fn select_next_stays_within_filtered_set() {
         }
     }
 
-    app.handle_daemon_event(panel_snapshot_event(Box::new(ConvoyFixtureSnapshot {
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
         convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
@@ -1983,7 +1936,7 @@ fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::con
 #[test]
 fn enter_tasks_focus_default_selects_first_task() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
@@ -1998,7 +1951,7 @@ fn enter_tasks_focus_default_selects_first_task() {
 #[test]
 fn enter_tasks_focus_noop_on_empty_tasks() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &[])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &[])]))));
     app.ui.is_convoys = true;
 
     app.enter_convoy_vessels_focus("flotilla");
@@ -2010,7 +1963,7 @@ fn enter_tasks_focus_noop_on_empty_tasks() {
 #[test]
 fn convoy_vessels_select_delta_clamps_within_tasks() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
     app.ui.is_convoys = true;
     app.enter_convoy_vessels_focus("flotilla");
 
@@ -2025,7 +1978,7 @@ fn convoy_vessels_select_delta_clamps_within_tasks() {
 #[test]
 fn switching_convoys_resets_task_state_and_focus() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![
         convoy_with_vessels("alpha", &["a1"]),
         convoy_with_vessels("beta", &["b1"]),
     ]))));
@@ -2043,7 +1996,7 @@ fn switching_convoys_resets_task_state_and_focus() {
 #[test]
 fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
     app.enter_convoy_vessels_focus("flotilla");
     app.convoy_vessels_select_delta("flotilla", 1);
@@ -2053,7 +2006,7 @@ fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
     // Remove t2 via delta.
     let mut shrunk = convoy_with_vessels("alpha", &["t1"]);
     shrunk.id = crate::convoy_model::ConvoyId::new("flotilla", "alpha");
-    app.handle_daemon_event(panel_delta_event(Box::new(crate::convoy_model::ConvoyFixtureDelta {
+    app.handle_daemon_event(result_delta_event(Box::new(crate::convoy_model::ConvoyFixtureDelta {
         seq: 2,
         namespace: "flotilla".into(),
         changed: vec![shrunk],
@@ -2071,7 +2024,7 @@ fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
 #[test]
 fn exit_tasks_focus_keeps_selected_vessel() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
     app.enter_convoy_vessels_focus("flotilla");
     app.convoy_vessels_select_delta("flotilla", 1);
@@ -2085,7 +2038,7 @@ fn exit_tasks_focus_keeps_selected_vessel() {
 #[test]
 fn l_drills_in_then_esc_returns_to_list_focus() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
     app.ui.is_convoys = true;
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
 
@@ -2100,7 +2053,7 @@ fn l_drills_in_then_esc_returns_to_list_focus() {
 #[test]
 fn h_returns_from_tasks_to_list_focus() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Char('l')));
@@ -2113,7 +2066,7 @@ fn h_returns_from_tasks_to_list_focus() {
 #[test]
 fn enter_also_drills_into_tasks_focus() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Enter));
@@ -2123,7 +2076,7 @@ fn enter_also_drills_into_tasks_focus() {
 #[test]
 fn right_and_left_arrows_navigate_focus() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Right));
@@ -2136,7 +2089,7 @@ fn right_and_left_arrows_navigate_focus() {
 #[test]
 fn arrow_keys_route_task_navigation_when_tasks_focused() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Right));
 
@@ -2149,7 +2102,7 @@ fn arrow_keys_route_task_navigation_when_tasks_focused() {
 #[test]
 fn jk_routes_to_task_navigation_when_tasks_focused() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
     app.ui.is_convoys = true;
 
     app.handle_key(key(KeyCode::Char('l')));
@@ -2168,10 +2121,7 @@ fn jk_routes_to_task_navigation_when_tasks_focused() {
 #[test]
 fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &[
-        "implement",
-        "review",
-    ])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement", "review"])]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('j')));
@@ -2194,7 +2144,7 @@ fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
 #[test]
 fn x_prefill_quotes_vessel_names_with_whitespace() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["fix my bug"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["fix my bug"])]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("fix my bug"));
@@ -2214,7 +2164,7 @@ fn x_prefill_quotes_vessel_names_with_whitespace() {
 #[test]
 fn x_then_enter_dispatches_convoy_task_complete() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement"])]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
@@ -2236,8 +2186,10 @@ fn x_then_enter_routes_remote_convoy_task_complete_to_its_host() {
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
     let mut convoy = convoy_with_vessels("remote-convoy", &["implement"]);
-    convoy.vessels[0].completion_target.as_mut().expect("completion target").host = HostName::new("feta");
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    // The vessel's host routes capability actions; a replica row carries the
+    // origin host stamped on the vessel.
+    convoy.vessels[0].host = Some(HostName::new("feta"));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
@@ -2248,36 +2200,11 @@ fn x_then_enter_routes_remote_convoy_task_complete_to_its_host() {
 }
 
 #[test]
-fn x_uses_complete_intent_target_instead_of_display_fields() {
-    let mut app = stub_app();
-    let mut convoy = convoy_with_vessels("display-convoy", &["display-vessel"]);
-    convoy.vessels[0].completion_target = Some(crate::convoy_model::WorkCompletionTarget {
-        convoy: "target-convoy".into(),
-        vessel: "target-vessel".into(),
-        host: HostName::local(),
-    });
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('x')));
-
-    let palette = app
-        .screen
-        .modal_stack
-        .last()
-        .expect("modal pushed")
-        .as_any()
-        .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
-        .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy target-convoy work target-vessel complete ");
-}
-
-#[test]
 fn x_rejects_complete_intent_for_unknown_remote_host() {
     let mut app = stub_app();
     let mut convoy = convoy_with_vessels("remote-convoy", &["implement"]);
-    convoy.vessels[0].completion_target.as_mut().expect("completion target").host = HostName::new("missing-host");
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    convoy.vessels[0].host = Some(HostName::new("missing-host"));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
@@ -2291,7 +2218,7 @@ fn x_is_unavailable_without_complete_intent() {
     let mut app = stub_app();
     let mut convoy = convoy_with_vessels("alpha", &["implement"]);
     convoy.vessels[0].completion_target = None;
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
@@ -2331,7 +2258,7 @@ fn convoy_with_vessel_refs(name: &str, tasks: &[(&str, Option<&str>)]) -> crate:
 #[test]
 fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[(
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[(
         "implement",
         Some("ws://task-a-implement"),
     )])]))));
@@ -2357,7 +2284,7 @@ fn a_on_remote_task_routes_select_workspace_to_its_host() {
     insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
     let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
     convoy.vessels[0].host = Some(HostName::new("feta"));
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('a')));
@@ -2371,7 +2298,7 @@ fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
     let mut app = stub_app();
     let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
     convoy.vessels[0].host = Some(HostName::new("missing-host"));
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('a')));
@@ -2383,7 +2310,7 @@ fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
 #[test]
 fn a_on_task_without_workspace_ref_sets_status_message() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[("implement", None)])]))));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[("implement", None)])]))));
     app.ui.is_convoys = true;
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("implement"));
@@ -2399,7 +2326,7 @@ fn a_on_task_without_workspace_ref_sets_status_message() {
 #[test]
 fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
     let mut app = stub_app();
-    app.handle_daemon_event(panel_snapshot_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[
         ("implement", Some("ws://impl")),
         ("review", Some("ws://rev")),
     ])]))));

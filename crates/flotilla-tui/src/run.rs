@@ -28,6 +28,17 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         app.handle_daemon_event(event);
     }
 
+    // Subscribe to the convoys query — the only named query the TUI renders
+    // today. The subscribe replay returns the initial result set.
+    let query_events = app
+        .daemon
+        .subscribe_queries(&[flotilla_protocol::QueryCursor { query: flotilla_protocol::QueryId::Convoys, since: None }])
+        .await
+        .unwrap_or_default();
+    for event in query_events {
+        app.handle_daemon_event(event);
+    }
+
     execute!(stdout(), EnableMouseCapture)?;
     let mut events = event::EventHandler::new(Duration::from_millis(50));
     events.attach_daemon(daemon_rx);
