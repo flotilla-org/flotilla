@@ -337,27 +337,6 @@ struct OpenViewsFile {
     views: Vec<OpenViewEntry>,
 }
 
-/// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
-pub fn path_to_slug(path: &Path) -> String {
-    let raw = path.to_string_lossy().to_lowercase();
-    let mut prev_hyphen = false;
-    let slug: String = raw
-        .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
-                prev_hyphen = false;
-                Some(c)
-            } else if !prev_hyphen {
-                prev_hyphen = true;
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .collect();
-    slug.trim_matches('-').to_string()
-}
-
 fn repo_file_key(path: &Path) -> String {
     let key = urlencoding::encode(&path.to_string_lossy()).into_owned();
     if key.len() > 200 {
@@ -407,19 +386,31 @@ impl ConfigStore {
         self.base.join("tab-order.json")
     }
 
-    /// Load all persisted repo paths from config dir, sorted alphabetically by path.
+    /// Load all persisted repo paths, migrating noncanonical filenames and sorting by path.
     pub fn load_repos(&self) -> Vec<ExecutionEnvironmentPath> {
         let dir = self.repos_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
-        let mut repos: Vec<(String, ExecutionEnvironmentPath)> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
-            .filter_map(|e| {
-                let content = std::fs::read_to_string(e.path()).ok()?;
+        let files: Vec<PathBuf> =
+            entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|ext| ext == "toml")).map(|e| e.path()).collect();
+        let mut repos: Vec<(String, ExecutionEnvironmentPath)> = files
+            .into_iter()
+            .filter_map(|source| {
+                let content = std::fs::read_to_string(&source).ok()?;
                 let config: RepoConfig = toml::from_str(&content).ok()?;
                 let path = PathBuf::from(&config.path);
+                let canonical = dir.join(format!("{}.toml", repo_file_key(&path)));
+                if source != canonical.as_path() {
+                    let result = if canonical.as_path().exists() {
+                        std::fs::remove_file(&source)
+                    } else {
+                        std::fs::rename(&source, canonical.as_path())
+                    };
+                    if let Err(err) = result {
+                        tracing::warn!(from = %source.display(), to = %canonical, %err, "failed to migrate repo config filename");
+                    }
+                }
                 if path.is_dir() {
                     Some((config.path, ExecutionEnvironmentPath::new(path)))
                 } else {
@@ -428,6 +419,7 @@ impl ConfigStore {
             })
             .collect();
         repos.sort_by(|a, b| a.0.cmp(&b.0));
+        repos.dedup_by(|a, b| a.0 == b.0);
         repos.into_iter().map(|(_, path)| path).collect()
     }
 
