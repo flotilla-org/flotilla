@@ -41,7 +41,7 @@ use flotilla_protocol::{
     TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, TypedResolver,
     REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
@@ -49,6 +49,11 @@ use tokio::sync::Notify;
 struct FixedRemoteHostDetector {
     owner: &'static str,
     repo: &'static str,
+}
+
+struct MutableRemoteHostDetector {
+    owner: &'static str,
+    repo: Arc<std::sync::RwLock<String>>,
 }
 
 fn qpath(host: &HostName, path: impl Into<PathBuf>) -> QualifiedPath {
@@ -64,6 +69,19 @@ impl RepoDetector for FixedRemoteHostDetector {
         _env: &dyn flotilla_core::providers::discovery::EnvVars,
     ) -> Vec<EnvironmentAssertion> {
         vec![EnvironmentAssertion::remote_host(HostPlatform::GitHub, self.owner, self.repo, "origin")]
+    }
+}
+
+#[async_trait]
+impl RepoDetector for MutableRemoteHostDetector {
+    async fn detect(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _runner: &dyn flotilla_core::providers::CommandRunner,
+        _env: &dyn flotilla_core::providers::discovery::EnvVars,
+    ) -> Vec<EnvironmentAssertion> {
+        let repo = self.repo.read().expect("mutable remote detector should not be poisoned").clone();
+        vec![EnvironmentAssertion::remote_host(HostPlatform::GitHub, self.owner, repo, "origin")]
     }
 }
 
@@ -1737,6 +1755,231 @@ async fn repo_refresh_reconciles_observed_checkouts() {
 }
 
 #[tokio::test]
+async fn removing_final_local_root_deletes_observed_checkouts() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    assert_eq!(observed.list().await.expect("observed checkout list should succeed").items.len(), 1);
+
+    daemon.remove_repo(&repo).await.expect("remove final local root");
+
+    assert!(observed.list().await.expect("observed checkout list should succeed").items.is_empty());
+}
+
+#[tokio::test]
+async fn removing_final_local_root_preserves_adopted_checkouts() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    let published = observed.list().await.expect("observed checkout list should succeed");
+    let repo_key = published.items[0].metadata.labels.get(REPO_KEY_LABEL).expect("observed checkout should carry a repo key").clone();
+    observed
+        .create(
+            &InputMeta::builder()
+                .name("adopted-checkout".to_string())
+                .labels(std::collections::BTreeMap::from([
+                    (flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string()),
+                    (REPO_KEY_LABEL.to_string(), repo_key),
+                ]))
+                .build(),
+            &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "main".to_string(),
+                path: repo.to_string_lossy().into_owned(),
+                repo_ref: "github-com-owner-repo".to_string(),
+                is_main: true,
+            }),
+        )
+        .await
+        .expect("adopted checkout should be creatable");
+
+    daemon.remove_repo(&repo).await.expect("remove final local root");
+
+    let remaining = observed.list().await.expect("observed checkout list should succeed");
+    assert_eq!(remaining.items.len(), 1);
+    assert_eq!(remaining.items[0].metadata.name, "adopted-checkout");
+}
+
+#[tokio::test]
+async fn removing_one_of_multiple_local_roots_preserves_observed_checkouts() {
+    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_fake_repos().await;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo_a, &mut events).await;
+    wait_for_observed_checkout_count(&observed, 2).await;
+
+    daemon.remove_repo(&repo_a).await.expect("remove first local root");
+
+    let surviving_checkout_path = repo_b.join("main").to_string_lossy().into_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let remaining = observed.list().await.expect("observed checkout list should succeed");
+            if matches!(
+                remaining.items.as_slice(),
+                [checkout]
+                    if matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == surviving_checkout_path)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("surviving root's observed Checkout should remain");
+    let remaining = observed.list().await.expect("observed checkout list should succeed");
+    assert!(matches!(
+        &remaining.items[0].spec,
+        ResourceCheckoutSpec::Observed(spec) if spec.path == surviving_checkout_path
+    ));
+
+    daemon.remove_repo(&repo_b).await.expect("remove final local root");
+
+    assert!(observed.list().await.expect("observed checkout list should succeed").items.is_empty());
+}
+
+#[tokio::test]
+async fn removing_final_local_root_deletes_observed_checkouts_when_virtual_root_remains() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    let virtual_repo = PathBuf::from("/remote/desktop/owner/repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
+
+    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let identity = RepoIdentity { authority: "github.com".to_string(), path: "owner/repo".to_string() };
+    daemon.add_virtual_repo(identity.clone(), virtual_repo.clone(), vec![], 0).await.expect("add virtual root");
+    daemon.add_repo(&repo).await.expect("add local root");
+
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    assert_eq!(observed.list().await.expect("observed checkout list should succeed").items.len(), 1);
+
+    daemon.remove_repo(&repo).await.expect("remove final local root");
+
+    assert!(observed.list().await.expect("observed checkout list should succeed").items.is_empty());
+    assert_eq!(daemon.tracked_repo_identity_for_path(&virtual_repo).await, Some(identity));
+}
+
+#[tokio::test]
+async fn repository_identity_change_removes_old_repo_key_observed_checkouts() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let discovered_repo = Arc::new(std::sync::RwLock::new("old-repo".to_string()));
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "owner", repo: Arc::clone(&discovered_repo) }));
+
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+    let old = observed.list().await.expect("observed checkout list should succeed");
+    assert_eq!(old.items.len(), 1);
+    assert_eq!(old.items[0].metadata.labels.get(REPO_LABEL).map(String::as_str), Some("github-com-owner-old-repo"));
+
+    *discovered_repo.write().expect("mutable remote detector should not be poisoned") = "new-repo".to_string();
+    daemon.add_repo(&repo).await.expect("refresh tracked path with new repository identity");
+    let _ = trigger_refresh_and_recv(&daemon, &repo, &mut events).await;
+
+    let current = observed.list().await.expect("observed checkout list should succeed");
+    assert_eq!(current.items.len(), 1);
+    assert_eq!(current.items[0].metadata.labels.get(REPO_LABEL).map(String::as_str), Some("github-com-owner-new-repo"));
+}
+
+#[tokio::test]
+async fn repository_identity_change_reconciles_old_identity_shared_by_another_root() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo_a = temp.path().join("repo-a");
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_a).expect("create repo-a dir");
+    std::fs::create_dir_all(&repo_b).expect("create repo-b dir");
+
+    let state_a = FakeVcsState::builder(repo_a.clone()).branch("main", true).checkout("main").is_main(true).path(&repo_a).build().build();
+    let state_b = FakeVcsState::builder(repo_b.clone()).branch("main", true).checkout("main").is_main(true).path(&repo_b).build().build();
+    let discovered_repo = Arc::new(std::sync::RwLock::new("old-repo".to_string()));
+    let mut discovery = fake_discovery(false);
+    discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(state_a.clone())), Box::new(FakeVcsFactory::new(state_b.clone()))];
+    discovery.factories.checkout_managers =
+        vec![Box::new(FakeCheckoutManagerFactory::new(state_a)), Box::new(FakeCheckoutManagerFactory::new(state_b))];
+    discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "owner", repo: Arc::clone(&discovered_repo) }));
+
+    let daemon = InProcessDaemon::new(
+        vec![repo_a.clone(), repo_b.clone()],
+        test_config_store(temp.path().join("config")),
+        discovery,
+        HostName::local(),
+    )
+    .await;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let mut events = daemon.subscribe();
+
+    let _ = trigger_refresh_and_recv(&daemon, &repo_a, &mut events).await;
+    wait_for_observed_checkout_count(&observed, 2).await;
+
+    *discovered_repo.write().expect("mutable remote detector should not be poisoned") = "new-repo".to_string();
+    daemon.add_repo(&repo_a).await.expect("migrate first root to new repository identity");
+    let _ = trigger_refresh_and_recv(&daemon, &repo_a, &mut events).await;
+
+    let repo_a_path = repo_a.to_string_lossy().into_owned();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let stale_old_identity_checkout =
+                observed.list().await.expect("observed checkout list should succeed").items.into_iter().any(|checkout| {
+                    checkout.metadata.labels.get(REPO_LABEL).map(String::as_str) == Some("github-com-owner-old-repo")
+                        && matches!(checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == repo_a_path)
+                });
+            if !stale_old_identity_checkout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("migrated root's Checkout should be removed from the old identity");
+
+    let current = observed.list().await.expect("observed checkout list should succeed");
+    assert_eq!(current.items.len(), 2);
+    assert!(current.items.iter().any(|checkout| {
+        checkout.metadata.labels.get(REPO_LABEL).map(String::as_str) == Some("github-com-owner-old-repo")
+            && matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == repo_b.to_string_lossy())
+    }));
+    assert!(current.items.iter().any(|checkout| {
+        checkout.metadata.labels.get(REPO_LABEL).map(String::as_str) == Some("github-com-owner-new-repo")
+            && matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == repo_a.to_string_lossy())
+    }));
+}
+
+#[tokio::test]
 async fn static_ssh_repo_refresh_stamps_discovered_checkout_environment_id() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
@@ -1896,6 +2139,19 @@ async fn trigger_refresh_and_recv(
             _ => {}
         }
     }
+}
+
+async fn wait_for_observed_checkout_count(observed: &TypedResolver<ResourceCheckout>, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if observed.list().await.expect("observed checkout list should succeed").items.len() == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("observed checkout count should converge");
 }
 
 #[tokio::test]
