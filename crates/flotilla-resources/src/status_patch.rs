@@ -41,6 +41,33 @@ where
     .await
 }
 
+/// Applies a status patch only while `check` accepts each freshly fetched resource version.
+///
+/// The check runs before the initial write and again after every optimistic-concurrency conflict,
+/// keeping state-dependent validation in the same retry loop as the mutation it guards.
+pub async fn apply_status_patch_checked<T>(
+    resolver: &TypedResolver<T>,
+    name: &str,
+    patch: &T::StatusPatch,
+    check: impl Fn(&ResourceObject<T>) -> Result<(), ResourceError>,
+) -> Result<ResourceObject<T>, ResourceError>
+where
+    T: Resource,
+    T::Status: Default,
+{
+    apply_status_patch_inner(
+        name,
+        patch,
+        || async {
+            let current = resolver.get(name).await?;
+            check(&current)?;
+            Ok((current.metadata.resource_version, current.status))
+        },
+        |resource_version, new_status| async move { resolver.update_status(name, &resource_version, &new_status).await },
+    )
+    .await
+}
+
 async fn apply_status_patch_inner<S, P, R, G, GFut, U, UFut>(
     name: &str,
     patch: &P,
