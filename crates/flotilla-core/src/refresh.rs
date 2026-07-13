@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     future::Future,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -10,9 +11,11 @@ use flotilla_protocol::{
     qualified_path::{HostId, PathQualifier, QualifiedPath},
     CorrelationKey, EnvironmentId, HostName,
 };
+use futures::FutureExt;
 use tokio::{
     sync::{watch, Notify},
     task::JoinHandle,
+    time::Instant,
 };
 
 use crate::{
@@ -51,6 +54,76 @@ pub struct RepoRefreshHandle {
     _task_handle: JoinHandle<()>,
 }
 
+#[derive(Clone, Copy)]
+struct RefreshCadence {
+    interval: Duration,
+    offset: Duration,
+}
+
+#[derive(Clone, Copy)]
+enum RefreshKind {
+    Full,
+    Fast,
+    Slow,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RefreshSchedule {
+    startup_offset: Duration,
+    fast: RefreshCadence,
+    slow: RefreshCadence,
+}
+
+impl RefreshSchedule {
+    pub(crate) fn for_repo(repo_root: &Path, fast_interval: Duration, slow_interval: Duration) -> Self {
+        let mut hasher = DefaultHasher::new();
+        repo_root.hash(&mut hasher);
+        let hash = hasher.finish();
+        Self {
+            startup_offset: stagger_offset(hash.rotate_left(41), Duration::from_secs(1)),
+            fast: RefreshCadence { interval: fast_interval, offset: stagger_offset(hash, fast_interval) },
+            slow: RefreshCadence { interval: slow_interval, offset: stagger_offset(hash.rotate_left(17), slow_interval) },
+        }
+    }
+
+    #[cfg(test)]
+    fn without_stagger(fast_interval: Duration, slow_interval: Duration) -> Self {
+        Self {
+            startup_offset: Duration::ZERO,
+            fast: RefreshCadence { interval: fast_interval, offset: Duration::ZERO },
+            slow: RefreshCadence { interval: slow_interval, offset: Duration::ZERO },
+        }
+    }
+}
+
+impl From<Duration> for RefreshSchedule {
+    fn from(interval: Duration) -> Self {
+        Self::without_stagger_for_interval(interval)
+    }
+}
+
+impl RefreshSchedule {
+    fn without_stagger_for_interval(interval: Duration) -> Self {
+        Self {
+            startup_offset: Duration::ZERO,
+            fast: RefreshCadence { interval, offset: Duration::ZERO },
+            slow: RefreshCadence { interval, offset: Duration::ZERO },
+        }
+    }
+}
+
+fn stagger_offset(hash: u64, interval: Duration) -> Duration {
+    let interval_nanos = interval.as_nanos();
+    if interval_nanos == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos((u128::from(hash) % interval_nanos) as u64)
+}
+
+fn first_tick(cadence: RefreshCadence) -> Instant {
+    Instant::now() + cadence.interval + cadence.offset
+}
+
 pub(crate) fn normalize_checkout_publication(path: QualifiedPath, host_id: Option<&HostId>, _host_name: &HostName) -> QualifiedPath {
     match host_id {
         Some(host_id) => QualifiedPath::host(host_id.clone(), path.path),
@@ -87,23 +160,78 @@ impl RepoRefreshHandle {
         agent_state_store: crate::agents::SharedAgentStateStore,
         interval: Duration,
     ) -> Self {
+        Self::spawn_with_schedule(
+            repo_root,
+            registry,
+            criteria,
+            environment_id,
+            host_id,
+            attachable_store,
+            agent_state_store,
+            interval.into(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_with_schedule(
+        repo_root: PathBuf,
+        registry: Arc<ProviderRegistry>,
+        criteria: RepoCriteria,
+        environment_id: Option<EnvironmentId>,
+        host_id: Option<HostId>,
+        attachable_store: SharedAttachableStore,
+        agent_state_store: crate::agents::SharedAgentStateStore,
+        schedule: RefreshSchedule,
+    ) -> Self {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(RefreshSnapshot::default()));
         let refresh_trigger = Arc::new(Notify::new());
         let trigger = refresh_trigger.clone();
 
         let task_handle = tokio::spawn(async move {
-            let mut timer = tokio::time::interval(interval);
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = timer.tick() => {}
-                    _ = trigger.notified() => {}
-                }
+            if !schedule.startup_offset.is_zero() {
+                tokio::time::sleep(schedule.startup_offset).await;
+            }
+            // A manual trigger received during the startup stagger is already
+            // satisfied by the initial full refresh. Consume its permit before
+            // scanning so a mutation-triggered refresh that arrives while the
+            // scan is in flight remains pending for the loop below.
+            let _ = trigger.notified().now_or_never();
+            let mut provider_data = ProviderData::default();
+            let mut fast_errors = Vec::new();
+            let mut slow_errors = Vec::new();
+            let initial = run_refresh_cycle(
+                RefreshKind::Full,
+                &mut provider_data,
+                &mut fast_errors,
+                &mut slow_errors,
+                &repo_root,
+                &registry,
+                &criteria,
+                environment_id.as_ref(),
+                host_id.as_ref(),
+                &attachable_store,
+                &agent_state_store,
+            )
+            .await;
+            if snapshot_tx.send(initial).is_err() {
+                return;
+            }
 
-                // Fetch all provider data
-                let mut provider_data = ProviderData::default();
-                let errors = refresh_providers(
+            let mut fast_timer = tokio::time::interval_at(first_tick(schedule.fast), schedule.fast.interval);
+            fast_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut slow_timer = tokio::time::interval_at(first_tick(schedule.slow), schedule.slow.interval);
+            slow_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let kind = tokio::select! {
+                    _ = fast_timer.tick() => RefreshKind::Fast,
+                    _ = slow_timer.tick() => RefreshKind::Slow,
+                    _ = trigger.notified() => RefreshKind::Full,
+                };
+                let snapshot = run_refresh_cycle(
+                    kind,
                     &mut provider_data,
+                    &mut fast_errors,
+                    &mut slow_errors,
                     &repo_root,
                     &registry,
                     &criteria,
@@ -113,13 +241,6 @@ impl RepoRefreshHandle {
                     &agent_state_store,
                 )
                 .await;
-                let provider_health = compute_provider_health(&registry, &errors);
-
-                // Correlate
-                let providers = Arc::new(provider_data);
-                let (work_items, correlation_groups) = data::correlate(&providers);
-
-                let snapshot = Arc::new(RefreshSnapshot { providers, work_items, correlation_groups, errors, provider_health });
 
                 // Publish — receivers will see has_changed().
                 // Break if receiver is dropped (handle dropped without Drop running).
@@ -149,6 +270,63 @@ impl RepoRefreshHandle {
     pub fn trigger_refresh(&self) {
         self.refresh_trigger.notify_one();
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_refresh_cycle(
+    kind: RefreshKind,
+    provider_data: &mut ProviderData,
+    fast_errors: &mut Vec<RefreshError>,
+    slow_errors: &mut Vec<RefreshError>,
+    repo_root: &Path,
+    registry: &ProviderRegistry,
+    criteria: &RepoCriteria,
+    environment_id: Option<&EnvironmentId>,
+    host_id: Option<&HostId>,
+    attachable_store: &SharedAttachableStore,
+    agent_state_store: &crate::agents::SharedAgentStateStore,
+) -> Arc<RefreshSnapshot> {
+    match kind {
+        RefreshKind::Full => {
+            let mut fast_data = provider_data.clone();
+            let mut slow_data = provider_data.clone();
+            let (new_fast_errors, new_slow_errors) = tokio::join!(
+                refresh_fast_providers(&mut fast_data, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store,),
+                refresh_slow_providers(&mut slow_data, repo_root, registry, criteria, host_id),
+            );
+            install_fast_provider_data(provider_data, fast_data);
+            install_slow_provider_data(provider_data, slow_data);
+            *fast_errors = new_fast_errors;
+            *slow_errors = new_slow_errors;
+        }
+        RefreshKind::Fast => {
+            *fast_errors =
+                refresh_fast_providers(provider_data, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store)
+                    .await;
+        }
+        RefreshKind::Slow => {
+            *slow_errors = refresh_slow_providers(provider_data, repo_root, registry, criteria, host_id).await;
+        }
+    }
+    let errors: Vec<_> = fast_errors.iter().chain(slow_errors.iter()).cloned().collect();
+    let provider_health = compute_provider_health(registry, &errors);
+    let providers = Arc::new(provider_data.clone());
+    let (work_items, correlation_groups) = data::correlate(&providers);
+    Arc::new(RefreshSnapshot { providers, work_items, correlation_groups, errors, provider_health })
+}
+
+fn install_fast_provider_data(target: &mut ProviderData, source: ProviderData) {
+    target.checkouts = source.checkouts;
+    target.workspaces = source.workspaces;
+    target.managed_terminals = source.managed_terminals;
+    target.attachable_sets = source.attachable_sets;
+    target.agents = source.agents;
+}
+
+fn install_slow_provider_data(target: &mut ProviderData, source: ProviderData) {
+    target.change_requests = source.change_requests;
+    target.sessions = source.sessions;
+    target.branches = source.branches;
 }
 
 impl Drop for RepoRefreshHandle {
@@ -195,12 +373,34 @@ fn insert_category_health<I>(
 }
 
 /// Fetch all provider data into the given ProviderData struct.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn refresh_providers(
     pd: &mut ProviderData,
     repo_root: &Path,
     registry: &ProviderRegistry,
     criteria: &RepoCriteria,
+    environment_id: Option<&EnvironmentId>,
+    host_id: Option<&HostId>,
+    attachable_store: &SharedAttachableStore,
+    agent_state_store: &crate::agents::SharedAgentStateStore,
+) -> Vec<RefreshError> {
+    let mut errors = refresh_fast_providers(pd, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store).await;
+    errors.extend(refresh_slow_providers(pd, repo_root, registry, criteria, host_id).await);
+    errors
+}
+
+fn collect_errors(errors: &mut Vec<RefreshError>, category: &'static str, provider_errors: Vec<(String, String)>) {
+    for (provider, message) in provider_errors {
+        errors.push(RefreshError { category, provider, message });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_fast_providers(
+    pd: &mut ProviderData,
+    repo_root: &Path,
+    registry: &ProviderRegistry,
     environment_id: Option<&EnvironmentId>,
     host_id: Option<&HostId>,
     attachable_store: &SharedAttachableStore,
@@ -220,22 +420,6 @@ async fn refresh_providers(
             (vec![], vec![])
         }
     };
-
-    let cr_fut = collect_named_results(
-        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
-    );
-
-    let sessions_fut = collect_named_results(
-        registry.cloud_agents.iter().map(|(desc, ca)| (desc.display_name.clone(), ca.list_sessions(criteria))).collect(),
-    );
-
-    let branches_fut = collect_named_results(
-        registry.vcs.iter().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(&ee_root))).collect(),
-    );
-
-    let merged_fut = collect_named_results(
-        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
-    );
 
     let ws_fut = async {
         if let Some((desc, ws_mgr)) = registry.presentation_managers.preferred_with_desc() {
@@ -264,21 +448,7 @@ async fn refresh_providers(
         }
     };
 
-    let (
-        (checkouts, checkout_errors),
-        (crs, cr_errors),
-        (sessions, session_errors),
-        (branches, branch_errors),
-        (merged, merged_errors),
-        (workspaces, ws_errors),
-        tp_errors,
-    ) = tokio::join!(checkouts_fut, cr_fut, sessions_fut, branches_fut, merged_fut, ws_fut, tp_fut);
-
-    fn collect_errors(errors: &mut Vec<RefreshError>, category: &'static str, provider_errors: Vec<(String, String)>) {
-        for (provider, message) in provider_errors {
-            errors.push(RefreshError { category, provider, message });
-        }
-    }
+    let ((checkouts, checkout_errors), (workspaces, ws_errors), tp_errors) = tokio::join!(checkouts_fut, ws_fut, tp_fut);
 
     let local_host = HostName::local();
     pd.checkouts = checkouts
@@ -295,7 +465,46 @@ async fn refresh_providers(
         .collect();
     collect_errors(&mut errors, "checkouts", checkout_errors);
 
-    pd.change_requests = crs.into_iter().collect();
+    pd.workspaces = workspaces.into_iter().collect();
+    for workspace in pd.workspaces.values_mut() {
+        workspace.correlation_keys = normalize_checkout_correlation_keys(workspace.correlation_keys.clone(), host_id, &local_host);
+    }
+    collect_errors(&mut errors, "workspaces", ws_errors);
+
+    collect_errors(&mut errors, "terminals", tp_errors);
+
+    project_attachable_data(pd, registry, attachable_store);
+    project_agent_data(pd, agent_state_store);
+
+    errors
+}
+
+async fn refresh_slow_providers(
+    pd: &mut ProviderData,
+    repo_root: &Path,
+    registry: &ProviderRegistry,
+    criteria: &RepoCriteria,
+    host_id: Option<&HostId>,
+) -> Vec<RefreshError> {
+    let mut errors = Vec::new();
+    let ee_root = ExecutionEnvironmentPath::new(repo_root);
+    let cr_fut = collect_named_results(
+        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_change_requests(repo_root, 20))).collect(),
+    );
+    let sessions_fut = collect_named_results(
+        registry.cloud_agents.iter().map(|(desc, agent)| (desc.display_name.clone(), agent.list_sessions(criteria))).collect(),
+    );
+    let branches_fut = collect_named_results(
+        registry.vcs.iter().map(|(desc, vcs)| (desc.display_name.clone(), vcs.list_remote_branches(&ee_root))).collect(),
+    );
+    let merged_fut = collect_named_results(
+        registry.change_requests.iter().map(|(desc, cr)| (desc.display_name.clone(), cr.list_merged_branch_names(repo_root, 50))).collect(),
+    );
+    let ((change_requests, cr_errors), (sessions, session_errors), (branches, branch_errors), (merged, merged_errors)) =
+        tokio::join!(cr_fut, sessions_fut, branches_fut, merged_fut);
+
+    let local_host = HostName::local();
+    pd.change_requests = change_requests.into_iter().collect();
     for change_request in pd.change_requests.values_mut() {
         change_request.correlation_keys =
             normalize_checkout_correlation_keys(change_request.correlation_keys.clone(), host_id, &local_host);
@@ -308,28 +517,15 @@ async fn refresh_providers(
     }
     collect_errors(&mut errors, "sessions", session_errors);
 
-    pd.workspaces = workspaces.into_iter().collect();
-    for workspace in pd.workspaces.values_mut() {
-        workspace.correlation_keys = normalize_checkout_correlation_keys(workspace.correlation_keys.clone(), host_id, &local_host);
+    use flotilla_protocol::delta::{Branch, BranchStatus};
+    pd.branches.clear();
+    collect_errors(&mut errors, "branches", branch_errors);
+    collect_errors(&mut errors, "merged", merged_errors);
+    for name in branches {
+        pd.branches.insert(name, Branch { status: BranchStatus::Remote });
     }
-    collect_errors(&mut errors, "workspaces", ws_errors);
-
-    collect_errors(&mut errors, "terminals", tp_errors);
-
-    project_attachable_data(pd, registry, attachable_store);
-    project_agent_data(pd, agent_state_store);
-    {
-        use flotilla_protocol::delta::{Branch, BranchStatus};
-        let remote = branches;
-        collect_errors(&mut errors, "branches", branch_errors);
-        let merged_names = merged;
-        collect_errors(&mut errors, "merged", merged_errors);
-        for name in remote {
-            pd.branches.insert(name, Branch { status: BranchStatus::Remote });
-        }
-        for name in merged_names {
-            pd.branches.insert(name, Branch { status: BranchStatus::Merged });
-        }
+    for name in merged {
+        pd.branches.insert(name, Branch { status: BranchStatus::Merged });
     }
 
     errors
@@ -341,6 +537,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         tracing::warn!("attachable store lock poisoned while projecting provider data");
         return;
     };
+    pd.managed_terminals.clear();
 
     if let Some(provider_name) = workspace_provider.as_deref() {
         for (ws_ref, workspace) in &mut pd.workspaces {
@@ -422,6 +619,7 @@ fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::
         tracing::warn!("agent state store lock poisoned while projecting agent data");
         return;
     };
+    pd.agents.clear();
     for (attachable_id, entry) in store.list_agents() {
         // Only include agents whose terminal's attachable set belongs to this repo.
         // Find the set that contains this attachable_id.

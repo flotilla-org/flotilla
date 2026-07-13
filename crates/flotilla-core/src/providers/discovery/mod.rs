@@ -13,12 +13,16 @@ pub mod factories;
 pub mod test_support;
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use async_trait::async_trait;
+use flotilla_protocol::EnvironmentId;
 use futures::stream;
+use tokio::sync::OnceCell as AsyncOnceCell;
 
 use crate::{
     agent_adapter::AgentAdapterRegistry,
@@ -32,6 +36,7 @@ use crate::{
         issue_tracker::IssueProvider,
         presentation::PresentationManager,
         registry::{ProviderRegistry, ProviderSet},
+        scan_cache::{SharedPresentationManager, SharedTerminalPool},
         terminal::TerminalPool,
         vcs::{CheckoutManager, Vcs},
         CommandRunner,
@@ -533,6 +538,112 @@ pub struct DiscoveryRuntime {
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,
     pub(crate) attachable_store: OnceLock<SharedAttachableStore>,
+    pub(crate) host_scoped_providers: HostScopedProviderCache,
+}
+
+const HOST_SCAN_CACHE_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+pub(crate) struct HostScopedProviderCache {
+    environments: Mutex<HashMap<EnvironmentId, Arc<AsyncOnceCell<HostScopedDiscovery>>>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct HostScopedProviders {
+    cloud_agents: Vec<(ProviderDescriptor, Arc<dyn CloudAgentService>)>,
+    presentation_managers: Vec<(ProviderDescriptor, Arc<dyn PresentationManager>)>,
+    terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct HostScopedDiscovery {
+    providers: HostScopedProviders,
+    unmet: Vec<(String, UnmetRequirement)>,
+}
+
+impl HostScopedDiscovery {
+    fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
+        for (descriptor, provider) in &self.providers.cloud_agents {
+            registry.cloud_agents.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
+        }
+        for (descriptor, provider) in &self.providers.presentation_managers {
+            registry.presentation_managers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
+        }
+        for (descriptor, provider) in &self.providers.terminal_pools {
+            registry.terminal_pools.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
+        }
+        unmet.extend(self.unmet.iter().cloned());
+    }
+}
+
+async fn probe_host_category<T: ?Sized + Send + Sync + 'static>(
+    factories: &[Box<dyn Factory<Descriptor = ProviderDescriptor, Output = T>>],
+    host_bag: &EnvironmentBag,
+    config: &ConfigStore,
+    probe_root: &ExecutionEnvironmentPath,
+    runner: &Arc<dyn CommandRunner>,
+    wrap: impl Fn(Arc<T>) -> Arc<T>,
+) -> (Vec<(ProviderDescriptor, Arc<T>)>, Vec<(String, UnmetRequirement)>) {
+    let mut providers = Vec::new();
+    let mut unmet = Vec::new();
+    for factory in factories {
+        let descriptor = factory.descriptor();
+        if providers.iter().any(|(existing, _): &(ProviderDescriptor, Arc<T>)| existing.implementation == descriptor.implementation) {
+            continue;
+        }
+        match factory.probe(host_bag, config, probe_root, Arc::clone(runner)).await {
+            Ok(provider) => providers.push((descriptor, wrap(provider))),
+            Err(requirements) => {
+                unmet.extend(requirements.into_iter().map(|requirement| (descriptor.implementation.clone(), requirement)));
+            }
+        }
+    }
+    (providers, unmet)
+}
+
+impl HostScopedProviderCache {
+    /// Probe host-scoped categories once per environment and retain the provider
+    /// instances for every repository discovered there. All factories in these
+    /// categories are audited to depend only on the host bag, process config,
+    /// and environment runner; none consumes repository detector state or root.
+    pub(crate) async fn discover_for_environment(
+        &self,
+        environment_id: &EnvironmentId,
+        host_bag: &EnvironmentBag,
+        factories: &FactoryRegistry,
+        config: &ConfigStore,
+        probe_root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> HostScopedDiscovery {
+        let cell = self
+            .environments
+            .lock()
+            .expect("host-scoped provider cache lock poisoned")
+            .entry(environment_id.clone())
+            .or_insert_with(|| Arc::new(AsyncOnceCell::new()))
+            .clone();
+
+        cell.get_or_init(|| async {
+            let (cloud_agents, mut unmet) =
+                probe_host_category(&factories.cloud_agents, host_bag, config, probe_root, &runner, |provider| provider).await;
+            let (presentation_managers, presentation_unmet) =
+                probe_host_category(&factories.presentation_managers, host_bag, config, probe_root, &runner, |provider| {
+                    Arc::new(SharedPresentationManager::new(provider, HOST_SCAN_CACHE_TTL))
+                })
+                .await;
+            unmet.extend(presentation_unmet);
+            let (terminal_pools, terminal_unmet) =
+                probe_host_category(&factories.terminal_pools, host_bag, config, probe_root, &runner, |provider| {
+                    Arc::new(SharedTerminalPool::new(provider, HOST_SCAN_CACHE_TTL))
+                })
+                .await;
+            unmet.extend(terminal_unmet);
+
+            HostScopedDiscovery { providers: HostScopedProviders { cloud_agents, presentation_managers, terminal_pools }, unmet }
+        })
+        .await
+        .clone()
+    }
 }
 
 impl DiscoveryRuntime {
@@ -545,6 +656,7 @@ impl DiscoveryRuntime {
             repo_detectors: detectors::default_repo_detectors(),
             factories,
             attachable_store: OnceLock::new(),
+            host_scoped_providers: HostScopedProviderCache::default(),
         }
     }
 
@@ -588,6 +700,34 @@ pub async fn discover_providers(
     config: &ConfigStore,
     runner: Arc<dyn CommandRunner>,
     env: &dyn EnvVars,
+) -> DiscoveryResult {
+    discover_providers_inner(host_bag, repo_root, repo_detectors, factories, config, runner, env, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn discover_providers_with_host_scoped(
+    host_bag: &EnvironmentBag,
+    repo_root: &ExecutionEnvironmentPath,
+    repo_detectors: &[Box<dyn RepoDetector>],
+    factories: &FactoryRegistry,
+    config: &ConfigStore,
+    runner: Arc<dyn CommandRunner>,
+    env: &dyn EnvVars,
+    host_scoped: &HostScopedDiscovery,
+) -> DiscoveryResult {
+    discover_providers_inner(host_bag, repo_root, repo_detectors, factories, config, runner, env, Some(host_scoped)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn discover_providers_inner(
+    host_bag: &EnvironmentBag,
+    repo_root: &ExecutionEnvironmentPath,
+    repo_detectors: &[Box<dyn RepoDetector>],
+    factories: &FactoryRegistry,
+    config: &ConfigStore,
+    runner: Arc<dyn CommandRunner>,
+    env: &dyn EnvVars,
+    host_scoped: Option<&HostScopedDiscovery>,
 ) -> DiscoveryResult {
     let runner_ref = &*runner;
     // Phase 1: run repo detectors
@@ -638,22 +778,26 @@ pub async fn discover_providers(
         registry.issue_trackers.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.cloud_agents.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
+    if host_scoped.is_none() {
+        probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.cloud_agents.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+    }
     probe_all(&factories.ai_utilities, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.ai_utilities.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.presentation_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.presentation_managers.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
-    probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.terminal_pools.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
+    if host_scoped.is_none() {
+        probe_all(&factories.presentation_managers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.presentation_managers.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+        probe_all(&factories.terminal_pools, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.terminal_pools.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+    }
     probe_all(&factories.environment_providers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
         registry.environment_providers.insert(desc.implementation.clone(), desc, provider);
     })
@@ -671,6 +815,10 @@ pub async fn discover_providers(
                 unmet.extend(reqs.into_iter().map(|r| (desc.implementation.clone(), r)));
             }
         }
+    }
+
+    if let Some(host_scoped) = host_scoped {
+        host_scoped.install(&mut registry, &mut unmet);
     }
 
     // Apply provider preferences from config, tracking unresolved preferences.

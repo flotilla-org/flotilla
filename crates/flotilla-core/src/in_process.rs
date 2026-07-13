@@ -56,7 +56,10 @@ use crate::{
     model::{provider_names_from_registry, repo_name, RepoModel},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        discovery::{discover_providers, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag},
+        discovery::{
+            discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
+            EnvironmentBag,
+        },
         ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
     },
@@ -569,7 +572,21 @@ async fn discover_repo_for_environment(
     let remote_env = StaticEnvVars::from_bag(&host_bag);
     let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
 
-    Ok(discover_providers(&host_bag, &ee_path, &discovery.repo_detectors, &discovery.factories, config, runner, env).await)
+    let host_scoped = discovery
+        .host_scoped_providers
+        .discover_for_environment(environment_id, &host_bag, &discovery.factories, config, &ee_path, Arc::clone(&runner))
+        .await;
+    Ok(discover_providers_with_host_scoped(
+        &host_bag,
+        &ee_path,
+        &discovery.repo_detectors,
+        &discovery.factories,
+        config,
+        runner,
+        env,
+        &host_scoped,
+    )
+    .await)
 }
 
 fn normalize_local_provider_hosts(

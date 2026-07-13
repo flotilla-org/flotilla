@@ -269,6 +269,7 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
         repo_detectors: super::detectors::default_repo_detectors(),
         factories,
         attachable_store: OnceLock::new(),
+        host_scoped_providers: Default::default(),
     }
 }
 // ---------------------------------------------------------------------------
@@ -1202,6 +1203,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             issue_query_services: issue_query_service_factories,
         },
         attachable_store,
+        host_scoped_providers: Default::default(),
     }
 }
 

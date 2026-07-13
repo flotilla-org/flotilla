@@ -15,7 +15,7 @@ use crate::{
         registry::{ProviderRegistry, ProviderSet},
         types::RepoCriteria,
     },
-    refresh::RepoRefreshHandle,
+    refresh::{RefreshSchedule, RepoRefreshHandle},
 };
 pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     fn labels<T: ?Sized>(set: &ProviderSet<T>) -> CategoryLabels {
@@ -95,7 +95,8 @@ impl RepoModel {
         let labels = labels_from_registry(&registry);
         let registry = Arc::new(registry);
         let criteria = RepoCriteria { repo_slug };
-        let refresh_handle = RepoRefreshHandle::spawn(
+        let refresh_schedule = RefreshSchedule::for_repo(&repo_root, Duration::from_secs(10), Duration::from_secs(60));
+        let refresh_handle = RepoRefreshHandle::spawn_with_schedule(
             repo_root,
             registry.clone(),
             criteria,
@@ -103,7 +104,7 @@ impl RepoModel {
             host_id,
             attachable_store,
             agent_state_store,
-            Duration::from_secs(10),
+            refresh_schedule,
         );
         Self { registry, data: DataStore::default(), labels, refresh_handle, environment_id }
     }

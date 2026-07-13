@@ -4,7 +4,7 @@ pub mod git_worktree;
 pub mod provisioning;
 pub mod wt;
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use async_trait::async_trait;
 use flotilla_protocol::CheckoutIntent;
@@ -130,12 +130,39 @@ pub fn parse_issue_config_output(output: &str) -> Vec<AssociationKey> {
 /// Read issue links from git config for a specific branch.
 /// Returns empty vec if no links or on error (non-fatal).
 pub(crate) async fn read_branch_issue_links(repo_root: &Path, branch: &str, runner: &dyn CommandRunner) -> Vec<AssociationKey> {
-    let pattern = format!("branch\\.{}\\.flotilla\\.issues\\.", regex_escape_branch(branch));
-    let result = run!(runner, "git", &["config", "--get-regexp", &pattern], repo_root);
-    match result {
-        Ok(output) => parse_issue_config_output(&output),
-        Err(_) => Vec::new(),
+    let branches = [branch.to_string()];
+    read_branch_issue_links_batch(repo_root, &branches, runner).await.remove(branch).unwrap_or_default()
+}
+
+/// Read issue links for every supplied branch with one repository-wide git config query.
+/// Returns an empty map if there are no links or the best-effort query fails.
+pub(crate) async fn read_branch_issue_links_batch(
+    repo_root: &Path,
+    branches: &[String],
+    runner: &dyn CommandRunner,
+) -> HashMap<String, Vec<AssociationKey>> {
+    let pattern = r"^branch\..*\.flotilla\.issues\.";
+    let Ok(output) = run!(runner, "git", &["config", "--get-regexp", pattern], repo_root) else {
+        return HashMap::new();
+    };
+
+    let mut links: HashMap<String, Vec<AssociationKey>> = HashMap::new();
+    for line in output.lines() {
+        let Some((config_key, value)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        for branch in branches {
+            let prefix = format!("branch.{branch}.flotilla.issues.");
+            let Some(provider) = config_key.strip_prefix(&prefix) else {
+                continue;
+            };
+            for id in value.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+                links.entry(branch.clone()).or_default().push(AssociationKey::IssueRef(provider.to_string(), id.to_string()));
+            }
+            break;
+        }
     }
+    links
 }
 
 /// Write issue links to git config for a specific branch.
@@ -202,21 +229,6 @@ pub(crate) async fn validate_checkout_target_in_git_dir(
     validate_checkout_target_with_prefix(cwd, &["--git-dir", git_dir], branch, intent, runner).await
 }
 
-/// Escape special regex characters in branch names for git config --get-regexp.
-fn regex_escape_branch(branch: &str) -> String {
-    let mut escaped = String::with_capacity(branch.len());
-    for c in branch.chars() {
-        match c {
-            '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '\\' | '|' | '^' | '$' => {
-                escaped.push('\\');
-                escaped.push(c);
-            }
-            _ => escaped.push(c),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::CheckoutIntent;
@@ -250,10 +262,18 @@ mod tests {
         assert!(keys.is_empty());
     }
 
-    #[test]
-    fn regex_escape_branch_with_dots() {
-        assert_eq!(regex_escape_branch("feat.x"), "feat\\.x");
-        assert_eq!(regex_escape_branch("simple"), "simple");
+    #[tokio::test]
+    async fn batch_issue_links_do_not_cross_match_branch_prefixes() {
+        let runner =
+            MockRunner::new(vec![Ok(
+                concat!("branch.main.flotilla.issues.github 1\n", "branch.main-2.flotilla.issues.github 2\n",).to_string()
+            )]);
+        let branches = vec!["main".to_string(), "main-2".to_string()];
+
+        let links = read_branch_issue_links_batch(Path::new("/repo"), &branches, &runner).await;
+
+        assert_eq!(links["main"], vec![AssociationKey::IssueRef("github".into(), "1".into())]);
+        assert_eq!(links["main-2"], vec![AssociationKey::IssueRef("github".into(), "2".into())]);
     }
 
     #[test]

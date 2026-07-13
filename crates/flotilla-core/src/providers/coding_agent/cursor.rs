@@ -1,24 +1,30 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::providers::{http_execute, types::*, HttpClient};
+use crate::providers::{http_execute, scan_cache::SharedScan, types::*, HttpClient};
+
+const AGENTS_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct CursorCodingAgent {
     provider_name: String,
     api_key: String,
     http: Arc<dyn HttpClient>,
+    agents_cache: SharedScan<Vec<CursorAgent>>,
     auth_warned: AtomicBool,
 }
 
 impl CursorCodingAgent {
     pub fn new(provider_name: String, api_key: String, http: Arc<dyn HttpClient>) -> Self {
-        Self { provider_name, api_key, http, auth_warned: AtomicBool::new(false) }
+        Self { provider_name, api_key, http, agents_cache: SharedScan::new(AGENTS_CACHE_TTL), auth_warned: AtomicBool::new(false) }
     }
 
     async fn fetch_agents(&self) -> Result<Vec<CursorAgent>, String> {
@@ -159,7 +165,7 @@ fn repo_slug_from_cursor_repository(repository: &str) -> Option<String> {
 #[async_trait]
 impl super::CloudAgentService for CursorCodingAgent {
     async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        let agents = match self.fetch_agents().await {
+        let agents = match self.agents_cache.get_or_scan(|| self.fetch_agents()).await {
             Ok(agents) => agents,
             Err(e) if e.contains("authentication") => {
                 if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -211,6 +217,8 @@ impl super::CloudAgentService for CursorCodingAgent {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::providers::coding_agent::CloudAgentService;
 
@@ -298,6 +306,42 @@ mod tests {
     fn cursor_service() -> CursorCodingAgent {
         let http: Arc<dyn crate::providers::HttpClient> = Arc::new(MockHttpClient);
         CursorCodingAgent::new("cursor".into(), "test-key".into(), http)
+    }
+
+    struct CountingCursorHttp {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::HttpClient for CountingCursorHttp {
+        async fn execute(
+            &self,
+            _request: reqwest::Request,
+            _label: &crate::providers::ChannelLabel,
+        ) -> Result<http::Response<bytes::Bytes>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            Ok(http::Response::builder()
+                .status(200)
+                .body(bytes::Bytes::from_static(
+                    br#"{"agents":[{"id":"one","name":"One","status":"RUNNING","source":{"repository":"owner/a"},"target":{"branchName":"main"}}]}"#,
+                ))
+                .expect("Cursor response"))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_repo_projections_share_one_account_wide_agent_fetch() {
+        let http = Arc::new(CountingCursorHttp { calls: AtomicUsize::new(0) });
+        let agent = CursorCodingAgent::new("cursor".into(), "test-key".into(), http.clone());
+        let repo_a = RepoCriteria { repo_slug: Some("owner/a".into()) };
+        let repo_b = RepoCriteria { repo_slug: Some("owner/b".into()) };
+
+        let (first, second) = tokio::join!(agent.list_sessions(&repo_a), agent.list_sessions(&repo_b));
+
+        assert_eq!(first.expect("first repo projection").len(), 1);
+        assert!(second.expect("second repo projection").is_empty());
+        assert_eq!(http.calls.load(Ordering::SeqCst), 1, "account-wide fetch should be shared before filtering by repo");
     }
 
     #[tokio::test]

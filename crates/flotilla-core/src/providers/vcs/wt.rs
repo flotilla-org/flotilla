@@ -120,11 +120,11 @@ impl super::CheckoutManager for WtCheckoutManager {
         let worktrees: Vec<WtWorktree> = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let mut checkouts: Vec<(ExecutionEnvironmentPath, Checkout)> = worktrees.into_iter().map(|wt| wt.into_checkout()).collect();
 
-        // Enrich with issue links from git config
-        let futures: Vec<_> = checkouts.iter().map(|(_, co)| super::read_branch_issue_links(root, &co.branch, &*self.runner)).collect();
-        let all_links = futures::future::join_all(futures).await;
-        for ((_, co), links) in checkouts.iter_mut().zip(all_links) {
-            co.association_keys = links;
+        // Enrich with issue links from one repository-wide git config query.
+        let branches: Vec<_> = checkouts.iter().map(|(_, checkout)| checkout.branch.clone()).collect();
+        let mut issue_links = super::read_branch_issue_links_batch(root, &branches, &*self.runner).await;
+        for (_, checkout) in &mut checkouts {
+            checkout.association_keys = issue_links.remove(&checkout.branch).unwrap_or_default();
         }
 
         Ok(checkouts)
@@ -184,8 +184,31 @@ mod tests {
     use super::*;
     use crate::providers::{
         replay,
+        testing::MockRunner,
         vcs::{checkout_test_support::git, CheckoutManager},
     };
+
+    #[tokio::test]
+    async fn list_checkouts_reads_all_branch_issue_links_with_one_git_config_call() {
+        let worktrees = serde_json::json!([
+            {"branch": "main", "path": "/repo", "is_main": true},
+            {"branch": "feature/foo", "path": "/repo.feature-foo"}
+        ])
+        .to_string();
+        let issue_links =
+            concat!("branch.main.flotilla.issues.github 1\n", "branch.feature/foo.flotilla.issues.linear ENG-2\n").to_string();
+        let runner = Arc::new(MockRunner::new(vec![Ok(worktrees), Ok(issue_links)]));
+        let manager = WtCheckoutManager::new(runner.clone());
+
+        let checkouts = manager.list_checkouts(&ExecutionEnvironmentPath::new("/repo")).await.expect("list checkouts with issue links");
+
+        assert_eq!(checkouts[0].1.association_keys, vec![AssociationKey::IssueRef("github".into(), "1".into())]);
+        assert_eq!(checkouts[1].1.association_keys, vec![AssociationKey::IssueRef("linear".into(), "ENG-2".into())]);
+        assert_eq!(runner.calls(), vec![
+            ("wt".into(), vec!["list".into(), "--format=json".into()]),
+            ("git".into(), vec!["config".into(), "--get-regexp".into(), r"^branch\..*\.flotilla\.issues\.".into(),]),
+        ]);
+    }
 
     // ── Setup helpers (only called in record mode) ──
 

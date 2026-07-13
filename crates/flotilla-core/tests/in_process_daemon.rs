@@ -2130,12 +2130,19 @@ async fn trigger_refresh_and_recv(
     repo: &Path,
     rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
 ) -> DaemonEvent {
+    let expected_identity = daemon.tracked_repo_identity_for_path(repo).await.expect("refreshed repo should be tracked");
     daemon.refresh(&RepoSelector::Path(repo.to_path_buf())).await.expect("refresh should succeed");
     loop {
         let event = recv_event(rx).await;
         match &event {
-            DaemonEvent::RepoSnapshot(snapshot) if snapshot.repo.as_deref() == Some(repo) => return event,
-            DaemonEvent::RepoDelta(delta) if delta.repo.as_deref() == Some(repo) => return event,
+            DaemonEvent::RepoSnapshot(snapshot)
+                if snapshot.repo.as_deref() == Some(repo) && snapshot.repo_identity == expected_identity =>
+            {
+                return event;
+            }
+            DaemonEvent::RepoDelta(delta) if delta.repo.as_deref() == Some(repo) && delta.repo_identity == expected_identity => {
+                return event
+            }
             _ => {}
         }
     }

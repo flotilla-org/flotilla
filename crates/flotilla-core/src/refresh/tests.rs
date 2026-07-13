@@ -1,4 +1,11 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::{
@@ -298,6 +305,304 @@ async fn wait_for_snapshot(rx: &mut tokio::sync::watch::Receiver<Arc<RefreshSnap
     rx.borrow().clone()
 }
 
+struct CountingCloudAgent(AtomicUsize);
+
+#[async_trait]
+impl CloudAgentService for CountingCloudAgent {
+    async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![])
+    }
+
+    async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+struct CountingWorkspaceManager(AtomicUsize);
+
+#[async_trait]
+impl PresentationManager for CountingWorkspaceManager {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![])
+    }
+
+    async fn create_workspace(&self, _config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
+        Err("not implemented".into())
+    }
+
+    async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn delete_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn binding_scope_prefix(&self) -> String {
+        String::new()
+    }
+}
+
+struct BlockingFirstWorkspaceManager {
+    calls: AtomicUsize,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl PresentationManager for BlockingFirstWorkspaceManager {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(vec![])
+    }
+
+    async fn create_workspace(&self, _config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
+        Err("not implemented".into())
+    }
+
+    async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn delete_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn binding_scope_prefix(&self) -> String {
+        String::new()
+    }
+}
+
+#[tokio::test]
+async fn trigger_during_initial_scan_runs_a_follow_up_refresh() {
+    let manager = Arc::new(BlockingFirstWorkspaceManager {
+        calls: AtomicUsize::new(0),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.presentation_managers.insert("workspace", desc("Workspace"), manager.clone());
+    let _handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        Duration::from_secs(60),
+    );
+
+    manager.started.notified().await;
+    _handle.trigger_refresh();
+    manager.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager.calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("trigger received during the initial scan should remain pending");
+}
+
+struct BarrierCheckoutManager(Arc<tokio::sync::Barrier>);
+
+#[async_trait]
+impl CheckoutManager for BarrierCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        self.0.wait().await;
+        Ok(vec![])
+    }
+
+    async fn create_checkout(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        Err("not implemented".to_string())
+    }
+
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str) -> Result<(), String> {
+        Err("not implemented".to_string())
+    }
+}
+
+struct BarrierCloudAgent(Arc<tokio::sync::Barrier>);
+
+#[async_trait]
+impl CloudAgentService for BarrierCloudAgent {
+    async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
+        self.0.wait().await;
+        Ok(vec![])
+    }
+
+    async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn full_refresh_runs_fast_and_slow_tiers_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut registry = ProviderRegistry::new();
+    registry.checkout_managers.insert("checkout", desc("Checkout"), Arc::new(BarrierCheckoutManager(Arc::clone(&barrier))));
+    registry.cloud_agents.insert("cloud", desc("Cloud"), Arc::new(BarrierCloudAgent(Arc::clone(&barrier))));
+
+    let handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        Duration::from_secs(60),
+    );
+    let mut rx = handle.snapshot_rx.clone();
+
+    tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+        .await
+        .expect("fast and slow providers should both start before either finishes");
+    wait_for_snapshot(&mut rx).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn periodic_refresh_uses_fast_and_slow_provider_cadences() {
+    let cloud_agent = Arc::new(CountingCloudAgent(AtomicUsize::new(0)));
+    let workspace_manager = Arc::new(CountingWorkspaceManager(AtomicUsize::new(0)));
+    let mut registry = ProviderRegistry::new();
+    registry.cloud_agents.insert("cloud", desc("Cloud"), cloud_agent.clone());
+    registry.presentation_managers.insert("workspace", desc("Workspace"), workspace_manager.clone());
+
+    let handle = RepoRefreshHandle::spawn_with_schedule(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        RefreshSchedule::without_stagger(Duration::from_secs(10), Duration::from_secs(60)),
+    );
+    let mut rx = handle.snapshot_rx.clone();
+    rx.changed().await.expect("initial full refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 1);
+    assert_eq!(cloud_agent.0.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    rx.changed().await.expect("fast refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 2);
+    assert_eq!(cloud_agent.0.load(Ordering::SeqCst), 1, "cloud agents should wait for the slow cadence");
+
+    handle.trigger_refresh();
+    rx.changed().await.expect("manual full refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 3);
+    assert_eq!(cloud_agent.0.load(Ordering::SeqCst), 2, "manual refresh should include slow providers");
+}
+
+#[tokio::test(start_paused = true)]
+async fn staggered_schedule_delays_the_initial_full_refresh() {
+    let workspace_manager = Arc::new(CountingWorkspaceManager(AtomicUsize::new(0)));
+    let mut registry = ProviderRegistry::new();
+    registry.presentation_managers.insert("workspace", desc("Workspace"), workspace_manager.clone());
+    let schedule = RefreshSchedule {
+        startup_offset: Duration::from_secs(3),
+        fast: RefreshCadence { interval: Duration::from_secs(10), offset: Duration::from_secs(3) },
+        slow: RefreshCadence { interval: Duration::from_secs(60), offset: Duration::from_secs(20) },
+    };
+
+    let handle = RepoRefreshHandle::spawn_with_schedule(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        schedule,
+    );
+    let mut rx = handle.snapshot_rx.clone();
+    handle.trigger_refresh();
+    tokio::task::yield_now().await;
+    assert!(!rx.has_changed().expect("refresh sender alive"));
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    assert!(!rx.has_changed().expect("refresh sender alive"));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    rx.changed().await.expect("staggered initial refresh");
+    tokio::task::yield_now().await;
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn repo_refresh_schedules_have_stable_distinct_offsets() {
+    let fast = Duration::from_secs(10);
+    let slow = Duration::from_secs(60);
+    let first = RefreshSchedule::for_repo(Path::new("/repos/first"), fast, slow);
+    let first_again = RefreshSchedule::for_repo(Path::new("/repos/first"), fast, slow);
+    let second = RefreshSchedule::for_repo(Path::new("/repos/second"), fast, slow);
+
+    assert_eq!(first.fast.offset, first_again.fast.offset);
+    assert_eq!(first.slow.offset, first_again.slow.offset);
+    assert_eq!(first.startup_offset, first_again.startup_offset);
+    assert_ne!(first.fast.offset, second.fast.offset);
+    assert_ne!(first.slow.offset, second.slow.offset);
+    assert_ne!(first.startup_offset, second.startup_offset);
+    assert!(first.startup_offset < Duration::from_secs(1));
+    assert!(first.fast.offset < fast);
+    assert!(first.slow.offset < slow);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_refresh_preserves_slow_provider_errors_and_health() {
+    let mut registry = ProviderRegistry::new();
+    registry.cloud_agents.insert("cloud", desc("Cloud"), Arc::new(MockCloudAgent::failing("offline")));
+    let handle = RepoRefreshHandle::spawn_with_schedule(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        RefreshSchedule::without_stagger(Duration::from_secs(10), Duration::from_secs(60)),
+    );
+    let mut rx = handle.snapshot_rx.clone();
+    rx.changed().await.expect("initial full refresh");
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    rx.changed().await.expect("fast refresh");
+    let snapshot = rx.borrow().clone();
+
+    assert!(snapshot.errors.iter().any(|error| error.category == "sessions" && error.message == "offline"));
+    assert_eq!(snapshot.provider_health.get(&("cloud_agent", "Cloud".into())), Some(&false));
+}
+
 #[test]
 fn refresh_snapshot_default_is_empty() {
     let snap = RefreshSnapshot::default();
@@ -460,13 +765,13 @@ fn project_attachable_data_populates_sets_and_ids() {
     let store_dir = tempfile::tempdir().expect("tempdir");
     let attachable_store =
         crate::attachable::shared_file_backed_attachable_store(&crate::path_context::DaemonHostPath::new(store_dir.path()));
-    let set_id = {
+    let (set_id, attachable_id) = {
         let mut store = attachable_store.lock().expect("lock store");
         let set_id = store.ensure_terminal_set(
             Some(flotilla_protocol::HostName::local()),
             Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")).into()),
         );
-        let _attachable_id = store.ensure_terminal_attachable(
+        let attachable_id = store.ensure_terminal_attachable(
             &set_id,
             "terminal_pool",
             "shpool",
@@ -483,7 +788,7 @@ fn project_attachable_data_populates_sets_and_ids() {
             object_id: set_id.to_string(),
             external_ref: "ws-1".into(),
         });
-        set_id
+        (set_id, attachable_id)
     };
 
     let mut pd = ProviderData::default();
@@ -508,7 +813,54 @@ fn project_attachable_data_populates_sets_and_ids() {
 
     assert_eq!(pd.attachable_sets.len(), 1);
     assert!(pd.attachable_sets.contains_key(&set_id));
+    assert!(pd.managed_terminals.contains_key(&attachable_id));
     assert_eq!(pd.workspaces.get("ws-1").and_then(|ws| ws.attachable_set_id.as_ref()), Some(&set_id));
+
+    attachable_store.lock().expect("lock store").remove_set(&set_id);
+    project_attachable_data(&mut pd, &registry, &attachable_store);
+    assert!(pd.managed_terminals.is_empty(), "removed terminals must not survive the next projection");
+}
+
+#[test]
+fn project_agent_data_removes_agents_missing_from_the_store() {
+    let attachable_store = test_attachable_store();
+    let agent_store = test_agent_state_store();
+    let host = flotilla_protocol::HostName::local();
+    let checkout = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
+    let (set_id, attachable_id) = {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        let set_id = store.ensure_terminal_set(Some(host), Some(checkout.clone().into()));
+        let attachable_id = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "test",
+            "agent",
+            crate::attachable::TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
+            "claude",
+            ExecutionEnvironmentPath::new("/repo/wt-feat"),
+            flotilla_protocol::TerminalStatus::Running,
+        );
+        (set_id, attachable_id)
+    };
+    agent_store.lock().expect("lock agent store").upsert(attachable_id.clone(), crate::agents::AgentEntry {
+        harness: flotilla_protocol::AgentHarness::ClaudeCode,
+        status: flotilla_protocol::AgentStatus::Active,
+        model: None,
+        session_title: None,
+        session_id: None,
+        last_event_epoch_secs: 0,
+    });
+    let mut pd = ProviderData::default();
+    pd.checkouts.insert(checkout.into(), TestCheckout::new("feat").build());
+
+    project_attachable_data(&mut pd, &ProviderRegistry::new(), &attachable_store);
+    project_agent_data(&mut pd, &agent_store);
+    assert!(pd.attachable_sets.contains_key(&set_id));
+    assert!(pd.agents.contains_key(attachable_id.as_str()));
+
+    agent_store.lock().expect("lock agent store").remove(&attachable_id);
+    project_agent_data(&mut pd, &agent_store);
+    assert!(pd.agents.is_empty(), "removed agents must not survive the next projection");
 }
 
 #[tokio::test]
