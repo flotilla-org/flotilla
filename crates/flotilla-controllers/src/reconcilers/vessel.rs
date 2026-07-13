@@ -536,7 +536,7 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
         return Ok(PlacementStrategy::HostDirect { host_ref: host_ref.clone(), pool: spec.pool.clone() });
     }
 
-    if let Some(docker) = &spec.docker_per_task {
+    if let Some(docker) = &spec.docker_per_vessel {
         return match &docker.checkout {
             DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path } => Ok(PlacementStrategy::DockerWorktreeOnHostAndMount {
                 host_ref: docker.host_ref.clone(),

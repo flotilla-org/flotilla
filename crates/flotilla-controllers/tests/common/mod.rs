@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use flotilla_resources::{
     canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
     Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerPerTaskPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
     TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
@@ -158,7 +158,7 @@ pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace:
         &fixture.name,
         PlacementPolicySpec::builder()
             .pool(fixture.pool)
-            .docker_per_task(DockerPerTaskPlacementPolicySpec {
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: fixture.host_ref,
                 image: fixture.image,
                 default_cwd: fixture.default_cwd,

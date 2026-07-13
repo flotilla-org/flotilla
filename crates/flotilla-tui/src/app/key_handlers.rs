@@ -412,10 +412,10 @@ impl App {
     pub(super) fn open_complete_convoy_work_palette(&mut self, scope: &crate::app::ConvoyScope) {
         let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
         // A vessel-pinned view targets its own vessel, never the shared selection.
-        let Some(task) = scope.vessel.as_ref().or(self.convoys_ui.selected_vessel.as_ref()) else { return };
-        let selected_vessel = task.clone();
+        let Some(vessel) = scope.vessel.as_ref().or(self.convoys_ui.selected_vessel.as_ref()) else { return };
+        let selected_vessel = vessel.clone();
         let completion_target =
-            convoy.vessels.iter().find(|candidate| candidate.name == *task).and_then(|task| task.completion_target.clone());
+            convoy.vessels.iter().find(|candidate| candidate.name == *vessel).and_then(|candidate| candidate.completion_target.clone());
         let Some(completion_target) = completion_target else {
             self.set_status_message(Some(format!("completion unavailable for vessel '{selected_vessel}'")));
             return;
@@ -436,14 +436,14 @@ impl App {
         self.screen.modal_stack.push(Box::new(widget));
     }
 
-    /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
+    /// Dispatch `SelectWorkspace` for the selected vessel's workspace, or show a transient status when none exists yet.
     pub(super) fn attach_selected_convoy_vessel(&mut self, scope: &crate::app::ConvoyScope) {
         // A vessel-pinned view targets its own vessel, never the shared selection.
-        let Some(task) = scope.vessel.clone().or_else(|| self.convoys_ui.selected_vessel.clone()) else { return };
+        let Some(vessel) = scope.vessel.clone().or_else(|| self.convoys_ui.selected_vessel.clone()) else { return };
         let target = self
             .scoped_convoy_summary(scope)
-            .and_then(|convoy| convoy.vessels.iter().find(|t| t.name == task))
-            .map(|task| (task.workspace_ref.clone(), task.host.clone()));
+            .and_then(|convoy| convoy.vessels.iter().find(|candidate| candidate.name == vessel))
+            .map(|candidate| (candidate.workspace_ref.clone(), candidate.host.clone()));
         match target {
             Some((Some(ws_ref), host)) => {
                 // Convoy views carry no repo context; fall back to a
@@ -462,7 +462,7 @@ impl App {
                 };
                 self.proto_commands.push(cmd);
             }
-            _ => self.set_status_message(Some(format!("no workspace yet for vessel '{task}'"))),
+            _ => self.set_status_message(Some(format!("no workspace yet for vessel '{vessel}'"))),
         }
     }
 

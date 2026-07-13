@@ -30,7 +30,7 @@ use flotilla_core::{
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, repo_key, Clone, CloneSpec, Convoy,
-    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, Host,
+    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, TerminalSessionSource,
     Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
@@ -441,7 +441,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
                     &empty_meta(&docker_name),
                     &PlacementPolicySpec::builder()
                         .pool(profile.docker_pool.clone())
-                        .docker_per_task(DockerPerTaskPlacementPolicySpec {
+                        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                             host_ref: profile.host_id.clone(),
                             image: DEFAULT_DOCKER_IMAGE.to_string(),
                             default_cwd: Some("/workspace".to_string()),
