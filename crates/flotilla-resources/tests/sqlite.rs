@@ -1,5 +1,7 @@
 mod common;
 
+use std::{sync::mpsc as std_mpsc, thread, time::Instant};
+
 use chrono::Utc;
 use common::{
     contract::{
@@ -16,17 +18,48 @@ use common::{
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
-    Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_REF_LABEL,
+    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, NoStatusPatch, Resource, ResourceBackend, ResourceError,
+    SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase,
+    WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use rstest::rstest;
+use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SlowResource;
+
+#[derive(Debug, Clone, Deserialize)]
+struct SlowSpec {
+    value: String,
+    #[serde(skip)]
+    serialization_delay: Duration,
+}
+
+impl Serialize for SlowSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        thread::sleep(self.serialization_delay);
+        let mut state = serializer.serialize_struct("SlowSpec", 1)?;
+        state.serialize_field("value", &self.value)?;
+        state.end()
+    }
+}
+
+impl Resource for SlowResource {
+    type Spec = SlowSpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.test", version: "v1", plural: "slowresources", kind: "SlowResource" };
 }
 
 #[rstest]
@@ -159,6 +192,88 @@ async fn objects_and_resource_versions_survive_restart() {
         .await
         .expect("update should succeed after restart");
     assert_eq!(updated.metadata.resource_version, "2");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delayed_sqlite_open_does_not_stall_tokio_executor() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+
+    let blocker_path = path.clone();
+    let (locked_tx, locked_rx) = std_mpsc::channel();
+    let blocker = thread::spawn(move || {
+        let connection = rusqlite::Connection::open(blocker_path).expect("blocking connection should open");
+        connection.execute_batch("CREATE TABLE startup_lock (value INTEGER); BEGIN EXCLUSIVE").expect("exclusive transaction should begin");
+        locked_tx.send(()).expect("lock acquisition should be reported");
+        thread::sleep(Duration::from_millis(400));
+        connection.execute_batch("ROLLBACK").expect("exclusive transaction should roll back");
+    });
+    locked_rx.recv().expect("blocking transaction should start");
+
+    let started = Instant::now();
+    let heartbeat = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        started.elapsed()
+    });
+    SqliteBackend::open_async(&path).await.expect("sqlite backend should open after lock release");
+
+    let heartbeat_delay = heartbeat.await.expect("heartbeat should complete");
+    assert!(heartbeat_delay < Duration::from_millis(150), "Tokio heartbeat was delayed by {heartbeat_delay:?}");
+    blocker.join().expect("blocking connection thread should finish");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn slow_sqlite_crud_does_not_stall_tokio_executor() {
+    let resolver = backend().using::<SlowResource>("flotilla");
+    let started = Instant::now();
+    let heartbeat = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        started.elapsed()
+    });
+
+    resolver
+        .create(&resource_meta().name("alpha").call(), &SlowSpec {
+            value: "alpha".to_string(),
+            serialization_delay: Duration::from_millis(200),
+        })
+        .await
+        .expect("slow create should succeed");
+
+    let heartbeat_delay = heartbeat.await.expect("heartbeat should complete");
+    assert!(heartbeat_delay < Duration::from_millis(150), "Tokio heartbeat was delayed by {heartbeat_delay:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_create_and_watch_delivers_the_committed_version_once() {
+    let resolver = backend().using::<SlowResource>("flotilla");
+    let create_resolver = resolver.clone();
+    let create = tokio::spawn(async move {
+        create_resolver
+            .create(&resource_meta().name("alpha").call(), &SlowSpec {
+                value: "alpha".to_string(),
+                serialization_delay: Duration::from_millis(200),
+            })
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let watch_resolver = resolver.clone();
+    let watch = tokio::spawn(async move { watch_resolver.watch(WatchStart::FromVersion("0".to_string())).await });
+    tokio::task::yield_now().await;
+    thread::sleep(Duration::from_millis(450));
+
+    create.await.expect("create task should complete").expect("create should succeed");
+    let mut watch = watch.await.expect("watch task should complete").expect("watch should start");
+    let event = timeout(Duration::from_secs(1), watch.next())
+        .await
+        .expect("watch should replay the create")
+        .expect("watch should remain open")
+        .expect("event should decode");
+    assert!(matches!(event, WatchEvent::Added(object) if object.metadata.name == "alpha"));
+    assert!(
+        timeout(Duration::from_millis(50), watch.next()).await.is_err(),
+        "the committed version must not be emitted by both replay and live notification"
+    );
 }
 
 #[tokio::test]

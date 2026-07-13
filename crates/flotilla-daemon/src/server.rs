@@ -99,12 +99,17 @@ fn build_peer_manager(daemon: &Arc<InProcessDaemon>, config: &ConfigStore) -> Re
     Ok(Arc::new(Mutex::new(peer_manager)))
 }
 
-fn build_embedded_resource_backend(config: &ConfigStore) -> Result<ResourceBackend, String> {
+async fn build_embedded_resource_backend(config: &ConfigStore) -> Result<ResourceBackend, String> {
     let path = config.state_dir().as_path().join("resources.sqlite");
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| format!("create embedded resource store directory {}: {err}", parent.display()))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| format!("create embedded resource store directory {}: {err}", parent.display()))?;
     }
-    SqliteBackend::open(&path).map(ResourceBackend::Sqlite).map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
+    SqliteBackend::open_async(&path)
+        .await
+        .map(ResourceBackend::Sqlite)
+        .map_err(|err| format!("open embedded resource store {}: {err}", path.display()))
 }
 
 pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &ConfigStore) -> Result<tokio::task::JoinHandle<()>, String> {
@@ -187,7 +192,7 @@ impl DaemonServer {
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let resource_backend = build_embedded_resource_backend(&config)?;
+        let resource_backend = build_embedded_resource_backend(&config).await?;
         let daemon =
             InProcessDaemon::new_with_resource_backend(repo_paths, Arc::clone(&config), discovery, host_name.clone(), resource_backend)
                 .await;
