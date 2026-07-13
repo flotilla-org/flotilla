@@ -19,14 +19,9 @@ pub async fn reconcile_checkouts(
     repo_identity: &RepoIdentity,
     providers: &ProviderData,
 ) -> Result<(), ResourceError> {
-    let canonical_repo = canonical_repo_url(repo_identity).map_err(ResourceError::invalid)?;
-    let repo_key = repo_key(&canonical_repo);
-    let repo_ref = descriptive_repo_slug(&canonical_repo);
+    let scope = observed_checkout_scope(repo_identity)?;
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
-    let selector = BTreeMap::from([
-        (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Observed.as_label_value().to_string()),
-        (REPO_KEY_LABEL.to_string(), repo_key.clone()),
-    ]);
+    let selector = scope.selector();
     let mut existing: HashMap<_, _> = checkouts
         .list_matching_labels(&selector)
         .await?
@@ -36,12 +31,12 @@ pub async fn reconcile_checkouts(
         .collect();
 
     for (path, checkout) in &providers.checkouts {
-        let name = observed_checkout_name(&repo_key, path);
-        let meta = observed_checkout_meta(&name, &repo_key, &repo_ref);
+        let name = observed_checkout_name(&scope.repo_key, path);
+        let meta = observed_checkout_meta(&name, &scope.repo_key, &scope.repo_ref);
         let spec = ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: checkout.branch.clone(),
             path: path.path.to_string_lossy().into_owned(),
-            repo_ref: repo_ref.clone(),
+            repo_ref: scope.repo_ref.clone(),
             is_main: checkout.is_main,
         });
 
@@ -61,6 +56,45 @@ pub async fn reconcile_checkouts(
     }
 
     Ok(())
+}
+
+/// Delete the Checkout facts previously published for one local repository.
+///
+/// Adopted and managed Checkouts are outside this projection's lifecycle, so
+/// cleanup is restricted to resources carrying the observed authority label.
+pub async fn delete_observed_checkouts(
+    backend: &ResourceBackend,
+    namespace: &str,
+    repo_identity: &RepoIdentity,
+) -> Result<(), ResourceError> {
+    let scope = observed_checkout_scope(repo_identity)?;
+    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
+    let selector = scope.selector();
+
+    for checkout in checkouts.list_matching_labels(&selector).await?.items {
+        checkouts.delete(&checkout.metadata.name).await?;
+    }
+
+    Ok(())
+}
+
+struct ObservedCheckoutScope {
+    repo_key: String,
+    repo_ref: String,
+}
+
+impl ObservedCheckoutScope {
+    fn selector(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Observed.as_label_value().to_string()),
+            (REPO_KEY_LABEL.to_string(), self.repo_key.clone()),
+        ])
+    }
+}
+
+fn observed_checkout_scope(repo_identity: &RepoIdentity) -> Result<ObservedCheckoutScope, ResourceError> {
+    let canonical_repo = canonical_repo_url(repo_identity).map_err(ResourceError::invalid)?;
+    Ok(ObservedCheckoutScope { repo_key: repo_key(&canonical_repo), repo_ref: descriptive_repo_slug(&canonical_repo) })
 }
 
 fn canonical_repo_url(identity: &RepoIdentity) -> Result<String, String> {

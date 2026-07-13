@@ -892,6 +892,9 @@ pub struct InProcessDaemon {
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
     observed_resource_backend: ResourceBackend,
+    /// Serializes observed Checkout publication with repository removal so a
+    /// refresh captured before untracking cannot recreate deleted resources.
+    observed_checkout_reconciliation: Mutex<()>,
     aggregator_projection_state: RwLock<AggregatorProjectionState>,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
@@ -1030,6 +1033,7 @@ impl InProcessDaemon {
             daemon_socket_path: RwLock::new(None),
             resource_backend,
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
+            observed_checkout_reconciliation: Mutex::new(()),
             aggregator_projection_state: RwLock::new(AggregatorProjectionState::new()),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
@@ -1693,6 +1697,11 @@ impl InProcessDaemon {
                 warn!(repo = %identity.path, "skipping observed checkout reconciliation after checkout discovery failed");
                 continue;
             }
+            let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+            let has_local_root = self.repos.read().await.get(identity).is_some_and(|state| !state.local_paths().is_empty());
+            if !has_local_root {
+                continue;
+            }
             if let Err(error) =
                 crate::observed_resources::reconcile_checkouts(&self.observed_resource_backend, &namespace, identity, local_providers).await
             {
@@ -2018,14 +2027,6 @@ impl InProcessDaemon {
     pub async fn add_repo(&self, path: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
         let (path, resolved_from) = self.normalize_repo_path(path).await;
 
-        // Check if already tracked (under read lock for fast path)
-        {
-            let identities = self.path_identities.read().await;
-            if identities.contains_key(&path) {
-                return Ok((path, resolved_from));
-            }
-        }
-
         // Create the model outside the lock (spawns provider detection and refresh)
         let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
             &self.environment_manager,
@@ -2040,6 +2041,19 @@ impl InProcessDaemon {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
         let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+        if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
+            if tracked_identity == identity {
+                return Ok((path, resolved_from));
+            }
+            if let Err(error) = self.remove_repo(&path).await {
+                // Another add_repo call may have removed or migrated this path
+                // after our identity lookup. Continue through the idempotent
+                // insertion path unless it is still tracked elsewhere.
+                if self.tracked_repo_identity_for_path(&path).await.is_some_and(|current| current != identity) {
+                    return Err(error);
+                }
+            }
+        }
         let slug = repo_slug.clone();
         let mut model = RepoModel::new(
             path.clone(),
@@ -2111,8 +2125,10 @@ impl InProcessDaemon {
     pub async fn remove_repo(&self, path: &Path) -> Result<(), String> {
         let path = path.to_path_buf();
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
+        let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
 
         let mut removed_identity = false;
+        let removed_final_local_root;
         let mut new_preferred_path = None;
         {
             let mut repos = self.repos.write().await;
@@ -2123,6 +2139,12 @@ impl InProcessDaemon {
             let previous_preferred = state.preferred_path().to_path_buf();
             if !state.remove_root(&path) {
                 return Err(format!("repo not tracked: {}", path.display()));
+            }
+            removed_final_local_root = state.local_paths().is_empty();
+            if !removed_final_local_root {
+                for root in state.roots.iter().filter(|root| root.is_local) {
+                    root.model.refresh_handle.trigger_refresh();
+                }
             }
             if state.roots.is_empty() {
                 repos.remove(&repo_identity);
@@ -2141,6 +2163,16 @@ impl InProcessDaemon {
             drop(pp);
             self.peer_overlay_versions.write().await.remove(&repo_identity);
         }
+
+        if removed_final_local_root {
+            let namespace = self.provisioning_namespace().await;
+            if let Err(error) =
+                crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, &repo_identity).await
+            {
+                warn!(repo = %repo_identity.path, %error, "failed to delete observed checkouts for untracked repo");
+            }
+        }
+        drop(observed_reconciliation);
 
         // Persist to config
         self.config.remove_repo(&ExecutionEnvironmentPath::new(&path));
@@ -3179,11 +3211,12 @@ impl InProcessDaemon {
             let result = match convoys.get(convoy).await {
                 Ok(current) => match current.status.as_ref() {
                     None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },
-                    Some(status) if !status.work.contains_key(work) => {
-                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") }
-                    }
-                    Some(_) => {
-                        match apply_resource_status_patch(
+                    Some(status) => match status.work.get(work) {
+                        None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") },
+                        Some(state) if state.phase.is_terminal() => {
+                            flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} work {work} is already terminal") }
+                        }
+                        Some(_) => match apply_resource_status_patch(
                             &convoys,
                             convoy,
                             &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
@@ -3192,8 +3225,8 @@ impl InProcessDaemon {
                         {
                             Ok(_) => flotilla_protocol::CommandValue::Ok,
                             Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-                        }
-                    }
+                        },
+                    },
                 },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
             };
