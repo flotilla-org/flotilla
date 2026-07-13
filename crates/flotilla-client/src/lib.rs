@@ -320,6 +320,13 @@ pub async fn connect_or_spawn(
     // handshake failure means a daemon is listening but is incompatible or
     // malformed; surface that error instead of treating the socket as stale
     // and silently spawning a second daemon over the live process.
+    //
+    // Deliberately no retry at this probe, unlike the two probes below: those
+    // sit in windows where a *just-spawned* daemon is expected and an error is
+    // probably a startup race, while a steady-state daemon that fails a
+    // 5s-bounded handshake is a condition the caller should hear about
+    // immediately — this is the interactive path, and retries would only
+    // delay an error the user has to act on anyway.
     if let Some(daemon) = connect_existing_stateful(socket_path).await? {
         return Ok(daemon);
     }
@@ -405,7 +412,9 @@ pub async fn connect_or_spawn(
         spawn_daemon(config_dir, config_dir_override, socket_override)?;
     }
 
-    // Poll for connection with a 10s deadline. Handshake errors here are
+    // Poll for connection with a 10s deadline (soft: the deadline is checked
+    // between probes, and a probe can block up to HELLO_HANDSHAKE_TIMEOUT, so
+    // the true worst-case is deadline + handshake timeout). Handshake errors here are
     // retried rather than propagated: the daemon on this socket was spawned by
     // us moments ago, so an error is far more likely a startup race (accepted
     // before the serve loop is up) than a genuine incompatibility. The last
