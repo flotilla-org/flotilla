@@ -26,14 +26,15 @@ use flotilla_protocol::{
     StatusResponse, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, terminal_session_attach_target,
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
-    Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, Resource,
-    ResourceBackend, ResourceError, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
+    external_patches as convoy_external_patches, terminal_session_attach_target, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
+    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment,
+    InMemoryBackend, InputMeta, InputValue, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+    Project, ProjectRepositorySpec, ProjectSpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
+    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -3238,26 +3239,25 @@ impl InProcessDaemon {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let result = match convoys.get(convoy).await {
-                Ok(current) => match current.status.as_ref() {
-                    None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },
-                    Some(status) => match status.work.get(work) {
-                        None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") },
-                        Some(state) if state.phase.is_terminal() => {
-                            flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} work {work} is already terminal") }
-                        }
-                        Some(_) => match apply_resource_status_patch(
-                            &convoys,
-                            convoy,
-                            &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
-                        )
-                        .await
-                        {
-                            Ok(_) => flotilla_protocol::CommandValue::Ok,
-                            Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-                        },
-                    },
+            let check_work_is_completable = |current: &ResourceObject<ResourceConvoy>| match current.status.as_ref() {
+                None => Err(ResourceError::other(format!("convoy {convoy} has no status"))),
+                Some(status) => match status.work.get(work) {
+                    None => Err(ResourceError::other(format!("convoy {convoy} does not contain work {work}"))),
+                    Some(state) if state.phase.is_terminal() => {
+                        Err(ResourceError::other(format!("convoy {convoy} work {work} is already terminal")))
+                    }
+                    Some(_) => Ok(()),
                 },
+            };
+            let result = match apply_resource_status_patch_checked(
+                &convoys,
+                convoy,
+                &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
+                check_work_is_completable,
+            )
+            .await
+            {
+                Ok(_) => flotilla_protocol::CommandValue::Ok,
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
             };
             self.finish_context_free_command(id, empty_identity, result);

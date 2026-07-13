@@ -58,7 +58,7 @@ pub use resource::{
 };
 pub use retention::{EventRetention, ResourceStoreDiagnostics, ResourceStoreWarning};
 pub use sqlite::SqliteBackend;
-pub use status_patch::{apply_status_patch, NoStatusPatch, StatusPatch};
+pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
     terminal_session_attach_target, CrewSessionStatus, InnerCommandStatus, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession, TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,
