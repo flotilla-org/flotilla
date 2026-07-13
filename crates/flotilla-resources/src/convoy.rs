@@ -116,6 +116,12 @@ pub enum WorkPhase {
     Cancelled,
 }
 
+impl WorkPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Failed | Self::Cancelled)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WorkCompletionAuthority {
     #[default]

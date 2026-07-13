@@ -376,10 +376,6 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
-    pub async fn apply_convoy_event(&mut self, event: WatchEvent<Convoy>) {
-        self.apply_convoy_event_from(LocalSource::Durable, event).await;
-    }
-
     async fn apply_convoy_event_from(&mut self, source: LocalSource, event: WatchEvent<Convoy>) {
         match event {
             WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) => {
@@ -456,10 +452,6 @@ impl Aggregator {
             sessions.into_iter().map(|session| ((session.metadata.namespace.clone(), session.metadata.name.clone()), session)).collect();
         self.sessions_by_source.insert(source, replacement);
         self.rebuild_session_projection().await;
-    }
-
-    pub async fn apply_session_event(&mut self, event: WatchEvent<TerminalSession>) {
-        self.apply_session_event_from(LocalSource::Durable, event).await;
     }
 
     async fn apply_session_event_from(&mut self, source: LocalSource, event: WatchEvent<TerminalSession>) {
@@ -690,6 +682,7 @@ impl Aggregator {
             .depends_on(definition.depends_on.clone())
             .host(self.local_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
+            .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .build()
     }
 }
@@ -765,9 +758,10 @@ mod tests {
         time::Duration,
     };
 
+    use chrono::Utc;
     use flotilla_protocol::result_set::ResultSet;
     use flotilla_resources::{
-        ConvoySpec, InMemoryBackend, InputMeta, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend,
+        ConvoySpec, InMemoryBackend, InputMeta, ObjectMeta, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend,
         TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
@@ -996,6 +990,72 @@ mod tests {
             if matches_query {
                 return event;
             }
+        }
+    }
+
+    #[bon::builder]
+    fn convoy_with_work(convoy_phase: ResourceConvoyPhase, work_phase: Option<ResourceWorkPhase>) -> ResourceObject<Convoy> {
+        let definition = VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build();
+        let work = work_phase.map(|phase| ("implement".to_string(), WorkState::builder().phase(phase).build())).into_iter().collect();
+        ResourceObject {
+            metadata: ObjectMeta {
+                name: "convoy-a".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+            },
+            spec: ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            status: Some(ConvoyStatus {
+                phase: convoy_phase,
+                workflow_snapshot: Some(WorkflowSnapshot { vessels: vec![definition] }),
+                work,
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn emitted_vessel(convoy: ResourceObject<Convoy>) -> VesselRow {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(1);
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), tx);
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+
+        let DaemonEvent::ResultSet(result_set) = rx.recv().await.expect("initial result set") else {
+            panic!("expected result set");
+        };
+        let rows = result_set.rows.as_convoys().expect("convoy rows");
+        let convoy = rows.first().expect("convoy row");
+        convoy.vessels.first().expect("vessel row").clone()
+    }
+
+    #[tokio::test]
+    async fn terminal_work_is_not_completable() {
+        for phase in [ResourceWorkPhase::Complete, ResourceWorkPhase::Failed, ResourceWorkPhase::Cancelled] {
+            let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
+
+            assert!(!vessel.complete_work, "{phase:?} work must not expose the completion override");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_missing_from_status_is_not_completable() {
+        let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).call()).await;
+
+        assert!(!vessel.complete_work);
+    }
+
+    #[tokio::test]
+    async fn non_terminal_work_is_completable() {
+        for phase in [ResourceWorkPhase::Pending, ResourceWorkPhase::Ready, ResourceWorkPhase::Launching, ResourceWorkPhase::Running] {
+            let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
+
+            assert!(vessel.complete_work, "{phase:?} work must expose the completion override");
         }
     }
 

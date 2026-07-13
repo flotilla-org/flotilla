@@ -114,6 +114,23 @@ async fn wait_for_command_result(events: &mut tokio::sync::broadcast::Receiver<D
     .expect("timeout waiting for command result")
 }
 
+async fn force_complete_work(daemon: &InProcessDaemon, events: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> CommandValue {
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyWorkForceComplete {
+                convoy: "convoy-a".to_string(),
+                work: "implement".to_string(),
+                message: Some("done".to_string()),
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+    wait_for_command_result(events, command_id).await
+}
+
 async fn new_attach_test_daemon(config_base: &Path) -> Arc<InProcessDaemon> {
     new_attach_test_daemon_with_pool(config_base).await.0
 }
@@ -2208,37 +2225,24 @@ async fn convoy_completion_command_updates_convoy_task_status() {
         .expect("convoy status update should succeed");
 
     let mut events = daemon.subscribe();
-    let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyWorkForceComplete {
-                convoy: "convoy-a".to_string(),
-                work: "implement".to_string(),
-                message: Some("done".to_string()),
-            },
-        })
-        .await
-        .expect("execute should return a command id");
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match events.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
-                Ok(_) => {}
-                Err(err) => panic!("unexpected event error: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for command result");
+    let result = force_complete_work(&daemon, &mut events).await;
 
     assert_eq!(result, CommandValue::Ok);
     let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status should exist");
     assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
     assert_eq!(status.work["implement"].message.as_deref(), Some("done"));
+
+    for phase in [WorkPhase::Complete, WorkPhase::Failed, WorkPhase::Cancelled] {
+        let current = convoys.get("convoy-a").await.expect("convoy get should succeed");
+        let mut status = current.status.expect("convoy status should exist");
+        status.work.get_mut("implement").expect("implement work").phase = phase;
+        convoys.update_status("convoy-a", &current.metadata.resource_version, &status).await.expect("convoy status update should succeed");
+
+        assert_eq!(force_complete_work(&daemon, &mut events).await, CommandValue::Error {
+            message: "convoy convoy-a work implement is already terminal".to_string()
+        });
+    }
 }
 
 #[tokio::test]

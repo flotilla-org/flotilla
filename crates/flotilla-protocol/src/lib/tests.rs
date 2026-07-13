@@ -570,6 +570,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         .crew(vec![CrewMemberSummary { role: "coder".into(), command_preview: "fix the bug".into() }])
         .host(HostName::new("local"))
         .attach("ws-1".to_string())
+        .complete_work(true)
         .build();
     let review = VesselRow::builder()
         .resource(review_ref)
@@ -596,7 +597,8 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
     assert_eq!(rows[0].vessels[1].depends_on, vec![rows[0].vessels[0].name.clone()]);
     assert!(rows[0].vessels[0].attach.is_some(), "presentation join surfaces as attach capability");
     assert!(rows[0].vessels[1].attach.is_none());
-    assert!(rows[0].vessels[1].complete_work);
+    assert!(rows[0].vessels[0].complete_work);
+    assert!(!rows[0].vessels[1].complete_work, "capabilities default closed");
     assert_eq!(StreamKey::Query { query: QueryId::Convoys }, StreamKey::Query { query: result_set.query() });
 }
 
