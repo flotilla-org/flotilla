@@ -1888,7 +1888,14 @@ async fn trigger_refresh_and_recv(
     rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
 ) -> DaemonEvent {
     daemon.refresh(&RepoSelector::Path(repo.to_path_buf())).await.expect("refresh should succeed");
-    recv_event(rx).await
+    loop {
+        let event = recv_event(rx).await;
+        match &event {
+            DaemonEvent::RepoSnapshot(snapshot) if snapshot.repo.as_deref() == Some(repo) => return event,
+            DaemonEvent::RepoDelta(delta) if delta.repo.as_deref() == Some(repo) => return event,
+            _ => {}
+        }
+    }
 }
 
 #[tokio::test]
@@ -1909,6 +1916,14 @@ async fn daemon_broadcasts_snapshots() {
         }
         other => panic!("expected RepoSnapshot or RepoDelta, got {:?}", other),
     }
+
+    assert!(
+        matches!(
+            recv_event(&mut rx).await,
+            DaemonEvent::RepoRefreshCompleted { repo: Some(completed_repo), .. } if completed_repo == repo
+        ),
+        "repo data event should be followed by its refresh completion marker"
+    );
 }
 
 #[tokio::test]
@@ -2988,6 +3003,53 @@ async fn duplicate_local_roots_share_identity_but_remain_tracked() {
     assert_eq!(repos[0].path.as_deref(), Some(repo_b.as_path()), "remaining root should become the preferred path");
     assert!(daemon.tracked_repo_identity_for_path(&repo_a).await.is_none());
     assert_eq!(daemon.tracked_repo_identity_for_path(&repo_b).await, Some(identity_b));
+}
+
+#[tokio::test]
+async fn only_preferred_root_refresh_emits_completion_for_shared_identity() {
+    let (_temp, repo_a, repo_b, daemon) = daemon_for_duplicate_fake_repos().await;
+    let identity = daemon.tracked_repo_identity_for_path(&repo_a).await.expect("shared repo identity");
+    let mut events = daemon.subscribe();
+
+    daemon.trigger_root_refresh_for_test(&repo_a).await.expect("settle preferred root");
+    loop {
+        if matches!(
+            recv_event(&mut events).await,
+            DaemonEvent::RepoRefreshCompleted { repo_identity, .. } if repo_identity == identity
+        ) {
+            break;
+        }
+    }
+    while events.try_recv().is_ok() {}
+
+    daemon.trigger_root_refresh_for_test(&repo_b).await.expect("refresh non-preferred root");
+    loop {
+        match recv_event(&mut events).await {
+            DaemonEvent::RepoSnapshot(snapshot) if snapshot.repo_identity == identity => break,
+            DaemonEvent::RepoDelta(delta) if delta.repo_identity == identity => break,
+            _ => {}
+        }
+    }
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, DaemonEvent::RepoRefreshCompleted { .. }),
+            "non-preferred root refresh should not emit a logical repo completion: {event:?}"
+        );
+    }
+
+    daemon.trigger_root_refresh_for_test(&repo_a).await.expect("refresh preferred root");
+    loop {
+        match recv_event(&mut events).await {
+            DaemonEvent::RepoSnapshot(snapshot) if snapshot.repo_identity == identity => break,
+            DaemonEvent::RepoDelta(delta) if delta.repo_identity == identity => break,
+            _ => {}
+        }
+    }
+    assert!(matches!(
+        recv_event(&mut events).await,
+        DaemonEvent::RepoRefreshCompleted { repo_identity, repo: Some(path) }
+            if repo_identity == identity && path == repo_a
+    ));
 }
 
 // TODO(task-9): Migrate to fake VCS — this test depends on real git for two reasons:

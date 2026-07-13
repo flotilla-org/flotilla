@@ -319,6 +319,9 @@ impl HighFidelityHarness {
             DaemonEvent::PeerStatusChanged { node_id, status } => format!("peer_status node_id={node_id} status={status:?}"),
             DaemonEvent::RepoSnapshot(snap) => format!("repo_snapshot repo={} seq={}", fmt_optional_path(snap.repo.as_deref()), snap.seq),
             DaemonEvent::RepoDelta(delta) => format!("repo_delta repo={} seq={}", fmt_optional_path(delta.repo.as_deref()), delta.seq),
+            DaemonEvent::RepoRefreshCompleted { repo, .. } => {
+                format!("repo_refresh_completed repo={}", fmt_optional_path(repo.as_deref()))
+            }
             DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
             DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
             DaemonEvent::HostRemoved { environment_id, .. } => format!("host_removed {environment_id}"),
@@ -434,6 +437,9 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         }
         DaemonEvent::RepoDelta(delta) => {
             format!("{source}: repo_delta repo={} seq={}", fmt_optional_path(delta.repo.as_deref()), delta.seq)
+        }
+        DaemonEvent::RepoRefreshCompleted { repo, .. } => {
+            format!("{source}: repo_refresh_completed repo={}", fmt_optional_path(repo.as_deref()))
         }
         DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
         DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),

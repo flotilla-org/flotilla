@@ -11,6 +11,36 @@ use flotilla_protocol::{
 
 use crate::widgets::section_table::IssueRow;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingIssueFetch {
+    Page(u32),
+    PageThenRefresh(u32),
+    RefreshFirstPage,
+    RefreshFirstPageAgain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IssueRefreshRequest {
+    Started,
+    Deferred,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IssueFetchCompletion {
+    Ignored,
+    Applied,
+    AppliedAndRefresh,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IssueFetchFailure {
+    Ignored,
+    Initial,
+    Existing,
+    ExistingAndRefresh,
+}
+
 /// State for a single paginated query — tracks accumulated items and next page.
 pub struct IssuePagingState {
     pub params: IssueQuery,
@@ -18,21 +48,111 @@ pub struct IssuePagingState {
     pub next_page: u32,
     pub total: Option<u32>,
     pub has_more: bool,
-    pub fetch_pending: bool,
+    pub pending_fetch: Option<PendingIssueFetch>,
 }
 
 impl IssuePagingState {
     pub fn new(params: IssueQuery) -> Self {
-        Self { params, items: Vec::new(), next_page: 1, total: None, has_more: true, fetch_pending: false }
+        Self { params, items: Vec::new(), next_page: 1, total: None, has_more: true, pending_fetch: None }
     }
 
-    /// Append a fetched page of results and update pagination metadata.
-    pub fn append_page(&mut self, page: IssueResultPage) {
+    fn append_page(&mut self, page: IssueResultPage) {
         self.total = page.total;
         self.has_more = page.has_more;
-        self.fetch_pending = false;
         self.next_page += 1;
         self.items.extend(page.items);
+    }
+
+    fn replace_first_page(&mut self, page: IssueResultPage) {
+        self.items = page.items;
+        self.total = page.total;
+        self.has_more = page.has_more;
+        self.next_page = 2;
+    }
+
+    pub fn fetch_pending(&self) -> bool {
+        self.pending_fetch.is_some()
+    }
+
+    pub fn begin_page_fetch(&mut self, page: u32) -> bool {
+        if self.fetch_pending() || self.next_page != page {
+            return false;
+        }
+        self.pending_fetch = Some(PendingIssueFetch::Page(page));
+        true
+    }
+
+    pub fn request_refresh(&mut self) -> IssueRefreshRequest {
+        if self.next_page == 1 {
+            return IssueRefreshRequest::Ignored;
+        }
+        match self.pending_fetch {
+            None => {
+                self.pending_fetch = Some(PendingIssueFetch::RefreshFirstPage);
+                IssueRefreshRequest::Started
+            }
+            Some(PendingIssueFetch::Page(page)) => {
+                self.pending_fetch = Some(PendingIssueFetch::PageThenRefresh(page));
+                IssueRefreshRequest::Deferred
+            }
+            Some(PendingIssueFetch::RefreshFirstPage) => {
+                self.pending_fetch = Some(PendingIssueFetch::RefreshFirstPageAgain);
+                IssueRefreshRequest::Deferred
+            }
+            Some(PendingIssueFetch::PageThenRefresh(_) | PendingIssueFetch::RefreshFirstPageAgain) => IssueRefreshRequest::Deferred,
+        }
+    }
+
+    pub fn complete_fetch(&mut self, requested_page: u32, page: IssueResultPage) -> IssueFetchCompletion {
+        match self.pending_fetch {
+            Some(PendingIssueFetch::Page(page_number)) if page_number == requested_page => {
+                self.append_page(page);
+                self.pending_fetch = None;
+                IssueFetchCompletion::Applied
+            }
+            Some(PendingIssueFetch::PageThenRefresh(page_number)) if page_number == requested_page => {
+                self.append_page(page);
+                self.pending_fetch = Some(PendingIssueFetch::RefreshFirstPage);
+                IssueFetchCompletion::AppliedAndRefresh
+            }
+            Some(PendingIssueFetch::RefreshFirstPage) if requested_page == 1 => {
+                self.replace_first_page(page);
+                self.pending_fetch = None;
+                IssueFetchCompletion::Applied
+            }
+            Some(PendingIssueFetch::RefreshFirstPageAgain) if requested_page == 1 => {
+                self.replace_first_page(page);
+                self.pending_fetch = Some(PendingIssueFetch::RefreshFirstPage);
+                IssueFetchCompletion::AppliedAndRefresh
+            }
+            _ => IssueFetchCompletion::Ignored,
+        }
+    }
+
+    pub fn fail_fetch(&mut self, requested_page: u32) -> IssueFetchFailure {
+        match self.pending_fetch {
+            Some(PendingIssueFetch::Page(page_number)) if page_number == requested_page => {
+                self.pending_fetch = None;
+                if requested_page == 1 && self.items.is_empty() {
+                    IssueFetchFailure::Initial
+                } else {
+                    IssueFetchFailure::Existing
+                }
+            }
+            Some(PendingIssueFetch::PageThenRefresh(page_number)) if page_number == requested_page => {
+                self.pending_fetch = Some(PendingIssueFetch::RefreshFirstPage);
+                IssueFetchFailure::ExistingAndRefresh
+            }
+            Some(PendingIssueFetch::RefreshFirstPage) if requested_page == 1 => {
+                self.pending_fetch = None;
+                IssueFetchFailure::Existing
+            }
+            Some(PendingIssueFetch::RefreshFirstPageAgain) if requested_page == 1 => {
+                self.pending_fetch = Some(PendingIssueFetch::RefreshFirstPage);
+                IssueFetchFailure::ExistingAndRefresh
+            }
+            _ => IssueFetchFailure::Ignored,
+        }
     }
 
     /// Convert the paging state's issue items into native `IssueRow` values
@@ -68,6 +188,60 @@ impl IssueViewState {
         } else {
             self.default.as_mut()
         }
+    }
+
+    fn matching_mut(&mut self, params: &IssueQuery) -> Option<&mut IssuePagingState> {
+        if params.search.is_some() {
+            if self.search_query != params.search {
+                return None;
+            }
+            self.search.as_mut()
+        } else {
+            self.default.as_mut()
+        }
+    }
+
+    pub fn begin_page_fetch(&mut self, params: &IssueQuery, page: u32) -> bool {
+        let target = if params.search.is_some() {
+            if self.search_query != params.search {
+                return false;
+            }
+            &mut self.search
+        } else {
+            &mut self.default
+        };
+        if target.is_none() {
+            if page != 1 {
+                return false;
+            }
+            *target = Some(IssuePagingState::new(params.clone()));
+        }
+        let Some(state) = target.as_mut() else { return false };
+        state.params == *params && state.begin_page_fetch(page)
+    }
+
+    pub fn request_refresh(&mut self, params: &IssueQuery) -> IssueRefreshRequest {
+        let Some(state) = self.matching_mut(params) else { return IssueRefreshRequest::Ignored };
+        if state.params != *params {
+            return IssueRefreshRequest::Ignored;
+        }
+        state.request_refresh()
+    }
+
+    pub fn complete_fetch(&mut self, params: &IssueQuery, requested_page: u32, page: IssueResultPage) -> IssueFetchCompletion {
+        let Some(state) = self.matching_mut(params) else { return IssueFetchCompletion::Ignored };
+        if state.params != *params {
+            return IssueFetchCompletion::Ignored;
+        }
+        state.complete_fetch(requested_page, page)
+    }
+
+    pub fn fail_fetch(&mut self, params: &IssueQuery, requested_page: u32) -> IssueFetchFailure {
+        let Some(state) = self.matching_mut(params) else { return IssueFetchFailure::Ignored };
+        if state.params != *params {
+            return IssueFetchFailure::Ignored;
+        }
+        state.fail_fetch(requested_page)
     }
 
     /// Convert the active listing's items into native `IssueRow` values for display.
@@ -116,7 +290,7 @@ mod tests {
             next_page: 2,
             total: Some(1),
             has_more: false,
-            fetch_pending: false,
+            pending_fetch: None,
         });
         let active = state.active().expect("should have active");
         assert_eq!(active.items.len(), 1);
@@ -132,7 +306,7 @@ mod tests {
             next_page: 2,
             total: Some(1),
             has_more: false,
-            fetch_pending: false,
+            pending_fetch: None,
         });
         state.search = Some(IssuePagingState {
             params: IssueQuery { search: Some("search".into()) },
@@ -140,7 +314,7 @@ mod tests {
             next_page: 2,
             total: Some(1),
             has_more: false,
-            fetch_pending: false,
+            pending_fetch: None,
         });
         let active = state.active().expect("should have active");
         assert!(active.params.search.is_some());
@@ -155,17 +329,18 @@ mod tests {
             next_page: 2,
             total: None,
             has_more: true,
-            fetch_pending: true,
+            pending_fetch: Some(PendingIssueFetch::Page(2)),
         };
-        paging.append_page(IssueResultPage {
+        let completion = paging.complete_fetch(2, IssueResultPage {
             items: vec![test_issue("2", "Second"), test_issue("3", "Third")],
             total: Some(10),
             has_more: true,
         });
+        assert_eq!(completion, IssueFetchCompletion::Applied);
         assert_eq!(paging.items.len(), 3);
         assert_eq!(paging.total, Some(10));
         assert!(paging.has_more);
-        assert!(!paging.fetch_pending);
+        assert!(!paging.fetch_pending());
         assert_eq!(paging.next_page, 3);
     }
 
@@ -177,7 +352,7 @@ mod tests {
             next_page: 1,
             total: Some(2),
             has_more: false,
-            fetch_pending: false,
+            pending_fetch: None,
         };
         let rows = paging.to_issue_rows();
         assert_eq!(rows.len(), 2);
@@ -206,7 +381,7 @@ mod tests {
             next_page: 1,
             total: None,
             has_more: false,
-            fetch_pending: false,
+            pending_fetch: None,
         });
         state.search = Some(IssuePagingState {
             params: IssueQuery { search: Some("test".into()) },
@@ -214,7 +389,7 @@ mod tests {
             next_page: 1,
             total: None,
             has_more: true,
-            fetch_pending: false,
+            pending_fetch: None,
         });
         let active = state.active_mut().expect("should have active");
         assert!(active.params.search.is_some());

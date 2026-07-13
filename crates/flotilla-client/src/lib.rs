@@ -593,6 +593,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
             }
         }
         DaemonEvent::RepoTracked(_)
+        | DaemonEvent::RepoRefreshCompleted { .. }
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
         | DaemonEvent::CommandStepUpdate { .. }
@@ -653,6 +654,7 @@ async fn recover_from_gap(ctx: &EventContext) {
                                 }
                             }
                             DaemonEvent::RepoTracked(_)
+                            | DaemonEvent::RepoRefreshCompleted { .. }
                             | DaemonEvent::RepoUntracked { .. }
                             | DaemonEvent::CommandStarted { .. }
                             | DaemonEvent::CommandFinished { .. }
@@ -816,6 +818,7 @@ impl DaemonHandle for SocketDaemon {
                     DaemonEvent::HostSnapshot(snap) => (StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq),
                     DaemonEvent::HostRemoved { environment_id, seq } => (StreamKey::Host { environment_id: environment_id.clone() }, *seq),
                     DaemonEvent::RepoTracked(_)
+                    | DaemonEvent::RepoRefreshCompleted { .. }
                     | DaemonEvent::RepoUntracked { .. }
                     | DaemonEvent::CommandStarted { .. }
                     | DaemonEvent::CommandFinished { .. }

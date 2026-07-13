@@ -1739,7 +1739,7 @@ fn set_search_query_resets_search_paging_state() {
         next_page: 2,
         total: Some(10),
         has_more: true,
-        fetch_pending: false,
+        pending_fetch: None,
     });
     app.issue_views.insert(repo.clone(), view);
 
@@ -1757,7 +1757,7 @@ fn set_search_query_resets_search_paging_state() {
 fn stale_search_results_discarded_by_drain() {
     use flotilla_protocol::issue_query::{IssueQuery, IssueResultPage};
 
-    use crate::app::issue_view::{IssuePagingState, IssueQueryUpdate, IssueViewState};
+    use crate::app::issue_view::{IssuePagingState, IssueQueryUpdate, IssueViewState, PendingIssueFetch};
 
     let mut app = stub_app();
     let repo = app.model.repo_order[0].clone();
@@ -1771,7 +1771,7 @@ fn stale_search_results_discarded_by_drain() {
         next_page: 1,
         total: None,
         has_more: true,
-        fetch_pending: true,
+        pending_fetch: Some(PendingIssueFetch::Page(1)),
     });
     app.issue_views.insert(repo.clone(), view);
 
