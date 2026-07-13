@@ -345,6 +345,16 @@ fn repo_file_key(path: &Path) -> String {
     key
 }
 
+fn migrate_repo_file(source: &Path, canonical: &Path) {
+    if source == canonical {
+        return;
+    }
+    let result = if canonical.exists() { std::fs::remove_file(source) } else { std::fs::rename(source, canonical) };
+    if let Err(err) = result {
+        tracing::warn!(from = %source.display(), to = %canonical.display(), %err, "failed to migrate repo config filename");
+    }
+}
+
 /// Owns daemon-side paths and caches the global `FlotillaConfig`.
 ///
 /// NOTE: This struct is accumulating path responsibilities beyond pure config.
@@ -387,7 +397,7 @@ impl ConfigStore {
     }
 
     /// Load all persisted repo paths, migrating noncanonical filenames and sorting by path.
-    pub fn load_repos(&self) -> Vec<ExecutionEnvironmentPath> {
+    pub fn load_and_migrate_repos(&self) -> Vec<ExecutionEnvironmentPath> {
         let dir = self.repos_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
@@ -401,16 +411,7 @@ impl ConfigStore {
                 let config: RepoConfig = toml::from_str(&content).ok()?;
                 let path = PathBuf::from(&config.path);
                 let canonical = dir.join(format!("{}.toml", repo_file_key(&path)));
-                if source != canonical.as_path() {
-                    let result = if canonical.as_path().exists() {
-                        std::fs::remove_file(&source)
-                    } else {
-                        std::fs::rename(&source, canonical.as_path())
-                    };
-                    if let Err(err) = result {
-                        tracing::warn!(from = %source.display(), to = %canonical, %err, "failed to migrate repo config filename");
-                    }
-                }
+                migrate_repo_file(&source, canonical.as_path());
                 if path.is_dir() {
                     Some((config.path, ExecutionEnvironmentPath::new(path)))
                 } else {
@@ -585,7 +586,7 @@ pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> 
     let mut repo_roots: Vec<ExecutionEnvironmentPath> = Vec::new();
 
     // 1. Persisted repos in saved tab order
-    let persisted = config.load_repos();
+    let persisted = config.load_and_migrate_repos();
     let tab_order = config.load_tab_order();
     if let Some(order) = tab_order {
         for path in &order {
