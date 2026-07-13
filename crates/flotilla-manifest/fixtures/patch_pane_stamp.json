@@ -1,0 +1,77 @@
+{
+  "set": {
+    "flotilla.attach.ref": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "implement"
+      }
+    },
+    "flotilla.convoy": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "dev/manifest-extraction"
+      }
+    },
+    "flotilla.crew.role": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "coder"
+      }
+    },
+    "flotilla.host": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "feta"
+      }
+    },
+    "flotilla.namespace": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "dev"
+      }
+    },
+    "flotilla.session": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "feta/dev/terminal-impl-coder"
+      }
+    },
+    "flotilla.vessel": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "implement"
+      }
+    }
+  },
+  "source_id": "flotilla-attach",
+  "target": {
+    "kind": "pane",
+    "value": {
+      "id": 42,
+      "kind": "terminal"
+    }
+  },
+  "type": "metadata-patch",
+  "unset": []
+}

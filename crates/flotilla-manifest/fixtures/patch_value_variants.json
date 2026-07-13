@@ -1,0 +1,40 @@
+{
+  "set": {
+    "flotilla.crew.roles": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "string-list",
+        "value": [
+          "coder",
+          "reviewer"
+        ]
+      }
+    },
+    "ordinal": {
+      "ordinal": -100,
+      "precedence": 5,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "integer",
+        "value": -100
+      }
+    },
+    "status.attention": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "bool",
+        "value": true
+      }
+    }
+  },
+  "source_id": "flotilla-connector",
+  "target": {
+    "kind": "root"
+  },
+  "type": "metadata-patch",
+  "unset": []
+}

@@ -19,7 +19,7 @@ use flotilla_protocol::{
     arg::{flatten, Arg},
     qualified_path::QualifiedPath,
     result_set::{ConvoyRow, ResultSet, Rows},
-    Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
+    AttachBinding, Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
     FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
     HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, QueryCursor,
     RepoDelta, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand,
@@ -220,6 +220,14 @@ fn empty_repo_identity() -> flotilla_protocol::RepoIdentity {
     flotilla_protocol::RepoIdentity { authority: String::new(), path: String::new() }
 }
 
+/// An attach resolution: the command the CLI should exec, plus the
+/// structured binding it stamps onto its enclosing PM pane (#708).
+#[derive(Debug, Clone)]
+pub struct ResolvedAttach {
+    pub command: String,
+    pub binding: Option<AttachBinding>,
+}
+
 fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>) -> Vec<String> {
     let mut refs = vec![session_name.to_string()];
 
@@ -285,14 +293,44 @@ fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
 
 enum AttachTarget {
     Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
-    Replica { host: HostName },
+    Replica { row: Box<FleetListRow> },
 }
 
 impl AttachTarget {
-    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<String, String> {
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<ResolvedAttach, String> {
         match self {
-            Self::Local(session) => daemon.attach_command_for_session(reference, session).await,
-            Self::Replica { host } => daemon.recursive_attach_command_for_remote(host, reference).await,
+            Self::Local(session) => {
+                let (command, host) = daemon.attach_command_for_session(reference, session).await?;
+                let labels = &session.metadata.labels;
+                let binding = AttachBinding::builder()
+                    .host(host)
+                    .namespace(session.metadata.namespace.clone())
+                    .session(session.metadata.name.clone())
+                    .maybe_convoy(labels.get(CONVOY_LABEL).cloned())
+                    .maybe_vessel(labels.get(VESSEL_LABEL).cloned())
+                    .role(labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone()))
+                    .build();
+                Ok(ResolvedAttach { command, binding: Some(binding) })
+            }
+            Self::Replica { row } => {
+                let command = daemon.recursive_attach_command_for_remote(&row.host, reference).await?;
+                // Replica rows carry crew as "vessel/role" (or a bare role)
+                // and the owning host's namespace + session name, so
+                // cross-host panes stamp the full join key.
+                let (vessel, role) = match row.crew.split_once('/') {
+                    Some((vessel, role)) => (Some(vessel.to_owned()), Some(role.to_owned())),
+                    None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty())),
+                };
+                let binding = AttachBinding::builder()
+                    .host(row.host.clone())
+                    .namespace(row.namespace.clone())
+                    .maybe_session(row.session.clone())
+                    .maybe_convoy(Some(row.convoy.clone()).filter(|convoy| convoy != "-"))
+                    .maybe_vessel(vessel)
+                    .maybe_role(role)
+                    .build();
+                Ok(ResolvedAttach { command, binding: Some(binding) })
+            }
         }
     }
 }
@@ -319,7 +357,7 @@ impl AttachCandidateIndex {
         Self { candidates, exact }
     }
 
-    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<String, String> {
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<ResolvedAttach, String> {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
@@ -378,15 +416,17 @@ fn append_crewless_convoy_rows(
             if !convoys_with_crew.insert(row.name.clone()) {
                 continue;
             }
-            rows.push(FleetListRow {
-                convoy: row.name.clone(),
-                vessel: "-".to_string(),
-                authority: None,
-                crew: "-".to_string(),
-                crew_state: convoy_state_label(row),
-                host: host.clone(),
-                staleness: staleness.clone(),
-            });
+            rows.push(
+                FleetListRow::builder()
+                    .convoy(row.name.clone())
+                    .vessel("-")
+                    .crew("-")
+                    .crew_state(convoy_state_label(row))
+                    .host(host.clone())
+                    .namespace(target_namespace)
+                    .staleness(staleness.clone())
+                    .build(),
+            );
         }
     }
 }
@@ -2830,15 +2870,19 @@ impl InProcessDaemon {
                 .and_then(|environment| resource_environment_host_ref(environment))
                 .map(|host_ref| self.target_host_for_resource_ref(host_ref))
                 .unwrap_or_else(|| self.host_name.clone());
-            rows.push(FleetListRow {
-                convoy: convoy.clone(),
-                vessel: session.spec.env_ref.clone(),
-                authority: authority_by_convoy.get(&convoy).cloned().flatten(),
-                crew,
-                crew_state: session_status_label(session.status.as_ref().map(|status| status.phase)),
-                host,
-                staleness: FleetStaleness::Local,
-            });
+            rows.push(
+                FleetListRow::builder()
+                    .convoy(convoy.clone())
+                    .vessel(session.spec.env_ref.clone())
+                    .maybe_authority(authority_by_convoy.get(&convoy).cloned().flatten())
+                    .crew(crew)
+                    .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
+                    .host(host)
+                    .namespace(session.metadata.namespace.clone())
+                    .session(session.metadata.name.clone())
+                    .staleness(FleetStaleness::Local)
+                    .build(),
+            );
         }
         let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
@@ -2853,7 +2897,7 @@ impl InProcessDaemon {
         Ok((rows, observed_generation))
     }
 
-    pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<String, String> {
+    pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<ResolvedAttach, String> {
         // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
@@ -2919,7 +2963,7 @@ impl InProcessDaemon {
                     candidates.push(AttachCandidate {
                         label: fleet_row_attach_reference_label(row),
                         references: fleet_row_attach_reference_keys(row),
-                        target: AttachTarget::Replica { host: row.host.clone() },
+                        target: AttachTarget::Replica { row: Box::new(row.clone()) },
                     });
                 }
             }
@@ -2928,11 +2972,13 @@ impl InProcessDaemon {
         Ok(AttachCandidateIndex::new(candidates))
     }
 
+    /// Resolve the attach command for a locally-known session, returning it
+    /// with the host that actually owns the session (the binding host).
     async fn attach_command_for_session(
         &self,
         reference: &str,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, HostName), String> {
         let namespace = self.provisioning_namespace().await;
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
         let environment = environments
@@ -2948,10 +2994,12 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
         let target_host = self.target_host_for_resource_ref(host_ref);
         if target_host != self.host_name {
-            return self.recursive_attach_command_for_remote(&target_host, reference).await;
+            let command = self.recursive_attach_command_for_remote(&target_host, reference).await?;
+            return Ok((command, target_host));
         }
 
-        self.local_attach_command_for_session(session, &environment).await
+        let command = self.local_attach_command_for_session(session, &environment).await?;
+        Ok((command, self.host_name.clone()))
     }
 
     async fn recursive_attach_command_for_remote(&self, target_host: &HostName, reference: &str) -> Result<String, String> {
@@ -3852,7 +3900,9 @@ impl DaemonHandle for InProcessDaemon {
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::Attach { reference } => match self.resolve_attach_command_internal(reference).await {
-                Ok(command) => Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command }),
+                Ok(resolved) => {
+                    Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command: resolved.command, binding: resolved.binding })
+                }
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryIssues { repo, params, page, count } => {

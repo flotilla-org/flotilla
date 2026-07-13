@@ -125,7 +125,8 @@ pub struct FleetListResponse {
     pub replicas: Vec<FleetReplicaStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct FleetListRow {
     pub convoy: String,
     pub vessel: String,
@@ -134,6 +135,12 @@ pub struct FleetListRow {
     pub crew: String,
     pub crew_state: String,
     pub host: HostName,
+    /// Namespace the crew session lives in on its owning host.
+    pub namespace: String,
+    /// Crew session name — with `host` and `namespace` this is the
+    /// `flotilla.session` pane join key. Absent for crewless convoy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     pub staleness: FleetStaleness,
 }
 

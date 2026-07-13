@@ -1,0 +1,24 @@
+[
+  {
+    "identity": {
+      "key": "flotilla.session",
+      "value": {
+        "type": "text",
+        "value": "feta/dev/terminal-impl-coder"
+      }
+    },
+    "nearest_distance": 0,
+    "target_count": 1
+  },
+  {
+    "identity": {
+      "key": "zellij.pane.cwd",
+      "value": {
+        "type": "text",
+        "value": "/Users/robert/dev/flotilla"
+      }
+    },
+    "nearest_distance": 1,
+    "target_count": 2
+  }
+]

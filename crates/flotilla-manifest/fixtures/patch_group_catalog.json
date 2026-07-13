@@ -1,0 +1,81 @@
+{
+  "set": {
+    "factory.id": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "flotilla:convoys/dev/manifest-extraction/implement"
+      }
+    },
+    "flotilla.work.phase": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "running"
+      }
+    },
+    "materialize.recipe": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "flotilla attach implement"
+      }
+    },
+    "materialize.target": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "pane"
+      }
+    },
+    "status.state": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "active"
+      }
+    }
+  },
+  "source_id": "flotilla-connector",
+  "target": {
+    "kind": "group",
+    "value": [
+      {
+        "key": "git.repo",
+        "value": {
+          "type": "text",
+          "value": "flotilla-org/flotilla"
+        }
+      },
+      {
+        "key": "flotilla.convoy",
+        "label": "manifest extraction",
+        "value": {
+          "type": "text",
+          "value": "dev/manifest-extraction"
+        }
+      },
+      {
+        "key": "flotilla.vessel",
+        "value": {
+          "type": "text",
+          "value": "implement"
+        }
+      }
+    ]
+  },
+  "type": "metadata-patch",
+  "unset": [
+    "status.attention"
+  ]
+}

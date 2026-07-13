@@ -110,13 +110,13 @@ impl<'a> WorkspaceOrchestrator<'a> {
         } else {
             ExecutionEnvironmentPath::new(self.config_base)
         };
-        let attach_request = WorkspaceAttachRequest {
-            name: prepared.label.clone(),
-            working_directory: working_dir,
-            template_vars: HashMap::from([("main_command".to_string(), "claude".to_string())]),
-            template_yaml: prepared.template_yaml.clone(),
-            attach_commands,
-        };
+        let attach_request = WorkspaceAttachRequest::builder()
+            .name(prepared.label.clone())
+            .working_directory(working_dir)
+            .template_vars(HashMap::from([("main_command".to_string(), "claude".to_string())]))
+            .maybe_template_yaml(prepared.template_yaml.clone())
+            .attach_commands(attach_commands)
+            .build();
 
         match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
@@ -306,13 +306,13 @@ fn checkout_key_for_store(target_host: &HostName, checkout_path: &Path, checkout
 }
 
 fn workspace_attach_request_from_config(config: crate::providers::types::WorkspaceConfig) -> WorkspaceAttachRequest {
-    WorkspaceAttachRequest {
-        name: config.name,
-        working_directory: config.working_directory,
-        template_vars: config.template_vars,
-        template_yaml: config.template_yaml,
-        attach_commands: config.resolved_commands.unwrap_or_default(),
-    }
+    WorkspaceAttachRequest::builder()
+        .name(config.name)
+        .working_directory(config.working_directory)
+        .template_vars(config.template_vars)
+        .maybe_template_yaml(config.template_yaml)
+        .attach_commands(config.resolved_commands.unwrap_or_default())
+        .build()
 }
 
 /// Resolve prepared pane commands through the hop chain, producing `(role, command_string)` pairs

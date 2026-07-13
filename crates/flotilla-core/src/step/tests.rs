@@ -324,7 +324,7 @@ async fn symbolic_step_action_succeeds() {
 async fn produced_does_not_override_final_result() {
     let (cancel, tx) = setup();
     let resolver = TestResolver::new(vec![
-        Ok(StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach cmd".into() })),
+        Ok(StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach cmd".into(), binding: None })),
         Ok(StepOutcome::Completed),
     ]);
     let plan = StepPlan::new(vec![make_step("step-a"), make_step("step-b")]);
@@ -385,7 +385,10 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
             _action: StepAction,
             prior: &[StepOutcome],
         ) -> Result<StepOutcome, String> {
-            assert_eq!(prior, &[StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach remote".into() })]);
+            assert_eq!(prior, &[StepOutcome::Produced(CommandValue::AttachCommandResolved {
+                command: "attach remote".into(),
+                binding: None
+            })]);
             Ok(StepOutcome::Completed)
         }
     }
@@ -400,7 +403,7 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
         assert_host: remote_host.clone(),
         progress: vec![],
         wait_for_cancel: None,
-        result: Ok(vec![StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach remote".into() })]),
+        result: Ok(vec![StepOutcome::Produced(CommandValue::AttachCommandResolved { command: "attach remote".into(), binding: None })]),
     }]);
 
     let result = run_step_plan_with_remote_executor(

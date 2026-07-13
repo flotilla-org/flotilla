@@ -19,11 +19,15 @@ use flotilla_core::{
     providers::{registry::ProviderRegistry, types::WorkspaceAttachRequest},
     HostName,
 };
+use flotilla_manifest::{
+    projection::{project_segment, vessel_factory_id, vessel_group_path},
+    stamp::WorkspaceStamp,
+};
 use flotilla_protocol::{arg, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
-    TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL,
+    Convoy, Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
+    TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL, REPO_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -36,7 +40,8 @@ pub trait PresentationRuntime: Send + Sync {
     async fn tear_down(&self, manager: &str, workspace_ref: &str) -> Result<(), String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PresentationPlan {
     pub policy: String,
     pub name: String,
@@ -44,6 +49,8 @@ pub struct PresentationPlan {
     pub presentation_local_cwd: ExecutionEnvironmentPath,
     pub previous: Option<PreviousWorkspace>,
     pub spec_hash: String,
+    /// Manifest metadata for the created workspace (the tab-id two-step).
+    pub stamp: Option<WorkspaceStamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,13 +135,12 @@ impl PresentationPolicy for DefaultPolicy {
         }
 
         RenderedWorkspace {
-            attach_request: WorkspaceAttachRequest {
-                name: context.name.clone(),
-                working_directory: context.presentation_local_cwd.clone(),
-                template_vars: HashMap::new(),
-                template_yaml: Some(default_policy_template_yaml(&roles)),
-                attach_commands: processes.iter().map(|process| (process.role.clone(), process.attach_command.clone())).collect(),
-            },
+            attach_request: WorkspaceAttachRequest::builder()
+                .name(context.name.clone())
+                .working_directory(context.presentation_local_cwd.clone())
+                .template_yaml(default_policy_template_yaml(&roles))
+                .attach_commands(processes.iter().map(|process| (process.role.clone(), process.attach_command.clone())).collect())
+                .build(),
         }
     }
 }
@@ -202,6 +208,7 @@ pub struct PresentationReconciler<R> {
     terminal_sessions: TypedResolver<TerminalSession>,
     environments: TypedResolver<Environment>,
     hosts: TypedResolver<Host>,
+    convoys: TypedResolver<Convoy>,
     hop_chain: HopChainContext,
     policies: Arc<PresentationPolicyRegistry>,
 }
@@ -218,7 +225,8 @@ impl<R> PresentationReconciler<R> {
             runtime,
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
-            hosts: backend.using::<Host>(namespace),
+            hosts: backend.clone().using::<Host>(namespace),
+            convoys: backend.using::<Convoy>(namespace),
             hop_chain,
             policies,
         }
@@ -257,6 +265,31 @@ impl<R> PresentationReconciler<R> {
         let attach_command = self.build_attach_command(session, &environment, host_ref, attach_args)?;
 
         Ok(ResolvedProcess { role: session.spec.role.clone(), labels: session.metadata.labels.clone(), attach_command })
+    }
+
+    /// The manifest stamp for this presentation's workspace: the vessel's
+    /// GroupPath spine, built exactly as the connector's catalog builds it so
+    /// the tab and the vessel land on the same group node.
+    async fn workspace_stamp(&self, obj: &ResourceObject<Presentation>) -> WorkspaceStamp {
+        let namespace = &obj.metadata.namespace;
+        let convoy_name = &obj.spec.convoy_ref;
+        let vessel = &obj.spec.name;
+        // Tab stamps have no TTL, so a wrong scope would stick: on a failed
+        // convoy lookup, stamp no scope at all (honestly absent — the pane
+        // identities still group the tab) rather than a spine missing its
+        // project segment.
+        let scope = match self.convoys.get(convoy_name).await {
+            Ok(convoy) => {
+                let project =
+                    project_segment(convoy.spec.project_ref.as_deref(), convoy.metadata.labels.get(REPO_LABEL).map(String::as_str));
+                Some(vessel_group_path(project, namespace, convoy_name, vessel))
+            }
+            Err(err) => {
+                warn!(%err, convoy = %convoy_name, "convoy lookup failed; stamping workspace without a scope");
+                None
+            }
+        };
+        WorkspaceStamp { kind: "flotilla-vessel".to_owned(), factory_id: vessel_factory_id(namespace, convoy_name, vessel), scope }
     }
 
     fn build_attach_command(
@@ -363,14 +396,15 @@ where
             return Ok(PresentationDeps::InSync);
         }
 
-        let plan = PresentationPlan {
-            policy: obj.spec.presentation_policy_ref.clone(),
-            name: obj.spec.name.clone(),
-            crew: processes,
-            presentation_local_cwd: self.hop_chain.presentation_local_cwd(),
-            previous,
-            spec_hash,
-        };
+        let plan = PresentationPlan::builder()
+            .policy(obj.spec.presentation_policy_ref.clone())
+            .name(obj.spec.name.clone())
+            .crew(processes)
+            .presentation_local_cwd(self.hop_chain.presentation_local_cwd())
+            .maybe_previous(previous)
+            .spec_hash(spec_hash)
+            .stamp(self.workspace_stamp(obj).await)
+            .build();
 
         // This dependency fetch intentionally performs the runtime apply. The apply result is the
         // authoritative observed workspace state we need to patch into PresentationStatus, and the
@@ -439,8 +473,9 @@ impl PresentationRuntime for ProviderPresentationRuntime {
             .presentation_managers
             .preferred_with_desc()
             .ok_or_else(|| ApplyPresentationError::Failed("no presentation manager configured".to_string()))?;
-        let rendered = policy
+        let mut rendered = policy
             .render(&plan.crew, &PolicyContext { name: plan.name.clone(), presentation_local_cwd: plan.presentation_local_cwd.clone() });
+        rendered.attach_request.stamp = plan.stamp.clone();
 
         let mut tore_down_previous = false;
         if let Some(previous) = &plan.previous {

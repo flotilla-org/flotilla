@@ -1,0 +1,10 @@
+[package]
+name = "gen-manifest-fixtures"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+andamento-shared = { path = "/Users/robert/dev/andamento/crates/andamento-shared" }
+serde_json = "1"
+
+[workspace]
