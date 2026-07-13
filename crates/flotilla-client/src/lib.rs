@@ -98,22 +98,13 @@ pub struct SocketDaemon {
 impl SocketDaemon {
     /// Connect to a running daemon at the given Unix socket path.
     ///
-    /// Builds a session from the socket and then starts the shared client
-    /// reader/pending-request machinery on top of it.
+    /// Requires a bounded, stateful Hello handshake before starting the shared
+    /// client reader/pending-request machinery. This makes protocol-version
+    /// validation part of every real socket connection rather than an opt-in
+    /// call-site choice.
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, String> {
         let session = connect_unix_message_session(socket_path).await?;
-        Self::from_session(session)
-    }
-
-    /// Connect to a running daemon with a stateful Hello handshake.
-    ///
-    /// Sends a `Hello` with `ConnectionRole::Client` and a fresh `session_id`,
-    /// waits for the server's Hello reply, then builds the normal client session.
-    /// The `session_id` enables cursor ownership for directed query responses.
-    pub async fn connect_stateful(socket_path: &Path) -> Result<Arc<Self>, String> {
-        let session = connect_unix_message_session(socket_path).await?;
-        do_client_hello(&session).await?;
-        Self::from_session(session)
+        from_session_stateful_bounded(socket_path, session).await
     }
 
     /// Build a client from an existing `MessageSession`, performing a Hello
@@ -470,8 +461,12 @@ async fn connect_existing_stateful(socket_path: &Path) -> Result<Option<Arc<Sock
         Ok(session) => session,
         Err(_) => return Ok(None),
     };
+    from_session_stateful_bounded(socket_path, session).await.map(Some)
+}
+
+async fn from_session_stateful_bounded(socket_path: &Path, session: MessageSession) -> Result<Arc<SocketDaemon>, String> {
     match tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful(session)).await {
-        Ok(result) => result.map(Some),
+        Ok(result) => result,
         Err(_) => Err(format!(
             "daemon at {} accepted the connection but did not complete the Hello handshake within {}s — it may be wedged; check or restart it",
             socket_path.display(),
