@@ -19,11 +19,13 @@ use flotilla_core::{
     },
 };
 use flotilla_protocol::{
-    qualified_path::QualifiedPath, AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget,
-    Command, CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary,
-    Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData,
-    RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome,
-    StepStatus, StreamKey, VectorClock, PROTOCOL_VERSION,
+    qualified_path::QualifiedPath,
+    result_set::{QueryId, ResultDelta, Rows},
+    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
+    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId, NodeInfo,
+    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity,
+    RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus,
+    StreamKey, VectorClock, PROTOCOL_VERSION,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
@@ -39,6 +41,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::{
+    client_connection::QuerySubscriptions,
     handle_client, handle_client_session,
     peer_runtime::{
         disconnect_peer_and_rebuild, forward_with_keepalive_for_test, handle_remote_restart_if_needed, relay_peer_data, send_local_to_peer,
@@ -172,7 +175,8 @@ async fn dispatch_request_with_state(
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(daemon, &remote_command_router, agent_state_store, uuid::Uuid::nil());
+    let request_dispatcher =
+        RequestDispatcher::new(daemon, &remote_command_router, agent_state_store, uuid::Uuid::nil(), QuerySubscriptions::default());
     request_dispatcher.dispatch(id, request).await
 }
 
@@ -672,7 +676,8 @@ async fn query_commands_return_directed_response_instead_of_remote_dispatch() {
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil());
+    let request_dispatcher =
+        RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil(), QuerySubscriptions::default());
 
     // Local query commands (host=None) execute directly and return QueryResult.
     let response = request_dispatcher
@@ -721,7 +726,13 @@ async fn request_dispatcher_forwards_remote_query_through_peer_manager() {
         let remote_command_router = remote_command_router.clone();
         let agent_state_store = agent_state_store.clone();
         async move {
-            let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil());
+            let request_dispatcher = RequestDispatcher::new(
+                &daemon,
+                &remote_command_router,
+                &agent_state_store,
+                uuid::Uuid::nil(),
+                QuerySubscriptions::default(),
+            );
             request_dispatcher
                 .dispatch(402, Request::Execute {
                     command: Command {
@@ -802,7 +813,8 @@ async fn remote_command_mutations_route_remote_step_requests() {
         &pending_remote_cancels,
         &next_remote_command_id,
     );
-    let request_dispatcher = RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil());
+    let request_dispatcher =
+        RequestDispatcher::new(&daemon, &remote_command_router, &agent_state_store, uuid::Uuid::nil(), QuerySubscriptions::default());
 
     let response = request_dispatcher
         .dispatch(402, Request::Execute {
@@ -1327,8 +1339,13 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
             &pending_remote_cancels_for_task,
             &next_remote_command_id_for_task,
         );
-        let request_dispatcher =
-            RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task, uuid::Uuid::nil());
+        let request_dispatcher = RequestDispatcher::new(
+            &daemon_for_task,
+            &remote_command_router,
+            &agent_state_store_for_task,
+            uuid::Uuid::nil(),
+            QuerySubscriptions::default(),
+        );
         request_dispatcher.dispatch(41, Request::Cancel { command_id: 1u64 << 62 }).await
     });
 
@@ -1446,8 +1463,13 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
             &pending_remote_cancels_for_task,
             &next_remote_command_id_for_task,
         );
-        let request_dispatcher =
-            RequestDispatcher::new(&daemon_for_task, &remote_command_router, &agent_state_store_for_task, uuid::Uuid::nil());
+        let request_dispatcher = RequestDispatcher::new(
+            &daemon_for_task,
+            &remote_command_router,
+            &agent_state_store_for_task,
+            uuid::Uuid::nil(),
+            QuerySubscriptions::default(),
+        );
         request_dispatcher.dispatch(403, Request::Cancel { command_id }).await
     });
 
@@ -2442,6 +2464,104 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
     drop(client_session);
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     assert_eq!(client_count.load(Ordering::SeqCst), 0, "request client should be removed after disconnect");
+}
+
+#[tokio::test]
+async fn handle_client_session_filters_query_events_until_subscribed() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let client_notify = Arc::new(Notify::new());
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (client_session, server_session) = message_session_pair();
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let pm = Arc::clone(&peer_manager);
+    let count_ref = Arc::clone(&client_count);
+    let notify_ref = Arc::clone(&client_notify);
+    let handle = tokio::spawn(async move {
+        let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
+        handle_client_session(
+            server_session,
+            daemon_for_task,
+            shutdown_rx,
+            peer_data_tx,
+            pm,
+            remote_command_router,
+            count_ref,
+            notify_ref,
+            peer_connected_tx,
+            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
+        )
+        .await;
+    });
+
+    // Establish the session (and thus the event relay) with a first request.
+    client_session.write(Message::Request { id: 1, request: Request::ListRepos }).await.expect("write request");
+    match ok_response(read_session_message(&client_session).await, 1) {
+        Response::ListRepos(_) => {}
+        other => panic!("expected ListRepos response, got {other:?}"),
+    }
+
+    let result_delta = |seq| {
+        DaemonEvent::ResultDelta(Box::new(ResultDelta { query: QueryId::Convoys, seq, changed: Rows::Convoys(vec![]), removed: vec![] }))
+    };
+    let marker = |command_id| DaemonEvent::CommandStarted {
+        command_id,
+        node_id: daemon.node_id().clone(),
+        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repo: None,
+        description: "marker".to_string(),
+    };
+
+    // Before subscribing, query events must be filtered: send a delta then a
+    // marker; the marker must be the next event on the socket.
+    daemon.send_event(result_delta(1));
+    daemon.send_event(marker(1));
+    match read_session_message(&client_session).await {
+        Message::Event { event } => match *event {
+            DaemonEvent::CommandStarted { command_id, .. } => assert_eq!(command_id, 1),
+            other => panic!("unsubscribed query delta should be filtered; got {other:?}"),
+        },
+        other => panic!("expected event message, got {other:?}"),
+    }
+
+    // Subscribe: the response replays a full ResultSet for the stale cursor.
+    client_session
+        .write(Message::Request {
+            id: 2,
+            request: Request::SubscribeQueries { queries: vec![QueryCursor { query: QueryId::Convoys, since: None }] },
+        })
+        .await
+        .expect("write subscribe request");
+    match ok_response(read_session_message(&client_session).await, 2) {
+        Response::SubscribeQueries(events) => {
+            assert!(
+                matches!(events.as_slice(), [DaemonEvent::ResultSet(result_set)] if result_set.query == QueryId::Convoys),
+                "subscribe should replay one convoys result set, got {events:?}"
+            );
+        }
+        other => panic!("expected SubscribeQueries response, got {other:?}"),
+    }
+
+    // After subscribing, query deltas reach the socket.
+    daemon.send_event(result_delta(2));
+    match read_session_message(&client_session).await {
+        Message::Event { event } => match *event {
+            DaemonEvent::ResultDelta(delta) => {
+                assert_eq!(delta.query, QueryId::Convoys);
+                assert_eq!(delta.seq, 2);
+            }
+            other => panic!("expected ResultDelta after subscribing, got {other:?}"),
+        },
+        other => panic!("expected event message, got {other:?}"),
+    }
+
+    drop(client_session);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 }
 
 #[tokio::test]

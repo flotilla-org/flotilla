@@ -459,14 +459,17 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
         DaemonEvent::HostRemoved { environment_id, seq } => {
             format!("[host]     {environment_id}: removed (seq {seq})")
         }
-        DaemonEvent::PanelSnapshot(snapshot) => {
-            let row_count: usize = snapshot.tab.panels.iter().map(|panel| panel.rows.len()).sum();
-            format!("[panel]     {}: full snapshot (seq {}, {} rows)", snapshot.tab.id, snapshot.seq, row_count)
+        DaemonEvent::ResultSet(result_set) => {
+            format!("[query]     {}: full result set (seq {}, {} rows)", result_set.query, result_set.seq, result_set.rows.len())
         }
-        DaemonEvent::PanelDelta(delta) => {
-            let changed: usize = delta.panels.iter().map(|panel| panel.changed.len()).sum();
-            let removed: usize = delta.panels.iter().map(|panel| panel.removed.len()).sum();
-            format!("[panel]     {}: delta (seq {}, {} changed, {} removed)", delta.tab_id, delta.seq, changed, removed)
+        DaemonEvent::ResultDelta(delta) => {
+            format!(
+                "[query]     {}: delta (seq {}, {} changed, {} removed)",
+                delta.query,
+                delta.seq,
+                delta.changed.len(),
+                delta.removed.len()
+            )
         }
     }
 }
@@ -478,8 +481,8 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         DaemonEvent::RepoDelta(delta) => Some((StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq)),
         DaemonEvent::HostSnapshot(snap) => Some((StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq)),
         DaemonEvent::HostRemoved { environment_id, seq } => Some((StreamKey::Host { environment_id: environment_id.clone() }, *seq)),
-        DaemonEvent::PanelSnapshot(snapshot) => Some((StreamKey::Panel { tab: snapshot.tab.id.clone() }, snapshot.seq)),
-        DaemonEvent::PanelDelta(delta) => Some((StreamKey::Panel { tab: delta.tab_id.clone() }, delta.seq)),
+        DaemonEvent::ResultSet(result_set) => Some((StreamKey::Query { query: result_set.query }, result_set.seq)),
+        DaemonEvent::ResultDelta(delta) => Some((StreamKey::Query { query: delta.query }, delta.seq)),
         DaemonEvent::RepoTracked(_)
         | DaemonEvent::RepoUntracked { .. }
         | DaemonEvent::CommandStarted { .. }
@@ -626,6 +629,27 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
         }
         Err(e) => {
             eprintln!("warning: failed to replay initial state: {e}");
+        }
+    }
+
+    // Subscribe to every named query so watch shows the full data plane.
+    let cursors: Vec<flotilla_protocol::QueryCursor> =
+        flotilla_protocol::QueryId::ALL.iter().map(|&query| flotilla_protocol::QueryCursor { query, since: None }).collect();
+    match daemon.subscribe_queries(&cursors).await {
+        Ok(events) => {
+            for event in &events {
+                if let Some((stream_key, seq)) = event_stream_seq(event) {
+                    replay_seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
+                }
+                let line = match format {
+                    OutputFormat::Human => format_event_human(event),
+                    OutputFormat::Json => flotilla_protocol::output::json_line(event),
+                };
+                println!("{line}");
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to subscribe to queries: {e}");
         }
     }
 

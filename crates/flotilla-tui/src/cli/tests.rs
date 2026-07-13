@@ -968,66 +968,59 @@ mod query_event_formatting {
     }
 }
 
-mod panel_event_formatting {
+mod result_set_event_formatting {
     use flotilla_protocol::{
-        panel::{PanelDelta, PanelRowsDelta, PanelSnapshot, TabView},
-        DaemonEvent,
+        result_set::{QueryId, ResultDelta, ResultSet, Rows},
+        DaemonEvent, ResourceRef,
     };
 
     use crate::cli::format_event_human;
 
     #[test]
-    fn panel_snapshot_formatting() {
-        let snap = PanelSnapshot { seq: 7, tab: TabView { id: "convoys".into(), title: "Convoys".into(), panels: vec![] } };
-        let event = DaemonEvent::PanelSnapshot(Box::new(snap));
+    fn result_set_formatting() {
+        let result_set = ResultSet { query: QueryId::Convoys, seq: 7, rows: Rows::Convoys(vec![]) };
+        let event = DaemonEvent::ResultSet(Box::new(result_set));
         let line = format_event_human(&event);
-        assert!(line.contains("[panel]"), "should have panel tag");
-        assert!(line.contains("convoys"), "should include tab id");
+        assert!(line.contains("[query]"), "should have query tag");
+        assert!(line.contains("convoys"), "should include query id");
         assert!(line.contains("seq 7"), "should include seq number");
         assert!(line.contains("0 rows"), "should count rows");
     }
 
     #[test]
-    fn panel_delta_formatting() {
-        use flotilla_protocol::panel::{PanelId, ResourceRef};
-        let delta = PanelDelta {
+    fn result_delta_formatting() {
+        let delta = ResultDelta {
+            query: QueryId::Convoys,
             seq: 12,
-            tab_id: "convoys".into(),
-            panels: vec![PanelRowsDelta {
-                panel_id: PanelId::new("convoys"),
-                changed: vec![],
-                removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
-            }],
+            changed: Rows::Convoys(vec![]),
+            removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
         };
-        let event = DaemonEvent::PanelDelta(Box::new(delta));
+        let event = DaemonEvent::ResultDelta(Box::new(delta));
         let line = format_event_human(&event);
-        assert!(line.contains("[panel]"), "should have panel tag");
-        assert!(line.contains("convoys"), "should include tab id");
+        assert!(line.contains("[query]"), "should have query tag");
+        assert!(line.contains("convoys"), "should include query id");
         assert!(line.contains("seq 12") || line.contains("12"), "should include seq number");
         assert!(line.contains("0 changed"), "should show changed count");
         assert!(line.contains("1 removed"), "should show removed count");
     }
 }
 
-mod watch_dedupe_panel {
+mod watch_dedupe_query {
     use std::collections::HashMap;
 
     use flotilla_protocol::{
-        panel::{PanelDelta, PanelSnapshot, TabView},
+        result_set::{QueryId, ResultDelta, ResultSet, Rows},
         DaemonEvent, StreamKey,
     };
 
     use crate::cli::event_stream_seq;
 
-    fn panel_snapshot(tab: &str, seq: u64) -> DaemonEvent {
-        DaemonEvent::PanelSnapshot(Box::new(PanelSnapshot {
-            seq,
-            tab: TabView { id: tab.into(), title: "Convoys".into(), panels: vec![] },
-        }))
+    fn result_set(seq: u64) -> DaemonEvent {
+        DaemonEvent::ResultSet(Box::new(ResultSet { query: QueryId::Convoys, seq, rows: Rows::Convoys(vec![]) }))
     }
 
-    fn panel_delta(tab: &str, seq: u64) -> DaemonEvent {
-        DaemonEvent::PanelDelta(Box::new(PanelDelta { seq, tab_id: tab.into(), panels: vec![] }))
+    fn result_delta(seq: u64) -> DaemonEvent {
+        DaemonEvent::ResultDelta(Box::new(ResultDelta { query: QueryId::Convoys, seq, changed: Rows::Convoys(vec![]), removed: vec![] }))
     }
 
     /// Simulate the run_watch dedup logic: build replay_seqs from a slice of
@@ -1053,63 +1046,53 @@ mod watch_dedupe_panel {
     }
 
     #[test]
-    fn event_stream_seq_returns_panel_key_for_snapshot() {
-        let event = panel_snapshot("convoys", 5);
+    fn event_stream_seq_returns_query_key_for_result_set() {
+        let event = result_set(5);
         let result = event_stream_seq(&event);
-        assert_eq!(result, Some((StreamKey::Panel { tab: "convoys".into() }, 5)));
+        assert_eq!(result, Some((StreamKey::Query { query: QueryId::Convoys }, 5)));
     }
 
     #[test]
-    fn event_stream_seq_returns_panel_key_for_delta() {
-        let event = panel_delta("convoys", 9);
+    fn event_stream_seq_returns_query_key_for_delta() {
+        let event = result_delta(9);
         let result = event_stream_seq(&event);
-        assert_eq!(result, Some((StreamKey::Panel { tab: "convoys".into() }, 9)));
+        assert_eq!(result, Some((StreamKey::Query { query: QueryId::Convoys }, 9)));
     }
 
     #[test]
-    fn duplicate_seq_panel_delta_is_suppressed() {
+    fn duplicate_seq_result_delta_is_suppressed() {
         // A delta arrives in replay at seq=5; the broadcast channel then delivers
         // the same event again (seq=5). The live duplicate must be suppressed.
-        let replay = [panel_delta("convoys", 5)];
-        let live = [panel_delta("convoys", 5)];
+        let replay = [result_delta(5)];
+        let live = [result_delta(5)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert!(printed.is_empty(), "duplicate-seq delta should be suppressed by dedup, but {} event(s) were printed", printed.len());
     }
 
     #[test]
-    fn newer_seq_panel_delta_is_printed() {
+    fn newer_seq_result_delta_is_printed() {
         // Replay has seq=5; a genuinely new delta (seq=6) must pass through.
-        let replay = [panel_delta("convoys", 5)];
-        let live = [panel_delta("convoys", 6)];
+        let replay = [result_delta(5)];
+        let live = [result_delta(6)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert_eq!(printed.len(), 1, "new-seq delta should pass dedup filter");
     }
 
     #[test]
-    fn snapshot_replay_suppresses_same_seq_live_snapshot() {
-        // Replay delivers a full namespace snapshot at seq=3; the broadcast
-        // buffer then delivers that same snapshot — must be suppressed.
-        let replay = [panel_snapshot("convoys", 3)];
-        let live = [panel_snapshot("convoys", 3)];
+    fn result_set_replay_suppresses_same_seq_live_result_set() {
+        // Replay delivers a full result set at seq=3; the broadcast buffer
+        // then delivers that same result set — must be suppressed.
+        let replay = [result_set(3)];
+        let live = [result_set(3)];
         let printed = events_printed_after_dedup(&replay, &live);
-        assert!(printed.is_empty(), "duplicate-seq snapshot should be suppressed");
-    }
-
-    #[test]
-    fn different_panel_events_are_not_cross_suppressed() {
-        // Replay has "flotilla" at seq=5; a live delta for "other" at seq=5
-        // should still be printed (different StreamKey).
-        let replay = [panel_delta("convoys", 5)];
-        let live = [panel_delta("checkouts", 5)];
-        let printed = events_printed_after_dedup(&replay, &live);
-        assert_eq!(printed.len(), 1, "events for different namespaces should not suppress each other");
+        assert!(printed.is_empty(), "duplicate-seq result set should be suppressed");
     }
 
     #[test]
     fn older_seq_live_event_is_suppressed() {
         // Replay has seq=10; if a stale live event with seq=8 arrives, suppress it.
-        let replay = [panel_snapshot("convoys", 10)];
-        let live = [panel_delta("convoys", 8)];
+        let replay = [result_set(10)];
+        let live = [result_delta(8)];
         let printed = events_printed_after_dedup(&replay, &live);
         assert!(printed.is_empty(), "stale live event (seq < replay_seq) should be suppressed");
     }

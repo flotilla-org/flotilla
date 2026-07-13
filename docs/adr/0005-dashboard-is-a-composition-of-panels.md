@@ -1,6 +1,7 @@
 # The main view is a surface-agnostic composition of panels
 
-**Status:** Accepted
+**Status:** Accepted — amended by ADR 0011 (panels are consumer-side view
+composition; the wire carries named-query result sets, never layout)
 **Date:** 2026-06-25
 
 The main view is modelled as a **View Model**, not a fixed repo-centric table:

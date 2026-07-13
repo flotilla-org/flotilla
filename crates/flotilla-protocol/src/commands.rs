@@ -889,7 +889,7 @@ mod tests {
                     host: crate::HostName::new("desktop"),
                     staleness: FleetStaleness::Local,
                 }],
-                panels: vec![],
+                result_sets: vec![],
             })),
             CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
             CommandValue::EnvironmentCreated { env_id: crate::EnvironmentId::new("env-1") },

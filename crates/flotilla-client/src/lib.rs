@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    Command, ConnectionRole, DaemonEvent, Message, NodeId, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot, Request, Response,
-    ResponseResult, StatusResponse, StreamKey, TopologyResponse, PROTOCOL_VERSION,
+    Command, ConnectionRole, DaemonEvent, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot,
+    Request, Response, ResponseResult, StatusResponse, StreamKey, TopologyResponse, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -23,6 +23,11 @@ use tracing::{debug, error, warn};
 /// avoids the race where a spawned seq update hasn't run before the next delta
 /// arrives.
 type SeqMap = std::sync::RwLock<HashMap<StreamKey, u64>>;
+
+/// Named queries this client is currently subscribed to. Gap recovery
+/// re-subscribes with the full set, since `SubscribeQueries` replaces the
+/// connection's subscription.
+type QuerySet = std::sync::RwLock<HashSet<QueryId>>;
 
 /// RAII guard that removes a lock file when dropped.
 ///
@@ -84,6 +89,7 @@ pub struct SocketDaemon {
     /// Local snapshot seq per repo, for gap detection.
     /// Updated by replay_since (seeding) and the background reader (live events).
     local_seqs: Arc<SeqMap>,
+    subscribed_queries: Arc<QuerySet>,
 }
 
 impl SocketDaemon {
@@ -122,6 +128,7 @@ impl SocketDaemon {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let subscribed_queries: Arc<QuerySet> = Arc::new(std::sync::RwLock::new(HashSet::new()));
         let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Spawn background reader task
@@ -129,6 +136,7 @@ impl SocketDaemon {
         let reader_pending = Arc::clone(&pending);
         let reader_next_id = Arc::clone(&next_id);
         let reader_local_seqs = Arc::clone(&local_seqs);
+        let reader_subscribed = Arc::clone(&subscribed_queries);
         let reader_recovering = Arc::clone(&recovering);
         let reader_event_tx = event_tx.clone();
         let reader_task = tokio::spawn(async move {
@@ -148,6 +156,7 @@ impl SocketDaemon {
                             handle_event(
                                 event,
                                 &reader_local_seqs,
+                                &reader_subscribed,
                                 &reader_recovering,
                                 &reader_event_tx,
                                 &reader_session,
@@ -193,6 +202,7 @@ impl SocketDaemon {
             next_id: Arc::clone(&next_id),
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             local_seqs: Arc::clone(&local_seqs),
+            subscribed_queries: Arc::clone(&subscribed_queries),
         });
 
         Ok(daemon)
@@ -451,9 +461,11 @@ fn into_success_response(result: ResponseResult) -> Result<Response, String> {
 /// This function is non-async and never blocks the reader loop. Gap recovery
 /// is spawned on a separate task to avoid deadlocking the reader (which must
 /// remain free to route the recovery response).
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     event: DaemonEvent,
     local_seqs: &Arc<SeqMap>,
+    subscribed_queries: &Arc<QuerySet>,
     recovering: &Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
     event_tx: &broadcast::Sender<DaemonEvent>,
     session: &Arc<MessageSession>,
@@ -507,6 +519,7 @@ fn handle_event(
                     }
 
                     let local_seqs = Arc::clone(local_seqs);
+                    let subscribed_queries = Arc::clone(subscribed_queries);
                     let recovering = Arc::clone(recovering);
                     let event_tx = event_tx.clone();
                     let session = Arc::clone(session);
@@ -530,7 +543,16 @@ fn handle_event(
                                 debug!("discarding buffered delta already covered by recovery");
                                 continue;
                             }
-                            handle_event(buffered_event, &local_seqs, &recovering, &event_tx, &session, &pending, &next_id);
+                            handle_event(
+                                buffered_event,
+                                &local_seqs,
+                                &subscribed_queries,
+                                &recovering,
+                                &event_tx,
+                                &session,
+                                &pending,
+                                &next_id,
+                            );
                         }
                     });
                 }
@@ -550,37 +572,43 @@ fn handle_event(
             local_seqs.write().expect("sequence lock poisoned").insert(stream_key, snap.seq);
             let _ = event_tx.send(event);
         }
-        DaemonEvent::PanelSnapshot(snap) => {
-            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq);
+        DaemonEvent::ResultSet(result_set) => {
+            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Query { query: result_set.query }, result_set.seq);
             let _ = event_tx.send(event);
         }
-        DaemonEvent::PanelDelta(delta) => {
-            let tab = delta.tab_id.clone();
+        DaemonEvent::ResultDelta(delta) => {
+            let query = delta.query;
             let seq = delta.seq;
-            let stream_key = StreamKey::Panel { tab: tab.clone() };
+            let stream_key = StreamKey::Query { query };
             let local_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
 
             match local_seq {
                 Some(ls) if seq == ls + 1 => {
                     local_seqs.write().expect("sequence lock poisoned").insert(stream_key, seq);
-                    debug!(%tab, %seq, "applied panel delta");
+                    debug!(%query, %seq, "applied result delta");
                     let _ = event_tx.send(event);
+                }
+                Some(ls) if seq <= ls => {
+                    // Already covered by the current result set — e.g. a live
+                    // delta that raced ahead of the subscribe replay. Ignore.
+                    debug!(%query, local_seq = ls, %seq, "ignoring stale result delta");
                 }
                 _ => {
                     if let Some(ls) = local_seq {
-                        warn!(%tab, local_seq = ls, %seq, "panel seq gap, requesting replay");
+                        warn!(%query, local_seq = ls, %seq, "result seq gap, resubscribing");
                     } else {
-                        warn!(%tab, %seq, "received panel delta for unknown tab, requesting replay");
+                        warn!(%query, %seq, "received result delta for unknown query, resubscribing");
                     }
 
                     let local_seqs = Arc::clone(local_seqs);
+                    let subscribed_queries = Arc::clone(subscribed_queries);
                     let event_tx = event_tx.clone();
                     let session = Arc::clone(session);
                     let pending = Arc::clone(pending);
                     let next_id = Arc::clone(next_id);
 
                     tokio::spawn(async move {
-                        recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
+                        recover_query_gap(&local_seqs, &subscribed_queries, &event_tx, &session, &pending, &next_id).await;
                     });
                 }
             }
@@ -650,26 +678,14 @@ async fn recover_from_gap(
                                     seqs.insert(key, *seq);
                                 }
                             }
-                            DaemonEvent::PanelSnapshot(snap) => {
-                                let key = StreamKey::Panel { tab: snap.tab.id.clone() };
-                                let current = seqs.get(&key).copied().unwrap_or(0);
-                                if snap.seq >= current {
-                                    seqs.insert(key, snap.seq);
-                                }
-                            }
-                            DaemonEvent::PanelDelta(delta) => {
-                                let key = StreamKey::Panel { tab: delta.tab_id.clone() };
-                                let current = seqs.get(&key).copied().unwrap_or(0);
-                                if delta.seq >= current {
-                                    seqs.insert(key, delta.seq);
-                                }
-                            }
                             DaemonEvent::RepoTracked(_)
                             | DaemonEvent::RepoUntracked { .. }
                             | DaemonEvent::CommandStarted { .. }
                             | DaemonEvent::CommandFinished { .. }
                             | DaemonEvent::CommandStepUpdate { .. }
-                            | DaemonEvent::PeerStatusChanged { .. } => {}
+                            | DaemonEvent::PeerStatusChanged { .. }
+                            | DaemonEvent::ResultSet(_)
+                            | DaemonEvent::ResultDelta(_) => {}
                         }
                     }
                 }
@@ -686,6 +702,69 @@ async fn recover_from_gap(
         },
         Err(e) => {
             error!(err = %e, "gap recovery: replay_since request failed");
+        }
+    }
+}
+
+/// Build subscribe cursors for the currently subscribed queries from local
+/// seq tracking.
+fn encode_query_cursors(subscribed_queries: &QuerySet, local_seqs: &SeqMap) -> Vec<QueryCursor> {
+    let subscribed = subscribed_queries.read().expect("subscribed queries lock poisoned");
+    let seqs = local_seqs.read().expect("sequence lock poisoned");
+    subscribed.iter().map(|&query| QueryCursor { query, since: seqs.get(&StreamKey::Query { query }).copied() }).collect()
+}
+
+/// Seed local seq tracking from subscribe-replay result sets, monotonically —
+/// a live event may have advanced a query's seq while the request was in
+/// flight.
+fn seed_query_seqs(local_seqs: &SeqMap, events: &[DaemonEvent]) {
+    let mut seqs = local_seqs.write().expect("sequence lock poisoned");
+    for event in events {
+        if let DaemonEvent::ResultSet(result_set) = event {
+            let key = StreamKey::Query { query: result_set.query };
+            seqs.entry(key).and_modify(|seq| *seq = (*seq).max(result_set.seq)).or_insert(result_set.seq);
+        }
+    }
+}
+
+/// Recover from a result-set seq gap by re-subscribing with current cursors;
+/// the daemon replays a full `ResultSet` for each stale query.
+async fn recover_query_gap(
+    local_seqs: &SeqMap,
+    subscribed_queries: &QuerySet,
+    event_tx: &broadcast::Sender<DaemonEvent>,
+    session: &Arc<MessageSession>,
+    pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
+    next_id: &AtomicU64,
+) {
+    let queries = encode_query_cursors(subscribed_queries, local_seqs);
+    // A delta for an unsubscribed query cannot reach this connection, so an
+    // unknown-query gap implies a subscription exists; still, guard the
+    // degenerate empty case.
+    if queries.is_empty() {
+        warn!("query gap recovery skipped: no subscribed queries");
+        return;
+    }
+    let resp = send_request(session.as_ref(), pending, next_id, Request::SubscribeQueries { queries }).await;
+
+    match resp {
+        Ok(result) => match into_success_response(result) {
+            Ok(Response::SubscribeQueries(events)) => {
+                debug!(event_count = events.len(), "query gap recovery: got result sets");
+                seed_query_seqs(local_seqs, &events);
+                for event in events {
+                    let _ = event_tx.send(event);
+                }
+            }
+            Ok(other) => {
+                error!(response = ?other, "query gap recovery: unexpected subscribe_queries response");
+            }
+            Err(e) => {
+                error!(err = %e, "query gap recovery: subscribe_queries returned error response");
+            }
+        },
+        Err(e) => {
+            error!(err = %e, "query gap recovery: subscribe_queries request failed");
         }
     }
 }
@@ -763,19 +842,34 @@ impl DaemonHandle for SocketDaemon {
                     DaemonEvent::RepoDelta(delta) => (StreamKey::Repo { identity: delta.repo_identity.clone() }, delta.seq),
                     DaemonEvent::HostSnapshot(snap) => (StreamKey::Host { environment_id: snap.environment_id.clone() }, snap.seq),
                     DaemonEvent::HostRemoved { environment_id, seq } => (StreamKey::Host { environment_id: environment_id.clone() }, *seq),
-                    DaemonEvent::PanelSnapshot(snap) => (StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq),
-                    DaemonEvent::PanelDelta(delta) => (StreamKey::Panel { tab: delta.tab_id.clone() }, delta.seq),
                     DaemonEvent::RepoTracked(_)
                     | DaemonEvent::RepoUntracked { .. }
                     | DaemonEvent::CommandStarted { .. }
                     | DaemonEvent::CommandFinished { .. }
                     | DaemonEvent::CommandStepUpdate { .. }
-                    | DaemonEvent::PeerStatusChanged { .. } => continue,
+                    | DaemonEvent::PeerStatusChanged { .. }
+                    | DaemonEvent::ResultSet(_)
+                    | DaemonEvent::ResultDelta(_) => continue,
                 };
                 seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
             }
         }
 
+        Ok(events)
+    }
+
+    async fn subscribe_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        // Record the subscription before sending so a delta racing ahead of
+        // the response finds the query known and recovery can re-subscribe.
+        {
+            let mut subscribed = self.subscribed_queries.write().expect("subscribed queries lock poisoned");
+            *subscribed = queries.iter().map(|cursor| cursor.query).collect();
+        }
+        let events = match into_success_response(self.request(Request::SubscribeQueries { queries: queries.to_vec() }).await?)? {
+            Response::SubscribeQueries(events) => events,
+            other => return Err(format!("unexpected response for subscribe_queries: {other:?}")),
+        };
+        seed_query_seqs(&self.local_seqs, &events);
         Ok(events)
     }
 

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use flotilla_protocol::{
-    panel::{PanelDelta, PanelSnapshot, TabView},
     qualified_path::HostId,
+    result_set::{QueryId, ResultDelta, ResultSet, Rows},
     EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -47,6 +47,14 @@ fn make_snapshot(repo: &Path, seq: u64) -> RepoSnapshot {
 
 fn make_delta(repo: &Path, prev_seq: u64, seq: u64) -> RepoDelta {
     RepoDelta { seq, prev_seq, repo_identity: repo_identity(), repo: Some(repo.to_path_buf()), changes: vec![], work_items: vec![] }
+}
+
+fn no_subscriptions() -> Arc<QuerySet> {
+    Arc::new(std::sync::RwLock::new(HashSet::new()))
+}
+
+fn convoys_subscription() -> Arc<QuerySet> {
+    Arc::new(std::sync::RwLock::new(HashSet::from([QueryId::Convoys])))
 }
 
 fn request_harness() -> RequestHarness {
@@ -277,6 +285,7 @@ async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
     handle_event(
         DaemonEvent::RepoSnapshot(Box::new(make_snapshot(&repo, 10))),
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -286,6 +295,7 @@ async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 10, 11))),
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -313,6 +323,7 @@ async fn handle_event_buffers_delta_when_recovery_already_running() {
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 99, 100))),
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -401,6 +412,7 @@ async fn handle_event_starts_recovery_for_unknown_repo_delta() {
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 0, 1))),
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -428,6 +440,7 @@ async fn handle_event_starts_recovery_on_seq_gap() {
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 10, 11))),
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -460,7 +473,16 @@ async fn handle_event_forwards_repo_added() {
         provider_health: HashMap::new(),
         loading: false,
     };
-    handle_event(DaemonEvent::RepoTracked(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &session, &pending, &next_id);
+    handle_event(
+        DaemonEvent::RepoTracked(Box::new(repo_info)),
+        &local_seqs,
+        &no_subscriptions(),
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
 
     let event = event_rx.try_recv().expect("should receive RepoTracked");
     assert!(matches!(event, DaemonEvent::RepoTracked(_)));
@@ -482,6 +504,7 @@ async fn handle_event_forwards_command_started() {
             description: "testing".into(),
         },
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -509,6 +532,7 @@ async fn handle_event_forwards_command_finished() {
             result: flotilla_protocol::commands::CommandValue::Ok,
         },
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -539,6 +563,7 @@ async fn handle_event_forwards_command_step_update() {
             status: flotilla_protocol::commands::StepStatus::Started,
         },
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -560,6 +585,7 @@ async fn handle_event_forwards_peer_status_changed() {
     handle_event(
         DaemonEvent::PeerStatusChanged { node_id: NodeId::new("peer-1"), status: flotilla_protocol::PeerConnectionState::Connected },
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -582,6 +608,7 @@ async fn handle_event_forwards_host_removed_and_tracks_seq() {
     handle_event(
         DaemonEvent::HostRemoved { environment_id: environment_id.clone(), seq: 9 },
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -608,6 +635,7 @@ async fn handle_event_repo_removed_evicts_seq_and_forwards() {
     handle_event(
         DaemonEvent::RepoUntracked { path: Some(repo.clone()), repo_identity: repo_identity() },
         &local_seqs,
+        &no_subscriptions(),
         &recovering,
         &event_tx,
         &session,
@@ -852,26 +880,27 @@ async fn recover_from_gap_handles_empty_replay() {
     assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&StreamKey::Repo { identity: repo_identity() }), Some(&5));
 }
 
-// --- Panel stream gap detection ---
+// --- Query result stream gap detection ---
 
-fn make_panel_snapshot(tab: &str, seq: u64) -> PanelSnapshot {
-    PanelSnapshot { seq, tab: TabView { id: tab.to_string(), title: "Convoys".to_string(), panels: vec![] } }
+fn make_result_set(seq: u64) -> ResultSet {
+    ResultSet { query: QueryId::Convoys, seq, rows: Rows::Convoys(vec![]) }
 }
 
-fn make_panel_delta(tab: &str, seq: u64) -> PanelDelta {
-    PanelDelta { seq, tab_id: tab.to_string(), panels: vec![] }
+fn make_result_delta(seq: u64) -> ResultDelta {
+    ResultDelta { query: QueryId::Convoys, seq, changed: Rows::Convoys(vec![]), removed: vec![] }
 }
 
 #[tokio::test]
-async fn handle_event_panel_snapshot_updates_local_seq_and_forwards() {
+async fn handle_event_result_set_updates_local_seq_and_forwards() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
-        DaemonEvent::PanelSnapshot(Box::new(make_panel_snapshot("convoys", 5))),
+        DaemonEvent::ResultSet(Box::new(make_result_set(5))),
         &local_seqs,
+        &convoys_subscription(),
         &recovering,
         &event_tx,
         &session,
@@ -879,23 +908,24 @@ async fn handle_event_panel_snapshot_updates_local_seq_and_forwards() {
         &next_id,
     );
 
-    let event = event_rx.try_recv().expect("should receive PanelSnapshot");
-    assert!(matches!(event, DaemonEvent::PanelSnapshot(_)));
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(5));
+    let event = event_rx.try_recv().expect("should receive ResultSet");
+    assert!(matches!(event, DaemonEvent::ResultSet(_)));
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(5));
 }
 
 #[tokio::test]
-async fn handle_event_panel_delta_happy_path_applies_and_forwards() {
+async fn handle_event_result_delta_happy_path_applies_and_forwards() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Panel { tab: "convoys".into() }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
 
     // seq=2, local is 1 — exactly one ahead, happy path.
     handle_event(
-        DaemonEvent::PanelDelta(Box::new(make_panel_delta("convoys", 2))),
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(2))),
         &local_seqs,
+        &convoys_subscription(),
         &recovering,
         &event_tx,
         &session,
@@ -903,23 +933,49 @@ async fn handle_event_panel_delta_happy_path_applies_and_forwards() {
         &next_id,
     );
 
-    let event = event_rx.try_recv().expect("should receive PanelDelta");
-    assert!(matches!(event, DaemonEvent::PanelDelta(_)));
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(2));
+    let event = event_rx.try_recv().expect("should receive ResultDelta");
+    assert!(matches!(event, DaemonEvent::ResultDelta(_)));
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(2));
 }
 
 #[tokio::test]
-async fn handle_event_panel_delta_seq_gap_triggers_recovery() {
+async fn handle_event_result_delta_stale_seq_is_ignored() {
+    let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    // Local seq is 5 — a delta at seq 5 is already covered by the current
+    // result set (e.g. it raced ahead of the subscribe replay).
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 5);
+    let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (event_tx, mut event_rx) = broadcast::channel(16);
+    let (session, pending, next_id, _server) = event_harness();
+
+    handle_event(
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(5))),
+        &local_seqs,
+        &convoys_subscription(),
+        &recovering,
+        &event_tx,
+        &session,
+        &pending,
+        &next_id,
+    );
+
+    assert!(event_rx.try_recv().is_err(), "stale delta must not be forwarded");
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(5));
+}
+
+#[tokio::test]
+async fn handle_event_result_delta_seq_gap_triggers_resubscribe() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     // Local seq is 1, but incoming delta seq is 3 — seq 2 was dropped.
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Panel { tab: "convoys".into() }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (session, pending, next_id, server) = event_harness();
 
     handle_event(
-        DaemonEvent::PanelDelta(Box::new(make_panel_delta("convoys", 3))),
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(3))),
         &local_seqs,
+        &convoys_subscription(),
         &recovering,
         &event_tx,
         &session,
@@ -927,25 +983,30 @@ async fn handle_event_panel_delta_seq_gap_triggers_recovery() {
         &next_id,
     );
 
-    // Recovery should be spawned: a ReplaySince request should arrive on the server end.
+    // Recovery should be spawned: a SubscribeQueries request should arrive
+    // with the current cursor.
     let (_, request) = tokio::time::timeout(std::time::Duration::from_secs(1), read_request(&server))
         .await
-        .expect("expected ReplaySince request within 1 second");
+        .expect("expected SubscribeQueries request within 1 second");
 
-    assert!(matches!(request, Request::ReplaySince { .. }), "panel seq gap should trigger a ReplaySince request, got: {request:?}");
+    let Request::SubscribeQueries { queries } = request else {
+        panic!("result seq gap should trigger a SubscribeQueries request, got: {request:?}");
+    };
+    assert_eq!(queries, vec![QueryCursor { query: QueryId::Convoys, since: Some(1) }]);
 }
 
 #[tokio::test]
-async fn handle_event_panel_delta_for_unknown_tab_triggers_recovery() {
+async fn handle_event_result_delta_for_unknown_query_triggers_resubscribe() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    // No local seq for "flotilla" at all.
+    // Subscribed, but no result set applied yet.
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (session, pending, next_id, server) = event_harness();
 
     handle_event(
-        DaemonEvent::PanelDelta(Box::new(make_panel_delta("convoys", 1))),
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(1))),
         &local_seqs,
+        &convoys_subscription(),
         &recovering,
         &event_tx,
         &session,
@@ -953,12 +1014,12 @@ async fn handle_event_panel_delta_for_unknown_tab_triggers_recovery() {
         &next_id,
     );
 
-    // Recovery should be spawned: a ReplaySince request should arrive.
+    // Recovery should be spawned: a SubscribeQueries request should arrive.
     let (_, request) = tokio::time::timeout(std::time::Duration::from_secs(1), read_request(&server))
         .await
-        .expect("expected ReplaySince request within 1 second for unknown panel delta");
+        .expect("expected SubscribeQueries request within 1 second for unknown query delta");
 
-    assert!(matches!(request, Request::ReplaySince { .. }), "delta for unknown panel should trigger recovery, got: {request:?}");
+    assert!(matches!(request, Request::SubscribeQueries { .. }), "delta for unknown query should trigger resubscribe, got: {request:?}");
 }
 
 // --- ResponseResult helper paths ---
