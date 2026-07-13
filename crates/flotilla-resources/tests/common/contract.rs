@@ -76,13 +76,13 @@ impl ResourceContractFixture for WorkflowTemplateFixture {
     }
 
     fn assert_created(created: &ResourceObject<Self::Resource>) {
-        assert_eq!(created.spec.tasks.len(), 2);
+        assert_eq!(created.spec.vessels.len(), 2);
         assert!(created.status.is_none());
     }
 
     fn assert_updated(updated: &ResourceObject<Self::Resource>) {
-        match &updated.spec.tasks[0].processes[1].source {
-            flotilla_resources::ProcessSource::Tool { command } => assert_eq!(command, "cargo check --all-targets"),
+        match &updated.spec.vessels[0].crew[1].source {
+            flotilla_resources::CrewSource::Tool { command } => assert_eq!(command, "cargo check --all-targets"),
             other => panic!("expected tool process, got {other:?}"),
         }
     }
@@ -377,7 +377,7 @@ pub async fn assert_metadata_roundtrip_with_backend<F: ResourceContractFixture>(
     meta.annotations.insert("note".to_string(), "preserve-me".to_string());
     meta.owner_references = vec![OwnerReference {
         api_version: "flotilla.work/v1".to_string(),
-        kind: "TaskWorkspace".to_string(),
+        kind: "Vessel".to_string(),
         name: "alpha-implement".to_string(),
         controller: true,
     }];

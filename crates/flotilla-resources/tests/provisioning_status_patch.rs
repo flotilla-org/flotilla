@@ -2,8 +2,8 @@ use chrono::{TimeZone, Utc};
 use flotilla_resources::{
     CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus, CloneStatusPatch, EnvironmentPhase, EnvironmentStatus,
     EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, PresentationPhase, PresentationStatus,
-    PresentationStatusPatch, StatusPatch, TaskWorkspacePhase, TaskWorkspaceStatus, TaskWorkspaceStatusPatch, TerminalSessionPhase,
-    TerminalSessionStatus, TerminalSessionStatusPatch,
+    PresentationStatusPatch, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase,
+    VesselStatus, VesselStatusPatch,
 };
 
 #[test]
@@ -131,21 +131,21 @@ fn terminal_session_failure_is_distinct_from_a_stopped_crew_member_and_can_resta
 }
 
 #[test]
-fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
-    let mut status = TaskWorkspaceStatus::default();
+fn vessel_status_patch_marks_provisioning_ready_and_failed() {
+    let mut status = VesselStatus::default();
     let started_at = Utc.timestamp_opt(10, 0).single().expect("timestamp");
     let ready_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
 
-    TaskWorkspaceStatusPatch::MarkProvisioning {
+    VesselStatusPatch::MarkProvisioning {
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "12".to_string(),
         started_at,
     }
     .apply(&mut status);
-    assert_eq!(status.phase, TaskWorkspacePhase::Provisioning);
+    assert_eq!(status.phase, VesselPhase::Provisioning);
     assert_eq!(status.observed_policy_ref.as_deref(), Some("docker-on-01HXYZ"));
 
-    TaskWorkspaceStatusPatch::MarkProvisioning {
+    VesselStatusPatch::MarkProvisioning {
         observed_policy_ref: "docker-on-01HXYZ".to_string(),
         observed_policy_version: "13".to_string(),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
@@ -153,17 +153,17 @@ fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
     .apply(&mut status);
     assert_eq!(status.started_at, Some(started_at), "reconcile must not restamp an in-progress transition");
 
-    TaskWorkspaceStatusPatch::MarkReady {
+    VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
         checkout_ref: Some("checkout-a".to_string()),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         ready_at,
     }
     .apply(&mut status);
-    assert_eq!(status.phase, TaskWorkspacePhase::Ready);
+    assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.terminal_session_refs.len(), 2);
 
-    TaskWorkspaceStatusPatch::MarkReady {
+    VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
         checkout_ref: Some("checkout-a".to_string()),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
@@ -172,8 +172,8 @@ fn task_workspace_status_patch_marks_provisioning_ready_and_failed() {
     .apply(&mut status);
     assert_eq!(status.ready_at, Some(ready_at), "reconcile must not restamp an established Ready transition");
 
-    TaskWorkspaceStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
-    assert_eq!(status.phase, TaskWorkspacePhase::Failed);
+    VesselStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
+    assert_eq!(status.phase, VesselPhase::Failed);
     assert_eq!(status.message.as_deref(), Some("clone failed"));
 }
 

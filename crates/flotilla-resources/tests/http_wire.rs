@@ -241,7 +241,7 @@ async fn filtered_list_encodes_exact_match_label_selector() {
     let resolver = backend.using::<Convoy>("flotilla");
     let selector = BTreeMap::from([
         ("flotilla.work/convoy".to_string(), "convoy-a".to_string()),
-        ("flotilla.work/task".to_string(), "implement".to_string()),
+        ("flotilla.work/vessel".to_string(), "implement".to_string()),
     ]);
 
     let listed = resolver.list_matching_labels(&selector).await.expect("filtered list should succeed");
@@ -249,7 +249,7 @@ async fn filtered_list_encodes_exact_match_label_selector() {
     assert!(listed.items.is_empty());
     let request = request_rx.await.expect("captured request");
     assert!(
-        request.contains("/apis/flotilla.work/v1/namespaces/flotilla/convoys?labelSelector=flotilla.work%2Fconvoy%3Dconvoy-a%2Cflotilla.work%2Ftask%3Dimplement"),
+        request.contains("/apis/flotilla.work/v1/namespaces/flotilla/convoys?labelSelector=flotilla.work%2Fconvoy%3Dconvoy-a%2Cflotilla.work%2Fvessel%3Dimplement"),
         "unexpected request: {request}"
     );
 }

@@ -132,7 +132,7 @@ pub struct RenderContext<'a> {
     /// Currently selected convoy id for the Convoys tab.
     pub convoys_selected: Option<crate::convoy_model::ConvoyId>,
     /// Currently selected task name within the selected convoy, if any.
-    pub convoys_selected_task: Option<&'a str>,
+    pub convoys_selected_vessel: Option<&'a str>,
     /// Which pane (list / tasks) currently has focus on the Convoys tab.
     pub convoys_focus: crate::app::ConvoysFocus,
     /// Active filter string for the Convoys tab.

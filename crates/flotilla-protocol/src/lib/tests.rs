@@ -552,10 +552,10 @@ fn panel_stream_round_trips_a_resource_backed_leg_dag() {
     };
 
     let convoy_ref = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "fix-bug-123");
-    let implement_ref = convoy_ref.subresource("legs/implement");
-    let review_ref = convoy_ref.subresource("legs/review");
+    let implement_ref = convoy_ref.subresource("vessels/implement");
+    let review_ref = convoy_ref.subresource("vessels/review");
     let attach = IntentDefinition::new("attach", "Attach", IntentKind::Attach);
-    let complete = IntentDefinition::new("complete-leg", "Complete leg", IntentKind::CompleteLeg);
+    let complete = IntentDefinition::new("complete-work", "Complete work", IntentKind::CompleteWork);
     let panel = PanelView {
         id: PanelId::new("convoys"),
         title: "Convoys".into(),
@@ -578,8 +578,8 @@ fn panel_stream_round_trips_a_resource_backed_leg_dag() {
                         ("phase".into(), PanelValue::String("running".into())),
                     ]),
                     intents: vec![
-                        RowIntent::vessel("attach", "ws-1", HostName::new("local")),
-                        RowIntent::leg("complete-leg", "flotilla", "fix-bug-123", "implement", HostName::new("local")),
+                        RowIntent::vessel("attach", "flotilla", "fix-bug-123", "implement", HostName::new("local"), Some("ws-1".into())),
+                        RowIntent::vessel("complete-work", "flotilla", "fix-bug-123", "implement", HostName::new("local"), None),
                     ],
                     children: vec![],
                     depends_on: vec![],

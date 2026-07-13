@@ -40,7 +40,7 @@ pub trait PresentationRuntime: Send + Sync {
 pub struct PresentationPlan {
     pub policy: String,
     pub name: String,
-    pub processes: Vec<ResolvedProcess>,
+    pub crew: Vec<ResolvedProcess>,
     pub presentation_local_cwd: ExecutionEnvironmentPath,
     pub previous: Option<PreviousWorkspace>,
     pub spec_hash: String,
@@ -366,7 +366,7 @@ where
         let plan = PresentationPlan {
             policy: obj.spec.presentation_policy_ref.clone(),
             name: obj.spec.name.clone(),
-            processes,
+            crew: processes,
             presentation_local_cwd: self.hop_chain.presentation_local_cwd(),
             previous,
             spec_hash,
@@ -439,10 +439,8 @@ impl PresentationRuntime for ProviderPresentationRuntime {
             .presentation_managers
             .preferred_with_desc()
             .ok_or_else(|| ApplyPresentationError::Failed("no presentation manager configured".to_string()))?;
-        let rendered = policy.render(&plan.processes, &PolicyContext {
-            name: plan.name.clone(),
-            presentation_local_cwd: plan.presentation_local_cwd.clone(),
-        });
+        let rendered = policy
+            .render(&plan.crew, &PolicyContext { name: plan.name.clone(), presentation_local_cwd: plan.presentation_local_cwd.clone() });
 
         let mut tore_down_previous = false;
         if let Some(previous) = &plan.previous {
@@ -578,8 +576,8 @@ fn has_any_observed_state(status: Option<&PresentationStatus>) -> bool {
 
 fn session_sort_key(session: &ResourceObject<TerminalSession>) -> (&str, &str, &str) {
     (
-        session.metadata.labels.get(flotilla_resources::TASK_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
-        session.metadata.labels.get(flotilla_resources::PROCESS_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
+        session.metadata.labels.get(flotilla_resources::VESSEL_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
+        session.metadata.labels.get(flotilla_resources::CREW_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
         session.metadata.name.as_str(),
     )
 }

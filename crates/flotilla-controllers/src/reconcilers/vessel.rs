@@ -8,18 +8,18 @@ use flotilla_resources::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
-    DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
-    FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority,
-    OwnerReference, PlacementPolicy, PlacementPolicySpec, ProcessSource, Resource, ResourceBackend, ResourceError, ResourceObject,
-    TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceStatusPatch, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSpec, TypedResolver, TASK_WORKSPACE_LABEL,
+    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
+    VesselStatusPatch, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
 
-pub struct TaskWorkspaceReconciler {
+pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     placement_policies: TypedResolver<PlacementPolicy>,
     environments: TypedResolver<Environment>,
@@ -29,7 +29,7 @@ pub struct TaskWorkspaceReconciler {
     namespace: String,
 }
 
-impl TaskWorkspaceReconciler {
+impl VesselReconciler {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
         Self {
             convoys: backend.clone().using::<Convoy>(namespace),
@@ -42,12 +42,12 @@ impl TaskWorkspaceReconciler {
         }
     }
 
-    pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = TaskWorkspace>>> {
+    pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
         vec![
-            Box::new(LabelMappedWatch::<Environment, TaskWorkspace> { label_key: TASK_WORKSPACE_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<Checkout, TaskWorkspace> { label_key: TASK_WORKSPACE_LABEL, _marker: PhantomData }),
-            Box::new(LabelMappedWatch::<TerminalSession, TaskWorkspace> { label_key: TASK_WORKSPACE_LABEL, _marker: PhantomData }),
-            Box::new(LabelJoinWatch::<Clone, TaskWorkspace> { label_key: REPO_KEY_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<Environment, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<Checkout, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
+            Box::new(LabelJoinWatch::<Clone, Vessel> { label_key: REPO_KEY_LABEL, _marker: PhantomData }),
         ]
     }
 }
@@ -85,21 +85,17 @@ enum PlannedPatch {
 }
 
 #[derive(Debug, Clone)]
-pub struct TaskWorkspaceDeps {
+pub struct VesselDeps {
     patch: PlannedPatch,
     actuations: Vec<Actuation>,
 }
 
-impl TaskWorkspaceDeps {
+impl VesselDeps {
     fn none() -> Self {
         Self { patch: PlannedPatch::None, actuations: Vec::new() }
     }
 
-    fn provisioning(
-        obj: &ResourceObject<TaskWorkspace>,
-        placement_policy: &ResourceObject<PlacementPolicy>,
-        actuations: Vec<Actuation>,
-    ) -> Self {
+    fn provisioning(obj: &ResourceObject<Vessel>, placement_policy: &ResourceObject<PlacementPolicy>, actuations: Vec<Actuation>) -> Self {
         Self { patch: provisioning_patch(obj, placement_policy), actuations }
     }
 
@@ -112,55 +108,53 @@ impl TaskWorkspaceDeps {
     }
 }
 
-impl Reconciler for TaskWorkspaceReconciler {
-    type Resource = TaskWorkspace;
-    type Dependencies = TaskWorkspaceDeps;
+impl Reconciler for VesselReconciler {
+    type Resource = Vessel;
+    type Dependencies = VesselDeps;
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
-        if obj.status.as_ref().map(|status| status.phase) == Some(TaskWorkspacePhase::Failed) {
-            return Ok(TaskWorkspaceDeps::none());
+        if obj.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Failed) {
+            return Ok(VesselDeps::none());
         }
 
         let convoy = match self.convoys.get(&obj.spec.convoy_ref).await {
             Ok(convoy) => convoy,
-            Err(ResourceError::NotFound { .. }) => {
-                return Ok(TaskWorkspaceDeps::failed(format!("convoy {} not found", obj.spec.convoy_ref)))
-            }
+            Err(ResourceError::NotFound { .. }) => return Ok(VesselDeps::failed(format!("convoy {} not found", obj.spec.convoy_ref))),
             Err(err) => return Err(err),
         };
         let placement_policy = match self.placement_policies.get(&obj.spec.placement_policy_ref).await {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
-                return Ok(TaskWorkspaceDeps::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
+                return Ok(VesselDeps::failed(format!("placement policy {} not found", obj.spec.placement_policy_ref)))
             }
             Err(err) => return Err(err),
         };
         let strategy = match placement_strategy(&placement_policy.spec) {
             Ok(strategy) => strategy,
-            Err(message) => return Ok(TaskWorkspaceDeps::failed(message)),
+            Err(message) => return Ok(VesselDeps::failed(message)),
         };
 
-        let (task_index, task) = match convoy
+        let (vessel_index, requirement) = match convoy
             .status
             .as_ref()
             .and_then(|status| status.workflow_snapshot.as_ref())
-            .and_then(|snapshot| snapshot.tasks.iter().enumerate().find(|(_, task)| task.name == obj.spec.task))
+            .and_then(|snapshot| snapshot.vessels.iter().enumerate().find(|(_, vessel)| vessel.name == obj.spec.vessel_name))
         {
-            Some((task_index, task)) => (task_index, task),
-            None => return Ok(TaskWorkspaceDeps::failed(format!("task {} missing from convoy snapshot", obj.spec.task))),
+            Some((vessel_index, requirement)) => (vessel_index, requirement),
+            None => return Ok(VesselDeps::failed(format!("vessel {} missing from convoy snapshot", obj.spec.vessel_name))),
         };
 
         let repo_url = match convoy.spec.repository.as_ref().map(|repository| repository.url.clone()) {
             Some(url) => url,
-            None => return Ok(TaskWorkspaceDeps::failed("convoy repository URL is missing".to_string())),
+            None => return Ok(VesselDeps::failed("convoy repository URL is missing".to_string())),
         };
         let git_ref = match convoy.spec.r#ref.clone() {
             Some(git_ref) => git_ref,
-            None => return Ok(TaskWorkspaceDeps::failed("convoy ref is missing".to_string())),
+            None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
         };
         let canonical_repo = match canonicalize_repo_url(&repo_url) {
             Ok(url) => url,
-            Err(err) => return Ok(TaskWorkspaceDeps::failed(err)),
+            Err(err) => return Ok(VesselDeps::failed(err)),
         };
         let repo_key = repo_key(&canonical_repo);
         let repo_slug = descriptive_repo_slug(&canonical_repo);
@@ -173,16 +167,16 @@ impl Reconciler for TaskWorkspaceReconciler {
             let clone_env = match self.environments.get(&clone_env_ref).await {
                 Ok(environment) => environment,
                 Err(ResourceError::NotFound { .. }) => {
-                    return Ok(TaskWorkspaceDeps::failed(format!("host-direct environment {clone_env_ref} not found")))
+                    return Ok(VesselDeps::failed(format!("host-direct environment {clone_env_ref} not found")))
                 }
                 Err(err) => return Err(err),
             };
             let clone_env_spec = match clone_env.spec.host_direct.as_ref() {
                 Some(spec) => spec,
-                None => return Ok(TaskWorkspaceDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
+                None => return Ok(VesselDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
             };
             if clone_env.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
             }
 
             let clone_name = format!("clone-{}", clone_key(&canonical_repo, &clone_env_ref));
@@ -191,10 +185,10 @@ impl Reconciler for TaskWorkspaceReconciler {
                 Ok(existing) => {
                     let existing_repo = match canonicalize_repo_url(&existing.spec.url) {
                         Ok(url) => url,
-                        Err(err) => return Ok(TaskWorkspaceDeps::failed(err)),
+                        Err(err) => return Ok(VesselDeps::failed(err)),
                     };
                     if existing_repo != canonical_repo || existing.spec.env_ref != clone_env_ref {
-                        return Ok(TaskWorkspaceDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
+                        return Ok(VesselDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
                     }
                     if existing.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
                         let message = existing
@@ -202,10 +196,10 @@ impl Reconciler for TaskWorkspaceReconciler {
                             .as_ref()
                             .and_then(|status| status.message.clone())
                             .unwrap_or_else(|| format!("clone {clone_name} failed"));
-                        return Ok(TaskWorkspaceDeps::failed(message));
+                        return Ok(VesselDeps::failed(message));
                     }
                     if existing.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                        return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {
@@ -220,7 +214,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                             .build(),
                         spec: CloneSpec { url: repo_url.clone(), env_ref: clone_env_ref.clone(), path: clone_path },
                     });
-                    return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                 }
                 Err(err) => return Err(err),
             }
@@ -241,10 +235,10 @@ impl Reconciler for TaskWorkspaceReconciler {
                                 .as_ref()
                                 .and_then(|status| status.message.clone())
                                 .unwrap_or_else(|| format!("environment {env_name} failed"));
-                            return Ok(TaskWorkspaceDeps::failed(message));
+                            return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                            return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -260,7 +254,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                                 }),
                             },
                         });
-                        return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                     }
                     Err(err) => return Err(err),
                 }
@@ -275,13 +269,13 @@ impl Reconciler for TaskWorkspaceReconciler {
                 let clone_env = match self.environments.get(&clone_env_ref).await {
                     Ok(environment) => environment,
                     Err(ResourceError::NotFound { .. }) => {
-                        return Ok(TaskWorkspaceDeps::failed(format!("host-direct environment {clone_env_ref} not found")))
+                        return Ok(VesselDeps::failed(format!("host-direct environment {clone_env_ref} not found")))
                     }
                     Err(err) => return Err(err),
                 };
                 let clone_env_spec = match clone_env.spec.host_direct.as_ref() {
                     Some(spec) => spec,
-                    None => return Ok(TaskWorkspaceDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
+                    None => return Ok(VesselDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
                 };
                 checkout_target_path(&clone_env_spec.repo_default_dir, &repo_slug, &obj.metadata.name)
             }
@@ -292,7 +286,7 @@ impl Reconciler for TaskWorkspaceReconciler {
         match self.checkouts.get(&checkout_name).await {
             Ok(existing) => {
                 if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
-                    return Ok(TaskWorkspaceDeps::failed(format!("checkout {checkout_name} is not adopted")));
+                    return Ok(VesselDeps::failed(format!("checkout {checkout_name} is not adopted")));
                 }
                 if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
                     let message = existing
@@ -300,7 +294,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                         .as_ref()
                         .and_then(|status| status.message.clone())
                         .unwrap_or_else(|| format!("checkout {checkout_name} failed"));
-                    return Ok(TaskWorkspaceDeps::failed(message));
+                    return Ok(VesselDeps::failed(message));
                 }
                 if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
                     let Some(path) = existing
@@ -309,16 +303,16 @@ impl Reconciler for TaskWorkspaceReconciler {
                         .and_then(|status| status.path.clone())
                         .or_else(|| existing.spec.target_path().map(str::to_string))
                     else {
-                        return Ok(TaskWorkspaceDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
+                        return Ok(VesselDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
                     };
                     checkout_ready_path = path;
                 } else {
-                    return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                 }
             }
             Err(ResourceError::NotFound { .. }) => {
                 if adopted_checkout_ref.is_some() {
-                    return Ok(TaskWorkspaceDeps::failed(format!("adopted checkout {checkout_name} not found")));
+                    return Ok(VesselDeps::failed(format!("adopted checkout {checkout_name} not found")));
                 }
                 let spec = match &strategy {
                     PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
@@ -341,7 +335,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                     meta: owned_child_meta(&checkout_name, obj, BTreeMap::from([(ENV_LABEL.to_string(), env_ref)])),
                     spec,
                 });
-                return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
             }
             Err(err) => return Err(err),
         }
@@ -352,15 +346,15 @@ impl Reconciler for TaskWorkspaceReconciler {
                 let environment = match self.environments.get(&env_name).await {
                     Ok(environment) => environment,
                     Err(ResourceError::NotFound { .. }) => {
-                        return Ok(TaskWorkspaceDeps::failed(format!("host-direct environment {env_name} not found")))
+                        return Ok(VesselDeps::failed(format!("host-direct environment {env_name} not found")))
                     }
                     Err(err) => return Err(err),
                 };
                 if environment.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
-                    return Ok(TaskWorkspaceDeps::failed(format!("environment {env_name} failed")));
+                    return Ok(VesselDeps::failed(format!("environment {env_name} failed")));
                 }
                 if environment.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                    return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                 }
                 env_name
             }
@@ -374,10 +368,10 @@ impl Reconciler for TaskWorkspaceReconciler {
                                 .as_ref()
                                 .and_then(|status| status.message.clone())
                                 .unwrap_or_else(|| format!("environment {env_name} failed"));
-                            return Ok(TaskWorkspaceDeps::failed(message));
+                            return Ok(VesselDeps::failed(message));
                         }
                         if existing.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
-                            return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                            return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
@@ -397,7 +391,7 @@ impl Reconciler for TaskWorkspaceReconciler {
                                 }),
                             },
                         });
-                        return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                     }
                     Err(err) => return Err(err),
                 }
@@ -408,17 +402,17 @@ impl Reconciler for TaskWorkspaceReconciler {
             }
         };
 
-        let first_agent_index = task.processes.iter().position(|process| matches!(process.source, ProcessSource::Agent { .. }));
+        let first_agent_index = requirement.crew.iter().position(|process| matches!(process.source, CrewSource::Agent { .. }));
         let mut terminal_refs = Vec::new();
-        for (process_index, process) in task.processes.iter().enumerate() {
-            let should_start = matches!(process.source, ProcessSource::Tool { .. }) || first_agent_index == Some(process_index);
+        for (crew_index, process) in requirement.crew.iter().enumerate() {
+            let should_start = matches!(process.source, CrewSource::Tool { .. }) || first_agent_index == Some(crew_index);
             let identity = TerminalSessionIdentity::builder()
-                .vessel(obj.metadata.name.clone())
+                .vessel_ref(obj.metadata.name.clone())
                 .convoy(obj.spec.convoy_ref.clone())
-                .leg(obj.spec.task.clone())
+                .vessel(obj.spec.vessel_name.clone())
                 .role(process.role.clone())
-                .task_index(task_index)
-                .process_index(process_index)
+                .vessel_index(vessel_index)
+                .crew_index(crew_index)
                 .labels(process.labels.clone())
                 .build();
             let terminal_name = identity.name();
@@ -427,20 +421,20 @@ impl Reconciler for TaskWorkspaceReconciler {
                     terminal_refs.push(terminal_name.clone());
                     let phase = existing.status.as_ref().map(|status| status.phase);
                     if phase == Some(TerminalSessionPhase::Failed)
-                        || (phase == Some(TerminalSessionPhase::Stopped) && matches!(process.source, ProcessSource::Tool { .. }))
+                        || (phase == Some(TerminalSessionPhase::Stopped) && matches!(process.source, CrewSource::Tool { .. }))
                     {
                         let message = existing
                             .status
                             .as_ref()
                             .and_then(|status| status.message.clone())
                             .unwrap_or_else(|| format!("terminal session {terminal_name} stopped"));
-                        return Ok(TaskWorkspaceDeps::failed(message));
+                        return Ok(VesselDeps::failed(message));
                     }
                     if phase == Some(TerminalSessionPhase::Stopped) {
                         continue;
                     }
                     if should_start && phase != Some(TerminalSessionPhase::Running) {
-                        return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                     }
                 }
                 Err(ResourceError::NotFound { .. }) => {
@@ -448,31 +442,31 @@ impl Reconciler for TaskWorkspaceReconciler {
                         continue;
                     }
                     let source = match &process.source {
-                        ProcessSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },
-                        ProcessSource::Agent { selector, prompt } => {
+                        CrewSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },
+                        CrewSource::Agent { selector, prompt } => {
                             let context = flotilla_resources::TerminalCrewContext {
                                 namespace: self.namespace.clone(),
                                 convoy: obj.spec.convoy_ref.clone(),
-                                vessel: obj.metadata.name.clone(),
+                                vessel_ref: obj.metadata.name.clone(),
                             };
-                            let members = task
-                                .processes
+                            let members = requirement
+                                .crew
                                 .iter()
                                 .enumerate()
                                 .map(|(index, member)| CrewBriefMember {
                                     role: member.role.clone(),
-                                    state: if matches!(member.source, ProcessSource::Tool { .. }) || first_agent_index == Some(index) {
+                                    state: if matches!(member.source, CrewSource::Tool { .. }) || first_agent_index == Some(index) {
                                         "active"
                                     } else {
                                         "latent"
                                     }
                                     .to_string(),
-                                    is_agent: matches!(member.source, ProcessSource::Agent { .. }),
+                                    is_agent: matches!(member.source, CrewSource::Agent { .. }),
                                 })
                                 .collect::<Vec<_>>();
                             flotilla_resources::TerminalSessionSource::Agent {
                                 selector: selector.clone(),
-                                brief: build_crew_brief(&context, &obj.spec.task, &process.role, prompt.as_deref(), &members),
+                                brief: build_crew_brief(&context, &obj.spec.vessel_name, &process.role, prompt.as_deref(), &members),
                                 context,
                                 message: None,
                             }
@@ -488,13 +482,13 @@ impl Reconciler for TaskWorkspaceReconciler {
                             pool: strategy.pool().to_string(),
                         },
                     });
-                    return Ok(TaskWorkspaceDeps::provisioning(obj, &placement_policy, actuations));
+                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                 }
                 Err(err) => return Err(err),
             }
         }
 
-        Ok(TaskWorkspaceDeps::ready(resolved_environment_ref, checkout_name, terminal_refs, actuations))
+        Ok(VesselDeps::ready(resolved_environment_ref, checkout_name, terminal_refs, actuations))
     }
 
     fn reconcile(
@@ -505,27 +499,25 @@ impl Reconciler for TaskWorkspaceReconciler {
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = match &deps.patch {
             PlannedPatch::None => None,
-            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version } => {
-                Some(TaskWorkspaceStatusPatch::MarkProvisioning {
-                    observed_policy_ref: observed_policy_ref.clone(),
-                    observed_policy_version: observed_policy_version.clone(),
-                    started_at: now,
-                })
-            }
-            PlannedPatch::Ready { environment_ref, checkout_ref, terminal_session_refs } => Some(TaskWorkspaceStatusPatch::MarkReady {
+            PlannedPatch::Provisioning { observed_policy_ref, observed_policy_version } => Some(VesselStatusPatch::MarkProvisioning {
+                observed_policy_ref: observed_policy_ref.clone(),
+                observed_policy_version: observed_policy_version.clone(),
+                started_at: now,
+            }),
+            PlannedPatch::Ready { environment_ref, checkout_ref, terminal_session_refs } => Some(VesselStatusPatch::MarkReady {
                 environment_ref: Some(environment_ref.clone()),
                 checkout_ref: Some(checkout_ref.clone()),
                 terminal_session_refs: terminal_session_refs.clone(),
                 ready_at: now,
             }),
-            PlannedPatch::Failed { message } => Some(TaskWorkspaceStatusPatch::MarkFailed { message: message.clone() }),
+            PlannedPatch::Failed { message } => Some(VesselStatusPatch::MarkFailed { message: message.clone() }),
         };
 
         ReconcileOutcome::with_actuations(patch, deps.actuations.clone())
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        let selector = BTreeMap::from([(TASK_WORKSPACE_LABEL.to_string(), obj.metadata.name.clone())]);
+        let selector = BTreeMap::from([(VESSEL_REF_LABEL.to_string(), obj.metadata.name.clone())]);
 
         delete_lifecycle_owned_matching(&self.terminal_sessions, &selector).await?;
         delete_lifecycle_owned_matching(&self.checkouts, &selector).await?;
@@ -535,7 +527,7 @@ impl Reconciler for TaskWorkspaceReconciler {
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
-        Some("flotilla.work/task-workspace-teardown")
+        Some("flotilla.work/vessel-workspace-teardown")
     }
 }
 
@@ -568,8 +560,8 @@ fn placement_strategy(spec: &PlacementPolicySpec) -> Result<PlacementStrategy, S
     Err("placement policy must define exactly one supported strategy".to_string())
 }
 
-fn provisioning_patch(obj: &ResourceObject<TaskWorkspace>, placement_policy: &ResourceObject<PlacementPolicy>) -> PlannedPatch {
-    if obj.status.as_ref().map(|status| status.phase) == Some(TaskWorkspacePhase::Provisioning) {
+fn provisioning_patch(obj: &ResourceObject<Vessel>, placement_policy: &ResourceObject<PlacementPolicy>) -> PlannedPatch {
+    if obj.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Provisioning) {
         PlannedPatch::None
     } else {
         PlannedPatch::Provisioning {
@@ -583,26 +575,26 @@ fn host_direct_environment_name(host_ref: &str) -> String {
     format!("host-direct-{host_ref}")
 }
 
-fn environment_name(task_workspace_name: &str) -> String {
-    format!("env-{task_workspace_name}")
+fn environment_name(vessel_name: &str) -> String {
+    format!("env-{vessel_name}")
 }
 
-fn checkout_name(task_workspace_name: &str) -> String {
-    format!("checkout-{task_workspace_name}")
+fn checkout_name(vessel_name: &str) -> String {
+    format!("checkout-{vessel_name}")
 }
 
-fn checkout_target_path(repo_default_dir: &str, repo_slug: &str, task_workspace_name: &str) -> String {
-    format!("{}/{}.{}", repo_default_dir.trim_end_matches('/'), repo_slug, task_workspace_name)
+fn checkout_target_path(repo_default_dir: &str, repo_slug: &str, vessel_name: &str) -> String {
+    format!("{}/{}.{}", repo_default_dir.trim_end_matches('/'), repo_slug, vessel_name)
 }
 
-fn owned_child_meta(name: &str, workspace: &ResourceObject<TaskWorkspace>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
-    extra_labels.insert(TASK_WORKSPACE_LABEL.to_string(), workspace.metadata.name.clone());
+fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
+    extra_labels.insert(VESSEL_REF_LABEL.to_string(), workspace.metadata.name.clone());
     InputMeta::builder()
         .name(name.to_string())
         .labels(extra_labels)
         .owner_references(vec![OwnerReference {
-            api_version: format!("{}/{}", TaskWorkspace::API_PATHS.group, TaskWorkspace::API_PATHS.version),
-            kind: TaskWorkspace::API_PATHS.kind.to_string(),
+            api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
+            kind: Vessel::API_PATHS.kind.to_string(),
             name: workspace.metadata.name.clone(),
             controller: true,
         }])

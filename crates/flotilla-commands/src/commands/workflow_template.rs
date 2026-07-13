@@ -78,7 +78,7 @@ mod tests {
     #[test]
     fn apply_reads_file_into_spec_yaml() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        std::fs::write(tmp.path(), "tasks: []\n").expect("write");
+        std::fs::write(tmp.path(), "vessels: []\n").expect("write");
         let path = tmp.path().to_string_lossy().to_string();
 
         let resolved = parse(&["workflow-template", "scratch", "apply", "--file", &path]).resolve().expect("resolve");
@@ -87,7 +87,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "tasks: []\n".into() },
+                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "vessels: []\n".into() },
             },
             repo: RepoContext::None,
             host: HostResolution::Local,

@@ -57,12 +57,7 @@ fn response(status: &str, body: &str) -> String {
 }
 
 fn owner_reference(name: &str) -> OwnerReference {
-    OwnerReference {
-        api_version: "flotilla.work/v1".to_string(),
-        kind: "TaskWorkspace".to_string(),
-        name: name.to_string(),
-        controller: true,
-    }
+    OwnerReference { api_version: "flotilla.work/v1".to_string(), kind: "Vessel".to_string(), name: name.to_string(), controller: true }
 }
 
 #[tokio::test]
@@ -81,7 +76,7 @@ async fn http_list_decodes_owner_references() {
                 "annotations": { "note": "test" },
                 "ownerReferences": [{
                     "apiVersion": "flotilla.work/v1",
-                    "kind": "TaskWorkspace",
+                    "kind": "Vessel",
                     "name": "alpha-implement",
                     "controller": true
                 }],
@@ -125,7 +120,7 @@ async fn http_create_serializes_owner_references() {
             "annotations": { "note": "test" },
             "ownerReferences": [{
                 "apiVersion": "flotilla.work/v1",
-                "kind": "TaskWorkspace",
+                "kind": "Vessel",
                 "name": "alpha-implement",
                 "controller": true
             }],
@@ -154,7 +149,9 @@ async fn http_create_serializes_owner_references() {
     let request = request_rx.await.expect("captured request");
 
     assert!(request.starts_with("POST /apis/flotilla.work/v1/namespaces/flotilla/convoys HTTP/1.1"));
-    assert!(request.contains("\"ownerReferences\":[{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"TaskWorkspace\",\"name\":\"alpha-implement\",\"controller\":true}]"));
+    assert!(request.contains(
+        "\"ownerReferences\":[{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Vessel\",\"name\":\"alpha-implement\",\"controller\":true}]"
+    ));
 }
 
 #[test]

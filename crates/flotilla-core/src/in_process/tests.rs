@@ -14,13 +14,13 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, Environment as ResourceEnvironment,
-    EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ProcessDefinition, ProcessSource, Selector, SnapshotTask, TaskPhase, TaskState,
-    TaskWorkspace, TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TerminalBrief, TerminalCrewContext,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Selector, TerminalBrief, TerminalCrewContext,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, WorkflowSnapshot,
-    CONVOY_LABEL, PROCESS_ORDINAL_LABEL, ROLE_LABEL, TASK_LABEL, TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
+    VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -236,8 +236,8 @@ async fn create_running_attach_session_with_pool(
                 name,
                 BTreeMap::from([
                     (CONVOY_LABEL.to_string(), convoy.to_string()),
-                    (TASK_LABEL.to_string(), task.to_string()),
-                    (TASK_WORKSPACE_LABEL.to_string(), format!("{convoy}-{task}")),
+                    (VESSEL_LABEL.to_string(), task.to_string()),
+                    (VESSEL_REF_LABEL.to_string(), format!("{convoy}-{task}")),
                     (ROLE_LABEL.to_string(), role.to_string()),
                 ]),
             ),
@@ -306,25 +306,22 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .await
         .expect("create convoy");
     let processes = vec![
-        ProcessDefinition::builder()
+        CrewSpec::builder()
             .role("coder".to_string())
-            .source(ProcessSource::Agent {
-                selector: Selector { capability: "coding".into() },
-                prompt: Some("Implement the change.".into()),
-            })
+            .source(CrewSource::Agent { selector: Selector { capability: "coding".into() }, prompt: Some("Implement the change.".into()) })
             .build(),
-        ProcessDefinition::builder()
+        CrewSpec::builder()
             .role("reviewer".to_string())
-            .source(ProcessSource::Agent { selector: Selector { capability: "review".into() }, prompt: Some("Review the change.".into()) })
+            .source(CrewSource::Agent { selector: Selector { capability: "review".into() }, prompt: Some("Review the change.".into()) })
             .build(),
     ];
     convoys
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
-                tasks: vec![SnapshotTask { name: "prepare".into(), depends_on: Vec::new(), processes: Vec::new() }, SnapshotTask {
+                vessels: vec![VesselRequirement { name: "prepare".into(), depends_on: Vec::new(), crew: Vec::new() }, VesselRequirement {
                     name: "implement".into(),
                     depends_on: Vec::new(),
-                    processes,
+                    crew: processes,
                 }],
             }),
             ..Default::default()
@@ -332,16 +329,16 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .await
         .expect("update convoy status");
 
-    let workspaces = daemon.resource_backend().using::<TaskWorkspace>("flotilla");
+    let workspaces = daemon.resource_backend().using::<Vessel>("flotilla");
     let workspace = workspaces
         .create(
             &input_meta_with_labels(
                 "demo-implement",
-                BTreeMap::from([(CONVOY_LABEL.into(), "demo".into()), (TASK_LABEL.into(), "implement".into())]),
+                BTreeMap::from([(CONVOY_LABEL.into(), "demo".into()), (VESSEL_LABEL.into(), "implement".into())]),
             ),
-            &TaskWorkspaceSpec {
+            &VesselSpec {
                 convoy_ref: "demo".into(),
-                task: "implement".into(),
+                vessel_name: "implement".into(),
                 placement_policy_ref: "host-direct".into(),
                 adopted_checkout_ref: None,
             },
@@ -349,8 +346,8 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .await
         .expect("create workspace");
     workspaces
-        .update_status("demo-implement", &workspace.metadata.resource_version, &TaskWorkspaceStatus {
-            phase: TaskWorkspacePhase::Ready,
+        .update_status("demo-implement", &workspace.metadata.resource_version, &VesselStatus {
+            phase: VesselPhase::Ready,
             environment_ref: Some(env_ref.into()),
             terminal_session_refs: vec!["terminal-demo-implement-coder".into()],
             ..Default::default()
@@ -365,8 +362,8 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                 "terminal-demo-implement-coder",
                 BTreeMap::from([
                     (CONVOY_LABEL.into(), "demo".into()),
-                    (TASK_LABEL.into(), "implement".into()),
-                    (TASK_WORKSPACE_LABEL.into(), "demo-implement".into()),
+                    (VESSEL_LABEL.into(), "implement".into()),
+                    (VESSEL_REF_LABEL.into(), "demo-implement".into()),
                     (ROLE_LABEL.into(), "coder".into()),
                 ]),
             ),
@@ -376,7 +373,11 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "coding".into() },
                     brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into() },
-                    context: TerminalCrewContext { namespace: "flotilla".into(), convoy: "demo".into(), vessel: "demo-implement".into() },
+                    context: TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-implement".into(),
+                    },
                     message: None,
                 },
                 cwd: "/repo".into(),
@@ -449,8 +450,8 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     assert!(
         matches!(reviewer.spec.source, TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Review commit abc123")
     );
-    assert_eq!(reviewer.metadata.labels.get(TASK_ORDINAL_LABEL).map(String::as_str), Some("001"));
-    assert_eq!(reviewer.metadata.labels.get(PROCESS_ORDINAL_LABEL).map(String::as_str), Some("001"));
+    assert_eq!(reviewer.metadata.labels.get(VESSEL_ORDINAL_LABEL).map(String::as_str), Some("001"));
+    assert_eq!(reviewer.metadata.labels.get(CREW_ORDINAL_LABEL).map(String::as_str), Some("001"));
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -482,7 +483,7 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
         crew_id: None,
         namespace: Some("flotilla".into()),
         convoy: Some("demo".into()),
-        vessel: Some("demo-implement".into()),
+        vessel_ref: Some("demo-implement".into()),
         role: Some("reviewer".into()),
     };
     let mut events = daemon.subscribe();
@@ -956,8 +957,8 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                 "terminal-convoy-a-implement-coder",
                 BTreeMap::from([
                     (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-                    (TASK_LABEL.to_string(), "implement".to_string()),
-                    (TASK_WORKSPACE_LABEL.to_string(), "convoy-a-implement".to_string()),
+                    (VESSEL_LABEL.to_string(), "implement".to_string()),
+                    (VESSEL_REF_LABEL.to_string(), "convoy-a-implement".to_string()),
                     (ROLE_LABEL.to_string(), "coder".to_string()),
                 ]),
             ),
@@ -970,7 +971,7 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                     context: TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "convoy-a".into(),
-                        vessel: "convoy-a-implement".into(),
+                        vessel_ref: "convoy-a-implement".into(),
                     },
                     message: None,
                 },
@@ -2053,8 +2054,8 @@ async fn convoy_completion_command_updates_convoy_task_status() {
         .update_status("convoy-a", &created.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
-            tasks: [("implement".to_string(), TaskState {
-                phase: TaskPhase::Running,
+            work: [("implement".to_string(), WorkState {
+                phase: WorkPhase::Running,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,
@@ -2078,9 +2079,9 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyLegComplete {
+            action: CommandAction::ConvoyWorkComplete {
                 convoy: "convoy-a".to_string(),
-                leg: "implement".to_string(),
+                work: "implement".to_string(),
                 message: Some("done".to_string()),
             },
         })
@@ -2102,8 +2103,8 @@ async fn convoy_completion_command_updates_convoy_task_status() {
     assert_eq!(result, CommandValue::Ok);
     let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status should exist");
-    assert_eq!(status.tasks["implement"].phase, TaskPhase::Completed);
-    assert_eq!(status.tasks["implement"].message.as_deref(), Some("done"));
+    assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
+    assert_eq!(status.work["implement"].message.as_deref(), Some("done"));
 }
 
 #[tokio::test]
@@ -2278,8 +2279,8 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
         .update_status("convoy-a", &created.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
-            tasks: [("implement".to_string(), TaskState {
-                phase: TaskPhase::Running,
+            work: [("implement".to_string(), WorkState {
+                phase: WorkPhase::Running,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,
@@ -2303,9 +2304,9 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyLegComplete {
+            action: CommandAction::ConvoyWorkComplete {
                 convoy: "convoy-a".to_string(),
-                leg: "implement".to_string(),
+                work: "implement".to_string(),
                 message: Some("done".to_string()),
             },
         })
@@ -2327,7 +2328,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
     assert_eq!(result, CommandValue::Ok);
     let convoy = convoys.get("convoy-a").await.expect("convoy get should succeed");
     let status = convoy.status.expect("convoy status should exist");
-    assert_eq!(status.tasks["implement"].phase, TaskPhase::Completed);
+    assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
 
     // The default namespace must NOT contain the convoy — completion should target
     // only the configured provisioning namespace, not the legacy hardcoded one.

@@ -28,14 +28,14 @@ pub struct CrewBriefMember {
 
 pub fn build_crew_brief(
     context: &flotilla_resources::TerminalCrewContext,
-    leg: &str,
+    vessel: &str,
     role: &str,
     prompt: Option<&str>,
     members: &[CrewBriefMember],
 ) -> flotilla_resources::TerminalBrief {
     let mut content = format!(
-        "# Flotilla crew brief\n\nYou are `{role}` in convoy `{}`, aboard vessel `{}` for leg `{leg}`.\n\n## Crew\n\n",
-        context.convoy, context.vessel
+        "# Flotilla crew brief\n\nYou are `{role}` in convoy `{}`, aboard vessel `{vessel}` (`{}`).\n\n## Crew\n\n",
+        context.convoy, context.vessel_ref
     );
     for member in members {
         content.push_str(&format!("- `{}`: {}\n", member.role, member.state));
@@ -45,7 +45,7 @@ pub fn build_crew_brief(
         content.push_str(&format!("Hand off to {} with `flotilla crew {} handoff --message '...'`.\n", member.role, member.role));
     }
     content.push_str(&format!(
-        "Leg completion is separate: `flotilla convoy {} leg {leg} complete`.\n\n## Assignment\n\n{}\n",
+        "Completing the work is separate: `flotilla convoy {} work {vessel} complete`.\n\n## Assignment\n\n{}\n",
         context.convoy,
         prompt.unwrap_or("No additional assignment was provided.")
     ));

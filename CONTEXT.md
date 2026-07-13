@@ -25,9 +25,13 @@ repository/codebase. The concrete form of the **Island** metaphor.
 _Avoid_: Repo (a Project may span more than the bare git remote), Workspace.
 
 **Convoy**:
-A named instance of a workflow — the primary unit of *launched* work. A DAG of
-**Legs** that cooperate to accomplish something. Replaces the older "attachable
-set" / "new branch" framing.
+A named instance of a workflow — the primary unit of *launched* work. What a
+convoy *declares* is a DAG of **VesselRequirements** — vessels with crew
+rosters, gated by `depends_on` — that cooperate to accomplish something; the
+fine-grained crew workflow is conversational (handoffs, briefs), not declared,
+and **Legs** stay implicit until they materialise *(corrected 2026-07-11, #680
+grill; this entry previously said "a DAG of Legs")*. Replaces the older
+"attachable set" / "new branch" framing.
 _Avoid_: Job, pipeline, attachable set.
 
 **Leg**:
@@ -37,20 +41,26 @@ routing given to promptable **Crew**, and is materialised by **zero or more
 Vessels** (e.g. one test Leg fanning across four platforms). Completed
 explicitly, not by process exit. Legs may stay out of the UX until workflow
 patterns settle; ad-hoc communication outside the script is not prohibited.
-_Avoid_: Task (retired — it conflated stage with placement; code types such as
-`TaskSummary`/`TaskWorkspace` keep the old name until renamed opportunistically),
+_Avoid_: Task (retired — it conflated stage with placement; the task-era code
+types were renamed in #680: `TaskWorkspace`→`Vessel`, `TaskState`→`WorkState`,
+`SnapshotTask`/`TaskDefinition`→`VesselRequirement`; "leg" appears nowhere in
+code — reserved until Legs materialise, likely as phases of crew activity),
 Step, pod.
 
 **VesselRequirement**:
 A declaration that a **Vessel** matching some abstract requirements (platform,
-capabilities, sandbox quality, affinity) must exist for a **Leg** — the runtime
-primitive placement resolution works on, and the fan-out unit (one requirement
-may materialise several Vessels). Authored by any orchestrator: a workflow
-template, an **orchestrating agent** (tool call), or a human (CLI pins / the
-picker). Templates carry abstract requirements only; launch-time **pins**
-(host=X, reuse hull Y, adopt this checkout) and fleet-level **PlacementPolicy**
-preferences merge at resolution (pins > requirements > policy preferences;
-unsatisfiable = loud failure, no silent fallback).
+capabilities, sandbox quality, affinity) must exist — the runtime primitive
+placement resolution works on. **One requirement ↔ one Vessel (at a time) is
+an invariant**: the requirement is *not* the fan-out unit; fan-out is
+*authored* — an orchestrating agent or embedded script emits several concrete
+requirements with unique names — never a field on the requirement *(amended
+2026-07-11, #680 grill; previously described as "the fan-out unit")*. Authored
+by any orchestrator: a workflow template, an **orchestrating agent** (tool
+call), or a human (CLI pins / the picker). Templates carry abstract
+requirements only; launch-time **pins** (host=X, reuse hull Y, adopt this
+checkout) and fleet-level **PlacementPolicy** preferences merge at resolution
+(pins > requirements > policy preferences; unsatisfiable = loud failure, no
+silent fallback).
 _Avoid_: placement (the act, not the declaration), recipe, target.
 
 **Vessel**:

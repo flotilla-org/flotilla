@@ -58,7 +58,7 @@ mod tests {
             phase,
             message: None,
             repo_hint: None,
-            tasks: vec![],
+            vessels: vec![],
             started_at: None,
             finished_at: None,
             observed_workflow_ref: None,

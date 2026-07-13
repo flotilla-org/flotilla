@@ -21,8 +21,9 @@ pub struct CrewNoun {
     pub namespace: Option<String>,
     #[arg(long)]
     pub convoy: Option<String>,
-    #[arg(long)]
-    pub vessel: Option<String>,
+    /// Vessel resource name (e.g. `myconvoy-implement`)
+    #[arg(long = "vessel-ref")]
+    pub vessel_ref: Option<String>,
     #[arg(long)]
     pub role: Option<String>,
 }
@@ -42,7 +43,7 @@ impl CrewNoun {
             .maybe_crew_id(self.crew_id.or(ambient_crew_id))
             .maybe_namespace(self.namespace)
             .maybe_convoy(self.convoy)
-            .maybe_vessel(self.vessel)
+            .maybe_vessel_ref(self.vessel_ref)
             .maybe_role(self.role)
             .build();
         let action = match (self.subject.as_str(), self.verb) {
@@ -70,7 +71,7 @@ impl std::fmt::Display for CrewNoun {
             ("--crew-id", self.crew_id.as_ref()),
             ("--namespace", self.namespace.as_ref()),
             ("--convoy", self.convoy.as_ref()),
-            ("--vessel", self.vessel.as_ref()),
+            ("--vessel-ref", self.vessel_ref.as_ref()),
             ("--role", self.role.as_ref()),
         ] {
             if let Some(value) = value {
@@ -127,7 +128,7 @@ mod tests {
             "flotilla",
             "--convoy",
             "demo",
-            "--vessel",
+            "--vessel-ref",
             "demo-implement",
             "--role",
             "coder",
@@ -138,7 +139,7 @@ mod tests {
                 crew_id: None,
                 namespace: Some("flotilla".into()),
                 convoy: Some("demo".into()),
-                vessel: Some("demo-implement".into()),
+                vessel_ref: Some("demo-implement".into()),
                 role: Some("coder".into()),
             }
         });
@@ -153,7 +154,7 @@ mod tests {
             "flotilla",
             "--convoy",
             "demo",
-            "--vessel",
+            "--vessel-ref",
             "demo-implement",
             "--role",
             "coder",

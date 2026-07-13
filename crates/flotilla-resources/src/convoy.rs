@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::ProcessDefinition};
+use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement};
 
 mod reconcile;
 
@@ -48,8 +48,11 @@ pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_snapshot: Option<WorkflowSnapshot>,
+    /// Work aboard each declared vessel, keyed by vessel (requirement) name.
+    /// Today written by explicit completion; becomes a roll-up over crew-level
+    /// work state later (flotilla#681).
     #[serde(default)]
-    pub tasks: BTreeMap<String, TaskState>,
+    pub work: BTreeMap<String, WorkState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,15 +67,7 @@ pub struct ConvoyStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowSnapshot {
-    pub tasks: Vec<SnapshotTask>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotTask {
-    pub name: String,
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    pub processes: Vec<ProcessDefinition>,
+    pub vessels: Vec<VesselRequirement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -86,8 +81,8 @@ pub enum ConvoyPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskState {
-    pub phase: TaskPhase,
+pub struct WorkState {
+    pub phase: WorkPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,12 +96,12 @@ pub struct TaskState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskPhase {
+pub enum WorkPhase {
     Pending,
     Ready,
     Launching,
     Running,
-    Completed,
+    Complete,
     Failed,
     Cancelled,
 }
@@ -123,7 +118,7 @@ pub enum ConvoyStatusPatch {
         workflow_snapshot: WorkflowSnapshot,
         observed_workflow_ref: String,
         observed_workflows: BTreeMap<String, String>,
-        tasks: BTreeMap<String, TaskState>,
+        work: BTreeMap<String, WorkState>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     },
@@ -132,11 +127,11 @@ pub enum ConvoyStatusPatch {
         message: String,
         finished_at: DateTime<Utc>,
     },
-    AdvanceTasksToReady {
+    AdvanceWorkToReady {
         ready: BTreeMap<String, DateTime<Utc>>,
     },
     FailConvoy {
-        cancelled_tasks: BTreeMap<String, DateTime<Utc>>,
+        cancelled_work: BTreeMap<String, DateTime<Utc>>,
         finished_at: DateTime<Utc>,
         message: Option<String>,
     },
@@ -145,26 +140,26 @@ pub enum ConvoyStatusPatch {
         started_at: Option<DateTime<Utc>>,
         finished_at: Option<DateTime<Utc>>,
     },
-    TaskLaunching {
-        task: String,
+    WorkLaunching {
+        work: String,
         started_at: DateTime<Utc>,
         placement: PlacementStatus,
     },
-    TaskRunning {
-        task: String,
+    WorkRunning {
+        work: String,
     },
-    MarkTaskCompleted {
-        task: String,
+    MarkWorkCompleted {
+        work: String,
         finished_at: DateTime<Utc>,
         message: Option<String>,
     },
-    MarkTaskFailed {
-        task: String,
+    MarkWorkFailed {
+        work: String,
         finished_at: DateTime<Utc>,
         message: String,
     },
-    MarkTaskCancelled {
-        task: String,
+    MarkWorkCancelled {
+        work: String,
         finished_at: DateTime<Utc>,
     },
 }
@@ -172,11 +167,11 @@ pub enum ConvoyStatusPatch {
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
         match self {
-            Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, tasks, phase, started_at } => {
+            Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, phase, started_at } => {
                 status.workflow_snapshot = Some(workflow_snapshot.clone());
                 status.observed_workflow_ref = Some(observed_workflow_ref.clone());
                 status.observed_workflows = Some(observed_workflows.clone());
-                status.tasks = tasks.clone();
+                status.work = work.clone();
                 status.phase = *phase;
                 if let Some(started_at) = started_at {
                     status.started_at.get_or_insert(*started_at);
@@ -187,21 +182,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.message = Some(message.clone());
                 status.finished_at.get_or_insert(*finished_at);
             }
-            Self::AdvanceTasksToReady { ready } => {
-                for (task, ready_at) in ready {
-                    if let Some(state) = status.tasks.get_mut(task) {
-                        state.phase = TaskPhase::Ready;
+            Self::AdvanceWorkToReady { ready } => {
+                for (work, ready_at) in ready {
+                    if let Some(state) = status.work.get_mut(work) {
+                        state.phase = WorkPhase::Ready;
                         state.ready_at.get_or_insert(*ready_at);
                     }
                 }
             }
-            Self::FailConvoy { cancelled_tasks, finished_at, message } => {
+            Self::FailConvoy { cancelled_work, finished_at, message } => {
                 status.phase = ConvoyPhase::Failed;
                 status.finished_at.get_or_insert(*finished_at);
                 status.message = message.clone();
-                for (task, cancelled_at) in cancelled_tasks {
-                    if let Some(state) = status.tasks.get_mut(task) {
-                        state.phase = TaskPhase::Cancelled;
+                for (work, cancelled_at) in cancelled_work {
+                    if let Some(state) = status.work.get_mut(work) {
+                        state.phase = WorkPhase::Cancelled;
                         state.finished_at.get_or_insert(*cancelled_at);
                     }
                 }
@@ -215,35 +210,35 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.finished_at.get_or_insert(*finished_at);
                 }
             }
-            Self::TaskLaunching { task, started_at, placement } => {
-                if let Some(state) = status.tasks.get_mut(task) {
-                    state.phase = TaskPhase::Launching;
+            Self::WorkLaunching { work, started_at, placement } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = WorkPhase::Launching;
                     state.started_at.get_or_insert(*started_at);
                     state.placement = Some(placement.clone());
                 }
             }
-            Self::TaskRunning { task } => {
-                if let Some(state) = status.tasks.get_mut(task) {
-                    state.phase = TaskPhase::Running;
+            Self::WorkRunning { work } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = WorkPhase::Running;
                 }
             }
-            Self::MarkTaskCompleted { task, finished_at, message } => {
-                if let Some(state) = status.tasks.get_mut(task) {
-                    state.phase = TaskPhase::Completed;
+            Self::MarkWorkCompleted { work, finished_at, message } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = WorkPhase::Complete;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }
             }
-            Self::MarkTaskFailed { task, finished_at, message } => {
-                if let Some(state) = status.tasks.get_mut(task) {
-                    state.phase = TaskPhase::Failed;
+            Self::MarkWorkFailed { work, finished_at, message } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = WorkPhase::Failed;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());
                 }
             }
-            Self::MarkTaskCancelled { task, finished_at } => {
-                if let Some(state) = status.tasks.get_mut(task) {
-                    state.phase = TaskPhase::Cancelled;
+            Self::MarkWorkCancelled { work, finished_at } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = WorkPhase::Cancelled;
                     state.finished_at.get_or_insert(*finished_at);
                 }
             }
@@ -258,27 +253,27 @@ pub mod controller_patches {
         workflow_snapshot: WorkflowSnapshot,
         observed_workflow_ref: String,
         observed_workflows: BTreeMap<String, String>,
-        tasks: BTreeMap<String, TaskState>,
+        work: BTreeMap<String, WorkState>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, tasks, phase, started_at }
+        ConvoyStatusPatch::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, phase, started_at }
     }
 
     pub fn fail_init(phase: ConvoyPhase, message: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::FailInit { phase, message, finished_at }
     }
 
-    pub fn advance_tasks_to_ready(ready: BTreeMap<String, DateTime<Utc>>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::AdvanceTasksToReady { ready }
+    pub fn advance_work_to_ready(ready: BTreeMap<String, DateTime<Utc>>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::AdvanceWorkToReady { ready }
     }
 
     pub fn fail_convoy(
-        cancelled_tasks: BTreeMap<String, DateTime<Utc>>,
+        cancelled_work: BTreeMap<String, DateTime<Utc>>,
         finished_at: DateTime<Utc>,
         message: Option<String>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::FailConvoy { cancelled_tasks, finished_at, message }
+        ConvoyStatusPatch::FailConvoy { cancelled_work, finished_at, message }
     }
 
     pub fn roll_up_phase(phase: ConvoyPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> ConvoyStatusPatch {
@@ -289,27 +284,27 @@ pub mod controller_patches {
 pub mod provisioning_patches {
     use super::*;
 
-    pub fn task_launching(task: String, started_at: DateTime<Utc>, placement: PlacementStatus) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::TaskLaunching { task, started_at, placement }
+    pub fn work_launching(work: String, started_at: DateTime<Utc>, placement: PlacementStatus) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::WorkLaunching { work, started_at, placement }
     }
 
-    pub fn task_running(task: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::TaskRunning { task }
+    pub fn work_running(work: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::WorkRunning { work }
     }
 }
 
 pub mod external_patches {
     use super::*;
 
-    pub fn mark_task_completed(task: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkTaskCompleted { task, finished_at, message }
+    pub fn mark_work_completed(work: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkWorkCompleted { work, finished_at, message }
     }
 
-    pub fn mark_task_failed(task: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkTaskFailed { task, finished_at, message }
+    pub fn mark_work_failed(work: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkWorkFailed { work, finished_at, message }
     }
 
-    pub fn mark_task_cancelled(task: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkTaskCancelled { task, finished_at }
+    pub fn mark_work_cancelled(work: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkWorkCancelled { work, finished_at }
     }
 }

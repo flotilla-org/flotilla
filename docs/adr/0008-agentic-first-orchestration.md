@@ -24,8 +24,12 @@ dynamic practice**, not designed ahead of it.
   producing. This pulls a **Python and/or TypeScript client SDK** forward
   (sooner rather than later), tracking the CLI surface closely. Simple
   workflow programs stay simply analysable; some will be very dynamic.
-- **Inter-leg data flow stays deliberately unformalised** (prompts + git)
-  until patterns recur.
+- **Inter-crew data flow stays deliberately unformalised** (prompts + git)
+  until patterns recur. *(Note 2026-07-11, #680 grill: when it does formalise,
+  the shape is per-workflow explicitness about what a crew passes on and
+  receives — filesystem state via vcs push/pull or mutagen-style sync,
+  artifacts in object storage — never a blanket implicit sync rule; workflows
+  may legitimately call for experimentally isolated branches.)*
 
 ## Open: durable execution
 

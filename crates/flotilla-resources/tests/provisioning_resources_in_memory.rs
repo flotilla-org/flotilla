@@ -5,22 +5,24 @@ use common::{owner_reference, resource_meta};
 use flotilla_resources::{
     Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentMount,
     EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, ResourceBackend, Selector, TaskWorkspace,
-    TaskWorkspacePhase, TaskWorkspaceSpec, TaskWorkspaceStatus, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource,
-    TerminalSessionSpec,
+    HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, ResourceBackend, Selector, TerminalBrief,
+    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselPhase, VesselSpec, VesselStatus,
 };
 
 fn placement_meta(name: &str) -> flotilla_resources::InputMeta {
     resource_meta().name(name).call()
 }
 
-fn task_workspace_meta(name: &str) -> flotilla_resources::InputMeta {
+fn vessel_meta(name: &str) -> flotilla_resources::InputMeta {
     resource_meta()
         .name(name)
         .labels(
-            [("flotilla.work/convoy".to_string(), "fix-bug-123".to_string()), ("flotilla.work/task".to_string(), "implement".to_string())]
-                .into_iter()
-                .collect(),
+            [
+                ("flotilla.work/convoy".to_string(), "fix-bug-123".to_string()),
+                ("flotilla.work/vessel".to_string(), "implement".to_string()),
+            ]
+            .into_iter()
+            .collect(),
         )
         .owner_references(vec![owner_reference("fix-bug-123", "Convoy")])
         .finalizers(vec!["flotilla.work/example".to_string()])
@@ -32,7 +34,7 @@ fn docker_environment_meta(name: &str) -> flotilla_resources::InputMeta {
     resource_meta()
         .name(name)
         .labels([("flotilla.work/host".to_string(), "01HXYZ".to_string())].into_iter().collect())
-        .owner_references(vec![owner_reference("convoy-fix-bug-123-implement", "TaskWorkspace")])
+        .owner_references(vec![owner_reference("convoy-fix-bug-123-implement", "Vessel")])
         .finalizers(vec!["flotilla.work/environment-teardown".to_string()])
         .call()
 }
@@ -58,18 +60,18 @@ async fn placement_policy_roundtrips_without_status() {
 }
 
 #[tokio::test]
-async fn task_workspace_metadata_and_status_roundtrip() {
-    let resolver = ResourceBackend::InMemory(InMemoryBackend::default()).using::<TaskWorkspace>("flotilla");
-    let spec = TaskWorkspaceSpec {
+async fn vessel_metadata_and_status_roundtrip() {
+    let resolver = ResourceBackend::InMemory(InMemoryBackend::default()).using::<Vessel>("flotilla");
+    let spec = VesselSpec {
         convoy_ref: "fix-bug-123".to_string(),
-        task: "implement".to_string(),
+        vessel_name: "implement".to_string(),
         placement_policy_ref: "docker-on-01HXYZ".to_string(),
         adopted_checkout_ref: None,
     };
-    let created = resolver.create(&task_workspace_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
+    let created = resolver.create(&vessel_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
     let updated = resolver
-        .update_status("convoy-fix-bug-123-implement", &created.metadata.resource_version, &TaskWorkspaceStatus {
-            phase: TaskWorkspacePhase::Ready,
+        .update_status("convoy-fix-bug-123-implement", &created.metadata.resource_version, &VesselStatus {
+            phase: VesselPhase::Ready,
             message: None,
             observed_policy_ref: Some("docker-on-01HXYZ".to_string()),
             observed_policy_version: Some("12".to_string()),
@@ -142,7 +144,7 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
                 path: ".flotilla/briefs/coder.md".into(),
                 content: "You are coder in convoy demo.\n\nImplement the change.".into(),
             },
-            context: TerminalCrewContext { namespace: "flotilla".into(), convoy: "demo".into(), vessel: "demo-implement".into() },
+            context: TerminalCrewContext { namespace: "flotilla".into(), convoy: "demo".into(), vessel_ref: "demo-implement".into() },
             message: None,
         },
         cwd: "/workspace".into(),

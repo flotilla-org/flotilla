@@ -148,7 +148,7 @@ impl PanelColumn {
 #[serde(rename_all = "snake_case")]
 pub enum IntentKind {
     Attach,
-    CompleteLeg,
+    CompleteWork,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,8 +167,16 @@ impl IntentDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IntentTarget {
-    Vessel { attach_ref: String, host: HostName },
-    Leg { namespace: String, convoy: String, leg: String, host: HostName },
+    /// One row entity: the vessel (within-convoy name) plus, when a running
+    /// session exists, the attach reference to reach it.
+    Vessel {
+        namespace: String,
+        convoy: String,
+        vessel: String,
+        host: HostName,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_ref: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,20 +186,17 @@ pub struct RowIntent {
 }
 
 impl RowIntent {
-    pub fn vessel(intent_id: impl Into<String>, attach_ref: impl Into<String>, host: HostName) -> Self {
-        Self { intent_id: intent_id.into(), target: IntentTarget::Vessel { attach_ref: attach_ref.into(), host } }
-    }
-
-    pub fn leg(
+    pub fn vessel(
         intent_id: impl Into<String>,
         namespace: impl Into<String>,
         convoy: impl Into<String>,
-        leg: impl Into<String>,
+        vessel: impl Into<String>,
         host: HostName,
+        attach_ref: Option<String>,
     ) -> Self {
         Self {
             intent_id: intent_id.into(),
-            target: IntentTarget::Leg { namespace: namespace.into(), convoy: convoy.into(), leg: leg.into(), host },
+            target: IntentTarget::Vessel { namespace: namespace.into(), convoy: convoy.into(), vessel: vessel.into(), host, attach_ref },
         }
     }
 }

@@ -148,7 +148,7 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
     terminal.draw(|f| {
         let area = f.area();
         let convoys_selected = app.convoys_ui.selected.clone();
-        let convoys_selected_task = app.convoys_ui.selected_task.as_deref();
+        let convoys_selected_vessel = app.convoys_ui.selected_vessel.as_deref();
         let convoys_focus = app.convoys_ui.focus;
         let convoy_filter = app.convoys_ui.filter.as_str();
         // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
@@ -166,7 +166,7 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
             in_flight: &app.in_flight,
             namespaces: &app.namespaces,
             convoys_selected,
-            convoys_selected_task,
+            convoys_selected_vessel,
             convoys_focus,
             convoy_filter,
             convoys,

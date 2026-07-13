@@ -44,9 +44,9 @@ pub enum Action {
     OpenContextualPalette,
     FillSelected,
     /// Open the command palette pre-filled to complete the selected convoy task.
-    CompleteConvoyLeg,
+    CompleteConvoyWork,
     /// Attach the active workspace manager to the selected convoy task's workspace.
-    AttachConvoyLeg,
+    AttachConvoyVessel,
     Dispatch(Intent),
 }
 
@@ -113,8 +113,8 @@ impl Action {
             "open_command_palette" => Action::OpenCommandPalette,
             "open_contextual_palette" => Action::OpenContextualPalette,
             "fill_selected" => Action::FillSelected,
-            "complete_convoy_leg" => Action::CompleteConvoyLeg,
-            "attach_convoy_leg" => Action::AttachConvoyLeg,
+            "complete_convoy_work" => Action::CompleteConvoyWork,
+            "attach_convoy_vessel" => Action::AttachConvoyVessel,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
             "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
@@ -163,8 +163,8 @@ impl Action {
             Action::OpenCommandPalette => "open_command_palette",
             Action::OpenContextualPalette => "open_contextual_palette",
             Action::FillSelected => "fill_selected",
-            Action::CompleteConvoyLeg => "complete_convoy_leg",
-            Action::AttachConvoyLeg => "attach_convoy_leg",
+            Action::CompleteConvoyWork => "complete_convoy_work",
+            Action::AttachConvoyVessel => "attach_convoy_vessel",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
                 Intent::CreateWorkspace => "create_workspace",
@@ -210,8 +210,8 @@ impl Action {
             Action::OpenCommandPalette => "Open command palette",
             Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::FillSelected => "Fill selected item",
-            Action::CompleteConvoyLeg => "Complete convoy leg",
-            Action::AttachConvoyLeg => "Attach to leg workspace",
+            Action::CompleteConvoyWork => "Complete work",
+            Action::AttachConvoyVessel => "Attach to vessel workspace",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
                 Intent::CreateWorkspace => "Create workspace",
@@ -282,7 +282,7 @@ impl Keymap {
             (&config.help, BindingModeId::Help),
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
-            (&config.convoy_tasks, BindingModeId::ConvoyTasks),
+            (&config.convoy_vessels, BindingModeId::ConvoyVessels),
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
             (&config.close_confirm, BindingModeId::CloseConfirm),

@@ -147,7 +147,7 @@ async fn list_matching_labels_returns_only_exact_matches() {
 
     let mut alpha_meta = convoy_meta("alpha");
     alpha_meta.labels.insert("flotilla.work/convoy".to_string(), "convoy-a".to_string());
-    alpha_meta.labels.insert("flotilla.work/task".to_string(), "implement".to_string());
+    alpha_meta.labels.insert("flotilla.work/vessel".to_string(), "implement".to_string());
     resolver.create(&alpha_meta, &convoy_spec("template-a")).await.expect("alpha create should succeed");
 
     let mut beta_meta = convoy_meta("beta");
@@ -156,12 +156,12 @@ async fn list_matching_labels_returns_only_exact_matches() {
 
     let mut gamma_meta = convoy_meta("gamma");
     gamma_meta.labels.insert("flotilla.work/convoy".to_string(), "convoy-b".to_string());
-    gamma_meta.labels.insert("flotilla.work/task".to_string(), "implement".to_string());
+    gamma_meta.labels.insert("flotilla.work/vessel".to_string(), "implement".to_string());
     resolver.create(&gamma_meta, &convoy_spec("template-c")).await.expect("gamma create should succeed");
 
     let selector = BTreeMap::from([
         ("flotilla.work/convoy".to_string(), "convoy-a".to_string()),
-        ("flotilla.work/task".to_string(), "implement".to_string()),
+        ("flotilla.work/vessel".to_string(), "implement".to_string()),
     ]);
 
     let listed = resolver.list_matching_labels(&selector).await.expect("filtered list should succeed");

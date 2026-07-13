@@ -149,9 +149,9 @@ pub enum CommandAction {
     GenerateBranchName {
         issue_keys: Vec<String>,
     },
-    ConvoyLegComplete {
+    ConvoyWorkComplete {
         convoy: String,
-        leg: String,
+        work: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -289,7 +289,7 @@ impl Command {
             CommandAction::LinkIssuesToChangeRequest { .. } => "Linking issues...",
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
-            CommandAction::ConvoyLegComplete { .. } => "Completing convoy leg...",
+            CommandAction::ConvoyWorkComplete { .. } => "Completing work...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
@@ -566,9 +566,9 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyLegComplete {
+                action: CommandAction::ConvoyWorkComplete {
                     convoy: "convoy-a".into(),
-                    leg: "implement".into(),
+                    work: "implement".into(),
                     message: Some("done".into()),
                 },
             },
@@ -601,7 +601,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "tasks: []\n".into() },
+                action: CommandAction::WorkflowTemplateApply { name: "scratch".into(), spec_yaml: "vessels: []\n".into() },
             },
             Command {
                 node_id: None,
@@ -866,8 +866,8 @@ mod tests {
             })),
             CommandValue::CrewList(Box::new(CrewListResponse {
                 convoy: "convoy-a".into(),
-                vessel: "convoy-a-implement".into(),
-                leg: "implement".into(),
+                vessel_ref: "convoy-a-implement".into(),
+                vessel: "implement".into(),
                 members: vec![CrewListMember {
                     role: "coder".into(),
                     kind: "agent".into(),

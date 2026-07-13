@@ -14,8 +14,8 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{
     CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, HopChainContext,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TaskWorkspaceReconciler, TerminalRuntime,
-    TerminalRuntimeState, TerminalSessionReconciler,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -32,8 +32,8 @@ use flotilla_resources::{
     clone_key, controller::ControllerLoop, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec,
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation, PresentationPhase, PresentationSpec, ResourceBackend, ResourceError,
-    StatusPatch, TaskWorkspace, TaskWorkspacePhase, TerminalSession, TerminalSessionPhase, CONVOY_LABEL, PROCESS_ORDINAL_LABEL,
-    TASK_ORDINAL_LABEL, TASK_WORKSPACE_LABEL,
+    StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -196,14 +196,14 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
 
     let harness = full_controller_harness(backend.clone());
 
-    let workspaces = backend.clone().using::<TaskWorkspace>(NAMESPACE);
+    let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
     harness
         .wait_until(Duration::from_secs(3), || {
             let workspaces = workspaces.clone();
             async move {
                 matches!(
                     workspaces.get("workspace-a").await.ok().and_then(|workspace| workspace.status).map(|status| status.phase),
-                    Some(TaskWorkspacePhase::Ready)
+                    Some(VesselPhase::Ready)
                 )
             }
         })
@@ -212,7 +212,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let workspace = workspaces.get("workspace-a").await.expect("workspace get should succeed");
     let ready_resource_version = workspace.metadata.resource_version.clone();
     let status = workspace.status.expect("workspace status should be present");
-    assert_eq!(status.phase, TaskWorkspacePhase::Ready);
+    assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.environment_ref.as_deref(), Some("host-direct-01HXYZ"));
     assert_eq!(status.checkout_ref.as_deref(), Some("checkout-workspace-a"));
     assert_eq!(status.terminal_session_refs, vec!["terminal-workspace-a-coder".to_string()]);
@@ -408,8 +408,8 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
                 .labels(
                     [
                         (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
-                        (TASK_ORDINAL_LABEL.to_string(), "000".to_string()),
-                        (PROCESS_ORDINAL_LABEL.to_string(), "000".to_string()),
+                        (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+                        (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
                     ]
                     .into_iter()
                     .collect(),
@@ -516,7 +516,7 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
 }
 
 #[tokio::test]
-async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete() {
+async fn vessel_controller_finalizer_deletes_labeled_children_on_delete() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_workspace(
         &backend,
@@ -535,7 +535,7 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
         .create(
             &controller_meta()
                 .name("env-workspace-delete")
-                .labels([(TASK_WORKSPACE_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
+                .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
             &EnvironmentSpec {
                 host_direct: Some(HostDirectEnvironmentSpec {
@@ -553,7 +553,7 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
         .create(
             &controller_meta()
                 .name("checkout-workspace-delete")
-                .labels([(TASK_WORKSPACE_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
+                .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
             &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                 env_ref: "host-direct-01HXYZ".to_string(),
@@ -570,7 +570,7 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
         .create(
             &controller_meta()
                 .name("terminal-workspace-delete-coder")
-                .labels([(TASK_WORKSPACE_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
+                .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
             &flotilla_resources::TerminalSessionSpec {
                 env_ref: "host-direct-01HXYZ".to_string(),
@@ -583,7 +583,7 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
         .await
         .expect("terminal create should succeed");
 
-    let workspaces = backend.clone().using::<TaskWorkspace>(NAMESPACE);
+    let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
@@ -591,8 +591,8 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
     harness.spawn(
         ControllerLoop {
             primary: workspaces.clone(),
-            secondaries: TaskWorkspaceReconciler::secondary_watches(),
-            reconciler: TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE),
+            secondaries: VesselReconciler::secondary_watches(),
+            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }
@@ -605,7 +605,7 @@ async fn task_workspace_controller_finalizer_deletes_labeled_children_on_delete(
             async move {
                 matches!(
                     workspaces.get("workspace-delete").await,
-                    Ok(workspace) if workspace.metadata.finalizers == vec!["flotilla.work/task-workspace-teardown".to_string()]
+                    Ok(workspace) if workspace.metadata.finalizers == vec!["flotilla.work/vessel-workspace-teardown".to_string()]
                 )
             }
         })
@@ -725,9 +725,9 @@ fn full_controller_harness(backend: ResourceBackend) -> ControllerLoopHarness {
     );
     harness.spawn(
         ControllerLoop {
-            primary: backend.clone().using::<TaskWorkspace>(NAMESPACE),
-            secondaries: TaskWorkspaceReconciler::secondary_watches(),
-            reconciler: TaskWorkspaceReconciler::new(backend.clone(), NAMESPACE),
+            primary: backend.clone().using::<Vessel>(NAMESPACE),
+            secondaries: VesselReconciler::secondary_watches(),
+            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
             resync_interval: Duration::from_millis(50),
             backend,
         }

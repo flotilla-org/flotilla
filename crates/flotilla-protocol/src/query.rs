@@ -21,7 +21,7 @@ pub struct CrewCommandContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vessel: Option<String>,
+    pub vessel_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
 }
@@ -29,8 +29,8 @@ pub struct CrewCommandContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewListResponse {
     pub convoy: String,
+    pub vessel_ref: String,
     pub vessel: String,
-    pub leg: String,
     pub members: Vec<CrewListMember>,
 }
 

@@ -21,7 +21,7 @@ use crate::convoy_model::{ConvoyId, ConvoySummary};
 pub struct ConvoysPage<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
     pub selected: Option<&'a ConvoyId>,
-    pub selected_task: Option<&'a str>,
+    pub selected_vessel: Option<&'a str>,
     pub focus: crate::app::ConvoysFocus,
     pub filter: &'a str,
 }
@@ -43,7 +43,7 @@ impl<'a> ConvoysPage<'a> {
         ConvoyList { convoys: self.convoys.as_slice(), selected: self.selected, focused: list_focused }.render(f, chunks[0]);
         if let Some(id) = self.selected {
             if let Some(convoy) = self.convoys.iter().find(|c| &c.id == id) {
-                ConvoyDetail { convoy, selected_task: self.selected_task, focused: !list_focused }.render(f, chunks[1]);
+                ConvoyDetail { convoy, selected_vessel: self.selected_vessel, focused: !list_focused }.render(f, chunks[1]);
             }
         }
     }

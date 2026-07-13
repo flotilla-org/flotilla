@@ -11,7 +11,7 @@ pub struct WorkflowTemplateSpec {
     #[builder(default)]
     #[serde(default)]
     pub inputs: Vec<InputDefinition>,
-    pub tasks: Vec<TaskDefinition>,
+    pub vessels: Vec<VesselRequirement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,19 +22,19 @@ pub struct InputDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct TaskDefinition {
+pub struct VesselRequirement {
     pub name: String,
     #[builder(default)]
     #[serde(default)]
     pub depends_on: Vec<String>,
-    pub processes: Vec<ProcessDefinition>,
+    pub crew: Vec<CrewSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct ProcessDefinition {
+pub struct CrewSpec {
     pub role: String,
     #[serde(flatten)]
-    pub source: ProcessSource,
+    pub source: CrewSource,
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
@@ -42,7 +42,7 @@ pub struct ProcessDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
-pub enum ProcessSource {
+pub enum CrewSource {
     Agent {
         selector: Selector,
         #[serde(default)]
@@ -60,10 +60,10 @@ pub struct Selector {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
-    DuplicateTaskName { name: String },
-    DuplicateRoleInTask { task: String, role: String },
-    ReservedLabelKey { task: String, role: String, key: String },
-    UnknownDependency { task: String, missing: String },
+    DuplicateVesselName { name: String },
+    DuplicateRoleInVessel { vessel: String, role: String },
+    ReservedLabelKey { vessel: String, role: String, key: String },
+    UnknownDependency { vessel: String, missing: String },
     DependencyCycle { cycle: Vec<String> },
     DuplicateInputName { name: String },
     MalformedInterpolation { location: InterpolationLocation, text: String },
@@ -73,7 +73,7 @@ pub enum ValidationError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpolationLocation {
-    pub task: String,
+    pub vessel: String,
     pub role: String,
     pub field: InterpolationField,
 }
@@ -95,19 +95,19 @@ impl std::fmt::Display for InterpolationField {
 
 impl std::fmt::Display for InterpolationLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "task `{}` role `{}` {}", self.task, self.role, self.field)
+        write!(f, "vessel `{}` role `{}` {}", self.vessel, self.role, self.field)
     }
 }
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValidationError::DuplicateTaskName { name } => write!(f, "duplicate task name `{name}`"),
-            ValidationError::DuplicateRoleInTask { task, role } => write!(f, "duplicate role `{role}` in task `{task}`"),
-            ValidationError::ReservedLabelKey { task, role, key } => {
-                write!(f, "reserved label key `{key}` on task `{task}` role `{role}`")
+            ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
+            ValidationError::DuplicateRoleInVessel { vessel, role } => write!(f, "duplicate role `{role}` in vessel `{vessel}`"),
+            ValidationError::ReservedLabelKey { vessel, role, key } => {
+                write!(f, "reserved label key `{key}` on vessel `{vessel}` role `{role}`")
             }
-            ValidationError::UnknownDependency { task, missing } => write!(f, "task `{task}` depends on unknown task `{missing}`"),
+            ValidationError::UnknownDependency { vessel, missing } => write!(f, "vessel `{vessel}` depends on unknown vessel `{missing}`"),
             ValidationError::DependencyCycle { cycle } => write!(f, "dependency cycle: {}", cycle.join(" -> ")),
             ValidationError::DuplicateInputName { name } => write!(f, "duplicate input name `{name}`"),
             ValidationError::MalformedInterpolation { location, text } => {
@@ -134,12 +134,12 @@ pub(crate) struct TemplateToken<'a> {
 pub fn validate(spec: &WorkflowTemplateSpec) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     let declared_inputs = collect_inputs(spec, &mut errors);
-    let tasks_by_name = collect_tasks(spec, &mut errors);
+    let vessels_by_name = collect_vessels(spec, &mut errors);
 
-    for task in &spec.tasks {
-        validate_task(task, &declared_inputs, &tasks_by_name, &mut errors);
+    for vessel in &spec.vessels {
+        validate_vessel(vessel, &declared_inputs, &vessels_by_name, &mut errors);
     }
-    validate_cycles(&tasks_by_name, &mut errors);
+    validate_cycles(&vessels_by_name, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -158,38 +158,38 @@ fn collect_inputs(spec: &WorkflowTemplateSpec, errors: &mut Vec<ValidationError>
     declared_inputs
 }
 
-fn collect_tasks<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) -> BTreeMap<String, &'a TaskDefinition> {
-    let mut tasks_by_name = BTreeMap::new();
-    for task in &spec.tasks {
-        if tasks_by_name.insert(task.name.clone(), task).is_some() {
-            push_error(errors, ValidationError::DuplicateTaskName { name: task.name.clone() });
+fn collect_vessels<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) -> BTreeMap<String, &'a VesselRequirement> {
+    let mut vessels_by_name = BTreeMap::new();
+    for vessel in &spec.vessels {
+        if vessels_by_name.insert(vessel.name.clone(), vessel).is_some() {
+            push_error(errors, ValidationError::DuplicateVesselName { name: vessel.name.clone() });
         }
     }
-    tasks_by_name
+    vessels_by_name
 }
 
-fn validate_task(
-    task: &TaskDefinition,
+fn validate_vessel(
+    vessel: &VesselRequirement,
     declared_inputs: &BTreeSet<String>,
-    tasks_by_name: &BTreeMap<String, &TaskDefinition>,
+    vessels_by_name: &BTreeMap<String, &VesselRequirement>,
     errors: &mut Vec<ValidationError>,
 ) {
     let mut roles = BTreeSet::new();
-    for dependency in &task.depends_on {
-        if !tasks_by_name.contains_key(dependency) {
-            push_error(errors, ValidationError::UnknownDependency { task: task.name.clone(), missing: dependency.clone() });
+    for dependency in &vessel.depends_on {
+        if !vessels_by_name.contains_key(dependency) {
+            push_error(errors, ValidationError::UnknownDependency { vessel: vessel.name.clone(), missing: dependency.clone() });
         }
     }
 
-    for process in &task.processes {
+    for process in &vessel.crew {
         if !roles.insert(process.role.clone()) {
-            push_error(errors, ValidationError::DuplicateRoleInTask { task: task.name.clone(), role: process.role.clone() });
+            push_error(errors, ValidationError::DuplicateRoleInVessel { vessel: vessel.name.clone(), role: process.role.clone() });
         }
 
         for key in process.labels.keys() {
             if key.starts_with(crate::labels::RESERVED_PREFIX) {
                 push_error(errors, ValidationError::ReservedLabelKey {
-                    task: task.name.clone(),
+                    vessel: vessel.name.clone(),
                     role: process.role.clone(),
                     key: key.clone(),
                 });
@@ -197,19 +197,23 @@ fn validate_task(
         }
 
         match &process.source {
-            ProcessSource::Agent { prompt, .. } => {
+            CrewSource::Agent { prompt, .. } => {
                 if let Some(prompt) = prompt {
                     validate_template_text(
                         prompt,
-                        &InterpolationLocation { task: task.name.clone(), role: process.role.clone(), field: InterpolationField::Prompt },
+                        &InterpolationLocation {
+                            vessel: vessel.name.clone(),
+                            role: process.role.clone(),
+                            field: InterpolationField::Prompt,
+                        },
                         declared_inputs,
                         errors,
                     );
                 }
             }
-            ProcessSource::Tool { command } => validate_template_text(
+            CrewSource::Tool { command } => validate_template_text(
                 command,
-                &InterpolationLocation { task: task.name.clone(), role: process.role.clone(), field: InterpolationField::Command },
+                &InterpolationLocation { vessel: vessel.name.clone(), role: process.role.clone(), field: InterpolationField::Command },
                 declared_inputs,
                 errors,
             ),
@@ -217,36 +221,36 @@ fn validate_task(
     }
 }
 
-fn validate_cycles(tasks_by_name: &BTreeMap<String, &TaskDefinition>, errors: &mut Vec<ValidationError>) {
+fn validate_cycles(vessels_by_name: &BTreeMap<String, &VesselRequirement>, errors: &mut Vec<ValidationError>) {
     let mut states = BTreeMap::new();
     let mut stack = Vec::new();
 
-    for task_name in tasks_by_name.keys() {
-        visit_task(task_name, tasks_by_name, &mut states, &mut stack, errors);
+    for vessel_name in vessels_by_name.keys() {
+        visit_vessel(vessel_name, vessels_by_name, &mut states, &mut stack, errors);
     }
 }
 
-fn visit_task(
-    task_name: &str,
-    tasks_by_name: &BTreeMap<String, &TaskDefinition>,
+fn visit_vessel(
+    vessel_name: &str,
+    vessels_by_name: &BTreeMap<String, &VesselRequirement>,
     states: &mut BTreeMap<String, VisitState>,
     stack: &mut Vec<String>,
     errors: &mut Vec<ValidationError>,
 ) {
-    match states.get(task_name) {
+    match states.get(vessel_name) {
         Some(VisitState::Visited) => return,
         None => {}
         Some(VisitState::Visiting) => unreachable!("cycle detection handles visiting dependencies before recursion"),
     }
 
-    states.insert(task_name.to_string(), VisitState::Visiting);
-    stack.push(task_name.to_string());
+    states.insert(vessel_name.to_string(), VisitState::Visiting);
+    stack.push(vessel_name.to_string());
 
-    if let Some(task) = tasks_by_name.get(task_name) {
-        let mut dependencies = task.depends_on.iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some(vessel) = vessels_by_name.get(vessel_name) {
+        let mut dependencies = vessel.depends_on.iter().map(String::as_str).collect::<Vec<_>>();
         dependencies.sort_unstable();
         for dependency in dependencies {
-            if !tasks_by_name.contains_key(dependency) {
+            if !vessels_by_name.contains_key(dependency) {
                 continue;
             }
 
@@ -259,12 +263,12 @@ fn visit_task(
                 continue;
             }
 
-            visit_task(dependency, tasks_by_name, states, stack, errors);
+            visit_vessel(dependency, vessels_by_name, states, stack, errors);
         }
     }
 
     stack.pop();
-    states.insert(task_name.to_string(), VisitState::Visited);
+    states.insert(vessel_name.to_string(), VisitState::Visited);
 }
 
 fn validate_template_text(
@@ -352,36 +356,36 @@ fn push_error(errors: &mut Vec<ValidationError>, error: ValidationError) {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate, InputDefinition, InterpolationField, InterpolationLocation, ProcessDefinition, ProcessSource, Selector, TaskDefinition,
-        ValidationError, WorkflowTemplateSpec,
+        validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation, Selector, ValidationError,
+        VesselRequirement, WorkflowTemplateSpec,
     };
 
     fn valid_spec() -> WorkflowTemplateSpec {
         WorkflowTemplateSpec::builder()
             .inputs(vec![InputDefinition { name: "feature".to_string(), description: None }])
-            .tasks(vec![
-                TaskDefinition::builder()
+            .vessels(vec![
+                VesselRequirement::builder()
                     .name("implement".to_string())
-                    .processes(vec![
-                        ProcessDefinition::builder()
+                    .crew(vec![
+                        CrewSpec::builder()
                             .role("coder".to_string())
-                            .source(ProcessSource::Agent {
+                            .source(CrewSource::Agent {
                                 selector: Selector { capability: "code".to_string() },
                                 prompt: Some("Implement {{inputs.feature}} for {{workflow.name}}".to_string()),
                             })
                             .build(),
-                        ProcessDefinition::builder()
+                        CrewSpec::builder()
                             .role("build".to_string())
-                            .source(ProcessSource::Tool { command: "cargo check".to_string() })
+                            .source(CrewSource::Tool { command: "cargo check".to_string() })
                             .build(),
                     ])
                     .build(),
-                TaskDefinition::builder()
+                VesselRequirement::builder()
                     .name("review".to_string())
                     .depends_on(vec!["implement".to_string()])
-                    .processes(vec![ProcessDefinition::builder()
+                    .crew(vec![CrewSpec::builder()
                         .role("reviewer".to_string())
-                        .source(ProcessSource::Agent {
+                        .source(CrewSource::Agent {
                             selector: Selector { capability: "code-review".to_string() },
                             prompt: Some("Review {{workflow.namespace}}".to_string()),
                         })
@@ -392,41 +396,38 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_duplicate_task_names() {
+    fn validate_rejects_duplicate_vessel_names() {
         let mut spec = valid_spec();
-        spec.tasks.push(spec.tasks[0].clone());
+        spec.vessels.push(spec.vessels[0].clone());
 
-        let errors = validate(&spec).expect_err("duplicate task names should fail");
-        assert!(errors.contains(&ValidationError::DuplicateTaskName { name: "implement".to_string() }));
+        let errors = validate(&spec).expect_err("duplicate vessel names should fail");
+        assert!(errors.contains(&ValidationError::DuplicateVesselName { name: "implement".to_string() }));
     }
 
     #[test]
     fn validate_rejects_duplicate_role_names_within_task() {
         let mut spec = valid_spec();
-        spec.tasks[0].processes.push(
-            ProcessDefinition::builder()
-                .role("coder".to_string())
-                .source(ProcessSource::Tool { command: "cargo test".to_string() })
-                .build(),
-        );
+        spec.vessels[0]
+            .crew
+            .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "cargo test".to_string() }).build());
 
         let errors = validate(&spec).expect_err("duplicate role names should fail");
-        assert!(errors.contains(&ValidationError::DuplicateRoleInTask { task: "implement".to_string(), role: "coder".to_string() }));
+        assert!(errors.contains(&ValidationError::DuplicateRoleInVessel { vessel: "implement".to_string(), role: "coder".to_string() }));
     }
 
     #[test]
     fn validate_rejects_unknown_dependencies() {
         let mut spec = valid_spec();
-        spec.tasks[1].depends_on = vec!["missing".to_string()];
+        spec.vessels[1].depends_on = vec!["missing".to_string()];
 
         let errors = validate(&spec).expect_err("unknown dependencies should fail");
-        assert!(errors.contains(&ValidationError::UnknownDependency { task: "review".to_string(), missing: "missing".to_string() }));
+        assert!(errors.contains(&ValidationError::UnknownDependency { vessel: "review".to_string(), missing: "missing".to_string() }));
     }
 
     #[test]
     fn validate_rejects_cycles() {
         let mut spec = valid_spec();
-        spec.tasks[0].depends_on = vec!["review".to_string()];
+        spec.vessels[0].depends_on = vec!["review".to_string()];
 
         let errors = validate(&spec).expect_err("cycles should fail");
         assert!(errors.contains(&ValidationError::DependencyCycle {
@@ -446,14 +447,18 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_input_references() {
         let mut spec = valid_spec();
-        spec.tasks[0].processes[0].source = ProcessSource::Agent {
+        spec.vessels[0].crew[0].source = CrewSource::Agent {
             selector: Selector { capability: "code".to_string() },
             prompt: Some("Implement {{inputs.branch}}".to_string()),
         };
 
         let errors = validate(&spec).expect_err("unknown input references should fail");
         assert!(errors.contains(&ValidationError::UnknownInputReference {
-            location: InterpolationLocation { task: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt
+            },
             name: "branch".to_string(),
         }));
     }
@@ -461,14 +466,18 @@ mod tests {
     #[test]
     fn validate_rejects_unknown_workflow_fields() {
         let mut spec = valid_spec();
-        spec.tasks[0].processes[0].source = ProcessSource::Agent {
+        spec.vessels[0].crew[0].source = CrewSource::Agent {
             selector: Selector { capability: "code".to_string() },
             prompt: Some("Implement {{workflow.uid}}".to_string()),
         };
 
         let errors = validate(&spec).expect_err("unknown workflow fields should fail");
         assert!(errors.contains(&ValidationError::UnknownWorkflowField {
-            location: InterpolationLocation { task: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt
+            },
             name: "uid".to_string(),
         }));
     }
@@ -476,18 +485,26 @@ mod tests {
     #[test]
     fn validate_rejects_malformed_owned_interpolations() {
         let mut spec = valid_spec();
-        spec.tasks[0].processes[0].source = ProcessSource::Agent {
+        spec.vessels[0].crew[0].source = CrewSource::Agent {
             selector: Selector { capability: "code".to_string() },
             prompt: Some("Implement {{inputs.feature }} and {{workflow.name.extra}}".to_string()),
         };
 
         let errors = validate(&spec).expect_err("malformed owned interpolation should fail");
         assert!(errors.contains(&ValidationError::MalformedInterpolation {
-            location: InterpolationLocation { task: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt
+            },
             text: "inputs.feature ".to_string(),
         }));
         assert!(errors.contains(&ValidationError::MalformedInterpolation {
-            location: InterpolationLocation { task: "implement".to_string(), role: "coder".to_string(), field: InterpolationField::Prompt },
+            location: InterpolationLocation {
+                vessel: "implement".to_string(),
+                role: "coder".to_string(),
+                field: InterpolationField::Prompt
+            },
             text: "workflow.name.extra".to_string(),
         }));
     }
@@ -495,8 +512,7 @@ mod tests {
     #[test]
     fn validate_allows_foreign_interpolations() {
         let mut spec = valid_spec();
-        spec.tasks[0].processes[1].source =
-            ProcessSource::Tool { command: "kubectl get pod -o go-template='{{.metadata.name}}'".to_string() };
+        spec.vessels[0].crew[1].source = CrewSource::Tool { command: "kubectl get pod -o go-template='{{.metadata.name}}'".to_string() };
 
         assert!(validate(&spec).is_ok(), "foreign interpolations should pass through");
     }

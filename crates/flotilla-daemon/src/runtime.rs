@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, HopChainContext,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TaskWorkspaceReconciler, TerminalRuntime,
-    TerminalRuntimeState, TerminalSessionReconciler,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -30,10 +30,10 @@ use flotilla_core::{
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, repo_key, Clone, CloneSpec, Convoy,
-    ConvoyReconciler, DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, Host,
+    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ProcessDefinition, ProcessSource, ResourceBackend, ResourceError,
-    ResourceObject, TaskDefinition, TaskWorkspace, TerminalSessionSource, WorkflowTemplate, WorkflowTemplateSpec,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, TerminalSessionSource,
+    Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -269,11 +269,11 @@ fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
         "scratch",
         WorkflowTemplateSpec::builder()
             .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
-            .tasks(vec![TaskDefinition::builder()
+            .vessels(vec![VesselRequirement::builder()
                 .name("work".to_string())
-                .processes(vec![ProcessDefinition::builder()
+                .crew(vec![CrewSpec::builder()
                     .role("shell".to_string())
-                    .source(ProcessSource::Tool {
+                    .source(CrewSource::Tool {
                         command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
                     })
                     .build()])
@@ -640,14 +640,14 @@ fn spawn_controller_loops(
             let namespace_string = namespace_string.clone();
             let supervision = supervision.clone();
             async move {
-                supervise("task_workspace", supervision, move || {
+                supervise("vessel", supervision, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
                     async move {
                         ControllerLoop {
-                            primary: backend.clone().using::<TaskWorkspace>(&namespace_string),
-                            secondaries: TaskWorkspaceReconciler::secondary_watches(),
-                            reconciler: TaskWorkspaceReconciler::new(backend.clone(), &namespace_string),
+                            primary: backend.clone().using::<Vessel>(&namespace_string),
+                            secondaries: VesselReconciler::secondary_watches(),
+                            reconciler: VesselReconciler::new(backend.clone(), &namespace_string),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -719,7 +719,7 @@ fn spawn_controller_loops(
                             primary: backend.clone().using::<Convoy>(&namespace_string),
                             secondaries: ConvoyReconciler::secondary_watches(),
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
-                                .with_task_workspaces(backend.clone().using::<TaskWorkspace>(&namespace_string))
+                                .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
                                 .with_presentations(backend.clone().using::<Presentation>(&namespace_string)),
                             resync_interval: controller_resync_interval,
                             backend,
@@ -964,7 +964,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 env.extend([
                     ("FLOTILLA_CREW_ID".to_string(), crew_id),
                     ("FLOTILLA_CONVOY".to_string(), context.convoy.clone()),
-                    ("FLOTILLA_VESSEL".to_string(), context.vessel.clone()),
+                    ("FLOTILLA_VESSEL".to_string(), context.vessel_ref.clone()),
                     ("FLOTILLA_CREW_ROLE".to_string(), spec.role.clone()),
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
                 ]);
@@ -1107,9 +1107,9 @@ mod tests {
     };
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
     use flotilla_resources::{
-        Checkout as ResourceCheckout, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, LifecycleAuthority, PlacementPolicy,
-        ProcessDefinition, ProcessSource, Selector, SqliteBackend, TaskDefinition, TaskPhase, TerminalSession, TerminalSessionPhase,
-        TypedResolver, WorkflowTemplate, WorkflowTemplateSpec,
+        Checkout as ResourceCheckout, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
+        PlacementPolicy, Selector, SqliteBackend, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase,
+        WorkflowTemplate, WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -1224,11 +1224,11 @@ mod tests {
                 &empty_meta("wf-a"),
                 &WorkflowTemplateSpec::builder()
                     .inputs(Vec::new())
-                    .tasks(vec![TaskDefinition::builder()
+                    .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
-                        .processes(vec![ProcessDefinition::builder()
+                        .crew(vec![CrewSpec::builder()
                             .role("coder".to_string())
-                            .source(ProcessSource::Tool { command: "bash -lc 'echo stage4a'".to_string() })
+                            .source(CrewSource::Tool { command: "bash -lc 'echo stage4a'".to_string() })
                             .build()])
                         .build()])
                     .build(),
@@ -1257,14 +1257,14 @@ mod tests {
                 convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
                 Some(status)
                     if status.phase == ConvoyPhase::Active
-                        && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
+                        && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
             ) {
                 break;
             }
             if tokio::time::Instant::now() >= run_deadline {
                 let convoy = convoys.get("convoy-a").await.expect("convoy should exist");
-                let workspace = backend.clone().using::<TaskWorkspace>(NAMESPACE).list().await.expect("workspace list should succeed");
-                panic!("convoy did not reach running state: convoy={convoy:?} task_workspaces={workspace:?}");
+                let workspace = backend.clone().using::<Vessel>(NAMESPACE).list().await.expect("workspace list should succeed");
+                panic!("convoy did not reach running state: convoy={convoy:?} vessels={workspace:?}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1272,7 +1272,7 @@ mod tests {
         let host = backend.clone().using::<Host>(NAMESPACE).get(&host_id).await.expect("host should exist after startup");
         assert!(host.status.is_some(), "startup heartbeat should publish host status");
 
-        let workspaces = backend.clone().using::<TaskWorkspace>(NAMESPACE);
+        let workspaces = backend.clone().using::<Vessel>(NAMESPACE);
         let sqlite_path = config.state_dir().as_path().join("resources.sqlite");
         let idle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut previous_idle_sample = None;
@@ -1296,9 +1296,9 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyLegComplete {
+                action: CommandAction::ConvoyWorkComplete {
                     convoy: "convoy-a".to_string(),
-                    leg: "implement".to_string(),
+                    work: "implement".to_string(),
                     message: Some("done".to_string()),
                 },
             })
@@ -1312,7 +1312,7 @@ mod tests {
                     convoys.get("convoy-a").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Completed
-                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Completed)
+                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
                 )
             }
         })
@@ -1539,7 +1539,7 @@ mod tests {
                 context: flotilla_resources::TerminalCrewContext {
                     namespace: NAMESPACE.to_string(),
                     convoy: "demo".to_string(),
-                    vessel: "demo-implement".to_string(),
+                    vessel_ref: "demo-implement".to_string(),
                 },
                 message: None,
             },
@@ -1594,28 +1594,28 @@ mod tests {
                 &empty_meta("crew-workflow"),
                 &WorkflowTemplateSpec::builder()
                     .inputs(Vec::new())
-                    .tasks(vec![TaskDefinition::builder()
+                    .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
-                        .processes(vec![
-                            ProcessDefinition::builder()
+                        .crew(vec![
+                            CrewSpec::builder()
                                 .role("coder".to_string())
-                                .source(ProcessSource::Agent {
+                                .source(CrewSource::Agent {
                                     selector: Selector { capability: "coding".to_string() },
                                     prompt: Some(
                                         "Implement issue 668 without leaking this full brief into the launch command.".to_string(),
                                     ),
                                 })
                                 .build(),
-                            ProcessDefinition::builder()
+                            CrewSpec::builder()
                                 .role("reviewer".to_string())
-                                .source(ProcessSource::Agent {
+                                .source(CrewSource::Agent {
                                     selector: Selector { capability: "review".to_string() },
                                     prompt: Some("Review the coder's work.".to_string()),
                                 })
                                 .build(),
-                            ProcessDefinition::builder()
+                            CrewSpec::builder()
                                 .role("watcher".to_string())
-                                .source(ProcessSource::Tool { command: "cargo test --watch".to_string() })
+                                .source(CrewSource::Tool { command: "cargo test --watch".to_string() })
                                 .build(),
                         ])
                         .build()])
@@ -1653,7 +1653,7 @@ mod tests {
                     convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
-                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
+                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
                 )
             }
         })
@@ -1781,8 +1781,8 @@ mod tests {
         })
         .await;
         assert!(matches!(
-            convoys.get("crew-convoy").await.expect("crew convoy").status.and_then(|status| status.tasks.get("implement").cloned()),
-            Some(task) if task.phase == TaskPhase::Running
+            convoys.get("crew-convoy").await.expect("crew convoy").status.and_then(|status| status.work.get("implement").cloned()),
+            Some(task) if task.phase == WorkPhase::Running
         ));
         let stopped_list = daemon
             .execute_query(
@@ -1840,14 +1840,14 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyLegComplete {
+                action: CommandAction::ConvoyWorkComplete {
                     convoy: "crew-convoy".to_string(),
-                    leg: "implement".to_string(),
+                    work: "implement".to_string(),
                     message: Some("human accepted the crew's work".to_string()),
                 },
             })
             .await
-            .expect("complete crew leg");
+            .expect("complete work");
         assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
         wait_until(|| {
             let convoys = convoys.clone();
@@ -1869,11 +1869,11 @@ mod tests {
                 &empty_meta("unknown-capability"),
                 &WorkflowTemplateSpec::builder()
                     .inputs(Vec::new())
-                    .tasks(vec![TaskDefinition::builder()
+                    .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
-                        .processes(vec![ProcessDefinition::builder()
+                        .crew(vec![CrewSpec::builder()
                             .role("architect".to_string())
-                            .source(ProcessSource::Agent { selector: Selector { capability: "architect".to_string() }, prompt: None })
+                            .source(CrewSource::Agent { selector: Selector { capability: "architect".to_string() }, prompt: None })
                             .build()])
                         .build()])
                     .build(),
@@ -1913,7 +1913,7 @@ mod tests {
         })
         .await;
         let failed = convoys.get("unknown-convoy").await.expect("unknown convoy").status.expect("unknown status");
-        assert_eq!(failed.tasks.get("implement").and_then(|task| task.message.as_deref()), Some("unknown agent capability `architect`"));
+        assert_eq!(failed.work.get("implement").and_then(|task| task.message.as_deref()), Some("unknown agent capability `architect`"));
 
         for handle in controller_handles {
             handle.abort();
@@ -1959,11 +1959,11 @@ mod tests {
                 &empty_meta("wf-a"),
                 &WorkflowTemplateSpec::builder()
                     .inputs(Vec::new())
-                    .tasks(vec![TaskDefinition::builder()
+                    .vessels(vec![VesselRequirement::builder()
                         .name("implement".to_string())
-                        .processes(vec![ProcessDefinition::builder()
+                        .crew(vec![CrewSpec::builder()
                             .role("coder".to_string())
-                            .source(ProcessSource::Tool { command: "bash -lc 'echo adopted-stage4a'".to_string() })
+                            .source(CrewSource::Tool { command: "bash -lc 'echo adopted-stage4a'".to_string() })
                             .build()])
                         .build()])
                     .build(),
@@ -2000,7 +2000,7 @@ mod tests {
                     convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Active
-                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Running)
+                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Running)
                 )
             }
         })
@@ -2011,9 +2011,9 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyLegComplete {
+                action: CommandAction::ConvoyWorkComplete {
                     convoy: "convoy-adopted".to_string(),
-                    leg: "implement".to_string(),
+                    work: "implement".to_string(),
                     message: Some("done".to_string()),
                 },
             })
@@ -2028,7 +2028,7 @@ mod tests {
                     convoys.get("convoy-adopted").await.ok().and_then(|convoy| convoy.status).as_ref(),
                     Some(status)
                         if status.phase == ConvoyPhase::Completed
-                            && matches!(status.tasks.get("implement"), Some(task) if task.phase == TaskPhase::Completed)
+                            && matches!(status.work.get("implement"), Some(task) if task.phase == WorkPhase::Complete)
                 )
             }
         })
