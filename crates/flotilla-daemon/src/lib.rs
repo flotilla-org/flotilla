@@ -1,5 +1,5 @@
 mod aggregator;
-pub use aggregator::Aggregator;
+pub use aggregator::{Aggregator, AggregatorResolvers};
 
 pub mod cli;
 pub mod peer;

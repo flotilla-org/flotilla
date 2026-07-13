@@ -96,7 +96,9 @@ pub use query::{
     TopologyRoute, UnmetRequirementInfo,
 };
 pub use resource_ref::ResourceRef;
-pub use result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, ResultSet, Rows, VesselRow, WorkPhase};
+pub use result_set::{
+    ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, ResultSet, Rows, SessionPhase, SessionRow, VesselRow, WorkPhase,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,7 +113,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.

@@ -1,16 +1,16 @@
 //! Resource-store and fleet-replica Aggregator maintaining named-query result sets.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use flotilla_core::aggregator_projection::AggregatorProjectionState;
 use flotilla_protocol::{
-    result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, Rows, VesselRow, WorkPhase},
+    result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, Rows, SessionPhase, SessionRow, VesselRow, WorkPhase},
     DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
-    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL,
-    VESSEL_LABEL,
+    api_version, terminal_session_attach_target, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation,
+    Resource, ResourceError, ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement,
+    WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -18,28 +18,43 @@ use tokio::sync::broadcast;
 type PresentationKey = (String, String, String);
 
 #[derive(bon::Builder)]
+pub struct AggregatorResolvers {
+    durable_convoys: TypedResolver<Convoy>,
+    durable_presentations: TypedResolver<Presentation>,
+    durable_sessions: TypedResolver<TerminalSession>,
+    observed_convoys: TypedResolver<Convoy>,
+    observed_presentations: TypedResolver<Presentation>,
+    observed_sessions: TypedResolver<TerminalSession>,
+}
+
+#[derive(bon::Builder)]
 pub struct Aggregator {
     state: AggregatorProjectionState,
     local_host: HostName,
     presentation_workspaces: HashMap<PresentationKey, String>,
     bootstrapping: bool,
-    emitted_initial_snapshot: bool,
+    emitted_queries: HashSet<QueryId>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl Aggregator {
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { state, local_host, presentation_workspaces: HashMap::new(), bootstrapping: false, emitted_initial_snapshot: false, event_tx }
+        Self { state, local_host, presentation_workspaces: HashMap::new(), bootstrapping: false, emitted_queries: HashSet::new(), event_tx }
     }
 
     pub async fn run(
         mut self,
-        durable_convoys: TypedResolver<Convoy>,
-        durable_presentations: TypedResolver<Presentation>,
-        observed_convoys: TypedResolver<Convoy>,
-        observed_presentations: TypedResolver<Presentation>,
+        resolvers: AggregatorResolvers,
         mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
+        let AggregatorResolvers {
+            durable_convoys,
+            durable_presentations,
+            durable_sessions,
+            observed_convoys,
+            observed_presentations,
+            observed_sessions,
+        } = resolvers;
         self.bootstrapping = true;
         {
             let mut view = self.state.write().await;
@@ -48,13 +63,23 @@ impl Aggregator {
                 view.seq = view.seq.saturating_add(1);
             }
         }
+        {
+            let mut view = self.state.write_sessions().await;
+            if !view.local_rows.is_empty() {
+                view.local_rows.clear();
+                view.seq = view.seq.saturating_add(1);
+            }
+        }
         let mut durable_convoy_stream = self.list_and_watch_convoys(durable_convoys).await?;
         let mut durable_presentation_stream = self.list_and_watch_presentations(durable_presentations).await?;
+        let mut durable_session_stream = self.list_and_watch_sessions(durable_sessions).await?;
         let mut observed_convoy_stream = self.list_and_watch_convoys(observed_convoys).await?;
         let mut observed_presentation_stream = self.list_and_watch_presentations(observed_presentations).await?;
+        let mut observed_session_stream = self.list_and_watch_sessions(observed_sessions).await?;
         self.bootstrapping = false;
-        self.emitted_initial_snapshot = true;
+        self.emitted_queries.extend(QueryId::ALL.iter().copied());
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
+        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.sessions_result_set().await)));
 
         loop {
             tokio::select! {
@@ -68,6 +93,11 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable presentation watch ended")),
                 },
+                event = durable_session_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_session_event(event).await,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable terminal session watch ended")),
+                },
                 event = observed_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event(event).await,
                     Some(Err(err)) => return Err(err),
@@ -77,6 +107,11 @@ impl Aggregator {
                     Some(Ok(event)) => self.apply_presentation_event(event).await,
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator observed presentation watch ended")),
+                },
+                event = observed_session_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_session_event(event).await,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator observed terminal session watch ended")),
                 },
                 replica = replica_rx.recv() => match replica {
                     Ok(snapshots) => self.apply_replica_cache(snapshots).await,
@@ -111,6 +146,18 @@ impl Aggregator {
         let start = watch_start(&listed);
         for presentation in listed.items {
             self.apply_presentation_event(WatchEvent::Added(presentation)).await;
+        }
+        resolver.watch(start).await
+    }
+
+    async fn list_and_watch_sessions(
+        &mut self,
+        resolver: TypedResolver<TerminalSession>,
+    ) -> Result<flotilla_resources::WatchStream<TerminalSession>, ResourceError> {
+        let listed = resolver.list().await?;
+        let start = watch_start(&listed);
+        for session in listed.items {
+            self.apply_session_event(WatchEvent::Added(session)).await;
         }
         resolver.watch(start).await
     }
@@ -183,10 +230,10 @@ impl Aggregator {
                 if self.bootstrapping {
                     return;
                 }
-                if self.emitted_initial_snapshot {
+                if self.emitted_queries.contains(&QueryId::Convoys) {
                     self.emit_delta(vec![row], Vec::new()).await;
                 } else {
-                    self.emitted_initial_snapshot = true;
+                    self.emitted_queries.insert(QueryId::Convoys);
                     let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
                 }
             }
@@ -205,56 +252,100 @@ impl Aggregator {
         }
     }
 
-    pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
-        let mut replacements = HashMap::new();
-        for snapshot in snapshots {
-            let host = snapshot.host;
-            let mut rows = HashMap::new();
-            if let Some(Rows::Convoys(convoys)) =
-                snapshot.result_sets.into_iter().find(|result_set| result_set.query() == QueryId::Convoys).map(|result_set| result_set.rows)
-            {
-                for mut row in convoys {
-                    set_row_host(&mut row, &host);
-                    rows.insert(row.resource.clone(), row);
+    pub async fn apply_session_event(&mut self, event: WatchEvent<TerminalSession>) {
+        match event {
+            WatchEvent::Added(session) | WatchEvent::Modified(session) => {
+                if let Some(row) = self.summarize_session(&session) {
+                    let reference = row.resource.clone();
+                    let result_set = {
+                        let mut view = self.state.write_sessions().await;
+                        view.local_rows.insert(reference, row.clone());
+                        view.seq = view.seq.saturating_add(1);
+                        view.result_set()
+                    };
+                    if self.bootstrapping {
+                        return;
+                    }
+                    if self.emitted_queries.contains(&QueryId::Sessions) {
+                        self.emit_session_delta(vec![row], Vec::new()).await;
+                    } else {
+                        self.emitted_queries.insert(QueryId::Sessions);
+                        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+                    }
+                } else {
+                    self.remove_local_session(&session).await;
                 }
             }
-            replacements.insert(host, rows);
+            WatchEvent::Deleted(session) => self.remove_local_session(&session).await,
         }
+    }
 
-        let (changed, removed, full_result_set) = {
-            let mut view = self.state.write().await;
-            let previous = std::mem::take(&mut view.replica_rows);
-            let changed = replacements
-                .iter()
-                .flat_map(|(host, rows)| {
-                    let prior = previous.get(host);
-                    rows.iter()
-                        .filter(move |(reference, row)| prior.and_then(|prior| prior.get(*reference)) != Some(*row))
-                        .map(|(_, row)| row.clone())
-                })
-                .collect::<Vec<_>>();
-            let removed = previous
-                .iter()
-                .flat_map(|(host, rows)| {
-                    let replacement = replacements.get(host);
-                    rows.keys()
-                        .filter(move |reference| replacement.is_none_or(|replacement| !replacement.contains_key(*reference)))
-                        .cloned()
-                })
-                .collect::<Vec<_>>();
-            view.replica_rows = replacements;
-            if changed.is_empty() && removed.is_empty() {
+    async fn remove_local_session(&self, session: &ResourceObject<TerminalSession>) {
+        let reference = self.session_ref(&session.metadata.namespace, &session.metadata.name);
+        let removed = {
+            let mut view = self.state.write_sessions().await;
+            if view.local_rows.remove(&reference).is_none() {
                 return;
             }
             view.seq = view.seq.saturating_add(1);
-            (changed, removed, view.result_set())
+            reference
         };
+        if !self.bootstrapping {
+            self.emit_session_delta(Vec::new(), vec![removed]).await;
+        }
+    }
 
-        if self.emitted_initial_snapshot {
-            self.emit_delta(changed, removed).await;
-        } else {
-            self.emitted_initial_snapshot = true;
-            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(full_result_set)));
+    pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
+        let mut convoy_replacements = HashMap::new();
+        let mut session_replacements = HashMap::new();
+        for snapshot in snapshots {
+            let host = snapshot.host;
+            let mut convoy_rows = HashMap::new();
+            let mut session_rows = HashMap::new();
+            for result_set in snapshot.result_sets {
+                match result_set.rows {
+                    Rows::Convoys(convoys) => {
+                        for mut row in convoys {
+                            set_convoy_row_host(&mut row, &host);
+                            convoy_rows.insert(row.resource.clone(), row);
+                        }
+                    }
+                    Rows::Sessions(sessions) => {
+                        for mut row in sessions {
+                            set_session_row_host(&mut row, &host);
+                            session_rows.insert(row.resource.clone(), row);
+                        }
+                    }
+                }
+            }
+            convoy_replacements.insert(host.clone(), convoy_rows);
+            session_replacements.insert(host, session_rows);
+        }
+
+        let convoy_change = {
+            let mut view = self.state.write().await;
+            view.replace_replica_rows(convoy_replacements)
+        };
+        if let Some((changed, removed)) = convoy_change {
+            if self.emitted_queries.contains(&QueryId::Convoys) {
+                self.emit_delta(changed, removed).await;
+            } else {
+                self.emitted_queries.insert(QueryId::Convoys);
+                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
+            }
+        }
+
+        let session_change = {
+            let mut view = self.state.write_sessions().await;
+            view.replace_replica_rows(session_replacements)
+        };
+        if let Some((changed, removed)) = session_change {
+            if self.emitted_queries.contains(&QueryId::Sessions) {
+                self.emit_session_delta(changed, removed).await;
+            } else {
+                self.emitted_queries.insert(QueryId::Sessions);
+                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.sessions_result_set().await)));
+            }
         }
     }
 
@@ -263,8 +354,39 @@ impl Aggregator {
         let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(changed), removed })));
     }
 
+    async fn emit_session_delta(&self, changed: Vec<SessionRow>, removed: Vec<ResourceRef>) {
+        let seq = self.state.sessions_seq().await;
+        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Sessions(changed), removed })));
+    }
+
     fn convoy_ref(&self, namespace: &str, name: &str) -> ResourceRef {
         ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
+    }
+
+    fn session_ref(&self, namespace: &str, name: &str) -> ResourceRef {
+        ResourceRef::new(api_version(TerminalSession::API_PATHS), TerminalSession::API_PATHS.kind, namespace, name)
+            .on_host(self.local_host.clone())
+    }
+
+    fn summarize_session(&self, session: &ResourceObject<TerminalSession>) -> Option<SessionRow> {
+        if session.metadata.labels.contains_key(CONVOY_LABEL) {
+            return None;
+        }
+        let status = session.status.as_ref()?;
+        if status.phase != TerminalSessionPhase::Running {
+            return None;
+        }
+        let name = &session.metadata.name;
+        Some(
+            SessionRow::builder()
+                .resource(self.session_ref(&session.metadata.namespace, name))
+                .name(name)
+                .maybe_repo(session.metadata.labels.get(REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
+                .host(self.local_host.clone())
+                .maybe_attach(terminal_session_attach_target(session).is_ok().then(|| name.clone()))
+                .phase(SessionPhase::Running)
+                .build(),
+        )
     }
 
     fn vessel_attach(&self, namespace: &str, convoy: &str, vessel: &str) -> Option<String> {
@@ -342,12 +464,17 @@ fn watch_start<T: Resource>(listed: &ResourceList<T>) -> WatchStart {
     }
 }
 
-fn set_row_host(row: &mut ConvoyRow, host: &HostName) {
+fn set_convoy_row_host(row: &mut ConvoyRow, host: &HostName) {
     row.resource.host = Some(host.clone());
     for vessel in &mut row.vessels {
         vessel.resource.host = Some(host.clone());
         vessel.host = host.clone();
     }
+}
+
+fn set_session_row_host(row: &mut SessionRow, host: &HostName) {
+    row.resource.host = Some(host.clone());
+    row.host = host.clone();
 }
 
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
@@ -405,6 +532,24 @@ mod tests {
         }
     }
 
+    fn remote_session_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
+        let host = HostName::new(host);
+        let session = ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", name);
+        let row = SessionRow::builder()
+            .resource(session)
+            .name(name)
+            .host(HostName::new("incorrect-source-host"))
+            .attach(name)
+            .phase(SessionPhase::Running)
+            .build();
+        FleetReplicaSnapshot {
+            host,
+            generation: Some(generation.to_string()),
+            rows: Vec::new(),
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Sessions(vec![row]) }],
+        }
+    }
+
     fn convoy_names(rows: &Rows) -> Vec<&str> {
         rows.as_convoys().expect("convoy rows").iter().map(|row| row.name.as_str()).collect()
     }
@@ -441,6 +586,23 @@ mod tests {
         let rows = result_set.rows.as_convoys().expect("convoy rows");
         let row = rows.first().expect("replica convoy row");
         assert_eq!(row.project_ref.as_deref(), Some("my-project"));
+    }
+
+    #[tokio::test]
+    async fn replica_cache_unions_sessions_and_stamps_origin_host() {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+
+        aggregator.apply_replica_cache(vec![remote_session_snapshot("feta", "generation-1", "terminal-yeoman")]).await;
+        let event = rx.recv().await.expect("sessions replica event");
+        assert!(matches!(event, DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Sessions));
+
+        let result_set = state.sessions_result_set().await;
+        let rows = result_set.rows.as_sessions().expect("session rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resource.host, Some(HostName::new("feta")));
+        assert_eq!(rows[0].host, HostName::new("feta"));
     }
 
     #[tokio::test]
@@ -481,10 +643,14 @@ mod tests {
 
         let result = Aggregator::new(state.clone(), HostName::new("local"), event_tx)
             .run(
-                durable.clone().using::<Convoy>("flotilla"),
-                durable.using::<Presentation>("flotilla"),
-                observed.clone().using::<Convoy>("flotilla"),
-                observed.using::<Presentation>("flotilla"),
+                AggregatorResolvers::builder()
+                    .durable_convoys(durable.clone().using::<Convoy>("flotilla"))
+                    .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
+                    .durable_sessions(durable.using::<TerminalSession>("flotilla"))
+                    .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
+                    .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
+                    .observed_sessions(observed.using::<TerminalSession>("flotilla"))
+                    .build(),
                 replica_rx,
             )
             .await;

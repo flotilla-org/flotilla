@@ -304,7 +304,7 @@ fn append_crewless_convoy_rows(
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
     for result_set in result_sets {
-        let Rows::Convoys(convoys) = &result_set.rows;
+        let Rows::Convoys(convoys) = &result_set.rows else { continue };
         for row in convoys {
             if row.resource.namespace != target_namespace {
                 continue;

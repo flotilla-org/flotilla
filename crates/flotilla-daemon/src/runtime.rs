@@ -41,7 +41,7 @@ use tracing::warn;
 
 use crate::{
     supervisor::{supervise, ControllerSupervision},
-    Aggregator,
+    Aggregator, AggregatorResolvers,
 };
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
@@ -754,10 +754,14 @@ fn spawn_aggregator_task(
                 aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
                 aggregator
                     .run(
-                        durable.clone().using::<Convoy>(&namespace),
-                        durable.using::<Presentation>(&namespace),
-                        observed.clone().using::<Convoy>(&namespace),
-                        observed.using::<Presentation>(&namespace),
+                        AggregatorResolvers::builder()
+                            .durable_convoys(durable.clone().using::<Convoy>(&namespace))
+                            .durable_presentations(durable.using::<Presentation>(&namespace))
+                            .durable_sessions(durable.using::<flotilla_resources::TerminalSession>(&namespace))
+                            .observed_convoys(observed.clone().using::<Convoy>(&namespace))
+                            .observed_presentations(observed.using::<Presentation>(&namespace))
+                            .observed_sessions(observed.using::<flotilla_resources::TerminalSession>(&namespace))
+                            .build(),
                         daemon.subscribe_fleet_replicas(),
                     )
                     .await
