@@ -586,6 +586,7 @@ fn handle_event(
             }
         }
         DaemonEvent::RepoTracked(_)
+        | DaemonEvent::RepoRefreshCompleted { .. }
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }
         | DaemonEvent::CommandStepUpdate { .. }
@@ -665,6 +666,7 @@ async fn recover_from_gap(
                                 }
                             }
                             DaemonEvent::RepoTracked(_)
+                            | DaemonEvent::RepoRefreshCompleted { .. }
                             | DaemonEvent::RepoUntracked { .. }
                             | DaemonEvent::CommandStarted { .. }
                             | DaemonEvent::CommandFinished { .. }
@@ -766,6 +768,7 @@ impl DaemonHandle for SocketDaemon {
                     DaemonEvent::PanelSnapshot(snap) => (StreamKey::Panel { tab: snap.tab.id.clone() }, snap.seq),
                     DaemonEvent::PanelDelta(delta) => (StreamKey::Panel { tab: delta.tab_id.clone() }, delta.seq),
                     DaemonEvent::RepoTracked(_)
+                    | DaemonEvent::RepoRefreshCompleted { .. }
                     | DaemonEvent::RepoUntracked { .. }
                     | DaemonEvent::CommandStarted { .. }
                     | DaemonEvent::CommandFinished { .. }

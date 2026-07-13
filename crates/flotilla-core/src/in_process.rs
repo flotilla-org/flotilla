@@ -1225,6 +1225,21 @@ impl InProcessDaemon {
         .await
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn trigger_root_refresh_for_test(&self, repo_path: &Path) -> Result<(), String> {
+        let identity =
+            self.tracked_repo_identity_for_path(repo_path).await.ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        let repos = self.repos.read().await;
+        let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo_path.display()))?;
+        let root = state
+            .roots
+            .iter()
+            .find(|root| root.path == repo_path)
+            .ok_or_else(|| format!("repo root not tracked: {}", repo_path.display()))?;
+        root.model.refresh_handle.trigger_refresh();
+        Ok(())
+    }
+
     /// Returns the current connection status for a peer host.
     pub async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
         self.host_registry.peer_connection_status(node_id).await
@@ -1558,19 +1573,21 @@ impl InProcessDaemon {
                 .iter_mut()
                 .filter_map(|(identity, state)| {
                     let mut any_changed = false;
+                    let mut preferred_changed = false;
                     let mut snapshots = Vec::new();
-                    for root in &mut state.roots {
+                    for (root_index, root) in state.roots.iter_mut().enumerate() {
                         let handle = &mut root.model.refresh_handle;
                         if handle.snapshot_rx.has_changed().unwrap_or(false) {
                             let _ = handle.snapshot_rx.borrow_and_update();
                             any_changed = true;
+                            preferred_changed |= root_index == 0;
                         }
                         snapshots.push(handle.snapshot_rx.borrow().clone());
                     }
                     if !any_changed {
                         return None;
                     }
-                    Some((identity.clone(), snapshots))
+                    Some((identity.clone(), snapshots, preferred_changed))
                 })
                 .collect()
         };
@@ -1585,7 +1602,7 @@ impl InProcessDaemon {
 
         // Correlate and build proto snapshots outside any lock
         let mut updates = Vec::new();
-        for (identity, snapshots) in changed {
+        for (identity, snapshots, preferred_changed) in changed {
             let environment_id = {
                 let repos = self.repos.read().await;
                 repos.get(&identity).and_then(|state| state.preferred_environment_id().cloned())
@@ -1623,11 +1640,11 @@ impl InProcessDaemon {
             let (work_items, correlation_groups) = crate::data::correlate(&providers);
 
             let re_snapshot = RefreshSnapshot { providers, work_items, correlation_groups, errors, provider_health };
-            updates.push((identity, last_local_providers, re_snapshot));
+            updates.push((identity, last_local_providers, re_snapshot, preferred_changed));
         }
 
         let namespace = self.provisioning_namespace().await;
-        for (identity, local_providers, snapshot) in &updates {
+        for (identity, local_providers, snapshot, _) in &updates {
             if snapshot.errors.iter().any(|error| error.category == "checkouts") {
                 warn!(repo = %identity.path, "skipping observed checkout reconciliation after checkout discovery failed");
                 continue;
@@ -1641,7 +1658,7 @@ impl InProcessDaemon {
 
         // Apply updates under write lock and broadcast
         let mut repos = self.repos.write().await;
-        for (identity, last_local_providers, re_snapshot) in updates {
+        for (identity, last_local_providers, re_snapshot, preferred_changed) in updates {
             let Some(state) = repos.get_mut(&identity) else {
                 continue;
             };
@@ -1693,6 +1710,12 @@ impl InProcessDaemon {
 
             let event = choose_event(proto_snapshot, delta_entry);
             let _ = self.event_tx.send(event);
+            if preferred_changed {
+                let _ = self.event_tx.send(DaemonEvent::RepoRefreshCompleted {
+                    repo_identity: state.identity().clone(),
+                    repo: Some(state.preferred_path().to_path_buf()),
+                });
+            }
         }
 
         drop(repos);

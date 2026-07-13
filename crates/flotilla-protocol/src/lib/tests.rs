@@ -267,6 +267,17 @@ fn error_response_builds_with_error_message() {
 }
 
 #[test]
+fn repo_refresh_completed_event_roundtrip() {
+    let event = DaemonEvent::RepoRefreshCompleted {
+        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/my-repo".into() },
+        repo: Some(PathBuf::from("/tmp/my-repo")),
+    };
+    let json = serde_json::to_value(&event).expect("serialize");
+    assert_eq!(json["kind"], "repo_refresh_completed");
+    test_helpers::assert_json_roundtrip(&event);
+}
+
+#[test]
 fn daemon_event_command_started_roundtrip() {
     let event = DaemonEvent::CommandStarted {
         command_id: 42,

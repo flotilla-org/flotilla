@@ -783,76 +783,50 @@ impl App {
     }
 
     pub(crate) fn drain_background_updates(&mut self) {
-        use issue_view::IssueQueryUpdate;
+        use issue_view::{IssueFetchCompletion, IssueFetchFailure, IssueQueryUpdate};
 
         while let Ok(update) = self.issue_update_rx.try_recv() {
             match update {
                 IssueQueryUpdate::PageFetched { repo, params, requested_page, page } => {
                     let Some(view) = self.issue_views.get_mut(&repo) else { continue };
-                    let target = if params.search.is_some() {
-                        // Discard results from a stale search — the user may
-                        // have started a new search or cleared while this was
-                        // in flight.
-                        if view.search_query != params.search {
-                            continue;
+                    match view.complete_fetch(&params, requested_page, page) {
+                        IssueFetchCompletion::Ignored => continue,
+                        IssueFetchCompletion::Applied => {}
+                        IssueFetchCompletion::AppliedAndRefresh => {
+                            self.spawn_query_page(repo.clone(), params, 1, 50);
                         }
-                        view.search.as_mut()
-                    } else {
-                        view.default.as_mut()
-                    };
-                    let Some(state) = target else { continue };
-                    if state.params != params || state.next_page != requested_page || !state.fetch_pending {
-                        continue;
                     }
-                    state.append_page(page);
                     self.push_issue_items_to_repo_data(&repo);
                 }
                 IssueQueryUpdate::QueryFailed { repo, params, requested_page, message } => {
                     tracing::warn!(%message, requested_page, is_search = params.search.is_some(), "issue query failed");
-                    let mut restore_default_rows = false;
-                    let mut remove_default_state = false;
-                    let mut clear_search_ui = false;
-                    if let Some(view) = self.issue_views.get_mut(&repo) {
-                        let target = if params.search.is_some() {
-                            if view.search_query != params.search {
-                                continue;
-                            }
-                            view.search.as_mut()
-                        } else {
-                            view.default.as_mut()
-                        };
-                        let Some(state) = target else { continue };
-                        if state.params != params || state.next_page != requested_page || !state.fetch_pending {
-                            continue;
-                        }
-                        if requested_page == 1 && state.items.is_empty() {
-                            if params.search.is_some() {
-                                view.search = None;
-                                view.search_query = None;
-                                restore_default_rows = true;
-                                clear_search_ui = true;
-                            } else {
-                                remove_default_state = true;
-                            }
-                        } else {
-                            state.fetch_pending = false;
-                        }
-                    } else {
+                    let Some(view) = self.issue_views.get_mut(&repo) else { continue };
+                    let failure = view.fail_fetch(&params, requested_page);
+                    if failure == IssueFetchFailure::Ignored {
                         continue;
                     }
+
+                    let initial_failure = failure == IssueFetchFailure::Initial;
+                    let refresh_after_failure = failure == IssueFetchFailure::ExistingAndRefresh;
                     self.set_status_message(Some(message));
-                    if remove_default_state {
+
+                    if initial_failure && params.search.is_some() {
+                        if let Some(view) = self.issue_views.get_mut(&repo) {
+                            view.search = None;
+                            view.search_query = None;
+                        }
+                        if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
+                            page.active_search_query = None;
+                        }
+                        self.push_issue_items_to_repo_data(&repo);
+                    } else if initial_failure {
                         if let Some(view) = self.issue_views.get_mut(&repo) {
                             view.default = None;
                         }
                     }
-                    if clear_search_ui {
-                        if let Some(page) = self.screen.repo_pages.get_mut(&repo) {
-                            page.active_search_query = None;
-                        }
-                    }
-                    if restore_default_rows {
-                        self.push_issue_items_to_repo_data(&repo);
+
+                    if refresh_after_failure {
+                        self.spawn_query_page(repo, params, 1, 50);
                     }
                 }
             }
@@ -861,28 +835,12 @@ impl App {
 
     fn begin_issue_page_fetch(&mut self, repo: &RepoIdentity, params: &flotilla_protocol::issue_query::IssueQuery, page: u32) -> bool {
         let view = self.issue_views.entry(repo.clone()).or_default();
-        let target = if params.search.is_some() {
-            if view.search_query != params.search {
-                return false;
-            }
-            &mut view.search
-        } else {
-            &mut view.default
-        };
+        view.begin_page_fetch(params, page)
+    }
 
-        if target.is_none() {
-            if page != 1 {
-                return false;
-            }
-            *target = Some(issue_view::IssuePagingState::new(params.clone()));
-        }
-
-        let Some(state) = target.as_mut() else { return false };
-        if state.params != *params || state.fetch_pending || state.next_page != page {
-            return false;
-        }
-        state.fetch_pending = true;
-        true
+    fn begin_issue_refresh(&mut self, repo: &RepoIdentity, params: &flotilla_protocol::issue_query::IssueQuery) -> bool {
+        let Some(view) = self.issue_views.get_mut(repo) else { return false };
+        view.request_refresh(params) == issue_view::IssueRefreshRequest::Started
     }
 
     /// Spawn a background task to query one page of issue results.
@@ -947,6 +905,33 @@ impl App {
             return;
         }
         self.spawn_query_page(repo_identity.clone(), params, 1, 50);
+    }
+
+    /// Refresh settled issue listings while preserving their current rows until
+    /// replacement page-one results arrive. An initial fetch already in flight
+    /// is left alone.
+    fn refresh_issue_views(&mut self, repo_identity: &RepoIdentity) {
+        if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        self.maybe_fetch_default_issues(repo_identity);
+        let params: Vec<_> = self
+            .issue_views
+            .get(repo_identity)
+            .into_iter()
+            .flat_map(|view| [view.default.as_ref(), view.search.as_ref()])
+            .flatten()
+            .map(|state| state.params.clone())
+            .collect();
+        for params in params {
+            if self.begin_issue_refresh(repo_identity, &params) {
+                self.spawn_query_page(repo_identity.clone(), params, 1, 50);
+            }
+        }
     }
 
     /// Push issue rows from `IssueViewState` into the `Shared<RepoData>` for
@@ -1198,6 +1183,7 @@ impl App {
         match event {
             DaemonEvent::RepoSnapshot(snap) => self.apply_snapshot(*snap),
             DaemonEvent::RepoDelta(delta) => self.apply_delta(*delta),
+            DaemonEvent::RepoRefreshCompleted { repo_identity, .. } => self.refresh_issue_views(&repo_identity),
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
             DaemonEvent::CommandStarted { command_id, node_id, repo_identity, repo, description, .. } => {
@@ -1411,7 +1397,6 @@ impl App {
         // Log and display errors (clears status when errors resolve)
         self.set_status_message(format_error_status(&snap.errors, &path));
 
-        // On first snapshot for a repo, fetch default issues.
         self.maybe_fetch_default_issues(&repo_identity);
     }
 

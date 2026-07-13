@@ -411,6 +411,9 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 delta.changes.len()
             )
         }
+        DaemonEvent::RepoRefreshCompleted { repo_identity, repo } => {
+            format!("[refresh]  {}: completed", repo_label(repo.as_deref(), repo_identity))
+        }
         DaemonEvent::RepoTracked(info) => {
             format!("[repo]     {}: tracked", info.name)
         }
@@ -481,6 +484,7 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
         DaemonEvent::PanelSnapshot(snapshot) => Some((StreamKey::Panel { tab: snapshot.tab.id.clone() }, snapshot.seq)),
         DaemonEvent::PanelDelta(delta) => Some((StreamKey::Panel { tab: delta.tab_id.clone() }, delta.seq)),
         DaemonEvent::RepoTracked(_)
+        | DaemonEvent::RepoRefreshCompleted { .. }
         | DaemonEvent::RepoUntracked { .. }
         | DaemonEvent::CommandStarted { .. }
         | DaemonEvent::CommandFinished { .. }

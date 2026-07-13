@@ -192,7 +192,7 @@ impl App {
         let Some(page) = self.screen.repo_pages.get(&repo_identity) else { return };
         let Some(view) = self.issue_views.get(&repo_identity) else { return };
         let Some(active) = view.active() else { return };
-        if !active.has_more || active.fetch_pending {
+        if !active.has_more || active.fetch_pending() {
             return;
         }
         let issue_count = active.items.len();
