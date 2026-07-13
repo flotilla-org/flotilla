@@ -26,7 +26,7 @@ use flotilla_protocol::{HostName, NodeId, ProvisioningTarget, RepoIdentity};
 use ratatui::{layout::Rect, Frame};
 
 use crate::{
-    app::{CommandQueue, InFlightCommand, TuiModel, UiState},
+    app::{CommandQueue, InFlightCommand, OpenViews, TuiModel, UiState},
     binding_table::{KeyBindingMode, StatusFragment},
     keymap::{Action, Keymap},
     theme::Theme,
@@ -65,11 +65,24 @@ pub enum AppAction {
     ToggleMultiSelect,
     OpenActionMenu,
     ActionEnter,
-    StatusBarKeyPress { code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers },
+    StatusBarKeyPress {
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    },
     ClearError(usize),
-    SwitchToConfig,
-    SwitchToConvoys,
-    SwitchToRepo(usize),
+    /// Switch to the open View at this tab index.
+    SwitchToTab(usize),
+    /// Focus the View at this address, opening a tab for it if needed.
+    OpenView(flotilla_protocol::ViewAddress),
+    /// Return to the previously active tab (overview dismiss).
+    SwitchToLastView,
+    /// Close the open View at this tab index (pinned overview refuses).
+    CloseTab(usize),
+    /// Close the active tab.
+    CloseActiveTab,
+    /// Record that this TUI requested tracking of a repo path, so the
+    /// confirming `RepoTracked` event opens its tab.
+    ExpectRepoOpen(std::path::PathBuf),
     SaveTabOrder,
     OpenFilePicker,
     PrevTab,
@@ -78,8 +91,13 @@ pub enum AppAction {
     MoveTabRight,
     Refresh,
     ShowStatus(String),
-    SetSearchQuery { repo: RepoIdentity, query: String },
-    ClearSearchQuery { repo: RepoIdentity },
+    SetSearchQuery {
+        repo: RepoIdentity,
+        query: String,
+    },
+    ClearSearchQuery {
+        repo: RepoIdentity,
+    },
 }
 
 /// Result of handling an event in a widget.
@@ -105,12 +123,10 @@ pub struct WidgetContext<'a> {
     pub provisioning_target: &'a ProvisioningTarget,
     pub my_host: Option<HostName>,
     pub my_node_id: Option<NodeId>,
-    pub active_repo: usize,
-    pub repo_order: &'a [RepoIdentity],
+    /// The open tab set; the active View decides page dispatch and which
+    /// contextual commands apply.
+    pub views: &'a OpenViews,
     pub commands: &'a mut CommandQueue,
-    pub is_config: &'a mut bool,
-    /// Whether the Convoys tab is currently active.
-    pub is_convoys: bool,
     pub active_repo_is_remote_only: bool,
     /// Per-namespace convoy model — used by the command palette for convoy/task completions.
     pub namespaces: &'a crate::app::NamespaceMap,
@@ -123,6 +139,10 @@ pub struct WidgetContext<'a> {
 /// table state and layout areas.
 pub struct RenderContext<'a> {
     pub model: &'a TuiModel,
+    /// The open tab set; drives the tab bar and page dispatch.
+    pub views: &'a OpenViews,
+    /// Scoped mode: the pane is one View — no tab bar is drawn.
+    pub scoped: bool,
     pub ui: &'a mut UiState,
     pub theme: &'a Theme,
     pub keymap: &'a Keymap,

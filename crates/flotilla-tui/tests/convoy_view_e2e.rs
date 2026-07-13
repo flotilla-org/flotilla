@@ -218,8 +218,7 @@ async fn x_then_enter_completes_work_via_palette() {
     }
 
     // Switch the TUI into the Convoys tab and drive the keybinding flow.
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.open_view(flotilla_protocol::ViewAddress::Convoys { namespace: "flotilla".to_string() });
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())

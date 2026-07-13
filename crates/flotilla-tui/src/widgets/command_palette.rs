@@ -180,11 +180,14 @@ impl CommandPaletteWidget {
                 ctx.app_actions.push(AppAction::SetTarget(name.to_string()));
                 Outcome::Finished
             }
-            PaletteLocalResult::Search(query) => {
-                if *ctx.is_config {
-                    ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
-                    return Outcome::Finished;
+            PaletteLocalResult::OpenView(address) => {
+                match address.parse::<flotilla_protocol::ViewAddress>() {
+                    Ok(address) => ctx.app_actions.push(AppAction::OpenView(address)),
+                    Err(e) => ctx.app_actions.push(AppAction::ShowStatus(e)),
                 }
+                Outcome::Finished
+            }
+            PaletteLocalResult::Search(query) => {
                 let query = query.trim().to_string();
                 let Some(repo_identity) = ctx.model.active_repo_identity_opt().cloned() else {
                     ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
@@ -218,7 +221,6 @@ impl CommandPaletteWidget {
             resolved,
             ctx.model,
             self.source_item.as_ref(),
-            *ctx.is_config,
             active_repo.as_ref(),
             ctx.provisioning_target,
             &ctx.my_node_id,
@@ -241,7 +243,7 @@ impl CommandPaletteWidget {
         match action {
             // Actions that open other widgets — use Swap to replace the palette
             Action::OpenBranchInput => {
-                if *ctx.is_config || ctx.model.active_repo_identity_opt().is_none() {
+                if ctx.model.active_repo_identity_opt().is_none() {
                     ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
                     return Outcome::Finished;
                 }
@@ -249,7 +251,7 @@ impl CommandPaletteWidget {
                 Outcome::Swap(Box::new(widget))
             }
             Action::OpenIssueSearch => {
-                if *ctx.is_config || ctx.model.active_repo_identity_opt().is_none() {
+                if ctx.model.active_repo_identity_opt().is_none() {
                     ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
                     Outcome::Finished
                 } else {
@@ -301,7 +303,7 @@ impl CommandPaletteWidget {
                 Outcome::Finished
             }
             Action::Refresh => {
-                if *ctx.is_config {
+                if ctx.model.active_repo_identity_opt().is_none() {
                     ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
                     return Outcome::Finished;
                 }
@@ -319,7 +321,7 @@ impl CommandPaletteWidget {
                 Outcome::Finished
             }
             Action::OpenActionMenu => {
-                if *ctx.is_config {
+                if ctx.model.active_repo_identity_opt().is_none() {
                     ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
                     return Outcome::Finished;
                 }
@@ -399,7 +401,6 @@ pub(crate) fn tui_dispatch(
     resolved: Resolved,
     model: &TuiModel,
     item: Option<&WorkItem>,
-    is_config: bool,
     active_repo: Option<&RepoIdentity>,
     provisioning_target: &ProvisioningTarget,
     my_node_id: &Option<NodeId>,
@@ -421,12 +422,8 @@ pub(crate) fn tui_dispatch(
         }
         Resolved::Ready(cmd) => Ok(cmd),
         Resolved::NeedsContext { mut command, repo, host } => {
-            // Repo context from active tab
-            let tab_repo = if is_config {
-                None // overview tab — no repo context
-            } else {
-                active_repo.map(|id| RepoSelector::Identity(id.clone()))
-            };
+            // Repo context from the active tab (None on non-repo views)
+            let tab_repo = active_repo.map(|id| RepoSelector::Identity(id.clone()));
 
             match repo {
                 RepoContext::None => {}
@@ -436,7 +433,7 @@ pub(crate) fn tui_dispatch(
                     fill_repo_sentinels(&mut command.action, repo_sel);
                 }
                 RepoContext::Inferred => {
-                    if is_config {
+                    if tab_repo.is_none() {
                         return Err("no active repo — switch to a repo tab first".to_string());
                     }
                     command.context_repo = tab_repo;
@@ -481,7 +478,7 @@ pub(crate) fn tui_dispatch(
 
 impl InteractiveWidget for CommandPaletteWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        let has_repo_context = !*ctx.is_config;
+        let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
         match action {
             Action::SelectNext => {
                 let count = self.completions(ctx.model, ctx.namespaces, has_repo_context).len();
@@ -513,7 +510,7 @@ impl InteractiveWidget for CommandPaletteWidget {
     }
 
     fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
-        let has_repo_context = !*ctx.is_config;
+        let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
         // Right arrow: fill selected completion into input (Tab goes through handle_action)
         if matches!(key.code, KeyCode::Right) {
             let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
@@ -545,7 +542,7 @@ impl InteractiveWidget for CommandPaletteWidget {
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
-        let has_repo_context = !ctx.ui.is_config;
+        let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
         let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
         let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
         let area = overlay.body;
@@ -884,7 +881,7 @@ mod tests {
         let mut widget = CommandPaletteWidget::new();
         widget.input = Input::from("checkout create --branch feat");
         let mut harness = TestWidgetHarness::new();
-        harness.is_config = true;
+        harness.activate_overview();
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::Confirm, &mut ctx);
@@ -899,7 +896,7 @@ mod tests {
         let mut widget = CommandPaletteWidget::new();
         widget.input = Input::from("cr 42 close");
         let mut harness = TestWidgetHarness::new();
-        harness.is_config = true;
+        harness.activate_overview();
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::Confirm, &mut ctx);
@@ -999,7 +996,7 @@ mod tests {
         let cmd = Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
         let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(Resolved::Ready(cmd), &model, None, false, None, &local_target, &None, false);
+        let result = tui_dispatch(Resolved::Ready(cmd), &model, None, None, &local_target, &None, false);
         assert!(result.is_ok());
     }
 
@@ -1019,7 +1016,7 @@ mod tests {
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
         let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, None, true, None, &local_target, &None, false);
+        let result = tui_dispatch(resolved, &model, None, None, &local_target, &None, false);
         assert!(result.is_err());
     }
 
@@ -1074,7 +1071,7 @@ mod tests {
         };
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::ProvisioningTarget };
         let local_target = ProvisioningTarget::Host { host: host_name.clone() };
-        let result = tui_dispatch(resolved, &model, None, false, Some(&repo_id), &local_target, &None, false);
+        let result = tui_dispatch(resolved, &model, None, Some(&repo_id), &local_target, &None, false);
 
         assert!(result.is_err());
         assert!(result.err().unwrap().contains("ambiguous host: desktop"));
@@ -1097,7 +1094,7 @@ mod tests {
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Required, host: HostResolution::Local };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
         let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, None, false, Some(&repo_id), &local_target, &None, false).unwrap();
+        let result = tui_dispatch(resolved, &model, None, Some(&repo_id), &local_target, &None, false).unwrap();
         assert!(result.context_repo.is_some());
         match &result.action {
             CommandAction::Checkout { repo, .. } => assert_ne!(*repo, RepoSelector::Query("".into())),
@@ -1118,7 +1115,7 @@ mod tests {
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
         let model = TuiModel::from_repo_info(vec![]);
-        let result = tui_dispatch(resolved, &model, None, false, Some(&repo_id), &local_target, &None, false).expect("should succeed");
+        let result = tui_dispatch(resolved, &model, None, Some(&repo_id), &local_target, &None, false).expect("should succeed");
         assert_eq!(result.node_id, Some(NodeId::new("feta")));
     }
 
@@ -1154,8 +1151,7 @@ mod tests {
         let resolved = Resolved::NeedsContext { command: cmd, repo: RepoContext::Inferred, host: HostResolution::ProviderHost };
         let local_target = ProvisioningTarget::Host { host: HostName::local() };
         let model = TuiModel::from_repo_info(vec![]);
-        let result =
-            tui_dispatch(resolved, &model, Some(&item), false, Some(&repo_id), &local_target, &my_node_id, true).expect("should succeed");
+        let result = tui_dispatch(resolved, &model, Some(&item), Some(&repo_id), &local_target, &my_node_id, true).expect("should succeed");
         assert_eq!(result.node_id, Some(NodeId::new("remote-peer")));
     }
 }

@@ -54,6 +54,8 @@ pub enum PaletteLocalResult<'a> {
     SetTheme(&'a str),
     SetTarget(&'a str),
     Search(&'a str),
+    /// Open (or focus) the View at this address (ADR 0013).
+    OpenView(&'a str),
 }
 
 /// Try to parse input as a palette-local command. Returns None if not a local command.
@@ -64,6 +66,7 @@ pub fn parse_palette_local(input: &str) -> Option<PaletteLocalResult<'_>> {
         "layout" if !arg.is_empty() => Some(PaletteLocalResult::SetLayout(arg)),
         "theme" if !arg.is_empty() => Some(PaletteLocalResult::SetTheme(arg)),
         "target" if !arg.is_empty() => Some(PaletteLocalResult::SetTarget(arg)),
+        "open" if !arg.is_empty() => Some(PaletteLocalResult::OpenView(arg)),
         // "search" with trailing content → search command; bare "search" falls through to no-arg lookup
         "search" if input.starts_with("search ") => Some(PaletteLocalResult::Search(arg)),
         _ => {
@@ -85,9 +88,13 @@ pub fn palette_local_completions(input: &str) -> Vec<&'static str> {
     }
     match cmd {
         "layout" => LAYOUT_VALUES.iter().filter(|v| v.starts_with(rest.trim())).copied().collect(),
+        "open" => VIEW_KIND_PREFIXES.iter().filter(|v| v.starts_with(rest.trim())).copied().collect(),
         _ => vec![],
     }
 }
+
+/// View-address kind prefixes offered as `open` completions (ADR 0013).
+pub const VIEW_KIND_PREFIXES: &[&str] = &["overview", "convoys/", "convoy/", "vessel/", "project/", "repo/"];
 
 /// Result of parsing palette input text.
 #[derive(Debug)]
@@ -805,6 +812,7 @@ mod tests {
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
+            project_ref: None,
             vessels: vessels
                 .iter()
                 .map(|t| VesselSummary {
@@ -865,6 +873,7 @@ mod tests {
             provider_display_name: String::new(),
         });
         repo.providers = Arc::new(pd);
+        model.active_repo = Some(identity);
         model
     }
 

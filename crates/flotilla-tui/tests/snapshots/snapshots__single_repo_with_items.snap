@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 60
 expression: output
 ---
- ⚓  flotilla  |  🚢  convoys  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project ×  | [+]
 ── Checkouts ────────────────────────────────────────────────────── ⚙   ┌ Preview ─────────────────────────────────────┐
       Source     Path  Description Branch WT  WS  PR   SS   Issues Git  │Description: checkout feat-login              │
 ▸  ○               fe… checkout f… feat-… ✓                             │Branch: feat-login                            │

@@ -1,23 +1,38 @@
+use flotilla_protocol::ViewAddress;
+
 use crate::app::{
-    test_support::{issue_item, set_active_table_items, stub_app_with_repos},
+    test_support::{activate_repo_tab, issue_item, set_active_table_items, stub_app_with_repos},
     App,
 };
 
 /// Read the selected flat index from the active RepoPage.
 fn active_page_selection(app: &App) -> Option<usize> {
-    let identity = &app.model.repo_order[app.model.active_repo];
+    let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");
     app.screen.repo_pages.get(identity).and_then(|p| p.table.selected_flat_index())
 }
+
+/// The parsed address of the active tab.
+fn active_address(app: &App) -> ViewAddress {
+    app.views.active_address().expect("active tab should have a parsed address").clone()
+}
+
+fn convoys_address() -> ViewAddress {
+    ViewAddress::Convoys { namespace: "flotilla".to_string() }
+}
+
+// Seeded tab layout for `stub_app_with_repos(n)` is
+// `[overview(0), convoys(1), repo-0(2), .., repo-(n-1)(n+1)]` with repo-0 active.
 
 // ── switch_tab tests ─────────────────────────────────────────────
 
 #[test]
-fn switch_tab_sets_active_repo_and_mode() {
+fn switch_tab_sets_active_repo() {
     let mut app = stub_app_with_repos(3);
-    app.ui.is_config = true;
-    app.switch_tab(2);
-    assert_eq!(app.model.active_repo, 2);
-    assert!(!app.ui.is_config);
+    app.switch_tab(0);
+    assert_eq!(app.model.active_repo, None, "overview tab has no active repo");
+    activate_repo_tab(&mut app, 2);
+    assert_eq!(app.views.active_index(), 4);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[2].clone()));
 }
 
 #[test]
@@ -26,160 +41,174 @@ fn switch_tab_clears_unseen_changes() {
     // Mark repo-1 as having unseen changes
     let key = app.model.repo_order[1].clone();
     app.model.repos.get_mut(&key).unwrap().has_unseen_changes = true;
-    app.switch_tab(1);
+    activate_repo_tab(&mut app, 1);
     assert!(!app.model.repos[&key].has_unseen_changes);
 }
 
 #[test]
 fn switch_tab_noop_for_out_of_range() {
     let mut app = stub_app_with_repos(2);
-    app.switch_tab(5);
-    // Should remain at the default active_repo
-    assert_eq!(app.model.active_repo, 0);
+    app.switch_tab(9);
+    // Should remain on the seeded active tab (repo-0)
+    assert_eq!(app.views.active_index(), 2);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
 }
 
 #[test]
-fn switch_tab_from_config_mode() {
+fn switch_tab_from_overview_to_repo() {
     let mut app = stub_app_with_repos(2);
-    app.ui.is_config = true;
-    app.switch_tab(1);
-    assert_eq!(app.model.active_repo, 1);
-    assert!(!app.ui.is_config);
+    app.switch_tab(0);
+    activate_repo_tab(&mut app, 1);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[1].clone()));
+    assert_ne!(app.views.active_index(), 0, "should have left the overview tab");
 }
 
 // ── next_tab tests ───────────────────────────────────────────────
 
 #[test]
-fn next_tab_advances_active_repo() {
+fn next_tab_advances_to_next_repo_tab() {
     let mut app = stub_app_with_repos(3);
-    assert_eq!(app.model.active_repo, 0);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
     app.next_tab();
-    assert_eq!(app.model.active_repo, 1);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[1].clone()));
 }
 
 #[test]
-fn next_tab_wraps_to_config() {
+fn next_tab_wraps_to_overview_after_last_tab() {
     let mut app = stub_app_with_repos(2);
-    app.switch_tab(1); // go to last repo
+    activate_repo_tab(&mut app, 1); // go to last repo tab
     app.next_tab();
-    assert!(app.ui.is_config);
+    assert_eq!(active_address(&app), ViewAddress::Overview);
+    assert_eq!(app.model.active_repo, None);
 }
 
 #[test]
-fn next_tab_from_config_goes_to_convoys() {
+fn next_tab_from_overview_goes_to_convoys() {
     let mut app = stub_app_with_repos(3);
-    app.ui.is_config = true;
+    app.switch_tab(0);
     app.next_tab();
-    assert!(app.ui.is_convoys, "expected Convoys tab after next from config");
-    assert!(!app.ui.is_config);
+    assert_eq!(active_address(&app), convoys_address(), "expected Convoys tab after next from overview");
 }
 
 #[test]
 fn next_tab_from_convoys_goes_to_first_repo() {
     let mut app = stub_app_with_repos(3);
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.next_tab();
-    assert_eq!(app.model.active_repo, 0);
-    assert!(!app.ui.is_convoys);
-    assert!(!app.ui.is_config);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
 }
 
 #[test]
-fn next_tab_noop_with_no_repos() {
+fn next_tab_cycles_with_no_repos() {
     let mut app = stub_app_with_repos(0);
-    // Should not panic
+    // Layout is [overview, convoys] with convoys active — should not panic.
     app.next_tab();
+    assert_eq!(active_address(&app), ViewAddress::Overview);
 }
 
 // ── prev_tab tests ───────────────────────────────────────────────
 
 #[test]
-fn prev_tab_decrements_active_repo() {
+fn prev_tab_steps_back_to_previous_repo_tab() {
     let mut app = stub_app_with_repos(3);
-    app.switch_tab(2);
+    activate_repo_tab(&mut app, 2);
     app.prev_tab();
-    assert_eq!(app.model.active_repo, 1);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[1].clone()));
 }
 
 #[test]
-fn prev_tab_wraps_to_convoys() {
+fn prev_tab_wraps_to_convoys_from_first_repo() {
     let mut app = stub_app_with_repos(2);
-    // active_repo is 0 — prev goes to Convoys, not Config directly
+    // repo-0 is active — prev goes to Convoys, not the overview directly
     app.prev_tab();
-    assert!(app.ui.is_convoys);
-    assert!(!app.ui.is_config);
+    assert_eq!(active_address(&app), convoys_address());
+    assert_eq!(app.model.active_repo, None);
 }
 
 #[test]
-fn prev_tab_wraps_to_config_from_convoys() {
+fn prev_tab_wraps_to_overview_from_convoys() {
     let mut app = stub_app_with_repos(2);
-    app.ui.is_convoys = true;
-    app.ui.is_config = false;
+    app.switch_tab(1);
     app.prev_tab();
-    assert!(app.ui.is_config);
-    assert!(!app.ui.is_convoys);
+    assert_eq!(active_address(&app), ViewAddress::Overview);
 }
 
 #[test]
-fn prev_tab_from_config_goes_to_last() {
+fn prev_tab_from_overview_goes_to_last_tab() {
     let mut app = stub_app_with_repos(3);
-    app.ui.is_config = true;
+    app.switch_tab(0);
     app.prev_tab();
-    assert_eq!(app.model.active_repo, 2);
-    assert!(!app.ui.is_config);
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[2].clone()));
 }
 
 #[test]
-fn prev_tab_noop_with_no_repos() {
+fn prev_tab_cycles_with_no_repos() {
     let mut app = stub_app_with_repos(0);
-    // Should not panic
+    // Layout is [overview, convoys] with convoys active — should not panic.
     app.prev_tab();
+    assert_eq!(active_address(&app), ViewAddress::Overview);
 }
 
 // ── move_tab tests ───────────────────────────────────────────────
 
 #[test]
-fn move_tab_swaps_repos_forward() {
+fn move_tab_moves_active_tab_right_and_persists() {
     let mut app = stub_app_with_repos(3);
-    assert_eq!(app.model.active_repo, 0);
-    let path0 = app.model.repo_order[0].clone();
-    let path1 = app.model.repo_order[1].clone();
-    let result = app.move_tab(1);
-    assert!(result);
-    assert_eq!(app.model.active_repo, 1);
-    assert_eq!(app.model.repo_order[0], path1);
-    assert_eq!(app.model.repo_order[1], path0);
+    // Active is repo-0 at tab index 2.
+    let repo0 = ViewAddress::Repo(app.model.repo_order[0].clone());
+    let repo1 = ViewAddress::Repo(app.model.repo_order[1].clone());
+    let order_before = app.model.repo_order.clone();
+
+    assert!(app.move_tab(1));
+
+    assert_eq!(app.views.active_index(), 3, "active follows its tab");
+    assert_eq!(app.views.get(2).and_then(|v| v.address()), Some(&repo1));
+    assert_eq!(app.views.get(3).and_then(|v| v.address()), Some(&repo0));
+    assert_eq!(app.model.repo_order, order_before, "registration order is not tab order");
+
+    // The new tab order is persisted to open-views.toml.
+    let saved = app.config.load_open_views().expect("open views should be persisted after a move");
+    let addresses: Vec<String> = saved.iter().map(|e| e.address.clone()).collect();
+    assert_eq!(addresses[2], repo1.to_string());
+    assert_eq!(addresses[3], repo0.to_string());
 }
 
 #[test]
-fn move_tab_swaps_repos_backward() {
+fn move_tab_moves_active_tab_left() {
     let mut app = stub_app_with_repos(3);
-    app.switch_tab(2);
-    let path1 = app.model.repo_order[1].clone();
-    let path2 = app.model.repo_order[2].clone();
-    let result = app.move_tab(-1);
-    assert!(result);
-    assert_eq!(app.model.active_repo, 1);
-    assert_eq!(app.model.repo_order[1], path2);
-    assert_eq!(app.model.repo_order[2], path1);
+    activate_repo_tab(&mut app, 1); // tab index 3
+    let repo1 = ViewAddress::Repo(app.model.repo_order[1].clone());
+
+    assert!(app.move_tab(-1));
+
+    assert_eq!(app.views.active_index(), 2);
+    assert_eq!(app.views.get(2).and_then(|v| v.address()), Some(&repo1));
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[1].clone()), "moving a tab keeps it active");
 }
 
 #[test]
-fn move_tab_returns_false_at_boundary() {
+fn move_tab_returns_false_at_boundaries() {
     let mut app = stub_app_with_repos(3);
-    // At index 0, can't move backward
+    // The pinned overview never moves.
+    app.switch_tab(0);
+    assert!(!app.move_tab(1));
     assert!(!app.move_tab(-1));
-    // Move to last
-    app.switch_tab(2);
-    // At last index, can't move forward
+    // Convoys at index 1 cannot displace the pinned overview.
+    app.switch_tab(1);
+    assert!(!app.move_tab(-1));
+    // The last tab cannot move further right.
+    activate_repo_tab(&mut app, 2);
     assert!(!app.move_tab(1));
 }
 
 #[test]
-fn move_tab_returns_false_with_single_repo() {
+fn move_tab_stops_at_pinned_overview_with_single_repo() {
     let mut app = stub_app_with_repos(1);
-    assert!(!app.move_tab(1));
-    assert!(!app.move_tab(-1));
+    // [overview, convoys, repo-0] with repo-0 active.
+    assert!(!app.move_tab(1), "already the last tab");
+    assert!(app.move_tab(-1), "repo tab can swap left past convoys");
+    assert_eq!(app.views.active_index(), 1);
+    assert!(!app.move_tab(-1), "nothing displaces the pinned overview");
 }
 
 // ── select_next tests ────────────────────────────────────────────

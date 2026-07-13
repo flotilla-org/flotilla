@@ -147,6 +147,8 @@ pub struct ConvoySummary {
     pub phase: ConvoyPhase,
     pub message: Option<String>,
     pub repo_hint: Option<RepoKey>,
+    /// The Project this convoy belongs to (`ConvoySpec.project_ref`).
+    pub project_ref: Option<String>,
     pub vessels: Vec<VesselSummary>,
     pub started_at: Option<Timestamp>,
     pub finished_at: Option<Timestamp>,
@@ -164,6 +166,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             phase: row.phase.into(),
             message: row.message.clone(),
             repo_hint: row.repo.clone(),
+            project_ref: row.project_ref.clone(),
             vessels: row.vessels.iter().map(|vessel| vessel_summary(row, vessel)).collect(),
             started_at: row.started_at,
             finished_at: row.finished_at,

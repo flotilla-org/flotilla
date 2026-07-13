@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 67
 expression: output
 ---
- ⚓  flotilla  |  🚢  convoys  | alpha | beta | gamma | [+]
+ ⚓  flotilla  |  🚢  convoys  | alpha ×  | beta | gamma | [+]
                                                                     ⚙   ┌ Preview ─────────────────────────────────────┐
                                                                         │                                              │
                                                                         │                                              │

@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, HostName, NodeId, WorkItem};
+use flotilla_protocol::{Command, CommandAction, HostName, NodeId, ViewAddress, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
@@ -11,23 +11,29 @@ use crate::{
 impl App {
     // ── Key handling ──
 
-    /// Resolve a key event using the app-level config/convoys/normal distinction.
+    /// Resolve a key event using the active View's binding-mode stack.
     ///
-    /// Called when the base layer widget (Normal mode_id) is on top, so that
-    /// config mode gets Overview bindings, convoys mode gets Convoys bindings
-    /// (or ConvoyVessels when the user has drilled into the vessel tree), and
-    /// normal mode gets Normal bindings.
+    /// Called when the base layer widget (Normal mode_id) is on top, so the
+    /// overview gets Overview bindings, convoys-consuming views get Convoys
+    /// bindings (or ConvoyVessels when the user has drilled into — or the
+    /// view is pinned to — the vessel tree), repo views get Normal bindings,
+    /// and broken/dangling tabs get only the shell-level TabPage bindings.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode = if self.ui.is_config {
-            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview])
-        } else if self.ui.is_convoys {
-            let inner = match self.convoys_focus() {
-                super::ConvoysFocus::List => BindingModeId::Convoys,
-                super::ConvoysFocus::Vessels => BindingModeId::ConvoyVessels,
-            };
-            KeyBindingMode::Composed(vec![BindingModeId::TabPage, inner])
-        } else {
-            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal])
+        let mode = match self.views.active_address() {
+            Some(ViewAddress::Overview) => KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]),
+            Some(ViewAddress::Convoys { .. } | ViewAddress::Project { .. }) => {
+                let inner = match self.convoys_focus() {
+                    super::ConvoysFocus::List => BindingModeId::Convoys,
+                    super::ConvoysFocus::Vessels => BindingModeId::ConvoyVessels,
+                };
+                KeyBindingMode::Composed(vec![BindingModeId::TabPage, inner])
+            }
+            // Single-convoy and vessel views are the vessel tree, permanently.
+            Some(ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. }) => {
+                KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::ConvoyVessels])
+            }
+            Some(ViewAddress::Repo(_)) => KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]),
+            None => KeyBindingMode::Composed(vec![BindingModeId::TabPage]),
         };
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
     }
@@ -38,35 +44,47 @@ impl App {
     /// have: confirm/enter, action menu, file picker, dispatch intent, and
     /// convoy selection navigation.
     pub(super) fn dispatch_action(&mut self, action: Action) {
+        if let Some(scope) = self.active_convoy_scope() {
+            // Views pinned to one convoy (convoy/vessel kinds) are the
+            // vessel tree; list navigation doesn't apply.
+            let pinned = scope.convoy.is_some();
+            match action {
+                Action::SelectNext => match (pinned, self.convoys_focus()) {
+                    (false, super::ConvoysFocus::List) => self.convoys_tab_select_delta(&scope, 1),
+                    _ => self.convoy_vessels_select_delta(&scope, 1),
+                },
+                Action::SelectPrev => match (pinned, self.convoys_focus()) {
+                    (false, super::ConvoysFocus::List) => self.convoys_tab_select_delta(&scope, -1),
+                    _ => self.convoy_vessels_select_delta(&scope, -1),
+                },
+                // On the convoy list, Confirm (enter / l / right) drills into the vessel tree.
+                // In the vessel tree, Confirm is currently a no-op.
+                Action::Confirm => {
+                    if !pinned && matches!(self.convoys_focus(), super::ConvoysFocus::List) {
+                        self.enter_convoy_vessels_focus(&scope);
+                    }
+                }
+                // In the vessel tree, Dismiss (esc / left) returns to the convoy list.
+                Action::Dismiss => {
+                    if !pinned && matches!(self.convoys_focus(), super::ConvoysFocus::Vessels) {
+                        self.exit_convoy_vessels_focus();
+                    }
+                }
+                Action::CompleteConvoyWork => self.open_complete_convoy_work_palette(&scope),
+                Action::AttachConvoyVessel => self.attach_selected_convoy_vessel(&scope),
+                _ => {}
+            }
+            return;
+        }
+        // Repo-scoped fallthrough actions apply only on a live repo view.
+        if self.model.active_repo.is_none() {
+            return;
+        }
         match action {
-            Action::SelectNext if self.ui.is_convoys => match self.convoys_focus() {
-                super::ConvoysFocus::List => self.convoys_tab_select_delta(1),
-                super::ConvoysFocus::Vessels => self.convoy_vessels_select_delta("flotilla", 1),
-            },
-            Action::SelectPrev if self.ui.is_convoys => match self.convoys_focus() {
-                super::ConvoysFocus::List => self.convoys_tab_select_delta(-1),
-                super::ConvoysFocus::Vessels => self.convoy_vessels_select_delta("flotilla", -1),
-            },
-            // On the Convoys list, Confirm (enter / l / right) drills into the vessel tree.
-            // In the vessel tree, Confirm is currently a no-op (task-attach lands in PR 3).
-            Action::Confirm if self.ui.is_convoys => {
-                if matches!(self.convoys_focus(), super::ConvoysFocus::List) {
-                    self.enter_convoy_vessels_focus("flotilla");
-                }
-            }
-            // In the vessel tree, Dismiss (esc / left) returns to the convoy list.
-            // On the convoy list, Dismiss is a no-op (don't act on the hidden repo page).
-            Action::Dismiss if self.ui.is_convoys => {
-                if matches!(self.convoys_focus(), super::ConvoysFocus::Vessels) {
-                    self.exit_convoy_vessels_focus();
-                }
-            }
-            Action::CompleteConvoyWork if self.ui.is_convoys => self.open_complete_convoy_work_palette(),
-            Action::AttachConvoyVessel if self.ui.is_convoys => self.attach_selected_convoy_vessel(),
-            Action::Confirm if !self.ui.is_config => self.action_enter(),
-            Action::OpenActionMenu if !self.ui.is_config => self.open_action_menu(),
-            Action::OpenFilePicker if !self.ui.is_config => self.open_file_picker_from_active_repo_parent(),
-            Action::Dispatch(intent) if !self.ui.is_config => self.dispatch_if_available(intent),
+            Action::Confirm => self.action_enter(),
+            Action::OpenActionMenu => self.open_action_menu(),
+            Action::OpenFilePicker => self.open_file_picker_from_active_repo_parent(),
+            Action::Dispatch(intent) => self.dispatch_if_available(intent),
             // Handled by the widget stack (page widgets or modals) or
             // pre-dispatched as global actions. No-op if they reach here.
             _ => {}
@@ -150,16 +168,12 @@ impl App {
         self.process_app_actions(app_actions);
 
         // ── Tab drag handling ──
-        // The Tabs widget owns the drag state but can't mutate model.repo_order
-        // (read-only in WidgetContext). Perform the actual swap here.
+        // The Tabs widget owns the drag state but can't mutate the open-view
+        // set (read-only in WidgetContext). Perform the actual swap here.
         if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
             let tabs = &mut self.screen.tabs;
-            if tabs.drag.dragging_tab.is_some()
-                && tabs.drag.active
-                && tabs.handle_drag(mouse.column, mouse.row, &mut self.model.repo_order, &mut self.model.active_repo)
-            {
-                // Update drag index to the new position after the swap
-                tabs.update_drag_index(self.model.active_repo);
+            if tabs.drag.dragging_tab.is_some() && tabs.drag.active && tabs.handle_drag(mouse.column, mouse.row, &mut self.views) {
+                self.sync_active_view();
             }
         }
 
@@ -173,10 +187,7 @@ impl App {
 
     /// Get the current selection index from the active RepoPage, if any.
     fn active_page_selection(&self) -> Option<usize> {
-        if self.model.repo_order.is_empty() {
-            return None;
-        }
-        let identity = &self.model.repo_order[self.model.active_repo];
+        let identity = self.model.active_repo.as_ref()?;
         self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_flat_index())
     }
 
@@ -185,10 +196,7 @@ impl App {
     /// Check if the current selection is near the bottom of the issue section
     /// and fetch more results if the active paging state has more pages.
     fn check_infinite_scroll(&mut self) {
-        if self.model.repo_order.is_empty() {
-            return;
-        }
-        let repo_identity = self.model.repo_order[self.model.active_repo].clone();
+        let Some(repo_identity) = self.model.active_repo.clone() else { return };
         let Some(page) = self.screen.repo_pages.get(&repo_identity) else { return };
         let Some(view) = self.issue_views.get(&repo_identity) else { return };
         let Some(active) = view.active() else { return };
@@ -212,7 +220,7 @@ impl App {
     }
 
     pub(super) fn action_enter(&mut self) {
-        let identity = &self.model.repo_order[self.model.active_repo];
+        let Some(identity) = self.model.active_repo.as_ref() else { return };
         let has_multi = self.screen.repo_pages.get(identity).is_some_and(|p| !p.multi_selected.is_empty());
         if has_multi {
             self.action_enter_multi_select();
@@ -242,7 +250,7 @@ impl App {
     }
 
     fn action_enter_multi_select(&mut self) {
-        let identity = &self.model.repo_order[self.model.active_repo];
+        let Some(identity) = self.model.active_repo.as_ref() else { return };
         let Some(page) = self.screen.repo_pages.get(identity) else {
             return;
         };
@@ -306,8 +314,7 @@ impl App {
 
             match noun.resolve() {
                 Ok(resolved) => {
-                    let is_config = self.ui.is_config;
-                    let active_repo = if is_config { None } else { Some(self.model.active_repo_identity()) };
+                    let active_repo = self.model.active_repo.clone();
                     let provisioning_target = self.ui.provisioning_target.clone();
                     let remote_only = self.active_repo_is_remote_only();
 
@@ -315,8 +322,7 @@ impl App {
                         resolved,
                         &self.model,
                         Some(item),
-                        is_config,
-                        active_repo,
+                        active_repo.as_ref(),
                         &provisioning_target,
                         &my_node_id,
                         remote_only,
@@ -409,8 +415,8 @@ impl App {
     /// No-op when no convoy or vessel is selected. Convoy ids and vessel names are
     /// arbitrary strings (no validation), so they are routed through the
     /// palette's quoting helper to round-trip whitespace and special characters.
-    pub(super) fn open_complete_convoy_work_palette(&mut self) {
-        let Some(convoy) = self.selected_convoy_summary("flotilla") else { return };
+    pub(super) fn open_complete_convoy_work_palette(&mut self, scope: &crate::app::ConvoyScope) {
+        let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
         let Some(task) = self.convoys_ui.selected_vessel.as_ref() else { return };
         let selected_vessel = task.clone();
         let completion_target =
@@ -436,16 +442,21 @@ impl App {
     }
 
     /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
-    pub(super) fn attach_selected_convoy_vessel(&mut self) {
+    pub(super) fn attach_selected_convoy_vessel(&mut self, scope: &crate::app::ConvoyScope) {
         let Some(task) = self.convoys_ui.selected_vessel.clone() else { return };
-        // Single-namespace MVP: all convoys live in "flotilla" (see convoys_tab_select_delta).
         let target = self
-            .selected_convoy_summary("flotilla")
+            .scoped_convoy_summary(scope)
             .and_then(|convoy| convoy.vessels.iter().find(|t| t.name == task))
             .map(|task| (task.workspace_ref.clone(), task.host.clone()));
         match target {
             Some((Some(ws_ref), host)) => {
-                let mut cmd = self.repo_command(flotilla_protocol::CommandAction::SelectWorkspace { ws_ref });
+                // Convoy views carry no repo context; fall back to a
+                // context-free command rather than requiring an active repo.
+                let action = flotilla_protocol::CommandAction::SelectWorkspace { ws_ref };
+                let mut cmd = match self.model.active_repo.clone() {
+                    Some(identity) => self.repo_command_for_identity(identity, action),
+                    None => self.command(action),
+                };
                 cmd.node_id = match host.as_ref().map(|host| self.panel_target_node(host)).transpose() {
                     Ok(target) => target.flatten(),
                     Err(message) => {

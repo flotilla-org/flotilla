@@ -4,6 +4,7 @@ pub mod intent;
 pub mod issue_view;
 mod key_handlers;
 mod navigation;
+pub mod open_views;
 #[doc(hidden)]
 pub mod test_builders;
 #[cfg(test)]
@@ -22,11 +23,12 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
-    WorkItemIdentity,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, ViewAddress,
+    WorkItem, WorkItemIdentity,
 };
 use indexmap::IndexMap;
 pub use intent::Intent;
+pub use open_views::{OpenView, OpenViews, ViewTarget};
 use tokio::sync::mpsc;
 use tui_input::Input;
 use ui_state::PendingStatus;
@@ -126,8 +128,13 @@ pub struct TuiRepoModel {
 /// `DaemonHandle::list_repos()` and updated by daemon snapshot events.
 pub struct TuiModel {
     pub repos: HashMap<RepoIdentity, TuiRepoModel>,
+    /// Registration/listing order of tracked repos (daemon list order).
+    /// This is NOT tab order — tabs are `App::views` (`OpenViews`, ADR 0013).
     pub repo_order: Vec<RepoIdentity>,
-    pub active_repo: usize,
+    /// The repo the active tab is scoped to, when the active View is a repo
+    /// view. Synced from `App::views` by `App::sync_active_view` — never set
+    /// directly.
+    pub active_repo: Option<RepoIdentity>,
     /// Per-repo, per-provider auth status from last refresh.
     /// Key: (repo_identity, provider_category, provider_name)
     pub provider_statuses: HashMap<(RepoIdentity, String, String), ProviderStatus>,
@@ -159,15 +166,15 @@ impl TuiModel {
                 has_unseen_changes: false,
             });
         }
-        Self { repos, repo_order: order, active_repo: 0, provider_statuses: HashMap::new(), status_message: None, hosts: HashMap::new() }
+        Self { repos, repo_order: order, active_repo: None, provider_statuses: HashMap::new(), status_message: None, hosts: HashMap::new() }
     }
 
     pub fn active(&self) -> &TuiRepoModel {
-        &self.repos[&self.repo_order[self.active_repo]]
+        self.active_opt().expect("active() requires the active tab to be a tracked repo view")
     }
 
     pub fn active_opt(&self) -> Option<&TuiRepoModel> {
-        self.repo_order.get(self.active_repo).and_then(|identity| self.repos.get(identity))
+        self.active_repo.as_ref().and_then(|identity| self.repos.get(identity))
     }
 
     pub fn active_repo_root(&self) -> &PathBuf {
@@ -339,6 +346,17 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
     items.into_iter().filter(|item| !ui.status_bar.dismissed_status_ids.contains(&item.id)).collect()
 }
 
+/// The convoy-data scope of the active View, for view kinds that consume the
+/// convoys query (ADR 0013).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoyScope {
+    pub namespace: String,
+    /// Restrict the visible list to convoys of this Project (project views).
+    pub project: Option<String>,
+    /// Pin to exactly one convoy (single-convoy and vessel views).
+    pub convoy: Option<String>,
+}
+
 /// Filter a slice of convoy summaries by a case-insensitive substring `filter`.
 ///
 /// Matches against convoy name and `repo_hint`. An empty filter passes everything.
@@ -354,6 +372,15 @@ pub fn filter_convoys_by_str<'a>(
     convoys.into_iter().filter(move |c| {
         f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
     })
+}
+
+/// Filter convoys to a project scope (when set) and the text filter.
+pub fn filter_convoys_scoped<'a>(
+    convoys: impl IntoIterator<Item = &'a crate::convoy_model::ConvoySummary>,
+    project: Option<&'a str>,
+    filter: &str,
+) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> {
+    filter_convoys_by_str(convoys, filter).filter(move |c| project.is_none() || c.project_ref.as_deref() == project)
 }
 
 /// Log provider errors and format them into a status message.
@@ -382,6 +409,10 @@ pub struct App {
     pub daemon: Arc<dyn DaemonHandle>,
     pub config: Arc<ConfigStore>,
     pub model: TuiModel,
+    /// The open tab set — the single source of tab truth (ADR 0013).
+    /// Mutate only through the `App` tab methods so the active-repo sync and
+    /// `open-views.toml` persistence stay coherent.
+    pub views: OpenViews,
     pub ui: UiState,
     pub theme: Theme,
     pub keymap: Keymap,
@@ -404,13 +435,34 @@ pub struct App {
     /// Per-namespace convoy state. Keyed by namespace string. Populated from
     /// `DaemonEvent::ResultSet` / `ResultDelta`.
     pub namespaces: HashMap<String, NamespaceModel>,
-    /// Convoys tab UI state (selection, filter).
+    /// Convoys tab UI state (selection, filter). Shared by all convoys views
+    /// for now; keyed per view address when more convoy-scoped kinds land.
     pub convoys_ui: ConvoysUiState,
+    /// Repo paths this TUI asked the daemon to track (the [+] flow), whose
+    /// `RepoTracked` events should open a tab on arrival.
+    pub pending_repo_opens: Vec<PathBuf>,
+    /// Last seen seq per named query, for re-subscribe cursors.
+    pub query_seqs: HashMap<flotilla_protocol::QueryId, u64>,
+    /// Set when the open-view set changed and the daemon subscription no
+    /// longer matches it. The event loop re-subscribes and clears this.
+    pub subscriptions_dirty: bool,
+    /// Scoped mode (`flotilla view <address>`): exactly one View, no tab
+    /// shell, no `open-views.toml` coupling. Opens navigate in place.
+    pub scoped: bool,
 }
 
 impl App {
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
-        let model = TuiModel::from_repo_info(repos_info);
+        let mut model = TuiModel::from_repo_info(repos_info);
+        // Open-view set: persisted if present, else seeded to match the
+        // pre-View tab bar (overview + convoys + one tab per tracked repo).
+        // The seed isn't written back here — it is deterministic, and any
+        // tab mutation persists the set (scoped mode must never write it).
+        let views = match config.load_open_views() {
+            Some(entries) => OpenViews::from_entries(entries),
+            None => OpenViews::seed(model.repo_order.iter().cloned()),
+        };
+        model.active_repo = views.active_repo_identity().cloned();
         let mut ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
         ui.view_layout = match loaded_config.ui.preview.layout {
@@ -447,6 +499,7 @@ impl App {
             daemon,
             config,
             model,
+            views,
             ui,
             theme,
             keymap,
@@ -462,7 +515,47 @@ impl App {
             session_id: uuid::Uuid::new_v4(),
             namespaces: HashMap::new(),
             convoys_ui: ConvoysUiState::default(),
+            pending_repo_opens: Vec::new(),
+            query_seqs: HashMap::new(),
+            subscriptions_dirty: true,
+            scoped: false,
         }
+    }
+
+    /// Construct an `App` in scoped mode: exactly the one View at `address`,
+    /// never touching the persisted open-view set (ADR 0013).
+    pub fn new_scoped(
+        daemon: Arc<dyn DaemonHandle>,
+        repos_info: Vec<RepoInfo>,
+        config: Arc<ConfigStore>,
+        theme: Theme,
+        address: ViewAddress,
+    ) -> Self {
+        let mut app = Self::new(daemon, repos_info, config, theme);
+        app.views = OpenViews::scoped(address);
+        app.scoped = true;
+        app.subscriptions_dirty = true;
+        app.sync_active_view();
+        app
+    }
+
+    /// The named queries the open Views consume, with re-subscribe cursors —
+    /// the tab set IS the subscription set (ADR 0013). Repo views ride the
+    /// Plane-A repo streams and stay outside this lifecycle.
+    pub fn query_cursors(&self) -> Vec<flotilla_protocol::QueryCursor> {
+        let mut queries = Vec::new();
+        for view in self.views.iter() {
+            let query = match view.address() {
+                Some(
+                    ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } | ViewAddress::Project { .. },
+                ) => flotilla_protocol::QueryId::Convoys,
+                _ => continue,
+            };
+            if !queries.contains(&query) {
+                queries.push(query);
+            }
+        }
+        queries.into_iter().map(|query| flotilla_protocol::QueryCursor { query, since: self.query_seqs.get(&query).copied() }).collect()
     }
 
     /// Returns true when the UI has in-progress work that should be animated.
@@ -633,14 +726,33 @@ impl App {
         collect_visible_status_items(&self.model, &self.ui)
     }
 
-    pub fn persisted_tab_order_paths(&self) -> Vec<flotilla_core::path_context::ExecutionEnvironmentPath> {
-        self.model
-            .repo_order
-            .iter()
-            .filter_map(|repo_identity| {
-                self.model.repos.get(repo_identity).map(|repo| flotilla_core::path_context::ExecutionEnvironmentPath::new(&repo.path))
-            })
-            .collect()
+    /// Persist the open-view set after any tab mutation. Scoped sessions
+    /// never touch the persisted set (ADR 0013).
+    pub fn persist_open_views(&self) {
+        if !self.scoped {
+            self.config.save_open_views(&self.views.to_entries());
+        }
+    }
+
+    /// Re-derive tab-dependent state after any change to the active tab:
+    /// the model's active-repo scope, the unseen-changes badge, and the
+    /// status bar's layout indicator.
+    pub fn sync_active_view(&mut self) {
+        self.model.active_repo = self.views.active_repo_identity().cloned();
+        if let Some(identity) = self.model.active_repo.clone() {
+            if let Some(rm) = self.model.repos.get_mut(&identity) {
+                rm.has_unseen_changes = false;
+            }
+            if let Some(page) = self.screen.repo_pages.get(&identity) {
+                self.ui.view_layout = page.layout;
+            }
+        }
+        // A vessel view pins the vessel selection to its own vessel so
+        // vessel intents (attach, complete) target it.
+        if let Some(ViewAddress::Vessel { vessel, .. }) = self.views.active_address() {
+            self.convoys_ui.selected_vessel = Some(vessel.clone());
+            self.convoys_ui.focus = ConvoysFocus::Vessels;
+        }
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
@@ -838,7 +950,6 @@ impl App {
         let my_host = self.model.my_host().cloned();
         let my_node_id = self.model.my_node_id().cloned();
         let active_repo_is_remote_only = self.active_repo_is_remote_only();
-        let is_convoys = self.ui.is_convoys;
         crate::widgets::WidgetContext {
             model: &self.model,
             keymap: &self.keymap,
@@ -847,11 +958,8 @@ impl App {
             provisioning_target: &self.ui.provisioning_target,
             my_host,
             my_node_id,
-            active_repo: self.model.active_repo,
-            repo_order: &self.model.repo_order,
+            views: &self.views,
             commands: &mut self.proto_commands,
-            is_config: &mut self.ui.is_config,
-            is_convoys,
             active_repo_is_remote_only,
             namespaces: &self.namespaces,
             app_actions: Vec::new(),
@@ -878,9 +986,8 @@ impl App {
                     // Cycle the active page's layout (handles both the direct
                     // repo_page path where the page already cycled, and the
                     // command palette path where only the AppAction was emitted).
-                    if !self.model.repo_order.is_empty() {
-                        let identity = &self.model.repo_order[self.model.active_repo];
-                        if let Some(page) = self.screen.repo_pages.get_mut(identity) {
+                    if let Some(identity) = self.model.active_repo.clone() {
+                        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
                             page.cycle_layout();
                             self.ui.view_layout = page.layout;
                         }
@@ -899,9 +1006,8 @@ impl App {
                         }
                     };
                     self.ui.view_layout = layout;
-                    if !self.model.repo_order.is_empty() {
-                        let identity = &self.model.repo_order[self.model.active_repo];
-                        if let Some(page) = self.screen.repo_pages.get_mut(identity) {
+                    if let Some(identity) = self.model.active_repo.clone() {
+                        if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
                             page.layout = layout;
                         }
                     }
@@ -976,44 +1082,41 @@ impl App {
                 AppAction::ClearError(id) => {
                     self.dismiss_status_item(id);
                 }
-                AppAction::SwitchToConfig => {
-                    self.dismiss_modals();
-                    self.ui.is_config = true;
-                    self.ui.is_convoys = false;
-                }
-                AppAction::SwitchToConvoys => {
-                    self.dismiss_modals();
-                    self.ui.is_config = false;
-                    self.ui.is_convoys = true;
-                }
-                AppAction::SwitchToRepo(i) => {
-                    self.dismiss_modals();
-                    self.ui.is_convoys = false;
+                AppAction::SwitchToTab(i) => {
                     self.switch_tab(i);
                 }
+                AppAction::OpenView(address) => {
+                    self.open_view(address);
+                }
+                AppAction::SwitchToLastView => {
+                    self.switch_to_last_view();
+                }
+                AppAction::CloseTab(i) => {
+                    self.close_tab(i);
+                }
+                AppAction::CloseActiveTab => {
+                    self.close_active_tab();
+                }
+                AppAction::ExpectRepoOpen(path) => {
+                    self.pending_repo_opens.push(path);
+                }
                 AppAction::SaveTabOrder => {
-                    self.config.save_tab_order(&self.persisted_tab_order_paths());
+                    self.persist_open_views();
                 }
                 AppAction::OpenFilePicker => {
                     self.open_file_picker_from_active_repo_parent();
                 }
                 AppAction::PrevTab => {
-                    self.dismiss_modals();
                     self.prev_tab();
                 }
                 AppAction::NextTab => {
-                    self.dismiss_modals();
                     self.next_tab();
                 }
                 AppAction::MoveTabLeft => {
-                    if !self.ui.is_config && self.move_tab(-1) {
-                        self.config.save_tab_order(&self.persisted_tab_order_paths());
-                    }
+                    self.move_tab(-1);
                 }
                 AppAction::MoveTabRight => {
-                    if !self.ui.is_config && self.move_tab(1) {
-                        self.config.save_tab_order(&self.persisted_tab_order_paths());
-                    }
+                    self.move_tab(1);
                 }
                 AppAction::Refresh => {
                     if let Some(repo) = self.model.active_repo_root_opt().cloned() {
@@ -1160,6 +1263,7 @@ impl App {
                 }
             }
             DaemonEvent::ResultSet(result_set) => {
+                self.query_seqs.insert(result_set.query(), result_set.seq);
                 let Some(rows) = result_set.rows.as_convoys() else { return };
                 let mut touched: Vec<_> = self.namespaces.keys().cloned().collect();
                 if touched.is_empty() {
@@ -1181,6 +1285,7 @@ impl App {
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
+                self.query_seqs.insert(delta.query(), delta.seq);
                 let Some(changed) = delta.changed.as_convoys() else { return };
                 let mut touched = Vec::new();
                 for row in changed {
@@ -1242,13 +1347,9 @@ impl App {
             .retain(|k, _| k.0 != repo_identity || rm.provider_health.get(&k.1).is_some_and(|ps| ps.contains_key(&k.2)));
 
         // Change detection badge for inactive tabs
-        let active_idx = self.model.active_repo;
-        let i = self.model.repo_order.iter().position(|repo| repo == &repo_identity);
-        if let Some(idx) = i {
-            if idx != active_idx && *old_providers != *rm.providers {
-                if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
-                    repo_model.has_unseen_changes = true;
-                }
+        if self.model.active_repo.as_ref() != Some(&repo_identity) && *old_providers != *rm.providers {
+            if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
+                repo_model.has_unseen_changes = true;
             }
         }
 
@@ -1335,15 +1436,9 @@ impl App {
             .changes
             .iter()
             .any(|c| !matches!(c, flotilla_protocol::Change::ProviderHealth { .. } | flotilla_protocol::Change::ErrorsChanged(_)));
-        if has_data_changes {
-            let active_idx = self.model.active_repo;
-            let i = self.model.repo_order.iter().position(|repo| repo == &repo_identity);
-            if let Some(idx) = i {
-                if idx != active_idx {
-                    if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
-                        repo_model.has_unseen_changes = true;
-                    }
-                }
+        if has_data_changes && self.model.active_repo.as_ref() != Some(&repo_identity) {
+            if let Some(repo_model) = self.model.repos.get_mut(&repo_identity) {
+                repo_model.has_unseen_changes = true;
             }
         }
 
@@ -1391,7 +1486,7 @@ impl App {
 
         self.model.repos.insert(identity.clone(), TuiRepoModel {
             identity: info.identity,
-            path,
+            path: path.clone(),
             providers: Arc::new(ProviderData::default()),
             labels: info.labels,
             provider_names: info.provider_names,
@@ -1399,44 +1494,39 @@ impl App {
             loading: info.loading,
             has_unseen_changes: false,
         });
-        self.model.repo_order.push(identity);
+        self.model.repo_order.push(identity.clone());
+
+        // Open a tab only when this TUI asked for the add (the [+] flow).
+        // A repo registered by another session or the CLI is listed on the
+        // overview but does not force a tab here — and a scoped pane never
+        // grows tabs (ADR 0013).
+        if let Some(pos) = self.pending_repo_opens.iter().position(|pending| pending == &path) {
+            self.pending_repo_opens.remove(pos);
+            if !self.scoped {
+                self.open_view(ViewAddress::Repo(identity));
+            }
+        }
     }
 
+    /// The repo's data leaves the model; any tab open on it stays, rendering
+    /// its dangling-repo error state until the user closes it (ADR 0013 —
+    /// no silent pruning of the open-view set).
     fn handle_repo_removed(&mut self, repo_identity: &RepoIdentity) {
         self.model.repos.remove(repo_identity);
         self.model.repo_order.retain(|repo| repo != repo_identity);
         self.repo_data.remove(repo_identity);
         self.issue_views.remove(repo_identity);
         self.screen.repo_pages.remove(repo_identity);
-        if self.model.repo_order.is_empty() {
-            self.should_quit = true;
-            return;
-        }
-        if self.model.active_repo >= self.model.repo_order.len() {
-            self.model.active_repo = self.model.repo_order.len() - 1;
-        }
-        // Sync layout from the now-active page so the status bar indicator
-        // reflects the correct repo after removal.
-        let identity = &self.model.repo_order[self.model.active_repo];
-        if let Some(page) = self.screen.repo_pages.get(identity) {
-            self.ui.view_layout = page.layout;
-        }
     }
 
     pub fn selected_work_item(&self) -> Option<&WorkItem> {
-        if self.model.repo_order.is_empty() {
-            return None;
-        }
-        let identity = &self.model.repo_order[self.model.active_repo];
+        let identity = self.model.active_repo.as_ref()?;
         self.screen.repo_pages.get(identity).and_then(|page| page.table.selected_work_item())
     }
 
     /// Get the selected row (WorkItem or IssueRow) as an owned enum.
     pub(super) fn selected_row_cloned(&self) -> Option<OwnedSelectedRow> {
-        if self.model.repo_order.is_empty() {
-            return None;
-        }
-        let identity = &self.model.repo_order[self.model.active_repo];
+        let identity = self.model.active_repo.as_ref()?;
         let page = self.screen.repo_pages.get(identity)?;
         match page.table.selected_row()? {
             crate::widgets::split_table::SelectedRow::WorkItem(item) => Some(OwnedSelectedRow::WorkItem(Box::new(item.clone()))),
@@ -1527,10 +1617,37 @@ impl App {
         self.namespaces.get(namespace)?.convoys.get(id)
     }
 
+    /// The convoy-data scope of the active View, when it consumes the
+    /// convoys query. None on overview/repo/broken tabs.
+    pub(crate) fn active_convoy_scope(&self) -> Option<ConvoyScope> {
+        match self.views.active_address() {
+            Some(ViewAddress::Convoys { namespace }) => Some(ConvoyScope { namespace: namespace.clone(), project: None, convoy: None }),
+            Some(ViewAddress::Convoy { namespace, name }) => {
+                Some(ConvoyScope { namespace: namespace.clone(), project: None, convoy: Some(name.clone()) })
+            }
+            Some(ViewAddress::Vessel { namespace, convoy, .. }) => {
+                Some(ConvoyScope { namespace: namespace.clone(), project: None, convoy: Some(convoy.clone()) })
+            }
+            Some(ViewAddress::Project { namespace, name }) => {
+                Some(ConvoyScope { namespace: namespace.clone(), project: Some(name.clone()), convoy: None })
+            }
+            _ => None,
+        }
+    }
+
+    /// The convoy a scope acts on: the pinned convoy for single-convoy and
+    /// vessel views, otherwise the list selection.
+    pub(crate) fn scoped_convoy_summary<'a>(&'a self, scope: &ConvoyScope) -> Option<&'a crate::convoy_model::ConvoySummary> {
+        match &scope.convoy {
+            Some(name) => self.namespaces.get(&scope.namespace)?.convoys.values().find(|c| &c.name == name),
+            None => self.selected_convoy_summary(&scope.namespace),
+        }
+    }
+
     /// Switch focus to the vessel tree, defaulting to the first task if none selected.
     /// No-op when no convoy is selected or the convoy has no vessels.
-    pub fn enter_convoy_vessels_focus(&mut self, namespace: &str) {
-        let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
+    pub fn enter_convoy_vessels_focus(&mut self, scope: &ConvoyScope) {
+        let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
         if convoy.vessels.is_empty() {
             return;
         }
@@ -1546,10 +1663,10 @@ impl App {
         self.convoys_ui.focus = ConvoysFocus::List;
     }
 
-    /// Move task selection within the selected convoy by `delta` (positive = down).
+    /// Move task selection within the scoped convoy by `delta` (positive = down).
     /// Clamps at both ends. No-op when no vessels are visible.
-    pub fn convoy_vessels_select_delta(&mut self, namespace: &str, delta: isize) {
-        let Some(convoy) = self.selected_convoy_summary(namespace) else { return };
+    pub fn convoy_vessels_select_delta(&mut self, scope: &ConvoyScope, delta: isize) {
+        let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
         if convoy.vessels.is_empty() {
             self.convoys_ui.selected_vessel = None;
             return;
@@ -1562,14 +1679,12 @@ impl App {
 
     /// Move the convoy selection by `delta` positions (positive = down, negative = up).
     ///
-    /// Operates on the *filtered* visible set so j/k never lands on a hidden convoy.
-    /// Clamps at both ends. No-ops when there are no visible convoys.
-    pub(crate) fn convoys_tab_select_delta(&mut self, delta: isize) {
-        // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
-        // support will need a namespace scoping concept on ConvoysUiState —
-        // see issue #589 (arbitrary tabs).
+    /// Operates on the *filtered* visible set of the given scope so j/k never
+    /// lands on a hidden convoy. Clamps at both ends. No-ops when there are
+    /// no visible convoys.
+    pub(crate) fn convoys_tab_select_delta(&mut self, scope: &ConvoyScope, delta: isize) {
         let prior_selected = self.convoys_ui.selected.clone();
-        let ids: Vec<crate::convoy_model::ConvoyId> = self.visible_convoys("flotilla").map(|c| c.id.clone()).collect();
+        let ids: Vec<crate::convoy_model::ConvoyId> = self.visible_convoys_scoped(scope).map(|c| c.id.clone()).collect();
         if ids.is_empty() {
             self.convoys_ui.selected = None;
             self.reset_convoy_vessel_state();
@@ -1583,19 +1698,30 @@ impl App {
         }
     }
 
-    /// Set the filter string for the Convoys tab.
+    /// Set the filter string for the active convoys-consuming view.
     ///
     /// Updates the stored filter and invalidates the current selection if it is
     /// no longer visible under the new filter.
     pub fn set_convoy_filter(&mut self, f: impl Into<String>) {
         self.convoys_ui.filter = f.into();
-        self.refresh_convoy_selection_for_filter("flotilla");
+        if let Some(scope) = self.active_convoy_scope() {
+            self.refresh_convoy_selection_for_filter(&scope.namespace);
+        }
     }
 
     /// Iterate over convoys in the given namespace, filtered by the active
     /// filter string (case-insensitive substring match on name and repo_hint).
     pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> + 'a {
         filter_convoys_by_str(self.convoys(namespace), &self.convoys_ui.filter)
+    }
+
+    /// Iterate over the convoys visible in a scope: its namespace, restricted
+    /// to its project when set, under the active text filter.
+    pub fn visible_convoys_scoped<'a>(
+        &'a self,
+        scope: &'a ConvoyScope,
+    ) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> + 'a {
+        filter_convoys_scoped(self.convoys(&scope.namespace), scope.project.as_deref(), &self.convoys_ui.filter)
     }
 
     /// When the filter changes, check whether the current selection is still

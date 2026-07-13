@@ -7,7 +7,7 @@ use flotilla_protocol::{
 // Re-export shared WorkItem/RepoInfo builders — single source of truth in test_builders.
 pub use flotilla_tui::app::test_builders::{checkout_item, issue_item, pr_item, repo_info, session_item};
 use flotilla_tui::{
-    app::{InFlightCommand, ProviderStatus, RepoViewLayout, TuiModel, UiState},
+    app::{InFlightCommand, OpenViews, ProviderStatus, RepoViewLayout, TuiModel, UiState},
     keymap::Keymap,
     shared::Shared,
     theme::Theme,
@@ -24,6 +24,7 @@ fn repo_identity(name: &str) -> RepoIdentity {
 
 pub struct TestHarness {
     pub model: TuiModel,
+    pub views: OpenViews,
     pub ui: UiState,
     pub in_flight: HashMap<u64, InFlightCommand>,
     pub screen: flotilla_tui::widgets::screen::Screen,
@@ -34,7 +35,10 @@ pub struct TestHarness {
 
 impl TestHarness {
     /// Create a `TestHarness` from a pre-built model, populating RepoPages.
-    fn from_model(model: TuiModel) -> Self {
+    fn from_model(mut model: TuiModel) -> Self {
+        // Seeded tab layout: [overview, convoys, repo tabs...], first repo active.
+        let views = OpenViews::seed(model.repo_order.iter().cloned());
+        model.active_repo = views.active_repo_identity().cloned();
         let mut ui = UiState::new(&model.repo_order);
         // Pin the provisioning target to a fixed value for snapshot determinism.
         // Real apps use HostName::local() (the machine hostname), but snapshots
@@ -56,7 +60,7 @@ impl TestHarness {
             let page = flotilla_tui::widgets::repo_page::RepoPage::new(identity.clone(), shared, ui.view_layout);
             screen.repo_pages.insert(identity.clone(), page);
         }
-        Self { model, ui, in_flight: HashMap::new(), screen, theme: None, width: WIDTH, height: HEIGHT }
+        Self { model, views, ui, in_flight: HashMap::new(), screen, theme: None, width: WIDTH, height: HEIGHT }
     }
 
     /// Empty state: single repo with no data (the UI requires at least one repo).
@@ -92,9 +96,10 @@ impl TestHarness {
         self
     }
 
-    /// Set config mode.
+    /// Make the overview the active tab.
     pub fn with_config(mut self) -> Self {
-        self.ui.is_config = true;
+        self.views.switch_to(0);
+        self.model.active_repo = None;
         self
     }
 
@@ -181,6 +186,8 @@ impl TestHarness {
                 let area = frame.area();
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.model,
+                    views: &self.views,
+                    scoped: false,
                     ui: &mut self.ui,
                     theme: &theme,
                     keymap: &keymap,

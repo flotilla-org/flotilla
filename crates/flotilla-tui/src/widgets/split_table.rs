@@ -748,7 +748,7 @@ impl SplitTable {
     }
 
     fn render_providers(&self, model: &TuiModel, _ui: &UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
-        let repo_identity = &model.repo_order[model.active_repo];
+        let Some(repo_identity) = model.active_repo.as_ref() else { return };
         let rm = &model.repos[repo_identity];
 
         let mut rows: Vec<Row> = Vec::new();

@@ -6,6 +6,7 @@
 mod detail;
 mod glyphs;
 mod list;
+mod vessel_detail;
 
 pub use detail::ConvoyDetail;
 pub use list::ConvoyList;
@@ -15,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+pub use vessel_detail::VesselDetail;
 
 use crate::convoy_model::{ConvoyId, ConvoySummary};
 

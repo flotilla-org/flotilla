@@ -1,9 +1,11 @@
 use std::{any::Any, collections::HashMap};
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::RepoIdentity;
+use flotilla_protocol::{RepoIdentity, ViewAddress};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    text::Line,
+    widgets::Paragraph,
     Frame,
 };
 
@@ -16,12 +18,38 @@ use super::{
     AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::collect_visible_status_items,
+    app::{collect_visible_status_items, ViewTarget},
     binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
     keymap::Action,
     status_bar::StatusBarAction,
     ui_helpers,
 };
+
+/// What the active tab dispatches to. Derived from the active View each
+/// event/frame — the View's kind, not stateful flags, decides the page.
+enum ActivePage {
+    Overview,
+    /// A convoy list view: the convoys of a namespace, or of one project.
+    Convoys,
+    /// One convoy's vessel tree, full width.
+    Convoy {
+        namespace: String,
+        name: String,
+    },
+    /// One vessel's detail.
+    Vessel {
+        namespace: String,
+        convoy: String,
+        vessel: String,
+    },
+    Repo(RepoIdentity),
+    /// A repo view whose repo is no longer tracked, or an address that
+    /// failed to parse: renders its own error, handles only shell actions.
+    Error {
+        title: String,
+        detail: String,
+    },
+}
 
 /// Root widget that owns the tab bar, page content, status bar, and modal stack.
 ///
@@ -93,22 +121,62 @@ impl Screen {
         }
     }
 
-    /// Resolve the active repo identity from model state.
-    ///
-    /// Returns `Some(identity)` when the UI is on a repo tab (not Config or Convoys mode),
-    /// `None` when on the Flotilla (overview) or Convoys tab.
-    fn active_repo_identity<'a>(
-        &self,
-        repo_order: &'a [RepoIdentity],
-        active_repo: usize,
-        is_config: bool,
-        is_convoys: bool,
-    ) -> Option<&'a RepoIdentity> {
-        if is_config || is_convoys || repo_order.is_empty() {
-            None
-        } else {
-            repo_order.get(active_repo)
+    /// Resolve what the active View dispatches to, applying the loud-failure
+    /// rule: dangling repos and unparseable addresses become error pages,
+    /// never a silent fallback to another view (ADR 0013).
+    fn active_page(&self, view: &crate::app::OpenView, repos: &HashMap<RepoIdentity, crate::app::TuiRepoModel>) -> ActivePage {
+        match &view.target {
+            ViewTarget::View(ViewAddress::Overview) => ActivePage::Overview,
+            // Project dashboards render the convoy list scoped to the
+            // project (the scope filter is applied upstream, in the
+            // pre-filtered `RenderContext::convoys`).
+            ViewTarget::View(ViewAddress::Convoys { .. } | ViewAddress::Project { .. }) => ActivePage::Convoys,
+            ViewTarget::View(ViewAddress::Convoy { namespace, name }) => {
+                ActivePage::Convoy { namespace: namespace.clone(), name: name.clone() }
+            }
+            ViewTarget::View(ViewAddress::Vessel { namespace, convoy, vessel }) => {
+                ActivePage::Vessel { namespace: namespace.clone(), convoy: convoy.clone(), vessel: vessel.clone() }
+            }
+            ViewTarget::View(ViewAddress::Repo(identity)) => {
+                if repos.contains_key(identity) {
+                    ActivePage::Repo(identity.clone())
+                } else {
+                    ActivePage::Error {
+                        title: format!("repo not tracked: {}/{}", identity.authority, identity.path),
+                        detail: format!("view address: {}", ViewAddress::Repo(identity.clone())),
+                    }
+                }
+            }
+            ViewTarget::Broken { raw, error } => ActivePage::Error { title: format!("invalid view address: {raw}"), detail: error.clone() },
         }
+    }
+
+    /// Shell-level actions available on pages with no interactive widget
+    /// (convoys and error pages).
+    fn fallback_page_action(action: Action, ctx: &mut WidgetContext) -> Outcome {
+        match action {
+            Action::Quit => {
+                ctx.app_actions.push(AppAction::Quit);
+                Outcome::Consumed
+            }
+            Action::ToggleHelp => Outcome::Push(Box::new(super::help::HelpWidget::new())),
+            Action::OpenCommandPalette | Action::OpenContextualPalette => {
+                Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new()))
+            }
+            _ => Outcome::Ignored,
+        }
+    }
+
+    fn render_error_page(frame: &mut Frame, area: Rect, theme: &crate::theme::Theme, title: &str, detail: &str) {
+        let lines = vec![
+            Line::raw(""),
+            Line::styled(format!("⚠ {title}"), ratatui::style::Style::default().fg(theme.status_error)),
+            Line::raw(""),
+            Line::raw(detail.to_string()),
+            Line::raw(""),
+            Line::raw("This tab failed on its own — other tabs are unaffected. Close it, or fix open-views.toml."),
+        ];
+        frame.render_widget(Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center), area);
     }
 }
 
@@ -145,6 +213,10 @@ impl InteractiveWidget for Screen {
                 ctx.app_actions.push(AppAction::MoveTabRight);
                 return Outcome::Consumed;
             }
+            Action::CloseTab => {
+                ctx.app_actions.push(AppAction::CloseActiveTab);
+                return Outcome::Consumed;
+            }
             Action::CycleTheme => {
                 ctx.app_actions.push(AppAction::CycleTheme);
                 return Outcome::Consumed;
@@ -168,32 +240,19 @@ impl InteractiveWidget for Screen {
             _ => {}
         }
 
-        // Phase 3: No modal — dispatch to convoys page, overview page, or repo page
-        let is_config = *ctx.is_config;
-        let is_convoys = ctx.is_convoys;
-        let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config, is_convoys).cloned();
-        let outcome = if is_convoys {
-            // Convoys page has no interactive widget — handle TabPage globals here,
-            // ignore everything else (navigation, PrevTab, etc. were handled in Phase 2).
-            match action {
-                Action::Quit => {
-                    ctx.app_actions.push(AppAction::Quit);
-                    Outcome::Consumed
-                }
-                Action::ToggleHelp => Outcome::Push(Box::new(super::help::HelpWidget::new())),
-                Action::OpenCommandPalette | Action::OpenContextualPalette => {
-                    Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new()))
-                }
-                _ => Outcome::Ignored,
+        // Phase 3: No modal — dispatch to the active View's page.
+        let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
+            ActivePage::Overview => self.overview_page.handle_action(action, ctx),
+            // Convoy-family and error pages have no interactive widget —
+            // only the shell-level actions apply here (convoy navigation is
+            // App-level dispatch).
+            ActivePage::Convoys | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
+                Self::fallback_page_action(action, ctx)
             }
-        } else if let Some(ref identity) = active_identity {
-            if let Some(page) = self.repo_pages.get_mut(identity) {
-                page.handle_action(action, ctx)
-            } else {
-                self.overview_page.handle_action(action, ctx)
-            }
-        } else {
-            self.overview_page.handle_action(action, ctx)
+            ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
+                Some(page) => page.handle_action(action, ctx),
+                None => Self::fallback_page_action(action, ctx),
+            },
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -213,20 +272,14 @@ impl InteractiveWidget for Screen {
             return Outcome::Ignored;
         }
 
-        // No modal — dispatch to overview page or repo page
-        let is_config = *ctx.is_config;
-        let is_convoys = ctx.is_convoys;
-        let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config, is_convoys).cloned();
-        let outcome = if is_convoys {
-            Outcome::Ignored
-        } else if let Some(ref identity) = active_identity {
-            if let Some(page) = self.repo_pages.get_mut(identity) {
-                page.handle_raw_key(key, ctx)
-            } else {
-                self.overview_page.handle_raw_key(key, ctx)
-            }
-        } else {
-            self.overview_page.handle_raw_key(key, ctx)
+        // No modal — dispatch to the active View's page
+        let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
+            ActivePage::Overview => self.overview_page.handle_raw_key(key, ctx),
+            ActivePage::Convoys | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => Outcome::Ignored,
+            ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
+                Some(page) => page.handle_raw_key(key, ctx),
+                None => Outcome::Ignored,
+            },
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -290,20 +343,14 @@ impl InteractiveWidget for Screen {
             _ => {}
         }
 
-        // Dispatch to overview page or repo page for content area mouse events
-        let is_config = *ctx.is_config;
-        let is_convoys = ctx.is_convoys;
-        let active_identity = self.active_repo_identity(ctx.repo_order, ctx.active_repo, is_config, is_convoys).cloned();
-        let outcome = if is_convoys {
-            Outcome::Ignored
-        } else if let Some(ref identity) = active_identity {
-            if let Some(page) = self.repo_pages.get_mut(identity) {
-                page.handle_mouse(mouse, ctx)
-            } else {
-                self.overview_page.handle_mouse(mouse, ctx)
-            }
-        } else {
-            self.overview_page.handle_mouse(mouse, ctx)
+        // Dispatch to the active View's page for content area mouse events
+        let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
+            ActivePage::Overview => self.overview_page.handle_mouse(mouse, ctx),
+            ActivePage::Convoys | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => Outcome::Ignored,
+            ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
+                Some(page) => page.handle_mouse(mouse, ctx),
+                None => Outcome::Ignored,
+            },
         };
         if !matches!(outcome, Outcome::Ignored) {
             self.apply_outcome(outcome);
@@ -313,50 +360,104 @@ impl InteractiveWidget for Screen {
     }
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
-        let constraints = vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)];
+        // Scoped mode: the pane is one View — no tab bar row.
+        let constraints = if ctx.scoped {
+            vec![Constraint::Length(0), Constraint::Min(0), Constraint::Length(1)]
+        } else {
+            vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]
+        };
         let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
 
         // 1. Tab bar
-        self.tabs.render(ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
+        if !ctx.scoped {
+            self.tabs.render(ctx.views, ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
+        }
 
-        // 2. Content: dispatch to convoys page, repo page, or overview page
-        let is_config = ctx.ui.is_config;
-        let is_convoys = ctx.ui.is_convoys;
-        let active_identity = self.active_repo_identity(&ctx.model.repo_order, ctx.model.active_repo, is_config, is_convoys).cloned();
-        if is_convoys {
-            let selected = ctx.convoys_selected.as_ref();
-            ConvoysPage {
-                convoys: ctx.convoys.clone(),
-                selected,
-                selected_vessel: ctx.convoys_selected_vessel,
-                focus: ctx.convoys_focus,
-                filter: ctx.convoy_filter,
+        // 2. Content: dispatch to the active View's page
+        let active_page = self.active_page(ctx.views.active(), &ctx.model.repos);
+        match &active_page {
+            ActivePage::Convoys => {
+                let selected = ctx.convoys_selected.as_ref();
+                ConvoysPage {
+                    convoys: ctx.convoys.clone(),
+                    selected,
+                    selected_vessel: ctx.convoys_selected_vessel,
+                    focus: ctx.convoys_focus,
+                    filter: ctx.convoy_filter,
+                }
+                .render(frame, chunks[1]);
             }
-            .render(frame, chunks[1]);
-        } else if let Some(ref identity) = active_identity {
-            if let Some(page) = self.repo_pages.get_mut(identity) {
-                page.render(frame, chunks[1], ctx);
-            } else {
-                self.overview_page.render(frame, chunks[1], ctx);
+            ActivePage::Overview => self.overview_page.render(frame, chunks[1], ctx),
+            ActivePage::Convoy { namespace, name } => {
+                match ctx.namespaces.get(namespace).and_then(|m| m.convoys.values().find(|c| &c.name == name)) {
+                    Some(convoy) => {
+                        super::convoys_page::ConvoyDetail { convoy, selected_vessel: ctx.convoys_selected_vessel, focused: true }
+                            .render(frame, chunks[1])
+                    }
+                    None => Self::render_error_page(
+                        frame,
+                        chunks[1],
+                        ctx.theme,
+                        &format!("convoy not found: {namespace}/{name}"),
+                        "It may not have started yet, or it has been deleted.",
+                    ),
+                }
             }
-        } else {
-            self.overview_page.render(frame, chunks[1], ctx);
+            ActivePage::Vessel { namespace, convoy, vessel } => {
+                let found = ctx
+                    .namespaces
+                    .get(namespace)
+                    .and_then(|m| m.convoys.values().find(|c| &c.name == convoy))
+                    .and_then(|c| c.vessels.iter().find(|v| &v.name == vessel).map(|v| (c, v)));
+                match found {
+                    Some((convoy, vessel)) => super::convoys_page::VesselDetail { convoy, vessel }.render(frame, chunks[1]),
+                    None => Self::render_error_page(
+                        frame,
+                        chunks[1],
+                        ctx.theme,
+                        &format!("vessel not found: {namespace}/{convoy}/{vessel}"),
+                        "It may not have materialised yet, or its convoy has been deleted.",
+                    ),
+                }
+            }
+            ActivePage::Repo(identity) => {
+                let identity = identity.clone();
+                match self.repo_pages.get_mut(&identity) {
+                    Some(page) => page.render(frame, chunks[1], ctx),
+                    None => Self::render_error_page(
+                        frame,
+                        chunks[1],
+                        ctx.theme,
+                        &format!("no page for repo: {}/{}", identity.authority, identity.path),
+                        "",
+                    ),
+                }
+            }
+            ActivePage::Error { title, detail } => Self::render_error_page(frame, chunks[1], ctx.theme, title, detail),
         }
 
         // 3. Status bar — resolve all content, then call the pure renderer.
 
         // 3a. Resolve binding mode and status fragment.
-        // Modal stack takes priority; otherwise ask the active page directly.
+        // Modal stack takes priority; otherwise the active View's kind
+        // supplies its mode stack.
         let (binding_mode, fragment) = if let Some(modal) = self.modal_stack.last() {
             (modal.binding_mode(), modal.status_fragment())
-        } else if is_config {
-            (self.overview_page.binding_mode(), self.overview_page.status_fragment())
-        } else if is_convoys {
-            (KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys]), StatusFragment::default())
-        } else if let Some(page) = active_identity.as_ref().and_then(|id| self.repo_pages.get(id)) {
-            (page.binding_mode(), page.status_fragment())
         } else {
-            (KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]), StatusFragment::default())
+            match &active_page {
+                ActivePage::Overview => (self.overview_page.binding_mode(), self.overview_page.status_fragment()),
+                ActivePage::Convoys => {
+                    (KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys]), StatusFragment::default())
+                }
+                ActivePage::Convoy { .. } | ActivePage::Vessel { .. } => {
+                    (KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::ConvoyVessels]), StatusFragment::default())
+                }
+                ActivePage::Repo(identity) => match self.repo_pages.get(identity) {
+                    Some(page) => (page.binding_mode(), page.status_fragment()),
+                    None => (KeyBindingMode::Composed(vec![BindingModeId::TabPage]), StatusFragment::default()),
+                },
+                ActivePage::Error { .. } => (KeyBindingMode::Composed(vec![BindingModeId::TabPage]), StatusFragment::default()),
+            }
         };
 
         let active_mode = binding_mode.primary();

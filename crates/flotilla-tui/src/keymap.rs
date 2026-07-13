@@ -27,6 +27,7 @@ pub enum Action {
     NextTab,
     MoveTabLeft,
     MoveTabRight,
+    CloseTab,
     ToggleHelp,
     ToggleMultiSelect,
     ToggleProviders,
@@ -72,6 +73,7 @@ impl Action {
                 | Action::NextTab
                 | Action::MoveTabLeft
                 | Action::MoveTabRight
+                | Action::CloseTab
                 | Action::CycleTheme
                 | Action::CycleLayout
                 | Action::CycleHost
@@ -97,6 +99,7 @@ impl Action {
             "next_tab" => Action::NextTab,
             "move_tab_left" => Action::MoveTabLeft,
             "move_tab_right" => Action::MoveTabRight,
+            "close_tab" => Action::CloseTab,
             "toggle_help" => Action::ToggleHelp,
             "toggle_multi_select" => Action::ToggleMultiSelect,
             "toggle_providers" => Action::ToggleProviders,
@@ -147,6 +150,7 @@ impl Action {
             Action::NextTab => "next_tab",
             Action::MoveTabLeft => "move_tab_left",
             Action::MoveTabRight => "move_tab_right",
+            Action::CloseTab => "close_tab",
             Action::ToggleHelp => "toggle_help",
             Action::ToggleMultiSelect => "toggle_multi_select",
             Action::ToggleProviders => "toggle_providers",
@@ -194,6 +198,7 @@ impl Action {
             Action::NextTab => "Switch to next tab",
             Action::MoveTabLeft => "Move current tab left",
             Action::MoveTabRight => "Move current tab right",
+            Action::CloseTab => "Close current tab",
             Action::ToggleHelp => "Toggle help screen",
             Action::ToggleMultiSelect => "Toggle multi-select",
             Action::ToggleProviders => "Toggle provider config",

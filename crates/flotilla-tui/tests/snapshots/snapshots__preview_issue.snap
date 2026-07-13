@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 318
 expression: output
 ---
- ⚓  flotilla  |  🚢  convoys  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project ×  | [+]
 ── Issues ───────────────────────────────────────────────────────── ⚙   ┌ Preview ─────────────────────────────────────┐
       ID     Title                              Labels            PR    │Description: Fix login timeout bug            │
 ▸  ◇  #25    Fix login timeout bug                                      │Issue #25: Fix login timeout bug []           │

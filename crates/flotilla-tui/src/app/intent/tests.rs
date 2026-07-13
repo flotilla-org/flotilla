@@ -787,7 +787,9 @@ fn remote_only_app() -> App {
         has_unseen_changes: old.has_unseen_changes,
     };
     app.model.repo_order[0] = remote_identity.clone();
-    app.model.repos.insert(remote_identity, model);
+    app.model.repos.insert(remote_identity.clone(), model);
+    // Focus a tab on the swapped-in remote repo so it is the active repo view.
+    app.open_view(flotilla_protocol::ViewAddress::Repo(remote_identity));
     insert_local_host(&mut app.model, &HostName::local().to_string());
     app
 }

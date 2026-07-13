@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 334
 expression: output
 ---
- ⚓  flotilla  |  🚢  convoys  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project ×  | [+]
 ── Sessions ─────────────────────────────────────────────────────── ⚙   ┌ Preview ─────────────────────────────────────┐
       Source     Key         Description            Branch      Status  │Description: Debug API endpoints              │
 ▸  ▶             s5          Debug API endpoints    feat/sessi… ▶       │Branch: feat/session-branch                   │

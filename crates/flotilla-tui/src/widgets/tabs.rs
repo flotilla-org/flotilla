@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::RepoIdentity;
+use flotilla_protocol::ViewAddress;
 use ratatui::{layout::Rect, style::Style, Frame};
 
 use crate::{
-    app::{ui_state::DragState, TabId, TuiModel, UiState},
+    app::{ui_state::DragState, OpenView, OpenViews, TabId, TuiModel, UiState, ViewTarget},
     segment_bar::{self, BarStyle, ThemedRibbonStyle, ThemedTabBarStyle},
     theme::{BarKind, Theme},
     widgets::AppAction,
@@ -15,12 +15,10 @@ use crate::{
 /// and mutates `App` state accordingly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabBarAction {
-    /// Switch to the flotilla config screen.
-    SwitchToConfig,
-    /// Switch to the global convoys view.
-    SwitchToConvoys,
-    /// Switch to a repo tab and start a potential drag.
-    SwitchToRepo(usize),
+    /// Switch to the open View at this tab index.
+    SwitchTo(usize),
+    /// Close the open View at this tab index (its `×` was clicked).
+    Close(usize),
     /// Open the file picker to add a new repo.
     OpenFilePicker,
     /// No recognized tab was hit. The caller should continue with
@@ -28,16 +26,58 @@ pub enum TabBarAction {
     None,
 }
 
-/// Tab bar strip component. Handles rendering, hit-testing, drag-reorder,
-/// and tab navigation. Owned by `Screen`.
+/// Trailing close affordance shown on the active (closable) tab.
+const CLOSE_AFFORDANCE: &str = "×";
+
+/// Tab bar strip component. Handles rendering, hit-testing, and drag-reorder
+/// over the open-view set. Owned by `Screen`. Tab *semantics* (switch, move,
+/// close, pinning) live on `OpenViews`.
 #[derive(Default)]
 pub struct Tabs {
     /// Click target areas populated during render.
     tab_areas: BTreeMap<TabId, Rect>,
+    /// Close-affordance hit area for the active tab, when it is closable.
+    close_area: Option<(usize, Rect)>,
     /// Tab drag-reorder state.
     pub drag: DragState,
     /// Whether a drag is visually active.
     drag_active: bool,
+}
+
+/// The default (pre-override) label for an open View's tab.
+fn default_label(view: &OpenView, model: &TuiModel) -> String {
+    match &view.target {
+        ViewTarget::View(ViewAddress::Overview) => " ⚓ flotilla ".to_string(),
+        ViewTarget::View(ViewAddress::Convoys { namespace }) if namespace == "flotilla" => " 🚢 convoys ".to_string(),
+        ViewTarget::View(ViewAddress::Convoys { namespace }) => format!(" 🚢 {namespace} "),
+        ViewTarget::View(ViewAddress::Convoy { name, .. }) => format!(" 🚢 {name} "),
+        ViewTarget::View(ViewAddress::Vessel { convoy, vessel, .. }) => format!(" {convoy}/{vessel} "),
+        ViewTarget::View(ViewAddress::Project { name, .. }) => format!(" ⛰ {name} "),
+        ViewTarget::View(ViewAddress::Repo(identity)) => match model.repos.get(identity) {
+            Some(rm) => {
+                let name = TuiModel::repo_name(&rm.path);
+                let loading = if rm.loading { " ⟳" } else { "" };
+                let changed = if rm.has_unseen_changes { "*" } else { "" };
+                format!("{name}{changed}{loading}")
+            }
+            // Dangling repo view: the repo is no longer tracked. The tab
+            // stays, loudly (ADR 0013).
+            None => {
+                let name = identity.path.rsplit('/').next().unwrap_or(&identity.path);
+                format!("⚠ {name}")
+            }
+        },
+        ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
+    }
+}
+
+/// The visible label for an open View's tab: the user override when set,
+/// otherwise the kind default.
+pub fn tab_label(view: &OpenView, model: &TuiModel) -> String {
+    match &view.label_override {
+        Some(label) => format!(" {label} "),
+        None => default_label(view, model),
+    }
 }
 
 impl Tabs {
@@ -49,50 +89,30 @@ impl Tabs {
 
     /// Render the tab bar into `area`, populating click targets for later
     /// hit-testing.
-    pub fn render(&mut self, model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, views: &OpenViews, model: &TuiModel, ui: &mut UiState, theme: &Theme, frame: &mut Frame, area: Rect) {
         self.drag_active = self.drag.active;
 
         let mut items = Vec::new();
         let mut tab_ids = Vec::new();
+        let active_idx = views.active_index();
 
-        // Flotilla logo tab
-        let flotilla_style = theme.logo_style(ui.is_config);
-        items.push(segment_bar::SegmentItem {
-            label: TabId::FLOTILLA_LABEL.to_string(),
-            key_hint: None,
-            active: ui.is_config,
-            dragging: false,
-            style_override: Some(flotilla_style),
-        });
-        tab_ids.push(TabId::Flotilla);
-
-        // Convoys global tab
-        items.push(segment_bar::SegmentItem {
-            label: TabId::CONVOYS_LABEL.to_string(),
-            key_hint: None,
-            active: ui.is_convoys,
-            dragging: false,
-            style_override: None,
-        });
-        tab_ids.push(TabId::Convoys);
-
-        // Repo tabs
-        for (i, repo_identity) in model.repo_order.iter().enumerate() {
-            let rm = &model.repos[repo_identity];
-            let name = TuiModel::repo_name(&rm.path);
-            let is_active = !ui.is_config && !ui.is_convoys && i == model.active_repo;
-            let loading = if rm.loading { " ⟳" } else { "" };
-            let changed = if rm.has_unseen_changes { "*" } else { "" };
-            let label = format!("{name}{changed}{loading}");
-
+        for (i, view) in views.iter().enumerate() {
+            let is_active = i == active_idx;
+            let mut label = tab_label(view, model);
+            // The active tab carries a mouse close affordance when closable
+            // (everything but the pinned overview at index 0).
+            if is_active && i != 0 {
+                label = format!("{} {CLOSE_AFFORDANCE} ", label.trim_end_matches(' '));
+            }
+            let style_override = matches!(view.address(), Some(ViewAddress::Overview)).then(|| theme.logo_style(is_active));
             items.push(segment_bar::SegmentItem {
                 label,
                 key_hint: None,
                 active: is_active,
-                dragging: is_active && self.drag_active,
-                style_override: None,
+                dragging: is_active && self.drag_active && i != 0,
+                style_override,
             });
-            tab_ids.push(TabId::Repo(i));
+            tab_ids.push(TabId::View(i));
         }
 
         // [+] button
@@ -112,11 +132,17 @@ impl Tabs {
         };
         let hits = segment_bar::render(&items, tab_style.as_ref(), area, frame.buffer_mut());
 
-        // Map hit regions to tab areas
+        // Map hit regions to tab areas; carve the close affordance out of
+        // the active tab's segment (the trailing "× " cell pair).
         self.tab_areas.clear();
+        self.close_area = None;
         for hit in hits {
             if let Some(tab_id) = tab_ids.get(hit.index) {
-                self.tab_areas.insert(tab_id.clone(), hit.area);
+                if *tab_id == TabId::View(active_idx) && active_idx != 0 && hit.area.width >= 3 {
+                    let close = Rect::new(hit.area.x + hit.area.width - 3, hit.area.y, 3, hit.area.height);
+                    self.close_area = Some((active_idx, close));
+                }
+                self.tab_areas.insert(*tab_id, hit.area);
             }
         }
 
@@ -131,13 +157,15 @@ impl Tabs {
     /// Returns a `TabBarAction` describing what was clicked. The caller
     /// is responsible for actually performing the action on `App`.
     pub fn handle_click(&self, x: u16, y: u16) -> TabBarAction {
-        let hit =
-            self.tab_areas.iter().find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height).map(|(id, _)| id.clone());
+        if let Some((idx, area)) = self.close_area {
+            if x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height {
+                return TabBarAction::Close(idx);
+            }
+        }
+        let hit = self.tab_areas.iter().find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height).map(|(id, _)| *id);
 
         match hit {
-            Some(TabId::Flotilla) => TabBarAction::SwitchToConfig,
-            Some(TabId::Convoys) => TabBarAction::SwitchToConvoys,
-            Some(TabId::Repo(i)) => TabBarAction::SwitchToRepo(i),
+            Some(TabId::View(i)) => TabBarAction::SwitchTo(i),
             Some(TabId::Add) => TabBarAction::OpenFilePicker,
             None => TabBarAction::None,
         }
@@ -146,8 +174,8 @@ impl Tabs {
     // ── Drag handling ──
 
     /// Handle a drag event during tab reordering. Returns `true` if a swap
-    /// occurred and the caller should update model state.
-    pub fn handle_drag(&self, column: u16, row: u16, repo_order: &mut [RepoIdentity], active_repo: &mut usize) -> bool {
+    /// occurred (the caller persists the new order on mouse-up).
+    pub fn handle_drag(&mut self, column: u16, row: u16, views: &mut OpenViews) -> bool {
         let Some(dragging_idx) = self.drag.dragging_tab else {
             return false;
         };
@@ -157,23 +185,18 @@ impl Tabs {
         }
 
         for (id, r) in &self.tab_areas {
-            if let TabId::Repo(i) = *id {
+            if let TabId::View(i) = *id {
                 if column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height && i != dragging_idx {
-                    repo_order.swap(dragging_idx, i);
-                    *active_repo = i;
-                    // Note: we can't update drag.dragging_tab here because we take &self.
-                    // The caller must update drag.dragging_tab = Some(i) after this returns true.
-                    return true;
+                    if views.swap(dragging_idx, i) {
+                        self.drag.dragging_tab = Some(i);
+                        return true;
+                    }
+                    return false;
                 }
             }
         }
 
         false
-    }
-
-    /// Update the drag state after a successful swap.
-    pub fn update_drag_index(&mut self, new_idx: usize) {
-        self.drag.dragging_tab = Some(new_idx);
     }
 
     // ── Mouse event handling ──
@@ -188,20 +211,16 @@ impl Tabs {
             MouseEventKind::Down(MouseButton::Left) => {
                 let tab_action = self.handle_click(x, y);
                 match tab_action {
-                    TabBarAction::SwitchToConfig => {
-                        self.drag.dragging_tab = None;
-                        actions.push(AppAction::SwitchToConfig);
-                    }
-                    TabBarAction::SwitchToConvoys => {
-                        self.drag.dragging_tab = None;
-                        actions.push(AppAction::SwitchToConvoys);
-                    }
-                    TabBarAction::SwitchToRepo(i) => {
-                        actions.push(AppAction::SwitchToRepo(i));
-                        // Start potential drag
-                        self.drag.dragging_tab = Some(i);
+                    TabBarAction::SwitchTo(i) => {
+                        actions.push(AppAction::SwitchToTab(i));
+                        // Start potential drag (the pinned tab never drags)
+                        self.drag.dragging_tab = (i != 0).then_some(i);
                         self.drag.start_x = x;
                         self.drag.active = false;
+                    }
+                    TabBarAction::Close(i) => {
+                        self.drag.dragging_tab = None;
+                        actions.push(AppAction::CloseTab(i));
                     }
                     TabBarAction::OpenFilePicker => {
                         actions.push(AppAction::OpenFilePicker);
@@ -227,126 +246,11 @@ impl Tabs {
         actions
     }
 
-    // ── Tab navigation ──
-
-    /// Switch to the next tab (forward). Wraps from the last repo to config,
-    /// and from config to the first repo.
-    pub fn next_tab(&mut self, model: &mut TuiModel, ui: &mut UiState) {
-        self.step_tab(model, ui, TabDirection::Forward);
-    }
-
-    /// Switch to the previous tab (backward). Wraps from the first repo to config,
-    /// and from config to the last repo.
-    pub fn prev_tab(&mut self, model: &mut TuiModel, ui: &mut UiState) {
-        self.step_tab(model, ui, TabDirection::Backward);
-    }
-
-    /// Switch directly to a specific repo tab by index.
-    pub fn switch_to(&self, idx: usize, model: &mut TuiModel, ui: &mut UiState) {
-        if idx < model.repo_order.len() {
-            ui.is_config = false;
-            ui.is_convoys = false;
-            model.active_repo = idx;
-            let key = &model.repo_order[idx];
-            model.repos.get_mut(key).expect("active repo must have model entry").has_unseen_changes = false;
-        }
-    }
-
-    /// Move the current tab left (delta = -1) or right (delta = 1).
-    /// Returns true if a swap occurred.
-    pub fn move_tab(&self, delta: isize, model: &mut TuiModel) -> bool {
-        let len = model.repo_order.len();
-        if len < 2 {
-            return false;
-        }
-        let cur = model.active_repo;
-        let new_idx = cur as isize + delta;
-        if new_idx < 0 || new_idx >= len as isize {
-            return false;
-        }
-        let new_idx = new_idx as usize;
-        model.repo_order.swap(cur, new_idx);
-        model.active_repo = new_idx;
-        true
-    }
-
     /// Read-only access to the tab areas for external code that still
     /// references them (e.g. gear icon placement in the table area).
     pub fn tab_areas(&self) -> &BTreeMap<TabId, Rect> {
         &self.tab_areas
     }
-
-    // ── Private helpers ──
-
-    fn step_tab(&mut self, model: &mut TuiModel, ui: &mut UiState, direction: TabDirection) {
-        // Tab order: Flotilla (config) → Convoys → Repo(0) → Repo(1) → … → Repo(N-1) → Flotilla
-        // When there are no repos: Flotilla ↔ Convoys.
-        if ui.is_config {
-            match direction {
-                TabDirection::Forward => {
-                    // Config → Convoys
-                    ui.is_config = false;
-                    ui.is_convoys = true;
-                }
-                TabDirection::Backward => {
-                    // Config ← last repo (or stay at Convoys if no repos)
-                    ui.is_config = false;
-                    if model.repo_order.is_empty() {
-                        ui.is_convoys = true;
-                    } else {
-                        ui.is_convoys = false;
-                        model.active_repo = model.repo_order.len() - 1;
-                    }
-                }
-            }
-            return;
-        }
-
-        if ui.is_convoys {
-            match direction {
-                TabDirection::Forward => {
-                    // Convoys → Repo(0), or back to Config if no repos
-                    ui.is_convoys = false;
-                    if model.repo_order.is_empty() {
-                        ui.is_config = true;
-                    } else {
-                        model.active_repo = 0;
-                    }
-                }
-                TabDirection::Backward => {
-                    // Convoys → Config
-                    ui.is_convoys = false;
-                    ui.is_config = true;
-                }
-            }
-            return;
-        }
-
-        // On a repo tab
-        match direction {
-            TabDirection::Forward => {
-                if model.active_repo + 1 < model.repo_order.len() {
-                    self.switch_to(model.active_repo + 1, model, ui);
-                } else {
-                    // Last repo → Config
-                    ui.is_config = true;
-                }
-            }
-            TabDirection::Backward => {
-                if model.active_repo > 0 {
-                    self.switch_to(model.active_repo - 1, model, ui);
-                } else {
-                    // First repo → Convoys
-                    ui.is_convoys = true;
-                }
-            }
-        }
-    }
-}
-
-enum TabDirection {
-    Forward,
-    Backward,
 }
 
 #[cfg(test)]
@@ -365,17 +269,12 @@ mod tests {
     }
 
     #[test]
-    fn handle_click_detects_flotilla_tab() {
+    fn handle_click_detects_view_tabs() {
         let mut tabs = Tabs::new();
-        tabs.tab_areas.insert(TabId::Flotilla, Rect::new(0, 0, 10, 1));
-        assert_eq!(tabs.handle_click(5, 0), TabBarAction::SwitchToConfig);
-    }
-
-    #[test]
-    fn handle_click_detects_repo_tab() {
-        let mut tabs = Tabs::new();
-        tabs.tab_areas.insert(TabId::Repo(0), Rect::new(10, 0, 10, 1));
-        assert_eq!(tabs.handle_click(15, 0), TabBarAction::SwitchToRepo(0));
+        tabs.tab_areas.insert(TabId::View(0), Rect::new(0, 0, 10, 1));
+        tabs.tab_areas.insert(TabId::View(2), Rect::new(10, 0, 10, 1));
+        assert_eq!(tabs.handle_click(5, 0), TabBarAction::SwitchTo(0));
+        assert_eq!(tabs.handle_click(15, 0), TabBarAction::SwitchTo(2));
     }
 
     #[test]
@@ -385,175 +284,63 @@ mod tests {
         assert_eq!(tabs.handle_click(32, 0), TabBarAction::OpenFilePicker);
     }
 
-    // ── Tab navigation ──
-
     #[test]
-    fn next_tab_advances_active_repo() {
-        let mut app = stub_app_with_repos(3);
+    fn close_affordance_wins_over_the_tab_area() {
         let mut tabs = Tabs::new();
-        assert_eq!(app.model.active_repo, 0);
-        tabs.next_tab(&mut app.model, &mut app.ui);
-        assert_eq!(app.model.active_repo, 1);
+        tabs.tab_areas.insert(TabId::View(2), Rect::new(10, 0, 10, 1));
+        tabs.close_area = Some((2, Rect::new(17, 0, 3, 1)));
+        assert_eq!(tabs.handle_click(12, 0), TabBarAction::SwitchTo(2));
+        assert_eq!(tabs.handle_click(18, 0), TabBarAction::Close(2));
     }
 
+    // ── Drag ──
+
     #[test]
-    fn next_tab_wraps_to_config() {
+    fn drag_swaps_open_views_and_follows_the_tab() {
         let mut app = stub_app_with_repos(2);
         let mut tabs = Tabs::new();
-        tabs.switch_to(1, &mut app.model, &mut app.ui);
-        tabs.next_tab(&mut app.model, &mut app.ui);
-        assert!(app.ui.is_config);
+        // Tabs: 0 overview, 1 convoys, 2 repo0, 3 repo1
+        tabs.tab_areas.insert(TabId::View(2), Rect::new(20, 0, 10, 1));
+        tabs.tab_areas.insert(TabId::View(3), Rect::new(30, 0, 10, 1));
+        tabs.drag.dragging_tab = Some(2);
+        tabs.drag.active = true;
+
+        let before: Vec<_> = app.views.iter().map(|view| view.address().cloned()).collect();
+        assert!(tabs.handle_drag(35, 0, &mut app.views));
+        let after: Vec<_> = app.views.iter().map(|view| view.address().cloned()).collect();
+        assert_eq!(after[2], before[3]);
+        assert_eq!(after[3], before[2]);
+        assert_eq!(tabs.drag.dragging_tab, Some(3));
     }
 
     #[test]
-    fn next_tab_from_config_goes_to_convoys() {
-        let mut app = stub_app_with_repos(3);
-        let mut tabs = Tabs::new();
-        app.ui.is_config = true;
-        tabs.next_tab(&mut app.model, &mut app.ui);
-        assert!(app.ui.is_convoys, "expected Convoys tab after next from config");
-        assert!(!app.ui.is_config);
-    }
-
-    #[test]
-    fn next_tab_from_convoys_goes_to_first_repo() {
-        let mut app = stub_app_with_repos(3);
-        let mut tabs = Tabs::new();
-        app.ui.is_convoys = true;
-        tabs.next_tab(&mut app.model, &mut app.ui);
-        assert_eq!(app.model.active_repo, 0);
-        assert!(!app.ui.is_convoys);
-        assert!(!app.ui.is_config);
-    }
-
-    #[test]
-    fn next_tab_noop_with_no_repos() {
-        let mut app = stub_app_with_repos(0);
-        let mut tabs = Tabs::new();
-        tabs.next_tab(&mut app.model, &mut app.ui);
-    }
-
-    #[test]
-    fn prev_tab_decrements_active_repo() {
-        let mut app = stub_app_with_repos(3);
-        let mut tabs = Tabs::new();
-        tabs.switch_to(2, &mut app.model, &mut app.ui);
-        tabs.prev_tab(&mut app.model, &mut app.ui);
-        assert_eq!(app.model.active_repo, 1);
-    }
-
-    #[test]
-    fn prev_tab_wraps_to_convoys() {
-        let mut app = stub_app_with_repos(2);
-        let mut tabs = Tabs::new();
-        // active_repo is 0 — prev goes to Convoys, not Config directly
-        tabs.prev_tab(&mut app.model, &mut app.ui);
-        assert!(app.ui.is_convoys);
-        assert!(!app.ui.is_config);
-    }
-
-    #[test]
-    fn prev_tab_from_convoys_wraps_to_config() {
-        let mut app = stub_app_with_repos(2);
-        let mut tabs = Tabs::new();
-        app.ui.is_convoys = true;
-        app.ui.is_config = false;
-        tabs.prev_tab(&mut app.model, &mut app.ui);
-        assert!(app.ui.is_config);
-        assert!(!app.ui.is_convoys);
-    }
-
-    #[test]
-    fn prev_tab_from_config_goes_to_last() {
-        let mut app = stub_app_with_repos(3);
-        let mut tabs = Tabs::new();
-        app.ui.is_config = true;
-        tabs.prev_tab(&mut app.model, &mut app.ui);
-        assert_eq!(app.model.active_repo, 2);
-        assert!(!app.ui.is_config);
-    }
-
-    #[test]
-    fn prev_tab_noop_with_no_repos() {
-        let mut app = stub_app_with_repos(0);
-        let mut tabs = Tabs::new();
-        tabs.prev_tab(&mut app.model, &mut app.ui);
-    }
-
-    // ── switch_to ──
-
-    #[test]
-    fn switch_to_clears_unseen_changes() {
-        let mut app = stub_app_with_repos(2);
-        let tabs = Tabs::new();
-        let key = app.model.repo_order[1].clone();
-        app.model.repos.get_mut(&key).expect("repo model").has_unseen_changes = true;
-        tabs.switch_to(1, &mut app.model, &mut app.ui);
-        assert!(!app.model.repos[&key].has_unseen_changes);
-    }
-
-    #[test]
-    fn switch_to_sets_active_repo_and_mode() {
-        let mut app = stub_app_with_repos(3);
-        let tabs = Tabs::new();
-        app.ui.is_config = true;
-        tabs.switch_to(2, &mut app.model, &mut app.ui);
-        assert_eq!(app.model.active_repo, 2);
-        assert!(!app.ui.is_config);
-    }
-
-    #[test]
-    fn switch_to_noop_for_out_of_range() {
-        let mut app = stub_app_with_repos(2);
-        let tabs = Tabs::new();
-        tabs.switch_to(5, &mut app.model, &mut app.ui);
-        assert_eq!(app.model.active_repo, 0);
-    }
-
-    // ── move_tab ──
-
-    #[test]
-    fn move_tab_swaps_repos_forward() {
-        let mut app = stub_app_with_repos(3);
-        let tabs = Tabs::new();
-        assert_eq!(app.model.active_repo, 0);
-        let path0 = app.model.repo_order[0].clone();
-        let path1 = app.model.repo_order[1].clone();
-        let result = tabs.move_tab(1, &mut app.model);
-        assert!(result);
-        assert_eq!(app.model.active_repo, 1);
-        assert_eq!(app.model.repo_order[0], path1);
-        assert_eq!(app.model.repo_order[1], path0);
-    }
-
-    #[test]
-    fn move_tab_swaps_repos_backward() {
-        let mut app = stub_app_with_repos(3);
-        let tabs = Tabs::new();
-        tabs.switch_to(2, &mut app.model, &mut app.ui);
-        let path1 = app.model.repo_order[1].clone();
-        let path2 = app.model.repo_order[2].clone();
-        let result = tabs.move_tab(-1, &mut app.model);
-        assert!(result);
-        assert_eq!(app.model.active_repo, 1);
-        assert_eq!(app.model.repo_order[1], path2);
-        assert_eq!(app.model.repo_order[2], path1);
-    }
-
-    #[test]
-    fn move_tab_returns_false_at_boundary() {
-        let mut app = stub_app_with_repos(3);
-        let tabs = Tabs::new();
-        assert!(!tabs.move_tab(-1, &mut app.model));
-        tabs.switch_to(2, &mut app.model, &mut app.ui);
-        assert!(!tabs.move_tab(1, &mut app.model));
-    }
-
-    #[test]
-    fn move_tab_returns_false_with_single_repo() {
+    fn drag_never_swaps_with_the_pinned_overview() {
         let mut app = stub_app_with_repos(1);
-        let tabs = Tabs::new();
-        assert!(!tabs.move_tab(1, &mut app.model));
-        assert!(!tabs.move_tab(-1, &mut app.model));
+        let mut tabs = Tabs::new();
+        tabs.tab_areas.insert(TabId::View(0), Rect::new(0, 0, 10, 1));
+        tabs.drag.dragging_tab = Some(2);
+        tabs.drag.active = true;
+        assert!(!tabs.handle_drag(5, 0, &mut app.views));
+    }
+
+    // ── Labels ──
+
+    #[test]
+    fn label_override_wins_over_kind_default() {
+        let app = stub_app_with_repos(1);
+        let view = app.views.get(1).expect("convoys tab").clone();
+        assert_eq!(tab_label(&view, &app.model), " 🚢 convoys ");
+        let renamed = OpenView { label_override: Some("mine".to_string()), ..view };
+        assert_eq!(tab_label(&renamed, &app.model), " mine ");
+    }
+
+    #[test]
+    fn dangling_repo_view_labels_loudly() {
+        let app = stub_app_with_repos(0);
+        let address: ViewAddress = "repo/github.com/gone/repo".parse().expect("valid");
+        let mut views = OpenViews::from_entries(vec![]);
+        views.open_or_focus(address);
+        let view = views.active().clone();
+        assert_eq!(tab_label(&view, &app.model), "⚠ repo");
     }
 }

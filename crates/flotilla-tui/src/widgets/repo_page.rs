@@ -237,14 +237,14 @@ impl RepoPage {
 
     fn dismiss(&mut self, ctx: &mut WidgetContext) -> Outcome {
         // Cancellation takes priority while a command is running for this repo.
-        let active_repo = &ctx.repo_order[ctx.active_repo];
+        let active_repo = &self.repo_identity;
         if let Some(command_id) = ctx.in_flight.iter().filter(|(_, cmd)| &cmd.repo_identity == active_repo).map(|(id, _)| *id).max() {
             ctx.app_actions.push(AppAction::CancelCommand(command_id));
             return Outcome::Consumed;
         }
 
         if self.active_search_query.is_some() {
-            let repo_identity = ctx.repo_order[ctx.active_repo].clone();
+            let repo_identity = self.repo_identity.clone();
             self.active_search_query = None;
             ctx.app_actions.push(AppAction::ClearSearchQuery { repo: repo_identity });
         } else if self.show_providers {
@@ -348,73 +348,63 @@ impl InteractiveWidget for RepoPage {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if !*ctx.is_config {
-                    let x = mouse.column;
-                    let y = mouse.row;
+                let x = mouse.column;
+                let y = mouse.row;
 
-                    // Double-click detection using owned table state
-                    if let Some(hit) = self.table.row_at_mouse(x, y) {
-                        let now = Instant::now();
-                        let is_double_click = self.double_click.last_time.map(|t| now.duration_since(t).as_millis() < 400).unwrap_or(false)
-                            && self.double_click.last_selectable_idx == Some(hit);
+                // Double-click detection using owned table state
+                if let Some(hit) = self.table.row_at_mouse(x, y) {
+                    let now = Instant::now();
+                    let is_double_click = self.double_click.last_time.map(|t| now.duration_since(t).as_millis() < 400).unwrap_or(false)
+                        && self.double_click.last_selectable_idx == Some(hit);
 
-                        if is_double_click {
-                            // Select the row, then trigger double-click action
-                            self.table.select_by_mouse(hit.0, hit.1);
-                            ctx.app_actions.push(AppAction::ActionEnter);
-                            self.double_click.last_time = None;
-                            self.double_click.last_selectable_idx = None;
-                            return Outcome::Consumed;
-                        }
-
-                        self.double_click.last_time = Some(now);
-                        self.double_click.last_selectable_idx = Some(hit);
-                    }
-
-                    // Gear icon click (still needs ctx for the AppAction)
-                    if let Some(gear_area) = self.table.gear_area {
-                        if x >= gear_area.x && x < gear_area.x + gear_area.width && y >= gear_area.y && y < gear_area.y + gear_area.height {
-                            ctx.app_actions.push(AppAction::ToggleProviders);
-                            return Outcome::Consumed;
-                        }
-                    }
-
-                    // Single click: select row using owned state
-                    if let Some(hit) = self.table.row_at_mouse(x, y) {
+                    if is_double_click {
+                        // Select the row, then trigger double-click action
                         self.table.select_by_mouse(hit.0, hit.1);
+                        ctx.app_actions.push(AppAction::ActionEnter);
+                        self.double_click.last_time = None;
+                        self.double_click.last_selectable_idx = None;
                         return Outcome::Consumed;
                     }
+
+                    self.double_click.last_time = Some(now);
+                    self.double_click.last_selectable_idx = Some(hit);
+                }
+
+                // Gear icon click (still needs ctx for the AppAction)
+                if let Some(gear_area) = self.table.gear_area {
+                    if x >= gear_area.x && x < gear_area.x + gear_area.width && y >= gear_area.y && y < gear_area.y + gear_area.height {
+                        ctx.app_actions.push(AppAction::ToggleProviders);
+                        return Outcome::Consumed;
+                    }
+                }
+
+                // Single click: select row using owned state
+                if let Some(hit) = self.table.row_at_mouse(x, y) {
+                    self.table.select_by_mouse(hit.0, hit.1);
+                    return Outcome::Consumed;
                 }
 
                 Outcome::Ignored
             }
 
             MouseEventKind::Down(MouseButton::Right) => {
-                if !*ctx.is_config {
-                    // Right-click: select row using owned state, then open action menu
-                    if let Some(hit) = self.table.row_at_mouse(mouse.column, mouse.row) {
-                        self.table.select_by_mouse(hit.0, hit.1);
-                        ctx.app_actions.push(AppAction::OpenActionMenu);
-                        return Outcome::Consumed;
-                    }
+                // Right-click: select row using owned state, then open action menu
+                if let Some(hit) = self.table.row_at_mouse(mouse.column, mouse.row) {
+                    self.table.select_by_mouse(hit.0, hit.1);
+                    ctx.app_actions.push(AppAction::OpenActionMenu);
+                    return Outcome::Consumed;
                 }
                 Outcome::Ignored
             }
 
             MouseEventKind::ScrollDown => {
-                if !*ctx.is_config {
-                    self.table.select_next();
-                    return Outcome::Consumed;
-                }
-                Outcome::Ignored
+                self.table.select_next();
+                Outcome::Consumed
             }
 
             MouseEventKind::ScrollUp => {
-                if !*ctx.is_config {
-                    self.table.select_prev();
-                    return Outcome::Consumed;
-                }
-                Outcome::Ignored
+                self.table.select_prev();
+                Outcome::Consumed
             }
 
             _ => Outcome::Ignored,
