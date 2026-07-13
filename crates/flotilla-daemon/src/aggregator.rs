@@ -11,18 +11,20 @@ use flotilla_protocol::{
     DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
-    ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation, Resource, ResourceError,
+    ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart,
     WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
 type PresentationKey = (String, String, String);
+type SessionKey = (String, String);
 
 #[derive(bon::Builder)]
 pub struct AggregatorResolvers {
     durable_convoys: TypedResolver<Convoy>,
+    durable_environments: TypedResolver<Environment>,
     durable_presentations: TypedResolver<Presentation>,
     durable_sessions: TypedResolver<TerminalSession>,
     observed_convoys: TypedResolver<Convoy>,
@@ -35,6 +37,7 @@ pub struct Aggregator {
     state: AggregatorProjectionState,
     local_host: HostName,
     presentation_workspaces: HashMap<PresentationKey, String>,
+    terminal_sessions: HashMap<SessionKey, ResourceObject<TerminalSession>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
     attach_resolver: Option<Arc<InProcessDaemon>>,
@@ -47,6 +50,7 @@ impl Aggregator {
             state,
             local_host,
             presentation_workspaces: HashMap::new(),
+            terminal_sessions: HashMap::new(),
             bootstrapping: false,
             emitted_queries: HashSet::new(),
             attach_resolver: None,
@@ -66,6 +70,7 @@ impl Aggregator {
     ) -> Result<(), ResourceError> {
         let AggregatorResolvers {
             durable_convoys,
+            durable_environments,
             durable_presentations,
             durable_sessions,
             observed_convoys,
@@ -88,6 +93,7 @@ impl Aggregator {
             }
         }
         let mut durable_convoy_stream = self.list_and_watch_convoys(durable_convoys).await?;
+        let mut durable_environment_stream = self.list_and_watch_environments(durable_environments).await?;
         let mut durable_presentation_stream = self.list_and_watch_presentations(durable_presentations).await?;
         let mut durable_session_stream = self.list_and_watch_sessions(durable_sessions).await?;
         let mut observed_convoy_stream = self.list_and_watch_convoys(observed_convoys).await?;
@@ -104,6 +110,11 @@ impl Aggregator {
                     Some(Ok(event)) => self.apply_convoy_event(event).await,
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
+                },
+                event = durable_environment_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_environment_event(event).await,
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable environment watch ended")),
                 },
                 event = durable_presentation_stream.next() => match event {
                     Some(Ok(event)) => self.apply_presentation_event(event).await,
@@ -165,6 +176,14 @@ impl Aggregator {
             self.apply_presentation_event(WatchEvent::Added(presentation)).await;
         }
         resolver.watch(start).await
+    }
+
+    async fn list_and_watch_environments(
+        &self,
+        resolver: TypedResolver<Environment>,
+    ) -> Result<flotilla_resources::WatchStream<Environment>, ResourceError> {
+        let listed = resolver.list().await?;
+        resolver.watch(watch_start(&listed)).await
     }
 
     async fn list_and_watch_sessions(
@@ -272,6 +291,7 @@ impl Aggregator {
     pub async fn apply_session_event(&mut self, event: WatchEvent<TerminalSession>) {
         match event {
             WatchEvent::Added(session) | WatchEvent::Modified(session) => {
+                self.terminal_sessions.insert((session.metadata.namespace.clone(), session.metadata.name.clone()), session.clone());
                 if let Some(row) = self.summarize_session(&session).await {
                     let reference = row.resource.clone();
                     let result_set = {
@@ -293,7 +313,27 @@ impl Aggregator {
                     self.remove_local_session(&session).await;
                 }
             }
-            WatchEvent::Deleted(session) => self.remove_local_session(&session).await,
+            WatchEvent::Deleted(session) => {
+                self.terminal_sessions.remove(&(session.metadata.namespace.clone(), session.metadata.name.clone()));
+                self.remove_local_session(&session).await;
+            }
+        }
+    }
+
+    async fn apply_environment_event(&mut self, event: WatchEvent<Environment>) {
+        let environment = match event {
+            WatchEvent::Added(environment) | WatchEvent::Modified(environment) | WatchEvent::Deleted(environment) => environment,
+        };
+        let namespace = &environment.metadata.namespace;
+        let name = &environment.metadata.name;
+        let affected = self
+            .terminal_sessions
+            .iter()
+            .filter(|((session_namespace, _), session)| session_namespace == namespace && session.spec.env_ref == *name)
+            .map(|(_, session)| session.clone())
+            .collect::<Vec<_>>();
+        for session in affected {
+            self.apply_session_event(WatchEvent::Modified(session)).await;
         }
     }
 
@@ -666,6 +706,7 @@ mod tests {
             .run(
                 AggregatorResolvers::builder()
                     .durable_convoys(durable.clone().using::<Convoy>("flotilla"))
+                    .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                     .durable_sessions(durable.using::<TerminalSession>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))

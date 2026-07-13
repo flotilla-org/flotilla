@@ -130,12 +130,13 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     let mut rx = daemon.subscribe();
     let host_id = daemon.local_host_id().expect("local host id");
     let environment_name = format!("host-direct-{host_id}");
-    backend
-        .using::<Environment>("flotilla")
-        .create(&InputMeta::builder().name(environment_name.clone()).build(), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
-            docker: None,
-        })
+    let environment_spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
+        docker: None,
+    };
+    let environments = backend.using::<Environment>("flotilla");
+    environments
+        .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
         .await
         .expect("create attach environment");
     let sessions = daemon.observed_resource_backend().using::<TerminalSession>("flotilla");
@@ -197,7 +198,7 @@ async fn running_convoyless_session_emits_attachable_session_row() {
                 .labels(BTreeMap::from([(REPO_LABEL.to_string(), "flotilla-org/flotilla".to_string())]))
                 .build(),
             &TerminalSessionSpec {
-                env_ref: environment_name,
+                env_ref: environment_name.clone(),
                 role: "yeoman".to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
@@ -268,6 +269,57 @@ async fn running_convoyless_session_emits_attachable_session_row() {
         .map(session_rows)
         .expect("local sessions result set");
     assert_eq!(local_sessions.len(), 2);
+
+    environments.delete(&environment_name).await.expect("delete attach environment");
+    let unavailable = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                    if let Some(row) = delta
+                        .changed
+                        .as_sessions()
+                        .expect("session rows")
+                        .iter()
+                        .find(|row| row.name == "terminal-yeoman" && row.attach.is_none())
+                    {
+                        return row.clone();
+                    }
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for attach capability removal");
+    assert_eq!(unavailable.attach, None);
+
+    environments
+        .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
+        .await
+        .expect("recreate attach environment");
+    let available = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                    if let Some(row) = delta
+                        .changed
+                        .as_sessions()
+                        .expect("session rows")
+                        .iter()
+                        .find(|row| row.name == "terminal-yeoman" && row.attach.as_deref() == Some("terminal-yeoman"))
+                    {
+                        return row.clone();
+                    }
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for attach capability restoration");
+    assert_eq!(available.attach.as_deref(), Some("terminal-yeoman"));
 
     let running = sessions.get("terminal-yeoman").await.expect("running terminal session");
     sessions
