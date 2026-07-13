@@ -168,8 +168,8 @@ async fn x_then_enter_completes_work_via_palette() {
     let convoys = backend.using::<Convoy>("flotilla");
     convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix")).await.expect("create convoy");
 
-    let mut tasks = BTreeMap::new();
-    tasks.insert("implement".to_string(), WorkState {
+    let mut work = BTreeMap::new();
+    work.insert("implement".to_string(), WorkState {
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
@@ -186,7 +186,7 @@ async fn x_then_enter_completes_work_via_palette() {
             snapshot,
             "review-and-fix".into(),
             BTreeMap::new(),
-            tasks,
+            work,
             BTreeMap::new(),
             ConvoyPhase::Active,
             None,
@@ -195,7 +195,7 @@ async fn x_then_enter_completes_work_via_palette() {
     .await
     .expect("bootstrap convoy");
 
-    // Drain events until the convoy's task appears in the App.
+    // Drain events until the convoy's vessel appears in the App.
     let drain = |app: &mut App, daemon_rx: &mut tokio::sync::broadcast::Receiver<flotilla_protocol::DaemonEvent>| loop {
         match daemon_rx.try_recv() {
             Ok(event) => app.handle_daemon_event(event),
@@ -212,7 +212,7 @@ async fn x_then_enter_completes_work_via_palette() {
             break;
         }
         if Instant::now() >= deadline {
-            panic!("timed out waiting for convoy task to appear in app: {:?}", app.convoys("flotilla"));
+            panic!("timed out waiting for convoy vessel to appear in app: {:?}", app.convoys("flotilla"));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -244,14 +244,14 @@ async fn x_then_enter_completes_work_via_palette() {
     loop {
         drain(&mut app, &mut daemon_rx);
         if let Some(c) = app.convoys("flotilla").first() {
-            if let Some(t) = c.vessels.iter().find(|t| t.name == "implement") {
-                if t.phase == flotilla_tui::convoy_model::WorkPhase::Complete {
+            if let Some(vessel) = c.vessels.iter().find(|vessel| vessel.name == "implement") {
+                if vessel.phase == flotilla_tui::convoy_model::WorkPhase::Complete {
                     break;
                 }
             }
         }
         if Instant::now() >= deadline {
-            panic!("timed out: task did not transition to Completed in app: {:?}", app.convoys("flotilla"));
+            panic!("timed out: work did not transition to Completed in app: {:?}", app.convoys("flotilla"));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

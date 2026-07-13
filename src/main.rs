@@ -70,7 +70,7 @@ enum SubCommand {
     Ls,
     /// Attach to a running convoy crew session
     Attach {
-        /// Convoy, task, role, terminal session, or unique prefix
+        /// Convoy, vessel, role, terminal session, or unique prefix
         reference: String,
     },
     /// Emit this host's store-backed fleet replica snapshot

@@ -159,8 +159,8 @@ pub static BINDINGS: &[Binding] = &[
     // ── Convoys (outer focus: convoy list) ──
     // j/k/up/down come from Shared (SelectNext/SelectPrev). enter comes from Shared (Confirm).
     // l and right are vim-style and arrow-style synonyms for "drill into the vessel tree" — the
-    // app dispatches Confirm on the Convoys list to enter task focus.
-    h(BindingModeId::Convoys, "l", Action::Confirm, "Tasks"),
+    // app dispatches Confirm on the Convoys list to enter vessel focus.
+    h(BindingModeId::Convoys, "l", Action::Confirm, "Vessels"),
     b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),

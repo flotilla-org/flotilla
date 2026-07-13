@@ -14,7 +14,7 @@ use flotilla_resources::{
     controller::{Actuation, Reconciler},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyPhase, ConvoyReconciler,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec,
     ResourceBackend, ResourceError, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
     TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
@@ -151,7 +151,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     "workspace-docker-worktree",
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
-        .docker_per_task(DockerPerTaskPlacementPolicySpec {
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
             default_cwd: None,
@@ -176,7 +176,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     "workspace-docker-fresh",
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
-        .docker_per_task(DockerPerTaskPlacementPolicySpec {
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
             default_cwd: Some("/app".to_string()),

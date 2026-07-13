@@ -12,7 +12,7 @@ pub struct PlacementPolicySpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_direct: Option<HostDirectPlacementPolicySpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docker_per_task: Option<DockerPerTaskPlacementPolicySpec>,
+    pub docker_per_vessel: Option<DockerPerVesselPlacementPolicySpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +28,7 @@ pub enum HostDirectPlacementPolicyCheckout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DockerPerTaskPlacementPolicySpec {
+pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     pub image: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

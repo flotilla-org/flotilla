@@ -1566,25 +1566,25 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
     let vessels = convoy
         .vessels
         .into_iter()
-        .map(|task| {
-            let crew = task
+        .map(|vessel| {
+            let crew = vessel
                 .crew
                 .into_iter()
                 .map(|process| CrewMemberSummary { role: process.role, command_preview: process.command_preview })
                 .collect();
             VesselRow::builder()
-                .resource(resource.subresource(format!("vessels/{}", task.name)))
-                .name(&task.name)
-                .phase(wire_work_phase(task.phase))
+                .resource(resource.subresource(format!("vessels/{}", vessel.name)))
+                .name(&vessel.name)
+                .phase(wire_work_phase(vessel.phase))
                 .crew(crew)
-                .maybe_ready_at(task.ready_at)
-                .maybe_started_at(task.started_at)
-                .maybe_finished_at(task.finished_at)
-                .maybe_message(task.message)
-                .depends_on(task.depends_on)
-                .host(task.host.unwrap_or_else(HostName::local))
-                .maybe_attach(task.workspace_ref)
-                .complete_work(task.completion_target.is_some())
+                .maybe_ready_at(vessel.ready_at)
+                .maybe_started_at(vessel.started_at)
+                .maybe_finished_at(vessel.finished_at)
+                .maybe_message(vessel.message)
+                .depends_on(vessel.depends_on)
+                .host(vessel.host.unwrap_or_else(HostName::local))
+                .maybe_attach(vessel.workspace_ref)
+                .complete_work(vessel.completion_target.is_some())
                 .build()
         })
         .collect();
@@ -2151,14 +2151,14 @@ fn move_tab_on_convoys_tab_moves_the_convoys_tab() {
     assert_eq!(saved[2].address, convoys.to_string());
 }
 
-// -- Convoy task selection state --
+// -- Convoy vessel selection state --
 
-fn convoy_with_vessels(name: &str, tasks: &[&str]) -> crate::convoy_model::ConvoySummary {
+fn convoy_with_vessels(name: &str, vessel_names: &[&str]) -> crate::convoy_model::ConvoySummary {
     let mut c = test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false);
-    c.vessels = tasks
+    c.vessels = vessel_names
         .iter()
-        .map(|t| crate::convoy_model::VesselSummary {
-            name: (*t).into(),
+        .map(|vessel_name| crate::convoy_model::VesselSummary {
+            name: (*vessel_name).into(),
             depends_on: vec![],
             phase: crate::convoy_model::WorkPhase::Pending,
             crew: vec![],
@@ -2167,7 +2167,7 @@ fn convoy_with_vessels(name: &str, tasks: &[&str]) -> crate::convoy_model::Convo
             workspace_ref: None,
             completion_target: Some(crate::convoy_model::WorkCompletionTarget {
                 convoy: name.to_string(),
-                vessel: (*t).to_string(),
+                vessel: (*vessel_name).to_string(),
                 host: HostName::local(),
             }),
             ready_at: None,
@@ -2184,49 +2184,49 @@ fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::con
 }
 
 #[test]
-fn enter_tasks_focus_default_selects_first_task() {
+fn enter_vessels_focus_default_selects_first_vessel() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
     app.switch_tab(1);
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-    assert_eq!(app.selected_convoy_task(), None);
+    assert_eq!(app.selected_convoy_vessel(), None);
 
     app.enter_convoy_vessels_focus(&test_convoy_scope());
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-    assert_eq!(app.selected_convoy_task(), Some("t1"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
 }
 
 #[test]
-fn enter_tasks_focus_noop_on_empty_tasks() {
+fn enter_vessels_focus_noop_on_empty_vessels() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &[])]))));
     app.switch_tab(1);
 
     app.enter_convoy_vessels_focus(&test_convoy_scope());
 
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "focus should stay on List when convoy has no tasks");
-    assert_eq!(app.selected_convoy_task(), None);
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "focus should stay on List when convoy has no vessels");
+    assert_eq!(app.selected_convoy_vessel(), None);
 }
 
 #[test]
-fn convoy_vessels_select_delta_clamps_within_tasks() {
+fn convoy_vessels_select_delta_clamps_within_vessels() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
     app.switch_tab(1);
     app.enter_convoy_vessels_focus(&test_convoy_scope());
 
     app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
     app.convoy_vessels_select_delta(&test_convoy_scope(), 5);
-    assert_eq!(app.selected_convoy_task(), Some("t3"), "clamps at last task");
+    assert_eq!(app.selected_convoy_vessel(), Some("t3"), "clamps at last vessel");
     app.convoy_vessels_select_delta(&test_convoy_scope(), -10);
-    assert_eq!(app.selected_convoy_task(), Some("t1"), "clamps at first task");
+    assert_eq!(app.selected_convoy_vessel(), Some("t1"), "clamps at first vessel");
 }
 
 #[test]
-fn switching_convoys_resets_task_state_and_focus() {
+fn switching_convoys_resets_vessel_state_and_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![
         convoy_with_vessels("alpha", &["a1"]),
@@ -2240,7 +2240,7 @@ fn switching_convoys_resets_task_state_and_focus() {
 
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("beta"));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "switching convoy snaps focus back to List");
-    assert_eq!(app.selected_convoy_task(), None, "switching convoy clears task selection");
+    assert_eq!(app.selected_convoy_vessel(), None, "switching convoy clears vessel selection");
 }
 
 #[test]
@@ -2250,7 +2250,7 @@ fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
     app.switch_tab(1);
     app.enter_convoy_vessels_focus(&test_convoy_scope());
     app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
     // Remove t2 via delta.
@@ -2263,16 +2263,16 @@ fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
         removed: vec![],
     })));
 
-    assert_eq!(app.selected_convoy_task(), None, "selected_vessel is reset when it disappears from the convoy");
+    assert_eq!(app.selected_convoy_vessel(), None, "selected_vessel is reset when it disappears from the convoy");
     assert_eq!(
         app.convoys_focus(),
         crate::app::ConvoysFocus::List,
-        "focus snaps back to List so the task pane isn't focused with no row selected"
+        "focus snaps back to List so the vessel pane isn't focused with no row selected"
     );
 }
 
 #[test]
-fn exit_tasks_focus_keeps_selected_vessel() {
+fn exit_vessels_focus_keeps_selected_vessel() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
     app.switch_tab(1);
@@ -2282,7 +2282,7 @@ fn exit_tasks_focus_keeps_selected_vessel() {
     app.exit_convoy_vessels_focus();
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-    assert_eq!(app.selected_convoy_task(), Some("t2"), "selected_vessel survives exit so re-entering picks up the same row");
+    assert_eq!(app.selected_convoy_vessel(), Some("t2"), "selected_vessel survives exit so re-entering picks up the same row");
 }
 
 #[test]
@@ -2294,14 +2294,14 @@ fn l_drills_in_then_esc_returns_to_list_focus() {
 
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-    assert_eq!(app.selected_convoy_task(), Some("t1"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
 
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
 }
 
 #[test]
-fn h_returns_from_tasks_to_list_focus() {
+fn h_returns_from_vessels_to_list_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
     app.switch_tab(1);
@@ -2314,7 +2314,7 @@ fn h_returns_from_tasks_to_list_focus() {
 }
 
 #[test]
-fn enter_also_drills_into_tasks_focus() {
+fn enter_also_drills_into_vessels_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
     app.switch_tab(1);
@@ -2337,49 +2337,49 @@ fn right_and_left_arrows_navigate_focus() {
 }
 
 #[test]
-fn arrow_keys_route_task_navigation_when_tasks_focused() {
+fn arrow_keys_route_vessel_navigation_when_vessels_focused() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Right));
 
     app.handle_key(key(KeyCode::Down));
-    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
     app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.selected_convoy_task(), Some("t1"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
 }
 
 #[test]
-fn jk_routes_to_task_navigation_when_tasks_focused() {
+fn jk_routes_to_vessel_navigation_when_vessels_focused() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
     app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("t1"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
 
     app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
 
     app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_task(), Some("t3"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t3"));
 
     app.handle_key(key(KeyCode::Char('k')));
-    assert_eq!(app.selected_convoy_task(), Some("t2"));
+    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
 }
 
 #[test]
-fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
+fn x_in_vessels_focus_opens_palette_with_complete_prefill() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement", "review"])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_task(), Some("review"));
+    assert_eq!(app.selected_convoy_vessel(), Some("review"));
 
     app.handle_key(key(KeyCode::Char('x')));
 
-    assert!(app.screen.has_modal(), "pressing 'x' on a task should open the command palette modal");
+    assert!(app.screen.has_modal(), "pressing 'x' on a vessel should open the command palette modal");
     let palette = app
         .screen
         .modal_stack
@@ -2397,7 +2397,7 @@ fn x_prefill_quotes_vessel_names_with_whitespace() {
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["fix my bug"])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("fix my bug"));
+    assert_eq!(app.selected_convoy_vessel(), Some("fix my bug"));
 
     app.handle_key(key(KeyCode::Char('x')));
     let palette = app
@@ -2412,7 +2412,7 @@ fn x_prefill_quotes_vessel_names_with_whitespace() {
 }
 
 #[test]
-fn x_then_enter_dispatches_convoy_task_complete() {
+fn x_then_enter_dispatches_convoy_work_complete() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement"])]))));
     app.switch_tab(1);
@@ -2432,7 +2432,7 @@ fn x_then_enter_dispatches_convoy_task_complete() {
 }
 
 #[test]
-fn x_then_enter_routes_remote_convoy_task_complete_to_its_host() {
+fn x_then_enter_routes_remote_convoy_work_complete_to_its_host() {
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
     let mut convoy = convoy_with_vessels("remote-convoy", &["implement"]);
@@ -2477,23 +2477,23 @@ fn x_is_unavailable_without_complete_intent() {
     assert_eq!(app.model.status_message.as_deref(), Some("completion unavailable for vessel 'implement'"));
 }
 
-// -- Convoy task attach (`a`) --
+// -- Convoy vessel attach (`a`) --
 
-fn convoy_with_vessel_refs(name: &str, tasks: &[(&str, Option<&str>)]) -> crate::convoy_model::ConvoySummary {
+fn convoy_with_vessel_refs(name: &str, vessel_refs: &[(&str, Option<&str>)]) -> crate::convoy_model::ConvoySummary {
     let mut c = test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false);
-    c.vessels = tasks
+    c.vessels = vessel_refs
         .iter()
-        .map(|(t, ws)| crate::convoy_model::VesselSummary {
-            name: (*t).into(),
+        .map(|(vessel_name, workspace_ref)| crate::convoy_model::VesselSummary {
+            name: (*vessel_name).into(),
             depends_on: vec![],
             phase: crate::convoy_model::WorkPhase::Running,
             crew: vec![],
             host: None,
             checkout: None,
-            workspace_ref: ws.map(str::to_string),
+            workspace_ref: workspace_ref.map(str::to_string),
             completion_target: Some(crate::convoy_model::WorkCompletionTarget {
                 convoy: name.to_string(),
-                vessel: (*t).to_string(),
+                vessel: (*vessel_name).to_string(),
                 host: HostName::local(),
             }),
             ready_at: None,
@@ -2506,22 +2506,22 @@ fn convoy_with_vessel_refs(name: &str, tasks: &[(&str, Option<&str>)]) -> crate:
 }
 
 #[test]
-fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
+fn a_on_vessel_with_workspace_ref_dispatches_select_workspace() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[(
         "implement",
-        Some("ws://task-a-implement"),
+        Some("ws://vessel-a-implement"),
     )])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("implement"));
+    assert_eq!(app.selected_convoy_vessel(), Some("implement"));
 
     app.handle_key(key(KeyCode::Char('a')));
 
     let cmd = app.proto_commands.take_next().expect("expected a SelectWorkspace command");
     match &cmd.0.action {
         flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => {
-            assert_eq!(ws_ref, "ws://task-a-implement");
+            assert_eq!(ws_ref, "ws://vessel-a-implement");
         }
         other => panic!("expected SelectWorkspace, got {other:?}"),
     }
@@ -2529,7 +2529,7 @@ fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
 }
 
 #[test]
-fn a_on_remote_task_routes_select_workspace_to_its_host() {
+fn a_on_remote_vessel_routes_select_workspace_to_its_host() {
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
     let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
@@ -2544,7 +2544,7 @@ fn a_on_remote_task_routes_select_workspace_to_its_host() {
 }
 
 #[test]
-fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
+fn a_on_unknown_remote_vessel_does_not_fall_back_to_local_execution() {
     let mut app = stub_app();
     let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
     convoy.vessels[0].host = Some(HostName::new("missing-host"));
@@ -2558,23 +2558,23 @@ fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
 }
 
 #[test]
-fn a_on_task_without_workspace_ref_sets_status_message() {
+fn a_on_vessel_without_workspace_ref_sets_status_message() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[("implement", None)])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("implement"));
+    assert_eq!(app.selected_convoy_vessel(), Some("implement"));
 
     app.handle_key(key(KeyCode::Char('a')));
 
     assert!(app.proto_commands.take_next().is_none(), "no command dispatched when workspace_ref is None");
     let msg = app.model.status_message.as_deref().expect("expected a transient status message");
-    assert!(msg.contains("implement"), "status message should reference the task name, got: {msg}");
+    assert!(msg.contains("implement"), "status message should reference the vessel name, got: {msg}");
     assert!(msg.contains("no workspace yet"), "status message should explain no workspace yet, got: {msg}");
 }
 
 #[test]
-fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
+fn a_on_two_vessel_convoy_dispatches_correct_ws_ref_per_selection() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[
         ("implement", Some("ws://impl")),
@@ -2582,7 +2582,7 @@ fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
     ])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_task(), Some("implement"));
+    assert_eq!(app.selected_convoy_vessel(), Some("implement"));
 
     app.handle_key(key(KeyCode::Char('a')));
     let first = app.proto_commands.take_next().expect("first dispatch");
@@ -2592,7 +2592,7 @@ fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
     }
 
     app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_task(), Some("review"));
+    assert_eq!(app.selected_convoy_vessel(), Some("review"));
     app.handle_key(key(KeyCode::Char('a')));
     let second = app.proto_commands.take_next().expect("second dispatch");
     match &second.0.action {
