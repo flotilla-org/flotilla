@@ -349,6 +349,81 @@ impl PresentationManager for CountingWorkspaceManager {
     }
 }
 
+struct BarrierCheckoutManager(Arc<tokio::sync::Barrier>);
+
+#[async_trait]
+impl CheckoutManager for BarrierCheckoutManager {
+    async fn validate_target(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _intent: flotilla_protocol::CheckoutIntent,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn list_checkouts(&self, _repo_root: &ExecutionEnvironmentPath) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        self.0.wait().await;
+        Ok(vec![])
+    }
+
+    async fn create_checkout(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+        _branch: &str,
+        _create_branch: bool,
+    ) -> Result<(ExecutionEnvironmentPath, Checkout), String> {
+        Err("not implemented".to_string())
+    }
+
+    async fn remove_checkout(&self, _repo_root: &ExecutionEnvironmentPath, _branch: &str) -> Result<(), String> {
+        Err("not implemented".to_string())
+    }
+}
+
+struct BarrierCloudAgent(Arc<tokio::sync::Barrier>);
+
+#[async_trait]
+impl CloudAgentService for BarrierCloudAgent {
+    async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
+        self.0.wait().await;
+        Ok(vec![])
+    }
+
+    async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn full_refresh_runs_fast_and_slow_tiers_concurrently() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut registry = ProviderRegistry::new();
+    registry.checkout_managers.insert("checkout", desc("Checkout"), Arc::new(BarrierCheckoutManager(Arc::clone(&barrier))));
+    registry.cloud_agents.insert("cloud", desc("Cloud"), Arc::new(BarrierCloudAgent(Arc::clone(&barrier))));
+
+    let handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        Duration::from_secs(60),
+    );
+    let mut rx = handle.snapshot_rx.clone();
+
+    tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+        .await
+        .expect("fast and slow providers should both start before either finishes");
+    wait_for_snapshot(&mut rx).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn periodic_refresh_uses_fast_and_slow_provider_cadences() {
     let cloud_agent = Arc::new(CountingCloudAgent(AtomicUsize::new(0)));

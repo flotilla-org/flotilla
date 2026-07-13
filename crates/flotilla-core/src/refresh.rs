@@ -280,18 +280,47 @@ async fn run_refresh_cycle(
     attachable_store: &SharedAttachableStore,
     agent_state_store: &crate::agents::SharedAgentStateStore,
 ) -> Arc<RefreshSnapshot> {
-    if matches!(kind, RefreshKind::Full | RefreshKind::Fast) {
-        *fast_errors =
-            refresh_fast_providers(provider_data, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store).await;
-    }
-    if matches!(kind, RefreshKind::Full | RefreshKind::Slow) {
-        *slow_errors = refresh_slow_providers(provider_data, repo_root, registry, criteria, host_id).await;
+    match kind {
+        RefreshKind::Full => {
+            let mut fast_data = provider_data.clone();
+            let mut slow_data = provider_data.clone();
+            let (new_fast_errors, new_slow_errors) = tokio::join!(
+                refresh_fast_providers(&mut fast_data, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store,),
+                refresh_slow_providers(&mut slow_data, repo_root, registry, criteria, host_id),
+            );
+            install_fast_provider_data(provider_data, fast_data);
+            install_slow_provider_data(provider_data, slow_data);
+            *fast_errors = new_fast_errors;
+            *slow_errors = new_slow_errors;
+        }
+        RefreshKind::Fast => {
+            *fast_errors =
+                refresh_fast_providers(provider_data, repo_root, registry, environment_id, host_id, attachable_store, agent_state_store)
+                    .await;
+        }
+        RefreshKind::Slow => {
+            *slow_errors = refresh_slow_providers(provider_data, repo_root, registry, criteria, host_id).await;
+        }
     }
     let errors: Vec<_> = fast_errors.iter().chain(slow_errors.iter()).cloned().collect();
     let provider_health = compute_provider_health(registry, &errors);
     let providers = Arc::new(provider_data.clone());
     let (work_items, correlation_groups) = data::correlate(&providers);
     Arc::new(RefreshSnapshot { providers, work_items, correlation_groups, errors, provider_health })
+}
+
+fn install_fast_provider_data(target: &mut ProviderData, source: ProviderData) {
+    target.checkouts = source.checkouts;
+    target.workspaces = source.workspaces;
+    target.managed_terminals = source.managed_terminals;
+    target.attachable_sets = source.attachable_sets;
+    target.agents = source.agents;
+}
+
+fn install_slow_provider_data(target: &mut ProviderData, source: ProviderData) {
+    target.change_requests = source.change_requests;
+    target.sessions = source.sessions;
+    target.branches = source.branches;
 }
 
 impl Drop for RepoRefreshHandle {
