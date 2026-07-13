@@ -510,6 +510,7 @@ async fn provider_runtime_replaces_across_managers() {
                 workspace_ref: "workspace-old".to_string(),
             }),
             spec_hash: "hash".to_string(),
+            stamp: None,
         })
         .await
         .expect("apply should succeed");
@@ -517,6 +518,42 @@ async fn provider_runtime_replaces_across_managers() {
     assert_eq!(result.presentation_manager, "new");
     assert_eq!(old_manager.deleted.lock().expect("deleted lock").as_slice(), &["workspace-old".to_string()]);
     assert_eq!(new_manager.created.lock().expect("created lock").len(), 1);
+}
+
+#[tokio::test]
+async fn provider_runtime_threads_the_workspace_stamp_into_the_attach_request() {
+    let policies = Arc::new(PresentationPolicyRegistry::with_defaults());
+    let mut registry = ProviderRegistry::new();
+    let manager = Arc::new(RecordingPresentationManager::default());
+    registry.presentation_managers.insert(
+        "pm".to_string(),
+        ProviderDescriptor::labeled_simple(ProviderCategory::WorkspaceManager, "pm", "Pm", "", "", ""),
+        Arc::clone(&manager) as Arc<dyn PresentationManager>,
+    );
+    registry.presentation_managers.prefer_by_implementation("pm");
+    let runtime = ProviderPresentationRuntime::new(Arc::new(registry), Arc::clone(&policies));
+
+    let stamp = flotilla_manifest::stamp::WorkspaceStamp {
+        kind: "flotilla-vessel".to_string(),
+        factory_id: "flotilla:convoys/flotilla/convoy-a/implement".to_string(),
+        scope: None,
+    };
+    runtime
+        .apply(&PresentationPlan {
+            policy: "default".to_string(),
+            name: "implement".to_string(),
+            crew: vec![resolved_process("main", "attach term-a")],
+            presentation_local_cwd: flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"),
+            previous: None,
+            spec_hash: "hash".to_string(),
+            stamp: Some(stamp.clone()),
+        })
+        .await
+        .expect("apply should succeed");
+
+    let created = manager.created.lock().expect("created lock");
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].stamp.as_ref(), Some(&stamp), "the plan's stamp reaches the workspace creator");
 }
 
 #[tokio::test]
@@ -550,6 +587,7 @@ async fn provider_runtime_returns_retry_from_clean_slate_after_delete_then_creat
                 workspace_ref: "workspace-old".to_string(),
             }),
             spec_hash: "hash".to_string(),
+            stamp: None,
         })
         .await;
 

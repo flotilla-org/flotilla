@@ -13,8 +13,11 @@ use std::collections::BTreeMap;
 use flotilla_protocol::AttachBinding;
 
 use crate::{
-    keys::{KEY_ATTACH_REF, KEY_CONVOY, KEY_CREW_ROLE, KEY_HOST, KEY_NAMESPACE, KEY_SESSION, KEY_VESSEL, SOURCE_ATTACH},
-    wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
+    keys::{
+        KEY_ATTACH_REF, KEY_CONVOY, KEY_CREW_ROLE, KEY_FACTORY_ID, KEY_HOST, KEY_NAMESPACE, KEY_SCOPE, KEY_SESSION, KEY_TAB_KIND,
+        KEY_VESSEL, SOURCE_ACTUATOR, SOURCE_ATTACH,
+    },
+    wire::{GroupPath, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
 };
 
 /// Parse a zellij pane id as found in `ZELLIJ_PANE_ID` (plain integer) or
@@ -55,6 +58,32 @@ pub fn pane_stamp(pane: PaneTarget, attach_ref: &str, binding: Option<&AttachBin
     MetadataPatch { target: MetadataTarget::Pane(pane), source_id: SOURCE_ATTACH.to_owned(), set, unset: vec![] }
 }
 
+/// What the workspace creator stamps onto a workspace/tab it materialises —
+/// the tab-id two-step's payload (create → capture id → one Tab-target
+/// patch, the git-watcher's factory pattern).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceStamp {
+    /// Workspace kind, e.g. `flotilla-vessel`.
+    pub kind: String,
+    /// Dedupe key: producers re-creating this node can't duplicate it.
+    pub factory_id: String,
+    /// The group this workspace belongs to — must match the catalog's spine
+    /// exactly (build it with `projection::vessel_group_path`).
+    pub scope: Option<GroupPath>,
+}
+
+/// The Tab-target patch published after workspace creation. No TTL — the
+/// stamp is a fact about the tab, not about any daemon being alive.
+pub fn tab_stamp(tab_id: u64, stamp: &WorkspaceStamp) -> MetadataPatch {
+    let mut set = BTreeMap::new();
+    set.insert(KEY_TAB_KIND.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.kind.clone()), None));
+    set.insert(KEY_FACTORY_ID.to_owned(), MetadataValueUpdate::new(MetadataValue::text(stamp.factory_id.clone()), None));
+    if let Some(scope) = &stamp.scope {
+        set.insert(KEY_SCOPE.to_owned(), MetadataValueUpdate::new(scope.to_scope_value(), None));
+    }
+    MetadataPatch { target: MetadataTarget::Tab(tab_id), source_id: SOURCE_ACTUATOR.to_owned(), set, unset: vec![] }
+}
+
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::HostName;
@@ -89,6 +118,28 @@ mod tests {
         assert_eq!(patch.set[KEY_CREW_ROLE].value, MetadataValue::text("coder"));
         assert_eq!(patch.set[KEY_ATTACH_REF].value, MetadataValue::text("implement/coder"));
         assert!(patch.set.values().all(|update| update.ttl_ms.is_none()), "pane stamps carry no TTL");
+    }
+
+    #[test]
+    fn tab_stamp_carries_kind_factory_and_scope_without_ttl() {
+        use crate::{
+            keys::SOURCE_ACTUATOR,
+            projection::{project_segment, vessel_factory_id, vessel_group_path},
+        };
+        let scope = vessel_group_path(project_segment(None, Some("flotilla-org/flotilla")), "dev", "manifest-extraction", "implement");
+        let stamp = WorkspaceStamp {
+            kind: "flotilla-vessel".to_owned(),
+            factory_id: vessel_factory_id("dev", "manifest-extraction", "implement"),
+            scope: Some(scope.clone()),
+        };
+        let patch = tab_stamp(7, &stamp);
+
+        assert_eq!(patch.target, MetadataTarget::Tab(7));
+        assert_eq!(patch.source_id, SOURCE_ACTUATOR);
+        assert_eq!(patch.set[KEY_TAB_KIND].value, MetadataValue::text("flotilla-vessel"));
+        assert_eq!(patch.set[KEY_FACTORY_ID].value, MetadataValue::text("flotilla:convoys/dev/manifest-extraction/implement"));
+        assert_eq!(patch.set[KEY_SCOPE].value, scope.to_scope_value());
+        assert!(patch.set.values().all(|update| update.ttl_ms.is_none()), "tab stamps carry no TTL");
     }
 
     #[test]

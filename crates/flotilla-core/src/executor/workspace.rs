@@ -116,6 +116,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
             template_vars: HashMap::from([("main_command".to_string(), "claude".to_string())]),
             template_yaml: prepared.template_yaml.clone(),
             attach_commands,
+            stamp: None,
         };
 
         match ws_mgr.create_workspace(&attach_request).await {
@@ -312,6 +313,7 @@ fn workspace_attach_request_from_config(config: crate::providers::types::Workspa
         template_vars: config.template_vars,
         template_yaml: config.template_yaml,
         attach_commands: config.resolved_commands.unwrap_or_default(),
+        stamp: None,
     }
 }
 

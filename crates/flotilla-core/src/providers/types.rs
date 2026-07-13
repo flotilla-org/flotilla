@@ -42,4 +42,7 @@ pub struct WorkspaceAttachRequest {
     pub template_yaml: Option<String>,
     /// Final local commands used to attach to or reach prepared workspace surfaces.
     pub attach_commands: Vec<(String, String)>,
+    /// Manifest metadata to stamp onto the created workspace (the tab-id
+    /// two-step). `None` skips stamping.
+    pub stamp: Option<flotilla_manifest::stamp::WorkspaceStamp>,
 }

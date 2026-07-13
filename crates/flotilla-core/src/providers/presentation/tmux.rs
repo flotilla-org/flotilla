@@ -247,6 +247,7 @@ mod tests {
             template_yaml: None,
             template_vars: HashMap::new(),
             attach_commands: vec![],
+            stamp: None,
         };
         let (name1, ws1) = mgr.create_workspace(&config1).await.unwrap();
         assert_eq!(ws1.name, "feat-123");
@@ -260,6 +261,7 @@ mod tests {
             template_yaml: None,
             template_vars: HashMap::new(),
             attach_commands: vec![],
+            stamp: None,
         };
         let (name2, ws2) = mgr.create_workspace(&config2).await.unwrap();
         assert_eq!(ws2.name, "fix-456");

@@ -99,6 +99,29 @@ pub enum MetadataPathValue {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupPath(pub Vec<GroupSegment>);
 
+impl GroupPath {
+    /// This path as a scope *value* (for `tab.scope` facts). Nested
+    /// group-path values are unrepresentable in path segments and are
+    /// skipped; the catalog only builds paths from text segments.
+    pub fn to_scope_value(&self) -> MetadataValue {
+        let segments = self
+            .0
+            .iter()
+            .filter_map(|segment| {
+                let value = match &segment.value {
+                    MetadataValue::Text(value) => MetadataPathValue::Text(value.clone()),
+                    MetadataValue::Bool(value) => MetadataPathValue::Bool(*value),
+                    MetadataValue::Integer(value) => MetadataPathValue::Integer(*value),
+                    MetadataValue::StringList(values) => MetadataPathValue::StringList(values.clone()),
+                    MetadataValue::GroupPath(_) => return None,
+                };
+                Some(MetadataPathSegmentValue { key: segment.key.clone(), value, label: segment.label.clone() })
+            })
+            .collect();
+        MetadataValue::GroupPath(segments)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupSegment {
     pub key: String,

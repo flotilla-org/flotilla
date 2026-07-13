@@ -131,6 +131,22 @@ impl super::PresentationManager for ZellijPresentationManager {
         let session = self.session_name()?;
         let ws_ref = format!("{session}:{tab_id}");
 
+        // The tab-id two-step: stamp the created tab into the PM's metadata
+        // plane (scope, kind, factory id) so the manifest resolver can group
+        // it. Best-effort — a missing metadata plane never fails creation.
+        if let Some(stamp) = &config.stamp {
+            match tab_id.parse::<u64>() {
+                Ok(tab_id) => {
+                    let payload = flotilla_manifest::stamp::tab_stamp(tab_id, stamp).to_pipe_payload();
+                    let args = ["pipe", "--name", flotilla_manifest::wire::APPLY_METADATA_PATCH_PIPE, "--", &payload];
+                    if let Err(err) = run!(self.runner, "zellij", &args, Path::new(".")) {
+                        warn!(%err, %tab_id, "zellij: could not stamp workspace metadata");
+                    }
+                }
+                Err(_) => warn!(%tab_id, "zellij: new-tab output is not a tab id; skipping metadata stamp"),
+            }
+        }
+
         // Small delay to let zellij process the tab creation
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -310,6 +326,7 @@ mod tests {
             template_yaml: None,
             template_vars: HashMap::new(),
             attach_commands: vec![],
+            stamp: None,
         };
         let (ws_ref1, ws1) = mgr.create_workspace(&config1).await.unwrap();
         assert_eq!(ws1.name, "feat-123");
@@ -323,6 +340,7 @@ mod tests {
             template_yaml: None,
             template_vars: HashMap::new(),
             attach_commands: vec![],
+            stamp: None,
         };
         let (ws_ref2, ws2) = mgr.create_workspace(&config2).await.unwrap();
         assert_eq!(ws2.name, "fix-456");

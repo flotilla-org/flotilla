@@ -22,10 +22,7 @@ use crate::{
         KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_PROJECT, SEGMENT_VESSEL, SOURCE_CONNECTOR,
     },
     recipe::RecipeMint,
-    wire::{
-        GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataPathSegmentValue, MetadataPathValue, MetadataTarget,
-        MetadataValue, MetadataValueUpdate,
-    },
+    wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
 };
 
 /// The rows the catalog is projected from.
@@ -164,7 +161,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
 /// git-watcher publishes, so both producers' groups collide into one project
 /// cluster. Neither ⇒ `None`: the entity is truthfully unparented at
 /// archipelago level.
-fn project_segment(project_ref: Option<&str>, repo: Option<&str>) -> Option<GroupSegment> {
+pub fn project_segment(project_ref: Option<&str>, repo: Option<&str>) -> Option<GroupSegment> {
     let value = project_ref.or(repo)?;
     let label = value.rsplit('/').next().filter(|short| !short.is_empty() && *short != value);
     let segment = GroupSegment::text(SEGMENT_PROJECT, value);
@@ -172,6 +169,31 @@ fn project_segment(project_ref: Option<&str>, repo: Option<&str>) -> Option<Grou
         Some(label) => segment.with_label(label),
         None => segment,
     })
+}
+
+/// The GroupPath of a convoy — shared spine construction so every producer
+/// lands on the same group node.
+pub fn convoy_group_path(project: Option<GroupSegment>, namespace: &str, convoy: &str) -> GroupPath {
+    let mut path = Vec::new();
+    if let Some(segment) = project {
+        path.push(segment);
+    }
+    path.push(GroupSegment::text(SEGMENT_CONVOY, format!("{namespace}/{convoy}")).with_label(convoy.to_owned()));
+    GroupPath(path)
+}
+
+/// The GroupPath of a convoy-hosted vessel — shared by the catalog and the
+/// actuator's tab stamp so both producers land on the same group node.
+pub fn vessel_group_path(project: Option<GroupSegment>, namespace: &str, convoy: &str, vessel: &str) -> GroupPath {
+    let mut path = convoy_group_path(project, namespace, convoy);
+    path.0.push(GroupSegment::text(SEGMENT_VESSEL, vessel.to_owned()));
+    path
+}
+
+/// `factory.id` for a convoy-hosted vessel — the dedupe key shared by every
+/// producer that materialises this node.
+pub fn vessel_factory_id(namespace: &str, convoy: &str, vessel: &str) -> String {
+    format!("flotilla:convoys/{namespace}/{convoy}/{vessel}")
 }
 
 fn assert_project_group(catalog: &mut Catalog, segment: &GroupSegment) {
@@ -189,14 +211,12 @@ fn assert_project_group(catalog: &mut Catalog, segment: &GroupSegment) {
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {
     let namespace = &convoy.resource.namespace;
     let project = project_segment(convoy.project_ref.as_deref(), convoy.repo.as_ref().map(|repo| repo.0.as_str()));
-    let mut path = Vec::new();
     if let Some(segment) = &project {
         assert_project_group(catalog, segment);
-        path.push(segment.clone());
     }
     let ordinal = project.is_none().then_some(ARCHIPELAGO_ORDINAL);
 
-    path.push(GroupSegment::text(SEGMENT_CONVOY, format!("{namespace}/{}", convoy.name)).with_label(convoy.name.clone()));
+    let convoy_path = convoy_group_path(project.clone(), namespace, &convoy.name);
     let (state, attention) = convoy_badge(convoy.phase);
     let done = convoy.vessels.iter().filter(|vessel| vessel.phase == WorkPhase::Complete).count();
     let mut facts = vec![
@@ -214,10 +234,10 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     if !convoy.vessels.is_empty() {
         facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(format!("{done}/{} vessels done", convoy.vessels.len()))));
     }
-    catalog.assert_facts(MetadataTarget::Group(GroupPath(path.clone())), facts, ordinal);
+    catalog.assert_facts(MetadataTarget::Group(convoy_path), facts, ordinal);
 
     for vessel in &convoy.vessels {
-        project_vessel(catalog, convoy, vessel, path.clone(), ordinal, mint);
+        project_vessel(catalog, convoy, vessel, project.clone(), ordinal, mint);
     }
 }
 
@@ -225,18 +245,18 @@ fn project_vessel(
     catalog: &mut Catalog,
     convoy: &ConvoyRow,
     vessel: &VesselRow,
-    mut path: Vec<GroupSegment>,
+    project: Option<GroupSegment>,
     ordinal: Option<i64>,
     mint: &dyn RecipeMint,
 ) {
     let namespace = &convoy.resource.namespace;
-    path.push(GroupSegment::text(SEGMENT_VESSEL, vessel.name.clone()));
+    let path = vessel_group_path(project, namespace, &convoy.name, &vessel.name);
     let (state, attention) = work_badge(vessel.phase);
     let mut facts = vec![
         (KEY_WORK_PHASE, MetadataValue::text(vessel.phase.as_str())),
         (KEY_VESSEL_HOST, MetadataValue::text(vessel.host.to_string())),
         (KEY_STATUS_STATE, MetadataValue::text(state.as_str())),
-        (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:convoys/{namespace}/{}/{}", convoy.name, vessel.name))),
+        (KEY_FACTORY_ID, MetadataValue::text(vessel_factory_id(namespace, &convoy.name, &vessel.name))),
     ];
     if !vessel.crew.is_empty() {
         let roles = vessel.crew.iter().map(|member| member.role.clone()).collect();
@@ -254,7 +274,7 @@ fn project_vessel(
         facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("workspace")));
         facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
     }
-    catalog.assert_facts(MetadataTarget::Group(GroupPath(path)), facts, ordinal);
+    catalog.assert_facts(MetadataTarget::Group(path), facts, ordinal);
 }
 
 fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn RecipeMint) {
@@ -293,27 +313,9 @@ fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn Recip
     let identity_value = format!("{}/{namespace}/{}", session.host, session.name);
     catalog.assert_facts(
         MetadataTarget::Identity(MetadataIdentity { key: KEY_SESSION.to_owned(), value: MetadataValue::text(identity_value) }),
-        vec![(KEY_SCOPE, MetadataValue::GroupPath(to_path_segments(&group_path))), (KEY_STATUS_STATE, MetadataValue::text(state.as_str()))],
+        vec![(KEY_SCOPE, group_path.to_scope_value()), (KEY_STATUS_STATE, MetadataValue::text(state.as_str()))],
         None,
     );
-}
-
-fn to_path_segments(path: &GroupPath) -> Vec<MetadataPathSegmentValue> {
-    path.0
-        .iter()
-        .filter_map(|segment| {
-            let value = match &segment.value {
-                MetadataValue::Text(value) => MetadataPathValue::Text(value.clone()),
-                MetadataValue::Bool(value) => MetadataPathValue::Bool(*value),
-                MetadataValue::Integer(value) => MetadataPathValue::Integer(*value),
-                MetadataValue::StringList(values) => MetadataPathValue::StringList(values.clone()),
-                MetadataValue::GroupPath(_) => return None,
-            };
-            let mut path_segment = MetadataPathSegmentValue { key: segment.key.clone(), value, label: None };
-            path_segment.label = segment.label.clone();
-            Some(path_segment)
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -303,6 +303,7 @@ mod tests {
             name: "new".into(),
             working_directory: ExecutionEnvironmentPath::new("/repo"),
             attach_commands: vec![],
+            stamp: None,
             template_yaml: None,
             template_vars: Default::default(),
         };

@@ -338,6 +338,7 @@ mod tests {
             template_vars: std::collections::HashMap::new(),
             template_yaml: None,
             attach_commands: vec![],
+            stamp: None,
         };
 
         let err = manager.create_workspace(&config).await.expect_err("should fail when ref is missing");

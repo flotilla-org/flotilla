@@ -1,7 +1,7 @@
 use flotilla_protocol::{result_set::CrewMemberSummary, HostName, RepoKey, ResourceRef};
 
 use super::*;
-use crate::recipe::AttachOnlyRecipes;
+use crate::{recipe::AttachOnlyRecipes, wire::MetadataPathValue};
 
 fn mint() -> AttachOnlyRecipes {
     AttachOnlyRecipes::new("flotilla")
@@ -263,4 +263,27 @@ fn reassert_covers_every_target() {
     assert_eq!(patches.len(), 3, "project group + session group + session identity");
     assert!(patches.iter().all(|patch| patch.unset.is_empty()));
     assert!(patches.iter().all(|patch| patch.source_id == SOURCE_CONNECTOR));
+}
+
+#[test]
+fn shared_spine_helpers_match_the_catalog_targets() {
+    let reference = convoy_ref("dev", "manifest-extraction");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone())
+        .name("manifest-extraction")
+        .workflow_ref("implement-review")
+        .phase(ConvoyPhase::Active)
+        .repo(RepoKey("flotilla-org/flotilla".to_owned()))
+        .vessels(vec![vessel(&reference, "implement", WorkPhase::Running, None)])
+        .build();
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let patches = catalog.reassert_patches();
+
+    // The actuator's tab stamp builds its scope with these helpers; they
+    // must land on exactly the group nodes the catalog publishes.
+    let project = project_segment(None, Some("flotilla-org/flotilla"));
+    let vessel_target = MetadataTarget::Group(vessel_group_path(project.clone(), "dev", "manifest-extraction", "implement"));
+    let convoy_target = MetadataTarget::Group(convoy_group_path(project, "dev", "manifest-extraction"));
+    find(&patches, &vessel_target);
+    find(&patches, &convoy_target);
 }

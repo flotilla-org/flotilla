@@ -10,6 +10,7 @@ replay = []
 test-support = ["flotilla-protocol/test-support"]
 
 [dependencies]
+flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 tokio = { workspace = true }
