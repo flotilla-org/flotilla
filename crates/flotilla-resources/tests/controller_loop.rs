@@ -2,7 +2,7 @@ mod common;
 
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -12,7 +12,7 @@ use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
     ApiPaths, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend,
-    ResourceError, ResourceObject, TypedResolver, Vessel, VesselSpec,
+    ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel, VesselSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, time::timeout};
@@ -114,12 +114,12 @@ impl Reconciler for FinalizingReconciler {
 }
 
 #[derive(Clone)]
-struct DeletingFinalizerReconciler {
+struct RacingFinalizerRemovalReconciler {
     finalized: Arc<Mutex<Vec<String>>>,
     primaries: TypedResolver<PrimaryResource>,
 }
 
-impl Reconciler for DeletingFinalizerReconciler {
+impl Reconciler for RacingFinalizerRemovalReconciler {
     type Resource = PrimaryResource;
     type Dependencies = ();
 
@@ -138,14 +138,131 @@ impl Reconciler for DeletingFinalizerReconciler {
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         self.finalized.lock().expect("finalized lock").push(obj.metadata.name.clone());
-        match self.primaries.delete(&obj.metadata.name).await {
-            Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+        let meta = InputMeta::from(&obj.metadata).without_finalizer("flotilla.work/test-finalizer");
+        match self.primaries.update(&meta, &obj.metadata.resource_version, &obj.spec).await {
+            Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(err) => Err(err),
         }
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
         Some("flotilla.work/test-finalizer")
+    }
+}
+
+fn delete_synchronously<T: Resource>(resolver: TypedResolver<T>, name: String) {
+    let handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime for synchronous delete");
+        runtime.block_on(async move {
+            resolver.delete(&name).await.expect("synchronous delete should succeed");
+        });
+    });
+    assert!(handle.join().is_ok(), "synchronous delete thread should not panic");
+}
+
+#[derive(Clone)]
+struct RacingAttachReconciler {
+    primaries: TypedResolver<PrimaryResource>,
+    target: String,
+    raced: Arc<AtomicBool>,
+}
+
+impl Reconciler for RacingAttachReconciler {
+    type Resource = PrimaryResource;
+    type Dependencies = ();
+
+    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        _obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Dependencies,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        ReconcileOutcome::new(None)
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        if !self.raced.swap(true, Ordering::SeqCst) {
+            delete_synchronously(self.primaries.clone(), self.target.clone());
+        }
+        Some("flotilla.work/test-finalizer")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusfulResource;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StatusfulSpec {
+    value: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StatusfulStatus {
+    touched: bool,
+}
+
+enum TouchPatch {
+    Touch,
+}
+
+impl StatusPatch<StatusfulStatus> for TouchPatch {
+    fn apply(&self, status: &mut StatusfulStatus) {
+        match self {
+            Self::Touch => status.touched = true,
+        }
+    }
+}
+
+impl Resource for StatusfulResource {
+    type Spec = StatusfulSpec;
+    type Status = StatusfulStatus;
+    type StatusPatch = TouchPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "test-statusful", kind: "TestStatusful" };
+}
+
+#[derive(Clone)]
+struct RacingStatusPatchReconciler {
+    primaries: TypedResolver<StatusfulResource>,
+    target: String,
+    reconciled: Arc<Mutex<Vec<String>>>,
+}
+
+impl Reconciler for RacingStatusPatchReconciler {
+    type Resource = StatusfulResource;
+    type Dependencies = ();
+
+    async fn fetch_dependencies(&self, _obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
+        Ok(())
+    }
+
+    fn reconcile(
+        &self,
+        obj: &ResourceObject<Self::Resource>,
+        _deps: &Self::Dependencies,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> ReconcileOutcome<Self::Resource> {
+        self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        if obj.metadata.name == self.target {
+            delete_synchronously(self.primaries.clone(), obj.metadata.name.clone());
+        }
+        ReconcileOutcome::new(Some(TouchPatch::Touch))
+    }
+
+    async fn run_finalizer(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
     }
 }
 
@@ -520,7 +637,7 @@ async fn controller_loop_survives_notfound_when_removing_finalizer() {
         ControllerLoop {
             primary: primaries.clone(),
             secondaries: Vec::new(),
-            reconciler: DeletingFinalizerReconciler { finalized: Arc::clone(&finalized), primaries: primaries.clone() },
+            reconciler: RacingFinalizerRemovalReconciler { finalized: Arc::clone(&finalized), primaries: primaries.clone() },
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -552,6 +669,99 @@ async fn controller_loop_survives_notfound_when_removing_finalizer() {
     })
     .await
     .expect("controller loop should continue after finalizer removal NotFound");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_survives_notfound_when_attaching_finalizer() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: RacingAttachReconciler {
+                primaries: primaries.clone(),
+                target: "alpha".to_string(),
+                raced: Arc::new(AtomicBool::new(false)),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let primaries = primaries.clone();
+            async move { matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. })) }
+        })
+        .await;
+
+    primaries.create(&primary_meta("beta"), &PrimarySpec { value: "two".to_string() }).await.expect("second primary create should succeed");
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let primaries = primaries.clone();
+            async move {
+                primaries
+                    .get("beta")
+                    .await
+                    .is_ok_and(|object| object.metadata.finalizers == vec!["flotilla.work/test-finalizer".to_string()])
+            }
+        })
+        .await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_survives_notfound_when_patching_status() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<StatusfulResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &StatusfulSpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries.clone(),
+            secondaries: Vec::new(),
+            reconciler: RacingStatusPatchReconciler {
+                primaries: primaries.clone(),
+                target: "alpha".to_string(),
+                reconciled: Arc::clone(&reconciled),
+            },
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let primaries = primaries.clone();
+            let reconciled = Arc::clone(&reconciled);
+            async move {
+                let alpha_reconciled = reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha");
+                alpha_reconciled && matches!(primaries.get("alpha").await, Err(ResourceError::NotFound { .. }))
+            }
+        })
+        .await;
+
+    primaries
+        .create(&primary_meta("beta"), &StatusfulSpec { value: "two".to_string() })
+        .await
+        .expect("second primary create should succeed");
+    harness
+        .wait_until(Duration::from_secs(1), || {
+            let reconciled = Arc::clone(&reconciled);
+            async move { reconciled.lock().expect("reconciled lock").iter().any(|name| name == "beta") }
+        })
+        .await;
 
     harness.shutdown().await;
 }

@@ -531,6 +531,9 @@ impl SqliteBackend {
         let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource delete"))?;
         let existing = Self::select_existing::<T>(&tx, &key, name)?;
         let mut object = existing.ok_or_else(|| ResourceError::not_found(name))?;
+        if object.metadata.is_pending_finalization() {
+            return Ok(());
+        }
         let version = Self::allocate_version(&tx, &key)?;
         object.metadata.resource_version = version.to_string();
 

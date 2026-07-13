@@ -8,8 +8,8 @@ use flotilla_resources::{
     Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
     DockerPerTaskPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
-    WorkflowSnapshot,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase,
+    WorkState, WorkflowSnapshot,
 };
 use tokio::{
     task::JoinHandle,
@@ -46,6 +46,18 @@ pub fn labeled_meta(name: &str, labels: impl IntoIterator<Item = (String, String
 pub fn vessel_meta(name: &str, repo_url: &str) -> InputMeta {
     let canonical_repo = canonicalize_repo_url(repo_url).expect("repo URL should canonicalize");
     controller_meta().name(name).labels([("flotilla.work/repo-key".to_string(), repo_key(&canonical_repo))].into_iter().collect()).call()
+}
+
+#[bon::builder]
+pub fn work_state(
+    phase: WorkPhase,
+    ready_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    message: Option<String>,
+    placement: Option<flotilla_resources::PlacementStatus>,
+) -> WorkState {
+    WorkState { phase, ready_at, started_at, finished_at, message, placement }
 }
 
 pub async fn create_convoy_with_single_task(

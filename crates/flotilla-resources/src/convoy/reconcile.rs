@@ -552,7 +552,7 @@ fn cleanup_actuations(
                 if presentations.contains_key(&resource_name) {
                     actuations.push(Actuation::DeletePresentation { name: resource_name.clone() });
                 }
-                if vessels.contains_key(&resource_name) {
+                if vessels.get(&resource_name).is_some_and(|vessel| vessel.metadata.deletion_timestamp.is_none()) {
                     actuations.push(Actuation::DeleteVessel { name: resource_name });
                 }
             }

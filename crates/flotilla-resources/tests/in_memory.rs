@@ -6,14 +6,15 @@ use common::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip,
         assert_delete_emits_event, assert_identical_status_update_is_noop_with_backend, assert_identical_update_is_noop_with_backend,
-        assert_metadata_roundtrip, assert_namespace_isolation, assert_stale_resource_version_conflicts,
-        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays, assert_watch_now_semantics,
+        assert_metadata_roundtrip, assert_namespace_isolation, assert_repeated_delete_with_pending_finalizers_is_noop_with_backend,
+        assert_stale_resource_version_conflicts, assert_store_diagnostics_report_retained_events_with_backend,
+        assert_watch_from_version_replays, assert_watch_now_semantics,
         assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
     convoy_meta, convoy_spec,
 };
-use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, InputMeta, ResourceBackend};
+use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, ResourceBackend};
 use rstest::rstest;
 
 fn resolver(namespace: &str) -> flotilla_resources::TypedResolver<Convoy> {
@@ -122,23 +123,14 @@ async fn owner_references_roundtrip_through_in_memory_backend(#[case] _fixture: 
     assert_metadata_roundtrip::<ConvoyFixture>().await;
 }
 
+#[rstest]
+#[case(ConvoyFixture)]
 #[tokio::test]
-async fn delete_with_finalizers_marks_object_for_deletion_instead_of_removing_it() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let resolver = backend.clone().using::<Convoy>("default");
-    resolver
-        .create(
-            &InputMeta::builder().name("alpha".to_string()).finalizers(vec!["flotilla.work/test-finalizer".to_string()]).build(),
-            &convoy_spec("template-a"),
-        )
-        .await
-        .expect("create should succeed");
-
-    resolver.delete("alpha").await.expect("delete should succeed");
-
-    let object = resolver.get("alpha").await.expect("object should remain until finalizers are removed");
-    assert_eq!(object.metadata.finalizers, vec!["flotilla.work/test-finalizer".to_string()]);
-    assert!(object.metadata.deletion_timestamp.is_some(), "delete should set deletion timestamp");
+async fn repeated_delete_is_noop_while_finalizers_are_pending(#[case] _fixture: ConvoyFixture) {
+    assert_repeated_delete_with_pending_finalizers_is_noop_with_backend::<ConvoyFixture>(ResourceBackend::InMemory(
+        InMemoryBackend::default(),
+    ))
+    .await;
 }
 
 #[tokio::test]

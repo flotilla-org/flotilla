@@ -6,18 +6,19 @@ use chrono::Utc;
 use common::{
     create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
-    labeled_meta, meta, vessel_meta, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
+    labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus,
-    CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, LifecycleAuthority,
-    ObservedCheckoutSpec, PlacementPolicySpec, ResourceBackend, ResourceError, Selector, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkflowSnapshot,
-    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyPhase, ConvoyReconciler,
+    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
+    DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec,
+    ResourceBackend, ResourceError, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -411,6 +412,73 @@ async fn run_finalizer_deletes_all_labeled_children() {
         backend.clone().using::<TerminalSession>(NAMESPACE).get("terminal-workspace-finalize-coder").await,
         Err(ResourceError::NotFound { .. })
     ));
+}
+
+#[tokio::test]
+async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_pending() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    let terminals = backend.clone().using::<TerminalSession>(NAMESPACE);
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-finalizer", "implement", REPO_URL, GIT_REF).await;
+
+    let mut status = convoy.status.expect("convoy status");
+    status.phase = ConvoyPhase::Completed;
+    status.observed_workflow_ref = Some("wf".to_string());
+    status.work.insert(
+        "implement".to_string(),
+        work_state().phase(WorkPhase::Complete).finished_at(Utc::now()).message("done".to_string()).call(),
+    );
+    convoys
+        .update_status("convoy-finalizer", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("convoy completion should be recorded");
+
+    let vessel =
+        create_workspace(&backend, NAMESPACE, "convoy-finalizer-implement", "convoy-finalizer", "implement", "policy-finalizer", REPO_URL)
+            .await;
+    let mut vessel_meta = InputMeta::from(&vessel.metadata);
+    vessel_meta.labels.insert(CONVOY_LABEL.to_string(), "convoy-finalizer".to_string());
+    vessel_meta.finalizers = vec!["flotilla.work/vessel-workspace-teardown".to_string()];
+    vessels
+        .update(&vessel_meta, &vessel.metadata.resource_version, &vessel.spec)
+        .await
+        .expect("vessel finalizer and convoy label should be recorded");
+    create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
+
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
+    let completed = convoys.get("convoy-finalizer").await.expect("completed convoy should exist");
+    let first_dependencies = convoy_reconciler.fetch_dependencies(&completed).await.expect("first dependencies should load");
+    let first_outcome = convoy_reconciler.reconcile(&completed, &first_dependencies, Utc::now());
+    assert!(first_outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-finalizer-implement")));
+
+    vessels.delete("convoy-finalizer-implement").await.expect("first convoy cleanup should mark the vessel for deletion");
+    let pending_vessel = vessels.get("convoy-finalizer-implement").await.expect("pending finalizer should retain the vessel");
+    assert!(pending_vessel.metadata.deletion_timestamp.is_some());
+
+    let second_dependencies = convoy_reconciler.fetch_dependencies(&completed).await.expect("second dependencies should load");
+    let second_outcome = convoy_reconciler.reconcile(&completed, &second_dependencies, Utc::now());
+    assert!(
+        !second_outcome
+            .actuations
+            .iter()
+            .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-finalizer-implement")),
+        "a vessel already awaiting finalization should not be deleted again"
+    );
+
+    let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    vessel_reconciler.run_finalizer(&pending_vessel).await.expect("vessel finalizer should delete terminal children");
+    let clear_finalizer = InputMeta::from(&pending_vessel.metadata).without_finalizer("flotilla.work/vessel-workspace-teardown");
+    vessels
+        .update(&clear_finalizer, &pending_vessel.metadata.resource_version, &pending_vessel.spec)
+        .await
+        .expect("clearing the vessel finalizer should complete deletion");
+
+    assert!(matches!(vessels.get("convoy-finalizer-implement").await, Err(ResourceError::NotFound { .. })));
+    assert!(matches!(terminals.get("terminal-convoy-finalizer-implement-coder").await, Err(ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]
