@@ -1,3 +1,5 @@
+use std::sync::OnceLock;
+
 use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
     Args, CommandFactory, Subcommand,
@@ -6,6 +8,7 @@ use clap::{
 use crate::{commands::host::HostNounPartial, noun::NounCommand, quote_value};
 
 pub const ADDRESS_MARKER: char = '@';
+const CREW_COMMAND_SUBJECTS: &[&str] = &["list", "complete", "fail"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubjectNoun {
@@ -138,31 +141,47 @@ pub(crate) fn format_parse_error(error: clap::Error) -> String {
 }
 
 fn is_reserved_subject_token(noun: SubjectNoun, subject: &str) -> bool {
-    if noun == SubjectNoun::Crew && matches!(subject, "list" | "complete" | "fail") {
+    if noun == SubjectNoun::Crew && is_crew_command_subject(subject) {
         return true;
     }
 
     if noun == SubjectNoun::Host {
-        let mut command = HostNounPartial::command();
-        command.build();
-        if command.find_subcommand(subject).is_some() {
-            return true;
-        }
-        return is_noun_token(subject);
+        return host_command_tree().find_subcommand(subject).is_some() || is_noun_token(subject_command_tree(), subject);
     }
 
-    let root = <NounCommand as Subcommand>::augment_subcommands(clap::Command::new("subjects"));
+    let root = subject_command_tree();
     let noun = noun.command_name();
     let Some(command) =
         root.get_subcommands().find(|command| command.get_name() == noun || command.get_all_aliases().any(|alias| alias == noun))
     else {
         return false;
     };
-    command.find_subcommand(subject).is_some() || (command.is_allow_external_subcommands_set() && is_noun_token(subject))
+    command.find_subcommand(subject).is_some() || (command.is_allow_external_subcommands_set() && is_noun_token(root, subject))
 }
 
-fn is_noun_token(subject: &str) -> bool {
-    let root = <NounCommand as Subcommand>::augment_subcommands(clap::Command::new("subjects"));
+pub(crate) fn is_crew_command_subject(subject: &str) -> bool {
+    CREW_COMMAND_SUBJECTS.contains(&subject)
+}
+
+fn subject_command_tree() -> &'static clap::Command {
+    static TREE: OnceLock<clap::Command> = OnceLock::new();
+    TREE.get_or_init(|| {
+        let mut command = <NounCommand as Subcommand>::augment_subcommands(clap::Command::new("subjects"));
+        command.build();
+        command
+    })
+}
+
+fn host_command_tree() -> &'static clap::Command {
+    static TREE: OnceLock<clap::Command> = OnceLock::new();
+    TREE.get_or_init(|| {
+        let mut command = HostNounPartial::command();
+        command.build();
+        command
+    })
+}
+
+fn is_noun_token(root: &clap::Command, subject: &str) -> bool {
     let found =
         root.get_subcommands().any(|command| command.get_name() == subject || command.get_all_aliases().any(|alias| alias == subject));
     found

@@ -4,7 +4,7 @@ use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
 use crate::{
     quote_value,
     resolved::{HostResolution, RepoContext},
-    subject::SubjectInterpretation,
+    subject::{is_crew_command_subject, SubjectInterpretation},
     Resolved, SubjectArgs,
 };
 
@@ -61,7 +61,7 @@ impl CrewNoun {
                 context,
                 message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
             },
-            (reserved @ ("list" | "complete" | "fail"), SubjectInterpretation::Ordinary, Some(_)) => {
+            (reserved, SubjectInterpretation::Ordinary, Some(_)) if is_crew_command_subject(reserved) => {
                 return Err(format!("`{reserved}` is a crew command; use `@{reserved}` to address the crew role"));
             }
             (_, _, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: subject.value, message },
