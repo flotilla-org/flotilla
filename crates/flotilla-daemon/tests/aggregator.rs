@@ -72,7 +72,9 @@ async fn aggregator_emits_panel_events() {
     // Create a Convoy resource — the Aggregator should pick it up via the watch
     // stream and emit a PanelSnapshot for the default convoy tab.
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-    convoys.create(&convoy_meta("test-convoy-1"), &convoy_spec("my-workflow")).await.expect("create convoy");
+    let mut spec = convoy_spec("my-workflow");
+    spec.project_ref = Some("my-project".to_string());
+    convoys.create(&convoy_meta("test-convoy-1"), &spec).await.expect("create convoy");
 
     // Wait for the convoy panel snapshot.
     let found = tokio::time::timeout(Duration::from_secs(5), async {
@@ -92,6 +94,7 @@ async fn aggregator_emits_panel_events() {
     let rows = &found.tab.panels[0].rows;
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the snapshot");
     assert_eq!(rows[0].values.get("name").and_then(PanelValue::as_str), Some("test-convoy-1"));
+    assert_eq!(rows[0].values.get("project_ref").and_then(PanelValue::as_str), Some("my-project"));
 }
 
 /// Verifies the causal chain:
