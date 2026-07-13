@@ -114,6 +114,36 @@ async fn read_request(session: &MessageSession) -> (u64, Request) {
 }
 
 #[tokio::test]
+async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("daemon.sock");
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "skipping connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning: unix socket bind not permitted: {err}"
+            );
+            return;
+        }
+        Err(err) => panic!("bind listener: {err}"),
+    };
+
+    // Accept the connection and hold it open without ever sending a Hello —
+    // a wedged daemon from the caller's point of view.
+    let server_task = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.expect("accept client");
+        std::future::pending::<()>().await;
+    });
+
+    let error = match connect_or_spawn(&socket_path, dir.path(), None, Some(&socket_path)).await {
+        Ok(_) => panic!("a wedged daemon must surface an error, not hang or be replaced"),
+        Err(error) => error,
+    };
+    assert!(error.contains("did not complete the Hello handshake"), "unexpected error: {error}");
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn client_hello_rejects_daemon_protocol_version_mismatch() {
     let (client, server) = message_session_pair();
     let server_task = tokio::spawn(async move {
