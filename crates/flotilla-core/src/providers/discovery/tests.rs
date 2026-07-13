@@ -252,3 +252,123 @@ fn service_descriptor_fields() {
 fn service_category_slug() {
     assert_eq!(ServiceCategory::IssueQuery.slug(), "issue_query");
 }
+
+struct CountingPresentationManager(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl PresentationManager for CountingPresentationManager {
+    async fn list_workspaces(&self) -> Result<Vec<(String, crate::providers::types::Workspace)>, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![])
+    }
+
+    async fn create_workspace(
+        &self,
+        _config: &crate::providers::types::WorkspaceAttachRequest,
+    ) -> Result<(String, crate::providers::types::Workspace), String> {
+        unreachable!("not used by this test")
+    }
+
+    async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        unreachable!("not used by this test")
+    }
+
+    async fn delete_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        unreachable!("not used by this test")
+    }
+
+    fn binding_scope_prefix(&self) -> String {
+        String::new()
+    }
+}
+
+struct CountingPresentationFactory {
+    probes: Arc<std::sync::atomic::AtomicUsize>,
+    scans: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Factory for CountingPresentationFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn PresentationManager;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named(ProviderCategory::WorkspaceManager, "test")
+    }
+
+    async fn probe(
+        &self,
+        _env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
+        _runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<dyn PresentationManager>, Vec<UnmetRequirement>> {
+        self.probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(CountingPresentationManager(Arc::clone(&self.scans))))
+    }
+}
+
+fn factories_with_presentation(factory: CountingPresentationFactory) -> FactoryRegistry {
+    FactoryRegistry {
+        vcs: vec![],
+        checkout_managers: vec![],
+        change_requests: vec![],
+        issue_trackers: vec![],
+        cloud_agents: vec![],
+        ai_utilities: vec![],
+        presentation_managers: vec![Box::new(factory)],
+        terminal_pools: vec![],
+        environment_providers: vec![],
+        issue_query_services: vec![],
+    }
+}
+
+#[tokio::test]
+async fn host_scoped_provider_cache_probes_once_and_reuses_scans_within_an_environment() {
+    let cache = HostScopedProviderCache::default();
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factories = factories_with_presentation(CountingPresentationFactory { probes: Arc::clone(&probes), scans: Arc::clone(&scans) });
+    let config_dir = tempfile::tempdir().expect("config dir");
+    let config = ConfigStore::with_base(config_dir.path());
+    let runner: Arc<dyn CommandRunner> = Arc::new(test_support::DiscoveryMockRunner::builder().build());
+    let host_bag = EnvironmentBag::new();
+    let environment_a = EnvironmentId::new("a");
+    let environment_b = EnvironmentId::new("b");
+
+    let first = cache
+        .discover_for_environment(
+            &environment_a,
+            &host_bag,
+            &factories,
+            &config,
+            &ExecutionEnvironmentPath::new("/first"),
+            Arc::clone(&runner),
+        )
+        .await;
+    let second = cache
+        .discover_for_environment(
+            &environment_a,
+            &host_bag,
+            &factories,
+            &config,
+            &ExecutionEnvironmentPath::new("/second"),
+            Arc::clone(&runner),
+        )
+        .await;
+    assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1, "the second repo must not probe host providers again");
+
+    let first_manager = &first.providers.presentation_managers[0].1;
+    let second_manager = &second.providers.presentation_managers[0].1;
+    let (first_result, second_result) = tokio::join!(first_manager.list_workspaces(), second_manager.list_workspaces());
+    first_result.expect("first environment scan");
+    second_result.expect("shared environment scan");
+    assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let distinct_environment = cache
+        .discover_for_environment(&environment_b, &host_bag, &factories, &config, &ExecutionEnvironmentPath::new("/third"), runner)
+        .await;
+    distinct_environment.providers.presentation_managers[0].1.list_workspaces().await.expect("distinct environment scan");
+    assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

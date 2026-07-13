@@ -1,4 +1,11 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::{
@@ -296,6 +303,162 @@ async fn wait_for_snapshot(rx: &mut tokio::sync::watch::Receiver<Arc<RefreshSnap
         .expect("timed out waiting for snapshot")
         .expect("snapshot channel closed");
     rx.borrow().clone()
+}
+
+struct CountingCloudAgent(AtomicUsize);
+
+#[async_trait]
+impl CloudAgentService for CountingCloudAgent {
+    async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![])
+    }
+
+    async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+struct CountingWorkspaceManager(AtomicUsize);
+
+#[async_trait]
+impl PresentationManager for CountingWorkspaceManager {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![])
+    }
+
+    async fn create_workspace(&self, _config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
+        Err("not implemented".into())
+    }
+
+    async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn delete_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn binding_scope_prefix(&self) -> String {
+        String::new()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn periodic_refresh_uses_fast_and_slow_provider_cadences() {
+    let cloud_agent = Arc::new(CountingCloudAgent(AtomicUsize::new(0)));
+    let workspace_manager = Arc::new(CountingWorkspaceManager(AtomicUsize::new(0)));
+    let mut registry = ProviderRegistry::new();
+    registry.cloud_agents.insert("cloud", desc("Cloud"), cloud_agent.clone());
+    registry.presentation_managers.insert("workspace", desc("Workspace"), workspace_manager.clone());
+
+    let handle = RepoRefreshHandle::spawn_with_schedule(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        RefreshSchedule::without_stagger(Duration::from_secs(10), Duration::from_secs(60)),
+    );
+    let mut rx = handle.snapshot_rx.clone();
+    rx.changed().await.expect("initial full refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 1);
+    assert_eq!(cloud_agent.0.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    rx.changed().await.expect("fast refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 2);
+    assert_eq!(cloud_agent.0.load(Ordering::SeqCst), 1, "cloud agents should wait for the slow cadence");
+
+    handle.trigger_refresh();
+    rx.changed().await.expect("manual full refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 3);
+    assert_eq!(cloud_agent.0.load(Ordering::SeqCst), 2, "manual refresh should include slow providers");
+}
+
+#[tokio::test(start_paused = true)]
+async fn staggered_schedule_delays_the_initial_full_refresh() {
+    let workspace_manager = Arc::new(CountingWorkspaceManager(AtomicUsize::new(0)));
+    let mut registry = ProviderRegistry::new();
+    registry.presentation_managers.insert("workspace", desc("Workspace"), workspace_manager.clone());
+    let schedule = RefreshSchedule {
+        startup_offset: Duration::from_secs(3),
+        fast: RefreshCadence { interval: Duration::from_secs(10), offset: Duration::from_secs(3) },
+        slow: RefreshCadence { interval: Duration::from_secs(60), offset: Duration::from_secs(20) },
+    };
+
+    let handle = RepoRefreshHandle::spawn_with_schedule(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        schedule,
+    );
+    let mut rx = handle.snapshot_rx.clone();
+    tokio::task::yield_now().await;
+    assert!(!rx.has_changed().expect("refresh sender alive"));
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    assert!(!rx.has_changed().expect("refresh sender alive"));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    rx.changed().await.expect("staggered initial refresh");
+    assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn repo_refresh_schedules_have_stable_distinct_offsets() {
+    let fast = Duration::from_secs(10);
+    let slow = Duration::from_secs(60);
+    let first = RefreshSchedule::for_repo(Path::new("/repos/first"), fast, slow);
+    let first_again = RefreshSchedule::for_repo(Path::new("/repos/first"), fast, slow);
+    let second = RefreshSchedule::for_repo(Path::new("/repos/second"), fast, slow);
+
+    assert_eq!(first.fast.offset, first_again.fast.offset);
+    assert_eq!(first.slow.offset, first_again.slow.offset);
+    assert_eq!(first.startup_offset, first_again.startup_offset);
+    assert_ne!(first.fast.offset, second.fast.offset);
+    assert_ne!(first.slow.offset, second.slow.offset);
+    assert_ne!(first.startup_offset, second.startup_offset);
+    assert!(first.startup_offset < Duration::from_secs(1));
+    assert!(first.fast.offset < fast);
+    assert!(first.slow.offset < slow);
+}
+
+#[tokio::test(start_paused = true)]
+async fn fast_refresh_preserves_slow_provider_errors_and_health() {
+    let mut registry = ProviderRegistry::new();
+    registry.cloud_agents.insert("cloud", desc("Cloud"), Arc::new(MockCloudAgent::failing("offline")));
+    let handle = RepoRefreshHandle::spawn_with_schedule(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        RefreshSchedule::without_stagger(Duration::from_secs(10), Duration::from_secs(60)),
+    );
+    let mut rx = handle.snapshot_rx.clone();
+    rx.changed().await.expect("initial full refresh");
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    rx.changed().await.expect("fast refresh");
+    let snapshot = rx.borrow().clone();
+
+    assert!(snapshot.errors.iter().any(|error| error.category == "sessions" && error.message == "offline"));
+    assert_eq!(snapshot.provider_health.get(&("cloud_agent", "Cloud".into())), Some(&false));
 }
 
 #[test]

@@ -4,7 +4,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, LazyLock, Mutex,
     },
-    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -12,13 +11,14 @@ use reqwest;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::providers::{http_execute, run, types::*, CommandRunner, HttpClient};
+use crate::providers::{http_execute, run, scan_cache::SharedScan, types::*, CommandRunner, HttpClient};
 
 pub struct ClaudeCodingAgent {
     provider_name: String,
     runner: Arc<dyn CommandRunner>,
     http: Arc<dyn HttpClient>,
-    sessions_cache: Mutex<SessionsCache>,
+    sessions: SharedScan<Vec<WebSession>>,
+    known_session_ids: Mutex<std::collections::HashSet<String>>,
     auth_warned: AtomicBool,
 }
 
@@ -28,13 +28,28 @@ impl ClaudeCodingAgent {
             provider_name,
             runner,
             http,
-            sessions_cache: Mutex::new(SessionsCache {
-                sessions: Vec::new(),
-                fetched_at: None,
-                known_ids: std::collections::HashSet::new(),
-            }),
+            sessions: SharedScan::new(std::time::Duration::from_secs(SESSIONS_CACHE_TTL_SECS)),
+            known_session_ids: Mutex::new(std::collections::HashSet::new()),
             auth_warned: AtomicBool::new(false),
         }
+    }
+
+    fn log_session_changes(&self, fetched: &[WebSession]) {
+        let mut known_ids = self.known_session_ids.lock().expect("Claude known session IDs lock poisoned");
+        let new_ids: std::collections::HashSet<String> = fetched.iter().map(|session| session.id.clone()).collect();
+        if !known_ids.is_empty() {
+            for session in fetched {
+                if !known_ids.contains(&session.id) {
+                    info!(provider = "claude", title = %session.title, id = %session.id, "session appeared");
+                }
+            }
+            for old_id in &*known_ids {
+                if !new_ids.contains(old_id) {
+                    info!(provider = "claude", id = %old_id, "session gone");
+                }
+            }
+        }
+        *known_ids = new_ids;
     }
 }
 
@@ -114,15 +129,7 @@ impl WebSession {
     }
 }
 
-// ---------- sessions cache ----------
-
-struct SessionsCache {
-    sessions: Vec<WebSession>,
-    fetched_at: Option<Instant>,
-    known_ids: std::collections::HashSet<String>,
-}
-
-const SESSIONS_CACHE_TTL_SECS: u64 = 30;
+const SESSIONS_CACHE_TTL_SECS: u64 = 60;
 const CLAUDE_API_BASE_URL: &str = "https://api.anthropic.com";
 
 fn sessions_url_for(base_url: &str) -> String {
@@ -252,47 +259,15 @@ impl ClaudeCodingAgent {
 #[async_trait]
 impl super::CloudAgentService for ClaudeCodingAgent {
     async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, CloudAgentSession)>, String> {
-        // Check instance cache
-        let cached = {
-            let cache = self.sessions_cache.lock().unwrap();
-            if let Some(fetched_at) = cache.fetched_at {
-                if fetched_at.elapsed().as_secs() < SESSIONS_CACHE_TTL_SECS {
-                    Some(cache.sessions.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        let sessions = if let Some(sessions) = cached {
-            debug!(provider = "claude", "Claude sessions: cache hit");
-            sessions
-        } else {
-            let fetched = self.fetch_sessions(CLAUDE_API_BASE_URL).await?;
-            debug!(provider = "claude", count = fetched.len(), "Claude sessions: fetched from API");
-
-            // Diff against known IDs and log additions/removals at INFO
-            let mut cache = self.sessions_cache.lock().unwrap();
-            let new_ids: std::collections::HashSet<String> = fetched.iter().map(|s| s.id.clone()).collect();
-            if !cache.known_ids.is_empty() {
-                for s in &fetched {
-                    if !cache.known_ids.contains(&s.id) {
-                        info!(provider = "claude", title = %s.title, id = %s.id, "session appeared");
-                    }
-                }
-                for old_id in &cache.known_ids {
-                    if !new_ids.contains(old_id) {
-                        info!(provider = "claude", id = %old_id, "session gone");
-                    }
-                }
-            }
-            cache.known_ids = new_ids;
-            cache.sessions = fetched.clone();
-            cache.fetched_at = Some(Instant::now());
-            fetched
-        };
+        let sessions = self
+            .sessions
+            .get_or_scan(|| async {
+                let fetched = self.fetch_sessions(CLAUDE_API_BASE_URL).await?;
+                debug!(provider = "claude", count = fetched.len(), "Claude sessions: fetched from API");
+                self.log_session_changes(&fetched);
+                Ok(fetched)
+            })
+            .await?;
 
         // No remote slug means no cloud sessions can match this repo
         let Some(ref slug) = criteria.repo_slug else {
@@ -338,7 +313,11 @@ impl super::CloudAgentService for ClaudeCodingAgent {
     }
 
     async fn archive_session(&self, session_id: &str) -> Result<(), String> {
-        self.archive_session_inner(session_id, CLAUDE_API_BASE_URL).await
+        let result = self.archive_session_inner(session_id, CLAUDE_API_BASE_URL).await;
+        if result.is_ok() {
+            self.sessions.invalidate();
+        }
+        result
     }
 
     async fn attach_command(&self, session_id: &str) -> Result<String, String> {
@@ -348,7 +327,10 @@ impl super::CloudAgentService for ClaudeCodingAgent {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -385,6 +367,45 @@ mod tests {
 
     fn make_agent(runner: Arc<dyn CommandRunner>, http: Arc<dyn crate::providers::HttpClient>) -> ClaudeCodingAgent {
         ClaudeCodingAgent::new("claude".into(), runner, http)
+    }
+
+    struct CountingSessionsHttp {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl crate::providers::HttpClient for CountingSessionsHttp {
+        async fn execute(
+            &self,
+            _request: reqwest::Request,
+            _label: &crate::providers::ChannelLabel,
+        ) -> Result<http::Response<bytes::Bytes>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            Ok(http::Response::builder()
+                .status(200)
+                .body(bytes::Bytes::from_static(
+                    br#"{"data":[{"id":"one","title":"One","session_status":"running","updated_at":"2026-03-01T00:00:00Z","session_context":{"outcomes":[]}}]}"#,
+                ))
+                .expect("session response"))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_repo_projections_share_one_account_wide_session_fetch() {
+        let _test_lock = TEST_LOCK.lock().await;
+        reset_auth_state();
+        let runner = mock_runner(vec![Ok(token_json("shared", now_epoch_secs() + 3600))]);
+        let http = Arc::new(CountingSessionsHttp { calls: AtomicUsize::new(0) });
+        let agent = make_agent(runner, http.clone());
+
+        let repo_a = RepoCriteria { repo_slug: Some("owner/a".into()) };
+        let repo_b = RepoCriteria { repo_slug: Some("owner/b".into()) };
+        let (first, second) = tokio::join!(agent.list_sessions(&repo_a), agent.list_sessions(&repo_b));
+
+        first.expect("first repo projection");
+        second.expect("second repo projection");
+        assert_eq!(http.calls.load(Ordering::SeqCst), 1, "account-wide fetch should be shared before filtering by repo");
     }
 
     #[tokio::test]
@@ -477,46 +498,42 @@ mod tests {
         let session = replay::test_session(empty_fixture.to_str().unwrap(), replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = make_agent(runner, http);
-        {
-            let mut cache = agent.sessions_cache.lock().unwrap();
-            cache.sessions = vec![
-                WebSession {
-                    id: "one".into(),
-                    title: "One".into(),
-                    session_status: "running".into(),
-                    created_at: String::new(),
-                    updated_at: "2026-03-05T00:00:00Z".into(),
-                    session_context: SessionContext {
-                        model: "sonnet".into(),
-                        outcomes: vec![SessionOutcome {
-                            git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-a".into()], repo: Some("owner/repo".into()) }),
-                        }],
-                    },
+        agent.sessions.seed(vec![
+            WebSession {
+                id: "one".into(),
+                title: "One".into(),
+                session_status: "running".into(),
+                created_at: String::new(),
+                updated_at: "2026-03-05T00:00:00Z".into(),
+                session_context: SessionContext {
+                    model: "sonnet".into(),
+                    outcomes: vec![SessionOutcome {
+                        git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-a".into()], repo: Some("owner/repo".into()) }),
+                    }],
                 },
-                WebSession {
-                    id: "two".into(),
-                    title: "Two".into(),
-                    session_status: "something-else".into(),
-                    created_at: String::new(),
-                    updated_at: "2026-03-04T00:00:00Z".into(),
-                    session_context: SessionContext { model: String::new(), outcomes: vec![SessionOutcome { git_info: None }] },
+            },
+            WebSession {
+                id: "two".into(),
+                title: "Two".into(),
+                session_status: "something-else".into(),
+                created_at: String::new(),
+                updated_at: "2026-03-04T00:00:00Z".into(),
+                session_context: SessionContext { model: String::new(), outcomes: vec![SessionOutcome { git_info: None }] },
+            },
+            WebSession {
+                id: "skip".into(),
+                title: "Skip".into(),
+                session_status: "running".into(),
+                created_at: String::new(),
+                updated_at: "2026-03-03T00:00:00Z".into(),
+                session_context: SessionContext {
+                    model: "opus".into(),
+                    outcomes: vec![SessionOutcome {
+                        git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-b".into()], repo: Some("other/repo".into()) }),
+                    }],
                 },
-                WebSession {
-                    id: "skip".into(),
-                    title: "Skip".into(),
-                    session_status: "running".into(),
-                    created_at: String::new(),
-                    updated_at: "2026-03-03T00:00:00Z".into(),
-                    session_context: SessionContext {
-                        model: "opus".into(),
-                        outcomes: vec![SessionOutcome {
-                            git_info: Some(SessionGitInfo { branches: vec!["refs/heads/feat-b".into()], repo: Some("other/repo".into()) }),
-                        }],
-                    },
-                },
-            ];
-            cache.fetched_at = Some(Instant::now());
-        }
+            },
+        ]);
 
         let sessions = agent.list_sessions(&RepoCriteria { repo_slug: Some("owner/repo".into()) }).await.expect("list sessions");
 

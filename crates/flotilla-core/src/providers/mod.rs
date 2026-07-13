@@ -9,6 +9,7 @@ pub mod issue_query;
 pub mod issue_tracker;
 pub mod presentation;
 pub mod registry;
+pub(crate) mod scan_cache;
 pub mod ssh_runner;
 pub mod terminal;
 pub mod types;
