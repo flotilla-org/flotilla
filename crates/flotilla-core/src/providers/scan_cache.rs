@@ -24,7 +24,7 @@ pub(crate) struct SharedScan<T> {
 
 struct CachedScan<T> {
     scanned_at: Instant,
-    result: Result<T, String>,
+    result: T,
 }
 
 impl<T: Clone> SharedScan<T> {
@@ -38,18 +38,18 @@ impl<T: Clone> SharedScan<T> {
         Fut: Future<Output = Result<T, String>>,
     {
         if let Some(result) = self.fresh_result() {
-            return result;
+            return Ok(result);
         }
 
         let _guard = self.scan_lock.lock().await;
         if let Some(result) = self.fresh_result() {
-            return result;
+            return Ok(result);
         }
 
-        let result = scan().await;
+        let result = scan().await?;
         *self.result.lock().expect("shared scan result lock poisoned") =
             Some(CachedScan { scanned_at: Instant::now(), result: result.clone() });
-        result
+        Ok(result)
     }
 
     pub(crate) fn invalidate(&self) {
@@ -58,10 +58,10 @@ impl<T: Clone> SharedScan<T> {
 
     #[cfg(test)]
     pub(crate) fn seed(&self, value: T) {
-        *self.result.lock().expect("shared scan result lock poisoned") = Some(CachedScan { scanned_at: Instant::now(), result: Ok(value) });
+        *self.result.lock().expect("shared scan result lock poisoned") = Some(CachedScan { scanned_at: Instant::now(), result: value });
     }
 
-    fn fresh_result(&self) -> Option<Result<T, String>> {
+    fn fresh_result(&self) -> Option<T> {
         self.result
             .lock()
             .expect("shared scan result lock poisoned")
@@ -188,6 +188,29 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+
+    #[tokio::test]
+    async fn failed_scans_are_retried_instead_of_cached() {
+        let scan = SharedScan::new(Duration::from_secs(10));
+        let calls = AtomicUsize::new(0);
+
+        let first = scan
+            .get_or_scan(|| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<usize, _>("transient failure".to_string())
+            })
+            .await;
+        let second = scan
+            .get_or_scan(|| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            })
+            .await;
+
+        assert_eq!(first, Err("transient failure".to_string()));
+        assert_eq!(second, Ok(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     struct CountingPresentationManager {
         calls: AtomicUsize,

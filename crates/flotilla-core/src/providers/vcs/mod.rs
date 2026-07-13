@@ -262,6 +262,20 @@ mod tests {
         assert!(keys.is_empty());
     }
 
+    #[tokio::test]
+    async fn batch_issue_links_do_not_cross_match_branch_prefixes() {
+        let runner =
+            MockRunner::new(vec![Ok(
+                concat!("branch.main.flotilla.issues.github 1\n", "branch.main-2.flotilla.issues.github 2\n",).to_string()
+            )]);
+        let branches = vec!["main".to_string(), "main-2".to_string()];
+
+        let links = read_branch_issue_links_batch(Path::new("/repo"), &branches, &runner).await;
+
+        assert_eq!(links["main"], vec![AssociationKey::IssueRef("github".into(), "1".into())]);
+        assert_eq!(links["main-2"], vec![AssociationKey::IssueRef("github".into(), "2".into())]);
+    }
+
     #[test]
     fn parse_ahead_behind_normal() {
         let ab = parse_ahead_behind("3\t5\n").expect("should parse");
