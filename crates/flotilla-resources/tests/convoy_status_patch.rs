@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use chrono::{TimeZone, Utc};
 use flotilla_resources::{
     controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec,
-    CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
+    CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 
 fn ts(seconds: i64) -> chrono::DateTime<Utc> {
@@ -51,7 +52,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
 fn pending_task() -> WorkState {
     WorkState {
         phase: WorkPhase::Pending,
-        completion_overridden: false,
+        completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
         started_at: None,
         finished_at: None,
@@ -71,7 +72,7 @@ fn crew_completion_updates_only_the_calling_agent() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Running,
-            completion_overridden: false,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
             started_at: Some(ts(9)),
             finished_at: None,
@@ -135,7 +136,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Complete,
-            completion_overridden: true,
+            completion_authority: WorkCompletionAuthority::HumanOverride,
             ready_at: Some(ts(8)),
             started_at: Some(ts(9)),
             finished_at: Some(ts(16)),
@@ -162,7 +163,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     )
     .apply(&mut status);
 
-    assert!(!status.work["implement"].completion_overridden);
+    assert_eq!(status.work["implement"].completion_authority, WorkCompletionAuthority::CrewRollup);
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["coder"].finished_at, None);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::HandedBack);
@@ -179,7 +180,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Launching,
-            completion_overridden: false,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(8)),
             started_at: Some(ts(9)),
             finished_at: None,
@@ -243,7 +244,7 @@ fn advance_work_to_ready_updates_only_selected_tasks() {
             ("implement".to_string(), pending_task()),
             ("review".to_string(), WorkState {
                 phase: WorkPhase::Complete,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(5)),
                 started_at: Some(ts(6)),
                 finished_at: Some(ts(7)),
@@ -276,7 +277,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         work: BTreeMap::from([
             ("implement".to_string(), WorkState {
                 phase: WorkPhase::Failed,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(10)),
                 started_at: Some(ts(11)),
                 finished_at: Some(ts(12)),
@@ -285,7 +286,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
             }),
             ("review".to_string(), WorkState {
                 phase: WorkPhase::Running,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: Some(ts(20)),
                 started_at: Some(ts(21)),
                 finished_at: None,
@@ -316,7 +317,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
 fn roll_up_phase_only_touches_convoy_level_fields() {
     let review = WorkState {
         phase: WorkPhase::Complete,
-        completion_overridden: false,
+        completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: Some(ts(10)),
         started_at: Some(ts(11)),
         finished_at: Some(ts(12)),
@@ -351,7 +352,7 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("review".to_string(), WorkState {
             phase: WorkPhase::Running,
-            completion_overridden: false,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: Some(ts(10)),
             started_at: Some(ts(11)),
             finished_at: None,
@@ -372,7 +373,7 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
 
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.work["review"].phase, WorkPhase::Complete);
-    assert!(status.work["review"].completion_overridden);
+    assert_eq!(status.work["review"].completion_authority, WorkCompletionAuthority::HumanOverride);
     assert_eq!(status.work["review"].finished_at, Some(ts(50)));
     assert_eq!(status.work["review"].message.as_deref(), Some("done"));
 }
@@ -384,7 +385,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Running,
-            completion_overridden: false,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
             ready_at: None,
             started_at: None,
             finished_at: None,
@@ -408,7 +409,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
     external_patches::force_work_completed("implement".to_string(), ts(50), Some("human override".to_string())).apply(&mut status);
 
     assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
-    assert!(status.work["implement"].completion_overridden);
+    assert_eq!(status.work["implement"].completion_authority, WorkCompletionAuthority::HumanOverride);
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::HandedBack);
     assert_eq!(status.crew_work["implement"]["reviewer"].finished_at, None);

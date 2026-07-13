@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::{
     controller_patches, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement,
-    WorkPhase, WorkState, WorkflowSnapshot,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
     canonicalize_repo_url,
@@ -297,7 +297,7 @@ fn bootstrap_outcome(
         .map(|vessel| {
             (vessel.name.clone(), WorkState {
                 phase: WorkPhase::Pending,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,
@@ -493,7 +493,7 @@ fn roll_up_crew_work_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -
         let Some(crew) = status.crew_work.get(work).filter(|crew| !crew.is_empty()) else {
             continue;
         };
-        if work_state.completion_overridden {
+        if work_state.completion_authority == WorkCompletionAuthority::HumanOverride {
             continue;
         }
         if let Some((role, failed)) = crew.iter().find(|(_, state)| state.phase == CrewWorkPhase::Failed) {

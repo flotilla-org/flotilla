@@ -8,7 +8,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
     CrewWorkState, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector, StatusPatch,
-    VesselRequirement, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -218,7 +218,7 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
 pub fn pending_task_state() -> WorkState {
     WorkState {
         phase: WorkPhase::Pending,
-        completion_overridden: false,
+        completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
         started_at: None,
         finished_at: None,

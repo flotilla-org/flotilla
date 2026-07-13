@@ -100,8 +100,9 @@ spec:
                       phase:
                         type: string
                         enum: [Pending, Ready, Launching, Running, Complete, Failed, Cancelled]
-                      completion_overridden:
-                        type: boolean
+                      completion_authority:
+                        type: string
+                        enum: [CrewRollup, HumanOverride]
                       ready_at:
                         type: string
                         format: date-time

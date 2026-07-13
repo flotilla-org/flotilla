@@ -11,10 +11,6 @@ pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ReconcileOutcome};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch);
 
-fn bool_is_false(value: &bool) -> bool {
-    !*value
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
@@ -93,8 +89,8 @@ pub struct WorkState {
     pub phase: WorkPhase,
     /// A human explicitly completed this vessel's work at the roll-up level.
     /// Crew-owned state remains unchanged while this override is active.
-    #[serde(default, skip_serializing_if = "bool_is_false")]
-    pub completion_overridden: bool,
+    #[serde(default, skip_serializing_if = "WorkCompletionAuthority::is_crew_rollup")]
+    pub completion_authority: WorkCompletionAuthority,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,6 +112,19 @@ pub enum WorkPhase {
     Complete,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WorkCompletionAuthority {
+    #[default]
+    CrewRollup,
+    HumanOverride,
+}
+
+impl WorkCompletionAuthority {
+    fn is_crew_rollup(&self) -> bool {
+        *self == Self::CrewRollup
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -251,7 +260,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
                 for work in completion_overrides {
                     if let Some(state) = status.work.get_mut(work) {
-                        state.completion_overridden = true;
+                        state.completion_authority = WorkCompletionAuthority::HumanOverride;
                     }
                 }
             }
@@ -301,7 +310,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::WorkRunning { work, started_at } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
-                    state.completion_overridden = false;
+                    state.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(crew) = status.crew_work.get_mut(work) {
                     for state in crew.values_mut().filter(|state| state.phase == CrewWorkPhase::Pending) {
@@ -313,7 +322,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ForceWorkCompleted { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Complete;
-                    state.completion_overridden = true;
+                    state.completion_authority = WorkCompletionAuthority::HumanOverride;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
                 }
@@ -340,7 +349,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
-                    work.completion_overridden = false;
+                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.phase = CrewWorkPhase::Failed;
@@ -350,7 +359,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
                 if let Some(work) = status.work.get_mut(vessel) {
-                    work.completion_overridden = false;
+                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 let Some(crew) = status.crew_work.get_mut(vessel) else {
                     return;
@@ -375,7 +384,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RollUpWork { work, phase, transitioned_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = *phase;
-                    state.completion_overridden = false;
+                    state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = message.clone();
                     match phase {
                         WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {

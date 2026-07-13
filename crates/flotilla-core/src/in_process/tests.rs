@@ -19,8 +19,8 @@ use flotilla_resources::{
     LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Selector, TerminalBrief, TerminalCrewContext,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -327,7 +327,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
                 phase: WorkPhase::Running,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,
@@ -2147,7 +2147,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             workflow_snapshot: None,
             work: [("implement".to_string(), WorkState {
                 phase: WorkPhase::Running,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,
@@ -2374,7 +2374,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             workflow_snapshot: None,
             work: [("implement".to_string(), WorkState {
                 phase: WorkPhase::Running,
-                completion_overridden: false,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,

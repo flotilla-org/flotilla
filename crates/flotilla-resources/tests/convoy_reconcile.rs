@@ -12,7 +12,8 @@ use flotilla_resources::{
     controller::{Actuation, Reconciler},
     controller_patches, reconcile, repo_key, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, CrewSource,
     CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend,
-    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_LABEL,
 };
 
 async fn reconcile_once_with_resources(
@@ -658,7 +659,7 @@ fn human_completion_override_is_not_reopened_by_crew_rollup() {
     status.phase = ConvoyPhase::Active;
     let implement = status.work.get_mut("implement").expect("implement work");
     implement.phase = WorkPhase::Complete;
-    implement.completion_overridden = true;
+    implement.completion_authority = WorkCompletionAuthority::HumanOverride;
     implement.finished_at = Some(timestamp(20));
     status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));

@@ -31,7 +31,7 @@ pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{
     controller_patches, external_patches, provisioning_patches, reconcile, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler,
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InputValue, PlacementStatus,
-    ReconcileOutcome, WorkPhase, WorkState, WorkflowSnapshot,
+    ReconcileOutcome, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 pub use environment::{
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,

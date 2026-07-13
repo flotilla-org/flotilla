@@ -17,7 +17,7 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend,
-    VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_tui::{app::App, theme::Theme};
 
@@ -171,7 +171,7 @@ async fn x_then_enter_completes_work_via_palette() {
     let mut tasks = BTreeMap::new();
     tasks.insert("implement".to_string(), WorkState {
         phase: WorkPhase::Pending,
-        completion_overridden: false,
+        completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
         started_at: None,
         finished_at: None,
