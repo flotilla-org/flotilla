@@ -357,12 +357,25 @@ impl AttachableStoreState {
     }
 
     fn remove_member_link(&mut self, set_id: &AttachableSetId, attachable_id: &AttachableId) -> bool {
-        if let Some(set) = self.registry.sets.get_mut(set_id) {
+        let changed = if let Some(set) = self.registry.sets.get_mut(set_id) {
             let original_len = set.members.len();
             set.members.retain(|member| member != attachable_id);
-            return set.members.len() != original_len;
+            set.members.len() != original_len
+        } else {
+            false
+        };
+        if changed {
+            let is_empty = self.registry.sets.get(set_id).is_some_and(|set| set.members.is_empty());
+            let is_bound = self
+                .registry
+                .bindings
+                .iter()
+                .any(|binding| binding.object_kind == BindingObjectKind::AttachableSet && binding.object_id == set_id.as_str());
+            if is_empty && !is_bound {
+                self.registry.sets.shift_remove(set_id);
+            }
         }
-        false
+        changed
     }
 
     fn remove_set(&mut self, id: &AttachableSetId) -> Option<RemovedSetInfo> {

@@ -1,9 +1,9 @@
 use std::{collections::HashMap, path::Path};
 
-use flotilla_protocol::{provider_data::Issue, CommandValue, HostName};
+use flotilla_protocol::{provider_data::Issue, qualified_path::QualifiedPath, CommandValue, HostName};
 use tracing::{info, warn};
 
-use super::WorkspaceOrchestrator;
+use super::{known_local_checkout_key, WorkspaceOrchestrator};
 use crate::{
     attachable::SharedAttachableStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -215,6 +215,7 @@ impl<'a> TeleportSessionActionService<'a> {
     pub(super) async fn create_workspace_for_teleport(
         &self,
         checkout_path: &Path,
+        checkout_key: &QualifiedPath,
         branch: Option<&str>,
         teleport_cmd: &str,
     ) -> Result<(), String> {
@@ -228,14 +229,12 @@ impl<'a> TeleportSessionActionService<'a> {
             self.terminal_manager,
         );
         let name = branch.unwrap_or("session");
-        workspace_orchestrator.create_workspace_for_teleport(checkout_path, name, teleport_cmd).await
+        workspace_orchestrator.create_workspace_for_teleport(checkout_path, Some(checkout_key), name, teleport_cmd).await
     }
 
     fn checkout_path_from_key(&self, checkout_key: Option<&ExecutionEnvironmentPath>) -> Option<ExecutionEnvironmentPath> {
-        checkout_key.and_then(|key| {
-            let host_key = flotilla_protocol::qualified_path::QualifiedPath::from_host_name(self.local_host, key.as_path().to_path_buf());
-            self.read_only.providers_data.checkouts.get(&host_key).map(|_| key.clone())
-        })
+        checkout_key
+            .and_then(|key| known_local_checkout_key(self.read_only.providers_data, key.as_path(), self.local_host).map(|_| key.clone()))
     }
 }
 

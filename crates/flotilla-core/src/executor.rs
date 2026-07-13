@@ -51,6 +51,14 @@ fn display_host_for_checkout_path(providers_data: &ProviderData, checkout_path: 
     })
 }
 
+fn known_local_checkout_key<'a>(
+    providers_data: &'a ProviderData,
+    checkout_path: &Path,
+    local_host: &HostName,
+) -> Option<&'a QualifiedPath> {
+    providers_data.checkouts.keys().find(|key| key.path == checkout_path && checkout_is_local_owned(key, local_host))
+}
+
 fn workspace_label_for_host(
     label: &str,
     target_node_id: &NodeId,
@@ -763,7 +771,10 @@ impl StepResolver for ExecutorStepResolver {
                     &self.local_host,
                     tm.as_ref(),
                 );
-                service.create_workspace_for_teleport(&path, branch.as_deref(), &cmd).await?;
+                let checkout_key = known_local_checkout_key(self.providers_data.as_ref(), &path, &self.local_host)
+                    .cloned()
+                    .unwrap_or_else(|| QualifiedPath::host(self.environment_manager.local_host_id().clone(), path.clone()));
+                service.create_workspace_for_teleport(&path, &checkout_key, branch.as_deref(), &cmd).await?;
                 Ok(StepOutcome::Completed)
             }
             StepAction::ArchiveSession { session_id } => {
@@ -828,11 +839,11 @@ impl StepResolver for ExecutorStepResolver {
                 let workspace_config =
                     workspace_config(self.repo.root.as_path(), &label, checkout_path.as_path(), "claude", self.config_base.as_path());
                 let template_yaml = workspace_config.template_yaml.clone();
-                let prepared_commands = if let Some(ref tm) = tm {
+                let prepared_commands = if let (Some(tm), Some(set_id)) = (tm.as_ref(), attachable_set_id.as_ref()) {
                     let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
                     let workspace_config = workspace_config.clone();
                     terminal_preparation
-                        .prepare_terminal_commands(&branch, checkout_path.as_path(), &[], move || workspace_config.clone())
+                        .prepare_terminal_commands(set_id, &branch, checkout_path.as_path(), &[], move || workspace_config.clone())
                         .await?
                 } else {
                     let workspace_config = workspace_config.clone();
@@ -974,11 +985,11 @@ impl StepResolver for ExecutorStepResolver {
                         Some(&checkout_key),
                         None,
                     );
-                    let commands = if let Some(ref tm) = tm {
+                    let commands = if let (Some(tm), Some(set_id)) = (tm.as_ref(), attachable_set_id.as_ref()) {
                         let terminal_preparation =
                             TerminalPreparationService::new(tm, self.daemon_socket_path.as_ref().map(|p| p.as_path()));
                         terminal_preparation
-                            .prepare_terminal_commands(&co.branch, checkout_path.as_path(), &requested_commands, || {
+                            .prepare_terminal_commands(set_id, &co.branch, checkout_path.as_path(), &requested_commands, || {
                                 workspace_config(
                                     self.repo.root.as_path(),
                                     &co.branch,

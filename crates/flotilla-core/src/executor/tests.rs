@@ -1005,12 +1005,15 @@ async fn teleport_session_creates_workspace_even_when_one_exists() {
 #[tokio::test]
 async fn teleport_session_persists_workspace_binding() {
     let workspace_manager = Arc::new(MockWorkspaceManager::succeeding());
+    let terminal_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
+    registry.terminal_pools.insert("shpool", desc("shpool"), terminal_pool);
     let mut data = empty_data();
     data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
-    data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
+    let checkout_key = QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat");
+    data.checkouts.insert(checkout_key.clone(), TestCheckout::new("feat").build());
     let runner = runner_ok();
     let temp = tempfile::tempdir().expect("tempdir");
     let attachable_store = test_attachable_store(&DaemonHostPath::new(temp.path()));
@@ -1036,7 +1039,9 @@ async fn teleport_session_persists_workspace_binding() {
         .lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref")
         .expect("workspace binding should exist");
     let set = store.registry().sets.values().find(|set| set.id.as_str() == object_id).expect("set should exist");
-    assert_eq!(set.checkout, Some(HostPath::new(local_host(), PathBuf::from("/repo/wt-feat")).into()));
+    assert_eq!(store.registry().sets.len(), 1, "teleport should use one canonical attachable set");
+    assert_eq!(set.checkout, Some(checkout_key));
+    assert!(!set.members.is_empty(), "workspace binding should point to the set holding the terminal");
 }
 // -----------------------------------------------------------------------
 // Tests: SelectWorkspace
@@ -1843,23 +1848,35 @@ async fn teleport_session_uses_provider_specific_attach_command() {
 
 #[tokio::test]
 async fn teleport_session_with_branch_creates_checkout() {
+    let terminal_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
+    registry.terminal_pools.insert("shpool", desc("shpool"), terminal_pool);
     let mut data = empty_data();
     data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
+    let attachable_store = crate::attachable::shared_in_memory_attachable_store();
 
-    let result = run_build_plan_to_completion(
+    let result = run_build_plan_to_completion_with(
         CommandAction::TeleportSession { session_id: "sess-1".to_string(), branch: Some("feat".to_string()), checkout_key: None },
         registry,
         data,
         runner,
+        repo_root(),
+        config_base(),
+        attachable_store.clone(),
     )
     .await;
 
     assert_ok(result);
+    let store = attachable_store.lock().expect("attachable store lock");
+    assert_eq!(store.registry().sets.len(), 1, "fresh teleport checkout should use one canonical set");
+    let set = store.registry().sets.values().next().expect("canonical set");
+    assert_eq!(set.checkout, Some(QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat")));
+    assert!(!set.members.is_empty(), "canonical set should hold the terminal");
+    assert_eq!(store.lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref"), Some(set.id.as_str()));
 }
 
 #[tokio::test]
@@ -2393,10 +2410,12 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     let mut registry = ProviderRegistry::new();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
+    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) }));
     let registry = Arc::new(registry);
     let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
     let providers_data = Arc::new(empty_data());
-    let cb = config_base();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cb = DaemonHostPath::new(temp.path());
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
     let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
@@ -2446,6 +2465,14 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     let store = attachable.lock().expect("attachable store lock");
     let matching_sets = store.sets_for_checkout(&expected_checkout);
     assert_eq!(matching_sets.len(), 1, "new checkout should create one attachable set with its stable qualified path");
+    assert_eq!(store.registry().sets.len(), 1, "workspace terminals must not create a second set for the same checkout");
+    let set = store.registry().sets.get(&matching_sets[0]).expect("canonical attachable set");
+    assert!(!set.members.is_empty(), "workspace terminals should belong to the canonical attachable set");
+    assert_eq!(
+        store.lookup_binding("workspace_manager", "cmux", BindingObjectKind::AttachableSet, "mock-ref"),
+        Some(set.id.as_str()),
+        "workspace binding should point at the terminal-holding set"
+    );
 }
 
 #[tokio::test]
@@ -3092,7 +3119,8 @@ async fn resolve_workspace_commands_no_template_uses_default() {
     };
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    service.resolve_workspace_commands(&mut config).await;
+    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
+    service.resolve_workspace_commands_in_set(&mut config, &set_id).await;
 
     // Default template has one "main" terminal entry
     assert!(config.resolved_commands.is_some());
@@ -3121,7 +3149,8 @@ content:
     };
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    service.resolve_workspace_commands(&mut config).await;
+    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
+    service.resolve_workspace_commands_in_set(&mut config, &set_id).await;
 
     // All content entries were non-terminal, so resolved_commands stays None
     assert!(config.resolved_commands.is_none());
@@ -3132,6 +3161,7 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
     let mock_pool: Arc<dyn TerminalPool> = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let store = crate::attachable::shared_in_memory_attachable_store();
     let tm = crate::terminal_manager::TerminalManager::new(mock_pool, store, HostName::local());
+    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
     let requested = vec![PreparedTerminalCommand { role: "main".into(), command: "claude".into() }, PreparedTerminalCommand {
@@ -3140,7 +3170,7 @@ async fn prepare_terminal_commands_wraps_requested_commands_via_terminal_manager
     }];
 
     let result = service
-        .prepare_terminal_commands("feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
+        .prepare_terminal_commands(&set_id, "feat", Path::new("/repo/wt"), &requested, || panic!("workspace config should not be built"))
         .await
         .expect("prepare requested terminal commands");
 
@@ -3167,7 +3197,8 @@ async fn resolve_workspace_commands_invalid_template_uses_default() {
     };
 
     let service = super::terminals::TerminalPreparationService::new(&tm, None);
-    service.resolve_workspace_commands(&mut config).await;
+    let set_id = tm.allocate_set(HostName::local(), HostPath::new(HostName::local(), "/repo/wt").into()).expect("allocate terminal set");
+    service.resolve_workspace_commands_in_set(&mut config, &set_id).await;
 
     let commands = config.resolved_commands.expect("invalid template should fall back to default template");
     assert_eq!(commands.len(), 1);

@@ -115,6 +115,37 @@ fn contract_ensure_terminal_attachable_uses_binding_as_primary_identity(store: &
     );
 }
 
+fn contract_moving_last_attachable_prunes_unbound_source_set(store: &mut impl AttachableStoreApi) {
+    let host = HostName::new("desktop");
+    let source_set_id = store.ensure_terminal_set(Some(host.clone()), Some(HostPath::new(host.clone(), "/repo/source").into()));
+    let target_set_id = store.ensure_terminal_set(Some(host.clone()), Some(HostPath::new(host, "/repo/target").into()));
+    let attachable_id = store.ensure_terminal_attachable(
+        &source_set_id,
+        "terminal_pool",
+        "shpool",
+        "session-1",
+        TerminalPurpose { checkout: "source".into(), role: "main".into(), index: 0 },
+        "claude",
+        ExecutionEnvironmentPath::new("/repo/source"),
+        TerminalStatus::Running,
+    );
+
+    let moved_id = store.ensure_terminal_attachable(
+        &target_set_id,
+        "terminal_pool",
+        "shpool",
+        "session-1",
+        TerminalPurpose { checkout: "target".into(), role: "main".into(), index: 0 },
+        "claude",
+        ExecutionEnvironmentPath::new("/repo/target"),
+        TerminalStatus::Running,
+    );
+
+    assert_eq!(moved_id, attachable_id);
+    assert!(!store.registry().sets.contains_key(&source_set_id), "unbound source set should be removed when its last member moves");
+    assert_eq!(store.registry().sets.get(&target_set_id).map(|set| set.members.as_slice()), Some([attachable_id].as_slice()));
+}
+
 fn contract_replacing_binding_is_deterministic(store: &mut impl AttachableStoreApi) {
     store.replace_binding(ProviderBinding {
         provider_category: "workspace_manager".into(),
@@ -282,6 +313,18 @@ fn file_backed_contract_ensure_terminal_attachable_uses_binding_as_primary_ident
 #[test]
 fn in_memory_contract_ensure_terminal_attachable_uses_binding_as_primary_identity() {
     contract_ensure_terminal_attachable_uses_binding_as_primary_identity(&mut InMemoryAttachableStore::new());
+}
+
+#[test]
+fn file_backed_contract_moving_last_attachable_prunes_unbound_source_set() {
+    contract_moving_last_attachable_prunes_unbound_source_set(&mut AttachableStore::with_base(&temp_base(
+        &tempfile::tempdir().expect("tempdir"),
+    )));
+}
+
+#[test]
+fn in_memory_contract_moving_last_attachable_prunes_unbound_source_set() {
+    contract_moving_last_attachable_prunes_unbound_source_set(&mut InMemoryAttachableStore::new());
 }
 
 #[test]
