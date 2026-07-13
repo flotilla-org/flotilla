@@ -888,6 +888,27 @@ fn handle_repo_removed_keeps_tab_open_as_dangling() {
 }
 
 #[test]
+fn handle_repo_removed_dismisses_modals_open_on_the_active_repo_tab() {
+    let mut app = stub_app_with_repos(2);
+    activate_repo_tab(&mut app, 0);
+    let active_identity = app.model.active_repo.clone().expect("repo tab active");
+    let other_identity = app.model.repo_order[1].clone();
+
+    // Stand-in for a modal that reads the active repo's labels
+    // unconditionally in render (the delete-confirm panic scenario from
+    // review) — any open modal must not outlive the repo it was opened on.
+    app.screen.modal_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+
+    // Untracking a DIFFERENT repo leaves the modal alone…
+    app.handle_repo_removed(&other_identity);
+    assert!(app.has_modal(), "modal survives removal of an inactive repo");
+
+    // …untracking the ACTIVE tab's repo dismisses it.
+    app.handle_repo_removed(&active_identity);
+    assert!(!app.has_modal(), "modal must not outlive the active tab's repo");
+}
+
+#[test]
 fn closing_a_dangling_tab_syncs_layout_from_new_active_page() {
     let mut app = stub_app_with_repos(2);
     // Give the two repo pages different layouts.

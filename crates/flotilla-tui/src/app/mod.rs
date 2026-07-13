@@ -1517,6 +1517,14 @@ impl App {
         self.repo_data.remove(repo_identity);
         self.issue_views.remove(repo_identity);
         self.screen.repo_pages.remove(repo_identity);
+        // A modal opened against this repo (action menu, delete/close
+        // confirm) must not outlive it: those widgets read the active repo's
+        // labels unconditionally during render, which panics once the repo
+        // is gone. RepoUntracked can arrive from another session at any
+        // moment, so dismiss modals when the active tab loses its repo.
+        if self.model.active_repo.as_ref() == Some(repo_identity) {
+            self.dismiss_modals();
+        }
     }
 
     pub fn selected_work_item(&self) -> Option<&WorkItem> {
