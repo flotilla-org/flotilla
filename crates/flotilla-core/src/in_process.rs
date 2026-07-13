@@ -327,7 +327,7 @@ impl AttachCandidateIndex {
             self.candidates
                 .iter()
                 .enumerate()
-                .filter(|(_, candidate)| candidate.references.iter().any(|candidate| candidate.starts_with(reference)))
+                .filter(|(_, candidate)| candidate.references.iter().any(|candidate_reference| candidate_reference.starts_with(reference)))
                 .map(|(index, _)| index)
                 .collect()
         });
@@ -2869,6 +2869,7 @@ impl InProcessDaemon {
     }
 
     pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<String, String> {
+        // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
