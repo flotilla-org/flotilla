@@ -62,6 +62,8 @@ pub struct Selector {
 pub enum ValidationError {
     DuplicateVesselName { name: String },
     DuplicateRoleInVessel { vessel: String, role: String },
+    ReservedAddressMarkerInVesselName { name: String },
+    ReservedAddressMarkerInCrewRole { vessel: String, role: String },
     ReservedLabelKey { vessel: String, role: String, key: String },
     UnknownDependency { vessel: String, missing: String },
     DependencyCycle { cycle: Vec<String> },
@@ -104,6 +106,12 @@ impl std::fmt::Display for ValidationError {
         match self {
             ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
             ValidationError::DuplicateRoleInVessel { vessel, role } => write!(f, "duplicate role `{role}` in vessel `{vessel}`"),
+            ValidationError::ReservedAddressMarkerInVesselName { name } => {
+                write!(f, "vessel name `{name}` may not begin with the reserved `@` address marker")
+            }
+            ValidationError::ReservedAddressMarkerInCrewRole { vessel, role } => {
+                write!(f, "crew role `{role}` on vessel `{vessel}` may not begin with the reserved `@` address marker")
+            }
             ValidationError::ReservedLabelKey { vessel, role, key } => {
                 write!(f, "reserved label key `{key}` on vessel `{vessel}` role `{role}`")
             }
@@ -161,6 +169,9 @@ fn collect_inputs(spec: &WorkflowTemplateSpec, errors: &mut Vec<ValidationError>
 fn collect_vessels<'a>(spec: &'a WorkflowTemplateSpec, errors: &mut Vec<ValidationError>) -> BTreeMap<String, &'a VesselRequirement> {
     let mut vessels_by_name = BTreeMap::new();
     for vessel in &spec.vessels {
+        if vessel.name.starts_with('@') {
+            push_error(errors, ValidationError::ReservedAddressMarkerInVesselName { name: vessel.name.clone() });
+        }
         if vessels_by_name.insert(vessel.name.clone(), vessel).is_some() {
             push_error(errors, ValidationError::DuplicateVesselName { name: vessel.name.clone() });
         }
@@ -182,6 +193,12 @@ fn validate_vessel(
     }
 
     for process in &vessel.crew {
+        if process.role.starts_with('@') {
+            push_error(errors, ValidationError::ReservedAddressMarkerInCrewRole {
+                vessel: vessel.name.clone(),
+                role: process.role.clone(),
+            });
+        }
         if !roles.insert(process.role.clone()) {
             push_error(errors, ValidationError::DuplicateRoleInVessel { vessel: vessel.name.clone(), role: process.role.clone() });
         }

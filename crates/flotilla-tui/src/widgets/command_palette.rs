@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use flotilla_commands::{resolved::HostQueryKind, HostResolution, RepoContext, Resolved};
+use flotilla_commands::{address_subject_for_cli, resolved::HostQueryKind, HostResolution, RepoContext, Resolved, SubjectNoun};
 use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector, WorkItem};
 use ratatui::{
     layout::Rect,
@@ -27,11 +27,11 @@ pub fn palette_prefill(item: &WorkItem) -> Option<String> {
     }
     if let Some(branch) = &item.branch {
         if item.checkout_key().is_some() {
-            return Some(format!("checkout {} ", branch));
+            return Some(format!("checkout {} ", address_subject_for_cli(SubjectNoun::Checkout, branch)));
         }
     }
     if let Some(issue_key) = item.issue_keys.first() {
-        return Some(format!("issue {} ", issue_key));
+        return Some(format!("issue {} ", address_subject_for_cli(SubjectNoun::Issue, issue_key)));
     }
     if let Some(session_key) = &item.session_key {
         return Some(format!("agent {} ", session_key));
@@ -970,6 +970,18 @@ mod tests {
     }
 
     #[test]
+    fn prefill_addresses_checkout_branch_that_collides_with_a_verb() {
+        let item = checkout_item("status", "/tmp/repo", false);
+        assert_eq!(palette_prefill(&item), Some("checkout @status ".into()));
+    }
+
+    #[test]
+    fn prefill_uses_literal_subject_for_checkout_branch_beginning_with_marker() {
+        let item = checkout_item("@topic", "/tmp/repo", false);
+        assert_eq!(palette_prefill(&item), Some("checkout --subject @topic ".into()));
+    }
+
+    #[test]
     fn prefill_from_session_key() {
         let item = session_item("ses-123");
         assert_eq!(palette_prefill(&item), Some("agent ses-123 ".into()));
@@ -980,6 +992,13 @@ mod tests {
         let mut item = bare_item();
         item.issue_keys = vec!["99".into()];
         assert_eq!(palette_prefill(&item), Some("issue 99 ".into()));
+    }
+
+    #[test]
+    fn prefill_addresses_issue_key_that_collides_with_a_verb() {
+        let mut item = bare_item();
+        item.issue_keys = vec!["open".into()];
+        assert_eq!(palette_prefill(&item), Some("issue @open ".into()));
     }
 
     #[test]

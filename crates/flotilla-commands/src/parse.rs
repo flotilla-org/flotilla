@@ -4,16 +4,17 @@ use crate::{
     commands::host::HostNounPartial,
     noun::NounCommand,
     resolved::{Refinable, Resolved},
+    subject::format_parse_error,
 };
 
 pub fn parse_noun_command(tokens: &[&str]) -> Result<NounCommand, String> {
     let cmd = <NounCommand as Subcommand>::augment_subcommands(ClapCommand::new("flotilla").no_binary_name(true));
-    let matches = cmd.try_get_matches_from(tokens).map_err(|e| e.to_string())?;
+    let matches = cmd.try_get_matches_from(tokens).map_err(format_parse_error)?;
     <NounCommand as FromArgMatches>::from_arg_matches(&matches).map_err(|e| e.to_string())
 }
 
 pub fn parse_host_command(tokens: &[&str]) -> Result<Resolved, String> {
-    let partial = HostNounPartial::try_parse_from(tokens).map_err(|e| e.to_string())?;
+    let partial = HostNounPartial::try_parse_from(tokens).map_err(format_parse_error)?;
     partial.refine()?.resolve()
 }
 

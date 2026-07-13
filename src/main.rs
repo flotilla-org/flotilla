@@ -187,7 +187,7 @@ impl Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    let mut cli = Cli::parse();
+    let mut cli = Cli::try_parse().unwrap_or_else(|error| exit_cli_parse_error(error));
     let format = OutputFormat::from_json_flag(cli.json);
     let command = cli.command.take();
 
@@ -244,6 +244,18 @@ async fn main() -> Result<()> {
 
         None => run_tui(cli, None).await,
     }
+}
+
+fn exit_cli_parse_error(error: clap::Error) -> ! {
+    let hint = flotilla_commands::subject_parse_hint(&error);
+    let exit_code = error.exit_code();
+    if let Err(print_error) = error.print() {
+        eprintln!("failed to print command-line error: {print_error}");
+    }
+    if let Some(hint) = hint {
+        eprintln!("\n{hint}");
+    }
+    std::process::exit(exit_code)
 }
 
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
@@ -1045,6 +1057,14 @@ mod tests {
         let handoff = Cli::try_parse_from(["flotilla", "crew", "reviewer", "handoff", "--message", "Review commit abc123"])
             .expect("crew handoff should parse");
         assert!(matches!(handoff.command, Some(SubCommand::Crew(_))));
+
+        let marked = Cli::try_parse_from(["flotilla", "crew", "@list", "handoff", "--message", "Review commit abc123"])
+            .expect("marked crew role should parse");
+        assert!(matches!(marked.command, Some(SubCommand::Crew(_))));
+
+        let literal = Cli::try_parse_from(["flotilla", "crew", "--subject", "@reviewer", "handoff", "--message", "Review commit abc123"])
+            .expect("literal crew role should parse");
+        assert!(matches!(literal.command, Some(SubCommand::Crew(_))));
     }
 
     #[test]

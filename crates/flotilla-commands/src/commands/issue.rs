@@ -3,15 +3,15 @@ use flotilla_protocol::{issue_query::IssueQuery, Command, CommandAction, RepoSel
 
 use crate::{
     resolved::{HostResolution, RepoContext},
-    Resolved,
+    Resolved, SubjectArgs,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Issues")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct IssueNoun {
-    /// Issue ID or comma-separated IDs (e.g. "1,5,7")
-    pub subject: Option<String>,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
 
     #[command(subcommand)]
     pub verb: Option<IssueVerb>,
@@ -29,7 +29,8 @@ pub enum IssueVerb {
 
 impl IssueNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        match (self.subject, self.verb) {
+        let subject = self.subjects.resolve()?.map(|subject| subject.value);
+        match (subject, self.verb) {
             (Some(subject), Some(IssueVerb::Open)) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
@@ -79,9 +80,7 @@ impl IssueNoun {
 impl std::fmt::Display for IssueNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "issue")?;
-        if let Some(subject) = &self.subject {
-            write!(f, " {subject}")?;
-        }
+        self.subjects.write(f)?;
         if let Some(verb) = &self.verb {
             match verb {
                 IssueVerb::Open => write!(f, " open")?,
@@ -107,7 +106,7 @@ mod tests {
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
+        Resolved, SubjectArgs,
     };
 
     fn parse(args: &[&str]) -> IssueNoun {
@@ -127,6 +126,22 @@ mod tests {
             repo: RepoContext::Inferred,
             host: HostResolution::ProviderHost,
         });
+    }
+
+    #[test]
+    fn marked_subject_disambiguates_issue_named_open() {
+        let resolved = parse(&["issue", "@open", "open"]).resolve().expect("resolve marked issue subject");
+        assert!(matches!(resolved, Resolved::NeedsContext { command: Command {
+            action: CommandAction::OpenIssue { id }, ..
+        }, .. } if id == "open"));
+    }
+
+    #[test]
+    fn explicit_subject_preserves_issue_beginning_with_marker() {
+        let resolved = parse(&["issue", "--subject", "@open", "open"]).resolve().expect("resolve explicit issue subject");
+        assert!(matches!(resolved, Resolved::NeedsContext { command: Command {
+            action: CommandAction::OpenIssue { id }, ..
+        }, .. } if id == "@open"));
     }
 
     #[test]
@@ -166,7 +181,7 @@ mod tests {
 
     #[test]
     fn issue_open_no_subject_errors() {
-        let noun = IssueNoun { subject: None, verb: Some(super::IssueVerb::Open) };
+        let noun = IssueNoun { subjects: SubjectArgs::default(), verb: Some(super::IssueVerb::Open) };
         assert!(noun.resolve().is_err());
     }
 

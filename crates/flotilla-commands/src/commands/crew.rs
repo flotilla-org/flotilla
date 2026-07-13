@@ -4,14 +4,15 @@ use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
 use crate::{
     quote_value,
     resolved::{HostResolution, RepoContext},
-    Resolved,
+    subject::{is_crew_command_subject, SubjectInterpretation},
+    Resolved, SubjectArgs,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+#[derive(Debug, Clone, PartialEq, Eq, Parser, bon::Builder)]
 #[command(about = "Communicate with crew members")]
 pub struct CrewNoun {
-    /// Target crew role, or `list`
-    pub subject: String,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
     #[command(subcommand)]
     pub verb: Option<CrewVerb>,
     /// Explicit crew identity (normally read from FLOTILLA_CREW_ID)
@@ -49,17 +50,22 @@ impl CrewNoun {
             .maybe_vessel_ref(self.vessel_ref)
             .maybe_role(self.role)
             .build();
-        let action = match (self.subject.as_str(), self.verb) {
-            ("list", None) if self.message.is_none() => CommandAction::QueryCrewList { context },
-            ("list", None) => return Err("`flotilla crew list` does not accept --message".to_string()),
-            ("list", Some(_)) => return Err("`flotilla crew list` does not accept a verb".to_string()),
-            ("complete", None) => CommandAction::CrewComplete { context, message: self.message },
-            ("fail", None) => CommandAction::CrewFail {
+        let subject = self.subjects.resolve()?.ok_or_else(|| "crew command requires a command or target subject".to_string())?;
+        let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
+            ("list", SubjectInterpretation::Ordinary, None) if self.message.is_none() => CommandAction::QueryCrewList { context },
+            ("list", SubjectInterpretation::Ordinary, None) => {
+                return Err("`flotilla crew list` does not accept --message".to_string());
+            }
+            ("complete", SubjectInterpretation::Ordinary, None) => CommandAction::CrewComplete { context, message: self.message },
+            ("fail", SubjectInterpretation::Ordinary, None) => CommandAction::CrewFail {
                 context,
                 message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
             },
-            (_, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: self.subject, message },
-            (_, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
+            (reserved, SubjectInterpretation::Ordinary, Some(_)) if is_crew_command_subject(reserved) => {
+                return Err(format!("`{reserved}` is a crew command; use `@{reserved}` to address the crew role"));
+            }
+            (_, _, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: subject.value, message },
+            (_, _, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
         };
         Ok(Resolved::NeedsContext {
             command: Command { node_id: None, provisioning_target: None, context_repo: None, action },
@@ -75,7 +81,8 @@ impl CrewNoun {
 
 impl std::fmt::Display for CrewNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "crew {}", self.subject)?;
+        write!(f, "crew")?;
+        self.subjects.write(f)?;
         for (flag, value) in [
             ("--crew-id", self.crew_id.as_ref()),
             ("--namespace", self.namespace.as_ref()),
@@ -129,6 +136,46 @@ mod tests {
             target: "reviewer".into(),
             message: "Review commit abc123".into(),
         });
+    }
+
+    #[test]
+    fn address_marker_disambiguates_reserved_role_names() {
+        for role in ["list", "complete", "fail"] {
+            let marked = format!("@{role}");
+            let noun = CrewNoun::try_parse_from(["crew", &marked, "handoff", "--message", "continue"]).expect("parse marked crew role");
+            assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                target: role.into(),
+                message: "continue".into(),
+            });
+        }
+    }
+
+    #[test]
+    fn unmarked_reserved_role_names_explain_the_address_marker() {
+        for role in ["list", "complete", "fail"] {
+            let noun = CrewNoun::try_parse_from(["crew", role, "handoff", "--message", "continue"]).expect("parse ambiguous crew role");
+            let error = noun.resolve_with_crew_id(Some("crew-123".into())).expect_err("unmarked reserved role should fail");
+            assert!(error.contains(&format!("@{role}")), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn explicit_subject_preserves_literal_address_marker() {
+        let noun = CrewNoun::try_parse_from(["crew", "--subject", "@reviewer", "handoff", "--message", "continue"])
+            .expect("parse explicit crew subject");
+        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
+            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            target: "@reviewer".into(),
+            message: "continue".into(),
+        });
+    }
+
+    #[test]
+    fn positional_and_explicit_subject_conflict() {
+        let error = CrewNoun::try_parse_from(["crew", "reviewer", "--subject", "other", "handoff", "--message", "continue"])
+            .expect_err("subjects should be mutually exclusive");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -192,5 +239,11 @@ mod tests {
             "--message",
             "review-abc123",
         ]);
+    }
+
+    #[test]
+    fn marked_and_explicit_subjects_round_trip() {
+        assert_round_trip::<CrewNoun>(&["crew", "@list", "handoff", "--message", "review"]);
+        assert_round_trip::<CrewNoun>(&["crew", "--subject", "@reviewer", "handoff", "--message", "review"]);
     }
 }
