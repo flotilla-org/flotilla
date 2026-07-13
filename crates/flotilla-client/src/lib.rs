@@ -404,6 +404,22 @@ pub async fn connect_or_spawn(
         }
     }
 
+    // Final probe under the exclusively-held spawn lock. A daemon may have
+    // appeared (or kept failing the handshake) while we contended for the
+    // lock — in particular, a `continue` after a handshake error re-enters
+    // lock acquisition, which the releasing winner has left uncontended, so
+    // winning the lock says nothing about the socket being free. The lock
+    // makes this check race-free: nothing else may spawn while we hold it.
+    match connect_existing_stateful(socket_path).await {
+        Ok(Some(daemon)) => return Ok(daemon),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(format!(
+                "won the spawn lock, but a live daemon is on the socket and failing the handshake — not spawning over it: {e}"
+            ));
+        }
+    }
+
     {
         // Clean up stale socket
         let _ = std::fs::remove_file(socket_path);
