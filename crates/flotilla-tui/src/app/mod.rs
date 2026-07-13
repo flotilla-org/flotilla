@@ -1557,7 +1557,7 @@ impl App {
     }
 
     /// Returns the selected vessel name within the selected convoy, if any.
-    pub fn selected_convoy_task(&self) -> Option<&str> {
+    pub fn selected_convoy_vessel(&self) -> Option<&str> {
         self.convoys_ui.selected_vessel.as_deref()
     }
 
@@ -1572,7 +1572,7 @@ impl App {
     /// - Clears selection when there are no convoys.
     /// - Replaces a dangling selection (removed convoy) with the first available convoy.
     /// - Sets the first convoy as the default when no selection is set yet.
-    /// - Resets task focus state when the selected convoy changes.
+    /// - Resets vessel focus state when the selected convoy changes.
     /// - Clamps `selected_vessel` against the selected convoy's current vessel list.
     fn refresh_convoy_selection(&mut self, namespace: &str) {
         let prior_selected = self.convoys_ui.selected.clone();
@@ -1601,13 +1601,14 @@ impl App {
         self.convoys_ui.focus = ConvoysFocus::List;
     }
 
-    /// If `selected_vessel` no longer matches a task in the selected convoy,
+    /// If `selected_vessel` no longer matches a vessel in the selected convoy,
     /// reset it (`None`) and snap focus back to the convoy list. Otherwise the
-    /// task pane would render with bold borders but no selected row — visual
+    /// vessel pane would render with bold borders but no selected row — visual
     /// limbo until the user pressed `j`/`k`.
     fn clamp_selected_vessel(&mut self, namespace: &str) {
-        let Some(task) = self.convoys_ui.selected_vessel.clone() else { return };
-        let still_valid = self.selected_convoy_summary(namespace).is_some_and(|c| c.vessels.iter().any(|t| t.name == task));
+        let Some(vessel) = self.convoys_ui.selected_vessel.clone() else { return };
+        let still_valid =
+            self.selected_convoy_summary(namespace).is_some_and(|c| c.vessels.iter().any(|candidate| candidate.name == vessel));
         if !still_valid {
             self.convoys_ui.selected_vessel = None;
             self.convoys_ui.focus = ConvoysFocus::List;
@@ -1634,7 +1635,7 @@ impl App {
         }
     }
 
-    /// Switch focus to the vessel tree, defaulting to the first task if none selected.
+    /// Switch focus to the vessel tree, defaulting to the first vessel if none selected.
     /// No-op when no convoy is selected or the convoy has no vessels.
     pub fn enter_convoy_vessels_focus(&mut self, scope: &ConvoyScope) {
         let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
@@ -1653,7 +1654,7 @@ impl App {
         self.convoys_ui.focus = ConvoysFocus::List;
     }
 
-    /// Move task selection within the scoped convoy by `delta` (positive = down).
+    /// Move vessel selection within the scoped convoy by `delta` (positive = down).
     /// Clamps at both ends. No-op when no vessels are visible.
     pub fn convoy_vessels_select_delta(&mut self, scope: &ConvoyScope, delta: isize) {
         let Some(convoy) = self.scoped_convoy_summary(scope) else { return };

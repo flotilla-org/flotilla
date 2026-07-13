@@ -40,7 +40,7 @@ pub enum ConvoyVerb {
         /// Project this convoy belongs to (metadata grouping)
         #[arg(long = "project")]
         project_ref: Option<String>,
-        /// PlacementPolicy resource to use for task provisioning
+        /// PlacementPolicy resource to use for vessel provisioning
         #[arg(long = "placement-policy")]
         placement_policy: Option<String>,
         /// Existing local checkout/worktree to adopt as the convoy vessel

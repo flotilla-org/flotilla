@@ -49,7 +49,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
     }
 }
 
-fn pending_task() -> WorkState {
+fn pending_work() -> WorkState {
     WorkState {
         phase: WorkPhase::Pending,
         completion_authority: WorkCompletionAuthority::CrewRollup,
@@ -211,17 +211,17 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
 }
 
 #[test]
-fn bootstrap_sets_snapshot_and_initial_task_map() {
+fn bootstrap_sets_snapshot_and_initial_work_map() {
     let mut status = ConvoyStatus::default();
-    let mut tasks = BTreeMap::new();
-    tasks.insert("implement".to_string(), pending_task());
-    tasks.insert("review".to_string(), pending_task());
+    let mut work = BTreeMap::new();
+    work.insert("implement".to_string(), pending_work());
+    work.insert("review".to_string(), pending_work());
 
     let patch = controller_patches::bootstrap(
         sample_snapshot(),
         "review-and-fix".to_string(),
         [("review-and-fix".to_string(), "42".to_string())].into_iter().collect(),
-        tasks.clone(),
+        work.clone(),
         BTreeMap::new(),
         ConvoyPhase::Pending,
         None,
@@ -236,16 +236,16 @@ fn bootstrap_sets_snapshot_and_initial_task_map() {
         status.observed_workflows.as_ref().expect("observed workflows"),
         &BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])
     );
-    assert_eq!(status.work, tasks);
+    assert_eq!(status.work, work);
 }
 
 #[test]
-fn advance_work_to_ready_updates_only_selected_tasks() {
+fn advance_work_to_ready_updates_only_selected_vessels() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([
-            ("implement".to_string(), pending_task()),
+            ("implement".to_string(), pending_work()),
             ("review".to_string(), WorkState {
                 phase: WorkPhase::Complete,
                 completion_authority: WorkCompletionAuthority::CrewRollup,
@@ -306,12 +306,12 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
     };
 
-    let patch = controller_patches::fail_convoy(BTreeMap::from([("review".to_string(), ts(30))]), ts(30), Some("task failed".to_string()));
+    let patch = controller_patches::fail_convoy(BTreeMap::from([("review".to_string(), ts(30))]), ts(30), Some("work failed".to_string()));
     patch.apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Failed);
     assert_eq!(status.finished_at, Some(ts(30)));
-    assert_eq!(status.message.as_deref(), Some("task failed"));
+    assert_eq!(status.message.as_deref(), Some("work failed"));
     assert_eq!(status.work["implement"].phase, WorkPhase::Failed);
     assert_eq!(status.work["review"].phase, WorkPhase::Cancelled);
     assert_eq!(status.work["review"].finished_at, Some(ts(30)));
@@ -350,7 +350,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
 }
 
 #[test]
-fn external_completion_marks_task_complete_without_touching_convoy_phase() {
+fn external_completion_marks_work_complete_without_touching_convoy_phase() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
@@ -424,7 +424,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
-        work: BTreeMap::from([("implement".to_string(), pending_task())]),
+        work: BTreeMap::from([("implement".to_string(), pending_work())]),
         crew_work: BTreeMap::new(),
         message: None,
         started_at: None,

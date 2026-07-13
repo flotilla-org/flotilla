@@ -35,7 +35,7 @@ impl<'a> ConvoyDetail<'a> {
         f.render_widget(header, chunks[0]);
 
         // Body: vessel tree OR initializing placeholder
-        let body_block = Block::default().borders(Borders::ALL).border_style(border_style).title(" Tasks ");
+        let body_block = Block::default().borders(Borders::ALL).border_style(border_style).title(" Vessels ");
         let body_area = chunks[1];
         let body_inner = body_block.inner(body_area);
         f.render_widget(body_block, body_area);
@@ -59,21 +59,22 @@ impl<'a> ConvoyDetail<'a> {
             .convoy
             .vessels
             .iter()
-            .map(|t| {
-                let g = work_glyph(t.phase);
-                let label = Line::from(vec![Span::styled(g.symbol, g.style), Span::raw(format!(" {} ({} proc)", t.name, t.crew.len()))]);
-                TreeItem::new_leaf(t.name.clone(), label)
+            .map(|vessel| {
+                let g = work_glyph(vessel.phase);
+                let label =
+                    Line::from(vec![Span::styled(g.symbol, g.style), Span::raw(format!(" {} ({} proc)", vessel.name, vessel.crew.len()))]);
+                TreeItem::new_leaf(vessel.name.clone(), label)
             })
             .collect();
 
         // TreeState is built from `selected_vessel` on every render. Selection lives
         // in `ConvoysUiState` (the source of truth); expansion isn't needed because
-        // tasks render as flat leaves today. Lift TreeState if we get nested tasks.
+        // vessels render as flat leaves today. Lift TreeState if we get nested vessels.
         let mut state = TreeState::default();
         if let Some(name) = self.selected_vessel {
             state.select(vec![name.to_string()]);
         }
-        let tree = Tree::new(&items).expect("unique task names").highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        let tree = Tree::new(&items).expect("unique vessel names").highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(tree, tree_area, &mut state);
     }
 }
@@ -85,7 +86,7 @@ mod tests {
     use super::*;
     use crate::convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary, ProcessSummary, VesselSummary, WorkPhase};
 
-    fn multi_task_convoy() -> ConvoySummary {
+    fn multi_vessel_convoy() -> ConvoySummary {
         ConvoySummary {
             id: ConvoyId::new("flotilla", "fix-bug-123"),
             namespace: "flotilla".into(),
@@ -135,7 +136,7 @@ mod tests {
     #[test]
     fn convoy_detail_snapshot() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        let convoy = multi_task_convoy();
+        let convoy = multi_vessel_convoy();
         terminal
             .draw(|f| {
                 ConvoyDetail { convoy: &convoy, selected_vessel: None, focused: false }.render(f, f.area());
@@ -147,23 +148,23 @@ mod tests {
     #[test]
     fn convoy_detail_with_selected_vessel_renders() {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        let convoy = multi_task_convoy();
+        let convoy = multi_vessel_convoy();
         terminal
             .draw(|f| {
                 ConvoyDetail { convoy: &convoy, selected_vessel: Some("review"), focused: true }.render(f, f.area());
             })
             .unwrap();
         let rendered: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
-        // Both task names should appear; selection is style-only so the buffer
+        // Both vessel names should appear; selection is style-only so the buffer
         // content check is for parity with the unselected snapshot.
-        assert!(rendered.contains("implement"), "expected 'implement' task in render: {rendered}");
-        assert!(rendered.contains("review"), "expected 'review' task in render: {rendered}");
+        assert!(rendered.contains("implement"), "expected 'implement' vessel in render: {rendered}");
+        assert!(rendered.contains("review"), "expected 'review' vessel in render: {rendered}");
     }
 
     #[test]
     fn convoy_detail_initializing_snapshot() {
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
-        let mut convoy = multi_task_convoy();
+        let mut convoy = multi_vessel_convoy();
         convoy.initializing = true;
         convoy.vessels.clear();
         terminal
@@ -177,7 +178,7 @@ mod tests {
     #[test]
     fn terminal_failure_is_not_masked_by_initializing_placeholder() {
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("create terminal");
-        let mut convoy = multi_task_convoy();
+        let mut convoy = multi_vessel_convoy();
         convoy.phase = ConvoyPhase::Failed;
         convoy.message = Some("missing input 'topic'".into());
         convoy.initializing = true;

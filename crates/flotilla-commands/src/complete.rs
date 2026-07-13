@@ -183,6 +183,24 @@ mod tests {
     }
 
     #[test]
+    fn marked_subject_completes_to_verbs() {
+        let input = "checkout @status ";
+        let completions = complete(&test_root(), input, input.len());
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"status"), "marked subject should complete to verbs, got: {values:?}");
+        assert!(values.contains(&"remove"));
+    }
+
+    #[test]
+    fn explicit_literal_subject_completes_to_verbs() {
+        let input = "checkout --subject @topic ";
+        let completions = complete(&test_root(), input, input.len());
+        let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
+        assert!(values.contains(&"status"), "explicit subject should complete to verbs, got: {values:?}");
+        assert!(values.contains(&"remove"));
+    }
+
+    #[test]
     fn host_with_subject_completes_to_verbs_and_nouns() {
         let completions = complete(&test_root(), "host feta ", 10);
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();

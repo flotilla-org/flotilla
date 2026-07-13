@@ -44,9 +44,9 @@ pub enum Action {
     OpenCommandPalette,
     OpenContextualPalette,
     FillSelected,
-    /// Open the command palette pre-filled to complete the selected convoy task.
+    /// Open the command palette pre-filled to complete the selected convoy work.
     CompleteConvoyWork,
-    /// Attach the active workspace manager to the selected convoy task's workspace.
+    /// Attach the active workspace manager to the selected convoy vessel's workspace.
     AttachConvoyVessel,
     Dispatch(Intent),
 }

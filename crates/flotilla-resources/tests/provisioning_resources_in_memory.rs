@@ -3,10 +3,11 @@ mod common;
 use chrono::Utc;
 use common::{owner_reference, resource_meta};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerTaskPlacementPolicySpec, Environment, EnvironmentMount,
-    EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec, ResourceBackend, Selector, TerminalBrief,
-    TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    Checkout, CheckoutSpec, DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerVesselPlacementPolicySpec, Environment,
+    EnvironmentMount, EnvironmentMountMode, EnvironmentSpec, FreshCloneCheckoutSpec, Host, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, PlacementPolicy, PlacementPolicySpec,
+    ResourceBackend, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    VesselPhase, VesselSpec, VesselStatus,
 };
 
 fn placement_meta(name: &str) -> flotilla_resources::InputMeta {
@@ -156,14 +157,29 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
 }
 
 #[test]
-fn docker_per_task_policy_spec_is_constructible() {
-    let spec = DockerPerTaskPlacementPolicySpec {
-        host_ref: "01HXYZ".to_string(),
-        image: "ghcr.io/flotilla/dev:latest".to_string(),
-        default_cwd: Some("/workspace".to_string()),
-        env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
-        checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
-    };
+fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
+    let spec = PlacementPolicySpec::builder()
+        .pool("docker".to_string())
+        .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            host_ref: "01HXYZ".to_string(),
+            image: "ghcr.io/flotilla/dev:latest".to_string(),
+            default_cwd: Some("/workspace".to_string()),
+            env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
+            checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+        })
+        .build();
 
-    assert_eq!(spec.default_cwd.as_deref(), Some("/workspace"));
+    assert_eq!(
+        serde_json::to_value(spec).expect("placement policy should serialize"),
+        serde_json::json!({
+            "pool": "docker",
+            "docker_per_vessel": {
+                "host_ref": "01HXYZ",
+                "image": "ghcr.io/flotilla/dev:latest",
+                "default_cwd": "/workspace",
+                "env": {"FOO": "bar"},
+                "checkout": {"fresh_clone_in_container": {"clone_path": "/workspace"}}
+            }
+        })
+    );
 }

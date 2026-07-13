@@ -1232,6 +1232,7 @@ dependencies = [
 name = "flotilla-commands"
 version = "0.1.0"
 dependencies = [
+ "bon",
  "clap",
  "flotilla-protocol",
  "tempfile",

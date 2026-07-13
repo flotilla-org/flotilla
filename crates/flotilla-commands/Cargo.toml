@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 flotilla-protocol = { path = "../flotilla-protocol" }
+bon = { workspace = true }
 clap = { version = "4", features = ["derive", "string"] }
 
 [dev-dependencies]

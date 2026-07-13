@@ -26,14 +26,15 @@ use flotilla_protocol::{
     StatusResponse, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, terminal_session_attach_target,
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
-    Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, Resource,
-    ResourceBackend, ResourceError, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
+    external_patches as convoy_external_patches, terminal_session_attach_target, Checkout as ResourceCheckout,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
+    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment,
+    InMemoryBackend, InputMeta, InputValue, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
+    Project, ProjectRepositorySpec, ProjectSpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
+    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -287,6 +288,98 @@ fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
         format!("{} ({})", row.convoy, row.host)
     } else {
         format!("{}/{} ({})", row.convoy, row.crew, row.host)
+    }
+}
+
+enum AttachTarget {
+    Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
+    Replica { row: Box<FleetListRow> },
+}
+
+impl AttachTarget {
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<ResolvedAttach, String> {
+        match self {
+            Self::Local(session) => {
+                let (command, host) = daemon.attach_command_for_session(reference, session).await?;
+                let labels = &session.metadata.labels;
+                let binding = AttachBinding::builder()
+                    .host(host)
+                    .namespace(session.metadata.namespace.clone())
+                    .session(session.metadata.name.clone())
+                    .maybe_convoy(labels.get(CONVOY_LABEL).cloned())
+                    .maybe_vessel(labels.get(VESSEL_LABEL).cloned())
+                    .role(labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone()))
+                    .build();
+                Ok(ResolvedAttach { command, binding: Some(binding) })
+            }
+            Self::Replica { row } => {
+                let command = daemon.recursive_attach_command_for_remote(&row.host, reference).await?;
+                // Replica rows carry crew as "vessel/role" (or a bare role)
+                // and the owning host's namespace + session name, so
+                // cross-host panes stamp the full join key.
+                let (vessel, role) = match row.crew.split_once('/') {
+                    Some((vessel, role)) => (Some(vessel.to_owned()), Some(role.to_owned())),
+                    None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty())),
+                };
+                let binding = AttachBinding::builder()
+                    .host(row.host.clone())
+                    .namespace(row.namespace.clone())
+                    .maybe_session(row.session.clone())
+                    .maybe_convoy(Some(row.convoy.clone()).filter(|convoy| convoy != "-"))
+                    .maybe_vessel(vessel)
+                    .maybe_role(role)
+                    .build();
+                Ok(ResolvedAttach { command, binding: Some(binding) })
+            }
+        }
+    }
+}
+
+struct AttachCandidate {
+    label: String,
+    references: Vec<String>,
+    target: AttachTarget,
+}
+
+struct AttachCandidateIndex {
+    candidates: Vec<AttachCandidate>,
+    exact: HashMap<String, Vec<usize>>,
+}
+
+impl AttachCandidateIndex {
+    fn new(candidates: Vec<AttachCandidate>) -> Self {
+        let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            for reference in &candidate.references {
+                exact.entry(reference.clone()).or_default().push(index);
+            }
+        }
+        Self { candidates, exact }
+    }
+
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<ResolvedAttach, String> {
+        if reference.trim().is_empty() {
+            return Err("attach reference is required".to_string());
+        }
+
+        let matches = self.exact.get(reference).cloned().unwrap_or_else(|| {
+            self.candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.references.iter().any(|candidate_reference| candidate_reference.starts_with(reference)))
+                .map(|(index, _)| index)
+                .collect()
+        });
+        match matches.as_slice() {
+            [] => Err(format!("no attach target matching '{reference}'")),
+            [index] => self.candidates[*index].target.resolve(daemon, reference).await,
+            _ => {
+                let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
+                labels.sort();
+                labels.dedup();
+                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
+            }
+        }
     }
 }
 
@@ -2805,54 +2898,29 @@ impl InProcessDaemon {
     }
 
     pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<ResolvedAttach, String> {
+        // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
+        let index = self.attach_candidate_index().await?;
+        index.resolve(self, reference).await
+    }
 
-        enum AttachMatch {
-            Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
-            Replica { row: Box<FleetListRow> },
+    pub async fn resolvable_attach_references_internal(&self, references: &[String]) -> Result<HashSet<String>, String> {
+        if references.is_empty() {
+            return Ok(HashSet::new());
         }
-
-        impl AttachMatch {
-            async fn resolve(self, daemon: &InProcessDaemon, reference: &str, namespace: &str) -> Result<ResolvedAttach, String> {
-                match self {
-                    Self::Local(session) => {
-                        let (command, host) = daemon.attach_command_for_session(reference, &session).await?;
-                        let labels = &session.metadata.labels;
-                        let binding = AttachBinding::builder()
-                            .host(host)
-                            .namespace(namespace)
-                            .session(session.metadata.name.clone())
-                            .maybe_convoy(labels.get(CONVOY_LABEL).cloned())
-                            .maybe_vessel(labels.get(VESSEL_LABEL).cloned())
-                            .role(labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone()))
-                            .build();
-                        Ok(ResolvedAttach { command, binding: Some(binding) })
-                    }
-                    Self::Replica { row } => {
-                        let command = daemon.recursive_attach_command_for_remote(&row.host, reference).await?;
-                        // Replica rows carry crew as "vessel/role" (or a bare
-                        // role) and the owning host's namespace + session name,
-                        // so cross-host panes stamp the full join key.
-                        let (vessel, role) = match row.crew.split_once('/') {
-                            Some((vessel, role)) => (Some(vessel.to_owned()), Some(role.to_owned())),
-                            None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty())),
-                        };
-                        let binding = AttachBinding::builder()
-                            .host(row.host.clone())
-                            .namespace(row.namespace.clone())
-                            .maybe_session(row.session.clone())
-                            .maybe_convoy(Some(row.convoy.clone()).filter(|convoy| convoy != "-"))
-                            .maybe_vessel(vessel)
-                            .maybe_role(role)
-                            .build();
-                        Ok(ResolvedAttach { command, binding: Some(binding) })
-                    }
-                }
+        let index = self.attach_candidate_index().await?;
+        let mut resolved = HashSet::new();
+        for reference in references {
+            if index.resolve(self, reference).await.is_ok() {
+                resolved.insert(reference.clone());
             }
         }
+        Ok(resolved)
+    }
 
+    async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
         let namespace = self.provisioning_namespace().await;
         let durable_sessions =
             self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).list().await.map_err(|err| err.to_string())?.items;
@@ -2868,20 +2936,16 @@ impl InProcessDaemon {
         for session in durable_sessions.into_iter().chain(observed_sessions) {
             sessions_by_name.insert(session.metadata.name.clone(), session);
         }
-        let mut exact = Vec::new();
-        let mut prefix = Vec::new();
-
+        let mut candidates = Vec::new();
         for session in sessions_by_name.into_values() {
             if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
                 continue;
             }
-            let refs = attach_reference_keys(&session.metadata.name, &session.metadata.labels);
-            let label = attach_reference_label(&session.metadata.name, &session.metadata.labels);
-            if refs.iter().any(|candidate| candidate == reference) {
-                exact.push((label, AttachMatch::Local(Box::new(session))));
-            } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
-                prefix.push((label, AttachMatch::Local(Box::new(session))));
-            }
+            candidates.push(AttachCandidate {
+                label: attach_reference_label(&session.metadata.name, &session.metadata.labels),
+                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
+                target: AttachTarget::Local(Box::new(session)),
+            });
         }
 
         let configured_replica_hosts: HashSet<HostName> = self
@@ -2896,33 +2960,16 @@ impl InProcessDaemon {
                     if row.crew_state != "running" {
                         continue;
                     }
-                    let refs = fleet_row_attach_reference_keys(row);
-                    let label = fleet_row_attach_reference_label(row);
-                    let target = AttachMatch::Replica { row: Box::new(row.clone()) };
-                    if refs.iter().any(|candidate| candidate == reference) {
-                        exact.push((label, target));
-                    } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
-                        prefix.push((label, target));
-                    }
+                    candidates.push(AttachCandidate {
+                        label: fleet_row_attach_reference_label(row),
+                        references: fleet_row_attach_reference_keys(row),
+                        target: AttachTarget::Replica { row: Box::new(row.clone()) },
+                    });
                 }
             }
         }
         drop(cache);
-
-        let mut matches = if exact.is_empty() { prefix } else { exact };
-        match matches.len() {
-            0 => Err(format!("no attach target matching '{reference}'")),
-            1 => {
-                let (_label, target) = matches.remove(0);
-                target.resolve(self, reference, &namespace).await
-            }
-            _ => {
-                let mut labels: Vec<_> = matches.into_iter().map(|(label, _)| label).collect();
-                labels.sort();
-                labels.dedup();
-                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
-            }
-        }
+        Ok(AttachCandidateIndex::new(candidates))
     }
 
     /// Resolve the attach command for a locally-known session, returning it
@@ -3240,26 +3287,25 @@ impl InProcessDaemon {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let result = match convoys.get(convoy).await {
-                Ok(current) => match current.status.as_ref() {
-                    None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },
-                    Some(status) => match status.work.get(work) {
-                        None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") },
-                        Some(state) if state.phase.is_terminal() => {
-                            flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} work {work} is already terminal") }
-                        }
-                        Some(_) => match apply_resource_status_patch(
-                            &convoys,
-                            convoy,
-                            &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
-                        )
-                        .await
-                        {
-                            Ok(_) => flotilla_protocol::CommandValue::Ok,
-                            Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-                        },
-                    },
+            let check_work_is_completable = |current: &ResourceObject<ResourceConvoy>| match current.status.as_ref() {
+                None => Err(ResourceError::other(format!("convoy {convoy} has no status"))),
+                Some(status) => match status.work.get(work) {
+                    None => Err(ResourceError::other(format!("convoy {convoy} does not contain work {work}"))),
+                    Some(state) if state.phase.is_terminal() => {
+                        Err(ResourceError::other(format!("convoy {convoy} work {work} is already terminal")))
+                    }
+                    Some(_) => Ok(()),
                 },
+            };
+            let result = match apply_resource_status_patch_checked(
+                &convoys,
+                convoy,
+                &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
+                check_work_is_completable,
+            )
+            .await
+            {
+                Ok(_) => flotilla_protocol::CommandValue::Ok,
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
             };
             self.finish_context_free_command(id, empty_identity, result);

@@ -46,7 +46,7 @@ pub use labels::{
     VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 pub use placement_policy::{
-    DockerCheckoutStrategy, DockerPerTaskPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
     PlacementPolicy, PlacementPolicySpec,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
@@ -58,7 +58,7 @@ pub use resource::{
 };
 pub use retention::{EventRetention, ResourceStoreDiagnostics, ResourceStoreWarning};
 pub use sqlite::SqliteBackend;
-pub use status_patch::{apply_status_patch, NoStatusPatch, StatusPatch};
+pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
     terminal_session_attach_target, CrewSessionStatus, InnerCommandStatus, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession, TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,

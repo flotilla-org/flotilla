@@ -77,6 +77,24 @@ fn validate_rejects_duplicate_vessel_names() {
 }
 
 #[test]
+fn validate_rejects_address_marker_prefix_on_vessel_names() {
+    let mut spec = valid_workflow_template_spec();
+    spec.vessels[0].name = "@implement".to_string();
+
+    let errors = validate(&spec).expect_err("validation should fail");
+    assert!(errors.iter().any(|error| error.to_string().contains("vessel name `@implement`")), "unexpected errors: {errors:?}");
+}
+
+#[test]
+fn validate_rejects_address_marker_prefix_on_crew_roles() {
+    let mut spec = valid_workflow_template_spec();
+    spec.vessels[0].crew[0].role = "@coder".to_string();
+
+    let errors = validate(&spec).expect_err("validation should fail");
+    assert!(errors.iter().any(|error| error.to_string().contains("crew role `@coder`")), "unexpected errors: {errors:?}");
+}
+
+#[test]
 fn validate_rejects_duplicate_input_names() {
     let mut spec = valid_workflow_template_spec();
     spec.inputs.push(spec.inputs[0].clone());
