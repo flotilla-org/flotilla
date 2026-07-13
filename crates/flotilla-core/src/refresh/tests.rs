@@ -480,6 +480,7 @@ async fn staggered_schedule_delays_the_initial_full_refresh() {
         schedule,
     );
     let mut rx = handle.snapshot_rx.clone();
+    handle.trigger_refresh();
     tokio::task::yield_now().await;
     assert!(!rx.has_changed().expect("refresh sender alive"));
 
@@ -489,6 +490,7 @@ async fn staggered_schedule_delays_the_initial_full_refresh() {
 
     tokio::time::advance(Duration::from_secs(1)).await;
     rx.changed().await.expect("staggered initial refresh");
+    tokio::task::yield_now().await;
     assert_eq!(workspace_manager.0.load(Ordering::SeqCst), 1);
 }
 
