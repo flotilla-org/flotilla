@@ -6,7 +6,7 @@ use chrono::Utc;
 use common::{
     create_convoy_with_single_task, create_docker_worktree_policy, create_host_direct_policy, create_policy, create_ready_checkout,
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
-    labeled_meta, meta, vessel_meta, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
+    labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
@@ -17,8 +17,8 @@ use flotilla_resources::{
     DockerPerTaskPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec,
     ResourceBackend, ResourceError, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -425,14 +425,10 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
     let mut status = convoy.status.expect("convoy status");
     status.phase = ConvoyPhase::Completed;
     status.observed_workflow_ref = Some("wf".to_string());
-    status.work.insert("implement".to_string(), WorkState {
-        phase: WorkPhase::Complete,
-        ready_at: None,
-        started_at: None,
-        finished_at: Some(Utc::now()),
-        message: Some("done".to_string()),
-        placement: None,
-    });
+    status.work.insert(
+        "implement".to_string(),
+        work_state().phase(WorkPhase::Complete).finished_at(Utc::now()).message("done".to_string()).call(),
+    );
     convoys
         .update_status("convoy-finalizer", &convoy.metadata.resource_version, &status)
         .await
@@ -448,25 +444,9 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         .update(&vessel_meta, &vessel.metadata.resource_version, &vessel.spec)
         .await
         .expect("vessel finalizer and convoy label should be recorded");
-    terminals
-        .create(
-            &labeled_meta("terminal-convoy-finalizer-implement-coder", [(
-                VESSEL_REF_LABEL.to_string(),
-                "convoy-finalizer-implement".to_string(),
-            )]),
-            &TerminalSessionSpec {
-                env_ref: "host-direct-01HXYZ".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                pool: "cleat".to_string(),
-            },
-        )
-        .await
-        .expect("terminal child should be created");
+    create_labeled_terminal(&backend, NAMESPACE, "terminal-convoy-finalizer-implement-coder", "convoy-finalizer-implement").await;
 
-    let convoy_reconciler =
-        ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(NAMESPACE)).with_vessels(vessels.clone());
     let completed = convoys.get("convoy-finalizer").await.expect("completed convoy should exist");
     let first_dependencies = convoy_reconciler.fetch_dependencies(&completed).await.expect("first dependencies should load");
     let first_outcome = convoy_reconciler.reconcile(&completed, &first_dependencies, Utc::now());

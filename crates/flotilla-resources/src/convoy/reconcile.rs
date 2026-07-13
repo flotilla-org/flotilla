@@ -555,7 +555,6 @@ fn cleanup_actuations(
                 if vessels.get(&resource_name).is_some_and(|vessel| vessel.metadata.deletion_timestamp.is_none()) {
                     actuations.push(Actuation::DeleteVessel { name: resource_name });
                 }
-                }
             }
             WorkPhase::Pending => {}
         }

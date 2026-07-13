@@ -1,5 +1,6 @@
 mod common;
 
+use chrono::Utc;
 use common::{
     contract::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
@@ -10,12 +11,14 @@ use common::{
         assert_watch_now_semantics_with_backend, assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
     },
-    convoy_meta, convoy_spec, TestLoopHarness,
+    convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, TestLoopHarness,
 };
-use flotilla_controllers::reconcilers::TaskWorkspaceReconciler;
+use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
-    controller::ControllerLoop, Convoy, EventRetention, InputMeta, ResourceBackend, ResourceError, SqliteBackend, TaskWorkspace,
-    TaskWorkspaceSpec, TerminalSession, TerminalSessionSource, TerminalSessionSpec, WatchEvent, WatchStart, TASK_WORKSPACE_LABEL,
+    controller::{Actuation, ControllerLoop, Reconciler},
+    Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, ResourceBackend, ResourceError, SqliteBackend, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use rstest::rstest;
@@ -159,62 +162,100 @@ async fn objects_and_resource_versions_survive_restart() {
 }
 
 #[tokio::test]
-async fn pending_task_workspace_converges_after_sqlite_restart_and_repeated_delete() {
+async fn completed_convoy_cleanup_converges_after_sqlite_restart_with_pending_vessel_finalizer() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("resources.sqlite");
     let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should open"));
-    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    workspaces
+
+    let convoy =
+        convoys.create(&convoy_meta("convoy-restart"), &convoy_spec("workflow-restart")).await.expect("convoy create should succeed");
+    let mut completed_status = convoy_status(ConvoyPhase::Completed);
+    completed_status.observed_workflow_ref = Some("workflow-restart".to_string());
+    let mut completed_work = pending_task_state();
+    completed_work.phase = WorkPhase::Complete;
+    completed_work.finished_at = Some(Utc::now());
+    completed_work.message = Some("done".to_string());
+    completed_status.work.insert("implement".to_string(), completed_work);
+    convoys
+        .update_status("convoy-restart", &convoy.metadata.resource_version, &completed_status)
+        .await
+        .expect("convoy completion should be recorded");
+
+    vessels
         .create(
-            &InputMeta::builder()
-                .name("convoy-restart-implement".to_string())
-                .finalizers(vec!["flotilla.work/task-workspace-teardown".to_string()])
-                .build(),
-            &TaskWorkspaceSpec {
-                convoy_ref: "convoy-restart".to_string(),
-                task: "implement".to_string(),
-                placement_policy_ref: "policy-restart".to_string(),
-                adopted_checkout_ref: None,
-            },
+            &resource_meta()
+                .name("convoy-restart-implement")
+                .labels([(CONVOY_LABEL.to_string(), "convoy-restart".to_string())].into_iter().collect())
+                .finalizers(vec!["flotilla.work/vessel-workspace-teardown".to_string()])
+                .call(),
+            &restart_vessel_spec(),
         )
         .await
-        .expect("workspace create should succeed");
+        .expect("vessel create should succeed");
     terminals
         .create(
-            &InputMeta::builder()
-                .name("terminal-convoy-restart-implement-coder".to_string())
-                .labels([(TASK_WORKSPACE_LABEL.to_string(), "convoy-restart-implement".to_string())].into_iter().collect())
-                .build(),
-            &TerminalSessionSpec {
-                env_ref: "host-direct-01HXYZ".to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
-                cwd: "/workspace".to_string(),
-                pool: "cleat".to_string(),
-            },
+            &resource_meta()
+                .name("terminal-convoy-restart-implement-coder")
+                .labels([(VESSEL_REF_LABEL.to_string(), "convoy-restart-implement".to_string())].into_iter().collect())
+                .call(),
+            &restart_terminal_session_spec(),
         )
         .await
         .expect("terminal child should be created");
-    workspaces.delete("convoy-restart-implement").await.expect("first delete should mark the workspace");
+
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+    let completed_convoy = convoys.get("convoy-restart").await.expect("completed convoy should exist");
+    let initial_dependencies =
+        convoy_reconciler.fetch_dependencies(&completed_convoy).await.expect("initial cleanup dependencies should load");
+    let initial_cleanup = convoy_reconciler.reconcile(&completed_convoy, &initial_dependencies, Utc::now());
+    assert!(initial_cleanup
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-restart-implement")));
+
+    vessels.delete("convoy-restart-implement").await.expect("initial convoy cleanup should mark the vessel");
+    assert!(terminals.get("terminal-convoy-restart-implement-coder").await.is_ok(), "delayed finalizer should retain terminal child");
+
+    drop(convoy_reconciler);
     drop(terminals);
-    drop(workspaces);
+    drop(vessels);
+    drop(convoys);
     drop(backend);
 
     let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen"));
-    let workspaces = backend.clone().using::<TaskWorkspace>("flotilla");
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
     let terminals = backend.clone().using::<TerminalSession>("flotilla");
-    workspaces.delete("convoy-restart-implement").await.expect("restart cleanup should not hard-delete the pending workspace");
-    let pending = workspaces.get("convoy-restart-implement").await.expect("pending workspace should survive the repeated delete");
+    let convoy_reconciler = ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+    let restarted_convoy = convoys.get("convoy-restart").await.expect("completed convoy should survive restart");
+    let restart_dependencies =
+        convoy_reconciler.fetch_dependencies(&restarted_convoy).await.expect("restart cleanup dependencies should load");
+    let restart_cleanup = convoy_reconciler.reconcile(&restarted_convoy, &restart_dependencies, Utc::now());
+    assert!(
+        !restart_cleanup
+            .actuations
+            .iter()
+            .any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == "convoy-restart-implement")),
+        "restart cleanup must leave a persisted pending vessel to its finalizer"
+    );
+
+    vessels
+        .delete("convoy-restart-implement")
+        .await
+        .expect("a repeated queued cleanup after restart should not hard-delete the pending vessel");
+    let pending = vessels.get("convoy-restart-implement").await.expect("pending vessel should survive the repeated delete");
     assert!(pending.metadata.deletion_timestamp.is_some());
-    assert_eq!(pending.metadata.finalizers, vec!["flotilla.work/task-workspace-teardown".to_string()]);
+    assert_eq!(pending.metadata.finalizers, vec!["flotilla.work/vessel-workspace-teardown".to_string()]);
 
     let mut harness = TestLoopHarness::new();
     harness.spawn(
         ControllerLoop {
-            primary: workspaces.clone(),
+            primary: vessels.clone(),
             secondaries: Vec::new(),
-            reconciler: TaskWorkspaceReconciler::new(backend.clone(), "flotilla"),
+            reconciler: VesselReconciler::new(backend.clone(), "flotilla"),
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -222,15 +263,34 @@ async fn pending_task_workspace_converges_after_sqlite_restart_and_repeated_dele
     );
     harness
         .wait_until(Duration::from_secs(1), || {
-            let workspaces = workspaces.clone();
+            let vessels = vessels.clone();
             let terminals = terminals.clone();
             async move {
-                matches!(workspaces.get("convoy-restart-implement").await, Err(ResourceError::NotFound { .. }))
+                matches!(vessels.get("convoy-restart-implement").await, Err(ResourceError::NotFound { .. }))
                     && matches!(terminals.get("terminal-convoy-restart-implement-coder").await, Err(ResourceError::NotFound { .. }))
             }
         })
         .await;
     harness.shutdown().await;
+}
+
+fn restart_vessel_spec() -> VesselSpec {
+    VesselSpec {
+        convoy_ref: "convoy-restart".to_string(),
+        vessel_name: "implement".to_string(),
+        placement_policy_ref: "policy-restart".to_string(),
+        adopted_checkout_ref: None,
+    }
+}
+
+fn restart_terminal_session_spec() -> TerminalSessionSpec {
+    TerminalSessionSpec {
+        env_ref: "host-direct-01HXYZ".to_string(),
+        role: "coder".to_string(),
+        source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+        cwd: "/workspace".to_string(),
+        pool: "cleat".to_string(),
+    }
 }
 
 #[test]
