@@ -349,9 +349,12 @@ fn migrate_repo_file(source: &Path, canonical: &Path) {
     if source == canonical {
         return;
     }
-    let result = if canonical.exists() { std::fs::remove_file(source) } else { std::fs::rename(source, canonical) };
+    let canonical_exists = canonical.exists();
+    let result = if canonical_exists { std::fs::remove_file(source) } else { std::fs::rename(source, canonical) };
     if let Err(err) = result {
         tracing::warn!(from = %source.display(), to = %canonical.display(), %err, "failed to migrate repo config filename");
+    } else if canonical_exists {
+        tracing::info!(legacy = %source.display(), canonical = %canonical.display(), "removed duplicate legacy repo config");
     }
 }
 
