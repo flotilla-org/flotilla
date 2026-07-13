@@ -18,7 +18,7 @@ use super::{
     AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::{collect_visible_status_items, ViewTarget},
+    app::{collect_visible_status_items, view_kind, ViewTarget},
     binding_table::{BindingModeId, KeyBindingMode, StatusFragment},
     keymap::Action,
     status_bar::StatusBarAction,
@@ -30,7 +30,10 @@ use crate::{
 enum ActivePage {
     Overview,
     /// A convoy list view: the convoys of a namespace, or of one project.
-    Convoys,
+    Convoys {
+        /// Set for project dashboards — scopes the list and its empty state.
+        project: Option<String>,
+    },
     /// One convoy's vessel tree, full width.
     Convoy {
         namespace: String,
@@ -127,10 +130,11 @@ impl Screen {
     fn active_page(&self, view: &crate::app::OpenView, repos: &HashMap<RepoIdentity, crate::app::TuiRepoModel>) -> ActivePage {
         match &view.target {
             ViewTarget::View(ViewAddress::Overview) => ActivePage::Overview,
+            ViewTarget::View(ViewAddress::Convoys { .. }) => ActivePage::Convoys { project: None },
             // Project dashboards render the convoy list scoped to the
             // project (the scope filter is applied upstream, in the
             // pre-filtered `RenderContext::convoys`).
-            ViewTarget::View(ViewAddress::Convoys { .. } | ViewAddress::Project { .. }) => ActivePage::Convoys,
+            ViewTarget::View(ViewAddress::Project { name, .. }) => ActivePage::Convoys { project: Some(name.clone()) },
             ViewTarget::View(ViewAddress::Convoy { namespace, name }) => {
                 ActivePage::Convoy { namespace: namespace.clone(), name: name.clone() }
             }
@@ -246,7 +250,7 @@ impl InteractiveWidget for Screen {
             // Convoy-family and error pages have no interactive widget —
             // only the shell-level actions apply here (convoy navigation is
             // App-level dispatch).
-            ActivePage::Convoys | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
+            ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
                 Self::fallback_page_action(action, ctx)
             }
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
@@ -275,7 +279,9 @@ impl InteractiveWidget for Screen {
         // No modal — dispatch to the active View's page
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_raw_key(key, ctx),
-            ActivePage::Convoys | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => Outcome::Ignored,
+            ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
+                Outcome::Ignored
+            }
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_raw_key(key, ctx),
                 None => Outcome::Ignored,
@@ -346,7 +352,9 @@ impl InteractiveWidget for Screen {
         // Dispatch to the active View's page for content area mouse events
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_mouse(mouse, ctx),
-            ActivePage::Convoys | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => Outcome::Ignored,
+            ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
+                Outcome::Ignored
+            }
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_mouse(mouse, ctx),
                 None => Outcome::Ignored,
@@ -361,7 +369,7 @@ impl InteractiveWidget for Screen {
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         // Scoped mode: the pane is one View — no tab bar row.
-        let constraints = if ctx.scoped {
+        let constraints = if ctx.views.is_scoped() {
             vec![Constraint::Length(0), Constraint::Min(0), Constraint::Length(1)]
         } else {
             vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]
@@ -369,14 +377,14 @@ impl InteractiveWidget for Screen {
         let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
 
         // 1. Tab bar
-        if !ctx.scoped {
+        if !ctx.views.is_scoped() {
             self.tabs.render(ctx.views, ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
         }
 
         // 2. Content: dispatch to the active View's page
         let active_page = self.active_page(ctx.views.active(), &ctx.model.repos);
         match &active_page {
-            ActivePage::Convoys => {
+            ActivePage::Convoys { project } => {
                 let selected = ctx.convoys_selected.as_ref();
                 ConvoysPage {
                     convoys: ctx.convoys.clone(),
@@ -384,6 +392,7 @@ impl InteractiveWidget for Screen {
                     selected_vessel: ctx.convoys_selected_vessel,
                     focus: ctx.convoys_focus,
                     filter: ctx.convoy_filter,
+                    project: project.as_deref(),
                 }
                 .render(frame, chunks[1]);
             }
@@ -441,22 +450,26 @@ impl InteractiveWidget for Screen {
         // 3a. Resolve binding mode and status fragment.
         // Modal stack takes priority; otherwise the active View's kind
         // supplies its mode stack.
+        let scoped = ctx.views.is_scoped();
+        let address = ctx.views.active().address();
         let (binding_mode, fragment) = if let Some(modal) = self.modal_stack.last() {
             (modal.binding_mode(), modal.status_fragment())
         } else {
+            // Kind-level modes come from the page widget when it carries
+            // state (overview, repo pages), from `view_kind` otherwise; the
+            // shell layer (TabPage, TabShell unless scoped) composes here.
             match &active_page {
-                ActivePage::Overview => (self.overview_page.binding_mode(), self.overview_page.status_fragment()),
-                ActivePage::Convoys => {
-                    (KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys]), StatusFragment::default())
-                }
-                ActivePage::Convoy { .. } | ActivePage::Vessel { .. } => {
-                    (KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::ConvoyVessels]), StatusFragment::default())
+                ActivePage::Overview => {
+                    (view_kind::compose_with_shell(scoped, self.overview_page.binding_mode().modes()), self.overview_page.status_fragment())
                 }
                 ActivePage::Repo(identity) => match self.repo_pages.get(identity) {
-                    Some(page) => (page.binding_mode(), page.status_fragment()),
-                    None => (KeyBindingMode::Composed(vec![BindingModeId::TabPage]), StatusFragment::default()),
+                    Some(page) => (view_kind::compose_with_shell(scoped, page.binding_mode().modes()), page.status_fragment()),
+                    None => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
                 },
-                ActivePage::Error { .. } => (KeyBindingMode::Composed(vec![BindingModeId::TabPage]), StatusFragment::default()),
+                ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } => {
+                    (view_kind::binding_mode(address, ctx.convoys_focus, scoped), StatusFragment::default())
+                }
+                ActivePage::Error { .. } => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
             }
         };
 

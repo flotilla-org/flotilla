@@ -209,10 +209,11 @@ fn tab_switching_in_normal_and_overview() {
     let bracket_left = kc(KeyCode::Char('['), KeyModifiers::NONE);
     let bracket_right = kc(KeyCode::Char(']'), KeyModifiers::NONE);
 
-    // [/] live in TabPage; resolve through composed modes.
-    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]);
-    let overview_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]);
-    let convoys_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Convoys]);
+    // [/] live in TabShell (composed only where the tab bar exists);
+    // resolve through the full shell + kind stacks.
+    let normal_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::TabShell, BindingModeId::Normal]);
+    let overview_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::TabShell, BindingModeId::Overview]);
+    let convoys_composed = KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::TabShell, BindingModeId::Convoys]);
     assert_eq!(km.resolve(&normal_composed, bracket_left), Some(Action::PrevTab));
     assert_eq!(km.resolve(&normal_composed, bracket_right), Some(Action::NextTab));
     assert_eq!(km.resolve(&overview_composed, bracket_left), Some(Action::PrevTab));

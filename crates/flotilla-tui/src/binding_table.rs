@@ -19,13 +19,17 @@ pub enum BindingModeId {
     Shared,
     Normal,
     Overview,
-    /// App-global page-level bindings that are common to all top-level tabs
-    /// (tab navigation, quit, command palette, etc.). Top-level tab modes
+    /// App-global page-level bindings that are common to every page (quit,
+    /// help, command palette, theme, debug). Top-level view modes
     /// (`Normal`, `Overview`, `Convoys`) compose with this via
     /// `KeyBindingMode::Composed`. Overlay modes do NOT compose with it — they
-    /// mask tab-page globals so users can't accidentally switch tabs from a
-    /// confirm dialog.
+    /// mask page globals so users can't accidentally quit from a confirm
+    /// dialog.
     TabPage,
+    /// Tab-management bindings (switch, move, close). Composed by pages only
+    /// when the tab bar exists — scoped mode (`flotilla view`) has no tab
+    /// shell and therefore no tab bindings (ADR 0013).
+    TabShell,
     Convoys,
     /// Inner focus on the Convoys tab — the vessel tree on the right pane.
     /// Composed with `TabPage`. `j/k` navigate vessels; `esc` returns to the
@@ -56,6 +60,14 @@ impl KeyBindingMode {
         match self {
             KeyBindingMode::Single(id) => *id,
             KeyBindingMode::Composed(ids) => ids.last().copied().unwrap_or(BindingModeId::Normal),
+        }
+    }
+
+    /// The stack as a list, lowest priority first.
+    pub fn modes(&self) -> Vec<BindingModeId> {
+        match self {
+            KeyBindingMode::Single(id) => vec![*id],
+            KeyBindingMode::Composed(ids) => ids.clone(),
         }
     }
 }
@@ -120,16 +132,17 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Shared, "S-K", Action::ToggleStatusBarKeys),
     // ── TabPage — app-global tab-level bindings, composed by all top-level tabs ──
     h(BindingModeId::TabPage, "q", Action::Quit, "Quit"),
-    b(BindingModeId::TabPage, "[", Action::PrevTab),
-    b(BindingModeId::TabPage, "]", Action::NextTab),
-    b(BindingModeId::TabPage, "{", Action::MoveTabLeft),
-    b(BindingModeId::TabPage, "}", Action::MoveTabRight),
-    b(BindingModeId::TabPage, "S-X", Action::CloseTab),
     h(BindingModeId::TabPage, "h", Action::ToggleHelp, "Help"),
     h(BindingModeId::TabPage, "?", Action::OpenContextualPalette, "Ctx"),
     b(BindingModeId::TabPage, "S-T", Action::CycleTheme),
     b(BindingModeId::TabPage, "S-D", Action::ToggleDebug),
     b(BindingModeId::TabPage, "/", Action::OpenCommandPalette),
+    // ── TabShell — tab-management keys, only where the tab bar exists ──
+    b(BindingModeId::TabShell, "[", Action::PrevTab),
+    b(BindingModeId::TabShell, "]", Action::NextTab),
+    b(BindingModeId::TabShell, "{", Action::MoveTabLeft),
+    b(BindingModeId::TabShell, "}", Action::MoveTabRight),
+    b(BindingModeId::TabShell, "S-X", Action::CloseTab),
     // ── Normal ──
     // Hint order matters: ENT, ., n, ?, q matches the old status bar layout.
     hk(BindingModeId::Normal, "enter", "ENT", Action::Confirm, "Open"),

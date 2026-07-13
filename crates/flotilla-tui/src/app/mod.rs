@@ -10,6 +10,7 @@ pub mod test_builders;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod ui_state;
+pub(crate) mod view_kind;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -355,6 +356,9 @@ pub struct ConvoyScope {
     pub project: Option<String>,
     /// Pin to exactly one convoy (single-convoy and vessel views).
     pub convoy: Option<String>,
+    /// Pin to exactly one vessel (vessel views): selection never moves, and
+    /// vessel intents (attach, complete) target this vessel only.
+    pub vessel: Option<String>,
 }
 
 /// Filter a slice of convoy summaries by a case-insensitive substring `filter`.
@@ -446,9 +450,6 @@ pub struct App {
     /// Set when the open-view set changed and the daemon subscription no
     /// longer matches it. The event loop re-subscribes and clears this.
     pub subscriptions_dirty: bool,
-    /// Scoped mode (`flotilla view <address>`): exactly one View, no tab
-    /// shell, no `open-views.toml` coupling. Opens navigate in place.
-    pub scoped: bool,
 }
 
 impl App {
@@ -518,7 +519,6 @@ impl App {
             pending_repo_opens: Vec::new(),
             query_seqs: HashMap::new(),
             subscriptions_dirty: true,
-            scoped: false,
         }
     }
 
@@ -533,7 +533,6 @@ impl App {
     ) -> Self {
         let mut app = Self::new(daemon, repos_info, config, theme);
         app.views = OpenViews::scoped(address);
-        app.scoped = true;
         app.subscriptions_dirty = true;
         app.sync_active_view();
         app
@@ -545,12 +544,7 @@ impl App {
     pub fn query_cursors(&self) -> Vec<flotilla_protocol::QueryCursor> {
         let mut queries = Vec::new();
         for view in self.views.iter() {
-            let query = match view.address() {
-                Some(
-                    ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } | ViewAddress::Project { .. },
-                ) => flotilla_protocol::QueryId::Convoys,
-                _ => continue,
-            };
+            let Some(query) = view.address().and_then(view_kind::query) else { continue };
             if !queries.contains(&query) {
                 queries.push(query);
             }
@@ -729,7 +723,7 @@ impl App {
     /// Persist the open-view set after any tab mutation. Scoped sessions
     /// never touch the persisted set (ADR 0013).
     pub fn persist_open_views(&self) {
-        if !self.scoped {
+        if !self.views.is_scoped() {
             self.config.save_open_views(&self.views.to_entries());
         }
     }
@@ -1100,7 +1094,7 @@ impl App {
                 AppAction::ExpectRepoOpen(path) => {
                     self.pending_repo_opens.push(path);
                 }
-                AppAction::SaveTabOrder => {
+                AppAction::PersistOpenViews => {
                     self.persist_open_views();
                 }
                 AppAction::OpenFilePicker => {
@@ -1502,7 +1496,7 @@ impl App {
         // grows tabs (ADR 0013).
         if let Some(pos) = self.pending_repo_opens.iter().position(|pending| pending == &path) {
             self.pending_repo_opens.remove(pos);
-            if !self.scoped {
+            if !self.views.is_scoped() {
                 self.open_view(ViewAddress::Repo(identity));
             }
         }
@@ -1628,19 +1622,7 @@ impl App {
     /// The convoy-data scope of the active View, when it consumes the
     /// convoys query. None on overview/repo/broken tabs.
     pub(crate) fn active_convoy_scope(&self) -> Option<ConvoyScope> {
-        match self.views.active_address() {
-            Some(ViewAddress::Convoys { namespace }) => Some(ConvoyScope { namespace: namespace.clone(), project: None, convoy: None }),
-            Some(ViewAddress::Convoy { namespace, name }) => {
-                Some(ConvoyScope { namespace: namespace.clone(), project: None, convoy: Some(name.clone()) })
-            }
-            Some(ViewAddress::Vessel { namespace, convoy, .. }) => {
-                Some(ConvoyScope { namespace: namespace.clone(), project: None, convoy: Some(convoy.clone()) })
-            }
-            Some(ViewAddress::Project { namespace, name }) => {
-                Some(ConvoyScope { namespace: namespace.clone(), project: Some(name.clone()), convoy: None })
-            }
-            _ => None,
-        }
+        view_kind::convoy_scope(self.views.active_address()?)
     }
 
     /// The convoy a scope acts on: the pinned convoy for single-convoy and

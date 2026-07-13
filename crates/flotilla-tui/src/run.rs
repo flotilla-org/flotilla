@@ -178,19 +178,14 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
         // (namespace, plus project restriction on project dashboards).
         // Borrow only the convoy-related fields to avoid a whole-struct borrow
         // conflict with `&mut app.ui` below.
-        use flotilla_protocol::ViewAddress;
-        let (active_namespace, project) = match app.views.active_address() {
-            Some(ViewAddress::Convoys { namespace }) => (namespace.as_str(), None),
-            Some(ViewAddress::Project { namespace, name }) => (namespace.as_str(), Some(name.as_str())),
-            Some(ViewAddress::Convoy { namespace, .. } | ViewAddress::Vessel { namespace, .. }) => (namespace.as_str(), None),
-            _ => ("flotilla", None),
-        };
+        let scope = app.views.active_address().and_then(crate::app::view_kind::convoy_scope);
+        let (active_namespace, project) =
+            scope.as_ref().map(|s| (s.namespace.as_str(), s.project.as_deref())).unwrap_or(("flotilla", None));
         let raw = app.namespaces.get(active_namespace).map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
         let convoys: Vec<&_> = crate::app::filter_convoys_scoped(raw.iter().copied(), project, &app.convoys_ui.filter).collect();
         let mut ctx = crate::widgets::RenderContext {
             model: &app.model,
             views: &app.views,
-            scoped: app.scoped,
             ui: &mut app.ui,
             theme: &app.theme,
             keymap: &app.keymap,

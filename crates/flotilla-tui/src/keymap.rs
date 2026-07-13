@@ -284,6 +284,7 @@ impl Keymap {
         let mode_configs: &[(&std::collections::HashMap<String, String>, BindingModeId)] = &[
             (&config.normal, BindingModeId::Normal),
             (&config.tab_page, BindingModeId::TabPage),
+            (&config.tab_shell, BindingModeId::TabShell),
             (&config.help, BindingModeId::Help),
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
@@ -338,8 +339,9 @@ impl Keymap {
     /// by action, and organises into display sections with combined key names.
     pub fn help_sections(&self) -> Vec<HelpSection> {
         // Build the effective Normal-mode binding map: start with shared, then
-        // TabPage (app-global tab-level keys), then Normal (repo-tab specific).
-        // This mirrors the Composed([TabPage, Normal]) resolution order so the
+        // TabPage (app globals) and TabShell (tab management), then Normal
+        // (repo-tab specific). This mirrors the
+        // Composed([TabPage, TabShell, Normal]) resolution order so the
         // help screen accurately reflects what each key does in Normal mode.
         let mut effective: std::collections::HashMap<KeyCombination, Action> = std::collections::HashMap::new();
         if let Some(shared_bindings) = self.compiled.key_map.get(&BindingModeId::Shared) {
@@ -347,6 +349,9 @@ impl Keymap {
         }
         if let Some(tab_page_bindings) = self.compiled.key_map.get(&BindingModeId::TabPage) {
             effective.extend(tab_page_bindings);
+        }
+        if let Some(tab_shell_bindings) = self.compiled.key_map.get(&BindingModeId::TabShell) {
+            effective.extend(tab_shell_bindings);
         }
         if let Some(normal_bindings) = self.compiled.key_map.get(&BindingModeId::Normal) {
             effective.extend(normal_bindings);

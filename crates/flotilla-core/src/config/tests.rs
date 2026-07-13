@@ -133,13 +133,13 @@ fn legacy_tab_order_loads_and_tolerates_parse_failures() {
 
     assert!(store.load_tab_order().is_none());
 
-    std::fs::write(base.join("tab-order.json"), r#"["/a", "/b"]"#).unwrap();
+    std::fs::write(base.join("tab-order.json"), r#"["/a", "/b"]"#).expect("write tab-order fixture");
     assert_eq!(store.load_tab_order(), Some(vec![ee("/a"), ee("/b")]));
 
-    std::fs::write(base.join("tab-order.json"), "not json {{{").unwrap();
+    std::fs::write(base.join("tab-order.json"), "not json {{{").expect("write tab-order fixture");
     assert!(store.load_tab_order().is_none());
 
-    std::fs::write(base.join("tab-order.json"), r#"{"k":"v"}"#).unwrap();
+    std::fs::write(base.join("tab-order.json"), r#"{"k":"v"}"#).expect("write tab-order fixture");
     assert!(store.load_tab_order().is_none());
 }
 
@@ -158,7 +158,7 @@ fn open_views_roundtrip_and_parse_failures() {
     store.save_open_views(&views);
     assert_eq!(store.load_open_views(), Some(views));
 
-    std::fs::write(base.join("open-views.toml"), "not toml {{{").unwrap();
+    std::fs::write(base.join("open-views.toml"), "not toml {{{").expect("write open-views fixture");
     assert!(store.load_open_views().is_none());
 }
 

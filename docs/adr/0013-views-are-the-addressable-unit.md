@@ -3,8 +3,11 @@
 **Status:** Accepted
 **Date:** 2026-07-13
 **Relates to:** ADR 0005 (composition-of-panels view model, consumer-side),
-ADR 0011 (named-query result sets), issue #589 (arbitrary tab model), issue
-#667 (manifest connector — will embed these addresses in materialise recipes).
+ADR 0011 (named-query result sets), ADR 0012 (generic tables — its structured
+scope params, including `host`, ride this scheme's optional `?key=value`
+channel; see the host-free rule below), issue #589 (arbitrary tab model),
+issue #667 (manifest connector — will embed these addresses in materialise
+recipes).
 
 The TUI's tabs were hardcoded (overview, one tab per registered repo, a
 bolted-on convoys tab). Issue #589 makes tabs arbitrary, and the PM capability
@@ -49,10 +52,14 @@ concept (see CONTEXT.md: **View**).
   side (ADR 0005) and may evolve freely under a stable address. Panels are
   not addressable — no fragment/anchor syntax. A recipe minted today still
   opens the right View after its composition gains panels.
-- **Addresses are host-free.** They name resources (`namespace/name`
-  identities), not placements; host is routing data stamped on rows. Views
-  with a "local" notion filter to the current machine by default rather than
-  encoding a host in the address.
+- **Address identity is host-free.** Positional parameters name resources
+  (`namespace/name` identities), not placements; host is routing data stamped
+  on rows, and no kind ever takes a host as a positional parameter. Views
+  with a "local" notion filter to the current machine by default. This
+  refines (does not conflict with) ADR 0012's structured scope params: a
+  *host filter* on a table view (like any scope param) is an optional
+  `?key=value` — additive, deep-linkable, and distinct-by-address, without
+  host ever becoming part of a resource's identity.
 - **Parse failure and dangling references fail loudly, per View.** An
   unknown kind, malformed address, or address naming a resource that no
   longer exists renders that View's error state naming the address — never a

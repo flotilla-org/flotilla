@@ -58,13 +58,29 @@ impl OpenView {
     }
 }
 
-/// The ordered set of open Views and the active tab. Index 0 is always the
-/// pinned overview; it cannot be closed or displaced.
+/// Whether a set of open Views is the tabbed shell or a single scoped pane.
+/// This is the pinning policy: the tabbed shell pins the overview at index 0;
+/// a scoped pane pins its lone view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabSetMode {
+    /// The full tab shell: pinned overview at index 0, user-managed tabs,
+    /// persisted to `open-views.toml`.
+    Tabbed,
+    /// A scoped pane (`flotilla view <address>`): exactly one View; opens
+    /// navigate in place with a back stack; nothing is persisted.
+    Scoped,
+}
+
+/// The ordered set of open Views and the active tab.
 pub struct OpenViews {
     views: Vec<OpenView>,
     active: usize,
     /// The previously active index, for "dismiss overview" style returns.
     last_active: Option<usize>,
+    mode: TabSetMode,
+    /// Scoped-mode navigation history: addresses left behind by in-place
+    /// opens, popped by [`OpenViews::back`]. Always empty in tabbed mode.
+    back_stack: Vec<ViewAddress>,
 }
 
 impl OpenViews {
@@ -94,7 +110,7 @@ impl OpenViews {
             }
             None => true,
         });
-        Self { views, active: 0, last_active: None }
+        Self { views, active: 0, last_active: None, mode: TabSetMode::Tabbed, back_stack: Vec::new() }
     }
 
     /// The default set for a config with no `open-views.toml`: overview,
@@ -113,17 +129,36 @@ impl OpenViews {
     }
 
     /// A single-View set for scoped mode (`flotilla view <address>`): no
-    /// pinned overview, no tab shell. The lone view sits at index 0, which
-    /// the pinned-index guards conveniently make unmovable and unclosable.
+    /// pinned overview, no tab shell; opens navigate in place.
     pub fn scoped(address: ViewAddress) -> Self {
-        Self { views: vec![OpenView::of(address)], active: 0, last_active: None }
+        Self { views: vec![OpenView::of(address)], active: 0, last_active: None, mode: TabSetMode::Scoped, back_stack: Vec::new() }
     }
 
-    /// Replace the whole set with one View (scoped-mode in-place navigation).
-    pub fn replace_with(&mut self, address: ViewAddress) {
+    pub fn mode(&self) -> TabSetMode {
+        self.mode
+    }
+
+    pub fn is_scoped(&self) -> bool {
+        self.mode == TabSetMode::Scoped
+    }
+
+    /// Whether the tab at `idx` is pinned (unmovable, unclosable): the
+    /// overview in tabbed mode; the lone view in scoped mode.
+    fn is_pinned_index(&self, idx: usize) -> bool {
+        match self.mode {
+            TabSetMode::Tabbed => idx == 0,
+            TabSetMode::Scoped => true,
+        }
+    }
+
+    /// Scoped-mode back navigation: return to the address the last in-place
+    /// open left behind. Returns true if navigation happened.
+    pub fn back(&mut self) -> bool {
+        let Some(address) = self.back_stack.pop() else { return false };
         self.views = vec![OpenView::of(address)];
         self.active = 0;
         self.last_active = None;
+        true
     }
 
     pub fn to_entries(&self) -> Vec<OpenViewEntry> {
@@ -200,9 +235,23 @@ impl OpenViews {
         self.switch_to(next);
     }
 
-    /// Focus the View at `address`, opening a new tab after the active one if
-    /// it isn't open. Returns true if a tab was newly opened.
+    /// Focus the View at `address`. In tabbed mode, opens a new tab after
+    /// the active one if it isn't open; in scoped mode, navigates in place,
+    /// pushing the previous address onto the back stack. Returns true if
+    /// the view set changed.
     pub fn open_or_focus(&mut self, address: ViewAddress) -> bool {
+        if self.active_address() == Some(&address) {
+            return false;
+        }
+        if self.is_scoped() {
+            if let Some(previous) = self.active_address().cloned() {
+                self.back_stack.push(previous);
+            }
+            self.views = vec![OpenView::of(address)];
+            self.active = 0;
+            self.last_active = None;
+            return true;
+        }
         if let Some(idx) = self.find(&address) {
             self.switch_to(idx);
             return false;
@@ -216,12 +265,12 @@ impl OpenViews {
         true
     }
 
-    /// Move the tab at `idx` by `delta`. The pinned overview neither moves
-    /// nor is displaced. Returns the new index if a swap happened.
+    /// Move the tab at `idx` by `delta`. A pinned tab neither moves nor is
+    /// displaced. Returns the new index if a swap happened.
     pub fn move_tab(&mut self, idx: usize, delta: isize) -> Option<usize> {
         let len = self.views.len() as isize;
         let target = idx as isize + delta;
-        if idx == 0 || target < 1 || target >= len {
+        if self.is_pinned_index(idx) || target < 1 || target >= len {
             return None;
         }
         let target = target as usize;
@@ -235,9 +284,9 @@ impl OpenViews {
         Some(target)
     }
 
-    /// Swap two tabs (drag reorder). Pinned overview never participates.
+    /// Swap two tabs (drag reorder). Pinned tabs never participate.
     pub fn swap(&mut self, a: usize, b: usize) -> bool {
-        if a == 0 || b == 0 || a >= self.views.len() || b >= self.views.len() || a == b {
+        if self.is_pinned_index(a) || self.is_pinned_index(b) || a >= self.views.len() || b >= self.views.len() || a == b {
             return false;
         }
         self.views.swap(a, b);
@@ -250,11 +299,11 @@ impl OpenViews {
         true
     }
 
-    /// Close the tab at `idx`. The pinned overview is not closable. When the
+    /// Close the tab at `idx`. Pinned tabs are not closable. When the
     /// active tab closes, focus moves to the tab on its left. Returns true
     /// if a tab was closed.
     pub fn close(&mut self, idx: usize) -> bool {
-        if idx == 0 || idx >= self.views.len() {
+        if self.is_pinned_index(idx) || idx >= self.views.len() {
             return false;
         }
         self.views.remove(idx);
@@ -395,5 +444,34 @@ mod tests {
         assert_eq!(views.active_repo_identity(), None);
         views.switch_to(2);
         assert_eq!(views.active_repo_identity().map(|id| id.path.as_str()), Some("o/r"));
+    }
+
+    #[test]
+    fn scoped_set_navigates_in_place_with_a_back_stack() {
+        let mut views = OpenViews::scoped(addr("convoy/flotilla/manifest"));
+        assert!(views.is_scoped());
+        assert_eq!(views.len(), 1);
+
+        // In-place open: still one view, previous address remembered.
+        assert!(views.open_or_focus(addr("vessel/flotilla/manifest/leg-1")));
+        assert_eq!(views.len(), 1);
+        assert_eq!(views.active_address(), Some(&addr("vessel/flotilla/manifest/leg-1")));
+
+        // Re-opening the current address is a no-op (no self-push).
+        assert!(!views.open_or_focus(addr("vessel/flotilla/manifest/leg-1")));
+
+        // Back pops the history; a second back has nowhere to go.
+        assert!(views.back());
+        assert_eq!(views.active_address(), Some(&addr("convoy/flotilla/manifest")));
+        assert!(!views.back());
+    }
+
+    #[test]
+    fn scoped_lone_view_is_pinned() {
+        let mut views = OpenViews::scoped(addr("convoys/flotilla"));
+        assert!(!views.close(0), "scoped view is not closable");
+        assert_eq!(views.move_tab(0, 1), None, "scoped view does not move");
+        assert!(!views.swap(0, 0));
+        assert_eq!(views.len(), 1);
     }
 }

@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, HostName, NodeId, ViewAddress, WorkItem};
+use flotilla_protocol::{Command, CommandAction, HostName, NodeId, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
@@ -11,30 +11,13 @@ use crate::{
 impl App {
     // ── Key handling ──
 
-    /// Resolve a key event using the active View's binding-mode stack.
+    /// Resolve a key event using the active View's binding-mode stack
+    /// (`view_kind::binding_mode`: shell + kind, tab keys only when the tab
+    /// bar exists).
     ///
-    /// Called when the base layer widget (Normal mode_id) is on top, so the
-    /// overview gets Overview bindings, convoys-consuming views get Convoys
-    /// bindings (or ConvoyVessels when the user has drilled into — or the
-    /// view is pinned to — the vessel tree), repo views get Normal bindings,
-    /// and broken/dangling tabs get only the shell-level TabPage bindings.
+    /// Called when the base layer widget (Normal mode_id) is on top.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode = match self.views.active_address() {
-            Some(ViewAddress::Overview) => KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]),
-            Some(ViewAddress::Convoys { .. } | ViewAddress::Project { .. }) => {
-                let inner = match self.convoys_focus() {
-                    super::ConvoysFocus::List => BindingModeId::Convoys,
-                    super::ConvoysFocus::Vessels => BindingModeId::ConvoyVessels,
-                };
-                KeyBindingMode::Composed(vec![BindingModeId::TabPage, inner])
-            }
-            // Single-convoy and vessel views are the vessel tree, permanently.
-            Some(ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. }) => {
-                KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::ConvoyVessels])
-            }
-            Some(ViewAddress::Repo(_)) => KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal]),
-            None => KeyBindingMode::Composed(vec![BindingModeId::TabPage]),
-        };
+        let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.convoys_focus(), self.views.is_scoped());
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
     }
 
@@ -45,35 +28,46 @@ impl App {
     /// convoy selection navigation.
     pub(super) fn dispatch_action(&mut self, action: Action) {
         if let Some(scope) = self.active_convoy_scope() {
-            // Views pinned to one convoy (convoy/vessel kinds) are the
-            // vessel tree; list navigation doesn't apply.
-            let pinned = scope.convoy.is_some();
+            // A convoy-pinned view (convoy/vessel kinds) is the vessel tree;
+            // list navigation doesn't apply. A vessel-pinned view never
+            // moves its selection at all — it IS one vessel.
+            let convoy_pinned = scope.convoy.is_some();
+            let vessel_pinned = scope.vessel.is_some();
             match action {
-                Action::SelectNext => match (pinned, self.convoys_focus()) {
+                Action::SelectNext | Action::SelectPrev if vessel_pinned => {}
+                Action::SelectNext => match (convoy_pinned, self.convoys_focus()) {
                     (false, super::ConvoysFocus::List) => self.convoys_tab_select_delta(&scope, 1),
                     _ => self.convoy_vessels_select_delta(&scope, 1),
                 },
-                Action::SelectPrev => match (pinned, self.convoys_focus()) {
+                Action::SelectPrev => match (convoy_pinned, self.convoys_focus()) {
                     (false, super::ConvoysFocus::List) => self.convoys_tab_select_delta(&scope, -1),
                     _ => self.convoy_vessels_select_delta(&scope, -1),
                 },
                 // On the convoy list, Confirm (enter / l / right) drills into the vessel tree.
                 // In the vessel tree, Confirm is currently a no-op.
                 Action::Confirm => {
-                    if !pinned && matches!(self.convoys_focus(), super::ConvoysFocus::List) {
+                    if !convoy_pinned && matches!(self.convoys_focus(), super::ConvoysFocus::List) {
                         self.enter_convoy_vessels_focus(&scope);
                     }
                 }
-                // In the vessel tree, Dismiss (esc / left) returns to the convoy list.
+                // In the vessel tree, Dismiss (esc / left) returns to the
+                // convoy list; otherwise, scoped panes navigate back.
                 Action::Dismiss => {
-                    if !pinned && matches!(self.convoys_focus(), super::ConvoysFocus::Vessels) {
+                    if !convoy_pinned && matches!(self.convoys_focus(), super::ConvoysFocus::Vessels) {
                         self.exit_convoy_vessels_focus();
+                    } else if self.views.is_scoped() {
+                        self.scoped_back();
                     }
                 }
                 Action::CompleteConvoyWork => self.open_complete_convoy_work_palette(&scope),
                 Action::AttachConvoyVessel => self.attach_selected_convoy_vessel(&scope),
                 _ => {}
             }
+            return;
+        }
+        // Scoped panes: Esc walks the in-place navigation history.
+        if action == Action::Dismiss && self.views.is_scoped() {
+            self.scoped_back();
             return;
         }
         // Repo-scoped fallthrough actions apply only on a live repo view.
@@ -417,7 +411,8 @@ impl App {
     /// palette's quoting helper to round-trip whitespace and special characters.
     pub(super) fn open_complete_convoy_work_palette(&mut self, scope: &crate::app::ConvoyScope) {
         let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
-        let Some(task) = self.convoys_ui.selected_vessel.as_ref() else { return };
+        // A vessel-pinned view targets its own vessel, never the shared selection.
+        let Some(task) = scope.vessel.as_ref().or(self.convoys_ui.selected_vessel.as_ref()) else { return };
         let selected_vessel = task.clone();
         let completion_target =
             convoy.vessels.iter().find(|candidate| candidate.name == *task).and_then(|task| task.completion_target.clone());
@@ -443,7 +438,8 @@ impl App {
 
     /// Dispatch `SelectWorkspace` for the selected task's workspace, or show a transient status when none exists yet.
     pub(super) fn attach_selected_convoy_vessel(&mut self, scope: &crate::app::ConvoyScope) {
-        let Some(task) = self.convoys_ui.selected_vessel.clone() else { return };
+        // A vessel-pinned view targets its own vessel, never the shared selection.
+        let Some(task) = scope.vessel.clone().or_else(|| self.convoys_ui.selected_vessel.clone()) else { return };
         let target = self
             .scoped_convoy_summary(scope)
             .and_then(|convoy| convoy.vessels.iter().find(|t| t.name == task))

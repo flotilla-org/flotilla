@@ -91,7 +91,9 @@ impl InteractiveWidget for OverviewPage {
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
-        KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview])
+        // Kind-level modes only — Screen composes the shell layer
+        // (TabPage, and TabShell when the tab bar exists).
+        KeyBindingMode::Composed(vec![BindingModeId::Overview])
     }
 
     fn status_fragment(&self) -> StatusFragment {
@@ -139,7 +141,6 @@ mod tests {
                 let mut ctx = RenderContext {
                     model: &harness.model,
                     views: &harness.views,
-                    scoped: false,
                     ui: &mut ui,
                     theme: &theme,
                     keymap: &keymap,
@@ -190,7 +191,7 @@ mod tests {
     #[test]
     fn overview_page_binding_mode_is_overview() {
         let page = OverviewPage::new();
-        assert_eq!(page.binding_mode(), KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]));
+        assert_eq!(page.binding_mode(), KeyBindingMode::Composed(vec![BindingModeId::Overview]));
     }
 
     #[test]

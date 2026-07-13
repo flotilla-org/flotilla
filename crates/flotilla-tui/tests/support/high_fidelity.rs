@@ -368,7 +368,6 @@ impl HighFidelityHarness {
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.app.model,
                     views: &self.app.views,
-                    scoped: false,
                     ui: &mut self.app.ui,
                     theme: &theme,
                     keymap: &self.app.keymap,

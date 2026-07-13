@@ -23,18 +23,28 @@ impl App {
     }
 
     /// Focus the View at `address`, opening a tab for it if needed. Scoped
-    /// sessions navigate in place instead of growing a tab set — the pane
-    /// stays one View (ADR 0013).
+    /// sessions navigate in place (with a back stack) instead of growing a
+    /// tab set — the pane stays one View (ADR 0013).
     pub fn open_view(&mut self, address: ViewAddress) {
         self.dismiss_modals();
-        if self.scoped {
-            self.views.replace_with(address);
-            self.subscriptions_dirty = true;
-        } else if self.views.open_or_focus(address) {
+        if self.views.open_or_focus(address) {
             self.subscriptions_dirty = true;
             self.persist_open_views();
         }
         self.sync_active_view();
+    }
+
+    /// Scoped-mode back navigation: return to the View the last in-place
+    /// open left behind. Returns true if navigation happened.
+    pub fn scoped_back(&mut self) -> bool {
+        if self.views.back() {
+            self.dismiss_modals();
+            self.subscriptions_dirty = true;
+            self.sync_active_view();
+            true
+        } else {
+            false
+        }
     }
 
     /// Return to the previously active tab (overview dismiss).

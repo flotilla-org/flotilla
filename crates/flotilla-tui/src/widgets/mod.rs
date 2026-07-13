@@ -83,7 +83,7 @@ pub enum AppAction {
     /// Record that this TUI requested tracking of a repo path, so the
     /// confirming `RepoTracked` event opens its tab.
     ExpectRepoOpen(std::path::PathBuf),
-    SaveTabOrder,
+    PersistOpenViews,
     OpenFilePicker,
     PrevTab,
     NextTab,
@@ -141,8 +141,6 @@ pub struct RenderContext<'a> {
     pub model: &'a TuiModel,
     /// The open tab set; drives the tab bar and page dispatch.
     pub views: &'a OpenViews,
-    /// Scoped mode: the pane is one View — no tab bar is drawn.
-    pub scoped: bool,
     pub ui: &'a mut UiState,
     pub theme: &'a Theme,
     pub keymap: &'a Keymap,

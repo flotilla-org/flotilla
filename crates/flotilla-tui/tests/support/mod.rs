@@ -187,7 +187,6 @@ impl TestHarness {
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.model,
                     views: &self.views,
-                    scoped: false,
                     ui: &mut self.ui,
                     theme: &theme,
                     keymap: &keymap,

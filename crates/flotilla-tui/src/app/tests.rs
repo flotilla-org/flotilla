@@ -190,7 +190,7 @@ async fn drain_until_issue_count(app: &mut App, repo: &RepoIdentity, expected_co
 /// The convoy scope of the seeded convoys tab (namespace "flotilla", no
 /// project/convoy restriction).
 fn test_convoy_scope() -> crate::app::ConvoyScope {
-    crate::app::ConvoyScope { namespace: "flotilla".to_string(), project: None, convoy: None }
+    crate::app::ConvoyScope { namespace: "flotilla".to_string(), project: None, convoy: None, vessel: None }
 }
 
 #[test]
@@ -221,6 +221,42 @@ fn vessel_view_pins_vessel_selection() {
     app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
     assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("build"));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
+}
+
+#[test]
+fn vessel_view_selection_never_moves_off_its_vessel() {
+    use crate::keymap::Action;
+
+    let mut app = stub_app();
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["build", "test"])]))));
+
+    // On the vessel view, j/k must not move the selection to a sibling —
+    // the view IS one vessel, and attach/complete target it.
+    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
+    app.dispatch_action(Action::SelectNext);
+    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("build"), "vessel view selection is pinned");
+
+    // Sanity: the single-convoy view DOES navigate its vessel tree.
+    app.open_view("convoy/flotilla/alpha".parse().expect("valid address"));
+    app.dispatch_action(Action::SelectNext);
+    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("test"));
+}
+
+#[test]
+fn scoped_pane_esc_navigates_back() {
+    use crate::keymap::Action;
+
+    let mut app = stub_app();
+    app.views = crate::app::OpenViews::scoped("convoy/flotilla/alpha".parse().expect("valid address"));
+    app.sync_active_view();
+
+    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
+    assert_eq!(app.views.len(), 1, "scoped panes navigate in place");
+
+    app.dispatch_action(Action::Dismiss);
+    assert_eq!(app.views.active_address(), Some(&"convoy/flotilla/alpha".parse().expect("valid address")));
+    // Scoped sessions never persist an open-view set.
+    assert!(app.config.load_open_views().is_none());
 }
 
 #[test]
@@ -1724,7 +1760,6 @@ fn screen_renders_convoys_page_on_convoys_tab() {
             let mut ctx = crate::widgets::RenderContext {
                 model: &app.model,
                 views: &app.views,
-                scoped: false,
                 ui: &mut app.ui,
                 theme: &app.theme,
                 keymap: &app.keymap,

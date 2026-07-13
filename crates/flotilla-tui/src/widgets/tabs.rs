@@ -44,40 +44,84 @@ pub struct Tabs {
     drag_active: bool,
 }
 
-/// The default (pre-override) label for an open View's tab.
-fn default_label(view: &OpenView, model: &TuiModel) -> String {
+/// Repo tab decorations (unseen-changes and loading markers), and the
+/// dangling-repo fallback name.
+fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, qualified: bool) -> String {
+    match model.repos.get(identity) {
+        Some(rm) => {
+            let name = if qualified { format!("{}/{}", identity.authority, identity.path) } else { TuiModel::repo_name(&rm.path) };
+            let loading = if rm.loading { " ⟳" } else { "" };
+            let changed = if rm.has_unseen_changes { "*" } else { "" };
+            format!("{name}{changed}{loading}")
+        }
+        // Dangling repo view: the repo is no longer tracked. The tab
+        // stays, loudly (ADR 0013).
+        None => {
+            let name = identity.path.rsplit('/').next().unwrap_or(&identity.path);
+            format!("⚠ {name}")
+        }
+    }
+}
+
+/// The default (pre-override) label for an open View's tab: the short form,
+/// or the parameter-qualified form when short labels collide.
+fn default_label(view: &OpenView, model: &TuiModel, qualified: bool) -> String {
     match &view.target {
         ViewTarget::View(ViewAddress::Overview) => " ⚓ flotilla ".to_string(),
-        ViewTarget::View(ViewAddress::Convoys { namespace }) if namespace == "flotilla" => " 🚢 convoys ".to_string(),
+        ViewTarget::View(ViewAddress::Convoys { namespace }) if namespace == "flotilla" && !qualified => " 🚢 convoys ".to_string(),
         ViewTarget::View(ViewAddress::Convoys { namespace }) => format!(" 🚢 {namespace} "),
-        ViewTarget::View(ViewAddress::Convoy { name, .. }) => format!(" 🚢 {name} "),
-        ViewTarget::View(ViewAddress::Vessel { convoy, vessel, .. }) => format!(" {convoy}/{vessel} "),
-        ViewTarget::View(ViewAddress::Project { name, .. }) => format!(" ⛰ {name} "),
-        ViewTarget::View(ViewAddress::Repo(identity)) => match model.repos.get(identity) {
-            Some(rm) => {
-                let name = TuiModel::repo_name(&rm.path);
-                let loading = if rm.loading { " ⟳" } else { "" };
-                let changed = if rm.has_unseen_changes { "*" } else { "" };
-                format!("{name}{changed}{loading}")
+        ViewTarget::View(ViewAddress::Convoy { namespace, name }) => {
+            if qualified {
+                format!("🚢 {namespace}/{name}")
+            } else {
+                format!("🚢 {name}")
             }
-            // Dangling repo view: the repo is no longer tracked. The tab
-            // stays, loudly (ADR 0013).
-            None => {
-                let name = identity.path.rsplit('/').next().unwrap_or(&identity.path);
-                format!("⚠ {name}")
+        }
+        ViewTarget::View(ViewAddress::Vessel { convoy, vessel, .. }) => {
+            if qualified {
+                format!("{convoy}/{vessel}")
+            } else {
+                vessel.clone()
             }
-        },
+        }
+        ViewTarget::View(ViewAddress::Project { namespace, name }) => {
+            if qualified {
+                format!("⛰ {namespace}/{name}")
+            } else {
+                format!("⛰ {name}")
+            }
+        }
+        ViewTarget::View(ViewAddress::Repo(identity)) => repo_label(identity, model, qualified),
         ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
     }
 }
 
 /// The visible label for an open View's tab: the user override when set,
-/// otherwise the kind default.
+/// otherwise the kind default (short form).
 pub fn tab_label(view: &OpenView, model: &TuiModel) -> String {
     match &view.label_override {
-        Some(label) => format!(" {label} "),
-        None => default_label(view, model),
+        Some(label) => label.clone(),
+        None => default_label(view, model, false),
     }
+}
+
+/// Labels for the whole tab bar: short defaults, widened with qualifying
+/// parameters only where two tabs would otherwise read the same.
+fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<String> {
+    let labels: Vec<String> = views.iter().map(|view| tab_label(view, model)).collect();
+    labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let view = views.get(i).expect("label index in range");
+            let collides = labels.iter().enumerate().any(|(j, other)| j != i && other == label);
+            if collides && view.label_override.is_none() {
+                default_label(view, model, true)
+            } else {
+                label.clone()
+            }
+        })
+        .collect()
 }
 
 impl Tabs {
@@ -95,10 +139,11 @@ impl Tabs {
         let mut items = Vec::new();
         let mut tab_ids = Vec::new();
         let active_idx = views.active_index();
+        let labels = tab_labels(views, model);
 
         for (i, view) in views.iter().enumerate() {
             let is_active = i == active_idx;
-            let mut label = tab_label(view, model);
+            let mut label = labels[i].clone();
             // The active tab carries a mouse close affordance when closable
             // (everything but the pinned overview at index 0).
             if is_active && i != 0 {
@@ -236,7 +281,7 @@ impl Tabs {
             }
             MouseEventKind::Up(MouseButton::Left) if self.drag.dragging_tab.take().is_some() => {
                 if self.drag.active {
-                    actions.push(AppAction::SaveTabOrder);
+                    actions.push(AppAction::PersistOpenViews);
                 }
                 self.drag.active = false;
             }
@@ -331,7 +376,23 @@ mod tests {
         let view = app.views.get(1).expect("convoys tab").clone();
         assert_eq!(tab_label(&view, &app.model), " 🚢 convoys ");
         let renamed = OpenView { label_override: Some("mine".to_string()), ..view };
-        assert_eq!(tab_label(&renamed, &app.model), " mine ");
+        assert_eq!(tab_label(&renamed, &app.model), "mine");
+    }
+
+    #[test]
+    fn colliding_short_labels_widen_with_qualifying_parameters() {
+        let app = stub_app_with_repos(0);
+        let mut views = OpenViews::from_entries(vec![]);
+        // Two vessels both named "leg-1", in different convoys, plus one
+        // uniquely-named vessel.
+        views.open_or_focus("vessel/flotilla/alpha/leg-1".parse().expect("valid"));
+        views.open_or_focus("vessel/flotilla/bravo/leg-1".parse().expect("valid"));
+        views.open_or_focus("vessel/flotilla/bravo/solo".parse().expect("valid"));
+
+        let labels = tab_labels(&views, &app.model);
+        assert_eq!(labels[1], "alpha/leg-1", "colliding label widens");
+        assert_eq!(labels[2], "bravo/leg-1", "colliding label widens");
+        assert_eq!(labels[3], "solo", "unique label stays short");
     }
 
     #[test]

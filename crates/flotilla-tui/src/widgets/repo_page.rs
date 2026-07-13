@@ -417,10 +417,12 @@ impl InteractiveWidget for RepoPage {
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
+        // Kind-level modes only — Screen composes the shell layer
+        // (TabPage, and TabShell when the tab bar exists).
         if self.active_search_query.is_some() {
-            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal, BindingModeId::SearchActive])
+            KeyBindingMode::Composed(vec![BindingModeId::Normal, BindingModeId::SearchActive])
         } else {
-            KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Normal])
+            KeyBindingMode::Composed(vec![BindingModeId::Normal])
         }
     }
 
