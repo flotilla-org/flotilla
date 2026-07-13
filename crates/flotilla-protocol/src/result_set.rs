@@ -24,15 +24,19 @@ pub enum QueryId {
     /// All Convoys — durable ∪ observed, fleet-merged, joined with
     /// Presentation attach state. Rows are [`ConvoyRow`].
     Convoys,
+    /// Free-floating TerminalSessions with no Convoy association. Rows are
+    /// [`SessionRow`].
+    Sessions,
 }
 
 impl QueryId {
     /// Every query the Aggregator maintains.
-    pub const ALL: &'static [QueryId] = &[QueryId::Convoys];
+    pub const ALL: &'static [QueryId] = &[QueryId::Convoys, QueryId::Sessions];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Convoys => "convoys",
+            Self::Sessions => "sessions",
         }
     }
 }
@@ -85,18 +89,21 @@ impl ResultDelta {
 #[serde(tag = "kind", content = "rows", rename_all = "snake_case")]
 pub enum Rows {
     Convoys(Vec<ConvoyRow>),
+    Sessions(Vec<SessionRow>),
 }
 
 impl Rows {
     pub fn query(&self) -> QueryId {
         match self {
             Self::Convoys(_) => QueryId::Convoys,
+            Self::Sessions(_) => QueryId::Sessions,
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
             Self::Convoys(rows) => rows.len(),
+            Self::Sessions(rows) => rows.len(),
         }
     }
 
@@ -107,8 +114,62 @@ impl Rows {
     pub fn as_convoys(&self) -> Option<&[ConvoyRow]> {
         match self {
             Self::Convoys(rows) => Some(rows),
+            _ => None,
         }
     }
+
+    pub fn as_sessions(&self) -> Option<&[SessionRow]> {
+        match self {
+            Self::Sessions(rows) => Some(rows),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle phase of a free-floating terminal session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    #[default]
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+}
+
+impl SessionPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for SessionPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One row of the [`QueryId::Sessions`] result set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct SessionRow {
+    /// Row identity and merge key across hosts.
+    pub resource: ResourceRef,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoKey>,
+    /// Host whose daemon can act on this session.
+    pub host: HostName,
+    /// Session reference accepted by `flotilla attach`. `Some` is a
+    /// capability fact: the daemon can currently resolve the attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach: Option<String>,
+    pub phase: SessionPhase,
 }
 
 /// Convoy lifecycle phase as reported on query rows.

@@ -304,7 +304,7 @@ fn append_crewless_convoy_rows(
 ) {
     let mut convoys_with_crew: HashSet<String> = rows.iter().map(|row| row.convoy.clone()).collect();
     for result_set in result_sets {
-        let Rows::Convoys(convoys) = &result_set.rows;
+        let Rows::Convoys(convoys) = &result_set.rows else { continue };
         for row in convoys {
             if row.resource.namespace != target_namespace {
                 continue;
@@ -2777,12 +2777,24 @@ impl InProcessDaemon {
         }
 
         let namespace = self.provisioning_namespace().await;
-        let terminal_sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace);
-        let sessions = terminal_sessions.list().await.map_err(|err| err.to_string())?.items;
+        let durable_sessions =
+            self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).list().await.map_err(|err| err.to_string())?.items;
+        let observed_sessions = self
+            .observed_resource_backend
+            .clone()
+            .using::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
+        let mut sessions_by_name = HashMap::new();
+        for session in durable_sessions.into_iter().chain(observed_sessions) {
+            sessions_by_name.insert(session.metadata.name.clone(), session);
+        }
         let mut exact = Vec::new();
         let mut prefix = Vec::new();
 
-        for session in sessions {
+        for session in sessions_by_name.into_values() {
             if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
                 continue;
             }

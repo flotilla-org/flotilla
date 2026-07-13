@@ -8,7 +8,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use flotilla_protocol::{
-    result_set::{ConvoyRow, QueryId, ResultSet, Rows},
+    result_set::{ConvoyRow, QueryId, ResultSet, Rows, SessionRow},
     HostName, ResourceRef,
 };
 use tokio::sync::{RwLock, RwLockWriteGuard};
@@ -26,6 +26,16 @@ impl QueryRow for ConvoyRow {
 
     fn into_rows(rows: Vec<Self>) -> Rows {
         Rows::Convoys(rows)
+    }
+}
+
+impl QueryRow for SessionRow {
+    fn resource(&self) -> &ResourceRef {
+        &self.resource
+    }
+
+    fn into_rows(rows: Vec<Self>) -> Rows {
+        Rows::Sessions(rows)
     }
 }
 
@@ -66,9 +76,40 @@ impl<R: QueryRow> QueryProjection<R> {
     }
 }
 
+impl<R: QueryRow + PartialEq> QueryProjection<R> {
+    /// Replace every replica host's contribution after a fleet refresh and
+    /// return the changed and removed rows when the result set advanced.
+    pub fn replace_replica_rows(&mut self, replacements: HashMap<HostName, HashMap<ResourceRef, R>>) -> Option<(Vec<R>, Vec<ResourceRef>)> {
+        let previous = std::mem::take(&mut self.replica_rows);
+        let changed = replacements
+            .iter()
+            .flat_map(|(host, rows)| {
+                let prior = previous.get(host);
+                rows.iter()
+                    .filter(move |(reference, row)| prior.and_then(|prior| prior.get(*reference)) != Some(*row))
+                    .map(|(_, row)| row.clone())
+            })
+            .collect::<Vec<_>>();
+        let removed = previous
+            .iter()
+            .flat_map(|(host, rows)| {
+                let replacement = replacements.get(host);
+                rows.keys().filter(move |reference| replacement.is_none_or(|replacement| !replacement.contains_key(*reference))).cloned()
+            })
+            .collect::<Vec<_>>();
+        self.replica_rows = replacements;
+        if changed.is_empty() && removed.is_empty() {
+            return None;
+        }
+        self.seq = self.seq.saturating_add(1);
+        Some((changed, removed))
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
+    sessions: Arc<RwLock<QueryProjection<SessionRow>>>,
 }
 
 impl AggregatorProjectionState {
@@ -92,6 +133,22 @@ impl AggregatorProjectionState {
         self.convoys.read().await.local_result_set()
     }
 
+    pub async fn write_sessions(&self) -> RwLockWriteGuard<'_, QueryProjection<SessionRow>> {
+        self.sessions.write().await
+    }
+
+    pub async fn sessions_result_set(&self) -> ResultSet {
+        self.sessions.read().await.result_set()
+    }
+
+    pub async fn sessions_seq(&self) -> u64 {
+        self.sessions.read().await.seq
+    }
+
+    pub async fn local_sessions_result_set(&self) -> ResultSet {
+        self.sessions.read().await.local_result_set()
+    }
+
     /// This host's local result sets across all named queries, in the order
     /// of [`QueryId::ALL`].
     pub async fn local_result_sets(&self) -> Vec<ResultSet> {
@@ -99,6 +156,7 @@ impl AggregatorProjectionState {
         for query in QueryId::ALL {
             result_sets.push(match query {
                 QueryId::Convoys => self.local_result_set().await,
+                QueryId::Sessions => self.local_sessions_result_set().await,
             });
         }
         result_sets
@@ -108,6 +166,7 @@ impl AggregatorProjectionState {
     pub async fn result_set_for(&self, query: QueryId) -> ResultSet {
         match query {
             QueryId::Convoys => self.result_set().await,
+            QueryId::Sessions => self.sessions_result_set().await,
         }
     }
 }
