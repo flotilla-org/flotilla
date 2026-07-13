@@ -32,8 +32,10 @@ pub enum ViewTarget {
 }
 
 pub trait RecipeMint: Send + Sync {
-    /// Recipe materialising a live session into a pane.
-    fn session_attach(&self, attach_ref: &str) -> Option<Recipe>;
+    /// Recipe attaching a live entity — a session into a pane, or a vessel's
+    /// running session into a workspace; `attach_ref` is any reference the
+    /// daemon accepts (rows expose it as a capability fact).
+    fn attach(&self, attach_ref: &str) -> Option<Recipe>;
     /// Recipe materialising a scoped view of an entity with no live session.
     fn scoped_view(&self, target: &ViewTarget) -> Option<Recipe>;
 }
@@ -52,7 +54,7 @@ impl AttachOnlyRecipes {
 }
 
 impl RecipeMint for AttachOnlyRecipes {
-    fn session_attach(&self, attach_ref: &str) -> Option<Recipe> {
+    fn attach(&self, attach_ref: &str) -> Option<Recipe> {
         Some(Recipe::Command(format!("{} attach {attach_ref}", self.flotilla_bin)))
     }
 
@@ -68,7 +70,7 @@ mod tests {
     #[test]
     fn attach_only_mint_formats_attach_and_declines_views() {
         let mint = AttachOnlyRecipes::new("flotilla");
-        assert_eq!(mint.session_attach("implement"), Some(Recipe::Command("flotilla attach implement".to_owned())));
+        assert_eq!(mint.attach("implement"), Some(Recipe::Command("flotilla attach implement".to_owned())));
         assert_eq!(
             mint.scoped_view(&ViewTarget::Vessel {
                 namespace: "dev".to_owned(),

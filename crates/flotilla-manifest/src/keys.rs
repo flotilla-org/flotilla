@@ -16,6 +16,10 @@ pub const SOURCE_ACTUATOR: &str = "flotilla-actuator";
 pub const CATALOG_TTL_MS: u64 = 30_000;
 /// Re-assertion cadence for TTL'd catalog facts.
 pub const REASSERT_INTERVAL_MS: u64 = 10_000;
+/// Ordering hint stamped on archipelago-level groups (free-floating vessels
+/// with no project segment) so they group and order first by default —
+/// lower is earlier (ordering semantics: Leg-1 gap report §9.6).
+pub const ARCHIPELAGO_ORDINAL: i64 = -100;
 
 // Pane-stamp keys (`flotilla attach`, Pane target, no TTL).
 

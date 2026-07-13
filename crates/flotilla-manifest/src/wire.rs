@@ -20,7 +20,7 @@ pub const APPLY_METADATA_PATCH_PIPE: &str = "andamento-apply-metadata-patch";
 pub const OBSERVED_IDENTITIES_PIPE: &str = "andamento-observed-identities";
 
 /// A metadata fact value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
 pub enum MetadataValue {
     Text(String),
@@ -73,7 +73,19 @@ impl std::hash::Hash for MetadataPathSegmentValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+impl PartialOrd for MetadataPathSegmentValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MetadataPathSegmentValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key).then_with(|| self.value.cmp(&other.value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
 pub enum MetadataPathValue {
     Text(String),
@@ -84,7 +96,7 @@ pub enum MetadataPathValue {
 
 /// A hierarchical grouping path — the catalog's project → convoy → vessel
 /// spine is expressed as one of these per group target.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupPath(pub Vec<GroupSegment>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,22 +134,34 @@ impl std::hash::Hash for GroupSegment {
     }
 }
 
+impl PartialOrd for GroupSegment {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GroupSegment {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key).then_with(|| self.value.cmp(&other.value))
+    }
+}
+
 /// A key=value identity node in the PM's metadata graph. Facts published
 /// against an identity resolve transitively onto every pane carrying it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct MetadataIdentity {
     pub key: String,
     pub value: MetadataValue,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "kebab-case")]
 pub enum PaneTarget {
     Terminal(u32),
     Plugin(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum MetadataTarget {
     Root,
