@@ -1832,7 +1832,27 @@ async fn removing_one_of_multiple_local_roots_preserves_observed_checkouts() {
 
     daemon.remove_repo(&repo_a).await.expect("remove first local root");
 
-    assert_eq!(observed.list().await.expect("observed checkout list should succeed").items.len(), 2);
+    let surviving_checkout_path = repo_b.join("main").to_string_lossy().into_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let remaining = observed.list().await.expect("observed checkout list should succeed");
+            if matches!(
+                remaining.items.as_slice(),
+                [checkout]
+                    if matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == surviving_checkout_path)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("surviving root's observed Checkout should remain");
+    let remaining = observed.list().await.expect("observed checkout list should succeed");
+    assert!(matches!(
+        &remaining.items[0].spec,
+        ResourceCheckoutSpec::Observed(spec) if spec.path == surviving_checkout_path
+    ));
 
     daemon.remove_repo(&repo_b).await.expect("remove final local root");
 
