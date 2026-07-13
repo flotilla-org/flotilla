@@ -7,9 +7,10 @@ use std::{
 
 use chrono::Utc;
 use futures::{stream, StreamExt};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection as RusqliteConnection, OptionalExtension};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio_rusqlite::Connection;
 
 use crate::{
     error::ResourceError,
@@ -24,10 +25,9 @@ type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
 
 #[derive(Debug, Clone)]
 pub struct SqliteBackend {
-    // rusqlite is synchronous. The embedded daemon currently serializes SQLite
-    // access behind one mutex; move this behind spawn_blocking or tokio-rusqlite
-    // if controller contention shows up in practice.
-    connection: Arc<Mutex<Connection>>,
+    connection: Connection,
+    // Mutations notify and watches register from the connection thread so a
+    // committed event cannot land between replay and live delivery.
     watchers: Arc<Mutex<WatchersByStore>>,
     event_retention: EventRetention,
 }
@@ -70,8 +70,14 @@ impl SqliteBackend {
     }
 
     pub fn open_with_event_retention(path: impl AsRef<Path>, event_retention: EventRetention) -> Result<Self, ResourceError> {
-        let connection = Connection::open(path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
+        let connection =
+            RusqliteConnection::open(path).map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         Self::from_connection(connection, event_retention)
+    }
+
+    pub async fn open_async(path: impl AsRef<Path>) -> Result<Self, ResourceError> {
+        let connection = Connection::open(path).await.map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
+        Self::from_async_connection(connection, EventRetention::default()).await
     }
 
     pub fn open_in_memory() -> Result<Self, ResourceError> {
@@ -79,11 +85,25 @@ impl SqliteBackend {
     }
 
     pub fn open_in_memory_with_event_retention(event_retention: EventRetention) -> Result<Self, ResourceError> {
-        let connection = Connection::open_in_memory().map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
+        let connection =
+            RusqliteConnection::open_in_memory().map_err(|err| ResourceError::other(format!("open sqlite resource store: {err}")))?;
         Self::from_connection(connection, event_retention)
     }
 
-    fn from_connection(mut connection: Connection, event_retention: EventRetention) -> Result<Self, ResourceError> {
+    fn from_connection(mut connection: RusqliteConnection, event_retention: EventRetention) -> Result<Self, ResourceError> {
+        Self::initialize_connection(&mut connection, event_retention)?;
+        Ok(Self { connection: connection.into(), watchers: Arc::new(Mutex::new(HashMap::new())), event_retention })
+    }
+
+    async fn from_async_connection(connection: Connection, event_retention: EventRetention) -> Result<Self, ResourceError> {
+        connection
+            .call(move |connection| Self::initialize_connection(connection, event_retention))
+            .await
+            .map_err(Self::map_connection_error)?;
+        Ok(Self { connection, watchers: Arc::new(Mutex::new(HashMap::new())), event_retention })
+    }
+
+    fn initialize_connection(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|err| ResourceError::other(format!("configure sqlite resource store busy timeout: {err}")))?;
@@ -135,7 +155,7 @@ impl SqliteBackend {
                 "#,
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
-        let startup_diagnostics = Self::diagnostics_from_connection(&connection, event_retention)?;
+        let startup_diagnostics = Self::diagnostics_from_connection(connection, event_retention)?;
         if !startup_diagnostics.warnings.is_empty() {
             tracing::warn!(
                 event_count = startup_diagnostics.event_count,
@@ -146,29 +166,40 @@ impl SqliteBackend {
                 "resource event log tripwire triggered on startup; compacting",
             );
         }
-        Self::compact_existing_events(&mut connection, event_retention)?;
-        Ok(Self { connection: Arc::new(Mutex::new(connection)), watchers: Arc::new(Mutex::new(HashMap::new())), event_retention })
+        Self::compact_existing_events(connection, event_retention)?;
+        Ok(())
     }
 
     fn store_key<T: Resource>(namespace: &str) -> StoreKey {
         (T::API_PATHS.group.to_string(), T::API_PATHS.version.to_string(), T::API_PATHS.kind.to_string(), namespace.to_string())
     }
 
-    fn lock_connection(&self) -> Result<MutexGuard<'_, Connection>, ResourceError> {
-        self.connection.lock().map_err(|_| ResourceError::other("sqlite resource store lock poisoned"))
+    fn lock_watchers(watchers: &Mutex<WatchersByStore>) -> Result<MutexGuard<'_, WatchersByStore>, ResourceError> {
+        watchers.lock().map_err(|_| ResourceError::other("sqlite resource watch lock poisoned"))
     }
 
-    fn lock_watchers(&self) -> Result<MutexGuard<'_, WatchersByStore>, ResourceError> {
-        self.watchers.lock().map_err(|_| ResourceError::other("sqlite resource watch lock poisoned"))
+    async fn call<R, F>(&self, operation: F) -> Result<R, ResourceError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut RusqliteConnection) -> Result<R, ResourceError> + Send + 'static,
+    {
+        self.connection.call(operation).await.map_err(Self::map_connection_error)
+    }
+
+    fn map_connection_error(error: tokio_rusqlite::Error<ResourceError>) -> ResourceError {
+        match error {
+            tokio_rusqlite::Error::Error(error) => error,
+            other => ResourceError::other(format!("sqlite connection thread failed: {other}")),
+        }
     }
 
     pub(crate) async fn diagnostics(&self) -> Result<ResourceStoreDiagnostics, ResourceError> {
-        let connection = self.lock_connection()?;
-        Self::diagnostics_from_connection(&connection, self.event_retention)
+        let event_retention = self.event_retention;
+        self.call(move |connection| Self::diagnostics_from_connection(connection, event_retention)).await
     }
 
     fn diagnostics_from_connection(
-        connection: &Connection,
+        connection: &RusqliteConnection,
         event_retention: EventRetention,
     ) -> Result<ResourceStoreDiagnostics, ResourceError> {
         let object_count = connection
@@ -214,7 +245,7 @@ impl SqliteBackend {
         ResourceError::other(format!("{action}: {err}"))
     }
 
-    fn current_version(conn: &Connection, key: &StoreKey) -> Result<u64, ResourceError> {
+    fn current_version(conn: &RusqliteConnection, key: &StoreKey) -> Result<u64, ResourceError> {
         let version = conn
             .query_row(
                 "SELECT next_version FROM resource_sequences WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4",
@@ -300,7 +331,7 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn compact_existing_events(connection: &mut Connection, event_retention: EventRetention) -> Result<(), ResourceError> {
+    fn compact_existing_events(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
         let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource event startup compaction"))?;
         let stores = {
             let mut statement = tx
@@ -317,8 +348,8 @@ impl SqliteBackend {
         tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource event startup compaction"))
     }
 
-    fn notify_watchers(&self, key: &StoreKey, event: StoredEvent) {
-        if let Ok(mut watchers) = self.lock_watchers() {
+    fn notify_watchers(watchers: &Mutex<WatchersByStore>, key: &StoreKey, event: StoredEvent) {
+        if let Ok(mut watchers) = Self::lock_watchers(watchers) {
             if let Some(entries) = watchers.get_mut(key) {
                 entries.retain(|watcher| watcher.send(event.clone()).is_ok());
             }
@@ -327,45 +358,51 @@ impl SqliteBackend {
 
     pub(crate) async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let conn = self.lock_connection()?;
-        let body: String = conn
-            .query_row(
-                r#"
-                SELECT body_json FROM resource_objects
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                "#,
-                params![key.0, key.1, key.2, key.3, name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| Self::map_sqlite(err, "read sqlite resource object"))?
-            .ok_or_else(|| ResourceError::not_found(name))?;
-        let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
-        Self::decode_object::<T>(value)
+        let name = name.to_string();
+        self.call(move |connection| {
+            let body: String = connection
+                .query_row(
+                    r#"
+                    SELECT body_json FROM resource_objects
+                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                    "#,
+                    params![key.0, key.1, key.2, key.3, name],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| Self::map_sqlite(err, "read sqlite resource object"))?
+                .ok_or_else(|| ResourceError::not_found(&name))?;
+            let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
+            Self::decode_object::<T>(value)
+        })
+        .await
     }
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let conn = self.lock_connection()?;
-        let mut statement = conn
-            .prepare(
-                r#"
-                SELECT body_json FROM resource_objects
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
-                ORDER BY name
-                "#,
-            )
-            .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
-        let rows = statement
-            .query_map(params![key.0, key.1, key.2, key.3], |row| row.get::<_, String>(0))
-            .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
-        let mut items = Vec::new();
-        for row in rows {
-            let body = row.map_err(|err| Self::map_sqlite(err, "read sqlite resource list row"))?;
-            let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
-            items.push(Self::decode_object::<T>(value)?);
-        }
-        Ok(ResourceList { items, resource_version: Self::current_version(&conn, &key)?.to_string(), generation: None })
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    r#"
+                    SELECT body_json FROM resource_objects
+                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4
+                    ORDER BY name
+                    "#,
+                )
+                .map_err(|err| Self::map_sqlite(err, "prepare sqlite resource list"))?;
+            let rows = statement
+                .query_map(params![key.0, key.1, key.2, key.3], |row| row.get::<_, String>(0))
+                .map_err(|err| Self::map_sqlite(err, "query sqlite resource list"))?;
+            let mut items = Vec::new();
+            for row in rows {
+                let body = row.map_err(|err| Self::map_sqlite(err, "read sqlite resource list row"))?;
+                let value =
+                    serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode stored object JSON: {err}")))?;
+                items.push(Self::decode_object::<T>(value)?);
+            }
+            Ok(ResourceList { items, resource_version: Self::current_version(connection, &key)?.to_string(), generation: None })
+        })
+        .await
     }
 
     pub(crate) async fn list_typed_matching_labels<T: Resource>(
@@ -393,54 +430,61 @@ impl SqliteBackend {
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let mut conn = self.lock_connection()?;
-        let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource create"))?;
-        let exists = tx
-            .query_row(
-                r#"
-                SELECT 1 FROM resource_objects
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                "#,
-                params![key.0, key.1, key.2, key.3, meta.name],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|err| Self::map_sqlite(err, "check sqlite resource create conflict"))?
-            .is_some();
-        if exists {
-            return Err(ResourceError::conflict(&meta.name, "resource already exists"));
-        }
+        let namespace = namespace.to_string();
+        let meta = meta.clone();
+        let spec = spec.clone();
+        let watchers = Arc::clone(&self.watchers);
+        let event_retention = self.event_retention;
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource create"))?;
+            let exists = tx
+                .query_row(
+                    r#"
+                    SELECT 1 FROM resource_objects
+                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                    "#,
+                    params![key.0, key.1, key.2, key.3, meta.name],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|err| Self::map_sqlite(err, "check sqlite resource create conflict"))?
+                .is_some();
+            if exists {
+                return Err(ResourceError::conflict(&meta.name, "resource already exists"));
+            }
 
-        let version = Self::allocate_version(&tx, &key)?;
-        let object = ResourceObject::<T> {
-            metadata: ObjectMeta {
-                name: meta.name.clone(),
-                namespace: namespace.to_string(),
-                resource_version: version.to_string(),
-                labels: meta.labels.clone(),
-                annotations: meta.annotations.clone(),
-                owner_references: meta.owner_references.clone(),
-                finalizers: meta.finalizers.clone(),
-                deletion_timestamp: meta.deletion_timestamp,
-                creation_timestamp: Utc::now(),
-            },
-            spec: Self::clone_through_serde(spec)?,
-            status: None,
-        };
-        let encoded = Self::encode_object(&object)?;
-        let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-        tx.execute(
-            r#"
-            INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            params![key.0, key.1, key.2, key.3, meta.name, version, body_json],
-        )
-        .map_err(|err| Self::map_sqlite(err, "insert sqlite resource object"))?;
-        Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, self.event_retention)?;
-        tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource create"))?;
-        self.notify_watchers(&key, StoredEvent { kind: StoredEventKind::Added, object: encoded });
-        Ok(object)
+            let version = Self::allocate_version(&tx, &key)?;
+            let object = ResourceObject::<T> {
+                metadata: ObjectMeta {
+                    name: meta.name.clone(),
+                    namespace,
+                    resource_version: version.to_string(),
+                    labels: meta.labels.clone(),
+                    annotations: meta.annotations.clone(),
+                    owner_references: meta.owner_references.clone(),
+                    finalizers: meta.finalizers.clone(),
+                    deletion_timestamp: meta.deletion_timestamp,
+                    creation_timestamp: Utc::now(),
+                },
+                spec: Self::clone_through_serde(&spec)?,
+                status: None,
+            };
+            let encoded = Self::encode_object(&object)?;
+            let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
+            tx.execute(
+                r#"
+                INSERT INTO resource_objects (group_name, version, kind, namespace, name, resource_version, body_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "#,
+                params![key.0, key.1, key.2, key.3, meta.name, version, body_json],
+            )
+            .map_err(|err| Self::map_sqlite(err, "insert sqlite resource object"))?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Added, &body_json, event_retention)?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource create"))?;
+            Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Added, object: encoded });
+            Ok(object)
+        })
+        .await
     }
 
     pub(crate) async fn update_typed<T: Resource>(
@@ -451,46 +495,53 @@ impl SqliteBackend {
         spec: &T::Spec,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let mut conn = self.lock_connection()?;
-        let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource update"))?;
-        let existing = Self::select_existing::<T>(&tx, &key, &meta.name)?;
-        let mut object = existing.ok_or_else(|| ResourceError::not_found(&meta.name))?;
-        if object.metadata.resource_version != resource_version {
-            return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
-        }
-        if object.matches_update(meta, spec)? {
-            return Ok(object);
-        }
+        let meta = meta.clone();
+        let resource_version = resource_version.to_string();
+        let spec = spec.clone();
+        let watchers = Arc::clone(&self.watchers);
+        let event_retention = self.event_retention;
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource update"))?;
+            let existing = Self::select_existing::<T>(&tx, &key, &meta.name)?;
+            let mut object = existing.ok_or_else(|| ResourceError::not_found(&meta.name))?;
+            if object.metadata.resource_version != resource_version {
+                return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
+            }
+            if object.matches_update(&meta, &spec)? {
+                return Ok(object);
+            }
 
-        let version = Self::allocate_version(&tx, &key)?;
-        object.metadata.resource_version = version.to_string();
-        object.metadata.labels = meta.labels.clone();
-        object.metadata.annotations = meta.annotations.clone();
-        object.metadata.owner_references = meta.owner_references.clone();
-        object.metadata.finalizers = meta.finalizers.clone();
-        object.metadata.deletion_timestamp = meta.deletion_timestamp;
-        object.spec = Self::clone_through_serde(spec)?;
+            let version = Self::allocate_version(&tx, &key)?;
+            object.metadata.resource_version = version.to_string();
+            object.metadata.labels = meta.labels.clone();
+            object.metadata.annotations = meta.annotations.clone();
+            object.metadata.owner_references = meta.owner_references.clone();
+            object.metadata.finalizers = meta.finalizers.clone();
+            object.metadata.deletion_timestamp = meta.deletion_timestamp;
+            object.spec = Self::clone_through_serde(&spec)?;
 
-        let encoded = Self::encode_object(&object)?;
-        let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-        let event_kind = if object.metadata.deletion_timestamp.is_some() && object.metadata.finalizers.is_empty() {
-            tx.execute(
-                r#"
-                DELETE FROM resource_objects
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                "#,
-                params![key.0, key.1, key.2, key.3, meta.name],
-            )
-            .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
-            StoredEventKind::Deleted
-        } else {
-            Self::upsert_object(&tx, &key, &meta.name, version, &body_json)?;
-            StoredEventKind::Modified
-        };
-        Self::insert_event(&tx, &key, version, event_kind, &body_json, self.event_retention)?;
-        tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource update"))?;
-        self.notify_watchers(&key, StoredEvent { kind: event_kind, object: encoded });
-        Ok(object)
+            let encoded = Self::encode_object(&object)?;
+            let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
+            let event_kind = if object.metadata.deletion_timestamp.is_some() && object.metadata.finalizers.is_empty() {
+                tx.execute(
+                    r#"
+                    DELETE FROM resource_objects
+                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                    "#,
+                    params![key.0, key.1, key.2, key.3, meta.name],
+                )
+                .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
+                StoredEventKind::Deleted
+            } else {
+                Self::upsert_object(&tx, &key, &meta.name, version, &body_json)?;
+                StoredEventKind::Modified
+            };
+            Self::insert_event(&tx, &key, version, event_kind, &body_json, event_retention)?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource update"))?;
+            Self::notify_watchers(&watchers, &key, StoredEvent { kind: event_kind, object: encoded });
+            Ok(object)
+        })
+        .await
     }
 
     pub(crate) async fn update_status_typed<T: Resource>(
@@ -501,66 +552,80 @@ impl SqliteBackend {
         status: &T::Status,
     ) -> Result<ResourceObject<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let mut conn = self.lock_connection()?;
-        let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource status update"))?;
-        let existing = Self::select_existing::<T>(&tx, &key, name)?;
-        let mut object = existing.ok_or_else(|| ResourceError::not_found(name))?;
-        if object.metadata.resource_version != resource_version {
-            return Err(ResourceError::conflict(name, "stale resourceVersion"));
-        }
-        if object.matches_status(status)? {
-            return Ok(object);
-        }
+        let name = name.to_string();
+        let resource_version = resource_version.to_string();
+        let status = status.clone();
+        let watchers = Arc::clone(&self.watchers);
+        let event_retention = self.event_retention;
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource status update"))?;
+            let existing = Self::select_existing::<T>(&tx, &key, &name)?;
+            let mut object = existing.ok_or_else(|| ResourceError::not_found(&name))?;
+            if object.metadata.resource_version != resource_version {
+                return Err(ResourceError::conflict(&name, "stale resourceVersion"));
+            }
+            if object.matches_status(&status)? {
+                return Ok(object);
+            }
 
-        let version = Self::allocate_version(&tx, &key)?;
-        object.metadata.resource_version = version.to_string();
-        object.status = Some(Self::clone_through_serde(status)?);
+            let version = Self::allocate_version(&tx, &key)?;
+            object.metadata.resource_version = version.to_string();
+            object.status = Some(Self::clone_through_serde(&status)?);
 
-        let encoded = Self::encode_object(&object)?;
-        let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-        Self::upsert_object(&tx, &key, name, version, &body_json)?;
-        Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, self.event_retention)?;
-        tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource status update"))?;
-        self.notify_watchers(&key, StoredEvent { kind: StoredEventKind::Modified, object: encoded });
-        Ok(object)
+            let encoded = Self::encode_object(&object)?;
+            let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
+            Self::upsert_object(&tx, &key, &name, version, &body_json)?;
+            Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, event_retention)?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource status update"))?;
+            Self::notify_watchers(&watchers, &key, StoredEvent { kind: StoredEventKind::Modified, object: encoded });
+            Ok(object)
+        })
+        .await
     }
 
     pub(crate) async fn delete_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<(), ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let mut conn = self.lock_connection()?;
-        let tx = conn.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource delete"))?;
-        let existing = Self::select_existing::<T>(&tx, &key, name)?;
-        let mut object = existing.ok_or_else(|| ResourceError::not_found(name))?;
-        if object.metadata.is_pending_finalization() {
-            return Ok(());
-        }
-        let version = Self::allocate_version(&tx, &key)?;
-        object.metadata.resource_version = version.to_string();
+        let name = name.to_string();
+        let watchers = Arc::clone(&self.watchers);
+        let event_retention = self.event_retention;
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite resource delete"))?;
+            let existing = Self::select_existing::<T>(&tx, &key, &name)?;
+            let mut object = existing.ok_or_else(|| ResourceError::not_found(&name))?;
+            if object.metadata.is_pending_finalization() {
+                return Ok(());
+            }
+            let version = Self::allocate_version(&tx, &key)?;
+            object.metadata.resource_version = version.to_string();
 
-        let (event_kind, encoded) = if !object.metadata.finalizers.is_empty() && object.metadata.deletion_timestamp.is_none() {
-            object.metadata.deletion_timestamp = Some(Utc::now());
-            let encoded = Self::encode_object(&object)?;
-            let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-            Self::upsert_object(&tx, &key, name, version, &body_json)?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, self.event_retention)?;
-            (StoredEventKind::Modified, encoded)
-        } else {
-            let encoded = Self::encode_object(&object)?;
-            let body_json = serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
-            tx.execute(
-                r#"
-                DELETE FROM resource_objects
-                WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
-                "#,
-                params![key.0, key.1, key.2, key.3, name],
-            )
-            .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
-            Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, self.event_retention)?;
-            (StoredEventKind::Deleted, encoded)
-        };
-        tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource delete"))?;
-        self.notify_watchers(&key, StoredEvent { kind: event_kind, object: encoded });
-        Ok(())
+            let (event_kind, encoded) = if !object.metadata.finalizers.is_empty() && object.metadata.deletion_timestamp.is_none() {
+                object.metadata.deletion_timestamp = Some(Utc::now());
+                let encoded = Self::encode_object(&object)?;
+                let body_json =
+                    serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
+                Self::upsert_object(&tx, &key, &name, version, &body_json)?;
+                Self::insert_event(&tx, &key, version, StoredEventKind::Modified, &body_json, event_retention)?;
+                (StoredEventKind::Modified, encoded)
+            } else {
+                let encoded = Self::encode_object(&object)?;
+                let body_json =
+                    serde_json::to_string(&encoded).map_err(|err| ResourceError::decode(format!("encode object JSON: {err}")))?;
+                tx.execute(
+                    r#"
+                    DELETE FROM resource_objects
+                    WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name = ?5
+                    "#,
+                    params![key.0, key.1, key.2, key.3, name],
+                )
+                .map_err(|err| Self::map_sqlite(err, "delete sqlite resource object"))?;
+                Self::insert_event(&tx, &key, version, StoredEventKind::Deleted, &body_json, event_retention)?;
+                (StoredEventKind::Deleted, encoded)
+            };
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite resource delete"))?;
+            Self::notify_watchers(&watchers, &key, StoredEvent { kind: event_kind, object: encoded });
+            Ok(())
+        })
+        .await
     }
 
     pub(crate) async fn watch_typed<T: Resource>(&self, namespace: &str, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
@@ -575,15 +640,17 @@ impl SqliteBackend {
             }
         };
         let (sender, receiver) = mpsc::unbounded_channel();
-        let replay = {
-            let conn = self.lock_connection()?;
-            let replay = match replay_from {
-                Some(version) => Self::replay_events(&conn, &key, version)?,
-                None => Vec::new(),
-            };
-            self.lock_watchers()?.entry(key.clone()).or_default().push(sender);
-            replay
-        };
+        let watchers = Arc::clone(&self.watchers);
+        let replay = self
+            .call(move |connection| {
+                let replay = match replay_from {
+                    Some(version) => Self::replay_events(connection, &key, version)?,
+                    None => Vec::new(),
+                };
+                Self::lock_watchers(&watchers)?.entry(key).or_default().push(sender);
+                Ok(replay)
+            })
+            .await?;
 
         let replay_stream = stream::iter(replay.into_iter().map(Self::decode_event::<T>));
         let live_stream = stream::unfold(receiver, |mut receiver| async {
@@ -635,7 +702,7 @@ impl SqliteBackend {
         Ok(())
     }
 
-    fn replay_events(conn: &Connection, key: &StoreKey, replay_from: u64) -> Result<Vec<StoredEvent>, ResourceError> {
+    fn replay_events(conn: &RusqliteConnection, key: &StoreKey, replay_from: u64) -> Result<Vec<StoredEvent>, ResourceError> {
         let compacted_through = conn
             .query_row(
                 r#"

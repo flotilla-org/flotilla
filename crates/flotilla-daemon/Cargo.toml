@@ -31,7 +31,7 @@ visibility = "0.1.1"
 
 [dev-dependencies]
 indexmap = { workspace = true }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
