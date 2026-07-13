@@ -6,6 +6,7 @@ use flotilla_protocol::{Command, CommandAction, EnvironmentId, RepoSelector};
 use crate::{
     noun::NounCommand,
     resolved::{HostResolution, RepoContext},
+    subject::{resolve_subject, write_subject},
     Resolved,
 };
 
@@ -14,7 +15,11 @@ use crate::{
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct EnvironmentNoun {
     /// Canonical environment id
+    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
     pub subject: Option<String>,
+    /// Literal subject; use for external names beginning with `@`
+    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
+    pub explicit_subject: Option<String>,
 
     #[command(subcommand)]
     pub verb: Option<EnvironmentVerb>,
@@ -31,7 +36,8 @@ pub enum EnvironmentVerb {
 
 impl EnvironmentNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        match (self.subject, self.verb) {
+        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        match (subject, self.verb) {
             (Some(subject), Some(EnvironmentVerb::Refresh { repo })) => {
                 let environment_id = EnvironmentId::parse(&subject)?;
                 Ok(Resolved::NeedsContext {
@@ -49,8 +55,8 @@ impl EnvironmentNoun {
                 let environment_id = EnvironmentId::parse(&subject)?;
                 let cmd = clap::Command::new("environment-route").no_binary_name(true);
                 let cmd = <NounCommand as Subcommand>::augment_subcommands(cmd);
-                let matches = cmd.try_get_matches_from(&tokens).map_err(|e| e.to_string())?;
-                let noun = <NounCommand as clap::FromArgMatches>::from_arg_matches(&matches).map_err(|e| e.to_string())?;
+                let matches = cmd.try_get_matches_from(&tokens).map_err(crate::subject::format_parse_error)?;
+                let noun = <NounCommand as clap::FromArgMatches>::from_arg_matches(&matches).map_err(crate::subject::format_parse_error)?;
                 let mut resolved = noun.resolve()?;
                 resolved.set_explicit_environment(environment_id);
                 Ok(resolved)
@@ -66,9 +72,7 @@ impl EnvironmentNoun {
 impl fmt::Display for EnvironmentNoun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "environment")?;
-        if let Some(subject) = &self.subject {
-            write!(f, " {subject}")?;
-        }
+        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
         if let Some(verb) = &self.verb {
             match verb {
                 EnvironmentVerb::Refresh { repo } => {
@@ -116,6 +120,22 @@ mod tests {
             repo: RepoContext::None,
             host: HostResolution::ExplicitEnvironment(EnvironmentId::host(HostId::new("alpha-env"))),
         });
+    }
+
+    #[test]
+    fn marked_subject_disambiguates_environment_named_refresh() {
+        let resolved = parse(&["environment", "@refresh", "refresh"]).resolve().expect("resolve marked environment subject");
+        assert!(matches!(resolved, Resolved::NeedsContext {
+            host: HostResolution::ExplicitEnvironment(EnvironmentId::Provisioned(id)), ..
+        } if id == "refresh"));
+    }
+
+    #[test]
+    fn explicit_subject_preserves_environment_beginning_with_marker() {
+        let resolved = parse(&["environment", "--subject", "@refresh", "refresh"]).resolve().expect("resolve explicit environment subject");
+        assert!(matches!(resolved, Resolved::NeedsContext {
+            host: HostResolution::ExplicitEnvironment(EnvironmentId::Provisioned(id)), ..
+        } if id == "@refresh"));
     }
 
     #[test]

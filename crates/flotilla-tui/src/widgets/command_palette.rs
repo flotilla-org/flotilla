@@ -27,7 +27,7 @@ pub fn palette_prefill(item: &WorkItem) -> Option<String> {
     }
     if let Some(branch) = &item.branch {
         if item.checkout_key().is_some() {
-            return Some(format!("checkout {} ", branch));
+            return Some(format!("checkout {} ", flotilla_commands::address_subject_for_cli("checkout", branch)));
         }
     }
     if let Some(issue_key) = item.issue_keys.first() {
@@ -967,6 +967,18 @@ mod tests {
     fn prefill_from_checkout_branch() {
         let item = checkout_item("feat/my-branch", "/tmp/repo", false);
         assert_eq!(palette_prefill(&item), Some("checkout feat/my-branch ".into()));
+    }
+
+    #[test]
+    fn prefill_addresses_checkout_branch_that_collides_with_a_verb() {
+        let item = checkout_item("status", "/tmp/repo", false);
+        assert_eq!(palette_prefill(&item), Some("checkout @status ".into()));
+    }
+
+    #[test]
+    fn prefill_uses_literal_subject_for_checkout_branch_beginning_with_marker() {
+        let item = checkout_item("@topic", "/tmp/repo", false);
+        assert_eq!(palette_prefill(&item), Some("checkout --subject @topic ".into()));
     }
 
     #[test]

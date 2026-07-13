@@ -5,6 +5,7 @@ use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction
 
 use crate::{
     resolved::{HostResolution, RepoContext},
+    subject::{resolve_subject, write_subject},
     Resolved,
 };
 
@@ -13,7 +14,11 @@ use crate::{
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct CheckoutNoun {
     /// Branch name or checkout path
+    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
     pub subject: Option<String>,
+    /// Literal subject; use for external names beginning with `@`
+    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
+    pub explicit_subject: Option<String>,
 
     #[command(subcommand)]
     pub verb: Option<CheckoutVerb>,
@@ -41,7 +46,8 @@ pub enum CheckoutVerb {
 
 impl CheckoutNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        match (self.subject, self.verb) {
+        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        match (subject, self.verb) {
             (Some(_), Some(CheckoutVerb::Create { .. })) => {
                 Err("checkout create does not take a subject (repo comes from --repo or FLOTILLA_REPO)".into())
             }
@@ -89,9 +95,7 @@ impl CheckoutNoun {
 impl fmt::Display for CheckoutNoun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "checkout")?;
-        if let Some(subject) = &self.subject {
-            write!(f, " {subject}")?;
-        }
+        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
         if let Some(verb) = &self.verb {
             match verb {
                 CheckoutVerb::Create { branch, fresh } => {
@@ -222,8 +226,24 @@ mod tests {
     }
 
     #[test]
+    fn marked_subject_disambiguates_branch_named_status() {
+        let resolved = parse(&["checkout", "@status", "status"]).resolve().expect("resolve marked checkout subject");
+        assert!(matches!(resolved, Resolved::NeedsContext { command: Command {
+            action: CommandAction::FetchCheckoutStatus { branch, .. }, ..
+        }, .. } if branch == "status"));
+    }
+
+    #[test]
+    fn explicit_subject_preserves_branch_beginning_with_marker() {
+        let resolved = parse(&["checkout", "--subject", "@topic", "status"]).resolve().expect("resolve explicit checkout subject");
+        assert!(matches!(resolved, Resolved::NeedsContext { command: Command {
+            action: CommandAction::FetchCheckoutStatus { branch, .. }, ..
+        }, .. } if branch == "@topic"));
+    }
+
+    #[test]
     fn checkout_remove_no_subject_errors() {
-        let noun = CheckoutNoun { subject: None, verb: Some(super::CheckoutVerb::Remove) };
+        let noun = CheckoutNoun { subject: None, explicit_subject: None, verb: Some(super::CheckoutVerb::Remove) };
         assert!(noun.resolve().is_err());
     }
 
@@ -245,6 +265,12 @@ mod tests {
     #[test]
     fn round_trip_status() {
         assert_round_trip::<CheckoutNoun>(&["checkout", "my-feature", "status"]);
+    }
+
+    #[test]
+    fn marked_and_explicit_subjects_round_trip() {
+        assert_round_trip::<CheckoutNoun>(&["checkout", "@status", "status"]);
+        assert_round_trip::<CheckoutNoun>(&["checkout", "--subject", "@topic", "status"]);
     }
 
     #[test]

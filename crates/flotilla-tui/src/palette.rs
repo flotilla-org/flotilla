@@ -414,7 +414,7 @@ fn resolve_noun_name(token: &str) -> Option<String> {
 
 /// Subject completions for a given noun, drawn from model data.
 fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: &crate::app::NamespaceMap) -> Vec<PaletteCompletion> {
-    let lower = partial.to_lowercase();
+    let lower = partial.strip_prefix('@').unwrap_or(partial).to_lowercase();
     let items: Vec<(String, String)> = match noun {
         "convoy" => {
             // Single-namespace MVP: list convoys in "flotilla".
@@ -514,7 +514,11 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: 
     items
         .into_iter()
         .filter(|(value, _)| lower.is_empty() || value.to_lowercase().starts_with(&lower))
-        .map(|(value, description)| PaletteCompletion { value, description, key_hint: None })
+        .map(|(value, description)| PaletteCompletion {
+            value: flotilla_commands::address_subject_for_cli(noun, &value),
+            description,
+            key_hint: None,
+        })
         .collect()
 }
 
@@ -905,6 +909,13 @@ mod tests {
             status: crate::app::PeerStatus::Connected,
             summary: stub_host_summary("brie"),
         });
+        model.hosts.insert(EnvironmentId::host(HostId::new("status-env")), crate::app::TuiHostState {
+            environment_id: EnvironmentId::host(HostId::new("status-env")),
+            host_name: HostName::new("status"),
+            is_local: false,
+            status: crate::app::PeerStatus::Connected,
+            summary: stub_host_summary("status"),
+        });
         model
     }
 
@@ -979,6 +990,8 @@ mod tests {
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.contains(&"feta"), "expected 'feta' in {values:?}");
         assert!(values.contains(&"brie"), "expected 'brie' in {values:?}");
+        assert!(values.contains(&"@status"), "colliding host should use the address marker in {values:?}");
+        assert!(!values.contains(&"status"), "unmarked colliding host is not addressable: {values:?}");
     }
 
     #[test]

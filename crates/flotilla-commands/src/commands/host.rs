@@ -6,6 +6,7 @@ use flotilla_protocol::{Command, CommandAction, HostName, RepoSelector};
 use crate::{
     noun::NounCommand,
     resolved::{HostQueryKind, HostResolution, RepoContext},
+    subject::{resolve_subject, write_subject},
     Refinable, Resolved,
 };
 
@@ -13,17 +14,21 @@ use crate::{
 // Partial types (what clap parses into)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Parser)]
+#[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Manage and route to hosts")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct HostNounPartial {
     /// Host name
+    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
     pub subject: Option<String>,
+    /// Literal subject; use for external names beginning with `@`
+    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
+    pub explicit_subject: Option<String>,
     #[command(subcommand)]
     pub verb: Option<HostVerbPartial>,
 }
 
-#[derive(Debug, Clone, Subcommand)]
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum HostVerbPartial {
     /// List all known hosts
     List,
@@ -65,6 +70,7 @@ impl Refinable for HostNounPartial {
     type Refined = HostNoun;
 
     fn refine(self) -> Result<HostNoun, String> {
+        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
         let verb = match self.verb {
             Some(HostVerbPartial::List) => HostVerb::List,
             Some(HostVerbPartial::Status) => HostVerb::Status,
@@ -77,13 +83,13 @@ impl Refinable for HostNounPartial {
                 // start with the actual subcommand name, not a program name.
                 let cmd = clap::Command::new("host-route").no_binary_name(true);
                 let cmd = <NounCommand as Subcommand>::augment_subcommands(cmd);
-                let matches = cmd.try_get_matches_from(&tokens).map_err(|e| e.to_string())?;
-                let noun = <NounCommand as clap::FromArgMatches>::from_arg_matches(&matches).map_err(|e| e.to_string())?;
+                let matches = cmd.try_get_matches_from(&tokens).map_err(crate::subject::format_parse_error)?;
+                let noun = <NounCommand as clap::FromArgMatches>::from_arg_matches(&matches).map_err(crate::subject::format_parse_error)?;
                 HostVerb::Route(noun)
             }
             None => return Err("missing host command".into()),
         };
-        Ok(HostNoun { subject: self.subject, verb })
+        Ok(HostNoun { subject, verb })
     }
 }
 
@@ -139,9 +145,7 @@ impl HostNoun {
 impl fmt::Display for HostNounPartial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "host")?;
-        if let Some(subject) = &self.subject {
-            write!(f, " {subject}")?;
-        }
+        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
         if let Some(verb) = &self.verb {
             match verb {
                 HostVerbPartial::List => write!(f, " list")?,
@@ -202,6 +206,37 @@ mod tests {
         assert_eq!(parse_and_resolve(&["host", "alpha", "status"]), Resolved::HostQuery {
             subject: HostName::new("alpha"),
             kind: HostQueryKind::Status
+        });
+    }
+
+    #[test]
+    fn marked_subject_disambiguates_host_named_status() {
+        assert_eq!(parse_and_resolve(&["host", "@status", "status"]), Resolved::HostQuery {
+            subject: HostName::new("status"),
+            kind: HostQueryKind::Status,
+        });
+    }
+
+    #[test]
+    fn explicit_subject_preserves_host_beginning_with_marker() {
+        assert_eq!(parse_and_resolve(&["host", "--subject", "@status", "status"]), Resolved::HostQuery {
+            subject: HostName::new("@status"),
+            kind: HostQueryKind::Status,
+        });
+    }
+
+    #[test]
+    fn marked_host_and_nested_repo_subjects_compose() {
+        let resolved = parse_and_resolve(&["host", "@checkout", "repo", "@refresh", "work"]);
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoWork { repo: RepoSelector::Query("refresh".into()) },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Explicit(HostName::new("checkout")),
         });
     }
 
@@ -299,6 +334,12 @@ mod tests {
     fn host_display_status() {
         let partial = HostNounPartial::try_parse_from(["host", "alpha", "status"]).expect("should parse");
         assert_eq!(format!("{partial}"), "host alpha status");
+    }
+
+    #[test]
+    fn marked_and_explicit_subjects_round_trip() {
+        crate::test_utils::assert_round_trip::<HostNounPartial>(&["host", "@status", "status"]);
+        crate::test_utils::assert_round_trip::<HostNounPartial>(&["host", "--subject", "@status", "status"]);
     }
 
     #[test]

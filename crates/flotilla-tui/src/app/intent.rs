@@ -245,7 +245,7 @@ impl Intent {
             }
             Intent::OpenIssue => {
                 let id = item.issue_keys.first()?;
-                Some(NounCommand::Issue(IssueNoun { subject: Some(id.clone()), verb: Some(IssueVerb::Open) }))
+                Some(NounCommand::Issue(IssueNoun { subject: Some(id.clone()), explicit_subject: None, verb: Some(IssueVerb::Open) }))
             }
             Intent::ArchiveSession => {
                 let key = item.session_key.as_ref()?;
@@ -267,6 +267,7 @@ impl Intent {
                 let fresh = item.kind != WorkItemKind::RemoteBranch && item.kind != WorkItemKind::ChangeRequest;
                 Some(NounCommand::Checkout(CheckoutNoun {
                     subject: None,
+                    explicit_subject: None,
                     verb: Some(CheckoutVerb::Create { branch: branch.clone(), fresh }),
                 }))
             }
@@ -275,7 +276,7 @@ impl Intent {
                     return None;
                 }
                 let ids = item.issue_keys.join(",");
-                Some(NounCommand::Issue(IssueNoun { subject: Some(ids), verb: Some(IssueVerb::SuggestBranch) }))
+                Some(NounCommand::Issue(IssueNoun { subject: Some(ids), explicit_subject: None, verb: Some(IssueVerb::SuggestBranch) }))
             }
             // Non-convertible intents
             Intent::RemoveCheckout | Intent::CreateWorkspace | Intent::LinkIssuesToChangeRequest => None,

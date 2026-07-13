@@ -3,14 +3,21 @@ use std::{fmt, path::PathBuf};
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{CheckoutTarget, Command, CommandAction, RepoSelector};
 
-use crate::Resolved;
+use crate::{
+    subject::{resolve_subject, write_subject},
+    Resolved,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Manage repositories")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct RepoNoun {
     /// Repository slug (e.g. owner/repo)
+    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
     pub subject: Option<String>,
+    /// Literal subject; use for external names beginning with `@`
+    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
+    pub explicit_subject: Option<String>,
 
     #[command(subcommand)]
     pub verb: Option<RepoVerb>,
@@ -40,7 +47,8 @@ pub enum RepoVerb {
 
 impl RepoNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        match (self.subject, self.verb) {
+        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        match (subject, self.verb) {
             (_, Some(RepoVerb::Add { path })) => Ok(Resolved::Ready(Command {
                 node_id: None,
                 provisioning_target: None,
@@ -108,9 +116,7 @@ impl RepoNoun {
 impl fmt::Display for RepoNoun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "repo")?;
-        if let Some(subject) = &self.subject {
-            write!(f, " {subject}")?;
-        }
+        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
         if let Some(verb) = &self.verb {
             match verb {
                 RepoVerb::Add { path } => write!(f, " add {}", path.display())?,
@@ -247,6 +253,34 @@ mod tests {
     }
 
     #[test]
+    fn marked_subject_disambiguates_repo_named_refresh() {
+        let resolved = parse(&["repo", "@refresh", "providers"]).resolve().expect("resolve marked repo subject");
+        assert_eq!(
+            resolved,
+            Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("refresh".into()) },
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_subject_preserves_repo_beginning_with_marker() {
+        let resolved = parse(&["repo", "--subject", "@refresh", "providers"]).resolve().expect("resolve explicit repo subject");
+        assert_eq!(
+            resolved,
+            Resolved::Ready(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryRepoProviders { repo: RepoSelector::Query("@refresh".into()) },
+            })
+        );
+    }
+
+    #[test]
     fn repo_query_work() {
         let resolved = parse(&["repo", "myslug", "work"]).resolve().unwrap();
         assert_eq!(
@@ -350,6 +384,12 @@ mod tests {
     #[test]
     fn round_trip_providers() {
         assert_round_trip::<RepoNoun>(&["repo", "myslug", "providers"]);
+    }
+
+    #[test]
+    fn marked_and_explicit_subjects_round_trip() {
+        assert_round_trip::<RepoNoun>(&["repo", "@refresh", "providers"]);
+        assert_round_trip::<RepoNoun>(&["repo", "--subject", "@refresh", "providers"]);
     }
 
     #[test]
