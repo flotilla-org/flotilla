@@ -119,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             phase: ConvoyPhase::Active,
             workflow_snapshot: None,
             work: Default::default(),
+            crew_work: Default::default(),
             message: None,
             started_at: None,
             finished_at: None,

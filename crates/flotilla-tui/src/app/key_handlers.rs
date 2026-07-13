@@ -405,7 +405,7 @@ impl App {
         }
     }
 
-    /// Open the command palette pre-filled with `convoy <id> work <vessel> complete `.
+    /// Open the command palette pre-filled with `convoy <id> work <vessel> complete --force `.
     /// No-op when no convoy or vessel is selected. Convoy ids and vessel names are
     /// arbitrary strings (no validation), so they are routed through the
     /// palette's quoting helper to round-trip whitespace and special characters.
@@ -427,7 +427,7 @@ impl App {
             }
         };
         let prefill = format!(
-            "convoy {} work {} complete ",
+            "convoy {} work {} complete --force ",
             crate::palette::quote_palette_token(&completion_target.convoy),
             crate::palette::quote_palette_token(&completion_target.vessel),
         );

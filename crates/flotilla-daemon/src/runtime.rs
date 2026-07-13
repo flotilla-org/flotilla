@@ -1296,7 +1296,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyWorkComplete {
+                action: CommandAction::ConvoyWorkForceComplete {
                     convoy: "convoy-a".to_string(),
                     work: "implement".to_string(),
                     message: Some("done".to_string()),
@@ -1698,6 +1698,22 @@ mod tests {
             ("reviewer", "latent"),
             ("watcher", "active")
         ]);
+        let initial_status = convoys.get("crew-convoy").await.expect("crew convoy").status.expect("convoy status");
+        assert_eq!(initial_status.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+        assert_eq!(initial_status.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Working);
+        assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
+
+        let mut rx = daemon.subscribe();
+        let coder_complete_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewComplete { context: crew_context.clone(), message: Some("implementation ready".to_string()) },
+            })
+            .await
+            .expect("coder complete");
+        assert_eq!(wait_for_command_result(&mut rx, coder_complete_id).await, CommandValue::Ok);
 
         let mut rx = daemon.subscribe();
         let handoff_id = daemon
@@ -1706,7 +1722,7 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::CrewHandoff {
-                    context: crew_context,
+                    context: crew_context.clone(),
                     target: "reviewer".to_string(),
                     message: "Review commit abc123".to_string(),
                 },
@@ -1745,6 +1761,33 @@ mod tests {
             .any(|(session, text, submit)| session.ends_with("-reviewer") && text == "Review commit abc123" && *submit));
 
         let mut rx = daemon.subscribe();
+        let reviewer_complete_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
+                    message: Some("initial review complete".to_string()),
+                },
+            })
+            .await
+            .expect("reviewer complete");
+        assert_eq!(wait_for_command_result(&mut rx, reviewer_complete_id).await, CommandValue::Ok);
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                convoys
+                    .get("crew-convoy")
+                    .await
+                    .ok()
+                    .and_then(|convoy| convoy.status)
+                    .is_some_and(|status| status.phase == ConvoyPhase::Completed)
+            }
+        })
+        .await;
+
+        let mut rx = daemon.subscribe();
         let hand_back_id = daemon
             .execute(Command {
                 node_id: None,
@@ -1765,6 +1808,18 @@ mod tests {
             .await
             .iter()
             .any(|(session, text, submit)| session.ends_with("-coder") && text == "Address the review findings" && *submit));
+        wait_until(|| {
+            let convoys = convoys.clone();
+            async move {
+                convoys.get("crew-convoy").await.ok().and_then(|convoy| convoy.status).is_some_and(|status| {
+                    status.phase == ConvoyPhase::Active && status.work.get("implement").is_some_and(|work| work.phase == WorkPhase::Running)
+                })
+            }
+        })
+        .await;
+        let reopened = convoys.get("crew-convoy").await.expect("reopened convoy").status.expect("reopened status");
+        assert_eq!(reopened.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
+        assert_eq!(reopened.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::HandedBack);
 
         pool.remove_session(&coder.metadata.name).await;
         wait_until(|| {
@@ -1807,7 +1862,7 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::CrewHandoff {
-                    context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
+                    context: CrewCommandContext { crew_id: Some(reviewer_id.clone()), ..Default::default() },
                     target: "coder".to_string(),
                     message: "Resume after review".to_string(),
                 },
@@ -1830,25 +1885,57 @@ mod tests {
             }
         })
         .await;
+        let revived_coder = terminals.get(&coder.metadata.name).await.expect("revived coder");
+        let revived_coder_id = revived_coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived identity").id.clone();
 
         let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
         assert!(attach.contains("attach terminal-crew-convoy-implement-coder"));
 
         let mut rx = daemon.subscribe();
-        let complete_id = daemon
+        let coder_recomplete_id = daemon
             .execute(Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyWorkComplete {
-                    convoy: "crew-convoy".to_string(),
-                    work: "implement".to_string(),
-                    message: Some("human accepted the crew's work".to_string()),
+                action: CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some(revived_coder_id.clone()), ..Default::default() },
+                    message: Some("review findings addressed".to_string()),
                 },
             })
             .await
-            .expect("complete work");
-        assert_eq!(wait_for_command_result(&mut rx, complete_id).await, CommandValue::Ok);
+            .expect("coder re-complete");
+        assert_eq!(wait_for_command_result(&mut rx, coder_recomplete_id).await, CommandValue::Ok);
+
+        let mut rx = daemon.subscribe();
+        let return_to_reviewer_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewHandoff {
+                    context: CrewCommandContext { crew_id: Some(revived_coder_id), ..Default::default() },
+                    target: "reviewer".to_string(),
+                    message: "Please verify the fixes".to_string(),
+                },
+            })
+            .await
+            .expect("return to reviewer");
+        assert_eq!(wait_for_command_result(&mut rx, return_to_reviewer_id).await, CommandValue::Ok);
+
+        let mut rx = daemon.subscribe();
+        let final_review_id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some(reviewer_id), ..Default::default() },
+                    message: Some("changes accepted".to_string()),
+                },
+            })
+            .await
+            .expect("final reviewer completion");
+        assert_eq!(wait_for_command_result(&mut rx, final_review_id).await, CommandValue::Ok);
         wait_until(|| {
             let convoys = convoys.clone();
             async move {
@@ -1861,6 +1948,9 @@ mod tests {
             }
         })
         .await;
+        let completed = convoys.get("crew-convoy").await.expect("completed convoy").status.expect("completed status");
+        assert_eq!(completed.work["implement"].phase, WorkPhase::Complete);
+        assert!(completed.crew_work["implement"].values().all(|state| state.phase == flotilla_resources::CrewWorkPhase::Done));
 
         backend
             .clone()
@@ -2011,7 +2101,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyWorkComplete {
+                action: CommandAction::ConvoyWorkForceComplete {
                     convoy: "convoy-adopted".to_string(),
                     work: "implement".to_string(),
                     message: Some("done".to_string()),

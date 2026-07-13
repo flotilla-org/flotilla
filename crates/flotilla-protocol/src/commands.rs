@@ -149,7 +149,7 @@ pub enum CommandAction {
     GenerateBranchName {
         issue_keys: Vec<String>,
     },
-    ConvoyWorkComplete {
+    ConvoyWorkForceComplete {
         convoy: String,
         work: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +158,15 @@ pub enum CommandAction {
     CrewHandoff {
         context: CrewCommandContext,
         target: String,
+        message: String,
+    },
+    CrewComplete {
+        context: CrewCommandContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    CrewFail {
+        context: CrewCommandContext,
         message: String,
     },
     ConvoyCreate {
@@ -289,8 +298,10 @@ impl Command {
             CommandAction::LinkIssuesToChangeRequest { .. } => "Linking issues...",
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
-            CommandAction::ConvoyWorkComplete { .. } => "Completing work...",
+            CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
+            CommandAction::CrewComplete { .. } => "Completing crew work...",
+            CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectCreate { .. } => "Creating project...",
@@ -566,7 +577,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyWorkComplete {
+                action: CommandAction::ConvoyWorkForceComplete {
                     convoy: "convoy-a".into(),
                     work: "implement".into(),
                     message: Some("done".into()),
@@ -580,6 +591,24 @@ mod tests {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                     target: "reviewer".into(),
                     message: "review this".into(),
+                },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                    message: Some("ready for review".into()),
+                },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::CrewFail {
+                    context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                    message: "blocked".into(),
                 },
             },
             Command {

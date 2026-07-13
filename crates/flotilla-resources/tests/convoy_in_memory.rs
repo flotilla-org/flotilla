@@ -56,7 +56,7 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     apply_status_patch(
         &convoys,
         "convoy-a",
-        &external_patches::mark_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
+        &external_patches::force_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
     )
     .await
     .expect("implement completion should succeed");
@@ -67,7 +67,7 @@ async fn in_memory_controller_loop_drives_convoy_to_completion() {
     apply_status_patch(
         &convoys,
         "convoy-a",
-        &external_patches::mark_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
+        &external_patches::force_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
     )
     .await
     .expect("review completion should succeed");
@@ -139,7 +139,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
     apply_status_patch(
         &convoys,
         "convoy-loop",
-        &external_patches::mark_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
+        &external_patches::force_work_completed("implement".to_string(), timestamp(12), Some("implemented".to_string())),
     )
     .await
     .expect("implement completion should succeed");
@@ -160,7 +160,7 @@ async fn controller_loop_drives_convoy_progression_without_manual_reconcile_call
     apply_status_patch(
         &convoys,
         "convoy-loop",
-        &external_patches::mark_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
+        &external_patches::force_work_completed("review".to_string(), timestamp(14), Some("reviewed".to_string())),
     )
     .await
     .expect("review completion should succeed");

@@ -2270,7 +2270,7 @@ fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
         .as_any()
         .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
         .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy fix-bug-123 work review complete ");
+    assert_eq!(palette.input_value(), "convoy fix-bug-123 work review complete --force ");
 }
 
 #[test]
@@ -2290,7 +2290,7 @@ fn x_prefill_quotes_vessel_names_with_whitespace() {
         .as_any()
         .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
         .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy fix-bug-123 work \"fix my bug\" complete ");
+    assert_eq!(palette.input_value(), "convoy fix-bug-123 work \"fix my bug\" complete --force ");
 }
 
 #[test]
@@ -2304,12 +2304,12 @@ fn x_then_enter_dispatches_convoy_task_complete() {
 
     let cmd = app.proto_commands.take_next().expect("expected a command after Enter on palette");
     match &cmd.0.action {
-        flotilla_protocol::CommandAction::ConvoyWorkComplete { convoy, work, message } => {
+        flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } => {
             assert_eq!(convoy, "fix-bug-123");
             assert_eq!(work, "implement");
             assert_eq!(*message, None);
         }
-        other => panic!("expected ConvoyWorkComplete, got {other:?}"),
+        other => panic!("expected ConvoyWorkForceComplete, got {other:?}"),
     }
 }
 

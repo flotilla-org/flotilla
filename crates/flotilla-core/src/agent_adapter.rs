@@ -45,8 +45,7 @@ pub fn build_crew_brief(
         content.push_str(&format!("Hand off to {} with `flotilla crew {} handoff --message '...'`.\n", member.role, member.role));
     }
     content.push_str(&format!(
-        "Completing the work is separate: `flotilla convoy {} work {vessel} complete`.\n\n## Assignment\n\n{}\n",
-        context.convoy,
+        "Complete your assignment with `flotilla crew complete --message '...'`. If it cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
         prompt.unwrap_or("No additional assignment was provided.")
     ));
     flotilla_resources::TerminalBrief { path: crew_brief_path(role), content }
