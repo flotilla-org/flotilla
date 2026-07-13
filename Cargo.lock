@@ -1318,6 +1318,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotilla-manifest"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "flotilla-protocol"
 version = "0.1.0"
 dependencies = [

@@ -3,6 +3,7 @@ members = [
     "crates/flotilla-client",
     "crates/flotilla-commands",
     "crates/flotilla-core",
+    "crates/flotilla-manifest",
     "crates/flotilla-protocol",
     "crates/flotilla-resources",
     "crates/flotilla-controllers",
@@ -10,7 +11,7 @@ members = [
     "crates/flotilla-daemon",
     "crates/flotilla-tui",
 ]
-exclude = ["lints/long_inline_paths"]
+exclude = ["lints/long_inline_paths", "crates/flotilla-manifest/fixtures/generator"]
 resolver = "2"
 
 [workspace.package]

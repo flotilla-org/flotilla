@@ -1,0 +1,47 @@
+{
+  "set": {
+    "factory.id": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "flotilla:convoys/dev/manifest-extraction/implement"
+      }
+    },
+    "tab.kind": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "flotilla-vessel"
+      }
+    },
+    "tab.scope": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "group-path",
+        "value": [
+          {
+            "key": "git.repo",
+            "label": "flotilla",
+            "value": {
+              "type": "text",
+              "value": "flotilla-org/flotilla"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "source_id": "flotilla-actuator",
+  "target": {
+    "kind": "tab",
+    "value": 7
+  },
+  "type": "metadata-patch",
+  "unset": []
+}
