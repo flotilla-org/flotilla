@@ -211,7 +211,7 @@ impl Aggregator {
             let host = snapshot.host;
             let mut rows = HashMap::new();
             if let Some(Rows::Convoys(convoys)) =
-                snapshot.result_sets.into_iter().find(|result_set| result_set.query == QueryId::Convoys).map(|result_set| result_set.rows)
+                snapshot.result_sets.into_iter().find(|result_set| result_set.query() == QueryId::Convoys).map(|result_set| result_set.rows)
             {
                 for mut row in convoys {
                     set_row_host(&mut row, &host);
@@ -260,12 +260,7 @@ impl Aggregator {
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
-        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta {
-            query: QueryId::Convoys,
-            seq,
-            changed: Rows::Convoys(changed),
-            removed,
-        })));
+        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(changed), removed })));
     }
 
     fn convoy_ref(&self, namespace: &str, name: &str) -> ResourceRef {
@@ -399,7 +394,7 @@ mod tests {
             host,
             generation: Some(generation.to_string()),
             rows: Vec::new(),
-            result_sets: vec![ResultSet { query: QueryId::Convoys, seq: 1, rows: Rows::Convoys(vec![row]) }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Convoys(vec![row]) }],
         }
     }
 

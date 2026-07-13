@@ -2467,6 +2467,69 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
 }
 
 #[tokio::test]
+async fn handle_client_rejects_client_hello_with_version_mismatch() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let client_notify = Arc::new(Notify::new());
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+
+    let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
+    let daemon_for_task = Arc::clone(&daemon);
+    let pm = Arc::clone(&peer_manager);
+    let count_ref = Arc::clone(&client_count);
+    let notify_ref = Arc::clone(&client_notify);
+    let handle = tokio::spawn(async move {
+        let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
+        handle_client(
+            server_stream,
+            daemon_for_task,
+            shutdown_rx,
+            peer_data_tx,
+            pm,
+            remote_command_router,
+            count_ref,
+            notify_ref,
+            peer_connected_tx,
+            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
+        )
+        .await;
+    });
+
+    let (read_half, write_half) = client_stream.into_split();
+    let mut reader = BufReader::new(read_half).lines();
+    let mut writer = BufWriter::new(write_half);
+
+    let hello = Message::Hello {
+        protocol_version: PROTOCOL_VERSION + 1,
+        node_id: NodeId::new("client"),
+        display_name: "client".into(),
+        session_id: uuid::Uuid::nil(),
+        connection_role: Some(flotilla_protocol::ConnectionRole::Client),
+    };
+    flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
+
+    // The server replies with its own Hello (so the client can report which
+    // versions disagreed), then closes without entering the session loop.
+    let line = reader.next_line().await.expect("read hello response").expect("hello line");
+    let hello_back: Message = serde_json::from_str(&line).expect("parse hello");
+    match hello_back {
+        Message::Hello { protocol_version, .. } => assert_eq!(protocol_version, PROTOCOL_VERSION),
+        other => panic!("expected hello response, got {other:?}"),
+    }
+
+    let eof = tokio::time::timeout(Duration::from_secs(2), reader.next_line())
+        .await
+        .expect("server should close the mismatched connection promptly")
+        .expect("read after hello");
+    assert!(eof.is_none(), "expected EOF after version-mismatch hello, got {eof:?}");
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
+
+#[tokio::test]
 async fn handle_client_session_filters_query_events_until_subscribed() {
     let (_tmp, daemon) = empty_daemon().await;
     let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
@@ -2506,9 +2569,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
         other => panic!("expected ListRepos response, got {other:?}"),
     }
 
-    let result_delta = |seq| {
-        DaemonEvent::ResultDelta(Box::new(ResultDelta { query: QueryId::Convoys, seq, changed: Rows::Convoys(vec![]), removed: vec![] }))
-    };
+    let result_delta = |seq| DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }));
     let marker = |command_id| DaemonEvent::CommandStarted {
         command_id,
         node_id: daemon.node_id().clone(),
@@ -2540,7 +2601,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     match ok_response(read_session_message(&client_session).await, 2) {
         Response::SubscribeQueries(events) => {
             assert!(
-                matches!(events.as_slice(), [DaemonEvent::ResultSet(result_set)] if result_set.query == QueryId::Convoys),
+                matches!(events.as_slice(), [DaemonEvent::ResultSet(result_set)] if result_set.query() == QueryId::Convoys),
                 "subscribe should replay one convoys result set, got {events:?}"
             );
         }
@@ -2552,7 +2613,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     match read_session_message(&client_session).await {
         Message::Event { event } => match *event {
             DaemonEvent::ResultDelta(delta) => {
-                assert_eq!(delta.query, QueryId::Convoys);
+                assert_eq!(delta.query(), QueryId::Convoys);
                 assert_eq!(delta.seq, 2);
             }
             other => panic!("expected ResultDelta after subscribing, got {other:?}"),

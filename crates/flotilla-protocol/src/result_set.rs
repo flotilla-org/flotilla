@@ -44,25 +44,39 @@ impl fmt::Display for QueryId {
 }
 
 /// Full state of one named query's result set.
+///
+/// The query identity derives from the typed [`Rows`] variant (see
+/// [`ResultSet::query`]) — a mismatched query/rows pair is unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultSet {
-    pub query: QueryId,
     pub seq: u64,
     pub rows: Rows,
+}
+
+impl ResultSet {
+    pub fn query(&self) -> QueryId {
+        self.rows.query()
+    }
 }
 
 /// Incremental update to a named query's result set.
 ///
 /// Sequence numbers are contiguous per query: a delta is applicable iff
 /// `seq == last_seen + 1`; anything else is a gap and the client must
-/// resubscribe to get a fresh [`ResultSet`].
+/// resubscribe to get a fresh [`ResultSet`]. A removal-only delta carries an
+/// empty `changed` variant, which still tags the query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultDelta {
-    pub query: QueryId,
     pub seq: u64,
     pub changed: Rows,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed: Vec<ResourceRef>,
+}
+
+impl ResultDelta {
+    pub fn query(&self) -> QueryId {
+        self.changed.query()
+    }
 }
 
 /// Typed rows of a query result. The variant always matches the enclosing

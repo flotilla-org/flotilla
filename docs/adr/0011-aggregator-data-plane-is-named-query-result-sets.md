@@ -17,9 +17,14 @@ named queries.**
 
 - A **named query** (`QueryId`, e.g. `convoys`: all Convoys, durable ∪
   observed, fleet-merged, joined with Presentation attach state) is maintained
-  by the daemon Aggregator as a `ResultSet { query, seq, rows }` updated by
-  `ResultDelta { query, seq, changed, removed }` events
-  (`flotilla-protocol/src/result_set.rs`).
+  by the daemon Aggregator as a `ResultSet { seq, rows }` updated by
+  `ResultDelta { seq, changed, removed }` events
+  (`flotilla-protocol/src/result_set.rs`). The query identity is **derived
+  from the typed `Rows` variant** (`ResultSet::query()`), not carried as a
+  separate field — a mismatched query/rows pair is unrepresentable and
+  undeserializable, preserving the compile-time-safety rationale below as new
+  queries are added. A removal-only delta carries an empty `changed` variant,
+  which still tags the query.
 - **Layout never crosses the wire.** Columns, labels, titles, and tab
   composition are consumer config; #666 designs the per-kind table layer on
   top. ADR 0005's "tab is a composition of panels" remains the view model —
@@ -78,6 +83,16 @@ Two corollaries of typed rows:
   which now serves repo/host streams only).
 - Delivery restriction is a transport concern: the socket server must filter
   per connection; `InProcessDaemon`'s shared broadcast may over-deliver.
+
+## Versioning
+
+This is an incompatible wire change (event/request tags, `StreamKey`,
+`FleetReplicaSnapshot` fields), so `PROTOCOL_VERSION` bumps to 8. Peer
+handshakes already enforced version equality; the client-role Hello handshake
+now does too, on both sides (the server still replies with its Hello before
+closing so the client can report which versions disagreed). The SSH
+`replica-snapshot` path carries no version and relies on fleet hosts being
+upgraded together — acceptable in the no-backwards-compatibility phase.
 
 ## Consequences
 

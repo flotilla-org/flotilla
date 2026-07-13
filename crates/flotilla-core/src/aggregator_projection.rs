@@ -15,15 +15,11 @@ use tokio::sync::{RwLock, RwLockWriteGuard};
 
 /// A typed row of some named query's result set.
 pub trait QueryRow: Clone {
-    const QUERY: QueryId;
-
     fn resource(&self) -> &ResourceRef;
     fn into_rows(rows: Vec<Self>) -> Rows;
 }
 
 impl QueryRow for ConvoyRow {
-    const QUERY: QueryId = QueryId::Convoys;
-
     fn resource(&self) -> &ResourceRef {
         &self.resource
     }
@@ -66,7 +62,7 @@ impl<R: QueryRow> QueryProjection<R> {
             let right = right.resource();
             (&left.namespace, &left.name, &left.host).cmp(&(&right.namespace, &right.name, &right.host))
         });
-        ResultSet { query: R::QUERY, seq: self.seq, rows: R::into_rows(rows) }
+        ResultSet { seq: self.seq, rows: R::into_rows(rows) }
     }
 }
 

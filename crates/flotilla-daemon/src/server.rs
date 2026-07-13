@@ -472,6 +472,8 @@ async fn handle_client_session(
             if connection_role == Some(ConnectionRole::Client) {
                 // Stateful client handshake: reply with server Hello, then enter
                 // stateful client loop (session_id used for cursor ownership).
+                // The reply is sent even on version mismatch so the client can
+                // report which versions disagreed.
                 if session
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
@@ -483,6 +485,10 @@ async fn handle_client_session(
                     .await
                     .is_err()
                 {
+                    return;
+                }
+                if protocol_version != PROTOCOL_VERSION {
+                    warn!(expected = PROTOCOL_VERSION, got = protocol_version, %node_id, "rejecting client with protocol version mismatch");
                     return;
                 }
                 ClientConnection::new(daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store)

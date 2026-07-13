@@ -574,19 +574,19 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![implement, review])
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { query: QueryId::Convoys, seq: 7, rows: Rows::Convoys(vec![row]) }));
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]) }));
 
     let encoded = serde_json::to_string(&event).expect("serialize result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize result set");
     let DaemonEvent::ResultSet(result_set) = decoded else { panic!("expected ResultSet") };
     assert_eq!(result_set.seq, 7);
-    assert_eq!(result_set.rows.query(), result_set.query);
+    assert_eq!(result_set.query(), QueryId::Convoys);
     let rows = result_set.rows.as_convoys().expect("convoy rows");
     assert_eq!(rows[0].vessels[1].depends_on, vec![rows[0].vessels[0].name.clone()]);
     assert!(rows[0].vessels[0].attach.is_some(), "presentation join surfaces as attach capability");
     assert!(rows[0].vessels[1].attach.is_none());
     assert!(rows[0].vessels[1].complete_work);
-    assert_eq!(StreamKey::Query { query: QueryId::Convoys }, StreamKey::Query { query: result_set.query });
+    assert_eq!(StreamKey::Query { query: QueryId::Convoys }, StreamKey::Query { query: result_set.query() });
 }
 
 #[test]

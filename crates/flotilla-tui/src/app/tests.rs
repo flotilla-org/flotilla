@@ -1365,11 +1365,10 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
 }
 
 fn result_set_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnapshot>) -> flotilla_protocol::DaemonEvent {
-    use flotilla_protocol::result_set::{QueryId, ResultSet, Rows};
+    use flotilla_protocol::result_set::{ResultSet, Rows};
 
     let snapshot = snapshot.as_ref().clone();
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(ResultSet {
-        query: QueryId::Convoys,
         seq: snapshot.seq,
         rows: Rows::Convoys(snapshot.convoys.into_iter().map(wire_convoy_row).collect()),
     }))
@@ -1377,13 +1376,12 @@ fn result_set_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnaps
 
 fn result_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
     use flotilla_protocol::{
-        result_set::{QueryId, ResultDelta, Rows},
+        result_set::{ResultDelta, Rows},
         ResourceRef,
     };
 
     let delta = delta.as_ref().clone();
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(ResultDelta {
-        query: QueryId::Convoys,
         seq: delta.seq,
         changed: Rows::Convoys(delta.changed.into_iter().map(wire_convoy_row).collect()),
         removed: delta.removed.into_iter().map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name())).collect(),

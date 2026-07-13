@@ -970,7 +970,7 @@ mod query_event_formatting {
 
 mod result_set_event_formatting {
     use flotilla_protocol::{
-        result_set::{QueryId, ResultDelta, ResultSet, Rows},
+        result_set::{ResultDelta, ResultSet, Rows},
         DaemonEvent, ResourceRef,
     };
 
@@ -978,7 +978,7 @@ mod result_set_event_formatting {
 
     #[test]
     fn result_set_formatting() {
-        let result_set = ResultSet { query: QueryId::Convoys, seq: 7, rows: Rows::Convoys(vec![]) };
+        let result_set = ResultSet { seq: 7, rows: Rows::Convoys(vec![]) };
         let event = DaemonEvent::ResultSet(Box::new(result_set));
         let line = format_event_human(&event);
         assert!(line.contains("[query]"), "should have query tag");
@@ -990,7 +990,6 @@ mod result_set_event_formatting {
     #[test]
     fn result_delta_formatting() {
         let delta = ResultDelta {
-            query: QueryId::Convoys,
             seq: 12,
             changed: Rows::Convoys(vec![]),
             removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
@@ -1016,11 +1015,11 @@ mod watch_dedupe_query {
     use crate::cli::event_stream_seq;
 
     fn result_set(seq: u64) -> DaemonEvent {
-        DaemonEvent::ResultSet(Box::new(ResultSet { query: QueryId::Convoys, seq, rows: Rows::Convoys(vec![]) }))
+        DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]) }))
     }
 
     fn result_delta(seq: u64) -> DaemonEvent {
-        DaemonEvent::ResultDelta(Box::new(ResultDelta { query: QueryId::Convoys, seq, changed: Rows::Convoys(vec![]), removed: vec![] }))
+        DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }))
     }
 
     /// Simulate the run_watch dedup logic: build replay_seqs from a slice of

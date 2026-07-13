@@ -20,8 +20,8 @@ pub(super) type QuerySubscriptions = Arc<RwLock<HashSet<QueryId>>>;
 
 fn event_subscribed(event: &DaemonEvent, subscriptions: &QuerySubscriptions) -> bool {
     let query = match event {
-        DaemonEvent::ResultSet(result_set) => result_set.query,
-        DaemonEvent::ResultDelta(delta) => delta.query,
+        DaemonEvent::ResultSet(result_set) => result_set.query(),
+        DaemonEvent::ResultDelta(delta) => delta.query(),
         _ => return true,
     };
     subscriptions.read().expect("query subscriptions lock poisoned").contains(&query)

@@ -85,7 +85,7 @@ async fn aggregator_emits_result_set_events() {
     let found = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query == QueryId::Convoys => {
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys => {
                     return result_set;
                 }
                 Ok(_) => continue,
@@ -141,7 +141,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let result_set_after_a = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query == QueryId::Convoys => return result_set,
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Convoys => return result_set,
                 Ok(_) => continue,
                 Err(err) => panic!("recv error waiting for result set: {err}"),
             }
@@ -159,7 +159,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query == QueryId::Convoys => return delta,
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Convoys => return delta,
                 Ok(_) => continue,
                 Err(err) => panic!("recv error waiting for delta: {err}"),
             }
@@ -177,7 +177,7 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     let result_set = replay_events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::ResultSet(result_set) if result_set.query == QueryId::Convoys => Some(result_set),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(result_set),
             _ => None,
         })
         .expect("expected a ResultSet for the convoys query in subscribe replay");

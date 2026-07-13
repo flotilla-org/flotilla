@@ -322,8 +322,8 @@ impl HighFidelityHarness {
             DaemonEvent::RepoTracked(info) => format!("repo_tracked {}", fmt_optional_path(info.path.as_deref())),
             DaemonEvent::RepoUntracked { path, .. } => format!("repo_untracked {}", fmt_optional_path(path.as_deref())),
             DaemonEvent::HostRemoved { environment_id, .. } => format!("host_removed {environment_id}"),
-            DaemonEvent::ResultSet(result_set) => format!("result_set query={} seq={}", result_set.query, result_set.seq),
-            DaemonEvent::ResultDelta(delta) => format!("result_delta query={} seq={}", delta.query, delta.seq),
+            DaemonEvent::ResultSet(result_set) => format!("result_set query={} seq={}", result_set.query(), result_set.seq),
+            DaemonEvent::ResultDelta(delta) => format!("result_delta query={} seq={}", delta.query(), delta.seq),
         };
         self.recent_events.push(summary);
         if self.recent_events.len() > 20 {
@@ -438,8 +438,8 @@ fn record_recent_event(recent: &mut Vec<String>, source: &str, event: &DaemonEve
         DaemonEvent::RepoTracked(info) => format!("{source}: repo_tracked {}", fmt_optional_path(info.path.as_deref())),
         DaemonEvent::RepoUntracked { path, .. } => format!("{source}: repo_untracked {}", fmt_optional_path(path.as_deref())),
         DaemonEvent::HostRemoved { environment_id, .. } => format!("{source}: host_removed {environment_id}"),
-        DaemonEvent::ResultSet(result_set) => format!("{source}: result_set query={} seq={}", result_set.query, result_set.seq),
-        DaemonEvent::ResultDelta(delta) => format!("{source}: result_delta query={} seq={}", delta.query, delta.seq),
+        DaemonEvent::ResultSet(result_set) => format!("{source}: result_set query={} seq={}", result_set.query(), result_set.seq),
+        DaemonEvent::ResultDelta(delta) => format!("{source}: result_delta query={} seq={}", delta.query(), delta.seq),
     };
     recent.push(summary);
     if recent.len() > 20 {

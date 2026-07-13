@@ -74,6 +74,9 @@ async fn do_client_hello(session: &MessageSession) -> Result<(), String> {
         .map_err(|e| format!("failed to send Hello: {e}"))?;
 
     match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
+        Some(Message::Hello { protocol_version, .. }) if protocol_version != PROTOCOL_VERSION => Err(format!(
+            "daemon protocol version mismatch: daemon has {protocol_version}, client has {PROTOCOL_VERSION} — restart the daemon"
+        )),
         Some(Message::Hello { .. }) => Ok(()),
         Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
         None => Err("connection closed before Hello reply".into()),
@@ -133,18 +136,21 @@ impl SocketDaemon {
 
         // Spawn background reader task
         let reader_session = Arc::clone(&session);
-        let reader_pending = Arc::clone(&pending);
-        let reader_next_id = Arc::clone(&next_id);
-        let reader_local_seqs = Arc::clone(&local_seqs);
-        let reader_subscribed = Arc::clone(&subscribed_queries);
-        let reader_recovering = Arc::clone(&recovering);
-        let reader_event_tx = event_tx.clone();
+        let reader_context = EventContext {
+            local_seqs: Arc::clone(&local_seqs),
+            subscribed_queries: Arc::clone(&subscribed_queries),
+            recovering,
+            event_tx: event_tx.clone(),
+            session: Arc::clone(&session),
+            pending: Arc::clone(&pending),
+            next_id: Arc::clone(&next_id),
+        };
         let reader_task = tokio::spawn(async move {
             loop {
                 match reader_session.read().await {
                     Ok(Some(msg)) => match msg {
                         Message::Response { id, response } => {
-                            let mut map = reader_pending.lock().await;
+                            let mut map = reader_context.pending.lock().await;
                             if let Some(tx) = map.remove(&id) {
                                 let _ = tx.send(*response);
                             } else {
@@ -152,17 +158,7 @@ impl SocketDaemon {
                             }
                         }
                         Message::Event { event } => {
-                            let event = *event;
-                            handle_event(
-                                event,
-                                &reader_local_seqs,
-                                &reader_subscribed,
-                                &reader_recovering,
-                                &reader_event_tx,
-                                &reader_session,
-                                &reader_pending,
-                                &reader_next_id,
-                            );
+                            handle_event(*event, &reader_context);
                         }
                         Message::Request { .. } => {
                             warn!("received unexpected request from daemon");
@@ -177,7 +173,7 @@ impl SocketDaemon {
                     Ok(None) => {
                         // EOF — daemon closed connection
                         error!("daemon connection closed (EOF)");
-                        let mut map = reader_pending.lock().await;
+                        let mut map = reader_context.pending.lock().await;
                         for (_, tx) in map.drain() {
                             let _ = tx.send(ResponseResult::Err { message: "daemon connection closed".into() });
                         }
@@ -185,7 +181,7 @@ impl SocketDaemon {
                     }
                     Err(e) => {
                         error!(err = %e, "error reading from daemon session");
-                        let mut map = reader_pending.lock().await;
+                        let mut map = reader_context.pending.lock().await;
                         for (_, tx) in map.drain() {
                             let _ = tx.send(ResponseResult::Err { message: format!("daemon read error: {e}") });
                         }
@@ -455,23 +451,28 @@ fn into_success_response(result: ResponseResult) -> Result<Response, String> {
     }
 }
 
+/// Shared state the background reader threads through event handling and gap
+/// recovery: seq tracking, the query subscription set, in-flight recovery
+/// buffers, the subscriber fan-out, and the request plumbing recovery needs.
+#[derive(Clone)]
+struct EventContext {
+    local_seqs: Arc<SeqMap>,
+    subscribed_queries: Arc<QuerySet>,
+    recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
+    event_tx: broadcast::Sender<DaemonEvent>,
+    session: Arc<MessageSession>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
+    next_id: Arc<AtomicU64>,
+}
+
 /// Handle a daemon event in the background reader: update local seq tracking,
 /// forward to TUI subscribers, and spawn gap recovery if needed.
 ///
 /// This function is non-async and never blocks the reader loop. Gap recovery
 /// is spawned on a separate task to avoid deadlocking the reader (which must
 /// remain free to route the recovery response).
-#[allow(clippy::too_many_arguments)]
-fn handle_event(
-    event: DaemonEvent,
-    local_seqs: &Arc<SeqMap>,
-    subscribed_queries: &Arc<QuerySet>,
-    recovering: &Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
-    event_tx: &broadcast::Sender<DaemonEvent>,
-    session: &Arc<MessageSession>,
-    pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
-    next_id: &Arc<AtomicU64>,
-) {
+fn handle_event(event: DaemonEvent, ctx: &EventContext) {
+    let EventContext { local_seqs, recovering, event_tx, .. } = ctx;
     match &event {
         DaemonEvent::RepoSnapshot(snap) => {
             debug!(repo_identity = %snap.repo_identity, repo = ?snap.repo, seq = snap.seq, "received full snapshot");
@@ -518,22 +519,15 @@ fn handle_event(
                         warn!(repo_identity = %repo_identity, repo = ?repo, "received delta for unknown repo, requesting replay");
                     }
 
-                    let local_seqs = Arc::clone(local_seqs);
-                    let subscribed_queries = Arc::clone(subscribed_queries);
-                    let recovering = Arc::clone(recovering);
-                    let event_tx = event_tx.clone();
-                    let session = Arc::clone(session);
-                    let pending = Arc::clone(pending);
-                    let next_id = Arc::clone(next_id);
-
+                    let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
+                        recover_from_gap(&ctx).await;
                         // Drain buffered deltas, discarding any that recovery
                         // already covered (their seq <= recovered local_seq).
                         // Only re-process deltas that are genuinely ahead.
-                        let buffered = recovering.lock().unwrap().remove(&repo_identity).unwrap_or_default();
+                        let buffered = ctx.recovering.lock().unwrap().remove(&repo_identity).unwrap_or_default();
                         let stream_key = StreamKey::Repo { identity: repo_identity };
-                        let recovered_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
+                        let recovered_seq = ctx.local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
                         for buffered_event in buffered {
                             let dominated = match &buffered_event {
                                 DaemonEvent::RepoDelta(d) => recovered_seq.is_some_and(|rs| d.seq <= rs),
@@ -543,16 +537,7 @@ fn handle_event(
                                 debug!("discarding buffered delta already covered by recovery");
                                 continue;
                             }
-                            handle_event(
-                                buffered_event,
-                                &local_seqs,
-                                &subscribed_queries,
-                                &recovering,
-                                &event_tx,
-                                &session,
-                                &pending,
-                                &next_id,
-                            );
+                            handle_event(buffered_event, &ctx);
                         }
                     });
                 }
@@ -573,11 +558,11 @@ fn handle_event(
             let _ = event_tx.send(event);
         }
         DaemonEvent::ResultSet(result_set) => {
-            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Query { query: result_set.query }, result_set.seq);
+            local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Query { query: result_set.query() }, result_set.seq);
             let _ = event_tx.send(event);
         }
         DaemonEvent::ResultDelta(delta) => {
-            let query = delta.query;
+            let query = delta.query();
             let seq = delta.seq;
             let stream_key = StreamKey::Query { query };
             let local_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
@@ -600,15 +585,9 @@ fn handle_event(
                         warn!(%query, %seq, "received result delta for unknown query, resubscribing");
                     }
 
-                    let local_seqs = Arc::clone(local_seqs);
-                    let subscribed_queries = Arc::clone(subscribed_queries);
-                    let event_tx = event_tx.clone();
-                    let session = Arc::clone(session);
-                    let pending = Arc::clone(pending);
-                    let next_id = Arc::clone(next_id);
-
+                    let ctx = ctx.clone();
                     tokio::spawn(async move {
-                        recover_query_gap(&local_seqs, &subscribed_queries, &event_tx, &session, &pending, &next_id).await;
+                        recover_query_gap(&ctx).await;
                     });
                 }
             }
@@ -625,13 +604,8 @@ fn handle_event(
 
 /// Recover from a seq gap by calling `replay_since` with the stale seq,
 /// updating local seq tracking, and forwarding replay events to the TUI.
-async fn recover_from_gap(
-    local_seqs: &SeqMap,
-    event_tx: &broadcast::Sender<DaemonEvent>,
-    session: &Arc<MessageSession>,
-    pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
-    next_id: &AtomicU64,
-) {
+async fn recover_from_gap(ctx: &EventContext) {
+    let EventContext { local_seqs, event_tx, session, pending, next_id, .. } = ctx;
     let last_seen = {
         let seqs = local_seqs.read().expect("sequence lock poisoned");
         seqs.clone()
@@ -721,7 +695,7 @@ fn seed_query_seqs(local_seqs: &SeqMap, events: &[DaemonEvent]) {
     let mut seqs = local_seqs.write().expect("sequence lock poisoned");
     for event in events {
         if let DaemonEvent::ResultSet(result_set) = event {
-            let key = StreamKey::Query { query: result_set.query };
+            let key = StreamKey::Query { query: result_set.query() };
             seqs.entry(key).and_modify(|seq| *seq = (*seq).max(result_set.seq)).or_insert(result_set.seq);
         }
     }
@@ -729,14 +703,8 @@ fn seed_query_seqs(local_seqs: &SeqMap, events: &[DaemonEvent]) {
 
 /// Recover from a result-set seq gap by re-subscribing with current cursors;
 /// the daemon replays a full `ResultSet` for each stale query.
-async fn recover_query_gap(
-    local_seqs: &SeqMap,
-    subscribed_queries: &QuerySet,
-    event_tx: &broadcast::Sender<DaemonEvent>,
-    session: &Arc<MessageSession>,
-    pending: &Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>,
-    next_id: &AtomicU64,
-) {
+async fn recover_query_gap(ctx: &EventContext) {
+    let EventContext { local_seqs, subscribed_queries, event_tx, session, pending, next_id, .. } = ctx;
     let queries = encode_query_cursors(subscribed_queries, local_seqs);
     // A delta for an unsubscribed query cannot reach this connection, so an
     // unknown-query gap implies a subscription exists; still, guard the

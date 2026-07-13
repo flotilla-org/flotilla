@@ -55,7 +55,7 @@ fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Opti
 }
 
 fn convoy_result_set(seq: u64, rows: Vec<ConvoyRow>) -> ResultSet {
-    ResultSet { query: QueryId::Convoys, seq, rows: Rows::Convoys(rows) }
+    ResultSet { seq, rows: Rows::Convoys(rows) }
 }
 
 async fn set_local_convoy_rows(daemon: &InProcessDaemon, seq: u64, rows: Vec<ConvoyRow>) {
@@ -2496,7 +2496,7 @@ async fn subscribe_queries_replays_result_set_from_aggregator_state() {
     let result_set = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::ResultSet(result_set) if result_set.query == QueryId::Convoys => Some(result_set.clone()),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(result_set.clone()),
             _ => None,
         })
         .expect("expected ResultSet in subscribe replay");
@@ -2548,7 +2548,7 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
     let result_set = events
         .iter()
         .find_map(|e| match e {
-            DaemonEvent::ResultSet(result_set) if result_set.query == QueryId::Convoys => Some(result_set.clone()),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(result_set.clone()),
             _ => None,
         })
         .expect("client ahead of daemon must still receive a result set");
