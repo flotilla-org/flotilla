@@ -97,6 +97,8 @@ async fn apply_status_patch_initializes_missing_status_from_default() {
     assert_eq!(updated.metadata.resource_version, "2");
 }
 
+// The patch blocks one runtime worker at a synchronous barrier while the second worker lands the
+// concurrent update that makes its resourceVersion stale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checked_status_patch_revalidates_after_conflict_before_retrying() {
     let resolver = ResourceBackend::InMemory(InMemoryBackend::default()).using::<CounterResource>("flotilla");
