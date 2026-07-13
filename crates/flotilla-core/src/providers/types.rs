@@ -34,13 +34,16 @@ pub struct WorkspaceConfig {
     pub resolved_commands: Option<Vec<(String, String)>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkspaceAttachRequest {
     pub name: String,
     pub working_directory: ExecutionEnvironmentPath,
+    #[builder(default)]
     pub template_vars: HashMap<String, String>,
     pub template_yaml: Option<String>,
     /// Final local commands used to attach to or reach prepared workspace surfaces.
+    #[builder(default)]
     pub attach_commands: Vec<(String, String)>,
     /// Manifest metadata to stamp onto the created workspace (the tab-id
     /// two-step). `None` skips stamping.

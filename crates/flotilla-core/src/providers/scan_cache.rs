@@ -299,14 +299,11 @@ mod tests {
         assert!(second.expect("second workspace scan").is_empty());
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1, "concurrent readers should share the underlying scan");
 
-        let request = WorkspaceAttachRequest {
-            name: "new".into(),
-            working_directory: ExecutionEnvironmentPath::new("/repo"),
-            attach_commands: vec![],
-            stamp: None,
-            template_yaml: None,
-            template_vars: Default::default(),
-        };
+        let request = WorkspaceAttachRequest::builder()
+            .name("new")
+            .working_directory(ExecutionEnvironmentPath::new("/repo"))
+            .template_vars(Default::default())
+            .build();
         manager.create_workspace(&request).await.expect("create workspace");
         let workspaces = manager.list_workspaces().await.expect("scan after mutation");
 

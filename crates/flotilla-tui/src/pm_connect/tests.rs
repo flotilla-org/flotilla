@@ -235,20 +235,10 @@ fn sink_len_grew(sink: &Arc<RecordingSink>, seen: usize) -> bool {
 
 #[test]
 fn resolve_pm_prefers_explicit_socket_then_environment_detection() {
-    let options = PmConnectOptions {
-        zellij_bin: None,
-        plugin_url: None,
-        wheelhouse_socket: Some(PathBuf::from("/tmp/wheelhouse.sock")),
-        flotilla_bin: "flotilla".to_owned(),
-    };
+    let options = PmConnectOptions::builder().wheelhouse_socket(PathBuf::from("/tmp/wheelhouse.sock")).flotilla_bin("flotilla").build();
     assert!(matches!(resolve_pm(&options, &|_| None), Ok(PmInstance::Wheelhouse { .. })), "explicit socket needs no PM environment");
 
-    let detect = PmConnectOptions {
-        zellij_bin: Some("/opt/zellij".to_owned()),
-        plugin_url: None,
-        wheelhouse_socket: None,
-        flotilla_bin: "flotilla".to_owned(),
-    };
+    let detect = PmConnectOptions::builder().zellij_bin("/opt/zellij").flotilla_bin("flotilla").build();
     let pm = resolve_pm(&detect, &|key| (key == "ZELLIJ").then(|| "1".to_owned())).expect("zellij detected");
     assert!(matches!(pm, PmInstance::Zellij { ref bin, .. } if bin == "/opt/zellij"), "options override the detected default");
     let error = resolve_pm(&detect, &|_| None).map(|_| ()).expect_err("no PM detected");

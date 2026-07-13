@@ -500,18 +500,19 @@ async fn provider_runtime_replaces_across_managers() {
     let runtime = ProviderPresentationRuntime::new(Arc::new(registry), Arc::clone(&policies));
 
     let result = runtime
-        .apply(&PresentationPlan {
-            policy: "default".to_string(),
-            name: "convoy-a".to_string(),
-            crew: vec![resolved_process("main", "attach term-a")],
-            presentation_local_cwd: flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"),
-            previous: Some(flotilla_controllers::reconcilers::PreviousWorkspace {
-                presentation_manager: "old".to_string(),
-                workspace_ref: "workspace-old".to_string(),
-            }),
-            spec_hash: "hash".to_string(),
-            stamp: None,
-        })
+        .apply(
+            &PresentationPlan::builder()
+                .policy("default")
+                .name("convoy-a")
+                .crew(vec![resolved_process("main", "attach term-a")])
+                .presentation_local_cwd(flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"))
+                .previous(flotilla_controllers::reconcilers::PreviousWorkspace {
+                    presentation_manager: "old".to_string(),
+                    workspace_ref: "workspace-old".to_string(),
+                })
+                .spec_hash("hash")
+                .build(),
+        )
         .await
         .expect("apply should succeed");
 
@@ -539,15 +540,16 @@ async fn provider_runtime_threads_the_workspace_stamp_into_the_attach_request() 
         scope: None,
     };
     runtime
-        .apply(&PresentationPlan {
-            policy: "default".to_string(),
-            name: "implement".to_string(),
-            crew: vec![resolved_process("main", "attach term-a")],
-            presentation_local_cwd: flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"),
-            previous: None,
-            spec_hash: "hash".to_string(),
-            stamp: Some(stamp.clone()),
-        })
+        .apply(
+            &PresentationPlan::builder()
+                .policy("default")
+                .name("implement")
+                .crew(vec![resolved_process("main", "attach term-a")])
+                .presentation_local_cwd(flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"))
+                .spec_hash("hash")
+                .stamp(stamp.clone())
+                .build(),
+        )
         .await
         .expect("apply should succeed");
 
@@ -577,18 +579,19 @@ async fn provider_runtime_returns_retry_from_clean_slate_after_delete_then_creat
     let runtime = ProviderPresentationRuntime::new(Arc::new(registry), Arc::clone(&policies));
 
     let result = runtime
-        .apply(&PresentationPlan {
-            policy: "default".to_string(),
-            name: "convoy-a".to_string(),
-            crew: vec![resolved_process("main", "attach term-a")],
-            presentation_local_cwd: flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"),
-            previous: Some(flotilla_controllers::reconcilers::PreviousWorkspace {
-                presentation_manager: "old".to_string(),
-                workspace_ref: "workspace-old".to_string(),
-            }),
-            spec_hash: "hash".to_string(),
-            stamp: None,
-        })
+        .apply(
+            &PresentationPlan::builder()
+                .policy("default")
+                .name("convoy-a")
+                .crew(vec![resolved_process("main", "attach term-a")])
+                .presentation_local_cwd(flotilla_core::path_context::ExecutionEnvironmentPath::new("/tmp"))
+                .previous(flotilla_controllers::reconcilers::PreviousWorkspace {
+                    presentation_manager: "old".to_string(),
+                    workspace_ref: "workspace-old".to_string(),
+                })
+                .spec_hash("hash")
+                .build(),
+        )
         .await;
 
     assert!(matches!(result, Err(ApplyPresentationError::RetryFromCleanSlate(ref message)) if message == "boom"));

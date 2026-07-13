@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use tokio::{io::AsyncWriteExt, net::UnixStream, process::Command};
 
-use crate::wire::{MetadataPatch, APPLY_METADATA_PATCH_PIPE};
+use crate::{keys::APPLY_METADATA_PATCH_PIPE, wire::MetadataPatch};
 
 #[async_trait]
 pub trait PatchSink: Send + Sync {

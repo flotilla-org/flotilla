@@ -40,7 +40,8 @@ pub trait PresentationRuntime: Send + Sync {
     async fn tear_down(&self, manager: &str, workspace_ref: &str) -> Result<(), String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PresentationPlan {
     pub policy: String,
     pub name: String,
@@ -134,14 +135,12 @@ impl PresentationPolicy for DefaultPolicy {
         }
 
         RenderedWorkspace {
-            attach_request: WorkspaceAttachRequest {
-                name: context.name.clone(),
-                working_directory: context.presentation_local_cwd.clone(),
-                template_vars: HashMap::new(),
-                template_yaml: Some(default_policy_template_yaml(&roles)),
-                attach_commands: processes.iter().map(|process| (process.role.clone(), process.attach_command.clone())).collect(),
-                stamp: None,
-            },
+            attach_request: WorkspaceAttachRequest::builder()
+                .name(context.name.clone())
+                .working_directory(context.presentation_local_cwd.clone())
+                .template_yaml(default_policy_template_yaml(&roles))
+                .attach_commands(processes.iter().map(|process| (process.role.clone(), process.attach_command.clone())).collect())
+                .build(),
         }
     }
 }
@@ -275,16 +274,22 @@ impl<R> PresentationReconciler<R> {
         let namespace = &obj.metadata.namespace;
         let convoy_name = &obj.spec.convoy_ref;
         let vessel = &obj.spec.name;
-        let (project_ref, repo) = match self.convoys.get(convoy_name).await {
-            Ok(convoy) => (convoy.spec.project_ref.clone(), convoy.metadata.labels.get(REPO_LABEL).cloned()),
-            Err(_) => (None, None),
+        // Tab stamps have no TTL, so a wrong scope would stick: on a failed
+        // convoy lookup, stamp no scope at all (honestly absent — the pane
+        // identities still group the tab) rather than a spine missing its
+        // project segment.
+        let scope = match self.convoys.get(convoy_name).await {
+            Ok(convoy) => {
+                let project =
+                    project_segment(convoy.spec.project_ref.as_deref(), convoy.metadata.labels.get(REPO_LABEL).map(String::as_str));
+                Some(vessel_group_path(project, namespace, convoy_name, vessel))
+            }
+            Err(err) => {
+                warn!(%err, convoy = %convoy_name, "convoy lookup failed; stamping workspace without a scope");
+                None
+            }
         };
-        let project = project_segment(project_ref.as_deref(), repo.as_deref());
-        WorkspaceStamp {
-            kind: "flotilla-vessel".to_owned(),
-            factory_id: vessel_factory_id(namespace, convoy_name, vessel),
-            scope: Some(vessel_group_path(project, namespace, convoy_name, vessel)),
-        }
+        WorkspaceStamp { kind: "flotilla-vessel".to_owned(), factory_id: vessel_factory_id(namespace, convoy_name, vessel), scope }
     }
 
     fn build_attach_command(
@@ -391,15 +396,15 @@ where
             return Ok(PresentationDeps::InSync);
         }
 
-        let plan = PresentationPlan {
-            policy: obj.spec.presentation_policy_ref.clone(),
-            name: obj.spec.name.clone(),
-            crew: processes,
-            presentation_local_cwd: self.hop_chain.presentation_local_cwd(),
-            previous,
-            spec_hash,
-            stamp: Some(self.workspace_stamp(obj).await),
-        };
+        let plan = PresentationPlan::builder()
+            .policy(obj.spec.presentation_policy_ref.clone())
+            .name(obj.spec.name.clone())
+            .crew(processes)
+            .presentation_local_cwd(self.hop_chain.presentation_local_cwd())
+            .maybe_previous(previous)
+            .spec_hash(spec_hash)
+            .stamp(self.workspace_stamp(obj).await)
+            .build();
 
         // This dependency fetch intentionally performs the runtime apply. The apply result is the
         // authoritative observed workspace state we need to patch into PresentationStatus, and the

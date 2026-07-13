@@ -31,7 +31,15 @@ pub struct CatalogInput<'a> {
     pub sessions: &'a [SessionRow],
 }
 
-/// Frozen badge vocabulary (design §6, proposed for the Leg-1 freeze).
+/// A normalized badge: the frozen `status.state` vocabulary plus whether
+/// the entity demands attention (design §6, proposed for the Leg-1 freeze).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Badge {
+    pub state: BadgeState,
+    pub attention: bool,
+}
+
+/// Frozen `status.state` vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadgeState {
     Idle,
@@ -53,37 +61,41 @@ impl BadgeState {
     }
 }
 
-/// Badge for a convoy. `initializing` is already `Pending` on rows — both
-/// read as waiting, never a masked "initializing…".
-pub fn convoy_badge(phase: ConvoyPhase) -> (BadgeState, bool) {
+/// Badge for a convoy. A convoy still awaiting its workflow snapshot reads
+/// as waiting whatever its phase — truthfully not yet running, never a
+/// masked "initializing…".
+pub fn convoy_badge(phase: ConvoyPhase, initializing: bool) -> Badge {
+    if initializing {
+        return Badge { state: BadgeState::Waiting, attention: false };
+    }
     match phase {
-        ConvoyPhase::Pending => (BadgeState::Waiting, false),
-        ConvoyPhase::Active => (BadgeState::Active, false),
-        ConvoyPhase::Completed => (BadgeState::Done, false),
-        ConvoyPhase::Failed => (BadgeState::Failed, true),
-        ConvoyPhase::Cancelled => (BadgeState::Idle, false),
+        ConvoyPhase::Pending => Badge { state: BadgeState::Waiting, attention: false },
+        ConvoyPhase::Active => Badge { state: BadgeState::Active, attention: false },
+        ConvoyPhase::Completed => Badge { state: BadgeState::Done, attention: false },
+        ConvoyPhase::Failed => Badge { state: BadgeState::Failed, attention: true },
+        ConvoyPhase::Cancelled => Badge { state: BadgeState::Idle, attention: false },
     }
 }
 
 /// Badge for the work aboard a vessel. `Ready` demands attention: the crew
 /// could start and hasn't.
-pub fn work_badge(phase: WorkPhase) -> (BadgeState, bool) {
+pub fn work_badge(phase: WorkPhase) -> Badge {
     match phase {
-        WorkPhase::Pending => (BadgeState::Idle, false),
-        WorkPhase::Ready => (BadgeState::Waiting, true),
-        WorkPhase::Launching | WorkPhase::Running => (BadgeState::Active, false),
-        WorkPhase::Complete => (BadgeState::Done, false),
-        WorkPhase::Failed => (BadgeState::Failed, true),
-        WorkPhase::Cancelled => (BadgeState::Idle, false),
+        WorkPhase::Pending => Badge { state: BadgeState::Idle, attention: false },
+        WorkPhase::Ready => Badge { state: BadgeState::Waiting, attention: true },
+        WorkPhase::Launching | WorkPhase::Running => Badge { state: BadgeState::Active, attention: false },
+        WorkPhase::Complete => Badge { state: BadgeState::Done, attention: false },
+        WorkPhase::Failed => Badge { state: BadgeState::Failed, attention: true },
+        WorkPhase::Cancelled => Badge { state: BadgeState::Idle, attention: false },
     }
 }
 
-pub fn session_badge(phase: SessionPhase) -> (BadgeState, bool) {
+pub fn session_badge(phase: SessionPhase) -> Badge {
     match phase {
-        SessionPhase::Starting => (BadgeState::Waiting, false),
-        SessionPhase::Running => (BadgeState::Active, false),
-        SessionPhase::Stopped => (BadgeState::Idle, false),
-        SessionPhase::Failed => (BadgeState::Failed, true),
+        SessionPhase::Starting => Badge { state: BadgeState::Waiting, attention: false },
+        SessionPhase::Running => Badge { state: BadgeState::Active, attention: false },
+        SessionPhase::Stopped => Badge { state: BadgeState::Idle, attention: false },
+        SessionPhase::Failed => Badge { state: BadgeState::Failed, attention: true },
     }
 }
 
@@ -217,18 +229,18 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     let ordinal = project.is_none().then_some(ARCHIPELAGO_ORDINAL);
 
     let convoy_path = convoy_group_path(project.clone(), namespace, &convoy.name);
-    let (state, attention) = convoy_badge(convoy.phase);
+    let badge = convoy_badge(convoy.phase, convoy.initializing);
     let done = convoy.vessels.iter().filter(|vessel| vessel.phase == WorkPhase::Complete).count();
     let mut facts = vec![
         (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
         (KEY_CONVOY_WORKFLOW, MetadataValue::text(convoy.workflow_ref.clone())),
-        (KEY_STATUS_STATE, MetadataValue::text(state.as_str())),
+        (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
         (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:convoys/{namespace}/{}", convoy.name))),
     ];
     if let Some(message) = &convoy.message {
         facts.push((KEY_CONVOY_MESSAGE, MetadataValue::text(message.clone())));
     }
-    if attention {
+    if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if !convoy.vessels.is_empty() {
@@ -251,18 +263,18 @@ fn project_vessel(
 ) {
     let namespace = &convoy.resource.namespace;
     let path = vessel_group_path(project, namespace, &convoy.name, &vessel.name);
-    let (state, attention) = work_badge(vessel.phase);
+    let badge = work_badge(vessel.phase);
     let mut facts = vec![
         (KEY_WORK_PHASE, MetadataValue::text(vessel.phase.as_str())),
         (KEY_VESSEL_HOST, MetadataValue::text(vessel.host.to_string())),
-        (KEY_STATUS_STATE, MetadataValue::text(state.as_str())),
+        (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
         (KEY_FACTORY_ID, MetadataValue::text(vessel_factory_id(namespace, &convoy.name, &vessel.name))),
     ];
     if !vessel.crew.is_empty() {
         let roles = vessel.crew.iter().map(|member| member.role.clone()).collect();
         facts.push((KEY_CREW_ROLES, MetadataValue::StringList(roles)));
     }
-    if attention {
+    if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if let Some(message) = &vessel.message {
@@ -292,13 +304,13 @@ fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn Recip
 
     path.push(GroupSegment::text(SEGMENT_VESSEL, session.name.clone()));
     let group_path = GroupPath(path);
-    let (state, attention) = session_badge(session.phase);
+    let badge = session_badge(session.phase);
     let mut facts = vec![
-        (KEY_STATUS_STATE, MetadataValue::text(state.as_str())),
+        (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
         (KEY_VESSEL_HOST, MetadataValue::text(session.host.to_string())),
         (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:sessions/{namespace}/{}", session.name))),
     ];
-    if attention {
+    if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if let Some(recipe) = session.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
@@ -313,7 +325,7 @@ fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn Recip
     let identity_value = format!("{}/{namespace}/{}", session.host, session.name);
     catalog.assert_facts(
         MetadataTarget::Identity(MetadataIdentity { key: KEY_SESSION.to_owned(), value: MetadataValue::text(identity_value) }),
-        vec![(KEY_SCOPE, group_path.to_scope_value()), (KEY_STATUS_STATE, MetadataValue::text(state.as_str()))],
+        vec![(KEY_SCOPE, group_path.to_scope_value()), (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str()))],
         None,
     );
 }

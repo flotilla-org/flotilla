@@ -20,9 +20,9 @@ use crate::{
     wire::{GroupPath, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate, PaneTarget},
 };
 
-/// Parse a zellij pane id as found in `ZELLIJ_PANE_ID` (plain integer) or
-/// display form (`terminal_42`).
-pub fn parse_zellij_pane_id(value: &str) -> Option<u32> {
+/// Parse a pane id as PMs expose it to child processes: a plain integer
+/// (`ZELLIJ_PANE_ID`, `WHEELHOUSE_PANE_ID`) or display form (`terminal_42`).
+pub fn parse_pane_id(value: &str) -> Option<u32> {
     let text = value.trim();
     let text = text.strip_prefix("terminal_").unwrap_or(text);
     text.parse().ok()
@@ -92,10 +92,10 @@ mod tests {
 
     #[test]
     fn parses_env_and_display_pane_ids() {
-        assert_eq!(parse_zellij_pane_id("42"), Some(42));
-        assert_eq!(parse_zellij_pane_id("terminal_7"), Some(7));
-        assert_eq!(parse_zellij_pane_id("plugin_7"), None);
-        assert_eq!(parse_zellij_pane_id(""), None);
+        assert_eq!(parse_pane_id("42"), Some(42));
+        assert_eq!(parse_pane_id("terminal_7"), Some(7));
+        assert_eq!(parse_pane_id("plugin_7"), None);
+        assert_eq!(parse_pane_id(""), None);
     }
 
     #[test]

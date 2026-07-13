@@ -857,15 +857,15 @@ async fn fleet_list_preserves_stale_rows_when_replica_is_unreachable() {
     let daemon = new_attach_test_daemon(&config_base).await;
     let last_sync = Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1);
     daemon.fleet_replica_cache.write().await.insert(HostName::new("feta"), FleetReplicaCacheEntry {
-        rows: vec![FleetListRow {
-            convoy: "convoy-remote".to_string(),
-            vessel: "remote-env".to_string(),
-            authority: None,
-            crew: "implement/coder".to_string(),
-            crew_state: "running".to_string(),
-            host: HostName::new("feta"),
-            staleness: FleetStaleness::Local,
-        }],
+        rows: vec![FleetListRow::builder()
+            .convoy("convoy-remote".to_string())
+            .vessel("remote-env".to_string())
+            .crew("implement/coder".to_string())
+            .crew_state("running".to_string())
+            .host(HostName::new("feta"))
+            .namespace("dev")
+            .staleness(FleetStaleness::Local)
+            .build()],
         result_sets: vec![],
         last_sync: Some(last_sync),
         generation: Some("gen-1".to_string()),
@@ -898,29 +898,30 @@ async fn replica_refresh_replaces_rows_when_generation_changes() {
     let first = FleetReplicaSnapshot {
         host: HostName::new("feta"),
         generation: Some("gen-1".to_string()),
-        rows: vec![FleetListRow {
-            convoy: "old-convoy".to_string(),
-            vessel: "old-env".to_string(),
-            authority: None,
-            crew: "implement/coder".to_string(),
-            crew_state: "running".to_string(),
-            host: HostName::new("feta"),
-            staleness: FleetStaleness::Local,
-        }],
+        rows: vec![FleetListRow::builder()
+            .convoy("old-convoy".to_string())
+            .vessel("old-env".to_string())
+            .crew("implement/coder".to_string())
+            .crew_state("running".to_string())
+            .host(HostName::new("feta"))
+            .namespace("dev")
+            .staleness(FleetStaleness::Local)
+            .build()],
         result_sets: vec![],
     };
     let second = FleetReplicaSnapshot {
         host: HostName::new("feta"),
         generation: Some("gen-2".to_string()),
-        rows: vec![FleetListRow {
-            convoy: "new-convoy".to_string(),
-            vessel: "new-env".to_string(),
-            authority: Some("adopted".to_string()),
-            crew: "reviewer".to_string(),
-            crew_state: "stopped".to_string(),
-            host: HostName::new("feta"),
-            staleness: FleetStaleness::Local,
-        }],
+        rows: vec![FleetListRow::builder()
+            .convoy("new-convoy".to_string())
+            .vessel("new-env".to_string())
+            .maybe_authority(Some("adopted".to_string()))
+            .crew("reviewer".to_string())
+            .crew_state("stopped".to_string())
+            .host(HostName::new("feta"))
+            .namespace("dev")
+            .staleness(FleetStaleness::Local)
+            .build()],
         result_sets: vec![],
     };
     let runner = Arc::new(QueuedOutputRunner::new(vec![
@@ -996,15 +997,15 @@ async fn replica_refresh_dedupes_crewless_rows_already_present_in_snapshot_rows(
     let snapshot = FleetReplicaSnapshot {
         host: HostName::new("feta"),
         generation: Some("gen-1".to_string()),
-        rows: vec![FleetListRow {
-            convoy: "remote-failed".to_string(),
-            vessel: "-".to_string(),
-            authority: None,
-            crew: "-".to_string(),
-            crew_state: "failed: missing input 'topic'".to_string(),
-            host: HostName::new("feta"),
-            staleness: FleetStaleness::Local,
-        }],
+        rows: vec![FleetListRow::builder()
+            .convoy("remote-failed".to_string())
+            .vessel("-".to_string())
+            .crew("-".to_string())
+            .crew_state("failed: missing input 'topic'".to_string())
+            .host(HostName::new("feta"))
+            .namespace("dev")
+            .staleness(FleetStaleness::Local)
+            .build()],
         result_sets: vec![convoy_result_set(3, vec![convoy_row(
             "flotilla",
             "remote-failed",
@@ -1221,15 +1222,16 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
 
     let daemon = new_attach_test_daemon(&config_base).await;
     daemon.fleet_replica_cache.write().await.insert(HostName::new("feta"), FleetReplicaCacheEntry {
-        rows: vec![FleetListRow {
-            convoy: "convoy-a".to_string(),
-            vessel: "remote-env".to_string(),
-            authority: None,
-            crew: "implement/coder".to_string(),
-            crew_state: "running".to_string(),
-            host: HostName::new("feta"),
-            staleness: FleetStaleness::Stale { last_sync: Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1) },
-        }],
+        rows: vec![FleetListRow::builder()
+            .convoy("convoy-a".to_string())
+            .vessel("remote-env".to_string())
+            .crew("implement/coder".to_string())
+            .crew_state("running".to_string())
+            .host(HostName::new("feta"))
+            .namespace("dev")
+            .session("terminal-remote-coder")
+            .staleness(FleetStaleness::Stale { last_sync: Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1) })
+            .build()],
         result_sets: vec![],
         last_sync: Some(Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1)),
         generation: Some("gen-1".to_string()),
@@ -1249,9 +1251,16 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command, .. } = result else {
+    let CommandValue::AttachCommandResolved { command, binding } = result else {
         panic!("expected attach command, got {result:?}");
     };
+    let binding = binding.expect("replica resolution carries the structured binding");
+    assert_eq!(binding.host.as_str(), "feta");
+    assert_eq!(binding.namespace, "dev");
+    assert_eq!(binding.session.as_deref(), Some("terminal-remote-coder"), "cross-host panes stamp the full join key");
+    assert_eq!(binding.convoy.as_deref(), Some("convoy-a"));
+    assert_eq!(binding.vessel.as_deref(), Some("implement"));
+    assert_eq!(binding.role.as_deref(), Some("coder"));
     assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the replica host over SSH: {command}");
     assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
@@ -1288,15 +1297,15 @@ async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
 
     let daemon = new_attach_test_daemon(&config_base).await;
     daemon.fleet_replica_cache.write().await.insert(HostName::new("removed"), FleetReplicaCacheEntry {
-        rows: vec![FleetListRow {
-            convoy: "convoy-a".to_string(),
-            vessel: "removed-env".to_string(),
-            authority: None,
-            crew: "implement/coder".to_string(),
-            crew_state: "running".to_string(),
-            host: HostName::new("removed"),
-            staleness: FleetStaleness::Fresh { last_sync: Utc::now() },
-        }],
+        rows: vec![FleetListRow::builder()
+            .convoy("convoy-a".to_string())
+            .vessel("removed-env".to_string())
+            .crew("implement/coder".to_string())
+            .crew_state("running".to_string())
+            .host(HostName::new("removed"))
+            .namespace("dev")
+            .staleness(FleetStaleness::Fresh { last_sync: Utc::now() })
+            .build()],
         result_sets: vec![],
         last_sync: Some(Utc::now()),
         generation: Some("gen-1".to_string()),

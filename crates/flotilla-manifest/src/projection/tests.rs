@@ -15,6 +15,7 @@ fn session_ref(namespace: &str, name: &str) -> ResourceRef {
     ResourceRef::new("flotilla/v1", "TerminalSession", namespace, name).on_host(HostName::new("feta"))
 }
 
+#[bon::builder]
 fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, attach: Option<&str>) -> VesselRow {
     VesselRow::builder()
         .resource(convoy.subresource(format!("vessels/{name}")))
@@ -25,6 +26,7 @@ fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, attach: Option<&st
         .build()
 }
 
+#[bon::builder]
 fn session(namespace: &str, name: &str, phase: SessionPhase, repo: Option<&str>, attach: Option<&str>) -> SessionRow {
     SessionRow::builder()
         .resource(session_ref(namespace, name))
@@ -77,7 +79,7 @@ fn convoy_with_project_ref_projects_the_full_spine() {
                 .host(HostName::new("feta"))
                 .attach("workspace-1")
                 .build(),
-            vessel(&reference, "review", WorkPhase::Complete, None),
+            vessel().convoy(&reference).name("review").phase(WorkPhase::Complete).call(),
         ])
         .build();
     let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
@@ -139,6 +141,23 @@ fn failed_convoy_surfaces_attention_and_message() {
 }
 
 #[test]
+fn initializing_convoy_reads_waiting_whatever_its_phase() {
+    let convoy = ConvoyRow::builder()
+        .resource(convoy_ref("dev", "warming-up"))
+        .name("warming-up")
+        .workflow_ref("implement-review")
+        .phase(ConvoyPhase::Active)
+        .initializing(true)
+        .build();
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let patches = catalog.reassert_patches();
+
+    let convoy_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_CONVOY, "dev/warming-up")]));
+    assert_eq!(text(convoy_patch, KEY_STATUS_STATE), "waiting", "no workflow snapshot yet is truthfully not active");
+    assert_eq!(text(convoy_patch, KEY_CONVOY_PHASE), "active", "the raw phase fact stays truthful too");
+}
+
+#[test]
 fn ready_vessel_waits_with_attention() {
     let reference = convoy_ref("dev", "auth");
     let convoy = ConvoyRow::builder()
@@ -146,7 +165,7 @@ fn ready_vessel_waits_with_attention() {
         .name("auth")
         .workflow_ref("implement-review")
         .phase(ConvoyPhase::Active)
-        .vessels(vec![vessel(&reference, "implement", WorkPhase::Ready, None)])
+        .vessels(vec![vessel().convoy(&reference).name("implement").phase(WorkPhase::Ready).call()])
         .build();
     let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
     let patches = catalog.reassert_patches();
@@ -159,7 +178,13 @@ fn ready_vessel_waits_with_attention() {
 
 #[test]
 fn session_with_repo_groups_under_project_and_publishes_identity() {
-    let session = session("dev", "terminal-scratch", SessionPhase::Running, Some("flotilla-org/flotilla"), Some("terminal-scratch"));
+    let session = session()
+        .namespace("dev")
+        .name("terminal-scratch")
+        .phase(SessionPhase::Running)
+        .repo("flotilla-org/flotilla")
+        .attach("terminal-scratch")
+        .call();
     let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
     let patches = catalog.reassert_patches();
 
@@ -188,7 +213,7 @@ fn session_with_repo_groups_under_project_and_publishes_identity() {
 
 #[test]
 fn session_without_repo_is_archipelago_ordered_first() {
-    let session = session("dev", "yeoman", SessionPhase::Running, None, Some("yeoman"));
+    let session = session().namespace("dev").name("yeoman").phase(SessionPhase::Running).attach("yeoman").call();
     let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
     let patches = catalog.reassert_patches();
 
@@ -203,7 +228,7 @@ fn session_without_repo_is_archipelago_ordered_first() {
 
 #[test]
 fn session_without_attach_lists_without_recipe() {
-    let session = session("dev", "wedged", SessionPhase::Failed, Some("flotilla-org/flotilla"), None);
+    let session = session().namespace("dev").name("wedged").phase(SessionPhase::Failed).repo("flotilla-org/flotilla").call();
     let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
     let patches = catalog.reassert_patches();
 
@@ -226,7 +251,7 @@ fn diff_sets_changes_and_unsets_disappearances() {
         .phase(ConvoyPhase::Failed)
         .message("boom")
         .build();
-    let old_session = session("dev", "scratch", SessionPhase::Running, None, Some("scratch"));
+    let old_session = session().namespace("dev").name("scratch").phase(SessionPhase::Running).attach("scratch").call();
     let previous = project_catalog(&CatalogInput { convoys: &[failed], sessions: &[old_session] }, &mint());
 
     let recovered =
@@ -257,7 +282,8 @@ fn diff_sets_changes_and_unsets_disappearances() {
 
 #[test]
 fn reassert_covers_every_target() {
-    let session = session("dev", "scratch", SessionPhase::Running, Some("flotilla-org/flotilla"), Some("scratch"));
+    let session =
+        session().namespace("dev").name("scratch").phase(SessionPhase::Running).repo("flotilla-org/flotilla").attach("scratch").call();
     let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
     let patches = catalog.reassert_patches();
     assert_eq!(patches.len(), 3, "project group + session group + session identity");
@@ -274,7 +300,7 @@ fn shared_spine_helpers_match_the_catalog_targets() {
         .workflow_ref("implement-review")
         .phase(ConvoyPhase::Active)
         .repo(RepoKey("flotilla-org/flotilla".to_owned()))
-        .vessels(vec![vessel(&reference, "implement", WorkPhase::Running, None)])
+        .vessels(vec![vessel().convoy(&reference).name("implement").phase(WorkPhase::Running).call()])
         .build();
     let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
     let patches = catalog.reassert_patches();

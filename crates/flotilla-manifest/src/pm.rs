@@ -11,7 +11,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     sink::{PatchSink, UnixSocketSink, ZellijPipeSink},
-    stamp::parse_zellij_pane_id,
+    stamp::parse_pane_id,
     wire::PaneTarget,
 };
 
@@ -23,26 +23,39 @@ pub enum PmInstance {
         /// The pane this process runs in, when the PM exposes it.
         pane: Option<PaneTarget>,
     },
-    /// Wheelhouse listens on a unix socket. No environment detection yet —
-    /// the listener contract is Leg 3 of the manifest extraction; until it
-    /// lands the socket is always explicit configuration.
-    Wheelhouse { socket: PathBuf },
+    /// Wheelhouse listens on a unix socket. The `WHEELHOUSE_SOCKET` /
+    /// `WHEELHOUSE_PANE_ID` environment spellings are flotilla's proposal
+    /// until Leg 3 of the manifest extraction defines the wheelhouse side;
+    /// they live only here, so blessing or renaming them is a one-line
+    /// change.
+    Wheelhouse {
+        socket: PathBuf,
+        /// The pane this process runs in, when wheelhouse exposes it.
+        pane: Option<PaneTarget>,
+    },
 }
 
 impl PmInstance {
     /// Detect the enclosing PM from the process environment (injected for
-    /// tests). `ZELLIJ` set means we run inside a zellij session.
+    /// tests). `ZELLIJ` set means a zellij session; `WHEELHOUSE_SOCKET`
+    /// means a wheelhouse instance.
     pub fn detect(env: &dyn Fn(&str) -> Option<String>) -> Option<PmInstance> {
+        if let Some(socket) = env("WHEELHOUSE_SOCKET") {
+            return Some(PmInstance::Wheelhouse {
+                socket: PathBuf::from(socket),
+                pane: env("WHEELHOUSE_PANE_ID").as_deref().and_then(parse_pane_id).map(PaneTarget::Terminal),
+            });
+        }
         env("ZELLIJ")?;
         Some(PmInstance::Zellij {
             bin: env("ZELLIJ_BIN").unwrap_or_else(|| "zellij".to_owned()),
             plugin_url: None,
-            pane: env("ZELLIJ_PANE_ID").as_deref().and_then(parse_zellij_pane_id).map(PaneTarget::Terminal),
+            pane: env("ZELLIJ_PANE_ID").as_deref().and_then(parse_pane_id).map(PaneTarget::Terminal),
         })
     }
 
     pub fn wheelhouse(socket: impl Into<PathBuf>) -> PmInstance {
-        PmInstance::Wheelhouse { socket: socket.into() }
+        PmInstance::Wheelhouse { socket: socket.into(), pane: None }
     }
 
     /// Override the zellij binary used for pipe delivery. No-op for PMs that
@@ -73,15 +86,14 @@ impl PmInstance {
                 }
                 Arc::new(sink)
             }
-            PmInstance::Wheelhouse { socket } => Arc::new(UnixSocketSink::new(socket.clone())),
+            PmInstance::Wheelhouse { socket, .. } => Arc::new(UnixSocketSink::new(socket.clone())),
         }
     }
 
     /// The pane this process runs in, for Pane-target stamping.
     pub fn current_pane(&self) -> Option<PaneTarget> {
         match self {
-            PmInstance::Zellij { pane, .. } => *pane,
-            PmInstance::Wheelhouse { .. } => None,
+            PmInstance::Zellij { pane, .. } | PmInstance::Wheelhouse { pane, .. } => *pane,
         }
     }
 }
@@ -111,6 +123,18 @@ mod tests {
     #[test]
     fn no_pm_environment_detects_nothing() {
         assert!(PmInstance::detect(&|_| None).is_none());
+    }
+
+    #[test]
+    fn detects_wheelhouse_socket_and_pane() {
+        let env = |key: &str| match key {
+            "WHEELHOUSE_SOCKET" => Some("/tmp/wheelhouse.sock".to_owned()),
+            "WHEELHOUSE_PANE_ID" => Some("9".to_owned()),
+            _ => None,
+        };
+        let pm = PmInstance::detect(&env).expect("wheelhouse detected");
+        assert!(matches!(pm, PmInstance::Wheelhouse { .. }));
+        assert_eq!(pm.current_pane(), Some(PaneTarget::Terminal(9)), "attach can stamp a wheelhouse pane");
     }
 
     #[test]

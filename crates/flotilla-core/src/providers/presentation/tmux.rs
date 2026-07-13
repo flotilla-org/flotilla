@@ -168,7 +168,6 @@ impl super::PresentationManager for TmuxPresentationManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
     use crate::{
@@ -241,28 +240,16 @@ mod tests {
         let mgr = TmuxPresentationManager::new(runner.clone());
 
         // Create workspace "feat-123"
-        let config1 = WorkspaceAttachRequest {
-            name: "feat-123".to_string(),
-            working_directory: ExecutionEnvironmentPath::new("/tmp"),
-            template_yaml: None,
-            template_vars: HashMap::new(),
-            attach_commands: vec![],
-            stamp: None,
-        };
+        let config1 =
+            WorkspaceAttachRequest::builder().name("feat-123".to_string()).working_directory(ExecutionEnvironmentPath::new("/tmp")).build();
         let (name1, ws1) = mgr.create_workspace(&config1).await.unwrap();
         assert_eq!(ws1.name, "feat-123");
         // ws_ref is now start_time:session:@window_id, not the name
         assert!(name1.contains(':'), "ws_ref should contain colons: {name1}");
 
         // Create workspace "fix-456"
-        let config2 = WorkspaceAttachRequest {
-            name: "fix-456".to_string(),
-            working_directory: ExecutionEnvironmentPath::new("/tmp"),
-            template_yaml: None,
-            template_vars: HashMap::new(),
-            attach_commands: vec![],
-            stamp: None,
-        };
+        let config2 =
+            WorkspaceAttachRequest::builder().name("fix-456".to_string()).working_directory(ExecutionEnvironmentPath::new("/tmp")).build();
         let (name2, ws2) = mgr.create_workspace(&config2).await.unwrap();
         assert_eq!(ws2.name, "fix-456");
         assert!(name2.contains(':'), "ws_ref should contain colons: {name2}");

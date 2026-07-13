@@ -12,13 +12,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Pipe name patches are written to (v0: andamento's current spelling;
-/// Leg 1 renames it `manifest-apply-patch`).
-pub const APPLY_METADATA_PATCH_PIPE: &str = "andamento-apply-metadata-patch";
-/// Pipe name that returns the identities the PM has observed on its panes
-/// (v0 spelling; Leg 1: `manifest-observed-identities`).
-pub const OBSERVED_IDENTITIES_PIPE: &str = "andamento-observed-identities";
-
 /// A metadata fact value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "kebab-case")]
@@ -208,18 +201,21 @@ impl MetadataValueUpdate {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct MetadataPatch {
     pub target: MetadataTarget,
     pub source_id: String,
     #[serde(default)]
+    #[builder(default)]
     pub set: BTreeMap<String, MetadataValueUpdate>,
     #[serde(default)]
+    #[builder(default)]
     pub unset: Vec<String>,
 }
 
 impl MetadataPatch {
-    /// The compact payload written to [`APPLY_METADATA_PATCH_PIPE`] — the
+    /// The compact payload written to the apply-patch pipe — the
     /// patch wrapped in andamento's externally-visible message envelope.
     pub fn to_pipe_payload(&self) -> String {
         serde_json::to_string(&WireMessage::MetadataPatch(self.clone())).expect("metadata patch serializes")

@@ -414,7 +414,12 @@ async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
 async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
     match command {
         PmSubCommand::Connect { zellij_bin, plugin_url, wheelhouse_socket, flotilla_bin } => {
-            let options = flotilla_tui::pm_connect::PmConnectOptions { zellij_bin, plugin_url, wheelhouse_socket, flotilla_bin };
+            let options = flotilla_tui::pm_connect::PmConnectOptions::builder()
+                .maybe_zellij_bin(zellij_bin)
+                .maybe_plugin_url(plugin_url)
+                .maybe_wheelhouse_socket(wheelhouse_socket)
+                .flotilla_bin(flotilla_bin)
+                .build();
             flotilla_tui::pm_connect::run(&cli.socket_path(), &cli.config_dir(), cli.config_dir.as_deref(), cli.socket.as_deref(), options)
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))

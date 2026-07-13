@@ -323,15 +323,17 @@ fn append_crewless_convoy_rows(
             if !convoys_with_crew.insert(row.name.clone()) {
                 continue;
             }
-            rows.push(FleetListRow {
-                convoy: row.name.clone(),
-                vessel: "-".to_string(),
-                authority: None,
-                crew: "-".to_string(),
-                crew_state: convoy_state_label(row),
-                host: host.clone(),
-                staleness: staleness.clone(),
-            });
+            rows.push(
+                FleetListRow::builder()
+                    .convoy(row.name.clone())
+                    .vessel("-")
+                    .crew("-")
+                    .crew_state(convoy_state_label(row))
+                    .host(host.clone())
+                    .namespace(target_namespace)
+                    .staleness(staleness.clone())
+                    .build(),
+            );
         }
     }
 }
@@ -2775,15 +2777,19 @@ impl InProcessDaemon {
                 .and_then(|environment| resource_environment_host_ref(environment))
                 .map(|host_ref| self.target_host_for_resource_ref(host_ref))
                 .unwrap_or_else(|| self.host_name.clone());
-            rows.push(FleetListRow {
-                convoy: convoy.clone(),
-                vessel: session.spec.env_ref.clone(),
-                authority: authority_by_convoy.get(&convoy).cloned().flatten(),
-                crew,
-                crew_state: session_status_label(session.status.as_ref().map(|status| status.phase)),
-                host,
-                staleness: FleetStaleness::Local,
-            });
+            rows.push(
+                FleetListRow::builder()
+                    .convoy(convoy.clone())
+                    .vessel(session.spec.env_ref.clone())
+                    .maybe_authority(authority_by_convoy.get(&convoy).cloned().flatten())
+                    .crew(crew)
+                    .crew_state(session_status_label(session.status.as_ref().map(|status| status.phase)))
+                    .host(host)
+                    .namespace(session.metadata.namespace.clone())
+                    .session(session.metadata.name.clone())
+                    .staleness(FleetStaleness::Local)
+                    .build(),
+            );
         }
         let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
         append_crewless_convoy_rows(&mut rows, namespace, &result_sets, &self.host_name, FleetStaleness::Local);
@@ -2805,7 +2811,7 @@ impl InProcessDaemon {
 
         enum AttachMatch {
             Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
-            Replica { row: FleetListRow },
+            Replica { row: Box<FleetListRow> },
         }
 
         impl AttachMatch {
@@ -2827,14 +2833,16 @@ impl InProcessDaemon {
                     Self::Replica { row } => {
                         let command = daemon.recursive_attach_command_for_remote(&row.host, reference).await?;
                         // Replica rows carry crew as "vessel/role" (or a bare
-                        // role); the remote session name is not known here.
+                        // role) and the owning host's namespace + session name,
+                        // so cross-host panes stamp the full join key.
                         let (vessel, role) = match row.crew.split_once('/') {
                             Some((vessel, role)) => (Some(vessel.to_owned()), Some(role.to_owned())),
                             None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty())),
                         };
                         let binding = AttachBinding::builder()
                             .host(row.host.clone())
-                            .namespace(namespace)
+                            .namespace(row.namespace.clone())
+                            .maybe_session(row.session.clone())
                             .maybe_convoy(Some(row.convoy.clone()).filter(|convoy| convoy != "-"))
                             .maybe_vessel(vessel)
                             .maybe_role(role)
@@ -2890,7 +2898,7 @@ impl InProcessDaemon {
                     }
                     let refs = fleet_row_attach_reference_keys(row);
                     let label = fleet_row_attach_reference_label(row);
-                    let target = AttachMatch::Replica { row: row.clone() };
+                    let target = AttachMatch::Replica { row: Box::new(row.clone()) };
                     if refs.iter().any(|candidate| candidate == reference) {
                         exact.push((label, target));
                     } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {

@@ -35,6 +35,8 @@ use flotilla_protocol::{
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct PmConnectOptions {
     pub zellij_bin: Option<String>,
     pub plugin_url: Option<String>,

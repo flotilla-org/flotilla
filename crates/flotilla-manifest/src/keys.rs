@@ -4,6 +4,13 @@
 //! Key map: design §5 on flotilla-org/flotilla#667. `flotilla.leg.*` is
 //! reserved and deliberately absent — legs are unmaterialised (#680).
 
+/// Pipe name patches are written to (v0: andamento's current spelling;
+/// Leg 1 renames it `manifest-apply-patch`).
+pub const APPLY_METADATA_PATCH_PIPE: &str = "andamento-apply-metadata-patch";
+/// Pipe name that returns the identities the PM has observed on its panes
+/// (v0 spelling; Leg 1: `manifest-observed-identities`).
+pub const OBSERVED_IDENTITIES_PIPE: &str = "andamento-observed-identities";
+
 /// Source id for catalog facts published by `flotilla pm connect`.
 pub const SOURCE_CONNECTOR: &str = "flotilla-connector";
 /// Source id for the pane stamp published by `flotilla attach`.

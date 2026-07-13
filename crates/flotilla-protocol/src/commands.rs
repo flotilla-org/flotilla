@@ -903,15 +903,16 @@ mod tests {
                 visible_environments: vec![],
             })),
             CommandValue::FleetList(Box::new(FleetListResponse {
-                rows: vec![FleetListRow {
-                    convoy: "convoy-a".into(),
-                    vessel: "vessel-a".into(),
-                    authority: Some("adopted".into()),
-                    crew: "implement/main".into(),
-                    crew_state: "running".into(),
-                    host: crate::HostName::new("desktop"),
-                    staleness: FleetStaleness::Local,
-                }],
+                rows: vec![FleetListRow::builder()
+                    .convoy("convoy-a")
+                    .vessel("vessel-a")
+                    .authority("adopted")
+                    .crew("implement/main")
+                    .crew_state("running")
+                    .host(crate::HostName::new("desktop"))
+                    .namespace("dev")
+                    .staleness(FleetStaleness::Local)
+                    .build()],
                 replicas: vec![FleetReplicaStatus {
                     host: crate::HostName::new("feta"),
                     reachable: false,
@@ -936,15 +937,15 @@ mod tests {
             CommandValue::FleetReplicaSnapshot(Box::new(FleetReplicaSnapshot {
                 host: crate::HostName::new("desktop"),
                 generation: Some("7".into()),
-                rows: vec![FleetListRow {
-                    convoy: "convoy-a".into(),
-                    vessel: "vessel-a".into(),
-                    authority: None,
-                    crew: "main".into(),
-                    crew_state: "exited".into(),
-                    host: crate::HostName::new("desktop"),
-                    staleness: FleetStaleness::Local,
-                }],
+                rows: vec![FleetListRow::builder()
+                    .convoy("convoy-a")
+                    .vessel("vessel-a")
+                    .crew("main")
+                    .crew_state("exited")
+                    .host(crate::HostName::new("desktop"))
+                    .namespace("dev")
+                    .staleness(FleetStaleness::Local)
+                    .build()],
                 result_sets: vec![],
             })),
             CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
