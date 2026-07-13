@@ -312,6 +312,7 @@ impl Aggregator {
         insert_optional_timestamp(&mut values, "started_at", status.and_then(|status| status.started_at));
         insert_optional_timestamp(&mut values, "finished_at", status.and_then(|status| status.finished_at));
         insert_optional_string(&mut values, "observed_workflow_ref", status.and_then(|status| status.observed_workflow_ref.clone()));
+        insert_optional_string(&mut values, "project_ref", convoy.spec.project_ref.clone());
         if let Some(repo) = convoy.metadata.labels.get(flotilla_resources::REPO_LABEL) {
             values.insert("repo".to_string(), PanelValue::String(repo.clone()));
         }
@@ -439,6 +440,7 @@ mod tests {
             values: BTreeMap::from([
                 ("name".to_string(), PanelValue::String(name.to_string())),
                 ("phase".to_string(), PanelValue::String("active".to_string())),
+                ("project_ref".to_string(), PanelValue::String("my-project".to_string())),
             ]),
             intents: vec![],
             children: vec![],
@@ -474,6 +476,20 @@ mod tests {
 
         let snapshot = state.snapshot().await;
         assert!(snapshot.tab.panels[0].rows.iter().any(|row| row.values.get("name").and_then(PanelValue::as_str) == Some("new")));
+    }
+
+    #[tokio::test]
+    async fn replica_cache_preserves_project_ref() {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+
+        aggregator.apply_replica_cache(vec![remote_snapshot("feta", "generation-1", "remote-convoy")]).await;
+        assert!(matches!(rx.recv().await.expect("initial event"), DaemonEvent::PanelSnapshot(_)));
+
+        let snapshot = state.snapshot().await;
+        let row = snapshot.tab.panels[0].rows.first().expect("replica convoy row");
+        assert_eq!(row.values.get("project_ref").and_then(PanelValue::as_str), Some("my-project"));
     }
 
     #[tokio::test]
