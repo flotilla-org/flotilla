@@ -391,11 +391,31 @@ impl Aggregator {
     }
 
     async fn rebuild_local_projection(&mut self) {
+        let mut effective_convoys = HashMap::new();
+        for source in LOCAL_SOURCE_PRECEDENCE {
+            let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
+            effective_convoys.extend(convoys.iter().map(|(reference, convoy)| (reference.clone(), convoy.clone())));
+        }
+        let presentation_keys = effective_convoys
+            .values()
+            .flat_map(|convoy| {
+                convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).into_iter().flat_map(|snapshot| {
+                    snapshot
+                        .vessels
+                        .iter()
+                        .map(|vessel| (convoy.metadata.namespace.clone(), convoy.metadata.name.clone(), vessel.name.clone()))
+                })
+            })
+            .collect::<HashSet<_>>();
+
         let mut presentation_workspaces = HashMap::new();
         for source in LOCAL_SOURCE_PRECEDENCE {
             let Some(presentations) = self.presentations_by_source.get(&source) else { continue };
             for presentation in presentations.values() {
                 let Some(key) = presentation_key(presentation) else { continue };
+                if !presentation_keys.contains(&key) {
+                    continue;
+                }
                 if let Some(workspace_ref) = presentation.status.as_ref().and_then(|status| status.observed_workspace_ref.clone()) {
                     presentation_workspaces.insert(key, workspace_ref);
                 } else {
@@ -407,11 +427,6 @@ impl Aggregator {
         }
         self.presentation_workspaces = presentation_workspaces;
 
-        let mut effective_convoys = HashMap::new();
-        for source in LOCAL_SOURCE_PRECEDENCE {
-            let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
-            effective_convoys.extend(convoys.iter().map(|(reference, convoy)| (reference.clone(), convoy.clone())));
-        }
         let replacement = effective_convoys
             .into_values()
             .map(|convoy| {
@@ -1362,6 +1377,23 @@ mod tests {
 
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn convoy_deletion_removes_its_presentation_workspace_from_the_join() {
+        let convoy = convoy_with_vessel("convoy-a").await;
+        let presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", Some("workspace-1")).await;
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx);
+        let key = ("flotilla".to_string(), "convoy-a".to_string(), "implement".to_string());
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        aggregator.apply_presentation_event_from(LocalSource::Durable, WatchEvent::Added(presentation)).await;
+        assert_eq!(aggregator.presentation_workspaces.get(&key).map(String::as_str), Some("workspace-1"));
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Deleted(convoy)).await;
+
+        assert!(!aggregator.presentation_workspaces.contains_key(&key));
     }
 
     #[tokio::test]
