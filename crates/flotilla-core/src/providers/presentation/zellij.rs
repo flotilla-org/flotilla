@@ -131,6 +131,22 @@ impl super::PresentationManager for ZellijPresentationManager {
         let session = self.session_name()?;
         let ws_ref = format!("{session}:{tab_id}");
 
+        // The tab-id two-step: stamp the created tab into the PM's metadata
+        // plane (scope, kind, factory id) so the manifest resolver can group
+        // it. Best-effort — a missing metadata plane never fails creation.
+        if let Some(stamp) = &config.stamp {
+            match tab_id.parse::<u64>() {
+                Ok(tab_id) => {
+                    let payload = flotilla_manifest::stamp::tab_stamp(tab_id, stamp).to_pipe_payload();
+                    let args = ["pipe", "--name", flotilla_manifest::keys::APPLY_METADATA_PATCH_PIPE, "--", &payload];
+                    if let Err(err) = run!(self.runner, "zellij", &args, Path::new(".")) {
+                        warn!(%err, %tab_id, "zellij: could not stamp workspace metadata");
+                    }
+                }
+                Err(_) => warn!(%tab_id, "zellij: new-tab output is not a tab id; skipping metadata stamp"),
+            }
+        }
+
         // Small delay to let zellij process the tab creation
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -222,7 +238,6 @@ impl super::PresentationManager for ZellijPresentationManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
     use crate::providers::{presentation::PresentationManager, replay};
@@ -304,26 +319,20 @@ mod tests {
         let mgr = ZellijPresentationManager::with_session_name(runner.clone(), "flotilla-test-zj-ws".to_string());
 
         // Create workspace "feat-123"
-        let config1 = WorkspaceAttachRequest {
-            name: "feat-123".to_string(),
-            working_directory: crate::path_context::ExecutionEnvironmentPath::new("/tmp"),
-            template_yaml: None,
-            template_vars: HashMap::new(),
-            attach_commands: vec![],
-        };
+        let config1 = WorkspaceAttachRequest::builder()
+            .name("feat-123".to_string())
+            .working_directory(crate::path_context::ExecutionEnvironmentPath::new("/tmp"))
+            .build();
         let (ws_ref1, ws1) = mgr.create_workspace(&config1).await.unwrap();
         assert_eq!(ws1.name, "feat-123");
         // ws_ref should now be session:tab_id format
         assert!(ws_ref1.starts_with("flotilla-test-zj-ws:"), "ws_ref should start with session name: {ws_ref1}");
 
         // Create workspace "fix-456"
-        let config2 = WorkspaceAttachRequest {
-            name: "fix-456".to_string(),
-            working_directory: crate::path_context::ExecutionEnvironmentPath::new("/tmp"),
-            template_yaml: None,
-            template_vars: HashMap::new(),
-            attach_commands: vec![],
-        };
+        let config2 = WorkspaceAttachRequest::builder()
+            .name("fix-456".to_string())
+            .working_directory(crate::path_context::ExecutionEnvironmentPath::new("/tmp"))
+            .build();
         let (ws_ref2, ws2) = mgr.create_workspace(&config2).await.unwrap();
         assert_eq!(ws2.name, "fix-456");
         assert!(ws_ref2.starts_with("flotilla-test-zj-ws:"), "ws_ref should start with session name: {ws_ref2}");

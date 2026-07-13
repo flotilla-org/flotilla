@@ -1,0 +1,23 @@
+{
+  "set": {
+    "status.state": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "idle"
+      }
+    }
+  },
+  "source_id": "flotilla-connector",
+  "target": {
+    "kind": "pane",
+    "value": {
+      "id": 3,
+      "kind": "plugin"
+    }
+  },
+  "type": "metadata-patch",
+  "unset": []
+}

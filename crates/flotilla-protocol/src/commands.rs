@@ -326,6 +326,29 @@ impl Command {
     }
 }
 
+/// The structured half of an attach resolution: everything the resolver
+/// knows about the binding at the moment it mints the attach command. The
+/// CLI stamps this onto its enclosing PM pane (pane → identity, #708) —
+/// `<host>/<namespace>/<session>` is the canonical join key the catalog
+/// publishes against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct AttachBinding {
+    /// Host whose daemon owns the session.
+    pub host: crate::HostName,
+    pub namespace: String,
+    /// Session name. Absent when resolution is delegated cross-host and the
+    /// local daemon only knows the target host, not the remote session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convoy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
 /// Result returned from command execution, or inter-step data passed between steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -370,6 +393,10 @@ pub enum CommandValue {
     Cancelled,
     AttachCommandResolved {
         command: String,
+        /// Structured binding for pane→identity stamping; `None` when the
+        /// resolving path cannot describe the target session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<AttachBinding>,
     },
     CheckoutPathResolved {
         path: PathBuf,
@@ -790,7 +817,7 @@ mod tests {
             }),
             CommandValue::Error { message: "something failed".into() },
             CommandValue::Cancelled,
-            CommandValue::AttachCommandResolved { command: "bash --login".into() },
+            CommandValue::AttachCommandResolved { command: "bash --login".into(), binding: None },
             CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
             CommandValue::RepoDetail(Box::new(RepoDetailResponse {
                 path: PathBuf::from("/repo"),
@@ -876,15 +903,16 @@ mod tests {
                 visible_environments: vec![],
             })),
             CommandValue::FleetList(Box::new(FleetListResponse {
-                rows: vec![FleetListRow {
-                    convoy: "convoy-a".into(),
-                    vessel: "vessel-a".into(),
-                    authority: Some("adopted".into()),
-                    crew: "implement/main".into(),
-                    crew_state: "running".into(),
-                    host: crate::HostName::new("desktop"),
-                    staleness: FleetStaleness::Local,
-                }],
+                rows: vec![FleetListRow::builder()
+                    .convoy("convoy-a")
+                    .vessel("vessel-a")
+                    .authority("adopted")
+                    .crew("implement/main")
+                    .crew_state("running")
+                    .host(crate::HostName::new("desktop"))
+                    .namespace("dev")
+                    .staleness(FleetStaleness::Local)
+                    .build()],
                 replicas: vec![FleetReplicaStatus {
                     host: crate::HostName::new("feta"),
                     reachable: false,
@@ -909,15 +937,15 @@ mod tests {
             CommandValue::FleetReplicaSnapshot(Box::new(FleetReplicaSnapshot {
                 host: crate::HostName::new("desktop"),
                 generation: Some("7".into()),
-                rows: vec![FleetListRow {
-                    convoy: "convoy-a".into(),
-                    vessel: "vessel-a".into(),
-                    authority: None,
-                    crew: "main".into(),
-                    crew_state: "exited".into(),
-                    host: crate::HostName::new("desktop"),
-                    staleness: FleetStaleness::Local,
-                }],
+                rows: vec![FleetListRow::builder()
+                    .convoy("convoy-a")
+                    .vessel("vessel-a")
+                    .crew("main")
+                    .crew_state("exited")
+                    .host(crate::HostName::new("desktop"))
+                    .namespace("dev")
+                    .staleness(FleetStaleness::Local)
+                    .build()],
                 result_sets: vec![],
             })),
             CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },

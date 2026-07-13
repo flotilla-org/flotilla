@@ -332,13 +332,11 @@ mod tests {
     #[tokio::test]
     async fn create_workspace_returns_error_when_ref_missing() {
         let manager = CmuxPresentationManager::new(Arc::new(MockRunner::new(vec![Ok("".to_string())])));
-        let config = WorkspaceAttachRequest {
-            name: "demo".into(),
-            working_directory: ExecutionEnvironmentPath::new("/tmp/repo"),
-            template_vars: std::collections::HashMap::new(),
-            template_yaml: None,
-            attach_commands: vec![],
-        };
+        let config = WorkspaceAttachRequest::builder()
+            .name("demo")
+            .working_directory(ExecutionEnvironmentPath::new("/tmp/repo"))
+            .template_vars(std::collections::HashMap::new())
+            .build();
 
         let err = manager.create_workspace(&config).await.expect_err("should fail when ref is missing");
         assert!(err.contains("returned no workspace ref"));

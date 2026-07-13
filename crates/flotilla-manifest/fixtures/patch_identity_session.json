@@ -1,0 +1,67 @@
+{
+  "set": {
+    "flotilla.crew.role": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "coder"
+      }
+    },
+    "status.state": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "active"
+      }
+    },
+    "tab.scope": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "group-path",
+        "value": [
+          {
+            "key": "git.repo",
+            "value": {
+              "type": "text",
+              "value": "flotilla-org/flotilla"
+            }
+          },
+          {
+            "key": "flotilla.convoy",
+            "label": "manifest extraction",
+            "value": {
+              "type": "text",
+              "value": "dev/manifest-extraction"
+            }
+          },
+          {
+            "key": "flotilla.vessel",
+            "value": {
+              "type": "text",
+              "value": "implement"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "source_id": "flotilla-connector",
+  "target": {
+    "kind": "identity",
+    "value": {
+      "key": "flotilla.session",
+      "value": {
+        "type": "text",
+        "value": "feta/dev/terminal-impl-coder"
+      }
+    }
+  },
+  "type": "metadata-patch",
+  "unset": []
+}

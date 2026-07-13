@@ -3,6 +3,7 @@ members = [
     "crates/flotilla-client",
     "crates/flotilla-commands",
     "crates/flotilla-core",
+    "crates/flotilla-manifest",
     "crates/flotilla-protocol",
     "crates/flotilla-resources",
     "crates/flotilla-controllers",
@@ -10,7 +11,7 @@ members = [
     "crates/flotilla-daemon",
     "crates/flotilla-tui",
 ]
-exclude = ["lints/long_inline_paths"]
+exclude = ["lints/long_inline_paths", "crates/flotilla-manifest/fixtures/generator"]
 resolver = "2"
 
 [workspace.package]
@@ -40,6 +41,7 @@ license.workspace = true
 flotilla-commands = { path = "crates/flotilla-commands" }
 flotilla-core = { path = "crates/flotilla-core" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
+flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-tui = { path = "crates/flotilla-tui" }
 ratatui = "0.30"

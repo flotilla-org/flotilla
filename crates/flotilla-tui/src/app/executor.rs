@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn attach_command_resolved_is_noop() {
         let mut app = stub_app();
-        handle_result(CommandValue::AttachCommandResolved { command: "bash --login".into() }, &mut app);
+        handle_result(CommandValue::AttachCommandResolved { command: "bash --login".into(), binding: None }, &mut app);
         assert!(app.model.status_message.is_none());
         assert!(app.proto_commands.take_next().is_none());
     }

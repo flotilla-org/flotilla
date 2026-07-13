@@ -81,8 +81,8 @@ pub(crate) mod test_helpers {
 }
 
 pub use commands::{
-    CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, PreparedTerminalCommand, PreparedWorkspace,
-    RepoSelector, ResolvedPaneCommand, StepStatus,
+    AttachBinding, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, PreparedTerminalCommand,
+    PreparedWorkspace, RepoSelector, ResolvedPaneCommand, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
@@ -115,7 +115,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.

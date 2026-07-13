@@ -498,15 +498,16 @@ mod command_result_human {
     #[test]
     fn fleet_list() {
         let result = CommandValue::FleetList(Box::new(FleetListResponse {
-            rows: vec![FleetListRow {
-                convoy: "convoy-a".into(),
-                vessel: "env-a".into(),
-                authority: Some("adopted".into()),
-                crew: "implement/coder".into(),
-                crew_state: "running".into(),
-                host: HostName::new("feta"),
-                staleness: FleetStaleness::Unreachable { last_sync: None, message: "connection refused".into() },
-            }],
+            rows: vec![FleetListRow::builder()
+                .convoy("convoy-a")
+                .vessel("env-a")
+                .authority("adopted")
+                .crew("implement/coder")
+                .crew_state("running")
+                .host(HostName::new("feta"))
+                .namespace("dev")
+                .staleness(FleetStaleness::Unreachable { last_sync: None, message: "connection refused".to_string() })
+                .build()],
             replicas: vec![FleetReplicaStatus {
                 host: HostName::new("feta"),
                 reachable: false,
@@ -530,15 +531,15 @@ mod command_result_human {
     #[test]
     fn fleet_list_shows_crewless_failed_convoy() {
         let result = CommandValue::FleetList(Box::new(FleetListResponse {
-            rows: vec![FleetListRow {
-                convoy: "convoy-failed".into(),
-                vessel: "-".into(),
-                authority: None,
-                crew: "-".into(),
-                crew_state: "failed: missing input 'topic'".into(),
-                host: HostName::new("kiwi"),
-                staleness: FleetStaleness::Local,
-            }],
+            rows: vec![FleetListRow::builder()
+                .convoy("convoy-failed")
+                .vessel("-")
+                .crew("-")
+                .crew_state("failed: missing input 'topic'")
+                .host(HostName::new("kiwi"))
+                .namespace("dev")
+                .staleness(FleetStaleness::Local)
+                .build()],
             replicas: vec![],
         }));
 

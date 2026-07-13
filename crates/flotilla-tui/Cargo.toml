@@ -9,6 +9,7 @@ bon = { workspace = true }
 flotilla-client = { path = "../flotilla-client" }
 flotilla-commands = { path = "../flotilla-commands" }
 flotilla-core = { path = "../flotilla-core" }
+flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
 tokio = { workspace = true }
 tracing = { workspace = true }
