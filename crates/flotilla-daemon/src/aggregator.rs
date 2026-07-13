@@ -284,7 +284,7 @@ impl Aggregator {
                     .vessels
                     .iter()
                     .map(|definition| {
-                        self.summarize_vessel(&resource, definition, phase, status.and_then(|status| status.work.get(&definition.name)))
+                        self.summarize_vessel(&resource, definition, status.and_then(|status| status.work.get(&definition.name)))
                     })
                     .collect()
             })
@@ -305,13 +305,7 @@ impl Aggregator {
             .build()
     }
 
-    fn summarize_vessel(
-        &self,
-        convoy_ref: &ResourceRef,
-        definition: &VesselRequirement,
-        convoy_phase: ResourceConvoyPhase,
-        state: Option<&WorkState>,
-    ) -> VesselRow {
+    fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
         let crew = definition
             .crew
             .iter()
@@ -335,7 +329,7 @@ impl Aggregator {
             .depends_on(definition.depends_on.clone())
             .host(self.local_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
-            .complete_work(!convoy_phase_is_terminal(convoy_phase) && state.is_some_and(|state| !work_phase_is_terminal(state.phase)))
+            .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .build()
     }
 }
@@ -387,10 +381,6 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
     }
 }
 
-fn work_phase_is_terminal(phase: ResourceWorkPhase) -> bool {
-    matches!(phase, ResourceWorkPhase::Complete | ResourceWorkPhase::Failed | ResourceWorkPhase::Cancelled)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -423,6 +413,7 @@ mod tests {
         rows.as_convoys().expect("convoy rows").iter().map(|row| row.name.as_str()).collect()
     }
 
+    #[bon::builder]
     fn convoy_with_work(convoy_phase: ResourceConvoyPhase, work_phase: Option<ResourceWorkPhase>) -> ResourceObject<Convoy> {
         let definition = VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build();
         let work = work_phase
@@ -479,13 +470,15 @@ mod tests {
         let DaemonEvent::ResultSet(result_set) = rx.recv().await.expect("initial result set") else {
             panic!("expected result set");
         };
-        result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row").vessels.first().expect("vessel row").clone()
+        let rows = result_set.rows.as_convoys().expect("convoy rows");
+        let convoy = rows.first().expect("convoy row");
+        convoy.vessels.first().expect("vessel row").clone()
     }
 
     #[tokio::test]
     async fn terminal_work_is_not_completable() {
         for phase in [ResourceWorkPhase::Complete, ResourceWorkPhase::Failed, ResourceWorkPhase::Cancelled] {
-            let vessel = emitted_vessel(convoy_with_work(ResourceConvoyPhase::Active, Some(phase))).await;
+            let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
 
             assert!(!vessel.complete_work, "{phase:?} work must not expose the completion override");
         }
@@ -493,20 +486,17 @@ mod tests {
 
     #[tokio::test]
     async fn work_missing_from_status_is_not_completable() {
-        let vessel = emitted_vessel(convoy_with_work(ResourceConvoyPhase::Active, None)).await;
+        let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).call()).await;
 
         assert!(!vessel.complete_work);
     }
 
     #[tokio::test]
-    async fn only_active_convoy_work_exposes_the_completion_override() {
-        let active = emitted_vessel(convoy_with_work(ResourceConvoyPhase::Active, Some(ResourceWorkPhase::Running))).await;
-        assert!(active.complete_work);
+    async fn non_terminal_work_is_completable() {
+        for phase in [ResourceWorkPhase::Pending, ResourceWorkPhase::Ready, ResourceWorkPhase::Launching, ResourceWorkPhase::Running] {
+            let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
 
-        for phase in [ResourceConvoyPhase::Completed, ResourceConvoyPhase::Failed, ResourceConvoyPhase::Cancelled] {
-            let vessel = emitted_vessel(convoy_with_work(phase, Some(ResourceWorkPhase::Running))).await;
-
-            assert!(!vessel.complete_work, "{phase:?} convoy must not expose the completion override");
+            assert!(vessel.complete_work, "{phase:?} work must expose the completion override");
         }
     }
 

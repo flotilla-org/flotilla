@@ -3153,6 +3153,9 @@ impl InProcessDaemon {
                     Some(status) if !status.work.contains_key(work) => {
                         flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") }
                     }
+                    Some(status) if status.work.get(work).is_some_and(|state| state.phase.is_terminal()) => {
+                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} work {work} is already terminal") }
+                    }
                     Some(_) => {
                         match apply_resource_status_patch(
                             &convoys,
