@@ -703,6 +703,11 @@ fn seed_query_seqs(local_seqs: &SeqMap, events: &[DaemonEvent]) {
 
 /// Recover from a result-set seq gap by re-subscribing with current cursors;
 /// the daemon replays a full `ResultSet` for each stale query.
+///
+/// Unlike repo recovery there is deliberately no in-flight coalescing buffer:
+/// concurrent resubscribes are idempotent (each replaces the subscription and
+/// returns full result sets, seeded monotonically), and stale deltas are
+/// dropped in `handle_event` rather than re-triggering recovery.
 async fn recover_query_gap(ctx: &EventContext) {
     let EventContext { local_seqs, subscribed_queries, event_tx, session, pending, next_id, .. } = ctx;
     let queries = encode_query_cursors(subscribed_queries, local_seqs);

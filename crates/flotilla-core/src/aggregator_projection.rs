@@ -95,7 +95,13 @@ impl AggregatorProjectionState {
     /// This host's local result sets across all named queries, in the order
     /// of [`QueryId::ALL`].
     pub async fn local_result_sets(&self) -> Vec<ResultSet> {
-        vec![self.local_result_set().await]
+        let mut result_sets = Vec::with_capacity(QueryId::ALL.len());
+        for query in QueryId::ALL {
+            result_sets.push(match query {
+                QueryId::Convoys => self.local_result_set().await,
+            });
+        }
+        result_sets
     }
 
     /// The current fleet-merged result set for one named query.
