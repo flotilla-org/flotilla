@@ -188,7 +188,7 @@ Key bindings are configurable via TOML. Defaults: `j/k` navigate, `Enter` execut
 
 Stored in `~/.config/flotilla/`:
 - `repos/*.toml` — one per tracked repo (`path = "..."`, plus per-provider config: `change_request`, `issue_tracker`, `cloud_agent`, `ai_utility`, `workspace_manager`, `terminal_pool`, `vcs.git`)
-- `tab-order.json` — array of repo paths
+- `open-views.toml` — ordered TUI-owned View addresses and label overrides
 - `keybindings.toml` — user key binding overrides
 
 Workspace templates: `.flotilla/workspace.yaml` in repo root.

@@ -5,7 +5,7 @@
 Stored in `~/.config/flotilla/`:
 
 - `repos/*.toml` — one file per tracked repo, containing `path = "..."`
-- `tab-order.json` — array of repo paths controlling tab order
+- `open-views.toml` — the ordered set of Views opened by the TUI
 
 Repos are added interactively from within flotilla using the `a` key.
 

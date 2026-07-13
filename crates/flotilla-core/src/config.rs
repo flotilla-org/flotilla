@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
 };
 
 use flotilla_protocol::NodeId;
@@ -403,10 +403,6 @@ impl ConfigStore {
         self.base.join("repos")
     }
 
-    fn tab_order_file(&self) -> DaemonHostPath {
-        self.base.join("tab-order.json")
-    }
-
     /// Load all persisted repo paths from config dir, sorted alphabetically by path.
     pub fn load_repos(&self) -> Vec<ExecutionEnvironmentPath> {
         let dir = self.repos_dir();
@@ -452,15 +448,6 @@ impl ConfigStore {
         let key = repo_file_key(path.as_path());
         let file = dir.join(format!("{key}.toml"));
         let _ = std::fs::remove_file(file.as_path());
-    }
-
-    /// Load the legacy tab order. Read-only: the file is no longer written —
-    /// it survives only to order repo registration and to seed
-    /// `open-views.toml` for configs created before the View model (ADR 0013).
-    pub fn load_tab_order(&self) -> Option<Vec<ExecutionEnvironmentPath>> {
-        let content = std::fs::read_to_string(self.tab_order_file().as_path()).ok()?;
-        let paths: Vec<String> = serde_json::from_str(&content).ok()?;
-        Some(paths.into_iter().map(|s| ExecutionEnvironmentPath::new(PathBuf::from(s))).collect())
     }
 
     fn open_views_file(&self) -> DaemonHostPath {
@@ -578,65 +565,6 @@ impl ConfigStore {
         }
         ResolvedCheckoutConfig { strategy: global.vcs.git.checkout_strategy.clone(), path: global.vcs.git.checkout_path.clone() }
     }
-}
-
-/// Collect repo roots: persisted (in legacy saved tab order, when present)
-/// first, then CLI args, then auto-detect from cwd. Persists any new repos.
-/// Tab order is a Surface concern (`open-views.toml`, ADR 0013) — nothing
-/// here writes it.
-pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<ExecutionEnvironmentPath> {
-    use crate::providers::{
-        vcs::{git::GitVcs, Vcs},
-        ProcessCommandRunner,
-    };
-
-    let mut repo_roots: Vec<ExecutionEnvironmentPath> = Vec::new();
-
-    // 1. Persisted repos in saved tab order
-    let persisted = config.load_repos();
-    let tab_order = config.load_tab_order();
-    if let Some(order) = tab_order {
-        for path in &order {
-            if persisted.contains(path) && !repo_roots.contains(path) {
-                repo_roots.push(path.clone());
-            }
-        }
-        // Any persisted repos not in the order file go at the end
-        for path in &persisted {
-            if !repo_roots.contains(path) {
-                repo_roots.push(path.clone());
-            }
-        }
-    } else {
-        repo_roots.extend(persisted);
-    }
-
-    // 2. CLI args (appended after persisted)
-    for root in cli_roots {
-        let canonical = ExecutionEnvironmentPath::new(std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()));
-        if !repo_roots.contains(&canonical) {
-            repo_roots.push(canonical);
-        }
-    }
-
-    // 3. Auto-detect from cwd — resolve to main repo root (not worktree)
-    let cwd = std::env::current_dir().ok();
-    if let Some(ref cwd) = cwd {
-        let git = GitVcs::new(Arc::new(ProcessCommandRunner));
-        let ee_cwd = ExecutionEnvironmentPath::new(cwd);
-        if let Some(repo_root) = git.resolve_repo_root(&ee_cwd).await {
-            if !repo_roots.contains(&repo_root) {
-                repo_roots.push(repo_root);
-            }
-        }
-    }
-
-    // Persist any new repos
-    for path in &repo_roots {
-        config.save_repo(path);
-    }
-
-    repo_roots
 }
 
 #[cfg(test)]

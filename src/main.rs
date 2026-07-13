@@ -2,7 +2,17 @@ use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
-use flotilla_core::{agents, config::ConfigStore, daemon::DaemonHandle, path_context::DaemonHostPath, path_policy::PathPolicy};
+use flotilla_core::{
+    agents,
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    path_policy::PathPolicy,
+    providers::{
+        vcs::{git::GitVcs, Vcs},
+        ProcessCommandRunner,
+    },
+};
 use flotilla_protocol::{
     commands::CommandValue, output::OutputFormat, AgentHookEvent, AttachableId, Command, CommandAction, EnvironmentId, HostName,
     RepoSelector,
@@ -283,6 +293,28 @@ fn exit_cli_parse_error(error: clap::Error) -> ! {
     std::process::exit(exit_code)
 }
 
+fn select_startup_repo_roots(cli_roots: &[PathBuf], cwd_repo_root: Option<PathBuf>) -> Vec<PathBuf> {
+    if cli_roots.is_empty() {
+        cwd_repo_root.into_iter().collect()
+    } else {
+        cli_roots.iter().map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone())).collect()
+    }
+}
+
+async fn startup_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let cwd_repo_root = if cli_roots.is_empty() {
+        let cwd = std::env::current_dir().ok().map(ExecutionEnvironmentPath::new);
+        let vcs = GitVcs::new(Arc::new(ProcessCommandRunner));
+        match cwd {
+            Some(cwd) => vcs.resolve_repo_root(&cwd).await.map(ExecutionEnvironmentPath::into_path_buf),
+            None => None,
+        }
+    } else {
+        None
+    };
+    select_startup_repo_roots(cli_roots, cwd_repo_root)
+}
+
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
 async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
@@ -299,7 +331,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     #[cfg(unix)]
     flotilla_tui::terminal::install_sigterm_handler();
 
-    let cli_repo_roots = cli.repo_root.clone();
+    let startup_repo_roots = startup_repo_roots(&cli.repo_root).await;
     let cli_theme = cli.theme.clone();
 
     // Spawn daemon init on a separate task so it runs concurrently with the splash
@@ -333,18 +365,17 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         }
     };
 
-    for root in &cli_repo_roots {
-        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+    for root in startup_repo_roots {
         if let Err(e) = daemon
             .execute(flotilla_protocol::Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: flotilla_protocol::CommandAction::TrackRepoPath { path: canonical.clone() },
+                action: flotilla_protocol::CommandAction::TrackRepoPath { path: root.clone() },
             })
             .await
         {
-            info!(repo = %canonical.display(), err = %e, "failed to add repo");
+            info!(repo = %root.display(), err = %e, "failed to add repo");
         }
     }
 
@@ -1033,12 +1064,32 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
     use flotilla_protocol::{
         qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState, ProvisioningTarget,
     };
 
-    use super::{provisioning_target_for_environment, run_replica_snapshot, select_host_target, Cli, SubCommand};
+    use super::{
+        provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots, Cli, SubCommand,
+    };
+
+    #[test]
+    fn explicit_repo_roots_take_precedence_over_cwd_detection() {
+        let explicit = vec![PathBuf::from("/repos/one"), PathBuf::from("/repos/two")];
+
+        let roots = select_startup_repo_roots(&explicit, Some(PathBuf::from("/repos/current")));
+
+        assert_eq!(roots, explicit);
+    }
+
+    #[test]
+    fn cwd_repo_is_used_when_no_explicit_root_is_given() {
+        let roots = select_startup_repo_roots(&[], Some(PathBuf::from("/repos/current")));
+
+        assert_eq!(roots, vec![PathBuf::from("/repos/current")]);
+    }
 
     #[test]
     fn cli_parses_topology_subcommand() {
