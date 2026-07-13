@@ -7,11 +7,12 @@ use crate::{resource::define_resource, status_patch::StatusPatch};
 
 define_resource!(Presentation, "presentations", PresentationSpec, PresentationStatus, PresentationStatusPatch);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct PresentationSpec {
     pub convoy_ref: String,
     pub presentation_policy_ref: String,
     pub name: String,
+    #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub process_selector: BTreeMap<String, String>,
 }

@@ -239,6 +239,6 @@ async fn observed_backend_expires_compacted_version_within_current_generation() 
 
     assert_eq!(err, flotilla_resources::ResourceError::WatchExpired {
         requested_version: created.metadata.resource_version,
-        compacted_through: second.metadata.resource_version,
+        compacted_through: Some(second.metadata.resource_version),
     });
 }

@@ -365,7 +365,7 @@ async fn reopening_with_smaller_retention_compacts_existing_events_and_persists_
         .expect_err("startup compaction should expire old version");
     assert_eq!(expired, flotilla_resources::ResourceError::WatchExpired {
         requested_version: first.metadata.resource_version,
-        compacted_through: second.metadata.resource_version,
+        compacted_through: Some(second.metadata.resource_version),
     });
 
     drop(resolver);
@@ -376,6 +376,6 @@ async fn reopening_with_smaller_retention_compacts_existing_events_and_persists_
     let resolver = backend.using::<Convoy>("flotilla");
     assert!(matches!(
         resolver.watch(WatchStart::FromVersion("1".to_string())).await,
-        Err(flotilla_resources::ResourceError::WatchExpired { compacted_through, .. }) if compacted_through == "2"
+        Err(flotilla_resources::ResourceError::WatchExpired { compacted_through, .. }) if compacted_through.as_deref() == Some("2")
     ));
 }

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use flotilla_core::aggregator_projection::AggregatorProjectionState;
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, Rows, VesselRow, WorkPhase},
@@ -9,18 +10,47 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
-    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL,
-    VESSEL_LABEL,
+    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
+    CONVOY_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
 type PresentationKey = (String, String, String);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LocalSource {
+    Durable,
+    Observed,
+}
+
+const LOCAL_SOURCE_PRECEDENCE: [LocalSource; 2] = [LocalSource::Durable, LocalSource::Observed];
+
+#[async_trait]
+trait AggregatorWatchSource<T: Resource>: Send + Sync {
+    async fn list(&self) -> Result<ResourceList<T>, ResourceError>;
+    async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError>;
+}
+
+#[async_trait]
+impl<T: Resource> AggregatorWatchSource<T> for TypedResolver<T> {
+    async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
+        self.list().await
+    }
+
+    async fn watch(&self, start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
+        self.watch(start).await
+    }
+}
+
 #[derive(bon::Builder)]
 pub struct Aggregator {
     state: AggregatorProjectionState,
     local_host: HostName,
+    #[builder(skip)]
+    convoys_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Convoy>>>,
+    #[builder(skip)]
+    presentations_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Presentation>>>,
     presentation_workspaces: HashMap<PresentationKey, String>,
     bootstrapping: bool,
     emitted_initial_snapshot: bool,
@@ -28,16 +58,38 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
+    const WATCH_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { state, local_host, presentation_workspaces: HashMap::new(), bootstrapping: false, emitted_initial_snapshot: false, event_tx }
+        Self {
+            state,
+            local_host,
+            convoys_by_source: HashMap::new(),
+            presentations_by_source: HashMap::new(),
+            presentation_workspaces: HashMap::new(),
+            bootstrapping: false,
+            emitted_initial_snapshot: false,
+            event_tx,
+        }
     }
 
     pub async fn run(
-        mut self,
+        self,
         durable_convoys: TypedResolver<Convoy>,
         durable_presentations: TypedResolver<Presentation>,
         observed_convoys: TypedResolver<Convoy>,
         observed_presentations: TypedResolver<Presentation>,
+        replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
+    ) -> Result<(), ResourceError> {
+        self.run_with_sources(&durable_convoys, &durable_presentations, &observed_convoys, &observed_presentations, replica_rx).await
+    }
+
+    async fn run_with_sources(
+        mut self,
+        durable_convoys: &dyn AggregatorWatchSource<Convoy>,
+        durable_presentations: &dyn AggregatorWatchSource<Presentation>,
+        observed_convoys: &dyn AggregatorWatchSource<Convoy>,
+        observed_presentations: &dyn AggregatorWatchSource<Presentation>,
         mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
         self.bootstrapping = true;
@@ -48,10 +100,10 @@ impl Aggregator {
                 view.seq = view.seq.saturating_add(1);
             }
         }
-        let mut durable_convoy_stream = self.list_and_watch_convoys(durable_convoys).await?;
-        let mut durable_presentation_stream = self.list_and_watch_presentations(durable_presentations).await?;
-        let mut observed_convoy_stream = self.list_and_watch_convoys(observed_convoys).await?;
-        let mut observed_presentation_stream = self.list_and_watch_presentations(observed_presentations).await?;
+        let mut durable_convoy_stream = self.recover_convoy_watch(LocalSource::Durable, durable_convoys).await?;
+        let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
+        let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
+        let mut observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
         self.bootstrapping = false;
         self.emitted_initial_snapshot = true;
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
@@ -59,22 +111,34 @@ impl Aggregator {
         loop {
             tokio::select! {
                 event = durable_convoy_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_convoy_event(event).await,
+                    Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Durable, event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_convoy_stream = self.recover_convoy_watch(LocalSource::Durable, durable_convoys).await?;
+                    }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
                 },
                 event = durable_presentation_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_presentation_event(event).await,
+                    Some(Ok(event)) => self.apply_presentation_event_from(LocalSource::Durable, event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
+                    }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable presentation watch ended")),
                 },
                 event = observed_convoy_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_convoy_event(event).await,
+                    Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Observed, event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
+                    }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator observed convoy watch ended")),
                 },
                 event = observed_presentation_stream.next() => match event {
-                    Some(Ok(event)) => self.apply_presentation_event(event).await,
+                    Some(Ok(event)) => self.apply_presentation_event_from(LocalSource::Observed, event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
+                    }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator observed presentation watch ended")),
                 },
@@ -91,117 +155,158 @@ impl Aggregator {
         }
     }
 
+    async fn recover_convoy_watch(
+        &mut self,
+        source: LocalSource,
+        resolver: &dyn AggregatorWatchSource<Convoy>,
+    ) -> Result<WatchStream<Convoy>, ResourceError> {
+        loop {
+            match self.list_and_watch_convoys(source, resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
+    async fn recover_presentation_watch(
+        &mut self,
+        source: LocalSource,
+        resolver: &dyn AggregatorWatchSource<Presentation>,
+    ) -> Result<WatchStream<Presentation>, ResourceError> {
+        loop {
+            match self.list_and_watch_presentations(source, resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
     async fn list_and_watch_convoys(
         &mut self,
-        resolver: TypedResolver<Convoy>,
-    ) -> Result<flotilla_resources::WatchStream<Convoy>, ResourceError> {
+        source: LocalSource,
+        resolver: &dyn AggregatorWatchSource<Convoy>,
+    ) -> Result<WatchStream<Convoy>, ResourceError> {
         let listed = resolver.list().await?;
         let start = watch_start(&listed);
-        for convoy in listed.items {
-            self.apply_convoy_event(WatchEvent::Added(convoy)).await;
-        }
-        resolver.watch(start).await
+        let watch = resolver.watch(start).await?;
+        self.replace_convoy_source(source, listed.items).await;
+        Ok(watch)
     }
 
     async fn list_and_watch_presentations(
         &mut self,
-        resolver: TypedResolver<Presentation>,
-    ) -> Result<flotilla_resources::WatchStream<Presentation>, ResourceError> {
+        source: LocalSource,
+        resolver: &dyn AggregatorWatchSource<Presentation>,
+    ) -> Result<WatchStream<Presentation>, ResourceError> {
         let listed = resolver.list().await?;
         let start = watch_start(&listed);
-        for presentation in listed.items {
-            self.apply_presentation_event(WatchEvent::Added(presentation)).await;
-        }
-        resolver.watch(start).await
+        let watch = resolver.watch(start).await?;
+        self.replace_presentation_source(source, listed.items).await;
+        Ok(watch)
     }
 
-    fn apply_presentation(&mut self, presentation: &ResourceObject<Presentation>) -> Option<(String, String)> {
-        let namespace = presentation.metadata.namespace.clone();
-        let convoy = presentation.metadata.labels.get(CONVOY_LABEL)?.clone();
-        let vessel = presentation.metadata.labels.get(VESSEL_LABEL)?.clone();
-        let key = (namespace.clone(), convoy.clone(), vessel);
-        match presentation.status.as_ref().and_then(|status| status.observed_workspace_ref.clone()) {
-            Some(workspace_ref) => {
-                self.presentation_workspaces.insert(key, workspace_ref);
-            }
-            None => {
-                self.presentation_workspaces.remove(&key);
-            }
-        }
-        Some((namespace, convoy))
+    async fn replace_convoy_source(&mut self, source: LocalSource, convoys: Vec<ResourceObject<Convoy>>) {
+        let replacement =
+            convoys.into_iter().map(|convoy| (self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name), convoy)).collect();
+        self.convoys_by_source.insert(source, replacement);
+        self.rebuild_local_projection().await;
     }
 
-    async fn apply_presentation_event(&mut self, event: WatchEvent<Presentation>) {
-        let affected = match &event {
-            WatchEvent::Added(presentation) | WatchEvent::Modified(presentation) => self.apply_presentation(presentation),
+    async fn replace_presentation_source(&mut self, source: LocalSource, presentations: Vec<ResourceObject<Presentation>>) {
+        let replacement = presentations
+            .into_iter()
+            .map(|presentation| (self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name), presentation))
+            .collect();
+        self.presentations_by_source.insert(source, replacement);
+        self.rebuild_local_projection().await;
+    }
+
+    async fn apply_presentation_event_from(&mut self, source: LocalSource, event: WatchEvent<Presentation>) {
+        match event {
+            WatchEvent::Added(presentation) | WatchEvent::Modified(presentation) => {
+                let reference = self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name);
+                self.presentations_by_source.entry(source).or_default().insert(reference, presentation);
+            }
             WatchEvent::Deleted(presentation) => {
-                let namespace = presentation.metadata.namespace.clone();
-                let convoy = presentation.metadata.labels.get(CONVOY_LABEL).cloned();
-                let vessel = presentation.metadata.labels.get(VESSEL_LABEL).cloned();
-                if let (Some(convoy), Some(vessel)) = (convoy, vessel) {
-                    self.presentation_workspaces.remove(&(namespace.clone(), convoy.clone(), vessel));
-                    Some((namespace, convoy))
-                } else {
-                    None
-                }
+                let reference = self.presentation_ref(&presentation.metadata.namespace, &presentation.metadata.name);
+                self.presentations_by_source.entry(source).or_default().remove(&reference);
             }
-        };
-        let Some((namespace, convoy)) = affected else { return };
-        self.refresh_local_convoy_attach(&namespace, &convoy).await;
-    }
-
-    /// Re-derive the Presentation join (vessel attach capability) for one
-    /// local convoy row after a Presentation change.
-    async fn refresh_local_convoy_attach(&mut self, namespace: &str, convoy: &str) {
-        let reference = self.convoy_ref(namespace, convoy);
-        let changed = {
-            let mut view = self.state.write().await;
-            let Some(row) = view.local_rows.get_mut(&reference) else { return };
-            for vessel in &mut row.vessels {
-                vessel.attach = self.vessel_attach(namespace, convoy, &vessel.name);
-            }
-            let changed = row.clone();
-            view.seq = view.seq.saturating_add(1);
-            changed
-        };
-        if !self.bootstrapping {
-            self.emit_delta(vec![changed], Vec::new()).await;
         }
+        self.rebuild_local_projection().await;
     }
 
     pub async fn apply_convoy_event(&mut self, event: WatchEvent<Convoy>) {
+        self.apply_convoy_event_from(LocalSource::Durable, event).await;
+    }
+
+    async fn apply_convoy_event_from(&mut self, source: LocalSource, event: WatchEvent<Convoy>) {
         match event {
             WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) => {
-                let row = self.summarize(&convoy);
-                let reference = row.resource.clone();
-                let result_set = {
-                    let mut view = self.state.write().await;
-                    view.local_rows.insert(reference, row.clone());
-                    view.seq = view.seq.saturating_add(1);
-                    view.result_set()
-                };
-                if self.bootstrapping {
-                    return;
-                }
-                if self.emitted_initial_snapshot {
-                    self.emit_delta(vec![row], Vec::new()).await;
-                } else {
-                    self.emitted_initial_snapshot = true;
-                    let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
-                }
+                let reference = self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
+                self.convoys_by_source.entry(source).or_default().insert(reference, convoy);
             }
             WatchEvent::Deleted(convoy) => {
                 let reference = self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
-                let removed = {
-                    let mut view = self.state.write().await;
-                    if view.local_rows.remove(&reference).is_none() {
-                        return;
-                    }
-                    view.seq = view.seq.saturating_add(1);
-                    reference
-                };
-                self.emit_delta(Vec::new(), vec![removed]).await;
+                self.convoys_by_source.entry(source).or_default().remove(&reference);
             }
+        }
+        self.rebuild_local_projection().await;
+    }
+
+    async fn rebuild_local_projection(&mut self) {
+        let mut presentation_workspaces = HashMap::new();
+        for source in LOCAL_SOURCE_PRECEDENCE {
+            let Some(presentations) = self.presentations_by_source.get(&source) else { continue };
+            for presentation in presentations.values() {
+                let Some(key) = presentation_key(presentation) else { continue };
+                if let Some(workspace_ref) = presentation.status.as_ref().and_then(|status| status.observed_workspace_ref.clone()) {
+                    presentation_workspaces.insert(key, workspace_ref);
+                } else {
+                    // A higher-precedence source with no active workspace still
+                    // masks an attach target from a lower-precedence source.
+                    presentation_workspaces.remove(&key);
+                }
+            }
+        }
+        self.presentation_workspaces = presentation_workspaces;
+
+        let mut effective_convoys = HashMap::new();
+        for source in LOCAL_SOURCE_PRECEDENCE {
+            let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
+            effective_convoys.extend(convoys.iter().map(|(reference, convoy)| (reference.clone(), convoy.clone())));
+        }
+        let replacement = effective_convoys
+            .into_values()
+            .map(|convoy| {
+                let row = self.summarize(&convoy);
+                (row.resource.clone(), row)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let (changed, removed, result_set) = {
+            let mut view = self.state.write().await;
+            let changed = replacement
+                .iter()
+                .filter(|(reference, row)| view.local_rows.get(*reference) != Some(*row))
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>();
+            let removed = view.local_rows.keys().filter(|reference| !replacement.contains_key(*reference)).cloned().collect::<Vec<_>>();
+            if changed.is_empty() && removed.is_empty() {
+                return;
+            }
+            view.local_rows = replacement;
+            view.seq = view.seq.saturating_add(1);
+            (changed, removed, view.result_set())
+        };
+
+        if self.bootstrapping {
+            return;
+        }
+        if self.emitted_initial_snapshot {
+            self.emit_delta(changed, removed).await;
+        } else {
+            self.emitted_initial_snapshot = true;
+            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
         }
     }
 
@@ -265,6 +370,11 @@ impl Aggregator {
 
     fn convoy_ref(&self, namespace: &str, name: &str) -> ResourceRef {
         ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
+    }
+
+    fn presentation_ref(&self, namespace: &str, name: &str) -> ResourceRef {
+        ResourceRef::new(api_version(Presentation::API_PATHS), Presentation::API_PATHS.kind, namespace, name)
+            .on_host(self.local_host.clone())
     }
 
     fn vessel_attach(&self, namespace: &str, convoy: &str, vessel: &str) -> Option<String> {
@@ -342,6 +452,14 @@ fn watch_start<T: Resource>(listed: &ResourceList<T>) -> WatchStart {
     }
 }
 
+fn presentation_key(presentation: &ResourceObject<Presentation>) -> Option<PresentationKey> {
+    Some((
+        presentation.metadata.namespace.clone(),
+        presentation.metadata.labels.get(CONVOY_LABEL)?.clone(),
+        presentation.metadata.labels.get(VESSEL_LABEL)?.clone(),
+    ))
+}
+
 fn set_row_host(row: &mut ConvoyRow, host: &HostName) {
     row.resource.host = Some(host.clone());
     for vessel in &mut row.vessels {
@@ -382,10 +500,142 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
     use flotilla_protocol::result_set::ResultSet;
-    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+    use flotilla_resources::{
+        ConvoySpec, InMemoryBackend, InputMeta, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend,
+        VesselRequirement, WorkflowSnapshot,
+    };
+    use futures::stream;
+    use tokio::{sync::Mutex, time::timeout};
 
     use super::*;
+
+    struct ScriptedSource<T: Resource> {
+        lists: Mutex<VecDeque<ResourceList<T>>>,
+        watches: Mutex<VecDeque<Result<WatchStream<T>, ResourceError>>>,
+        list_calls: AtomicUsize,
+        watch_calls: AtomicUsize,
+    }
+
+    impl<T: Resource> ScriptedSource<T> {
+        fn new(lists: Vec<ResourceList<T>>, watches: Vec<Result<WatchStream<T>, ResourceError>>) -> Self {
+            Self {
+                lists: Mutex::new(lists.into()),
+                watches: Mutex::new(watches.into()),
+                list_calls: AtomicUsize::new(0),
+                watch_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<T: Resource> AggregatorWatchSource<T> for ScriptedSource<T> {
+        async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.lists.lock().await.pop_front().ok_or_else(|| ResourceError::other("scripted list exhausted"))
+        }
+
+        async fn watch(&self, _start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
+            self.watch_calls.fetch_add(1, Ordering::SeqCst);
+            self.watches.lock().await.pop_front().ok_or_else(|| ResourceError::other("scripted watch exhausted"))?
+        }
+    }
+
+    fn pending_watch<T: Resource>() -> WatchStream<T> {
+        WatchStream::new(None, Box::pin(stream::pending()))
+    }
+
+    fn expiring_watch<T: Resource>() -> WatchStream<T> {
+        WatchStream::new(
+            None,
+            Box::pin(stream::once(async {
+                Err::<WatchEvent<T>, _>(ResourceError::WatchExpired {
+                    requested_version: "1".to_string(),
+                    compacted_through: Some("2".to_string()),
+                })
+            })),
+        )
+    }
+
+    fn failing_watch<T: Resource>(message: &'static str) -> WatchStream<T> {
+        WatchStream::new(None, Box::pin(stream::once(async move { Err::<WatchEvent<T>, _>(ResourceError::other(message)) })))
+    }
+
+    fn empty_list<T: Resource>() -> ResourceList<T> {
+        ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None }
+    }
+
+    async fn convoy_object(name: &str) -> ResourceObject<Convoy> {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        backend
+            .using::<Convoy>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            )
+            .await
+            .expect("create scripted convoy")
+    }
+
+    async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let resolver = backend.using::<Convoy>("flotilla");
+        let created = resolver
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            )
+            .await
+            .expect("create convoy with vessel");
+        let status = ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                vessels: vec![VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build()],
+            }),
+            work: BTreeMap::from([("implement".to_string(), WorkState::builder().phase(ResourceWorkPhase::Ready).build())]),
+            ..Default::default()
+        };
+        resolver.update_status(name, &created.metadata.resource_version, &status).await.expect("set convoy vessel status")
+    }
+
+    async fn presentation_object(name: &str, convoy: &str, vessel: &str, workspace: Option<&str>) -> ResourceObject<Presentation> {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let resolver = backend.using::<Presentation>("flotilla");
+        let created = resolver
+            .create(
+                &InputMeta::builder()
+                    .name(name.to_string())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.to_string(), convoy.to_string()),
+                        (VESSEL_LABEL.to_string(), vessel.to_string()),
+                    ]))
+                    .build(),
+                &PresentationSpec::builder()
+                    .convoy_ref(convoy.to_string())
+                    .presentation_policy_ref("default".to_string())
+                    .name(name.to_string())
+                    .build(),
+            )
+            .await
+            .expect("create scripted presentation");
+        resolver
+            .update_status(name, &created.metadata.resource_version, &PresentationStatus {
+                phase: PresentationPhase::Active,
+                observed_workspace_ref: workspace.map(str::to_string),
+                ..Default::default()
+            })
+            .await
+            .expect("set scripted presentation status")
+    }
 
     fn remote_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
         let host = HostName::new(host);
@@ -495,6 +745,229 @@ mod tests {
         };
         assert!(result_set.rows.is_empty());
         assert!(state.result_set().await.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_convoy_watch_relists_its_source_and_removes_missed_deletion() {
+        let stale = convoy_object("deleted-while-watch-expired").await;
+        let durable_convoys = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
+            vec![Ok(expiring_watch()), Ok(pending_watch())],
+        ));
+        let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+
+        let run_durable_convoys = Arc::clone(&durable_convoys);
+        let run_durable_presentations = Arc::clone(&durable_presentations);
+        let run_observed_convoys = Arc::clone(&observed_convoys);
+        let run_observed_presentations = Arc::clone(&observed_presentations);
+        let run_state = state.clone();
+        let task = tokio::spawn(async move {
+            Aggregator::new(run_state, HostName::new("local"), event_tx)
+                .run_with_sources(
+                    run_durable_convoys.as_ref(),
+                    run_durable_presentations.as_ref(),
+                    run_observed_convoys.as_ref(),
+                    run_observed_presentations.as_ref(),
+                    replica_rx,
+                )
+                .await
+        });
+
+        let initial =
+            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
+        assert_eq!(convoy_names(&initial.rows), vec!["deleted-while-watch-expired"]);
+
+        let removal = timeout(Duration::from_secs(1), event_rx.recv()).await.expect("relist delta timeout").expect("relist delta");
+        let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected relist delta") };
+        assert_eq!(removal.removed.len(), 1);
+        assert_eq!(removal.removed[0].name, "deleted-while-watch-expired");
+        assert!(state.result_set().await.rows.is_empty());
+        assert_eq!(durable_convoys.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(observed_convoys.watch_calls.load(Ordering::SeqCst), 1, "healthy watch must not restart");
+        assert!(!task.is_finished(), "aggregator should remain alive after in-place relist");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn expiry_between_list_and_watch_relists_before_publishing_source_snapshot() {
+        let stale = convoy_object("deleted-before-watch-started").await;
+        let durable_convoys = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
+            vec![
+                Err(ResourceError::WatchExpired { requested_version: "1".to_string(), compacted_through: Some("2".to_string()) }),
+                Ok(pending_watch()),
+            ],
+        ));
+        let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+
+        let run_durable_convoys = Arc::clone(&durable_convoys);
+        let run_state = state.clone();
+        let task = tokio::spawn(async move {
+            Aggregator::new(run_state, HostName::new("local"), event_tx)
+                .run_with_sources(
+                    run_durable_convoys.as_ref(),
+                    durable_presentations.as_ref(),
+                    observed_convoys.as_ref(),
+                    observed_presentations.as_ref(),
+                    replica_rx,
+                )
+                .await
+        });
+
+        let initial =
+            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
+        assert!(initial.rows.is_empty(), "failed watch attempt must not publish its stale list");
+        assert!(state.result_set().await.rows.is_empty());
+        assert_eq!(durable_convoys.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 2);
+        assert!(!task.is_finished(), "aggregator should remain alive after startup relist");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn expired_presentation_watch_relists_its_source_and_removes_stale_attach() {
+        let convoy = convoy_with_vessel("convoy-a").await;
+        let presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", Some("workspace-1")).await;
+        let durable_convoys = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![convoy], resource_version: "1".to_string(), generation: None }],
+            vec![Ok(pending_watch())],
+        ));
+        let durable_presentations = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![presentation], resource_version: "1".to_string(), generation: None }, empty_list()],
+            vec![Ok(expiring_watch()), Ok(pending_watch())],
+        ));
+        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+
+        let run_durable_convoys = Arc::clone(&durable_convoys);
+        let run_durable_presentations = Arc::clone(&durable_presentations);
+        let run_observed_convoys = Arc::clone(&observed_convoys);
+        let run_observed_presentations = Arc::clone(&observed_presentations);
+        let run_state = state.clone();
+        let task = tokio::spawn(async move {
+            Aggregator::new(run_state, HostName::new("local"), event_tx)
+                .run_with_sources(
+                    run_durable_convoys.as_ref(),
+                    run_durable_presentations.as_ref(),
+                    run_observed_convoys.as_ref(),
+                    run_observed_presentations.as_ref(),
+                    replica_rx,
+                )
+                .await
+        });
+
+        let initial =
+            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
+        let initial_row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+        assert_eq!(initial_row.vessels.first().expect("vessel row").attach.as_deref(), Some("workspace-1"));
+
+        let update = timeout(Duration::from_secs(1), event_rx.recv()).await.expect("relist delta timeout").expect("relist delta");
+        let DaemonEvent::ResultDelta(update) = update else { panic!("expected relist delta") };
+        let changed = update.changed.as_convoys().expect("changed convoy rows").first().expect("changed convoy row");
+        assert_eq!(changed.vessels.first().expect("changed vessel row").attach, None);
+        assert!(update.removed.is_empty());
+        assert_eq!(durable_presentations.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(durable_presentations.watch_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 1, "healthy watch must not restart");
+        assert!(!task.is_finished(), "aggregator should remain alive after presentation relist");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn observed_presentation_without_workspace_masks_durable_attach() {
+        let convoy = convoy_with_vessel("convoy-a").await;
+        let durable_presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", Some("stale-workspace")).await;
+        let observed_presentation = presentation_object("convoy-a-implement", "convoy-a", "implement", None).await;
+        let durable_convoys = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![convoy], resource_version: "1".to_string(), generation: None }],
+            vec![Ok(pending_watch())],
+        ));
+        let durable_presentations = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![durable_presentation], resource_version: "1".to_string(), generation: None }],
+            vec![Ok(pending_watch())],
+        ));
+        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_presentations = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![observed_presentation], resource_version: "1".to_string(), generation: None }],
+            vec![Ok(pending_watch())],
+        ));
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+
+        let run_state = state.clone();
+        let task = tokio::spawn(async move {
+            Aggregator::new(run_state, HostName::new("local"), event_tx)
+                .run_with_sources(
+                    durable_convoys.as_ref(),
+                    durable_presentations.as_ref(),
+                    observed_convoys.as_ref(),
+                    observed_presentations.as_ref(),
+                    replica_rx,
+                )
+                .await
+        });
+
+        let initial =
+            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
+        let row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+        assert_eq!(row.vessels.first().expect("vessel row").attach, None);
+        assert!(state.result_set().await.rows.as_convoys().expect("convoy rows")[0].vessels[0].attach.is_none());
+        assert!(!task.is_finished(), "aggregator should remain alive");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn non_expiry_watch_error_still_exits_aggregator() {
+        let durable_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(failing_watch("convoy watch failed"))]);
+        let durable_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            Aggregator::new(state, HostName::new("local"), event_tx).run_with_sources(
+                &durable_convoys,
+                &durable_presentations,
+                &observed_convoys,
+                &observed_presentations,
+                replica_rx,
+            ),
+        )
+        .await
+        .expect("aggregator should return the watch error")
+        .expect_err("non-expiry watch error should reach supervision");
+
+        assert_eq!(result, ResourceError::other("convoy watch failed"));
     }
 
     #[test]

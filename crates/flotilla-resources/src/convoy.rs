@@ -11,9 +11,10 @@ pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ReconcileOutcome};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
+    #[builder(default)]
     #[serde(default)]
     pub inputs: BTreeMap<String, InputValue>,
     #[serde(default)]
@@ -84,11 +85,12 @@ pub enum ConvoyPhase {
     Cancelled,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkState {
     pub phase: WorkPhase,
     /// A human explicitly completed this vessel's work at the roll-up level.
     /// Crew-owned state remains unchanged while this override is active.
+    #[builder(default)]
     #[serde(default, skip_serializing_if = "WorkCompletionAuthority::is_crew_rollup")]
     pub completion_authority: WorkCompletionAuthority,
     #[serde(default, skip_serializing_if = "Option::is_none")]

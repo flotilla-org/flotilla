@@ -169,6 +169,11 @@ impl HttpBackend {
             self.http.get(url).query(&query).send().await.map_err(|err| ResourceError::other(format!("WATCH resources: {err}")))?;
         let status = response.status();
         if !status.is_success() {
+            if status == StatusCode::GONE {
+                if let WatchStart::FromVersion(requested_version) = start {
+                    return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
+                }
+            }
             let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read watch error body: {err}")))?;
             return Err(map_status_error(status, &bytes, None));
         }
