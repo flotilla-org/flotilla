@@ -698,13 +698,13 @@ fn project_attachable_data_populates_sets_and_ids() {
     let store_dir = tempfile::tempdir().expect("tempdir");
     let attachable_store =
         crate::attachable::shared_file_backed_attachable_store(&crate::path_context::DaemonHostPath::new(store_dir.path()));
-    let set_id = {
+    let (set_id, attachable_id) = {
         let mut store = attachable_store.lock().expect("lock store");
         let set_id = store.ensure_terminal_set(
             Some(flotilla_protocol::HostName::local()),
             Some(flotilla_protocol::HostPath::new(flotilla_protocol::HostName::local(), PathBuf::from("/tmp/wt-feat")).into()),
         );
-        let _attachable_id = store.ensure_terminal_attachable(
+        let attachable_id = store.ensure_terminal_attachable(
             &set_id,
             "terminal_pool",
             "shpool",
@@ -721,7 +721,7 @@ fn project_attachable_data_populates_sets_and_ids() {
             object_id: set_id.to_string(),
             external_ref: "ws-1".into(),
         });
-        set_id
+        (set_id, attachable_id)
     };
 
     let mut pd = ProviderData::default();
@@ -746,7 +746,54 @@ fn project_attachable_data_populates_sets_and_ids() {
 
     assert_eq!(pd.attachable_sets.len(), 1);
     assert!(pd.attachable_sets.contains_key(&set_id));
+    assert!(pd.managed_terminals.contains_key(&attachable_id));
     assert_eq!(pd.workspaces.get("ws-1").and_then(|ws| ws.attachable_set_id.as_ref()), Some(&set_id));
+
+    attachable_store.lock().expect("lock store").remove_set(&set_id);
+    project_attachable_data(&mut pd, &registry, &attachable_store);
+    assert!(pd.managed_terminals.is_empty(), "removed terminals must not survive the next projection");
+}
+
+#[test]
+fn project_agent_data_removes_agents_missing_from_the_store() {
+    let attachable_store = test_attachable_store();
+    let agent_store = test_agent_state_store();
+    let host = flotilla_protocol::HostName::local();
+    let checkout = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
+    let (set_id, attachable_id) = {
+        let mut store = attachable_store.lock().expect("lock attachable store");
+        let set_id = store.ensure_terminal_set(Some(host), Some(checkout.clone().into()));
+        let attachable_id = store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "test",
+            "agent",
+            crate::attachable::TerminalPurpose { checkout: "feat".into(), role: "agent".into(), index: 0 },
+            "claude",
+            ExecutionEnvironmentPath::new("/repo/wt-feat"),
+            flotilla_protocol::TerminalStatus::Running,
+        );
+        (set_id, attachable_id)
+    };
+    agent_store.lock().expect("lock agent store").upsert(attachable_id.clone(), crate::agents::AgentEntry {
+        harness: flotilla_protocol::AgentHarness::ClaudeCode,
+        status: flotilla_protocol::AgentStatus::Active,
+        model: None,
+        session_title: None,
+        session_id: None,
+        last_event_epoch_secs: 0,
+    });
+    let mut pd = ProviderData::default();
+    pd.checkouts.insert(checkout.into(), TestCheckout::new("feat").build());
+
+    project_attachable_data(&mut pd, &ProviderRegistry::new(), &attachable_store);
+    project_agent_data(&mut pd, &agent_store);
+    assert!(pd.attachable_sets.contains_key(&set_id));
+    assert!(pd.agents.contains_key(attachable_id.as_str()));
+
+    agent_store.lock().expect("lock agent store").remove(&attachable_id);
+    project_agent_data(&mut pd, &agent_store);
+    assert!(pd.agents.is_empty(), "removed agents must not survive the next projection");
 }
 
 #[tokio::test]

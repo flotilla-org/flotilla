@@ -531,6 +531,7 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         tracing::warn!("attachable store lock poisoned while projecting provider data");
         return;
     };
+    pd.managed_terminals.clear();
 
     if let Some(provider_name) = workspace_provider.as_deref() {
         for (ws_ref, workspace) in &mut pd.workspaces {
@@ -612,6 +613,7 @@ fn project_agent_data(pd: &mut ProviderData, agent_state_store: &crate::agents::
         tracing::warn!("agent state store lock poisoned while projecting agent data");
         return;
     };
+    pd.agents.clear();
     for (attachable_id, entry) in store.list_agents() {
         // Only include agents whose terminal's attachable set belongs to this repo.
         // Find the set that contains this attachable_id.

@@ -18,8 +18,13 @@ use crate::{
 
 pub(crate) struct SharedScan<T> {
     ttl: Duration,
-    result: Mutex<Option<CachedScan<T>>>,
+    state: Mutex<ScanState<T>>,
     scan_lock: AsyncMutex<()>,
+}
+
+struct ScanState<T> {
+    generation: u64,
+    result: Option<CachedScan<T>>,
 }
 
 struct CachedScan<T> {
@@ -29,7 +34,7 @@ struct CachedScan<T> {
 
 impl<T: Clone> SharedScan<T> {
     pub(crate) fn new(ttl: Duration) -> Self {
-        Self { ttl, result: Mutex::new(None), scan_lock: AsyncMutex::new(()) }
+        Self { ttl, state: Mutex::new(ScanState { generation: 0, result: None }), scan_lock: AsyncMutex::new(()) }
     }
 
     pub(crate) async fn get_or_scan<F, Fut>(&self, scan: F) -> Result<T, String>
@@ -46,25 +51,31 @@ impl<T: Clone> SharedScan<T> {
             return Ok(result);
         }
 
+        let generation = self.state.lock().expect("shared scan state lock poisoned").generation;
         let result = scan().await?;
-        *self.result.lock().expect("shared scan result lock poisoned") =
-            Some(CachedScan { scanned_at: Instant::now(), result: result.clone() });
+        let mut state = self.state.lock().expect("shared scan state lock poisoned");
+        if state.generation == generation {
+            state.result = Some(CachedScan { scanned_at: Instant::now(), result: result.clone() });
+        }
         Ok(result)
     }
 
     pub(crate) fn invalidate(&self) {
-        *self.result.lock().expect("shared scan result lock poisoned") = None;
+        let mut state = self.state.lock().expect("shared scan state lock poisoned");
+        state.generation = state.generation.wrapping_add(1);
+        state.result = None;
     }
 
     #[cfg(test)]
     pub(crate) fn seed(&self, value: T) {
-        *self.result.lock().expect("shared scan result lock poisoned") = Some(CachedScan { scanned_at: Instant::now(), result: value });
+        self.state.lock().expect("shared scan state lock poisoned").result = Some(CachedScan { scanned_at: Instant::now(), result: value });
     }
 
     fn fresh_result(&self) -> Option<T> {
-        self.result
+        self.state
             .lock()
-            .expect("shared scan result lock poisoned")
+            .expect("shared scan state lock poisoned")
+            .result
             .as_ref()
             .filter(|cached| cached.scanned_at.elapsed() < self.ttl)
             .map(|cached| cached.result.clone())
@@ -210,6 +221,32 @@ mod tests {
         assert_eq!(first, Err("transient failure".to_string()));
         assert_eq!(second, Ok(42));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidation_during_a_scan_prevents_the_stale_result_from_being_cached() {
+        let scan = Arc::new(SharedScan::new(Duration::from_secs(10)));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let in_flight = {
+            let scan = Arc::clone(&scan);
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                scan.get_or_scan(|| async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(1)
+                })
+                .await
+            })
+        };
+
+        started.notified().await;
+        scan.invalidate();
+        release.notify_one();
+        assert_eq!(in_flight.await.expect("scan task"), Ok(1));
+        assert_eq!(scan.get_or_scan(|| async { Ok(2) }).await, Ok(2));
     }
 
     struct CountingPresentationManager {
