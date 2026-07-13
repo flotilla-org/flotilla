@@ -26,6 +26,9 @@ pub struct CrewNoun {
     pub vessel_ref: Option<String>,
     #[arg(long)]
     pub role: Option<String>,
+    /// Completion or failure message
+    #[arg(long)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -47,8 +50,14 @@ impl CrewNoun {
             .maybe_role(self.role)
             .build();
         let action = match (self.subject.as_str(), self.verb) {
-            ("list", None) => CommandAction::QueryCrewList { context },
+            ("list", None) if self.message.is_none() => CommandAction::QueryCrewList { context },
+            ("list", None) => return Err("`flotilla crew list` does not accept --message".to_string()),
             ("list", Some(_)) => return Err("`flotilla crew list` does not accept a verb".to_string()),
+            ("complete", None) => CommandAction::CrewComplete { context, message: self.message },
+            ("fail", None) => CommandAction::CrewFail {
+                context,
+                message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
+            },
             (_, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: self.subject, message },
             (_, None) => return Err("crew target requires a verb (for example: handoff)".to_string()),
         };
@@ -77,6 +86,9 @@ impl std::fmt::Display for CrewNoun {
             if let Some(value) = value {
                 write!(f, " {flag} {}", quote_value(value))?;
             }
+        }
+        if let Some(message) = &self.message {
+            write!(f, " --message {}", quote_value(message))?;
         }
         if let Some(CrewVerb::Handoff { message }) = &self.verb {
             write!(f, " handoff --message {}", quote_value(message))?;
@@ -116,6 +128,24 @@ mod tests {
             context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
             target: "reviewer".into(),
             message: "Review commit abc123".into(),
+        });
+    }
+
+    #[test]
+    fn complete_uses_ambient_crew_identity() {
+        let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review"]).expect("parse complete");
+        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewComplete {
+            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            message: Some("ready for review".into()),
+        });
+    }
+
+    #[test]
+    fn fail_uses_ambient_crew_identity() {
+        let noun = CrewNoun::try_parse_from(["crew", "fail", "--message", "cannot reproduce"]).expect("parse fail");
+        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewFail {
+            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+            message: "cannot reproduce".into(),
         });
     }
 

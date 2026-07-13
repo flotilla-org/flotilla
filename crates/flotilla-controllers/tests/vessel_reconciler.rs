@@ -353,6 +353,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     assert!(brief.content.contains("- `coder`: active"));
     assert!(brief.content.contains("- `reviewer`: latent"));
     assert!(brief.content.contains("flotilla crew reviewer handoff --message"));
+    assert!(brief.content.contains("flotilla crew complete"));
     assert!(brief.content.ends_with("Implement issue 668.\n"));
     assert_eq!(context.namespace, NAMESPACE);
     assert_eq!(context.vessel_ref, "workspace-crew");

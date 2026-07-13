@@ -99,7 +99,10 @@ spec:
                     properties:
                       phase:
                         type: string
-                        enum: [Pending, Ready, Launching, Running, Completed, Failed, Cancelled]
+                        enum: [Pending, Ready, Launching, Running, Complete, Failed, Cancelled]
+                      completion_authority:
+                        type: string
+                        enum: [CrewRollup, HumanOverride]
                       ready_at:
                         type: string
                         format: date-time
@@ -114,3 +117,22 @@ spec:
                       placement:
                         type: object
                         x-kubernetes-preserve-unknown-fields: true
+                crew_work:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      required: [phase]
+                      properties:
+                        phase:
+                          type: string
+                          enum: [Pending, Working, Done, HandedBack, Failed]
+                        started_at:
+                          type: string
+                          format: date-time
+                        finished_at:
+                          type: string
+                          format: date-time
+                        message:
+                          type: string

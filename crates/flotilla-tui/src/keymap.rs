@@ -210,7 +210,7 @@ impl Action {
             Action::OpenCommandPalette => "Open command palette",
             Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::FillSelected => "Fill selected item",
-            Action::CompleteConvoyWork => "Complete work",
+            Action::CompleteConvoyWork => "Force complete work",
             Action::AttachConvoyVessel => "Attach to vessel workspace",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",

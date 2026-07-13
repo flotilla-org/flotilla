@@ -1,11 +1,14 @@
-use std::{collections::BTreeMap, marker::PhantomData};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+};
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use super::{
-    controller_patches, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, VesselRequirement, WorkPhase, WorkState,
-    WorkflowSnapshot,
+    controller_patches, provisioning_patches, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, VesselRequirement,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
     canonicalize_repo_url,
@@ -170,7 +173,7 @@ fn reconcile_internal(
 ) -> InternalReconcileOutcome {
     let status = convoy.status.clone().unwrap_or_default();
 
-    if matches!(status.phase, ConvoyPhase::Completed | ConvoyPhase::Failed | ConvoyPhase::Cancelled) {
+    if matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled) {
         return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
             patch: None,
             actuations: Vec::new(),
@@ -196,6 +199,10 @@ fn reconcile_internal(
         return bootstrap_outcome(convoy, template, now);
     }
 
+    if let Some(outcome) = backfill_crew_work_outcome(&status) {
+        return with_cleanup(convoy, &status, vessels, presentations, outcome);
+    }
+
     if let Some(outcome) = fail_fast_outcome(&status, now) {
         return with_cleanup(convoy, &status, vessels, presentations, outcome);
     }
@@ -203,6 +210,14 @@ fn reconcile_internal(
     let provisioning = vessel_outcome(convoy, &status, vessels, now);
     if provisioning.patch.is_some() {
         return with_cleanup(convoy, &status, vessels, presentations, provisioning);
+    }
+
+    if let Some(outcome) = roll_up_crew_work_outcome(&status, now) {
+        return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
+            patch: outcome.patch,
+            actuations: provisioning.actuations,
+            events: outcome.events,
+        });
     }
 
     if let Some(outcome) = advance_ready_outcome(&status, now) {
@@ -282,12 +297,27 @@ fn bootstrap_outcome(
         .map(|vessel| {
             (vessel.name.clone(), WorkState {
                 phase: WorkPhase::Pending,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
                 ready_at: None,
                 started_at: None,
                 finished_at: None,
                 message: None,
                 placement: None,
             })
+        })
+        .collect();
+    let crew_work = template
+        .spec
+        .vessels
+        .iter()
+        .map(|vessel| {
+            let members = vessel
+                .crew
+                .iter()
+                .filter(|member| matches!(member.source, CrewSource::Agent { .. }))
+                .map(|member| (member.role.clone(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()))
+                .collect();
+            (vessel.name.clone(), members)
         })
         .collect();
 
@@ -297,12 +327,50 @@ fn bootstrap_outcome(
             convoy.spec.workflow_ref.clone(),
             [(convoy.spec.workflow_ref.clone(), template.metadata.resource_version.clone())].into_iter().collect(),
             work,
+            crew_work,
             ConvoyPhase::Pending,
             None,
         )),
         actuations: Vec::new(),
         events: Vec::new(),
     }
+}
+
+fn backfill_crew_work_outcome(status: &super::ConvoyStatus) -> Option<InternalReconcileOutcome> {
+    let snapshot = status.workflow_snapshot.as_ref()?;
+    let mut missing = BTreeMap::new();
+    let mut completion_overrides = BTreeSet::new();
+
+    for vessel in &snapshot.vessels {
+        let existing = status.crew_work.get(&vessel.name);
+        let work = status.work.get(&vessel.name);
+        let missing_crew = vessel
+            .crew
+            .iter()
+            .filter(|member| matches!(member.source, CrewSource::Agent { .. }))
+            .filter(|member| existing.is_none_or(|crew| !crew.contains_key(&member.role)))
+            .map(|member| {
+                let mut state = CrewWorkState::builder().phase(CrewWorkPhase::Pending).build();
+                if work.is_some_and(|work| work.phase == WorkPhase::Running) {
+                    state.phase = CrewWorkPhase::Working;
+                    state.started_at = work.and_then(|work| work.started_at);
+                }
+                (member.role.clone(), state)
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !missing_crew.is_empty() {
+            if work.is_some_and(|work| work.phase == WorkPhase::Complete) {
+                completion_overrides.insert(vessel.name.clone());
+            }
+            missing.insert(vessel.name.clone(), missing_crew);
+        }
+    }
+
+    (!missing.is_empty()).then(|| InternalReconcileOutcome {
+        patch: Some(controller_patches::backfill_crew_work(missing, completion_overrides)),
+        actuations: Vec::new(),
+        events: Vec::new(),
+    })
 }
 
 fn instantiate_process(convoy: &ResourceObject<Convoy>, process: &CrewSpec) -> CrewSpec {
@@ -420,11 +488,54 @@ fn advance_ready_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Op
     Some(ReconcileOutcome { patch: Some(controller_patches::advance_work_to_ready(ready)), events })
 }
 
+fn roll_up_crew_work_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option<ReconcileOutcome> {
+    for (work, work_state) in &status.work {
+        let Some(crew) = status.crew_work.get(work).filter(|crew| !crew.is_empty()) else {
+            continue;
+        };
+        if work_state.completion_authority == WorkCompletionAuthority::HumanOverride {
+            continue;
+        }
+        if let Some((role, failed)) = crew.iter().find(|(_, state)| state.phase == CrewWorkPhase::Failed) {
+            if work_state.phase != WorkPhase::Failed {
+                let message = failed.message.clone().unwrap_or_else(|| format!("crew member `{role}` failed"));
+                return Some(ReconcileOutcome {
+                    patch: Some(controller_patches::roll_up_work(work.clone(), WorkPhase::Failed, now, Some(message))),
+                    events: vec![ConvoyEvent::WorkPhaseChanged { work: work.clone(), from: work_state.phase, to: WorkPhase::Failed }],
+                });
+            }
+            continue;
+        }
+
+        let all_done = crew.values().all(|state| state.phase == CrewWorkPhase::Done);
+        let next_phase = match (work_state.phase, all_done) {
+            (WorkPhase::Running, true) => Some(WorkPhase::Complete),
+            (WorkPhase::Complete, false) => Some(WorkPhase::Running),
+            _ => None,
+        };
+        if let Some(next_phase) = next_phase {
+            return Some(ReconcileOutcome {
+                patch: Some(controller_patches::roll_up_work(work.clone(), next_phase, now, None)),
+                events: vec![ConvoyEvent::WorkPhaseChanged { work: work.clone(), from: work_state.phase, to: next_phase }],
+            });
+        }
+    }
+    None
+}
+
 fn roll_up_phase_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option<ReconcileOutcome> {
-    if !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete) {
+    let all_complete = !status.work.is_empty() && status.work.values().all(|state| state.phase == WorkPhase::Complete);
+    if all_complete && status.phase != ConvoyPhase::Completed {
         return Some(ReconcileOutcome {
             patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Completed, None, Some(now))),
             events: vec![ConvoyEvent::PhaseChanged { from: status.phase, to: ConvoyPhase::Completed }],
+        });
+    }
+
+    if !all_complete && status.phase == ConvoyPhase::Completed {
+        return Some(ReconcileOutcome {
+            patch: Some(controller_patches::roll_up_phase(ConvoyPhase::Active, None, None)),
+            events: vec![ConvoyEvent::PhaseChanged { from: ConvoyPhase::Completed, to: ConvoyPhase::Active }],
         });
     }
 
@@ -486,7 +597,7 @@ fn vessel_outcome(
                     }
                     if vessel.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Ready) {
                         return InternalReconcileOutcome {
-                            patch: Some(provisioning_patches::work_running(requirement.name.clone())),
+                            patch: Some(provisioning_patches::work_running(requirement.name.clone(), now)),
                             actuations,
                             events: vec![ConvoyEvent::WorkPhaseChanged {
                                 work: requirement.name.clone(),
@@ -548,6 +659,7 @@ fn cleanup_actuations(
                     actuations.push(create_presentation_actuation(convoy, work));
                 }
             }
+            WorkPhase::Complete if predicted_status.crew_work.get(work).is_some_and(|crew| !crew.is_empty()) => {}
             WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {
                 if presentations.contains_key(&resource_name) {
                     actuations.push(Actuation::DeletePresentation { name: resource_name.clone() });

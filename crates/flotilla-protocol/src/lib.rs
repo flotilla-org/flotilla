@@ -271,6 +271,15 @@ pub enum DaemonEvent {
     /// Incremental delta — sent when only a subset of data changed.
     #[serde(rename = "repo_delta")]
     RepoDelta(Box<RepoDelta>),
+    /// A local provider refresh cycle completed for a repo. This is distinct
+    /// from snapshot/delta publication, which can also be caused by replay or
+    /// peer-overlay changes.
+    #[serde(rename = "repo_refresh_completed")]
+    RepoRefreshCompleted {
+        repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<std::path::PathBuf>,
+    },
     #[serde(rename = "repo_tracked")]
     RepoTracked(Box<RepoInfo>),
     #[serde(rename = "repo_untracked")]

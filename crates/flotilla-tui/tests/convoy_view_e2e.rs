@@ -17,7 +17,7 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::HostName;
 use flotilla_resources::{
     apply_status_patch, controller_patches, Convoy, ConvoyPhase, ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend,
-    VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
+    VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use flotilla_tui::{app::App, theme::Theme};
 
@@ -171,6 +171,7 @@ async fn x_then_enter_completes_work_via_palette() {
     let mut tasks = BTreeMap::new();
     tasks.insert("implement".to_string(), WorkState {
         phase: WorkPhase::Pending,
+        completion_authority: WorkCompletionAuthority::CrewRollup,
         ready_at: None,
         started_at: None,
         finished_at: None,
@@ -181,7 +182,15 @@ async fn x_then_enter_completes_work_via_palette() {
     apply_status_patch(
         &convoys,
         "fix-bug-123",
-        &controller_patches::bootstrap(snapshot, "review-and-fix".into(), BTreeMap::new(), tasks, ConvoyPhase::Active, None),
+        &controller_patches::bootstrap(
+            snapshot,
+            "review-and-fix".into(),
+            BTreeMap::new(),
+            tasks,
+            BTreeMap::new(),
+            ConvoyPhase::Active,
+            None,
+        ),
     )
     .await
     .expect("bootstrap convoy");
@@ -221,7 +230,7 @@ async fn x_then_enter_completes_work_via_palette() {
 
     app.handle_key(key('l')); // drill into vessel focus
     app.handle_key(key('x')); // open palette pre-filled
-    app.handle_key(enter()); // confirm — dispatch ConvoyWorkComplete
+    app.handle_key(enter()); // confirm — dispatch ConvoyWorkForceComplete
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;

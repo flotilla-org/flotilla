@@ -8,8 +8,8 @@ use flotilla_resources::{
     Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
     DockerPerTaskPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase,
-    WorkState, WorkflowSnapshot,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use tokio::{
     task::JoinHandle,
@@ -57,7 +57,7 @@ pub fn work_state(
     message: Option<String>,
     placement: Option<flotilla_resources::PlacementStatus>,
 ) -> WorkState {
-    WorkState { phase, ready_at, started_at, finished_at, message, placement }
+    WorkState { phase, completion_authority: WorkCompletionAuthority::CrewRollup, ready_at, started_at, finished_at, message, placement }
 }
 
 pub async fn create_convoy_with_single_task(

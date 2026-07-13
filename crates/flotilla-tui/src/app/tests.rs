@@ -14,12 +14,12 @@ use flotilla_core::{
 use flotilla_protocol::{
     provider_data::Issue,
     qualified_path::{HostId, QualifiedPath},
-    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId, NodeInfo, ProvisioningTarget, RepoSelector,
-    WorkItemIdentity,
+    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId, NodeInfo, ProvisioningTarget, RepoIdentity,
+    RepoSelector, WorkItemIdentity,
 };
 use tempfile::tempdir;
 use test_support::*;
-use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::{watch, Mutex as TokioMutex, Semaphore};
 
 use super::*;
 
@@ -64,33 +64,33 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
 #[derive(Clone)]
 struct QueryStep {
     expected_page: u32,
-    gate: Option<Arc<Notify>>,
+    gate: Option<Arc<Semaphore>>,
     result: IssueResultPage,
 }
 
 struct ScriptedIssueQueryService {
     steps: TokioMutex<VecDeque<QueryStep>>,
-    requests: TokioMutex<Vec<u32>>,
+    requests: watch::Sender<Vec<u32>>,
 }
 
 impl ScriptedIssueQueryService {
     fn new(steps: Vec<QueryStep>) -> Self {
-        Self { steps: TokioMutex::new(steps.into()), requests: TokioMutex::new(Vec::new()) }
+        Self { steps: TokioMutex::new(steps.into()), requests: watch::channel(Vec::new()).0 }
     }
 
-    async fn requests(&self) -> Vec<u32> {
-        self.requests.lock().await.clone()
+    fn requests(&self) -> Vec<u32> {
+        self.requests.borrow().clone()
     }
 }
 
 #[async_trait]
 impl IssueQueryService for ScriptedIssueQueryService {
     async fn query(&self, _repo: &Path, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
-        self.requests.lock().await.push(page);
+        self.requests.send_modify(|requests| requests.push(page));
         let step = self.steps.lock().await.pop_front().expect("unexpected issue query");
         assert_eq!(step.expected_page, page, "unexpected page requested");
         if let Some(gate) = step.gate {
-            gate.notified().await;
+            gate.acquire().await.expect("query gate should remain open").forget();
         }
         Ok(step.result)
     }
@@ -139,6 +139,50 @@ async fn app_with_issue_query_service(service: Arc<dyn IssueQueryService>) -> (t
     let repos = daemon_handle.list_repos().await.expect("list repos");
     let app = App::new(daemon_handle, repos, Arc::new(ConfigStore::with_base(temp.path().join("tui-config"))), Theme::classic());
     (temp, repo, daemon, app)
+}
+
+async fn drain_until_requests(app: &mut App, service: &ScriptedIssueQueryService, expected: &[u32]) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            app.drain_background_updates();
+            let requests = service.requests();
+            assert!(expected.starts_with(&requests), "unexpected issue query sequence: {requests:?}");
+            if requests == expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for issue queries");
+}
+
+async fn drain_until_first_issue(app: &mut App, repo: &RepoIdentity, expected_id: &str) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            app.drain_background_updates();
+            if app.repo_data[repo].read().issue_rows.first().is_some_and(|row| row.id == expected_id) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for issue rows");
+}
+
+async fn drain_until_issue_count(app: &mut App, repo: &RepoIdentity, expected_count: usize) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            app.drain_background_updates();
+            if app.issue_views.get(repo).and_then(|view| view.default.as_ref()).is_some_and(|state| state.items.len() == expected_count) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for issue count");
 }
 
 // -- CommandQueue --
@@ -291,7 +335,7 @@ fn apply_snapshot_updates_provider_data() {
 
 #[tokio::test]
 async fn repeated_snapshots_do_not_queue_duplicate_initial_issue_pages() {
-    let page_one_gate = Arc::new(Notify::new());
+    let page_one_gate = Arc::new(Semaphore::new(0));
     let service = Arc::new(ScriptedIssueQueryService::new(vec![
         QueryStep { expected_page: 1, gate: Some(Arc::clone(&page_one_gate)), result: issue_page(1..=50, true) },
         QueryStep { expected_page: 1, gate: Some(Arc::clone(&page_one_gate)), result: issue_page(1..=50, true) },
@@ -300,16 +344,105 @@ async fn repeated_snapshots_do_not_queue_duplicate_initial_issue_pages() {
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot.clone())));
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    drain_until_requests(&mut app, &service, &[1]).await;
 
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(service.requests(), vec![1], "initial issue fetch should stay in-flight instead of queueing a duplicate page 1");
 
-    assert_eq!(service.requests().await, vec![1], "initial issue fetch should stay in-flight instead of queueing a duplicate page 1");
+    page_one_gate.add_permits(1);
+    let repo_identity = app.model.active_repo_identity().clone();
+    drain_until_first_issue(&mut app, &repo_identity, "1").await;
+}
 
-    page_one_gate.notify_waiters();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    app.drain_background_updates();
+#[tokio::test]
+async fn manual_refresh_replaces_default_issue_page_when_fresh_results_arrive() {
+    let refreshed_page_gate = Arc::new(Semaphore::new(0));
+    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+        QueryStep { expected_page: 1, gate: None, result: issue_page(1..=1, false) },
+        QueryStep { expected_page: 1, gate: Some(Arc::clone(&refreshed_page_gate)), result: issue_page(2..=2, false) },
+    ]));
+    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
+
+    let repo_identity = app.model.active_repo_identity().clone();
+    drain_until_first_issue(&mut app, &repo_identity, "1").await;
+
+    let mut daemon_events = daemon.subscribe();
+    app.handle_key(key(KeyCode::Char('r')));
+    let (command, pending_ctx) = app.proto_commands.take_next().expect("refresh command");
+    executor::dispatch(command, &mut app, pending_ctx).await;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = daemon_events.recv().await.expect("daemon event");
+            let refresh_completed = matches!(event, DaemonEvent::RepoRefreshCompleted { .. });
+            app.handle_daemon_event(event);
+            if refresh_completed {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("refreshed repo data");
+    drain_until_requests(&mut app, &service, &[1, 1]).await;
+
+    assert_eq!(service.requests(), vec![1, 1], "manual refresh should refetch the first issue page");
+    assert_eq!(app.repo_data[&repo_identity].read().issue_rows[0].id, "1", "old issue rows should remain visible while refreshing");
+
+    refreshed_page_gate.add_permits(1);
+    drain_until_first_issue(&mut app, &repo_identity, "2").await;
+}
+
+#[tokio::test]
+async fn periodic_refresh_completion_replaces_default_issue_page() {
+    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+        QueryStep { expected_page: 1, gate: None, result: issue_page(1..=1, false) },
+        QueryStep { expected_page: 1, gate: None, result: issue_page(2..=2, false) },
+    ]));
+    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
+
+    let repo_identity = app.model.active_repo_identity().clone();
+    drain_until_first_issue(&mut app, &repo_identity, "1").await;
+    app.handle_daemon_event(DaemonEvent::RepoRefreshCompleted { repo_identity: repo_identity.clone(), repo: Some(repo) });
+    drain_until_first_issue(&mut app, &repo_identity, "2").await;
+
+    assert_eq!(service.requests(), vec![1, 1]);
+}
+
+#[tokio::test]
+async fn refresh_during_issue_pagination_runs_after_the_page_completes() {
+    let page_two_gate = Arc::new(Semaphore::new(0));
+    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+        QueryStep { expected_page: 1, gate: None, result: issue_page(1..=50, true) },
+        QueryStep { expected_page: 2, gate: Some(Arc::clone(&page_two_gate)), result: issue_page(51..=60, false) },
+        QueryStep { expected_page: 1, gate: None, result: issue_page(101..=101, false) },
+    ]));
+    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
+
+    let repo_identity = app.model.active_repo_identity().clone();
+    drain_until_issue_count(&mut app, &repo_identity, 50).await;
+    let page = app.screen.repo_pages.get_mut(&repo_identity).expect("repo page");
+    page.reconcile_if_changed();
+    page.table.select_flat_index(44);
+    app.handle_key(key(KeyCode::Char('j')));
+    drain_until_requests(&mut app, &service, &[1, 2]).await;
+
+    app.handle_daemon_event(DaemonEvent::RepoRefreshCompleted { repo_identity: repo_identity.clone(), repo: Some(repo) });
+    assert_eq!(service.requests(), vec![1, 2], "refresh should wait for the in-flight page");
+
+    page_two_gate.add_permits(1);
+    drain_until_requests(&mut app, &service, &[1, 2, 1]).await;
+    drain_until_first_issue(&mut app, &repo_identity, "101").await;
+
+    assert_eq!(service.requests(), vec![1, 2, 1], "deferred refresh should run after pagination");
 }
 
 #[tokio::test]
@@ -322,22 +455,21 @@ async fn infinite_scroll_appends_the_next_issue_page_without_duplicates() {
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo)).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    app.drain_background_updates();
 
     let repo_identity = app.model.active_repo_identity().clone();
+    drain_until_issue_count(&mut app, &repo_identity, 50).await;
     let page = app.screen.repo_pages.get_mut(&repo_identity).expect("repo page");
     page.reconcile_if_changed();
     page.table.select_flat_index(44);
 
     app.handle_key(key(KeyCode::Char('j')));
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    app.drain_background_updates();
+    drain_until_requests(&mut app, &service, &[1, 2]).await;
+    drain_until_issue_count(&mut app, &repo_identity, 60).await;
 
     let default = app.issue_views.get(&repo_identity).and_then(|view| view.default.as_ref()).expect("default issue view");
     let ids: Vec<&str> = default.items.iter().map(|(id, _)| id.as_str()).collect();
     let unique_ids: std::collections::HashSet<&str> = ids.iter().copied().collect();
-    assert_eq!(service.requests().await, vec![1, 2], "scrolling near the bottom should request exactly one next page");
+    assert_eq!(service.requests(), vec![1, 2], "scrolling near the bottom should request exactly one next page");
     assert_eq!(ids.len(), 60, "the first two pages should be appended together");
     assert_eq!(unique_ids.len(), 60, "issue paging should not duplicate items");
     assert_eq!(ids.first().copied(), Some("1"));
@@ -362,7 +494,7 @@ fn first_page_search_failure_clears_active_search_state() {
         next_page: 1,
         total: None,
         has_more: true,
-        fetch_pending: true,
+        pending_fetch: Some(issue_view::PendingIssueFetch::Page(1)),
     });
 
     app.issue_update_tx
@@ -2138,7 +2270,7 @@ fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
         .as_any()
         .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
         .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy fix-bug-123 work review complete ");
+    assert_eq!(palette.input_value(), "convoy fix-bug-123 work review complete --force ");
 }
 
 #[test]
@@ -2158,7 +2290,7 @@ fn x_prefill_quotes_vessel_names_with_whitespace() {
         .as_any()
         .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
         .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy fix-bug-123 work \"fix my bug\" complete ");
+    assert_eq!(palette.input_value(), "convoy fix-bug-123 work \"fix my bug\" complete --force ");
 }
 
 #[test]
@@ -2172,12 +2304,12 @@ fn x_then_enter_dispatches_convoy_task_complete() {
 
     let cmd = app.proto_commands.take_next().expect("expected a command after Enter on palette");
     match &cmd.0.action {
-        flotilla_protocol::CommandAction::ConvoyWorkComplete { convoy, work, message } => {
+        flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } => {
             assert_eq!(convoy, "fix-bug-123");
             assert_eq!(work, "implement");
             assert_eq!(*message, None);
         }
-        other => panic!("expected ConvoyWorkComplete, got {other:?}"),
+        other => panic!("expected ConvoyWorkForceComplete, got {other:?}"),
     }
 }
 
