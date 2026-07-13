@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use flotilla_resources::{
-    controller_patches, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec, Selector, StatusPatch, VesselRequirement,
-    WorkPhase, WorkState, WorkflowSnapshot,
+    controller_patches, external_patches, provisioning_patches, ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewSource, CrewSpec,
+    CrewWorkPhase, CrewWorkState, Selector, StatusPatch, VesselRequirement, WorkPhase, WorkState, WorkflowSnapshot,
 };
 
 fn ts(seconds: i64) -> chrono::DateTime<Utc> {
@@ -52,6 +52,147 @@ fn pending_task() -> WorkState {
     WorkState { phase: WorkPhase::Pending, ready_at: None, started_at: None, finished_at: None, message: None, placement: None }
 }
 
+fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
+    CrewWorkState { phase, started_at: Some(ts(10)), finished_at: None, message: None }
+}
+
+#[test]
+fn crew_completion_updates_only_the_calling_agent() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Running,
+            ready_at: Some(ts(8)),
+            started_at: Some(ts(9)),
+            finished_at: None,
+            message: None,
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([
+                ("coder".to_string(), crew_work(CrewWorkPhase::Working)),
+                ("reviewer".to_string(), crew_work(CrewWorkPhase::Working)),
+            ]),
+        )]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(20), Some("ready for review".to_string()))
+        .apply(&mut status);
+    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(30), Some("still ready".to_string()))
+        .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
+    assert_eq!(status.crew_work["implement"]["coder"].finished_at, Some(ts(20)));
+    assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("still ready"));
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.work["implement"].phase, WorkPhase::Running);
+}
+
+#[test]
+fn crew_failure_records_terminal_state_and_message() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::new(),
+        crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "blocked by missing credentials".to_string())
+        .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Failed);
+    assert_eq!(status.crew_work["implement"]["coder"].finished_at, Some(ts(20)));
+    assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("blocked by missing credentials"));
+}
+
+#[test]
+fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
+    let mut coder = crew_work(CrewWorkPhase::Done);
+    coder.finished_at = Some(ts(15));
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Completed,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Complete,
+            ready_at: Some(ts(8)),
+            started_at: Some(ts(9)),
+            finished_at: Some(ts(16)),
+            message: Some("complete".to_string()),
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([("coder".to_string(), coder), ("reviewer".to_string(), crew_work(CrewWorkPhase::Working))]),
+        )]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: Some(ts(16)),
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    external_patches::handoff_crew_work(
+        "implement".to_string(),
+        "reviewer".to_string(),
+        "coder".to_string(),
+        ts(20),
+        "address review findings".to_string(),
+    )
+    .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["coder"].finished_at, None);
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::HandedBack);
+    assert_eq!(status.crew_work["implement"]["reviewer"].finished_at, Some(ts(20)));
+    assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
+}
+
+#[test]
+fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
+    let mut pending_coder = crew_work(CrewWorkPhase::Pending);
+    pending_coder.started_at = None;
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Launching,
+            ready_at: Some(ts(8)),
+            started_at: Some(ts(9)),
+            finished_at: None,
+            message: None,
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([("coder".to_string(), pending_coder), ("reviewer".to_string(), crew_work(CrewWorkPhase::Done))]),
+        )]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    provisioning_patches::work_running("implement".to_string(), ts(12)).apply(&mut status);
+
+    assert_eq!(status.work["implement"].phase, WorkPhase::Running);
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["coder"].started_at, Some(ts(12)));
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Done);
+}
+
 #[test]
 fn bootstrap_sets_snapshot_and_initial_task_map() {
     let mut status = ConvoyStatus::default();
@@ -64,6 +205,7 @@ fn bootstrap_sets_snapshot_and_initial_task_map() {
         "review-and-fix".to_string(),
         [("review-and-fix".to_string(), "42".to_string())].into_iter().collect(),
         tasks.clone(),
+        BTreeMap::new(),
         ConvoyPhase::Pending,
         None,
     );
@@ -96,6 +238,7 @@ fn advance_work_to_ready_updates_only_selected_tasks() {
                 placement: None,
             }),
         ]),
+        crew_work: BTreeMap::new(),
         message: Some("keep".to_string()),
         started_at: None,
         finished_at: None,
@@ -135,6 +278,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
                 placement: None,
             }),
         ]),
+        crew_work: BTreeMap::new(),
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -167,6 +311,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("review".to_string(), review.clone())]),
+        crew_work: BTreeMap::new(),
         message: Some("keep".to_string()),
         started_at: None,
         finished_at: None,
@@ -196,6 +341,7 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
             message: None,
             placement: None,
         })]),
+        crew_work: BTreeMap::new(),
         message: None,
         started_at: Some(ts(1)),
         finished_at: None,
@@ -203,7 +349,8 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
         observed_workflows: Some(BTreeMap::from([("review-and-fix".to_string(), "42".to_string())])),
     };
 
-    let patch = ConvoyStatusPatch::MarkWorkCompleted { work: "review".to_string(), finished_at: ts(50), message: Some("done".to_string()) };
+    let patch =
+        ConvoyStatusPatch::ForceWorkCompleted { work: "review".to_string(), finished_at: ts(50), message: Some("done".to_string()) };
     patch.apply(&mut status);
 
     assert_eq!(status.phase, ConvoyPhase::Active);
@@ -213,11 +360,47 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
 }
 
 #[test]
+fn forced_work_completion_marks_all_agent_crew_done() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Running,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            message: None,
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            BTreeMap::from([
+                ("coder".to_string(), crew_work(CrewWorkPhase::Working)),
+                ("reviewer".to_string(), crew_work(CrewWorkPhase::HandedBack)),
+            ]),
+        )]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    external_patches::force_work_completed("implement".to_string(), ts(50), Some("human override".to_string())).apply(&mut status);
+
+    assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Done);
+    assert_eq!(status.crew_work["implement"]["reviewer"].finished_at, Some(ts(50)));
+}
+
+#[test]
 fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Pending,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), pending_task())]),
+        crew_work: BTreeMap::new(),
         message: None,
         started_at: None,
         finished_at: None,
@@ -243,9 +426,9 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
     .apply(&mut status);
     assert_eq!(status.work["implement"].started_at, Some(ts(20)));
 
-    ConvoyStatusPatch::MarkWorkCompleted { work: "implement".to_string(), finished_at: ts(30), message: Some("done".to_string()) }
+    ConvoyStatusPatch::ForceWorkCompleted { work: "implement".to_string(), finished_at: ts(30), message: Some("done".to_string()) }
         .apply(&mut status);
-    ConvoyStatusPatch::MarkWorkCompleted { work: "implement".to_string(), finished_at: ts(31), message: Some("still done".to_string()) }
+    ConvoyStatusPatch::ForceWorkCompleted { work: "implement".to_string(), finished_at: ts(31), message: Some("still done".to_string()) }
         .apply(&mut status);
     assert_eq!(status.work["implement"].finished_at, Some(ts(30)));
     assert_eq!(status.work["implement"].message.as_deref(), Some("still done"));

@@ -14,8 +14,8 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
-    Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
+    CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta,
     LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Selector, TerminalBrief, TerminalCrewContext,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
@@ -317,6 +317,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
     ];
     convoys
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
                 vessels: vec![VesselRequirement { name: "prepare".into(), depends_on: Vec::new(), crew: Vec::new() }, VesselRequirement {
                     name: "implement".into(),
@@ -324,6 +325,31 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                     crew: processes,
                 }],
             }),
+            work: BTreeMap::from([("implement".to_string(), WorkState {
+                phase: WorkPhase::Running,
+                ready_at: None,
+                started_at: None,
+                finished_at: None,
+                message: None,
+                placement: None,
+            })]),
+            crew_work: BTreeMap::from([(
+                "implement".to_string(),
+                BTreeMap::from([
+                    ("coder".to_string(), CrewWorkState {
+                        phase: CrewWorkPhase::Working,
+                        started_at: None,
+                        finished_at: None,
+                        message: None,
+                    }),
+                    ("reviewer".to_string(), CrewWorkState {
+                        phase: CrewWorkPhase::Pending,
+                        started_at: None,
+                        finished_at: None,
+                        message: None,
+                    }),
+                ]),
+            )]),
             ..Default::default()
         })
         .await
@@ -404,6 +430,64 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
 }
 
 #[tokio::test]
+async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, _) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: Some("ready for review".into()),
+            },
+        })
+        .await
+        .expect("crew complete command");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("demo").await.expect("convoy");
+    let coder = &convoy.status.expect("convoy status").crew_work["implement"]["coder"];
+    assert_eq!(coder.phase, CrewWorkPhase::Done);
+    assert_eq!(coder.message.as_deref(), Some("ready for review"));
+}
+
+#[tokio::test]
+async fn crew_fail_uses_ambient_identity_to_fail_callers_work() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, _) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewFail {
+                context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+                message: "blocked by credentials".into(),
+            },
+        })
+        .await
+        .expect("crew fail command");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("demo").await.expect("convoy");
+    let coder = &convoy.status.expect("convoy status").crew_work["implement"]["coder"];
+    assert_eq!(coder.phase, CrewWorkPhase::Failed);
+    assert_eq!(coder.message.as_deref(), Some("blocked by credentials"));
+}
+
+#[tokio::test]
 async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
@@ -429,6 +513,18 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
         ("coder", "active"),
         ("reviewer", "latent")
     ]);
+
+    let mut events = daemon.subscribe();
+    let complete_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::CrewComplete { context: context.clone(), message: Some("implementation ready".into()) },
+        })
+        .await
+        .expect("complete coder work");
+    assert_eq!(wait_for_command_result(&mut events, complete_id).await, CommandValue::Ok);
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -506,6 +602,10 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
         "Address the review findings".to_string(),
         true
     )]);
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("demo").await.expect("convoy");
+    let crew_work = &convoy.status.expect("convoy status").crew_work["implement"];
+    assert_eq!(crew_work["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(crew_work["reviewer"].phase, CrewWorkPhase::HandedBack);
 
     let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
     let coder = terminals.get("terminal-demo-implement-coder").await.expect("coder");
@@ -2064,6 +2164,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             })]
             .into_iter()
             .collect(),
+            crew_work: BTreeMap::new(),
             message: None,
             started_at: None,
             finished_at: None,
@@ -2079,7 +2180,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyWorkComplete {
+            action: CommandAction::ConvoyWorkForceComplete {
                 convoy: "convoy-a".to_string(),
                 work: "implement".to_string(),
                 message: Some("done".to_string()),
@@ -2289,6 +2390,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             })]
             .into_iter()
             .collect(),
+            crew_work: BTreeMap::new(),
             message: None,
             started_at: None,
             finished_at: None,
@@ -2304,7 +2406,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyWorkComplete {
+            action: CommandAction::ConvoyWorkForceComplete {
                 convoy: "convoy-a".to_string(),
                 work: "implement".to_string(),
                 message: Some("done".to_string()),

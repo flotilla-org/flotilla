@@ -6,9 +6,9 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
-    ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, CrewSource, CrewSpec, InputDefinition,
-    InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector, StatusPatch, VesselRequirement, WorkPhase, WorkState,
-    WorkflowTemplate, WorkflowTemplateSpec,
+    ApiPaths, Convoy as RealConvoy, ConvoySpec as RealConvoySpec, ConvoyStatus as RealConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
+    CrewWorkState, InputDefinition, InputMeta, ObjectMeta, OwnerReference, Resource, ResourceObject, Selector, StatusPatch,
+    VesselRequirement, WorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -98,6 +98,7 @@ pub fn convoy_status(phase: flotilla_resources::ConvoyPhase) -> RealConvoyStatus
         phase,
         workflow_snapshot: None,
         work: Default::default(),
+        crew_work: Default::default(),
         message: None,
         started_at: None,
         finished_at: None,
@@ -218,6 +219,10 @@ pub fn pending_task_state() -> WorkState {
     WorkState { phase: WorkPhase::Pending, ready_at: None, started_at: None, finished_at: None, message: None, placement: None }
 }
 
+pub fn pending_crew_work_state() -> CrewWorkState {
+    CrewWorkState { phase: CrewWorkPhase::Pending, started_at: None, finished_at: None, message: None }
+}
+
 pub fn valid_workflow_template_object(name: &str) -> ResourceObject<WorkflowTemplate> {
     ResourceObject { metadata: object_meta(name, "flotilla", "42"), spec: valid_workflow_template_spec(), status: None }
 }
@@ -265,11 +270,16 @@ pub fn tool_only_workflow_template_object(name: &str) -> ResourceObject<Workflow
 pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     let snapshot = flotilla_resources::WorkflowSnapshot { vessels: valid_workflow_template_spec().vessels.into_iter().collect() };
     let work = [("implement".to_string(), pending_task_state()), ("review".to_string(), pending_task_state())].into_iter().collect();
+    let crew_work = BTreeMap::from([
+        ("implement".to_string(), BTreeMap::from([("coder".to_string(), pending_crew_work_state())])),
+        ("review".to_string(), BTreeMap::from([("reviewer".to_string(), pending_crew_work_state())])),
+    ]);
 
     RealConvoyStatus {
         phase: flotilla_resources::ConvoyPhase::Pending,
         workflow_snapshot: Some(snapshot),
         work,
+        crew_work,
         message: None,
         started_at: None,
         finished_at: None,
@@ -346,11 +356,13 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
             .collect(),
     };
     let work = [("implement".to_string(), pending_task_state()), ("review".to_string(), pending_task_state())].into_iter().collect();
+    let crew_work = BTreeMap::from([("implement".to_string(), BTreeMap::new()), ("review".to_string(), BTreeMap::new())]);
 
     RealConvoyStatus {
         phase: flotilla_resources::ConvoyPhase::Pending,
         workflow_snapshot: Some(snapshot),
         work,
+        crew_work,
         message: None,
         started_at: None,
         finished_at: None,

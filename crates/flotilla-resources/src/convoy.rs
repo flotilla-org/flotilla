@@ -49,10 +49,14 @@ pub struct ConvoyStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_snapshot: Option<WorkflowSnapshot>,
     /// Work aboard each declared vessel, keyed by vessel (requirement) name.
-    /// Today written by explicit completion; becomes a roll-up over crew-level
-    /// work state later (flotilla#681).
+    /// Agent-backed work rolls up from `crew_work`; tool-only work is completed
+    /// explicitly by an operator.
     #[serde(default)]
     pub work: BTreeMap<String, WorkState>,
+    /// Workflow state for each declared agent crew member, keyed first by
+    /// vessel name and then by its unique role. Tool processes are excluded.
+    #[serde(default)]
+    pub crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +110,27 @@ pub enum WorkPhase {
     Cancelled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewWorkState {
+    pub phase: CrewWorkPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CrewWorkPhase {
+    #[default]
+    Pending,
+    Working,
+    Done,
+    HandedBack,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlacementStatus {
     #[serde(flatten)]
@@ -119,6 +144,7 @@ pub enum ConvoyStatusPatch {
         observed_workflow_ref: String,
         observed_workflows: BTreeMap<String, String>,
         work: BTreeMap<String, WorkState>,
+        crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     },
@@ -147,8 +173,9 @@ pub enum ConvoyStatusPatch {
     },
     WorkRunning {
         work: String,
+        started_at: DateTime<Utc>,
     },
-    MarkWorkCompleted {
+    ForceWorkCompleted {
         work: String,
         finished_at: DateTime<Utc>,
         message: Option<String>,
@@ -162,16 +189,42 @@ pub enum ConvoyStatusPatch {
         work: String,
         finished_at: DateTime<Utc>,
     },
+    MarkCrewCompleted {
+        vessel: String,
+        role: String,
+        finished_at: DateTime<Utc>,
+        message: Option<String>,
+    },
+    MarkCrewFailed {
+        vessel: String,
+        role: String,
+        finished_at: DateTime<Utc>,
+        message: String,
+    },
+    HandoffCrewWork {
+        vessel: String,
+        sender_role: String,
+        target_role: String,
+        handed_off_at: DateTime<Utc>,
+        message: String,
+    },
+    RollUpWork {
+        work: String,
+        phase: WorkPhase,
+        transitioned_at: DateTime<Utc>,
+        message: Option<String>,
+    },
 }
 
 impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
     fn apply(&self, status: &mut ConvoyStatus) {
         match self {
-            Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, phase, started_at } => {
+            Self::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at } => {
                 status.workflow_snapshot = Some(workflow_snapshot.clone());
                 status.observed_workflow_ref = Some(observed_workflow_ref.clone());
                 status.observed_workflows = Some(observed_workflows.clone());
                 status.work = work.clone();
+                status.crew_work = crew_work.clone();
                 status.phase = *phase;
                 if let Some(started_at) = started_at {
                     status.started_at.get_or_insert(*started_at);
@@ -203,6 +256,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 status.phase = *phase;
+                if *phase == ConvoyPhase::Active {
+                    status.finished_at = None;
+                }
                 if let Some(started_at) = started_at {
                     status.started_at.get_or_insert(*started_at);
                 }
@@ -217,16 +273,29 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.placement = Some(placement.clone());
                 }
             }
-            Self::WorkRunning { work } => {
+            Self::WorkRunning { work, started_at } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
                 }
+                if let Some(crew) = status.crew_work.get_mut(work) {
+                    for state in crew.values_mut().filter(|state| state.phase == CrewWorkPhase::Pending) {
+                        state.phase = CrewWorkPhase::Working;
+                        state.started_at.get_or_insert(*started_at);
+                    }
+                }
             }
-            Self::MarkWorkCompleted { work, finished_at, message } => {
+            Self::ForceWorkCompleted { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Complete;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
+                }
+                if let Some(crew) = status.crew_work.get_mut(work) {
+                    for state in crew.values_mut() {
+                        state.phase = CrewWorkPhase::Done;
+                        state.finished_at = Some(*finished_at);
+                        state.message = message.clone();
+                    }
                 }
             }
             Self::MarkWorkFailed { work, finished_at, message } => {
@@ -242,6 +311,55 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                 }
             }
+            Self::MarkCrewCompleted { vessel, role, finished_at, message } => {
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Done;
+                    state.finished_at.get_or_insert(*finished_at);
+                    state.message = message.clone();
+                }
+            }
+            Self::MarkCrewFailed { vessel, role, finished_at, message } => {
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Failed;
+                    state.finished_at.get_or_insert(*finished_at);
+                    state.message = Some(message.clone());
+                }
+            }
+            Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
+                let Some(crew) = status.crew_work.get_mut(vessel) else {
+                    return;
+                };
+                let target_was_done = crew.get(target_role).is_some_and(|state| state.phase == CrewWorkPhase::Done);
+                if let Some(target) = crew.get_mut(target_role) {
+                    if matches!(target.phase, CrewWorkPhase::Pending | CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
+                        target.phase = CrewWorkPhase::Working;
+                        target.started_at.get_or_insert(*handed_off_at);
+                        target.finished_at = None;
+                        target.message = Some(message.clone());
+                    }
+                }
+                if target_was_done && sender_role != target_role {
+                    if let Some(sender) = crew.get_mut(sender_role) {
+                        sender.phase = CrewWorkPhase::HandedBack;
+                        sender.finished_at = Some(*handed_off_at);
+                        sender.message = Some(message.clone());
+                    }
+                }
+            }
+            Self::RollUpWork { work, phase, transitioned_at, message } => {
+                if let Some(state) = status.work.get_mut(work) {
+                    state.phase = *phase;
+                    state.message = message.clone();
+                    match phase {
+                        WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {
+                            state.finished_at = Some(*transitioned_at);
+                        }
+                        WorkPhase::Pending | WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running => {
+                            state.finished_at = None;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -254,10 +372,11 @@ pub mod controller_patches {
         observed_workflow_ref: String,
         observed_workflows: BTreeMap<String, String>,
         work: BTreeMap<String, WorkState>,
+        crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
     ) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, phase, started_at }
+        ConvoyStatusPatch::Bootstrap { workflow_snapshot, observed_workflow_ref, observed_workflows, work, crew_work, phase, started_at }
     }
 
     pub fn fail_init(phase: ConvoyPhase, message: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
@@ -279,6 +398,10 @@ pub mod controller_patches {
     pub fn roll_up_phase(phase: ConvoyPhase, started_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::RollUpPhase { phase, started_at, finished_at }
     }
+
+    pub fn roll_up_work(work: String, phase: WorkPhase, transitioned_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::RollUpWork { work, phase, transitioned_at, message }
+    }
 }
 
 pub mod provisioning_patches {
@@ -288,16 +411,16 @@ pub mod provisioning_patches {
         ConvoyStatusPatch::WorkLaunching { work, started_at, placement }
     }
 
-    pub fn work_running(work: String) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::WorkRunning { work }
+    pub fn work_running(work: String, started_at: DateTime<Utc>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::WorkRunning { work, started_at }
     }
 }
 
 pub mod external_patches {
     use super::*;
 
-    pub fn mark_work_completed(work: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::MarkWorkCompleted { work, finished_at, message }
+    pub fn force_work_completed(work: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::ForceWorkCompleted { work, finished_at, message }
     }
 
     pub fn mark_work_failed(work: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
@@ -306,5 +429,23 @@ pub mod external_patches {
 
     pub fn mark_work_cancelled(work: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::MarkWorkCancelled { work, finished_at }
+    }
+
+    pub fn mark_crew_completed(vessel: String, role: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkCrewCompleted { vessel, role, finished_at, message }
+    }
+
+    pub fn mark_crew_failed(vessel: String, role: String, finished_at: DateTime<Utc>, message: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkCrewFailed { vessel, role, finished_at, message }
+    }
+
+    pub fn handoff_crew_work(
+        vessel: String,
+        sender_role: String,
+        target_role: String,
+        handed_off_at: DateTime<Utc>,
+        message: String,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message }
     }
 }

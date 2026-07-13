@@ -181,7 +181,15 @@ async fn x_then_enter_completes_work_via_palette() {
     apply_status_patch(
         &convoys,
         "fix-bug-123",
-        &controller_patches::bootstrap(snapshot, "review-and-fix".into(), BTreeMap::new(), tasks, ConvoyPhase::Active, None),
+        &controller_patches::bootstrap(
+            snapshot,
+            "review-and-fix".into(),
+            BTreeMap::new(),
+            tasks,
+            BTreeMap::new(),
+            ConvoyPhase::Active,
+            None,
+        ),
     )
     .await
     .expect("bootstrap convoy");
@@ -221,7 +229,7 @@ async fn x_then_enter_completes_work_via_palette() {
 
     app.handle_key(key('l')); // drill into vessel focus
     app.handle_key(key('x')); // open palette pre-filled
-    app.handle_key(enter()); // confirm — dispatch ConvoyWorkComplete
+    app.handle_key(enter()); // confirm — dispatch ConvoyWorkForceComplete
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;

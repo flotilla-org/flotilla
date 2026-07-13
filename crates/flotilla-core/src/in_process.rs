@@ -776,6 +776,7 @@ struct ResolvedCrewContext {
     convoy: String,
     vessel_ref: String,
     vessel: String,
+    caller_role: String,
     caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
 }
 
@@ -1128,7 +1129,7 @@ impl InProcessDaemon {
     }
 
     /// Override the provisioning namespace used for daemon-side resource lookups
-    /// (e.g. `ConvoyWorkComplete`). Called by the daemon runtime at startup with
+    /// (e.g. `ConvoyWorkForceComplete`). Called by the daemon runtime at startup with
     /// `RuntimeOptions::namespace`.
     pub async fn set_provisioning_namespace(&self, namespace: String) {
         *self.provisioning_namespace.write().await = namespace;
@@ -2292,13 +2293,14 @@ impl InProcessDaemon {
                 .into_iter()
                 .find(|session| session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id))
                 .ok_or_else(|| format!("unknown FLOTILLA_CREW_ID `{crew_id}`"))?;
+            let role = session.spec.role.clone();
             let (convoy, vessel_ref) = match &session.spec.source {
                 TerminalSessionSource::Agent { context, .. } => (context.convoy.clone(), context.vessel_ref.clone()),
                 TerminalSessionSource::Tool { .. } => {
                     return Err(format!("crew identity `{crew_id}` belongs to a non-agent process"));
                 }
             };
-            return self.resolved_crew_context(namespace, convoy, vessel_ref, Some(session)).await;
+            return self.resolved_crew_context(namespace, convoy, vessel_ref, role, Some(session)).await;
         }
 
         let convoy = requested
@@ -2316,7 +2318,7 @@ impl InProcessDaemon {
         let caller = session_list.into_iter().find(|session| {
             session.spec.role == role && session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str) == Some(vessel_ref.as_str())
         });
-        self.resolved_crew_context(namespace, convoy, vessel_ref, caller).await
+        self.resolved_crew_context(namespace, convoy, vessel_ref, role, caller).await
     }
 
     async fn resolved_crew_context(
@@ -2324,6 +2326,7 @@ impl InProcessDaemon {
         namespace: String,
         convoy: String,
         vessel_ref: String,
+        caller_role: String,
         caller_session: Option<flotilla_resources::ResourceObject<ResourceTerminalSession>>,
     ) -> Result<ResolvedCrewContext, String> {
         let workspace = self.resource_backend.clone().using::<Vessel>(&namespace).get(&vessel_ref).await.map_err(|err| err.to_string())?;
@@ -2335,6 +2338,7 @@ impl InProcessDaemon {
             .convoy(convoy)
             .vessel_ref(vessel_ref)
             .vessel(workspace.spec.vessel_name)
+            .caller_role(caller_role)
             .maybe_caller_session(caller_session)
             .build())
     }
@@ -2390,6 +2394,50 @@ impl InProcessDaemon {
             .build())
     }
 
+    pub async fn crew_complete_internal(&self, requested: &CrewCommandContext, message: Option<String>) -> Result<(), String> {
+        let context = self.resolve_crew_context(requested).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
+        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        let known_agent = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .is_some_and(|crew| crew.contains_key(&context.caller_role));
+        if !known_agent {
+            return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
+        }
+        apply_resource_status_patch(
+            &convoys,
+            &context.convoy,
+            &convoy_external_patches::mark_crew_completed(context.vessel, context.caller_role, chrono::Utc::now(), message),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
+    pub async fn crew_fail_internal(&self, requested: &CrewCommandContext, message: String) -> Result<(), String> {
+        let context = self.resolve_crew_context(requested).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
+        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        let known_agent = convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .is_some_and(|crew| crew.contains_key(&context.caller_role));
+        if !known_agent {
+            return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
+        }
+        apply_resource_status_patch(
+            &convoys,
+            &context.convoy,
+            &convoy_external_patches::mark_crew_failed(context.vessel, context.caller_role, chrono::Utc::now(), message),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
     pub async fn crew_handoff_internal(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
@@ -2421,7 +2469,7 @@ impl InProcessDaemon {
             .labels(process.labels.clone())
             .build();
         let terminal_name = identity.name();
-        match sessions.get(&terminal_name).await {
+        let handoff_result = match sessions.get(&terminal_name).await {
             Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
                 Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&existing, message).await,
                 Some(ResourceTerminalSessionPhase::Stopped) => {
@@ -2459,9 +2507,9 @@ impl InProcessDaemon {
                             selector: selector.clone(),
                             brief,
                             context: TerminalCrewContext {
-                                namespace: context.namespace,
-                                convoy: context.convoy,
-                                vessel_ref: context.vessel_ref,
+                                namespace: context.namespace.clone(),
+                                convoy: context.convoy.clone(),
+                                vessel_ref: context.vessel_ref.clone(),
                             },
                             message: Some(pending_crew_message(message)),
                         },
@@ -2473,7 +2521,22 @@ impl InProcessDaemon {
                     .map_err(|err| err.to_string())
             }
             Err(err) => Err(err.to_string()),
-        }
+        };
+        handoff_result?;
+        apply_resource_status_patch(
+            &convoys,
+            &context.convoy,
+            &convoy_external_patches::handoff_crew_work(
+                context.vessel,
+                context.caller_role,
+                target.to_string(),
+                chrono::Utc::now(),
+                message.to_string(),
+            ),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
     }
 
     async fn deliver_to_crew_session(
@@ -3026,7 +3089,53 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyWorkComplete { convoy, work, message } = &command.action {
+        if let flotilla_protocol::CommandAction::CrewComplete { context, message } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.crew_complete_internal(context, message.clone()).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::CrewFail { context, message } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let result = match self.crew_fail_internal(context, message.clone()).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -3047,7 +3156,7 @@ impl InProcessDaemon {
                         match apply_resource_status_patch(
                             &convoys,
                             convoy,
-                            &convoy_external_patches::mark_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
+                            &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
                         )
                         .await
                         {

@@ -77,6 +77,9 @@ pub enum ConvoyWorkVerb {
         /// Optional completion message recorded on the work entry
         #[arg(long)]
         message: Option<String>,
+        /// Override agent-owned completion state
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -84,12 +87,13 @@ impl ConvoyNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         match self.verb {
             ConvoyVerb::Work(work) => match work.verb {
-                ConvoyWorkVerb::Complete { message } => Ok(Resolved::NeedsContext {
+                ConvoyWorkVerb::Complete { message: _, force: false } => Err("human work completion requires --force".to_string()),
+                ConvoyWorkVerb::Complete { message, force: true } => Ok(Resolved::NeedsContext {
                     command: Command {
                         node_id: None,
                         provisioning_target: None,
                         context_repo: None,
-                        action: CommandAction::ConvoyWorkComplete { convoy: self.subject, work: work.subject, message },
+                        action: CommandAction::ConvoyWorkForceComplete { convoy: self.subject, work: work.subject, message },
                     },
                     repo: RepoContext::None,
                     host: HostResolution::Local,
@@ -127,8 +131,11 @@ impl std::fmt::Display for ConvoyNoun {
             ConvoyVerb::Work(work) => {
                 write!(f, " work {}", work.subject)?;
                 match &work.verb {
-                    ConvoyWorkVerb::Complete { message } => {
+                    ConvoyWorkVerb::Complete { message, force } => {
                         write!(f, " complete")?;
+                        if *force {
+                            write!(f, " --force")?;
+                        }
                         if let Some(message) = message {
                             write!(f, " --message {message}")?;
                         }
@@ -179,13 +186,18 @@ mod tests {
 
     #[test]
     fn convoy_work_complete_resolves() {
-        let resolved = parse(&["convoy", "convoy-a", "work", "implement", "complete"]).resolve().expect("resolve");
+        let error = parse(&["convoy", "convoy-a", "work", "implement", "complete"])
+            .resolve()
+            .expect_err("human completion requires an explicit force flag");
+        assert_eq!(error, "human work completion requires --force");
+
+        let resolved = parse(&["convoy", "convoy-a", "work", "implement", "complete", "--force"]).resolve().expect("resolve");
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyWorkComplete { convoy: "convoy-a".into(), work: "implement".into(), message: None },
+                action: CommandAction::ConvoyWorkForceComplete { convoy: "convoy-a".into(), work: "implement".into(), message: None },
             },
             repo: RepoContext::None,
             host: HostResolution::Local,
@@ -194,13 +206,14 @@ mod tests {
 
     #[test]
     fn convoy_work_complete_with_message_resolves() {
-        let resolved = parse(&["convoy", "convoy-a", "work", "implement", "complete", "--message", "done"]).resolve().expect("resolve");
+        let resolved =
+            parse(&["convoy", "convoy-a", "work", "implement", "complete", "--force", "--message", "done"]).resolve().expect("resolve");
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyWorkComplete {
+                action: CommandAction::ConvoyWorkForceComplete {
                     convoy: "convoy-a".into(),
                     work: "implement".into(),
                     message: Some("done".into()),
