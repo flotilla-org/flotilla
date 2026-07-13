@@ -601,15 +601,46 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
 }
 
 #[test]
+fn result_set_round_trips_free_floating_session_capabilities() {
+    use crate::{
+        resource_ref::ResourceRef,
+        result_set::{QueryId, ResultSet, Rows, SessionPhase, SessionRow},
+    };
+
+    let row = SessionRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "terminal-yeoman"))
+        .name("terminal-yeoman")
+        .repo(RepoKey("flotilla-org/flotilla".into()))
+        .host(HostName::new("local"))
+        .attach("terminal-yeoman")
+        .phase(SessionPhase::Running)
+        .build();
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 11, rows: Rows::Sessions(vec![row]) }));
+
+    let encoded = serde_json::to_string(&event).expect("serialize session result set");
+    let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize session result set");
+    let DaemonEvent::ResultSet(result_set) = decoded else { panic!("expected ResultSet") };
+    assert_eq!(result_set.seq, 11);
+    assert_eq!(result_set.query(), QueryId::Sessions);
+    let rows = result_set.rows.as_sessions().expect("session rows");
+    assert_eq!(rows[0].name, "terminal-yeoman");
+    assert_eq!(rows[0].repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
+    assert_eq!(rows[0].host, HostName::new("local"));
+    assert_eq!(rows[0].attach.as_deref(), Some("terminal-yeoman"));
+    assert_eq!(rows[0].phase, SessionPhase::Running);
+}
+
+#[test]
 fn subscribe_queries_request_round_trips_cursors() {
     use crate::result_set::QueryId;
 
     let request = Request::SubscribeQueries {
-        queries: vec![QueryCursor { query: QueryId::Convoys, since: Some(41) }, QueryCursor { query: QueryId::Convoys, since: None }],
+        queries: vec![QueryCursor { query: QueryId::Convoys, since: Some(41) }, QueryCursor { query: QueryId::Sessions, since: None }],
     };
     let encoded = serde_json::to_string(&request).expect("serialize subscribe request");
     assert!(encoded.contains("\"subscribe_queries\""));
     assert!(encoded.contains("\"convoys\""));
+    assert!(encoded.contains("\"sessions\""));
     let decoded: Request = serde_json::from_str(&encoded).expect("deserialize subscribe request");
     assert_eq!(decoded, request);
 }

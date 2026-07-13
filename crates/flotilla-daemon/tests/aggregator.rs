@@ -6,14 +6,20 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeTerminalPool},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
-    result_set::{ConvoyRow, QueryId, ResultSet},
+    result_set::{ConvoyRow, QueryId, ResultSet, SessionRow},
     DaemonEvent, HostName, QueryCursor,
 };
-use flotilla_resources::{ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend};
+use flotilla_resources::{
+    ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ResourceBackend, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL, REPO_LABEL,
+};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
@@ -46,6 +52,10 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
 
 fn convoy_rows(result_set: &ResultSet) -> &[ConvoyRow] {
     result_set.rows.as_convoys().expect("convoy rows")
+}
+
+fn session_rows(result_set: &ResultSet) -> &[SessionRow] {
+    result_set.rows.as_sessions().expect("session rows")
 }
 
 #[tokio::test]
@@ -102,6 +112,236 @@ async fn aggregator_emits_result_set_events() {
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the result set");
     assert_eq!(rows[0].name, "test-convoy-1");
     assert_eq!(rows[0].project_ref.as_deref(), Some("my-project"));
+}
+
+#[tokio::test]
+async fn running_convoyless_session_emits_attachable_session_row() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new()))),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let mut rx = daemon.subscribe();
+    let host_id = daemon.local_host_id().expect("local host id");
+    let environment_name = format!("host-direct-{host_id}");
+    let environment_spec = EnvironmentSpec {
+        host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
+        docker: None,
+    };
+    let environments = backend.using::<Environment>("flotilla");
+    environments
+        .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
+        .await
+        .expect("create attach environment");
+    let sessions = daemon.observed_resource_backend().using::<TerminalSession>("flotilla");
+    let convoy_session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-convoy-coder".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "host-direct-local".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/repo".to_string(),
+                pool: "fake-terminals".to_string(),
+            },
+        )
+        .await
+        .expect("create convoy terminal session");
+    sessions
+        .update_status(&convoy_session.metadata.name, &convoy_session.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("cleat-convoy-coder".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark convoy terminal session running");
+    let unresolvable = sessions
+        .create(&InputMeta::builder().name("terminal-unresolvable".to_string()).build(), &TerminalSessionSpec {
+            env_ref: "missing-environment".to_string(),
+            role: "observer".to_string(),
+            source: TerminalSessionSource::Tool { command: "bash".to_string() },
+            cwd: "/repo".to_string(),
+            pool: "fake".to_string(),
+        })
+        .await
+        .expect("create unresolvable terminal session");
+    sessions
+        .update_status(&unresolvable.metadata.name, &unresolvable.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("cleat-unresolvable".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark unresolvable terminal session running");
+    let options = RuntimeOptions {
+        namespace: "flotilla".to_string(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        start_controllers: false,
+        ..RuntimeOptions::default()
+    };
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("runtime start");
+
+    let created = sessions
+        .create(
+            &InputMeta::builder()
+                .name("terminal-yeoman".to_string())
+                .labels(BTreeMap::from([(REPO_LABEL.to_string(), "flotilla-org/flotilla".to_string())]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: environment_name.clone(),
+                role: "yeoman".to_string(),
+                source: TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/repo".to_string(),
+                pool: "fake-terminals".to_string(),
+            },
+        )
+        .await
+        .expect("create terminal session");
+    sessions
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("cleat-yeoman".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark terminal session running");
+
+    let rows = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Sessions => {
+                    let rows = session_rows(&result_set);
+                    if !rows.is_empty() {
+                        return rows.to_vec();
+                    }
+                }
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                    let rows = delta.changed.as_sessions().expect("session rows");
+                    if !rows.is_empty() {
+                        return rows.to_vec();
+                    }
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for sessions result rows");
+
+    let row = rows.iter().find(|row| row.name == "terminal-yeoman").expect("attachable session row");
+    assert_eq!(row.repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
+    assert_eq!(row.host, HostName::new("local"));
+    assert_eq!(row.attach.as_deref(), Some("terminal-yeoman"));
+    assert_eq!(row.phase, flotilla_protocol::SessionPhase::Running);
+    let unresolvable = rows.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
+    assert_eq!(unresolvable.attach, None);
+    assert!(daemon.resolve_attach_command_internal("terminal-yeoman").await.is_ok());
+
+    let replay =
+        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Sessions, since: None }]).await.expect("subscribe to sessions query");
+    let replayed = replay
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Sessions => Some(session_rows(result_set)),
+            _ => None,
+        })
+        .expect("sessions replay result set");
+    assert_eq!(replayed.len(), 2);
+    let unresolvable = replayed.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
+    assert_eq!(unresolvable.attach, None);
+
+    let replica = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot");
+    let local_sessions = replica
+        .result_sets
+        .iter()
+        .find(|result_set| result_set.query() == QueryId::Sessions)
+        .map(session_rows)
+        .expect("local sessions result set");
+    assert_eq!(local_sessions.len(), 2);
+
+    environments.delete(&environment_name).await.expect("delete attach environment");
+    let unavailable = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                    if let Some(row) = delta
+                        .changed
+                        .as_sessions()
+                        .expect("session rows")
+                        .iter()
+                        .find(|row| row.name == "terminal-yeoman" && row.attach.is_none())
+                    {
+                        return row.clone();
+                    }
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for attach capability removal");
+    assert_eq!(unavailable.attach, None);
+
+    environments
+        .create(&InputMeta::builder().name(environment_name.clone()).build(), &environment_spec)
+        .await
+        .expect("recreate attach environment");
+    let available = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                    if let Some(row) = delta
+                        .changed
+                        .as_sessions()
+                        .expect("session rows")
+                        .iter()
+                        .find(|row| row.name == "terminal-yeoman" && row.attach.as_deref() == Some("terminal-yeoman"))
+                    {
+                        return row.clone();
+                    }
+                }
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for attach capability restoration");
+    assert_eq!(available.attach.as_deref(), Some("terminal-yeoman"));
+
+    let running = sessions.get("terminal-yeoman").await.expect("running terminal session");
+    sessions
+        .update_status(&running.metadata.name, &running.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Stopped,
+            ..Default::default()
+        })
+        .await
+        .expect("stop terminal session");
+    let removed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions && !delta.removed.is_empty() => return delta,
+                Ok(_) => continue,
+                Err(err) => panic!("broadcast receive error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for stopped session removal");
+    assert_eq!(removed.removed.len(), 1);
+    assert_eq!(removed.removed[0].name, "terminal-yeoman");
 }
 
 /// Verifies the causal chain:

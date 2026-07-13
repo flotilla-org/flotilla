@@ -1,22 +1,48 @@
 //! Resource-store and fleet-replica Aggregator maintaining named-query result sets.
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
-use flotilla_core::aggregator_projection::AggregatorProjectionState;
+use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_protocol::{
-    result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, Rows, VesselRow, WorkPhase},
+    result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, Rows, SessionPhase, SessionRow, VesselRow, WorkPhase},
     DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
-    ResourceObject, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
-    CONVOY_LABEL, VESSEL_LABEL,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation, Resource, ResourceError,
+    ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart,
+    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
 
 type PresentationKey = (String, String, String);
+type SessionKey = (String, String);
+
+#[derive(bon::Builder)]
+pub struct AggregatorResolvers {
+    durable_convoys: TypedResolver<Convoy>,
+    durable_environments: TypedResolver<Environment>,
+    durable_presentations: TypedResolver<Presentation>,
+    durable_sessions: TypedResolver<TerminalSession>,
+    observed_convoys: TypedResolver<Convoy>,
+    observed_presentations: TypedResolver<Presentation>,
+    observed_sessions: TypedResolver<TerminalSession>,
+}
+
+#[derive(bon::Builder)]
+struct AggregatorSourceRefs<'a> {
+    durable_convoys: &'a dyn AggregatorWatchSource<Convoy>,
+    durable_environments: &'a dyn AggregatorWatchSource<Environment>,
+    durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
+    durable_sessions: &'a dyn AggregatorWatchSource<TerminalSession>,
+    observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
+    observed_presentations: &'a dyn AggregatorWatchSource<Presentation>,
+    observed_sessions: &'a dyn AggregatorWatchSource<TerminalSession>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LocalSource {
@@ -51,9 +77,13 @@ pub struct Aggregator {
     convoys_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Convoy>>>,
     #[builder(skip)]
     presentations_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Presentation>>>,
+    #[builder(skip)]
+    sessions_by_source: HashMap<LocalSource, HashMap<SessionKey, ResourceObject<TerminalSession>>>,
     presentation_workspaces: HashMap<PresentationKey, String>,
+    terminal_sessions: HashMap<SessionKey, ResourceObject<TerminalSession>>,
     bootstrapping: bool,
-    emitted_initial_snapshot: bool,
+    emitted_queries: HashSet<QueryId>,
+    attach_resolver: Option<Arc<InProcessDaemon>>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
@@ -66,32 +96,61 @@ impl Aggregator {
             local_host,
             convoys_by_source: HashMap::new(),
             presentations_by_source: HashMap::new(),
+            sessions_by_source: HashMap::new(),
             presentation_workspaces: HashMap::new(),
+            terminal_sessions: HashMap::new(),
             bootstrapping: false,
-            emitted_initial_snapshot: false,
+            emitted_queries: HashSet::new(),
+            attach_resolver: None,
             event_tx,
         }
     }
 
+    pub fn with_attach_resolver(mut self, daemon: Arc<InProcessDaemon>) -> Self {
+        self.attach_resolver = Some(daemon);
+        self
+    }
+
     pub async fn run(
         self,
-        durable_convoys: TypedResolver<Convoy>,
-        durable_presentations: TypedResolver<Presentation>,
-        observed_convoys: TypedResolver<Convoy>,
-        observed_presentations: TypedResolver<Presentation>,
+        resolvers: AggregatorResolvers,
         replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
-        self.run_with_sources(&durable_convoys, &durable_presentations, &observed_convoys, &observed_presentations, replica_rx).await
+        let AggregatorResolvers {
+            durable_convoys,
+            durable_environments,
+            durable_presentations,
+            durable_sessions,
+            observed_convoys,
+            observed_presentations,
+            observed_sessions,
+        } = resolvers;
+        let sources = AggregatorSourceRefs::builder()
+            .durable_convoys(&durable_convoys)
+            .durable_environments(&durable_environments)
+            .durable_presentations(&durable_presentations)
+            .durable_sessions(&durable_sessions)
+            .observed_convoys(&observed_convoys)
+            .observed_presentations(&observed_presentations)
+            .observed_sessions(&observed_sessions)
+            .build();
+        self.run_with_sources(sources, replica_rx).await
     }
 
     async fn run_with_sources(
         mut self,
-        durable_convoys: &dyn AggregatorWatchSource<Convoy>,
-        durable_presentations: &dyn AggregatorWatchSource<Presentation>,
-        observed_convoys: &dyn AggregatorWatchSource<Convoy>,
-        observed_presentations: &dyn AggregatorWatchSource<Presentation>,
+        sources: AggregatorSourceRefs<'_>,
         mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
+        let AggregatorSourceRefs {
+            durable_convoys,
+            durable_environments,
+            durable_presentations,
+            durable_sessions,
+            observed_convoys,
+            observed_presentations,
+            observed_sessions,
+        } = sources;
         self.bootstrapping = true;
         {
             let mut view = self.state.write().await;
@@ -100,13 +159,24 @@ impl Aggregator {
                 view.seq = view.seq.saturating_add(1);
             }
         }
+        {
+            let mut view = self.state.write_sessions().await;
+            if !view.local_rows.is_empty() {
+                view.local_rows.clear();
+                view.seq = view.seq.saturating_add(1);
+            }
+        }
         let mut durable_convoy_stream = self.recover_convoy_watch(LocalSource::Durable, durable_convoys).await?;
+        let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
+        let mut durable_session_stream = self.recover_session_watch(LocalSource::Durable, durable_sessions).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
         let mut observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
+        let mut observed_session_stream = self.recover_session_watch(LocalSource::Observed, observed_sessions).await?;
         self.bootstrapping = false;
-        self.emitted_initial_snapshot = true;
+        self.emitted_queries.extend(QueryId::ALL.iter().copied());
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
+        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.sessions_result_set().await)));
 
         loop {
             tokio::select! {
@@ -118,6 +188,14 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
                 },
+                event = durable_environment_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_environment_event(event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable environment watch ended")),
+                },
                 event = durable_presentation_stream.next() => match event {
                     Some(Ok(event)) => self.apply_presentation_event_from(LocalSource::Durable, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -125,6 +203,14 @@ impl Aggregator {
                     }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable presentation watch ended")),
+                },
+                event = durable_session_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_session_event_from(LocalSource::Durable, event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_session_stream = self.recover_session_watch(LocalSource::Durable, durable_sessions).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable terminal session watch ended")),
                 },
                 event = observed_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Observed, event).await,
@@ -141,6 +227,14 @@ impl Aggregator {
                     }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator observed presentation watch ended")),
+                },
+                event = observed_session_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_session_event_from(LocalSource::Observed, event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        observed_session_stream = self.recover_session_watch(LocalSource::Observed, observed_sessions).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator observed terminal session watch ended")),
                 },
                 replica = replica_rx.recv() => match replica {
                     Ok(snapshots) => self.apply_replica_cache(snapshots).await,
@@ -181,6 +275,31 @@ impl Aggregator {
         }
     }
 
+    async fn recover_environment_watch(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Environment>,
+    ) -> Result<WatchStream<Environment>, ResourceError> {
+        loop {
+            match self.list_and_watch_environments(resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
+    async fn recover_session_watch(
+        &mut self,
+        source: LocalSource,
+        resolver: &dyn AggregatorWatchSource<TerminalSession>,
+    ) -> Result<WatchStream<TerminalSession>, ResourceError> {
+        loop {
+            match self.list_and_watch_sessions(source, resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
     async fn list_and_watch_convoys(
         &mut self,
         source: LocalSource,
@@ -210,6 +329,28 @@ impl Aggregator {
             convoys.into_iter().map(|convoy| (self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name), convoy)).collect();
         self.convoys_by_source.insert(source, replacement);
         self.rebuild_local_projection().await;
+    }
+
+    async fn list_and_watch_environments(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Environment>,
+    ) -> Result<WatchStream<Environment>, ResourceError> {
+        let listed = resolver.list().await?;
+        let watch = resolver.watch(watch_start(&listed)).await?;
+        self.rebuild_session_projection().await;
+        Ok(watch)
+    }
+
+    async fn list_and_watch_sessions(
+        &mut self,
+        source: LocalSource,
+        resolver: &dyn AggregatorWatchSource<TerminalSession>,
+    ) -> Result<WatchStream<TerminalSession>, ResourceError> {
+        let listed = resolver.list().await?;
+        let start = watch_start(&listed);
+        let watch = resolver.watch(start).await?;
+        self.replace_session_source(source, listed.items).await;
+        Ok(watch)
     }
 
     async fn replace_presentation_source(&mut self, source: LocalSource, presentations: Vec<ResourceObject<Presentation>>) {
@@ -302,70 +443,151 @@ impl Aggregator {
         if self.bootstrapping {
             return;
         }
-        if self.emitted_initial_snapshot {
+        if self.emitted_queries.contains(&QueryId::Convoys) {
             self.emit_delta(changed, removed).await;
         } else {
-            self.emitted_initial_snapshot = true;
+            self.emitted_queries.insert(QueryId::Convoys);
+            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+        }
+    }
+
+    async fn replace_session_source(&mut self, source: LocalSource, sessions: Vec<ResourceObject<TerminalSession>>) {
+        let replacement =
+            sessions.into_iter().map(|session| ((session.metadata.namespace.clone(), session.metadata.name.clone()), session)).collect();
+        self.sessions_by_source.insert(source, replacement);
+        self.rebuild_session_projection().await;
+    }
+
+    pub async fn apply_session_event(&mut self, event: WatchEvent<TerminalSession>) {
+        self.apply_session_event_from(LocalSource::Durable, event).await;
+    }
+
+    async fn apply_session_event_from(&mut self, source: LocalSource, event: WatchEvent<TerminalSession>) {
+        match event {
+            WatchEvent::Added(session) | WatchEvent::Modified(session) => {
+                self.sessions_by_source
+                    .entry(source)
+                    .or_default()
+                    .insert((session.metadata.namespace.clone(), session.metadata.name.clone()), session);
+            }
+            WatchEvent::Deleted(session) => {
+                self.sessions_by_source
+                    .entry(source)
+                    .or_default()
+                    .remove(&(session.metadata.namespace.clone(), session.metadata.name.clone()));
+            }
+        }
+        self.rebuild_session_projection().await;
+    }
+
+    async fn apply_environment_event(&mut self, _event: WatchEvent<Environment>) {
+        self.rebuild_session_projection().await;
+    }
+
+    async fn rebuild_session_projection(&mut self) {
+        let mut effective_sessions = HashMap::new();
+        for source in LOCAL_SOURCE_PRECEDENCE {
+            let Some(sessions) = self.sessions_by_source.get(&source) else { continue };
+            effective_sessions.extend(sessions.iter().map(|(key, session)| (key.clone(), session.clone())));
+        }
+        self.terminal_sessions = effective_sessions;
+
+        let mut replacement = HashMap::new();
+        for session in self.terminal_sessions.values() {
+            if let Some(row) = self.summarize_session(session).await {
+                replacement.insert(row.resource.clone(), row);
+            }
+        }
+
+        let (changed, removed, result_set) = {
+            let mut view = self.state.write_sessions().await;
+            let changed = replacement
+                .iter()
+                .filter(|(reference, row)| view.local_rows.get(*reference) != Some(*row))
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>();
+            let removed = view.local_rows.keys().filter(|reference| !replacement.contains_key(*reference)).cloned().collect::<Vec<_>>();
+            if changed.is_empty() && removed.is_empty() {
+                return;
+            }
+            view.local_rows = replacement;
+            view.seq = view.seq.saturating_add(1);
+            (changed, removed, view.result_set())
+        };
+
+        if self.bootstrapping {
+            return;
+        }
+        if self.emitted_queries.contains(&QueryId::Sessions) {
+            self.emit_session_delta(changed, removed).await;
+        } else {
+            self.emitted_queries.insert(QueryId::Sessions);
             let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
         }
     }
 
     pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
-        let mut replacements = HashMap::new();
+        let mut convoy_replacements = HashMap::new();
+        let mut session_replacements = HashMap::new();
         for snapshot in snapshots {
             let host = snapshot.host;
-            let mut rows = HashMap::new();
-            if let Some(Rows::Convoys(convoys)) =
-                snapshot.result_sets.into_iter().find(|result_set| result_set.query() == QueryId::Convoys).map(|result_set| result_set.rows)
-            {
-                for mut row in convoys {
-                    set_row_host(&mut row, &host);
-                    rows.insert(row.resource.clone(), row);
+            let mut convoy_rows = HashMap::new();
+            let mut session_rows = HashMap::new();
+            for result_set in snapshot.result_sets {
+                match result_set.rows {
+                    Rows::Convoys(convoys) => {
+                        for mut row in convoys {
+                            set_convoy_row_host(&mut row, &host);
+                            convoy_rows.insert(row.resource.clone(), row);
+                        }
+                    }
+                    Rows::Sessions(sessions) => {
+                        for mut row in sessions {
+                            set_session_row_host(&mut row, &host);
+                            session_rows.insert(row.resource.clone(), row);
+                        }
+                    }
                 }
             }
-            replacements.insert(host, rows);
+            convoy_replacements.insert(host.clone(), convoy_rows);
+            session_replacements.insert(host, session_rows);
         }
 
-        let (changed, removed, full_result_set) = {
+        let convoy_change = {
             let mut view = self.state.write().await;
-            let previous = std::mem::take(&mut view.replica_rows);
-            let changed = replacements
-                .iter()
-                .flat_map(|(host, rows)| {
-                    let prior = previous.get(host);
-                    rows.iter()
-                        .filter(move |(reference, row)| prior.and_then(|prior| prior.get(*reference)) != Some(*row))
-                        .map(|(_, row)| row.clone())
-                })
-                .collect::<Vec<_>>();
-            let removed = previous
-                .iter()
-                .flat_map(|(host, rows)| {
-                    let replacement = replacements.get(host);
-                    rows.keys()
-                        .filter(move |reference| replacement.is_none_or(|replacement| !replacement.contains_key(*reference)))
-                        .cloned()
-                })
-                .collect::<Vec<_>>();
-            view.replica_rows = replacements;
-            if changed.is_empty() && removed.is_empty() {
-                return;
-            }
-            view.seq = view.seq.saturating_add(1);
-            (changed, removed, view.result_set())
+            view.replace_replica_rows(convoy_replacements)
         };
+        if let Some((changed, removed)) = convoy_change {
+            if self.emitted_queries.contains(&QueryId::Convoys) {
+                self.emit_delta(changed, removed).await;
+            } else {
+                self.emitted_queries.insert(QueryId::Convoys);
+                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
+            }
+        }
 
-        if self.emitted_initial_snapshot {
-            self.emit_delta(changed, removed).await;
-        } else {
-            self.emitted_initial_snapshot = true;
-            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(full_result_set)));
+        let session_change = {
+            let mut view = self.state.write_sessions().await;
+            view.replace_replica_rows(session_replacements)
+        };
+        if let Some((changed, removed)) = session_change {
+            if self.emitted_queries.contains(&QueryId::Sessions) {
+                self.emit_session_delta(changed, removed).await;
+            } else {
+                self.emitted_queries.insert(QueryId::Sessions);
+                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.sessions_result_set().await)));
+            }
         }
     }
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
         let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(changed), removed })));
+    }
+
+    async fn emit_session_delta(&self, changed: Vec<SessionRow>, removed: Vec<ResourceRef>) {
+        let seq = self.state.sessions_seq().await;
+        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Sessions(changed), removed })));
     }
 
     fn convoy_ref(&self, namespace: &str, name: &str) -> ResourceRef {
@@ -377,6 +599,35 @@ impl Aggregator {
             .on_host(self.local_host.clone())
     }
 
+    fn session_ref(&self, namespace: &str, name: &str) -> ResourceRef {
+        ResourceRef::new(api_version(TerminalSession::API_PATHS), TerminalSession::API_PATHS.kind, namespace, name)
+            .on_host(self.local_host.clone())
+    }
+
+    async fn summarize_session(&self, session: &ResourceObject<TerminalSession>) -> Option<SessionRow> {
+        if session.metadata.labels.contains_key(CONVOY_LABEL) {
+            return None;
+        }
+        let status = session.status.as_ref()?;
+        if status.phase != TerminalSessionPhase::Running {
+            return None;
+        }
+        let name = &session.metadata.name;
+        let attach = match &self.attach_resolver {
+            Some(daemon) if daemon.resolve_attach_command_internal(name).await.is_ok() => Some(name.clone()),
+            _ => None,
+        };
+        Some(
+            SessionRow::builder()
+                .resource(self.session_ref(&session.metadata.namespace, name))
+                .name(name)
+                .maybe_repo(session.metadata.labels.get(REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
+                .host(self.local_host.clone())
+                .maybe_attach(attach)
+                .phase(SessionPhase::Running)
+                .build(),
+        )
+    }
     fn vessel_attach(&self, namespace: &str, convoy: &str, vessel: &str) -> Option<String> {
         self.presentation_workspaces.get(&(namespace.to_string(), convoy.to_string(), vessel.to_string())).cloned()
     }
@@ -460,12 +711,17 @@ fn presentation_key(presentation: &ResourceObject<Presentation>) -> Option<Prese
     ))
 }
 
-fn set_row_host(row: &mut ConvoyRow, host: &HostName) {
+fn set_convoy_row_host(row: &mut ConvoyRow, host: &HostName) {
     row.resource.host = Some(host.clone());
     for vessel in &mut row.vessels {
         vessel.resource.host = Some(host.clone());
         vessel.host = host.clone();
     }
+}
+
+fn set_session_row_host(row: &mut SessionRow, host: &HostName) {
+    row.resource.host = Some(host.clone());
+    row.host = host.clone();
 }
 
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
@@ -512,7 +768,7 @@ mod tests {
     use flotilla_protocol::result_set::ResultSet;
     use flotilla_resources::{
         ConvoySpec, InMemoryBackend, InputMeta, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend,
-        VesselRequirement, WorkflowSnapshot,
+        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -572,6 +828,29 @@ mod tests {
 
     fn empty_list<T: Resource>() -> ResourceList<T> {
         ResourceList { items: Vec::new(), resource_version: "2".to_string(), generation: None }
+    }
+
+    async fn run_with_test_sources(
+        aggregator: Aggregator,
+        durable_convoys: &dyn AggregatorWatchSource<Convoy>,
+        durable_presentations: &dyn AggregatorWatchSource<Presentation>,
+        observed_convoys: &dyn AggregatorWatchSource<Convoy>,
+        observed_presentations: &dyn AggregatorWatchSource<Presentation>,
+        replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
+    ) -> Result<(), ResourceError> {
+        let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let sources = AggregatorSourceRefs::builder()
+            .durable_convoys(durable_convoys)
+            .durable_environments(&durable_environments)
+            .durable_presentations(durable_presentations)
+            .durable_sessions(&durable_sessions)
+            .observed_convoys(observed_convoys)
+            .observed_presentations(observed_presentations)
+            .observed_sessions(&observed_sessions)
+            .build();
+        aggregator.run_with_sources(sources, replica_rx).await
     }
 
     async fn convoy_object(name: &str) -> ResourceObject<Convoy> {
@@ -637,6 +916,32 @@ mod tests {
             .expect("set scripted presentation status")
     }
 
+    async fn session_object(name: &str) -> ResourceObject<TerminalSession> {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<TerminalSession>("flotilla");
+        let created = resolver
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &TerminalSessionSpec::builder()
+                    .env_ref("local".to_string())
+                    .role("observer".to_string())
+                    .source(TerminalSessionSource::Tool { command: "bash".to_string() })
+                    .cwd("/repo".to_string())
+                    .pool("test".to_string())
+                    .build(),
+            )
+            .await
+            .expect("create scripted terminal session");
+        resolver
+            .update_status(name, &created.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some(name.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("set scripted terminal session status")
+    }
+
     fn remote_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
         let host = HostName::new(host);
         let convoy = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name).on_host(host.clone());
@@ -655,8 +960,43 @@ mod tests {
         }
     }
 
+    fn remote_session_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
+        let host = HostName::new(host);
+        let session = ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", name);
+        let row = SessionRow::builder()
+            .resource(session)
+            .name(name)
+            .host(HostName::new("incorrect-source-host"))
+            .attach(name)
+            .phase(SessionPhase::Running)
+            .build();
+        FleetReplicaSnapshot {
+            host,
+            generation: Some(generation.to_string()),
+            rows: Vec::new(),
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Sessions(vec![row]) }],
+        }
+    }
+
     fn convoy_names(rows: &Rows) -> Vec<&str> {
         rows.as_convoys().expect("convoy rows").iter().map(|row| row.name.as_str()).collect()
+    }
+
+    async fn recv_query_event(event_rx: &mut broadcast::Receiver<DaemonEvent>, query: QueryId, timeout_message: &str) -> DaemonEvent {
+        loop {
+            let event = timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{timeout_message}"))
+                .expect("aggregator event");
+            let matches_query = match &event {
+                DaemonEvent::ResultSet(result_set) => result_set.query() == query,
+                DaemonEvent::ResultDelta(delta) => delta.query() == query,
+                _ => false,
+            };
+            if matches_query {
+                return event;
+            }
+        }
     }
 
     #[tokio::test]
@@ -691,6 +1031,23 @@ mod tests {
         let rows = result_set.rows.as_convoys().expect("convoy rows");
         let row = rows.first().expect("replica convoy row");
         assert_eq!(row.project_ref.as_deref(), Some("my-project"));
+    }
+
+    #[tokio::test]
+    async fn replica_cache_unions_sessions_and_stamps_origin_host() {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+
+        aggregator.apply_replica_cache(vec![remote_session_snapshot("feta", "generation-1", "terminal-yeoman")]).await;
+        let event = rx.recv().await.expect("sessions replica event");
+        assert!(matches!(event, DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Sessions));
+
+        let result_set = state.sessions_result_set().await;
+        let rows = result_set.rows.as_sessions().expect("session rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resource.host, Some(HostName::new("feta")));
+        assert_eq!(rows[0].host, HostName::new("feta"));
     }
 
     #[tokio::test]
@@ -731,10 +1088,15 @@ mod tests {
 
         let result = Aggregator::new(state.clone(), HostName::new("local"), event_tx)
             .run(
-                durable.clone().using::<Convoy>("flotilla"),
-                durable.using::<Presentation>("flotilla"),
-                observed.clone().using::<Convoy>("flotilla"),
-                observed.using::<Presentation>("flotilla"),
+                AggregatorResolvers::builder()
+                    .durable_convoys(durable.clone().using::<Convoy>("flotilla"))
+                    .durable_environments(durable.clone().using::<Environment>("flotilla"))
+                    .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
+                    .durable_sessions(durable.using::<TerminalSession>("flotilla"))
+                    .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
+                    .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
+                    .observed_sessions(observed.using::<TerminalSession>("flotilla"))
+                    .build(),
                 replica_rx,
             )
             .await;
@@ -767,23 +1129,22 @@ mod tests {
         let run_observed_presentations = Arc::clone(&observed_presentations);
         let run_state = state.clone();
         let task = tokio::spawn(async move {
-            Aggregator::new(run_state, HostName::new("local"), event_tx)
-                .run_with_sources(
-                    run_durable_convoys.as_ref(),
-                    run_durable_presentations.as_ref(),
-                    run_observed_convoys.as_ref(),
-                    run_observed_presentations.as_ref(),
-                    replica_rx,
-                )
-                .await
+            run_with_test_sources(
+                Aggregator::new(run_state, HostName::new("local"), event_tx),
+                run_durable_convoys.as_ref(),
+                run_durable_presentations.as_ref(),
+                run_observed_convoys.as_ref(),
+                run_observed_presentations.as_ref(),
+                replica_rx,
+            )
+            .await
         });
 
-        let initial =
-            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         assert_eq!(convoy_names(&initial.rows), vec!["deleted-while-watch-expired"]);
 
-        let removal = timeout(Duration::from_secs(1), event_rx.recv()).await.expect("relist delta timeout").expect("relist delta");
+        let removal = recv_query_event(&mut event_rx, QueryId::Convoys, "relist delta timeout").await;
         let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected relist delta") };
         assert_eq!(removal.removed.len(), 1);
         assert_eq!(removal.removed[0].name, "deleted-while-watch-expired");
@@ -792,6 +1153,55 @@ mod tests {
         assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 2);
         assert_eq!(observed_convoys.watch_calls.load(Ordering::SeqCst), 1, "healthy watch must not restart");
         assert!(!task.is_finished(), "aggregator should remain alive after in-place relist");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn expired_session_watch_relists_its_source_and_removes_missed_deletion() {
+        let stale = session_object("deleted-while-watch-expired").await;
+        let durable_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_environments = Arc::new(ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_sessions = Arc::new(ScriptedSource::new(
+            vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
+            vec![Ok(expiring_watch()), Ok(pending_watch())],
+        ));
+        let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+
+        let run_state = state.clone();
+        let run_durable_sessions = Arc::clone(&durable_sessions);
+        let task = tokio::spawn(async move {
+            let sources = AggregatorSourceRefs::builder()
+                .durable_convoys(durable_convoys.as_ref())
+                .durable_environments(durable_environments.as_ref())
+                .durable_presentations(durable_presentations.as_ref())
+                .durable_sessions(run_durable_sessions.as_ref())
+                .observed_convoys(observed_convoys.as_ref())
+                .observed_presentations(observed_presentations.as_ref())
+                .observed_sessions(observed_sessions.as_ref())
+                .build();
+            Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources, replica_rx).await
+        });
+
+        let initial = recv_query_event(&mut event_rx, QueryId::Sessions, "initial sessions result set timeout").await;
+        let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial sessions result set") };
+        assert_eq!(initial.rows.as_sessions().expect("session rows")[0].name, "deleted-while-watch-expired");
+
+        let removal = recv_query_event(&mut event_rx, QueryId::Sessions, "sessions relist delta timeout").await;
+        let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected sessions relist delta") };
+        assert_eq!(removal.removed.len(), 1);
+        assert_eq!(removal.removed[0].name, "deleted-while-watch-expired");
+        assert!(state.sessions_result_set().await.rows.is_empty());
+        assert_eq!(durable_sessions.list_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(durable_sessions.watch_calls.load(Ordering::SeqCst), 2);
+        assert!(!task.is_finished(), "aggregator should remain alive after session relist");
 
         task.abort();
         let _ = task.await;
@@ -817,19 +1227,18 @@ mod tests {
         let run_durable_convoys = Arc::clone(&durable_convoys);
         let run_state = state.clone();
         let task = tokio::spawn(async move {
-            Aggregator::new(run_state, HostName::new("local"), event_tx)
-                .run_with_sources(
-                    run_durable_convoys.as_ref(),
-                    durable_presentations.as_ref(),
-                    observed_convoys.as_ref(),
-                    observed_presentations.as_ref(),
-                    replica_rx,
-                )
-                .await
+            run_with_test_sources(
+                Aggregator::new(run_state, HostName::new("local"), event_tx),
+                run_durable_convoys.as_ref(),
+                durable_presentations.as_ref(),
+                observed_convoys.as_ref(),
+                observed_presentations.as_ref(),
+                replica_rx,
+            )
+            .await
         });
 
-        let initial =
-            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         assert!(initial.rows.is_empty(), "failed watch attempt must not publish its stale list");
         assert!(state.result_set().await.rows.is_empty());
@@ -865,24 +1274,23 @@ mod tests {
         let run_observed_presentations = Arc::clone(&observed_presentations);
         let run_state = state.clone();
         let task = tokio::spawn(async move {
-            Aggregator::new(run_state, HostName::new("local"), event_tx)
-                .run_with_sources(
-                    run_durable_convoys.as_ref(),
-                    run_durable_presentations.as_ref(),
-                    run_observed_convoys.as_ref(),
-                    run_observed_presentations.as_ref(),
-                    replica_rx,
-                )
-                .await
+            run_with_test_sources(
+                Aggregator::new(run_state, HostName::new("local"), event_tx),
+                run_durable_convoys.as_ref(),
+                run_durable_presentations.as_ref(),
+                run_observed_convoys.as_ref(),
+                run_observed_presentations.as_ref(),
+                replica_rx,
+            )
+            .await
         });
 
-        let initial =
-            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         let initial_row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(initial_row.vessels.first().expect("vessel row").attach.as_deref(), Some("workspace-1"));
 
-        let update = timeout(Duration::from_secs(1), event_rx.recv()).await.expect("relist delta timeout").expect("relist delta");
+        let update = recv_query_event(&mut event_rx, QueryId::Convoys, "relist delta timeout").await;
         let DaemonEvent::ResultDelta(update) = update else { panic!("expected relist delta") };
         let changed = update.changed.as_convoys().expect("changed convoy rows").first().expect("changed convoy row");
         assert_eq!(changed.vessels.first().expect("changed vessel row").attach, None);
@@ -920,19 +1328,18 @@ mod tests {
 
         let run_state = state.clone();
         let task = tokio::spawn(async move {
-            Aggregator::new(run_state, HostName::new("local"), event_tx)
-                .run_with_sources(
-                    durable_convoys.as_ref(),
-                    durable_presentations.as_ref(),
-                    observed_convoys.as_ref(),
-                    observed_presentations.as_ref(),
-                    replica_rx,
-                )
-                .await
+            run_with_test_sources(
+                Aggregator::new(run_state, HostName::new("local"), event_tx),
+                durable_convoys.as_ref(),
+                durable_presentations.as_ref(),
+                observed_convoys.as_ref(),
+                observed_presentations.as_ref(),
+                replica_rx,
+            )
+            .await
         });
 
-        let initial =
-            timeout(Duration::from_secs(1), event_rx.recv()).await.expect("initial result set timeout").expect("initial result set");
+        let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
         let row = initial.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(row.vessels.first().expect("vessel row").attach, None);
@@ -955,7 +1362,8 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(1),
-            Aggregator::new(state, HostName::new("local"), event_tx).run_with_sources(
+            run_with_test_sources(
+                Aggregator::new(state, HostName::new("local"), event_tx),
                 &durable_convoys,
                 &durable_presentations,
                 &observed_convoys,
