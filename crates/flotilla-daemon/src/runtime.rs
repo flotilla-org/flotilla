@@ -750,7 +750,8 @@ fn spawn_aggregator_task(
             let namespace = namespace.clone();
             let state = state.clone();
             async move {
-                let mut aggregator = Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender());
+                let mut aggregator =
+                    Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender()).with_attach_resolver(Arc::clone(&daemon));
                 aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
                 aggregator
                     .run(

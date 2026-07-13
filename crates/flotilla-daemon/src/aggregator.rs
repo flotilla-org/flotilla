@@ -1,16 +1,19 @@
 //! Resource-store and fleet-replica Aggregator maintaining named-query result sets.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use flotilla_core::aggregator_projection::AggregatorProjectionState;
+use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, Rows, SessionPhase, SessionRow, VesselRow, WorkPhase},
     DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
 };
 use flotilla_resources::{
-    api_version, terminal_session_attach_target, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation,
-    Resource, ResourceError, ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement,
-    WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Presentation, Resource, ResourceError, ResourceList,
+    ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -34,12 +37,26 @@ pub struct Aggregator {
     presentation_workspaces: HashMap<PresentationKey, String>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
+    attach_resolver: Option<Arc<InProcessDaemon>>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
 impl Aggregator {
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
-        Self { state, local_host, presentation_workspaces: HashMap::new(), bootstrapping: false, emitted_queries: HashSet::new(), event_tx }
+        Self {
+            state,
+            local_host,
+            presentation_workspaces: HashMap::new(),
+            bootstrapping: false,
+            emitted_queries: HashSet::new(),
+            attach_resolver: None,
+            event_tx,
+        }
+    }
+
+    pub fn with_attach_resolver(mut self, daemon: Arc<InProcessDaemon>) -> Self {
+        self.attach_resolver = Some(daemon);
+        self
     }
 
     pub async fn run(
@@ -255,7 +272,7 @@ impl Aggregator {
     pub async fn apply_session_event(&mut self, event: WatchEvent<TerminalSession>) {
         match event {
             WatchEvent::Added(session) | WatchEvent::Modified(session) => {
-                if let Some(row) = self.summarize_session(&session) {
+                if let Some(row) = self.summarize_session(&session).await {
                     let reference = row.resource.clone();
                     let result_set = {
                         let mut view = self.state.write_sessions().await;
@@ -368,7 +385,7 @@ impl Aggregator {
             .on_host(self.local_host.clone())
     }
 
-    fn summarize_session(&self, session: &ResourceObject<TerminalSession>) -> Option<SessionRow> {
+    async fn summarize_session(&self, session: &ResourceObject<TerminalSession>) -> Option<SessionRow> {
         if session.metadata.labels.contains_key(CONVOY_LABEL) {
             return None;
         }
@@ -377,13 +394,17 @@ impl Aggregator {
             return None;
         }
         let name = &session.metadata.name;
+        let attach = match &self.attach_resolver {
+            Some(daemon) if daemon.resolve_attach_command_internal(name).await.is_ok() => Some(name.clone()),
+            _ => None,
+        };
         Some(
             SessionRow::builder()
                 .resource(self.session_ref(&session.metadata.namespace, name))
                 .name(name)
                 .maybe_repo(session.metadata.labels.get(REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
                 .host(self.local_host.clone())
-                .maybe_attach(terminal_session_attach_target(session).is_ok().then(|| name.clone()))
+                .maybe_attach(attach)
                 .phase(SessionPhase::Running)
                 .build(),
         )

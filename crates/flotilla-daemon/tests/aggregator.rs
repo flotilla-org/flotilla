@@ -6,7 +6,10 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeTerminalPool},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
@@ -14,8 +17,8 @@ use flotilla_protocol::{
     DaemonEvent, HostName, QueryCursor,
 };
 use flotilla_resources::{
-    ConvoySpec, InMemoryBackend, InputMeta, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL, REPO_LABEL,
+    ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ResourceBackend, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL, REPO_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -119,13 +122,23 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
-        fake_discovery(false),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_terminal_pool(Arc::new(FakeTerminalPool::new()))),
         HostName::new("local"),
         backend.clone(),
     )
     .await;
     let mut rx = daemon.subscribe();
-    let sessions = backend.using::<TerminalSession>("flotilla");
+    let host_id = daemon.local_host_id().expect("local host id");
+    let environment_name = format!("host-direct-{host_id}");
+    backend
+        .using::<Environment>("flotilla")
+        .create(&InputMeta::builder().name(environment_name.clone()).build(), &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_id.to_string(), repo_default_dir: "/tmp".to_string() }),
+            docker: None,
+        })
+        .await
+        .expect("create attach environment");
+    let sessions = daemon.observed_resource_backend().using::<TerminalSession>("flotilla");
     let convoy_session = sessions
         .create(
             &InputMeta::builder()
@@ -137,7 +150,7 @@ async fn running_convoyless_session_emits_attachable_session_row() {
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
-                pool: "cleat".to_string(),
+                pool: "fake-terminals".to_string(),
             },
         )
         .await
@@ -150,6 +163,24 @@ async fn running_convoyless_session_emits_attachable_session_row() {
         })
         .await
         .expect("mark convoy terminal session running");
+    let unresolvable = sessions
+        .create(&InputMeta::builder().name("terminal-unresolvable".to_string()).build(), &TerminalSessionSpec {
+            env_ref: "missing-environment".to_string(),
+            role: "observer".to_string(),
+            source: TerminalSessionSource::Tool { command: "bash".to_string() },
+            cwd: "/repo".to_string(),
+            pool: "fake".to_string(),
+        })
+        .await
+        .expect("create unresolvable terminal session");
+    sessions
+        .update_status(&unresolvable.metadata.name, &unresolvable.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("cleat-unresolvable".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark unresolvable terminal session running");
     let options = RuntimeOptions {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),
@@ -166,11 +197,11 @@ async fn running_convoyless_session_emits_attachable_session_row() {
                 .labels(BTreeMap::from([(REPO_LABEL.to_string(), "flotilla-org/flotilla".to_string())]))
                 .build(),
             &TerminalSessionSpec {
-                env_ref: "host-direct-local".to_string(),
+                env_ref: environment_name,
                 role: "yeoman".to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
-                pool: "cleat".to_string(),
+                pool: "fake-terminals".to_string(),
             },
         )
         .await
@@ -207,12 +238,14 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     .await
     .expect("timed out waiting for sessions result rows");
 
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].name, "terminal-yeoman");
-    assert_eq!(rows[0].repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
-    assert_eq!(rows[0].host, HostName::new("local"));
-    assert_eq!(rows[0].attach.as_deref(), Some("terminal-yeoman"));
-    assert_eq!(rows[0].phase, flotilla_protocol::SessionPhase::Running);
+    let row = rows.iter().find(|row| row.name == "terminal-yeoman").expect("attachable session row");
+    assert_eq!(row.repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
+    assert_eq!(row.host, HostName::new("local"));
+    assert_eq!(row.attach.as_deref(), Some("terminal-yeoman"));
+    assert_eq!(row.phase, flotilla_protocol::SessionPhase::Running);
+    let unresolvable = rows.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
+    assert_eq!(unresolvable.attach, None);
+    assert!(daemon.resolve_attach_command_internal("terminal-yeoman").await.is_ok());
 
     let replay =
         daemon.subscribe_queries(&[QueryCursor { query: QueryId::Sessions, since: None }]).await.expect("subscribe to sessions query");
@@ -223,8 +256,9 @@ async fn running_convoyless_session_emits_attachable_session_row() {
             _ => None,
         })
         .expect("sessions replay result set");
-    assert_eq!(replayed.len(), 1);
-    assert_eq!(replayed[0].name, "terminal-yeoman");
+    assert_eq!(replayed.len(), 2);
+    let unresolvable = replayed.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
+    assert_eq!(unresolvable.attach, None);
 
     let replica = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot");
     let local_sessions = replica
@@ -233,7 +267,7 @@ async fn running_convoyless_session_emits_attachable_session_row() {
         .find(|result_set| result_set.query() == QueryId::Sessions)
         .map(session_rows)
         .expect("local sessions result set");
-    assert_eq!(local_sessions.len(), 1);
+    assert_eq!(local_sessions.len(), 2);
 
     let running = sessions.get("terminal-yeoman").await.expect("running terminal session");
     sessions
