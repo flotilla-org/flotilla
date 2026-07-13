@@ -46,10 +46,10 @@ pub struct Tabs {
 
 /// Repo tab decorations (unseen-changes and loading markers), and the
 /// dangling-repo fallback name.
-fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, qualified: bool) -> String {
+fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, level: usize) -> String {
     match model.repos.get(identity) {
         Some(rm) => {
-            let name = if qualified { format!("{}/{}", identity.authority, identity.path) } else { TuiModel::repo_name(&rm.path) };
+            let name = if level > 0 { format!("{}/{}", identity.authority, identity.path) } else { TuiModel::repo_name(&rm.path) };
             let loading = if rm.loading { " ⟳" } else { "" };
             let changed = if rm.has_unseen_changes { "*" } else { "" };
             format!("{name}{changed}{loading}")
@@ -63,36 +63,37 @@ fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, qual
     }
 }
 
-/// The default (pre-override) label for an open View's tab: the short form,
-/// or the parameter-qualified form when short labels collide.
-fn default_label(view: &OpenView, model: &TuiModel, qualified: bool) -> String {
+/// The default (pre-override) label for an open View's tab at a
+/// qualification `level`: 0 is the short form; each higher level widens the
+/// label with more qualifying parameters (saturating per kind).
+fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
     match &view.target {
         ViewTarget::View(ViewAddress::Overview) => " ⚓ flotilla ".to_string(),
-        ViewTarget::View(ViewAddress::Convoys { namespace }) if namespace == "flotilla" && !qualified => " 🚢 convoys ".to_string(),
+        ViewTarget::View(ViewAddress::Convoys { namespace }) if namespace == "flotilla" && level == 0 => " 🚢 convoys ".to_string(),
         ViewTarget::View(ViewAddress::Convoys { namespace }) => format!(" 🚢 {namespace} "),
-        ViewTarget::View(ViewAddress::Convoy { namespace, name }) => {
-            if qualified {
-                format!("🚢 {namespace}/{name}")
-            } else {
-                format!("🚢 {name}")
-            }
-        }
-        ViewTarget::View(ViewAddress::Vessel { convoy, vessel, .. }) => {
-            if qualified {
-                format!("{convoy}/{vessel}")
-            } else {
-                vessel.clone()
-            }
-        }
-        ViewTarget::View(ViewAddress::Project { namespace, name }) => {
-            if qualified {
-                format!("⛰ {namespace}/{name}")
-            } else {
-                format!("⛰ {name}")
-            }
-        }
-        ViewTarget::View(ViewAddress::Repo(identity)) => repo_label(identity, model, qualified),
+        ViewTarget::View(ViewAddress::Convoy { namespace, name }) => match level {
+            0 => format!("🚢 {name}"),
+            _ => format!("🚢 {namespace}/{name}"),
+        },
+        ViewTarget::View(ViewAddress::Vessel { namespace, convoy, vessel }) => match level {
+            0 => vessel.clone(),
+            1 => format!("{convoy}/{vessel}"),
+            _ => format!("{namespace}/{convoy}/{vessel}"),
+        },
+        ViewTarget::View(ViewAddress::Project { namespace, name }) => match level {
+            0 => format!("⛰ {name}"),
+            _ => format!("⛰ {namespace}/{name}"),
+        },
+        ViewTarget::View(ViewAddress::Repo(identity)) => repo_label(identity, model, level),
         ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
+    }
+}
+
+/// The deepest qualification level a view's label can widen to.
+fn max_label_level(view: &OpenView) -> usize {
+    match &view.target {
+        ViewTarget::View(ViewAddress::Vessel { .. }) => 2,
+        _ => 1,
     }
 }
 
@@ -101,27 +102,38 @@ fn default_label(view: &OpenView, model: &TuiModel, qualified: bool) -> String {
 pub fn tab_label(view: &OpenView, model: &TuiModel) -> String {
     match &view.label_override {
         Some(label) => label.clone(),
-        None => default_label(view, model, false),
+        None => default_label(view, model, 0),
     }
 }
 
-/// Labels for the whole tab bar: short defaults, widened with qualifying
-/// parameters only where two tabs would otherwise read the same.
+/// Labels for the whole tab bar: short defaults, progressively widened with
+/// qualifying parameters only where two tabs would otherwise read the same
+/// (vessel labels widen to convoy/vessel, then namespace/convoy/vessel).
+/// User overrides never widen.
 fn tab_labels(views: &OpenViews, model: &TuiModel) -> Vec<String> {
-    let labels: Vec<String> = views.iter().map(|view| tab_label(view, model)).collect();
-    labels
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            let view = views.get(i).expect("label index in range");
-            let collides = labels.iter().enumerate().any(|(j, other)| j != i && other == label);
-            if collides && view.label_override.is_none() {
-                default_label(view, model, true)
-            } else {
-                label.clone()
+    let mut levels = vec![0usize; views.len()];
+    let mut labels: Vec<String> = views.iter().map(|view| tab_label(view, model)).collect();
+    // Each pass widens every still-colliding label by one level; two passes
+    // reach the deepest qualification any kind has.
+    for _ in 0..2 {
+        let mut changed = false;
+        for (i, view) in views.iter().enumerate() {
+            let collides = labels.iter().enumerate().any(|(j, other)| j != i && other == &labels[i]);
+            if collides && view.label_override.is_none() && levels[i] < max_label_level(view) {
+                levels[i] += 1;
+                changed = true;
             }
-        })
-        .collect()
+        }
+        if !changed {
+            break;
+        }
+        for (i, view) in views.iter().enumerate() {
+            if view.label_override.is_none() {
+                labels[i] = default_label(view, model, levels[i]);
+            }
+        }
+    }
+    labels
 }
 
 impl Tabs {
@@ -393,6 +405,20 @@ mod tests {
         assert_eq!(labels[1], "alpha/leg-1", "colliding label widens");
         assert_eq!(labels[2], "bravo/leg-1", "colliding label widens");
         assert_eq!(labels[3], "solo", "unique label stays short");
+    }
+
+    #[test]
+    fn cross_namespace_vessel_collisions_widen_to_the_namespace() {
+        let app = stub_app_with_repos(0);
+        let mut views = OpenViews::from_entries(vec![]);
+        // Same convoy and vessel names in two namespaces: convoy/vessel is
+        // still ambiguous, so the labels widen all the way to the namespace.
+        views.open_or_focus("vessel/ns-one/alpha/leg-1".parse().expect("valid"));
+        views.open_or_focus("vessel/ns-two/alpha/leg-1".parse().expect("valid"));
+
+        let labels = tab_labels(&views, &app.model);
+        assert_eq!(labels[1], "ns-one/alpha/leg-1");
+        assert_eq!(labels[2], "ns-two/alpha/leg-1");
     }
 
     #[test]
