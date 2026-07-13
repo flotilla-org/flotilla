@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use flotilla_protocol::{
-    panel::{PanelDelta, PanelSnapshot, TabView},
     qualified_path::HostId,
+    result_set::{QueryId, ResultDelta, ResultSet, Rows},
     EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -49,6 +49,34 @@ fn make_delta(repo: &Path, prev_seq: u64, seq: u64) -> RepoDelta {
     RepoDelta { seq, prev_seq, repo_identity: repo_identity(), repo: Some(repo.to_path_buf()), changes: vec![], work_items: vec![] }
 }
 
+fn test_context(
+    local_seqs: &Arc<SeqMap>,
+    subscribed_queries: &Arc<QuerySet>,
+    recovering: &Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
+    event_tx: &broadcast::Sender<DaemonEvent>,
+    session: &SharedSession,
+    pending: &SharedPending,
+    next_id: &Arc<AtomicU64>,
+) -> EventContext {
+    EventContext {
+        local_seqs: Arc::clone(local_seqs),
+        subscribed_queries: Arc::clone(subscribed_queries),
+        recovering: Arc::clone(recovering),
+        event_tx: event_tx.clone(),
+        session: Arc::clone(session),
+        pending: Arc::clone(pending),
+        next_id: Arc::clone(next_id),
+    }
+}
+
+fn no_subscriptions() -> Arc<QuerySet> {
+    Arc::new(std::sync::RwLock::new(HashSet::new()))
+}
+
+fn convoys_subscription() -> Arc<QuerySet> {
+    Arc::new(std::sync::RwLock::new(HashSet::from([QueryId::Convoys])))
+}
+
 fn request_harness() -> RequestHarness {
     let (client, server) = message_session_pair();
     RequestHarness {
@@ -83,6 +111,33 @@ async fn read_request(session: &MessageSession) -> (u64, Request) {
         Some(Message::Request { id, request }) => (id, request),
         other => panic!("expected request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn stateful_handshake_rejects_daemon_with_version_mismatch() {
+    let (client, server) = message_session_pair();
+
+    let server_task = tokio::spawn(async move {
+        let hello = server.read().await.expect("read client hello").expect("client hello");
+        assert!(matches!(hello, Message::Hello { protocol_version, .. } if protocol_version == PROTOCOL_VERSION));
+        server
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION + 1,
+                node_id: NodeId::new("daemon"),
+                display_name: "daemon".into(),
+                session_id: uuid::Uuid::nil(),
+                connection_role: Some(ConnectionRole::Client),
+            })
+            .await
+            .expect("write mismatched hello");
+    });
+
+    let err = match SocketDaemon::from_session_stateful(client).await {
+        Ok(_) => panic!("mismatched version must fail the handshake"),
+        Err(err) => err,
+    };
+    assert!(err.contains("protocol version mismatch"), "error should name the mismatch: {err}");
+    server_task.await.expect("join server task");
 }
 
 #[tokio::test]
@@ -276,21 +331,11 @@ async fn handle_event_updates_local_seqs_for_full_and_matching_delta() {
 
     handle_event(
         DaemonEvent::RepoSnapshot(Box::new(make_snapshot(&repo, 10))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 10, 11))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let first = event_rx.recv().await.expect("event");
@@ -312,12 +357,7 @@ async fn handle_event_buffers_delta_when_recovery_already_running() {
 
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 99, 100))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let buffered = recovering.lock().unwrap().get(&repo_identity()).cloned().expect("buffer exists");
@@ -334,13 +374,17 @@ async fn recover_from_gap_requests_replay_and_applies_seqs() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -400,12 +444,7 @@ async fn handle_event_starts_recovery_for_unknown_repo_delta() {
     // Delta for a repo we have no local seq for — should start recovery.
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 0, 1))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     // Recovery should have been initiated: repo should appear in recovering map.
@@ -427,12 +466,7 @@ async fn handle_event_starts_recovery_on_seq_gap() {
     // Delta with prev_seq=10 but local is 5 — gap.
     handle_event(
         DaemonEvent::RepoDelta(Box::new(make_delta(&repo, 10, 11))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let guard = recovering.lock().expect("recovering mutex not poisoned");
@@ -460,7 +494,10 @@ async fn handle_event_forwards_repo_added() {
         provider_health: HashMap::new(),
         loading: false,
     };
-    handle_event(DaemonEvent::RepoTracked(Box::new(repo_info)), &local_seqs, &recovering, &event_tx, &session, &pending, &next_id);
+    handle_event(
+        DaemonEvent::RepoTracked(Box::new(repo_info)),
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
+    );
 
     let event = event_rx.try_recv().expect("should receive RepoTracked");
     assert!(matches!(event, DaemonEvent::RepoTracked(_)));
@@ -481,12 +518,7 @@ async fn handle_event_forwards_command_started() {
             repo_identity: repo_identity(),
             description: "testing".into(),
         },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let event = event_rx.try_recv().expect("should receive CommandStarted");
@@ -508,12 +540,7 @@ async fn handle_event_forwards_command_finished() {
             repo_identity: repo_identity(),
             result: flotilla_protocol::commands::CommandValue::Ok,
         },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let event = event_rx.try_recv().expect("should receive CommandFinished");
@@ -538,12 +565,7 @@ async fn handle_event_forwards_command_step_update() {
             description: "step 2".into(),
             status: flotilla_protocol::commands::StepStatus::Started,
         },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let event = event_rx.try_recv().expect("should receive CommandStepUpdate");
@@ -559,12 +581,7 @@ async fn handle_event_forwards_peer_status_changed() {
 
     handle_event(
         DaemonEvent::PeerStatusChanged { node_id: NodeId::new("peer-1"), status: flotilla_protocol::PeerConnectionState::Connected },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let event = event_rx.try_recv().expect("should receive PeerStatusChanged");
@@ -581,12 +598,7 @@ async fn handle_event_forwards_host_removed_and_tracks_seq() {
 
     handle_event(
         DaemonEvent::HostRemoved { environment_id: environment_id.clone(), seq: 9 },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     let event = event_rx.try_recv().expect("should receive HostRemoved");
@@ -607,12 +619,7 @@ async fn handle_event_repo_removed_evicts_seq_and_forwards() {
 
     handle_event(
         DaemonEvent::RepoUntracked { path: Some(repo.clone()), repo_identity: repo_identity() },
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        &test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
     // Seq should be evicted.
@@ -635,13 +642,17 @@ async fn recover_from_gap_handles_parse_error_gracefully() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -669,7 +680,8 @@ async fn recover_from_gap_handles_request_failure_gracefully() {
     let (session, pending, next_id) = broken_request_harness();
 
     // recover_from_gap should complete without panic even when the request fails.
-    recover_from_gap(&local_seqs, &event_tx, &session, &pending, &next_id).await;
+    let recovering = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    recover_from_gap(&test_context(&local_seqs, &no_subscriptions(), &recovering, &event_tx, &session, &pending, &next_id)).await;
     // Local seqs should remain unchanged.
     assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&StreamKey::Repo { identity: repo_identity() }), Some(&5));
 }
@@ -684,13 +696,17 @@ async fn recover_from_gap_handles_error_response_gracefully() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -715,13 +731,17 @@ async fn recover_from_gap_applies_full_snapshot_seqs() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -750,15 +770,19 @@ async fn recover_from_gap_does_not_regress_seq_from_concurrent_live_update() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
         // Set seq high before recovery starts to validate the monotonic guard.
-        recover_local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 20);
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_context.local_seqs.write().expect("local_seqs write lock").insert(StreamKey::Repo { identity: repo_identity() }, 20);
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -786,13 +810,17 @@ async fn recover_from_gap_forwards_non_snapshot_replay_events() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -827,13 +855,17 @@ async fn recover_from_gap_handles_empty_replay() {
 
     let harness = request_harness();
 
-    let recover_local_seqs = Arc::clone(&local_seqs);
-    let recover_event_tx = event_tx.clone();
-    let recover_session = Arc::clone(&harness.session);
-    let recover_pending = Arc::clone(&harness.pending);
-    let recover_next_id = Arc::clone(&harness.next_id);
+    let recover_context = test_context(
+        &local_seqs,
+        &no_subscriptions(),
+        &Arc::new(std::sync::Mutex::new(HashMap::new())),
+        &event_tx,
+        &harness.session,
+        &harness.pending,
+        &harness.next_id,
+    );
     let recover_task = tokio::spawn(async move {
-        recover_from_gap(&recover_local_seqs, &recover_event_tx, &recover_session, &recover_pending, &recover_next_id).await;
+        recover_from_gap(&recover_context).await;
     });
 
     let (id, request) = read_request(&harness.remote).await;
@@ -852,113 +884,116 @@ async fn recover_from_gap_handles_empty_replay() {
     assert_eq!(local_seqs.read().expect("local_seqs read lock").get(&StreamKey::Repo { identity: repo_identity() }), Some(&5));
 }
 
-// --- Panel stream gap detection ---
+// --- Query result stream gap detection ---
 
-fn make_panel_snapshot(tab: &str, seq: u64) -> PanelSnapshot {
-    PanelSnapshot { seq, tab: TabView { id: tab.to_string(), title: "Convoys".to_string(), panels: vec![] } }
+fn make_result_set(seq: u64) -> ResultSet {
+    ResultSet { seq, rows: Rows::Convoys(vec![]) }
 }
 
-fn make_panel_delta(tab: &str, seq: u64) -> PanelDelta {
-    PanelDelta { seq, tab_id: tab.to_string(), panels: vec![] }
+fn make_result_delta(seq: u64) -> ResultDelta {
+    ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }
 }
 
 #[tokio::test]
-async fn handle_event_panel_snapshot_updates_local_seq_and_forwards() {
+async fn handle_event_result_set_updates_local_seq_and_forwards() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
 
     handle_event(
-        DaemonEvent::PanelSnapshot(Box::new(make_panel_snapshot("convoys", 5))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        DaemonEvent::ResultSet(Box::new(make_result_set(5))),
+        &test_context(&local_seqs, &convoys_subscription(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
-    let event = event_rx.try_recv().expect("should receive PanelSnapshot");
-    assert!(matches!(event, DaemonEvent::PanelSnapshot(_)));
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(5));
+    let event = event_rx.try_recv().expect("should receive ResultSet");
+    assert!(matches!(event, DaemonEvent::ResultSet(_)));
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(5));
 }
 
 #[tokio::test]
-async fn handle_event_panel_delta_happy_path_applies_and_forwards() {
+async fn handle_event_result_delta_happy_path_applies_and_forwards() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Panel { tab: "convoys".into() }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, mut event_rx) = broadcast::channel(16);
     let (session, pending, next_id, _server) = event_harness();
 
     // seq=2, local is 1 — exactly one ahead, happy path.
     handle_event(
-        DaemonEvent::PanelDelta(Box::new(make_panel_delta("convoys", 2))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(2))),
+        &test_context(&local_seqs, &convoys_subscription(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
-    let event = event_rx.try_recv().expect("should receive PanelDelta");
-    assert!(matches!(event, DaemonEvent::PanelDelta(_)));
-    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Panel { tab: "convoys".into() }).copied(), Some(2));
+    let event = event_rx.try_recv().expect("should receive ResultDelta");
+    assert!(matches!(event, DaemonEvent::ResultDelta(_)));
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(2));
 }
 
 #[tokio::test]
-async fn handle_event_panel_delta_seq_gap_triggers_recovery() {
+async fn handle_event_result_delta_stale_seq_is_ignored() {
+    let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    // Local seq is 5 — a delta at seq 5 is already covered by the current
+    // result set (e.g. it raced ahead of the subscribe replay).
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 5);
+    let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let (event_tx, mut event_rx) = broadcast::channel(16);
+    let (session, pending, next_id, _server) = event_harness();
+
+    handle_event(
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(5))),
+        &test_context(&local_seqs, &convoys_subscription(), &recovering, &event_tx, &session, &pending, &next_id),
+    );
+
+    assert!(event_rx.try_recv().is_err(), "stale delta must not be forwarded");
+    assert_eq!(local_seqs.read().expect("sequence lock").get(&StreamKey::Query { query: QueryId::Convoys }).copied(), Some(5));
+}
+
+#[tokio::test]
+async fn handle_event_result_delta_seq_gap_triggers_resubscribe() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
     // Local seq is 1, but incoming delta seq is 3 — seq 2 was dropped.
-    local_seqs.write().expect("sequence lock").insert(StreamKey::Panel { tab: "convoys".into() }, 1);
+    local_seqs.write().expect("sequence lock").insert(StreamKey::Query { query: QueryId::Convoys }, 1);
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (session, pending, next_id, server) = event_harness();
 
     handle_event(
-        DaemonEvent::PanelDelta(Box::new(make_panel_delta("convoys", 3))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(3))),
+        &test_context(&local_seqs, &convoys_subscription(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
-    // Recovery should be spawned: a ReplaySince request should arrive on the server end.
+    // Recovery should be spawned: a SubscribeQueries request should arrive
+    // with the current cursor.
     let (_, request) = tokio::time::timeout(std::time::Duration::from_secs(1), read_request(&server))
         .await
-        .expect("expected ReplaySince request within 1 second");
+        .expect("expected SubscribeQueries request within 1 second");
 
-    assert!(matches!(request, Request::ReplaySince { .. }), "panel seq gap should trigger a ReplaySince request, got: {request:?}");
+    let Request::SubscribeQueries { queries } = request else {
+        panic!("result seq gap should trigger a SubscribeQueries request, got: {request:?}");
+    };
+    assert_eq!(queries, vec![QueryCursor { query: QueryId::Convoys, since: Some(1) }]);
 }
 
 #[tokio::test]
-async fn handle_event_panel_delta_for_unknown_tab_triggers_recovery() {
+async fn handle_event_result_delta_for_unknown_query_triggers_resubscribe() {
     let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    // No local seq for "flotilla" at all.
+    // Subscribed, but no result set applied yet.
     let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let (event_tx, _event_rx) = broadcast::channel(16);
     let (session, pending, next_id, server) = event_harness();
 
     handle_event(
-        DaemonEvent::PanelDelta(Box::new(make_panel_delta("convoys", 1))),
-        &local_seqs,
-        &recovering,
-        &event_tx,
-        &session,
-        &pending,
-        &next_id,
+        DaemonEvent::ResultDelta(Box::new(make_result_delta(1))),
+        &test_context(&local_seqs, &convoys_subscription(), &recovering, &event_tx, &session, &pending, &next_id),
     );
 
-    // Recovery should be spawned: a ReplaySince request should arrive.
+    // Recovery should be spawned: a SubscribeQueries request should arrive.
     let (_, request) = tokio::time::timeout(std::time::Duration::from_secs(1), read_request(&server))
         .await
-        .expect("expected ReplaySince request within 1 second for unknown panel delta");
+        .expect("expected SubscribeQueries request within 1 second for unknown query delta");
 
-    assert!(matches!(request, Request::ReplaySince { .. }), "delta for unknown panel should trigger recovery, got: {request:?}");
+    assert!(matches!(request, Request::SubscribeQueries { .. }), "delta for unknown query should trigger resubscribe, got: {request:?}");
 }
 
 // --- ResponseResult helper paths ---

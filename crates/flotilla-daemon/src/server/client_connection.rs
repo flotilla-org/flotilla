@@ -1,15 +1,31 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use flotilla_core::{agents::SharedAgentStateStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{Message, Request};
+use flotilla_protocol::{DaemonEvent, Message, QueryId, Request};
 use flotilla_transport::message::MessageSession;
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
 
 use super::{remote_commands::RemoteCommandRouter, request_dispatch::RequestDispatcher};
+
+/// Named queries a client connection has subscribed to. Result-set events
+/// for other queries are not relayed to the connection.
+pub(super) type QuerySubscriptions = Arc<RwLock<HashSet<QueryId>>>;
+
+fn event_subscribed(event: &DaemonEvent, subscriptions: &QuerySubscriptions) -> bool {
+    let query = match event {
+        DaemonEvent::ResultSet(result_set) => result_set.query(),
+        DaemonEvent::ResultDelta(delta) => delta.query(),
+        _ => return true,
+    };
+    subscriptions.read().expect("query subscriptions lock poisoned").contains(&query)
+}
 
 pub(super) struct ClientConnection {
     daemon: Arc<InProcessDaemon>,
@@ -71,10 +87,15 @@ impl ClientConnection {
 
         let event_session = Arc::clone(session);
         let mut event_rx = self.daemon.subscribe();
+        let subscriptions = QuerySubscriptions::default();
+        let event_subscriptions = Arc::clone(&subscriptions);
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
+                        if !event_subscribed(&event, &event_subscriptions) {
+                            continue;
+                        }
                         let msg = Message::Event { event: Box::new(event) };
                         if event_session.write(msg).await.is_err() {
                             break;
@@ -88,7 +109,8 @@ impl ClientConnection {
             }
         });
 
-        let request_dispatcher = RequestDispatcher::new(&self.daemon, &self.remote_command_router, &self.agent_state_store, session_id);
+        let request_dispatcher =
+            RequestDispatcher::new(&self.daemon, &self.remote_command_router, &self.agent_state_store, session_id, subscriptions);
         (event_task, request_dispatcher, self.shutdown_rx.clone())
     }
 

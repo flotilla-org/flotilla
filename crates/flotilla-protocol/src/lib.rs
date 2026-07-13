@@ -7,13 +7,14 @@ mod host;
 mod host_summary;
 pub mod issue_query;
 pub mod output;
-pub mod panel;
 pub mod path_context;
 pub mod peer;
 pub mod provider_data;
 mod provisioning_target;
 pub mod qualified_path;
 pub mod query;
+pub mod resource_ref;
+pub mod result_set;
 pub mod snapshot;
 pub mod step;
 
@@ -94,6 +95,8 @@ pub use query::{
     ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse,
     TopologyRoute, UnmetRequirementInfo,
 };
+pub use resource_ref::ResourceRef;
+pub use result_set::{ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, ResultSet, Rows, VesselRow, WorkPhase};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +111,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -119,14 +122,24 @@ pub enum StreamKey {
     Repo { identity: RepoIdentity },
     #[serde(rename = "host")]
     Host { environment_id: EnvironmentId },
-    #[serde(rename = "panel")]
-    Panel { tab: String },
+    #[serde(rename = "query")]
+    Query { query: QueryId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayCursor {
     pub stream: StreamKey,
     pub seq: u64,
+}
+
+/// Per-query resume point for [`Request::SubscribeQueries`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCursor {
+    pub query: QueryId,
+    /// Last result-set seq the client has applied; `None` requests a full
+    /// [`ResultSet`] unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<u64>,
 }
 
 /// Typed client-to-daemon RPC requests.
@@ -136,16 +149,39 @@ pub struct ReplayCursor {
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum Request {
     ListRepos,
-    GetState { repo: std::path::PathBuf },
-    Execute { command: Command },
-    Cancel { command_id: u64 },
-    Refresh { repo: std::path::PathBuf },
-    AddRepo { path: std::path::PathBuf },
-    RemoveRepo { path: std::path::PathBuf },
-    ReplaySince { last_seen: Vec<ReplayCursor> },
+    GetState {
+        repo: std::path::PathBuf,
+    },
+    Execute {
+        command: Command,
+    },
+    Cancel {
+        command_id: u64,
+    },
+    Refresh {
+        repo: std::path::PathBuf,
+    },
+    AddRepo {
+        path: std::path::PathBuf,
+    },
+    RemoveRepo {
+        path: std::path::PathBuf,
+    },
+    ReplaySince {
+        last_seen: Vec<ReplayCursor>,
+    },
+    /// Subscribe this connection to the given named queries, replacing any
+    /// previous subscription set. For each query whose cursor is absent or
+    /// stale the daemon emits a full [`ResultSet`]; thereafter the connection
+    /// receives that query's events. Unsubscribed queries are not delivered.
+    SubscribeQueries {
+        queries: Vec<QueryCursor>,
+    },
     GetStatus,
     GetTopology,
-    AgentHook { event: AgentHookEvent },
+    AgentHook {
+        event: AgentHookEvent,
+    },
 }
 
 /// Typed daemon RPC success payloads.
@@ -157,16 +193,24 @@ pub enum Request {
 pub enum Response {
     ListRepos(Vec<RepoInfo>),
     GetState(Box<RepoSnapshot>),
-    Execute { command_id: u64 },
+    Execute {
+        command_id: u64,
+    },
     Cancel,
     Refresh,
     AddRepo,
     RemoveRepo,
     ReplaySince(Vec<DaemonEvent>),
+    /// Replay events for the newly subscribed queries: a full [`ResultSet`]
+    /// per query whose cursor was absent or stale.
+    SubscribeQueries(Vec<DaemonEvent>),
     GetStatus(StatusResponse),
     GetTopology(TopologyResponse),
     AgentHook,
-    QueryResult { command_id: u64, value: commands::CommandValue },
+    QueryResult {
+        command_id: u64,
+        value: commands::CommandValue,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,10 +317,13 @@ pub enum DaemonEvent {
     /// Node stream tombstone — sent when a previously visible node disappears.
     #[serde(rename = "host_removed")]
     HostRemoved { environment_id: EnvironmentId, seq: u64 },
-    #[serde(rename = "panel_snapshot")]
-    PanelSnapshot(Box<crate::panel::PanelSnapshot>),
-    #[serde(rename = "panel_delta")]
-    PanelDelta(Box<crate::panel::PanelDelta>),
+    /// Full result set for a subscribed named query — sent on subscribe and
+    /// after seq gaps.
+    #[serde(rename = "result_set")]
+    ResultSet(Box<ResultSet>),
+    /// Incremental result-set update for a subscribed named query.
+    #[serde(rename = "result_delta")]
+    ResultDelta(Box<ResultDelta>),
 }
 
 /// Peer connection state as seen by the TUI.

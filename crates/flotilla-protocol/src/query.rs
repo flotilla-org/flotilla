@@ -172,8 +172,10 @@ pub struct FleetReplicaSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<String>,
     pub rows: Vec<FleetListRow>,
+    /// This host's local result sets, one per named query — the unit of
+    /// federated query union when replicas merge.
     #[serde(default)]
-    pub panels: Vec<crate::panel::PanelSnapshot>,
+    pub result_sets: Vec<crate::result_set::ResultSet>,
 }
 
 // --- host / topology ---

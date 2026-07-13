@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    commands::CommandValue, Command, DaemonEvent, RepoInfo, RepoSelector, RepoSnapshot, StatusResponse, StreamKey, TopologyResponse,
+    commands::CommandValue, Command, DaemonEvent, QueryCursor, RepoInfo, RepoSelector, RepoSnapshot, StatusResponse, StreamKey,
+    TopologyResponse,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -40,6 +41,16 @@ pub trait DaemonHandle: Send + Sync {
     ///
     /// Repos not in `last_seen` get a `RepoSnapshot`.
     async fn replay_since(&self, last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String>;
+
+    /// Subscribe to named query result sets, replacing any previous
+    /// subscription. Returns a full `ResultSet` event for each query whose
+    /// cursor is absent or stale; subsequent updates arrive as `ResultSet`/
+    /// `ResultDelta` events on the event stream.
+    ///
+    /// Delivery restriction is a transport concern: `SocketDaemon`
+    /// connections only receive events for subscribed queries, while
+    /// `InProcessDaemon`'s shared broadcast may over-deliver.
+    async fn subscribe_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String>;
 
     /// Execute a query command synchronously. Returns the result directly
     /// without broadcasting. Only valid for commands where `action.is_query()`.

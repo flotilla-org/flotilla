@@ -11,7 +11,7 @@ pub(crate) mod test_support;
 pub mod ui_state;
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -21,7 +21,6 @@ use flotilla_core::{
     daemon::DaemonHandle,
 };
 use flotilla_protocol::{
-    panel::{IntentTarget, PanelRow, PanelValue, ResourceRef, Timestamp},
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
     ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, WorkItem,
     WorkItemIdentity,
@@ -34,6 +33,7 @@ use ui_state::PendingStatus;
 pub use ui_state::{BranchInputKind, DirEntry, RepoViewLayout, TabId, UiState};
 
 use crate::{
+    convoy_model::{ConvoyId, ConvoySummary},
     keymap::Keymap,
     shared::Shared,
     theme::Theme,
@@ -264,7 +264,7 @@ impl TuiModel {
 pub type NamespaceMap = HashMap<String, NamespaceModel>;
 
 /// Per-namespace convoy state tracked by the TUI. Populated from
-/// `DaemonEvent::PanelSnapshot` and updated by `DaemonEvent::PanelDelta`.
+/// `DaemonEvent::ResultSet` and updated by `DaemonEvent::ResultDelta`.
 #[derive(Default)]
 pub struct NamespaceModel {
     pub convoys: IndexMap<crate::convoy_model::ConvoyId, crate::convoy_model::ConvoySummary>,
@@ -356,134 +356,6 @@ pub fn filter_convoys_by_str<'a>(
     })
 }
 
-fn panel_convoy_id(resource: &ResourceRef) -> crate::convoy_model::ConvoyId {
-    let name = match &resource.host {
-        Some(host) => format!("{}@{}", resource.name, host.as_str()),
-        None => resource.name.clone(),
-    };
-    crate::convoy_model::ConvoyId::new(&resource.namespace, name)
-}
-
-fn panel_row_to_convoy(row: &PanelRow) -> Option<crate::convoy_model::ConvoySummary> {
-    if row.resource.kind != "Convoy" || row.resource.subresource.is_some() {
-        return None;
-    }
-    let name = panel_string(&row.values, "name")?;
-    let vessels = row
-        .children
-        .iter()
-        .filter_map(|child| {
-            let name = panel_string(&child.values, "name")?;
-            let attach_target = child.intents.iter().find_map(|intent| match &intent.target {
-                IntentTarget::Vessel { attach_ref: Some(attach_ref), host, .. } if intent.intent_id == "attach" => {
-                    Some((attach_ref.clone(), host.clone()))
-                }
-                IntentTarget::Vessel { .. } => None,
-            });
-            let completion_target = child.intents.iter().find_map(|intent| match &intent.target {
-                IntentTarget::Vessel { convoy, vessel, host, .. } if intent.intent_id == "complete-work" => {
-                    Some(crate::convoy_model::WorkCompletionTarget { convoy: convoy.clone(), vessel: vessel.clone(), host: host.clone() })
-                }
-                IntentTarget::Vessel { .. } => None,
-            });
-            let workspace_ref = attach_target.as_ref().map(|(attach_ref, _)| attach_ref.clone());
-            let intent_host = attach_target.map(|(_, host)| host);
-            Some(crate::convoy_model::VesselSummary {
-                name: name.to_string(),
-                depends_on: child
-                    .depends_on
-                    .iter()
-                    .filter_map(|reference| reference.subresource.as_deref()?.strip_prefix("vessels/").map(str::to_string))
-                    .collect(),
-                phase: work_phase(panel_string(&child.values, "phase")?),
-                crew: panel_crew(&child.values),
-                host: intent_host.or_else(|| panel_host(&child.values, "host")).or_else(|| child.resource.host.clone()),
-                checkout: panel_checkout(&child.values, "checkout"),
-                workspace_ref,
-                completion_target,
-                ready_at: panel_timestamp(&child.values, "ready_at"),
-                started_at: panel_timestamp(&child.values, "started_at"),
-                finished_at: panel_timestamp(&child.values, "finished_at"),
-                message: panel_string(&child.values, "message").map(str::to_string),
-            })
-        })
-        .collect();
-    Some(crate::convoy_model::ConvoySummary {
-        id: panel_convoy_id(&row.resource),
-        namespace: row.resource.namespace.clone(),
-        name: name.to_string(),
-        workflow_ref: panel_string(&row.values, "workflow_ref").unwrap_or_default().to_string(),
-        phase: convoy_phase(panel_string(&row.values, "phase")?),
-        message: panel_string(&row.values, "message").map(str::to_string),
-        repo_hint: panel_string(&row.values, "repo").map(|repo| flotilla_protocol::RepoKey(repo.to_string())),
-        vessels,
-        started_at: panel_timestamp(&row.values, "started_at"),
-        finished_at: panel_timestamp(&row.values, "finished_at"),
-        observed_workflow_ref: panel_string(&row.values, "observed_workflow_ref").map(str::to_string),
-        initializing: row.values.get("initializing").and_then(PanelValue::as_bool).unwrap_or(false),
-    })
-}
-
-fn panel_string<'a>(values: &'a BTreeMap<String, PanelValue>, key: &str) -> Option<&'a str> {
-    values.get(key).and_then(PanelValue::as_str)
-}
-
-fn panel_timestamp(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<Timestamp> {
-    match values.get(key) {
-        Some(PanelValue::Timestamp(value)) => Some(*value),
-        _ => None,
-    }
-}
-
-fn panel_host(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<HostName> {
-    match values.get(key) {
-        Some(PanelValue::Host(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn panel_checkout(values: &BTreeMap<String, PanelValue>, key: &str) -> Option<flotilla_protocol::CheckoutRef> {
-    match values.get(key) {
-        Some(PanelValue::Checkout(value)) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn panel_crew(values: &BTreeMap<String, PanelValue>) -> Vec<crate::convoy_model::ProcessSummary> {
-    let Some(PanelValue::List(crew)) = values.get("crew") else { return Vec::new() };
-    crew.iter()
-        .filter_map(|member| {
-            let PanelValue::Map(member) = member else { return None };
-            Some(crate::convoy_model::ProcessSummary {
-                role: panel_string(member, "role")?.to_string(),
-                command_preview: panel_string(member, "command_preview").unwrap_or_default().to_string(),
-            })
-        })
-        .collect()
-}
-
-fn work_phase(phase: &str) -> crate::convoy_model::WorkPhase {
-    match phase {
-        "ready" => crate::convoy_model::WorkPhase::Ready,
-        "launching" => crate::convoy_model::WorkPhase::Launching,
-        "running" => crate::convoy_model::WorkPhase::Running,
-        "complete" => crate::convoy_model::WorkPhase::Complete,
-        "failed" => crate::convoy_model::WorkPhase::Failed,
-        "cancelled" => crate::convoy_model::WorkPhase::Cancelled,
-        _ => crate::convoy_model::WorkPhase::Pending,
-    }
-}
-
-fn convoy_phase(phase: &str) -> crate::convoy_model::ConvoyPhase {
-    match phase {
-        "active" => crate::convoy_model::ConvoyPhase::Active,
-        "completed" => crate::convoy_model::ConvoyPhase::Completed,
-        "failed" => crate::convoy_model::ConvoyPhase::Failed,
-        "cancelled" => crate::convoy_model::ConvoyPhase::Cancelled,
-        _ => crate::convoy_model::ConvoyPhase::Pending,
-    }
-}
-
 /// Log provider errors and format them into a status message.
 ///
 /// Suppresses "issues disabled" messages since the daemon handles those.
@@ -530,7 +402,7 @@ pub struct App {
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
     /// Per-namespace convoy state. Keyed by namespace string. Populated from
-    /// `DaemonEvent::PanelSnapshot` / `PanelDelta`.
+    /// `DaemonEvent::ResultSet` / `ResultDelta`.
     pub namespaces: HashMap<String, NamespaceModel>,
     /// Convoys tab UI state (selection, filter).
     pub convoys_ui: ConvoysUiState,
@@ -1301,19 +1173,19 @@ impl App {
                     self.ui.provisioning_target = ProvisioningTarget::Host { host: HostName::local() };
                 }
             }
-            DaemonEvent::PanelSnapshot(snapshot) => {
-                let Some(panel) = snapshot.tab.panels.iter().find(|panel| panel.id.as_str() == "convoys") else { return };
+            DaemonEvent::ResultSet(result_set) => {
+                let Some(rows) = result_set.rows.as_convoys() else { return };
                 let mut touched: Vec<_> = self.namespaces.keys().cloned().collect();
                 if touched.is_empty() {
                     touched.push("flotilla".to_string());
                 }
                 self.namespaces.clear();
-                for row in &panel.rows {
-                    let Some(convoy) = panel_row_to_convoy(row) else { continue };
+                for row in rows {
+                    let convoy = ConvoySummary::from(row);
                     let namespace = convoy.namespace.clone();
                     let entry = self.namespaces.entry(namespace.clone()).or_default();
                     entry.convoys.insert(convoy.id.clone(), convoy);
-                    entry.last_seq = snapshot.seq;
+                    entry.last_seq = result_set.seq;
                     if !touched.contains(&namespace) {
                         touched.push(namespace);
                     }
@@ -1322,11 +1194,11 @@ impl App {
                     self.refresh_convoy_selection(&namespace);
                 }
             }
-            DaemonEvent::PanelDelta(delta) => {
-                let Some(panel) = delta.panels.iter().find(|panel| panel.panel_id.as_str() == "convoys") else { return };
+            DaemonEvent::ResultDelta(delta) => {
+                let Some(changed) = delta.changed.as_convoys() else { return };
                 let mut touched = Vec::new();
-                for row in &panel.changed {
-                    let Some(convoy) = panel_row_to_convoy(row) else { continue };
+                for row in changed {
+                    let convoy = ConvoySummary::from(row);
                     let namespace = convoy.namespace.clone();
                     let entry = self.namespaces.entry(namespace.clone()).or_default();
                     entry.convoys.insert(convoy.id.clone(), convoy);
@@ -1335,10 +1207,10 @@ impl App {
                         touched.push(namespace);
                     }
                 }
-                for removed in &panel.removed {
+                for removed in &delta.removed {
                     let namespace = removed.namespace.clone();
                     if let Some(entry) = self.namespaces.get_mut(&namespace) {
-                        entry.convoys.shift_remove(&panel_convoy_id(removed));
+                        entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
                         entry.last_seq = delta.seq;
                     }
                     if !touched.contains(&namespace) {

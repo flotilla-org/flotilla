@@ -8,13 +8,14 @@ use flotilla_core::{
 use flotilla_protocol::{AgentHookEvent, Command, CommandAction, Message, RepoSelector, Request, Response};
 use tracing::warn;
 
-use super::remote_commands::RemoteCommandRouter;
+use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
 
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
     remote_command_router: &'a RemoteCommandRouter,
     agent_state_store: &'a SharedAgentStateStore,
     session_id: uuid::Uuid,
+    query_subscriptions: QuerySubscriptions,
 }
 
 impl<'a> RequestDispatcher<'a> {
@@ -23,8 +24,9 @@ impl<'a> RequestDispatcher<'a> {
         remote_command_router: &'a RemoteCommandRouter,
         agent_state_store: &'a SharedAgentStateStore,
         session_id: uuid::Uuid,
+        query_subscriptions: QuerySubscriptions,
     ) -> Self {
-        Self { daemon, remote_command_router, agent_state_store, session_id }
+        Self { daemon, remote_command_router, agent_state_store, session_id, query_subscriptions }
     }
 
     pub(super) async fn dispatch(&self, id: u64, request: Request) -> Message {
@@ -100,6 +102,20 @@ impl<'a> RequestDispatcher<'a> {
                 let last_seen = last_seen.into_iter().map(|entry| (entry.stream, entry.seq)).collect();
                 match self.daemon.replay_since(&last_seen).await {
                     Ok(events) => Message::ok_response(id, Response::ReplaySince(events)),
+                    Err(e) => Message::error_response(id, e),
+                }
+            }
+
+            Request::SubscribeQueries { queries } => {
+                // Register interest before computing the replay so no event
+                // between the two is dropped; the client ignores any stale
+                // delta that races ahead of the replayed result set.
+                {
+                    let mut subscriptions = self.query_subscriptions.write().expect("query subscriptions lock poisoned");
+                    *subscriptions = queries.iter().map(|cursor| cursor.query).collect();
+                }
+                match self.daemon.subscribe_queries(&queries).await {
+                    Ok(events) => Message::ok_response(id, Response::SubscribeQueries(events)),
                     Err(e) => Message::error_response(id, e),
                 }
             }
