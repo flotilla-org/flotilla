@@ -19,15 +19,35 @@ fn write_repo_file(base: &Path, filename: &str, content: &str) {
     std::fs::write(repos_dir.join(filename), content).unwrap();
 }
 
+fn legacy_path_to_slug(path: &Path) -> String {
+    let raw = path.to_string_lossy().to_lowercase();
+    let mut prev_hyphen = false;
+    let slug: String = raw
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                prev_hyphen = false;
+                Some(c)
+            } else if !prev_hyphen {
+                prev_hyphen = true;
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect();
+    slug.trim_matches('-').to_string()
+}
+
 fn colliding_repo_paths(base: &Path) -> (PathBuf, PathBuf) {
     let repo_a = make_dir(&make_dir(base, "a-b"), "c");
     let repo_b = make_dir(&make_dir(base, "a"), "b-c");
-    assert_eq!(path_to_slug(&repo_a), path_to_slug(&repo_b), "test setup should produce a legacy slug collision");
+    assert_eq!(legacy_path_to_slug(&repo_a), legacy_path_to_slug(&repo_b), "test setup should produce a legacy slug collision");
     (repo_a, repo_b)
 }
 
 #[test]
-fn path_to_slug_covers_core_shapes() {
+fn legacy_path_to_slug_covers_core_shapes() {
     let cases = [
         ("/Users/alice/dev/myrepo", "users-alice-dev-myrepo"),
         ("relative/path", "relative-path"),
@@ -38,7 +58,7 @@ fn path_to_slug_covers_core_shapes() {
         (".", "."),
     ];
     for (input, expected) in cases {
-        assert_eq!(path_to_slug(Path::new(input)), expected, "unexpected slug for input: {input}");
+        assert_eq!(legacy_path_to_slug(Path::new(input)), expected, "unexpected slug for input: {input}");
     }
 }
 
@@ -52,10 +72,56 @@ fn save_repo_roundtrip_is_idempotent_and_removable() {
     let store = ConfigStore::with_base(base);
     store.save_repo(&repo_ee);
     store.save_repo(&repo_ee);
-    assert_eq!(store.load_repos(), vec![repo_ee.clone()]);
+    assert_eq!(store.load_and_migrate_repos(), vec![repo_ee.clone()]);
 
     store.remove_repo(&repo_ee);
-    assert!(store.load_repos().is_empty());
+    assert!(store.load_and_migrate_repos().is_empty());
+}
+
+#[test]
+fn load_and_migrate_repos_migrates_legacy_file_and_preserves_overrides() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "legacy-repo");
+    let legacy_filename = format!("{}.toml", legacy_path_to_slug(&repo));
+    let content = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"git\"\n", repo.display());
+    write_repo_file(base, &legacy_filename, &content);
+
+    let store = ConfigStore::with_base(base);
+
+    assert_eq!(store.load_and_migrate_repos(), vec![ee(&repo)]);
+    assert!(!base.join("repos").join(legacy_filename).exists());
+    assert_eq!(
+        std::fs::read_to_string(base.join("repos").join(format!("{}.toml", repo_file_key(&repo)))).expect("read migrated repo config"),
+        content
+    );
+    assert_eq!(store.resolve_checkout_config(&ee(&repo)).strategy, "git");
+
+    store.remove_repo(&ee(&repo));
+    assert!(store.load_and_migrate_repos().is_empty());
+}
+
+#[test]
+fn load_and_migrate_repos_keeps_canonical_config_when_legacy_duplicate_exists() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "duplicate-repo");
+    let canonical_content = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"wt\"\n", repo.display());
+    let legacy_content = format!("path = \"{}\"\n[vcs.git]\ncheckout_strategy = \"git\"\n", repo.display());
+    let canonical_filename = format!("{}.toml", repo_file_key(&repo));
+    let legacy_filename = format!("{}.toml", legacy_path_to_slug(&repo));
+    write_repo_file(base, &canonical_filename, &canonical_content);
+    write_repo_file(base, &legacy_filename, &legacy_content);
+
+    let store = ConfigStore::with_base(base);
+
+    assert_eq!(store.load_and_migrate_repos(), vec![ee(&repo)]);
+    assert_eq!(
+        std::fs::read_to_string(base.join("repos").join(canonical_filename)).expect("read canonical repo config"),
+        canonical_content
+    );
+    assert!(!base.join("repos").join(legacy_filename).exists());
+    assert_eq!(store.resolve_checkout_config(&ee(repo)).strategy, "wt");
 }
 
 #[test]
@@ -68,7 +134,7 @@ fn save_repo_tracks_paths_with_same_legacy_slug_independently() {
     store.save_repo(&ee(&repo_a));
     store.save_repo(&ee(&repo_b));
 
-    assert_eq!(store.load_repos(), vec![ee(repo_a), ee(repo_b)]);
+    assert_eq!(store.load_and_migrate_repos(), vec![ee(repo_a), ee(repo_b)]);
 }
 
 #[test]
@@ -82,7 +148,7 @@ fn remove_repo_only_removes_matching_path_when_legacy_slugs_collide() {
 
     store.remove_repo(&ee(&repo_b));
 
-    assert_eq!(store.load_repos(), vec![ee(repo_a)]);
+    assert_eq!(store.load_and_migrate_repos(), vec![ee(repo_a)]);
 }
 
 #[test]
@@ -96,11 +162,11 @@ fn save_repo_creates_repos_dir_if_missing() {
     store.save_repo(&repo_ee);
 
     assert!(base.join("repos").exists());
-    assert_eq!(store.load_repos(), vec![repo_ee]);
+    assert_eq!(store.load_and_migrate_repos(), vec![repo_ee]);
 }
 
 #[test]
-fn load_repos_sorts_and_skips_invalid_entries() {
+fn load_and_migrate_repos_sorts_and_skips_invalid_entries() {
     let dir = tempdir().unwrap();
     let base = dir.path();
     let repo_a = make_dir(base, "alpha");
@@ -115,14 +181,18 @@ fn load_repos_sorts_and_skips_invalid_entries() {
     write_repo_file(base, "missing-path.toml", "[section]\nkey = \"value\"\n");
     write_repo_file(base, "ghost.toml", "path = \"/nonexistent/ghost\"\n");
 
-    assert_eq!(store.load_repos(), vec![ee(repo_a), ee(repo_b)]);
+    assert_eq!(store.load_and_migrate_repos(), vec![ee(repo_a), ee(repo_b)]);
+    assert!(base.join("repos/broken.toml").exists());
+    assert!(base.join("repos/missing-path.toml").exists());
+    assert!(!base.join("repos/ghost.toml").exists());
+    assert!(base.join("repos/%2Fnonexistent%2Fghost.toml").exists());
 }
 
 #[test]
-fn load_repos_returns_empty_when_dir_missing() {
+fn load_and_migrate_repos_returns_empty_when_dir_missing() {
     let dir = tempdir().unwrap();
     let store = ConfigStore::with_base(dir.path());
-    assert!(store.load_repos().is_empty());
+    assert!(store.load_and_migrate_repos().is_empty());
 }
 
 #[test]

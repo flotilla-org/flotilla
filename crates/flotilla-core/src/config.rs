@@ -337,33 +337,25 @@ struct OpenViewsFile {
     views: Vec<OpenViewEntry>,
 }
 
-/// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
-pub fn path_to_slug(path: &Path) -> String {
-    let raw = path.to_string_lossy().to_lowercase();
-    let mut prev_hyphen = false;
-    let slug: String = raw
-        .chars()
-        .filter_map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
-                prev_hyphen = false;
-                Some(c)
-            } else if !prev_hyphen {
-                prev_hyphen = true;
-                Some('-')
-            } else {
-                None
-            }
-        })
-        .collect();
-    slug.trim_matches('-').to_string()
-}
-
 fn repo_file_key(path: &Path) -> String {
     let key = urlencoding::encode(&path.to_string_lossy()).into_owned();
     if key.len() > 200 {
         tracing::warn!(key_len = key.len(), path = %path.display(), "repo config filename key is close to filesystem limit");
     }
     key
+}
+
+fn migrate_repo_file(source: &Path, canonical: &Path) {
+    if source == canonical {
+        return;
+    }
+    let canonical_exists = canonical.exists();
+    let result = if canonical_exists { std::fs::remove_file(source) } else { std::fs::rename(source, canonical) };
+    if let Err(err) = result {
+        tracing::warn!(from = %source.display(), to = %canonical.display(), %err, "failed to migrate repo config filename");
+    } else if canonical_exists {
+        tracing::info!(legacy = %source.display(), canonical = %canonical.display(), "removed duplicate legacy repo config");
+    }
 }
 
 /// Owns daemon-side paths and caches the global `FlotillaConfig`.
@@ -407,19 +399,22 @@ impl ConfigStore {
         self.base.join("tab-order.json")
     }
 
-    /// Load all persisted repo paths from config dir, sorted alphabetically by path.
-    pub fn load_repos(&self) -> Vec<ExecutionEnvironmentPath> {
+    /// Load all persisted repo paths, migrating noncanonical filenames and sorting by path.
+    pub fn load_and_migrate_repos(&self) -> Vec<ExecutionEnvironmentPath> {
         let dir = self.repos_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
-        let mut repos: Vec<(String, ExecutionEnvironmentPath)> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
-            .filter_map(|e| {
-                let content = std::fs::read_to_string(e.path()).ok()?;
+        let files: Vec<PathBuf> =
+            entries.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|ext| ext == "toml")).map(|e| e.path()).collect();
+        let mut repos: Vec<(String, ExecutionEnvironmentPath)> = files
+            .into_iter()
+            .filter_map(|source| {
+                let content = std::fs::read_to_string(&source).ok()?;
                 let config: RepoConfig = toml::from_str(&content).ok()?;
                 let path = PathBuf::from(&config.path);
+                let canonical = dir.join(format!("{}.toml", repo_file_key(&path)));
+                migrate_repo_file(&source, canonical.as_path());
                 if path.is_dir() {
                     Some((config.path, ExecutionEnvironmentPath::new(path)))
                 } else {
@@ -428,6 +423,7 @@ impl ConfigStore {
             })
             .collect();
         repos.sort_by(|a, b| a.0.cmp(&b.0));
+        repos.dedup_by(|a, b| a.0 == b.0);
         repos.into_iter().map(|(_, path)| path).collect()
     }
 
@@ -593,7 +589,7 @@ pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> 
     let mut repo_roots: Vec<ExecutionEnvironmentPath> = Vec::new();
 
     // 1. Persisted repos in saved tab order
-    let persisted = config.load_repos();
+    let persisted = config.load_and_migrate_repos();
     let tab_order = config.load_tab_order();
     if let Some(order) = tab_order {
         for path in &order {
