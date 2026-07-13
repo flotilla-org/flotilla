@@ -79,7 +79,9 @@ async fn aggregator_emits_result_set_events() {
     // Create a Convoy resource — the Aggregator should pick it up via the watch
     // stream and emit a ResultSet for the convoys query.
     let convoys = backend.using::<flotilla_resources::Convoy>("flotilla");
-    convoys.create(&convoy_meta("test-convoy-1"), &convoy_spec("my-workflow")).await.expect("create convoy");
+    let mut spec = convoy_spec("my-workflow");
+    spec.project_ref = Some("my-project".to_string());
+    convoys.create(&convoy_meta("test-convoy-1"), &spec).await.expect("create convoy");
 
     // Wait for the convoys result set.
     let found = tokio::time::timeout(Duration::from_secs(5), async {
@@ -99,6 +101,7 @@ async fn aggregator_emits_result_set_events() {
     let rows = convoy_rows(&found);
     assert_eq!(rows.len(), 1, "expected exactly one convoy in the result set");
     assert_eq!(rows[0].name, "test-convoy-1");
+    assert_eq!(rows[0].project_ref.as_deref(), Some("my-project"));
 }
 
 /// Verifies the causal chain:

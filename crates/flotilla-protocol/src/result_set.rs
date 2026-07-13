@@ -197,6 +197,9 @@ pub struct ConvoyRow {
     pub finished_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_workflow_ref: Option<String>,
+    /// The Project this convoy belongs to, from `ConvoySpec.project_ref`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_ref: Option<String>,
     /// Vessels from the convoy's workflow snapshot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]

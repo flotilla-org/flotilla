@@ -300,6 +300,7 @@ impl Aggregator {
             .maybe_started_at(status.and_then(|status| status.started_at))
             .maybe_finished_at(status.and_then(|status| status.finished_at))
             .maybe_observed_workflow_ref(status.and_then(|status| status.observed_workflow_ref.clone()))
+            .maybe_project_ref(convoy.spec.project_ref.clone())
             .vessels(vessels)
             .build()
     }
@@ -389,7 +390,13 @@ mod tests {
     fn remote_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
         let host = HostName::new(host);
         let convoy = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", name).on_host(host.clone());
-        let row = ConvoyRow::builder().resource(convoy).name(name).workflow_ref("scratch").phase(ConvoyPhase::Active).build();
+        let row = ConvoyRow::builder()
+            .resource(convoy)
+            .name(name)
+            .workflow_ref("scratch")
+            .phase(ConvoyPhase::Active)
+            .project_ref("my-project")
+            .build();
         FleetReplicaSnapshot {
             host,
             generation: Some(generation.to_string()),
@@ -419,6 +426,21 @@ mod tests {
 
         let result_set = state.result_set().await;
         assert_eq!(convoy_names(&result_set.rows), vec!["new"]);
+    }
+
+    #[tokio::test]
+    async fn replica_cache_preserves_project_ref() {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+
+        aggregator.apply_replica_cache(vec![remote_snapshot("feta", "generation-1", "remote-convoy")]).await;
+        assert!(matches!(rx.recv().await.expect("initial event"), DaemonEvent::ResultSet(_)));
+
+        let result_set = state.result_set().await;
+        let rows = result_set.rows.as_convoys().expect("convoy rows");
+        let row = rows.first().expect("replica convoy row");
+        assert_eq!(row.project_ref.as_deref(), Some("my-project"));
     }
 
     #[tokio::test]
