@@ -5,7 +5,7 @@ use flotilla_protocol::{
     result_set::{QueryId, ResultDelta, ResultSet, Rows},
     EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
 };
-use flotilla_transport::message::{message_session_pair, MessageSession};
+use flotilla_transport::message::{message_session_pair, unix_message_session, MessageSession};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,
@@ -111,6 +111,68 @@ async fn read_request(session: &MessageSession) -> (u64, Request) {
         Some(Message::Request { id, request }) => (id, request),
         other => panic!("expected request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn client_hello_rejects_daemon_protocol_version_mismatch() {
+    let (client, server) = message_session_pair();
+    let server_task = tokio::spawn(async move {
+        let hello = server.read().await.expect("read client hello").expect("client hello");
+        assert!(matches!(hello, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+        server
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                node_id: NodeId::new("stale-daemon"),
+                display_name: "stale daemon".into(),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+            })
+            .await
+            .expect("write stale daemon hello");
+    });
+
+    let error = do_client_hello(&client).await.expect_err("protocol mismatch should reject the daemon");
+    assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
+    assert!(error.contains(&(PROTOCOL_VERSION - 1).to_string()), "error should report the daemon version: {error}");
+    server_task.await.expect("join server task");
+}
+
+#[tokio::test]
+async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("daemon.sock");
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch: unix socket bind not permitted: {err}");
+            return;
+        }
+        Err(err) => panic!("bind listener: {err}"),
+    };
+
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let session = unix_message_session(stream);
+        session
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                node_id: NodeId::new("stale-daemon"),
+                display_name: "stale daemon".into(),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+            })
+            .await
+            .expect("write stale daemon hello");
+    });
+
+    let result = connect_or_spawn(&socket_path, dir.path(), None, Some(&socket_path)).await;
+    server_task.await.expect("join server task");
+
+    let error = match result {
+        Ok(_) => panic!("an existing incompatible daemon should be rejected instead of reused or replaced"),
+        Err(error) => error,
+    };
+    assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
 }
 
 #[tokio::test]

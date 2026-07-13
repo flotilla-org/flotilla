@@ -316,8 +316,11 @@ pub async fn connect_or_spawn(
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    // Try to connect to existing daemon
-    if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+    // An existing socket must complete the stateful Hello handshake. A
+    // handshake failure means a daemon is listening but is incompatible or
+    // malformed; surface that error instead of treating the socket as stale
+    // and silently spawning a second daemon over the live process.
+    if let Some(daemon) = connect_existing_stateful(socket_path).await? {
         return Ok(daemon);
     }
 
@@ -339,7 +342,7 @@ pub async fn connect_or_spawn(
             }
             Ok(None) => {
                 // Another process spawned the daemon — retry connect.
-                if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+                if let Some(daemon) = connect_existing_stateful(socket_path).await? {
                     return Ok(daemon);
                 }
                 // Their daemon didn't come up — retry lock acquisition rather than
@@ -362,7 +365,7 @@ pub async fn connect_or_spawn(
                     }
                     Ok(None) => {
                         // Someone else spawned while we waited — one last connect attempt.
-                        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+                        if let Some(daemon) = connect_existing_stateful(socket_path).await? {
                             return Ok(daemon);
                         }
                         return Err("daemon spawn failed: all lock attempts exhausted and connect still failing".into());
@@ -390,13 +393,27 @@ pub async fn connect_or_spawn(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+        if let Some(daemon) = connect_existing_stateful(socket_path).await? {
             return Ok(daemon);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("timed out waiting for daemon to start (10s)".into());
         }
     }
+}
+
+/// Connect to an existing socket and require the client Hello handshake.
+///
+/// `Ok(None)` means no daemon accepted the Unix-socket connection, so the
+/// caller may use the spawn path. Once connected, handshake failures are
+/// returned verbatim: a live but incompatible daemon must not be mistaken for
+/// a stale socket.
+async fn connect_existing_stateful(socket_path: &Path) -> Result<Option<Arc<SocketDaemon>>, String> {
+    let session = match connect_unix_message_session(socket_path).await {
+        Ok(session) => session,
+        Err(_) => return Ok(None),
+    };
+    SocketDaemon::from_session_stateful(session).await.map(Some)
 }
 
 /// Send a request on the wire and wait for the response.
