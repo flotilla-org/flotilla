@@ -282,6 +282,68 @@ fn fleet_row_attach_reference_label(row: &FleetListRow) -> String {
     }
 }
 
+enum AttachTarget {
+    Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
+    Replica { host: HostName },
+}
+
+impl AttachTarget {
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<String, String> {
+        match self {
+            Self::Local(session) => daemon.attach_command_for_session(reference, session).await,
+            Self::Replica { host } => daemon.recursive_attach_command_for_remote(host, reference).await,
+        }
+    }
+}
+
+struct AttachCandidate {
+    label: String,
+    references: Vec<String>,
+    target: AttachTarget,
+}
+
+struct AttachCandidateIndex {
+    candidates: Vec<AttachCandidate>,
+    exact: HashMap<String, Vec<usize>>,
+}
+
+impl AttachCandidateIndex {
+    fn new(candidates: Vec<AttachCandidate>) -> Self {
+        let mut exact: HashMap<String, Vec<usize>> = HashMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            for reference in &candidate.references {
+                exact.entry(reference.clone()).or_default().push(index);
+            }
+        }
+        Self { candidates, exact }
+    }
+
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<String, String> {
+        if reference.trim().is_empty() {
+            return Err("attach reference is required".to_string());
+        }
+
+        let matches = self.exact.get(reference).cloned().unwrap_or_else(|| {
+            self.candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.references.iter().any(|candidate| candidate.starts_with(reference)))
+                .map(|(index, _)| index)
+                .collect()
+        });
+        match matches.as_slice() {
+            [] => Err(format!("no attach target matching '{reference}'")),
+            [index] => self.candidates[*index].target.resolve(daemon, reference).await,
+            _ => {
+                let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
+                labels.sort();
+                labels.dedup();
+                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
+            }
+        }
+    }
+}
+
 fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     match phase {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
@@ -2810,21 +2872,25 @@ impl InProcessDaemon {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
+        let index = self.attach_candidate_index().await?;
+        index.resolve(self, reference).await
+    }
 
-        enum AttachMatch {
-            Local(Box<flotilla_resources::ResourceObject<ResourceTerminalSession>>),
-            Replica { host: HostName },
+    pub async fn resolvable_attach_references_internal(&self, references: &[String]) -> Result<HashSet<String>, String> {
+        if references.is_empty() {
+            return Ok(HashSet::new());
         }
-
-        impl AttachMatch {
-            async fn resolve(self, daemon: &InProcessDaemon, reference: &str) -> Result<String, String> {
-                match self {
-                    Self::Local(session) => daemon.attach_command_for_session(reference, &session).await,
-                    Self::Replica { host } => daemon.recursive_attach_command_for_remote(&host, reference).await,
-                }
+        let index = self.attach_candidate_index().await?;
+        let mut resolved = HashSet::new();
+        for reference in references {
+            if index.resolve(self, reference).await.is_ok() {
+                resolved.insert(reference.clone());
             }
         }
+        Ok(resolved)
+    }
 
+    async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
         let namespace = self.provisioning_namespace().await;
         let durable_sessions =
             self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).list().await.map_err(|err| err.to_string())?.items;
@@ -2840,20 +2906,16 @@ impl InProcessDaemon {
         for session in durable_sessions.into_iter().chain(observed_sessions) {
             sessions_by_name.insert(session.metadata.name.clone(), session);
         }
-        let mut exact = Vec::new();
-        let mut prefix = Vec::new();
-
+        let mut candidates = Vec::new();
         for session in sessions_by_name.into_values() {
             if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
                 continue;
             }
-            let refs = attach_reference_keys(&session.metadata.name, &session.metadata.labels);
-            let label = attach_reference_label(&session.metadata.name, &session.metadata.labels);
-            if refs.iter().any(|candidate| candidate == reference) {
-                exact.push((label, AttachMatch::Local(Box::new(session))));
-            } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
-                prefix.push((label, AttachMatch::Local(Box::new(session))));
-            }
+            candidates.push(AttachCandidate {
+                label: attach_reference_label(&session.metadata.name, &session.metadata.labels),
+                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
+                target: AttachTarget::Local(Box::new(session)),
+            });
         }
 
         let configured_replica_hosts: HashSet<HostName> = self
@@ -2868,33 +2930,16 @@ impl InProcessDaemon {
                     if row.crew_state != "running" {
                         continue;
                     }
-                    let refs = fleet_row_attach_reference_keys(row);
-                    let label = fleet_row_attach_reference_label(row);
-                    let target = AttachMatch::Replica { host: row.host.clone() };
-                    if refs.iter().any(|candidate| candidate == reference) {
-                        exact.push((label, target));
-                    } else if refs.iter().any(|candidate| candidate.starts_with(reference)) {
-                        prefix.push((label, target));
-                    }
+                    candidates.push(AttachCandidate {
+                        label: fleet_row_attach_reference_label(row),
+                        references: fleet_row_attach_reference_keys(row),
+                        target: AttachTarget::Replica { host: row.host.clone() },
+                    });
                 }
             }
         }
         drop(cache);
-
-        let mut matches = if exact.is_empty() { prefix } else { exact };
-        match matches.len() {
-            0 => Err(format!("no attach target matching '{reference}'")),
-            1 => {
-                let (_label, target) = matches.remove(0);
-                target.resolve(self, reference).await
-            }
-            _ => {
-                let mut labels: Vec<_> = matches.into_iter().map(|(label, _)| label).collect();
-                labels.sort();
-                labels.dedup();
-                Err(format!("attach reference '{reference}' is ambiguous: {}", labels.join(", ")))
-            }
-        }
+        Ok(AttachCandidateIndex::new(candidates))
     }
 
     async fn attach_command_for_session(

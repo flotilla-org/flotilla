@@ -69,6 +69,18 @@ impl<T: Resource> AggregatorWatchSource<T> for TypedResolver<T> {
     }
 }
 
+#[async_trait]
+pub(crate) trait AttachCapabilityResolver: Send + Sync {
+    async fn resolvable_attach_references(&self, references: &[String]) -> Result<HashSet<String>, String>;
+}
+
+#[async_trait]
+impl AttachCapabilityResolver for InProcessDaemon {
+    async fn resolvable_attach_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
+        self.resolvable_attach_references_internal(references).await
+    }
+}
+
 #[derive(bon::Builder)]
 pub struct Aggregator {
     state: AggregatorProjectionState,
@@ -83,7 +95,8 @@ pub struct Aggregator {
     terminal_sessions: HashMap<SessionKey, ResourceObject<TerminalSession>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
-    attach_resolver: Option<Arc<InProcessDaemon>>,
+    #[builder(skip)]
+    attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
@@ -106,8 +119,11 @@ impl Aggregator {
         }
     }
 
-    pub fn with_attach_resolver(mut self, daemon: Arc<InProcessDaemon>) -> Self {
-        self.attach_resolver = Some(daemon);
+    pub(crate) fn with_attach_resolver<R>(mut self, resolver: Arc<R>) -> Self
+    where
+        R: AttachCapabilityResolver + 'static,
+    {
+        self.attach_resolver = Some(resolver);
         self
     }
 
@@ -484,9 +500,22 @@ impl Aggregator {
         }
         self.terminal_sessions = effective_sessions;
 
+        let attachable_references = match &self.attach_resolver {
+            Some(daemon) => {
+                let references = self
+                    .terminal_sessions
+                    .values()
+                    .filter(|session| is_projected_session(session))
+                    .map(|session| session.metadata.name.clone())
+                    .collect::<Vec<_>>();
+                daemon.resolvable_attach_references(&references).await.unwrap_or_default()
+            }
+            None => HashSet::new(),
+        };
+
         let mut replacement = HashMap::new();
         for session in self.terminal_sessions.values() {
-            if let Some(row) = self.summarize_session(session).await {
+            if let Some(row) = self.summarize_session(session, &attachable_references) {
                 replacement.insert(row.resource.clone(), row);
             }
         }
@@ -596,19 +625,12 @@ impl Aggregator {
             .on_host(self.local_host.clone())
     }
 
-    async fn summarize_session(&self, session: &ResourceObject<TerminalSession>) -> Option<SessionRow> {
-        if session.metadata.labels.contains_key(CONVOY_LABEL) {
-            return None;
-        }
-        let status = session.status.as_ref()?;
-        if status.phase != TerminalSessionPhase::Running {
+    fn summarize_session(&self, session: &ResourceObject<TerminalSession>, attachable_references: &HashSet<String>) -> Option<SessionRow> {
+        if !is_projected_session(session) {
             return None;
         }
         let name = &session.metadata.name;
-        let attach = match &self.attach_resolver {
-            Some(daemon) if daemon.resolve_attach_command_internal(name).await.is_ok() => Some(name.clone()),
-            _ => None,
-        };
+        let attach = attachable_references.contains(name).then(|| name.clone());
         Some(
             SessionRow::builder()
                 .resource(self.session_ref(&session.metadata.namespace, name))
@@ -704,6 +726,11 @@ fn presentation_key(presentation: &ResourceObject<Presentation>) -> Option<Prese
     ))
 }
 
+fn is_projected_session(session: &ResourceObject<TerminalSession>) -> bool {
+    !session.metadata.labels.contains_key(CONVOY_LABEL)
+        && session.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Running)
+}
+
 fn set_convoy_row_host(row: &mut ConvoyRow, host: &HostName) {
     row.resource.host = Some(host.clone());
     for vessel in &mut row.vessels {
@@ -797,6 +824,18 @@ mod tests {
         async fn watch(&self, _start: WatchStart) -> Result<WatchStream<T>, ResourceError> {
             self.watch_calls.fetch_add(1, Ordering::SeqCst);
             self.watches.lock().await.pop_front().ok_or_else(|| ResourceError::other("scripted watch exhausted"))?
+        }
+    }
+
+    struct CountingAttachResolver {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AttachCapabilityResolver for CountingAttachResolver {
+        async fn resolvable_attach_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(references.iter().cloned().collect())
         }
     }
 
@@ -934,6 +973,24 @@ mod tests {
             })
             .await
             .expect("set scripted terminal session status")
+    }
+
+    #[tokio::test]
+    async fn session_projection_resolves_attach_capabilities_once_per_rebuild() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let resolver = Arc::new(CountingAttachResolver { calls: AtomicUsize::new(0) });
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(Arc::clone(&resolver));
+
+        aggregator
+            .replace_session_source(LocalSource::Durable, vec![session_object("session-a").await, session_object("session-b").await])
+            .await;
+
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        let result_set = state.sessions_result_set().await;
+        let rows = result_set.rows.as_sessions().expect("session rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.attach.as_deref() == Some(row.name.as_str())));
     }
 
     fn remote_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
