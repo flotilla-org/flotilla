@@ -191,6 +191,11 @@ impl RepoRefreshHandle {
             if !schedule.startup_offset.is_zero() {
                 tokio::time::sleep(schedule.startup_offset).await;
             }
+            // A manual trigger received during the startup stagger is already
+            // satisfied by the initial full refresh. Consume its permit before
+            // scanning so a mutation-triggered refresh that arrives while the
+            // scan is in flight remains pending for the loop below.
+            let _ = trigger.notified().now_or_never();
             let mut provider_data = ProviderData::default();
             let mut fast_errors = Vec::new();
             let mut slow_errors = Vec::new();
@@ -211,10 +216,6 @@ impl RepoRefreshHandle {
             if snapshot_tx.send(initial).is_err() {
                 return;
             }
-            // A manual trigger received during the startup stagger is already
-            // satisfied by the initial full refresh. Consume its permit so it
-            // does not immediately duplicate the same provider work.
-            let _ = trigger.notified().now_or_never();
 
             let mut fast_timer = tokio::time::interval_at(first_tick(schedule.fast), schedule.fast.interval);
             fast_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

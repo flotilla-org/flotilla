@@ -349,6 +349,71 @@ impl PresentationManager for CountingWorkspaceManager {
     }
 }
 
+struct BlockingFirstWorkspaceManager {
+    calls: AtomicUsize,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl PresentationManager for BlockingFirstWorkspaceManager {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(vec![])
+    }
+
+    async fn create_workspace(&self, _config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
+        Err("not implemented".into())
+    }
+
+    async fn select_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn delete_workspace(&self, _ws_ref: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn binding_scope_prefix(&self) -> String {
+        String::new()
+    }
+}
+
+#[tokio::test]
+async fn trigger_during_initial_scan_runs_a_follow_up_refresh() {
+    let manager = Arc::new(BlockingFirstWorkspaceManager {
+        calls: AtomicUsize::new(0),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut registry = ProviderRegistry::new();
+    registry.presentation_managers.insert("workspace", desc("Workspace"), manager.clone());
+    let _handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        test_attachable_store(),
+        test_agent_state_store(),
+        Duration::from_secs(60),
+    );
+
+    manager.started.notified().await;
+    _handle.trigger_refresh();
+    manager.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager.calls.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("trigger received during the initial scan should remain pending");
+}
+
 struct BarrierCheckoutManager(Arc<tokio::sync::Barrier>);
 
 #[async_trait]
