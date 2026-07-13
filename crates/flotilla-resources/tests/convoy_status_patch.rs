@@ -119,12 +119,16 @@ fn crew_failure_records_terminal_state_and_message() {
         observed_workflows: Some(BTreeMap::new()),
     };
 
+    external_patches::mark_crew_completed("implement".to_string(), "coder".to_string(), ts(15), Some("initially done".to_string()))
+        .apply(&mut status);
     external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(20), "blocked by missing credentials".to_string())
+        .apply(&mut status);
+    external_patches::mark_crew_failed("implement".to_string(), "coder".to_string(), ts(30), "still blocked".to_string())
         .apply(&mut status);
 
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Failed);
     assert_eq!(status.crew_work["implement"]["coder"].finished_at, Some(ts(20)));
-    assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("blocked by missing credentials"));
+    assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("still blocked"));
 }
 
 #[test]

@@ -342,6 +342,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkCrewCompleted { vessel, role, finished_at, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    if state.phase != CrewWorkPhase::Done {
+                        state.finished_at = None;
+                    }
                     state.phase = CrewWorkPhase::Done;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
@@ -352,6 +355,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    if state.phase != CrewWorkPhase::Failed {
+                        state.finished_at = None;
+                    }
                     state.phase = CrewWorkPhase::Failed;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = Some(message.clone());

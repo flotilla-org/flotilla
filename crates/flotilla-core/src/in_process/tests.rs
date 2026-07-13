@@ -467,6 +467,59 @@ async fn crew_fail_uses_ambient_identity_to_fail_callers_work() {
 }
 
 #[tokio::test]
+async fn crew_complete_rejects_role_without_agent_work_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, _) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+
+    let error = daemon
+        .crew_complete_internal(
+            &CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".into()),
+                convoy: Some("demo".into()),
+                vessel_ref: Some("demo-implement".into()),
+                role: Some("build".into()),
+            },
+            None,
+        )
+        .await
+        .expect_err("role without agent work state should be rejected");
+
+    assert_eq!(error, "crew work for role `build` is not defined on vessel `implement`");
+}
+
+#[tokio::test]
+async fn handoff_rejects_failed_target_instead_of_succeeding_without_state_change() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, _) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    let reviewer_context = CrewCommandContext {
+        crew_id: None,
+        namespace: Some("flotilla".into()),
+        convoy: Some("demo".into()),
+        vessel_ref: Some("demo-implement".into()),
+        role: Some("reviewer".into()),
+    };
+    daemon.crew_fail_internal(&reviewer_context, "review failed".into()).await.expect("reviewer failure should be recorded");
+
+    let error = daemon
+        .crew_handoff_internal(
+            &CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+            "reviewer",
+            "retry the review",
+        )
+        .await
+        .expect_err("failed target should reject handoff");
+
+    assert_eq!(error, "crew target `reviewer` has failed work and cannot receive a handoff");
+}
+
+#[tokio::test]
 async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");

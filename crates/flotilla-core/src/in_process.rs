@@ -2472,6 +2472,15 @@ impl InProcessDaemon {
         let CrewSource::Agent { selector, prompt } = &process.source else {
             return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
         };
+        if convoy
+            .status
+            .as_ref()
+            .and_then(|status| status.crew_work.get(&context.vessel))
+            .and_then(|crew| crew.get(target))
+            .is_some_and(|state| state.phase == flotilla_resources::CrewWorkPhase::Failed)
+        {
+            return Err(format!("crew target `{target}` has failed work and cannot receive a handoff"));
+        }
 
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
