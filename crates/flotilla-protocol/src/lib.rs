@@ -17,6 +17,7 @@ pub mod resource_ref;
 pub mod result_set;
 pub mod snapshot;
 pub mod step;
+pub mod view_address;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -32,6 +33,7 @@ pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
+pub use view_address::ViewAddress;
 
 /// Stable mesh identity for a daemon node.
 ///

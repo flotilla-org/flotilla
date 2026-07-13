@@ -126,35 +126,50 @@ fn load_repos_returns_empty_when_dir_missing() {
 }
 
 #[test]
-fn tab_order_roundtrip_and_parse_failures() {
+fn legacy_tab_order_loads_and_tolerates_parse_failures() {
     let dir = tempdir().unwrap();
     let base = dir.path();
     let store = ConfigStore::with_base(base);
 
     assert!(store.load_tab_order().is_none());
 
-    let order = vec![ee("/a"), ee("/b")];
-    store.save_tab_order(&order);
-    assert_eq!(store.load_tab_order(), Some(order));
+    std::fs::write(base.join("tab-order.json"), r#"["/a", "/b"]"#).unwrap();
+    assert_eq!(store.load_tab_order(), Some(vec![ee("/a"), ee("/b")]));
 
     std::fs::write(base.join("tab-order.json"), "not json {{{").unwrap();
     assert!(store.load_tab_order().is_none());
 
     std::fs::write(base.join("tab-order.json"), r#"{"k":"v"}"#).unwrap();
     assert!(store.load_tab_order().is_none());
-
-    std::fs::write(base.join("tab-order.json"), "[]").unwrap();
-    assert_eq!(store.load_tab_order(), Some(Vec::new()));
 }
 
 #[test]
-fn save_tab_order_creates_base_dir() {
+fn open_views_roundtrip_and_parse_failures() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let store = ConfigStore::with_base(base);
+
+    assert!(store.load_open_views().is_none());
+
+    let views = vec![OpenViewEntry { address: "overview".to_string(), label: None }, OpenViewEntry {
+        address: "repo/github.com/o/r".to_string(),
+        label: Some("mine".to_string()),
+    }];
+    store.save_open_views(&views);
+    assert_eq!(store.load_open_views(), Some(views));
+
+    std::fs::write(base.join("open-views.toml"), "not toml {{{").unwrap();
+    assert!(store.load_open_views().is_none());
+}
+
+#[test]
+fn save_open_views_creates_base_dir() {
     let dir = tempdir().unwrap();
     let base = dir.path().join("new/config/dir");
     let store = ConfigStore::with_base(&base);
 
-    store.save_tab_order(&[ee("/a")]);
-    assert!(base.join("tab-order.json").exists());
+    store.save_open_views(&[OpenViewEntry { address: "overview".to_string(), label: None }]);
+    assert!(base.join("open-views.toml").exists());
 }
 
 #[test]

@@ -1328,6 +1328,7 @@ dependencies = [
  "chrono",
  "gethostname",
  "indexmap",
+ "percent-encoding",
  "serde",
  "serde_json",
  "serde_yml",

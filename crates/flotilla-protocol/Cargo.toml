@@ -17,6 +17,7 @@ indexmap = { workspace = true, features = ["serde"] }
 gethostname = "1.1.0"
 tracing = { workspace = true }
 url = "2"
+percent-encoding = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["io-util"] }
 

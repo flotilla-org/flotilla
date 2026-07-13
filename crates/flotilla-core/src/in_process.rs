@@ -2083,17 +2083,9 @@ impl InProcessDaemon {
             self.path_identities.write().await.insert(path.clone(), identity.clone());
         }
 
-        // Persist to config
+        // Persist to config. Tab order is Surface-owned (open-views.toml,
+        // ADR 0013) — the daemon only tracks registration.
         self.config.save_repo(&ExecutionEnvironmentPath::new(&path));
-        let tab_order = {
-            let repos = self.repos.read().await;
-            let order = self.repo_order.read().await;
-            order
-                .iter()
-                .filter_map(|id| repos.get(id).map(|state| ExecutionEnvironmentPath::new(state.preferred_path())))
-                .collect::<Vec<_>>()
-        };
-        self.config.save_tab_order(&tab_order);
 
         info!(repo = %path.display(), "added repo");
         if added_new_identity {
@@ -2157,17 +2149,9 @@ impl InProcessDaemon {
         }
         drop(observed_reconciliation);
 
-        // Persist to config
+        // Persist to config. Tab order is Surface-owned (open-views.toml,
+        // ADR 0013) — the daemon only tracks registration.
         self.config.remove_repo(&ExecutionEnvironmentPath::new(&path));
-        let tab_order = {
-            let repos = self.repos.read().await;
-            let order = self.repo_order.read().await;
-            order
-                .iter()
-                .filter_map(|id| repos.get(id).map(|state| ExecutionEnvironmentPath::new(state.preferred_path())))
-                .collect::<Vec<_>>()
-        };
-        self.config.save_tab_order(&tab_order);
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {

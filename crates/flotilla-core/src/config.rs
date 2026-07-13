@@ -319,6 +319,22 @@ struct RepoConfig {
     path: String,
 }
 
+/// One persisted open View (ADR 0013). The address stays a raw string here:
+/// an entry with an unknown or malformed address must degrade to that one
+/// view rendering an error state, never invalidate the whole file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenViewEntry {
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OpenViewsFile {
+    #[serde(default)]
+    views: Vec<OpenViewEntry>,
+}
+
 /// Convert "/Users/robert/dev/scratch" → "users-robert-dev-scratch"
 pub fn path_to_slug(path: &Path) -> String {
     let raw = path.to_string_lossy().to_lowercase();
@@ -436,19 +452,33 @@ impl ConfigStore {
         let _ = std::fs::remove_file(file.as_path());
     }
 
-    /// Load persisted tab order. Returns None if file doesn't exist or is invalid.
+    /// Load the legacy tab order. Read-only: the file is no longer written —
+    /// it survives only to order repo registration and to seed
+    /// `open-views.toml` for configs created before the View model (ADR 0013).
     pub fn load_tab_order(&self) -> Option<Vec<ExecutionEnvironmentPath>> {
         let content = std::fs::read_to_string(self.tab_order_file().as_path()).ok()?;
         let paths: Vec<String> = serde_json::from_str(&content).ok()?;
         Some(paths.into_iter().map(|s| ExecutionEnvironmentPath::new(PathBuf::from(s))).collect())
     }
 
-    /// Save tab order to disk.
-    pub fn save_tab_order(&self, order: &[ExecutionEnvironmentPath]) {
+    fn open_views_file(&self) -> DaemonHostPath {
+        self.base.join("open-views.toml")
+    }
+
+    /// Load the persisted open-view set. Returns None if the file doesn't
+    /// exist or is invalid — the caller seeds a default set (ADR 0013).
+    pub fn load_open_views(&self) -> Option<Vec<OpenViewEntry>> {
+        let content = std::fs::read_to_string(self.open_views_file().as_path()).ok()?;
+        let file: OpenViewsFile = toml::from_str(&content).map_err(|e| tracing::warn!(err = %e, "failed to parse open-views.toml")).ok()?;
+        Some(file.views)
+    }
+
+    /// Save the open-view set (ordered; index 0 is the pinned overview).
+    pub fn save_open_views(&self, views: &[OpenViewEntry]) {
         let _ = std::fs::create_dir_all(self.base.as_path());
-        let paths: Vec<&str> = order.iter().filter_map(|p| p.as_path().to_str()).collect();
-        if let Ok(content) = serde_json::to_string_pretty(&paths) {
-            let _ = std::fs::write(self.tab_order_file().as_path(), content);
+        let file = OpenViewsFile { views: views.to_vec() };
+        if let Ok(content) = toml::to_string(&file) {
+            let _ = std::fs::write(self.open_views_file().as_path(), content);
         }
     }
 
@@ -548,8 +578,10 @@ impl ConfigStore {
     }
 }
 
-/// Collect repo roots: persisted (in saved tab order) first, then CLI args, then auto-detect from cwd.
-/// Persists any new repos and saves tab order.
+/// Collect repo roots: persisted (in legacy saved tab order, when present)
+/// first, then CLI args, then auto-detect from cwd. Persists any new repos.
+/// Tab order is a Surface concern (`open-views.toml`, ADR 0013) — nothing
+/// here writes it.
 pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> Vec<ExecutionEnvironmentPath> {
     use crate::providers::{
         vcs::{git::GitVcs, Vcs},
@@ -597,11 +629,10 @@ pub async fn resolve_repo_roots(cli_roots: &[PathBuf], config: &ConfigStore) -> 
         }
     }
 
-    // Persist any new repos and save tab order
+    // Persist any new repos
     for path in &repo_roots {
         config.save_repo(path);
     }
-    config.save_tab_order(&repo_roots);
 
     repo_roots
 }
