@@ -5,7 +5,7 @@ use flotilla_protocol::{
     result_set::{QueryId, ResultDelta, ResultSet, Rows},
     EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
 };
-use flotilla_transport::message::{message_session_pair, MessageSession};
+use flotilla_transport::message::{message_session_pair, unix_message_session, MessageSession};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,
@@ -111,6 +111,174 @@ async fn read_request(session: &MessageSession) -> (u64, Request) {
         Some(Message::Request { id, request }) => (id, request),
         other => panic!("expected request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_contention() {
+    // The two-process fleet-upgrade race: process B wins the spawn lock,
+    // brings up an incompatible daemon, and releases the lock; process A —
+    // which was blocked on B's lock — must report B's daemon rather than
+    // deleting its socket and spawning over it. The test plays B: it holds
+    // the spawn lock, binds a stale-version listener only after A's first
+    // probe has found nothing, then releases the lock.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("daemon.sock");
+    let lock_path = std::path::PathBuf::from(format!("{}.lock", socket_path.display()));
+
+    let lock_file = match acquire_spawn_lock(&lock_path) {
+        Ok(Some(file)) => file,
+        Ok(None) => panic!("fresh lock should be won outright"),
+        Err(err) if err.contains("Operation not permitted") || err.contains("not supported") => {
+            eprintln!(
+                "skipping connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_contention: flock not available: {err}"
+            );
+            return;
+        }
+        Err(err) => panic!("acquire spawn lock: {err}"),
+    };
+
+    let client_socket = socket_path.clone();
+    let client_dir = dir.path().to_path_buf();
+    let client_task = tokio::spawn(async move { connect_or_spawn(&client_socket, &client_dir, None, Some(&client_socket)).await });
+
+    // Give A time to run its first probe (nothing listening) and block on the lock.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_contention: unix socket bind not permitted: {err}");
+            client_task.abort();
+            return;
+        }
+        Err(err) => panic!("bind listener: {err}"),
+    };
+    let server_task = tokio::spawn(async move {
+        // B's daemon answers every probe with a stale-version Hello.
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(_) => return,
+            };
+            let session = unix_message_session(stream);
+            let _ = session.read().await;
+            let _ = session
+                .write(Message::Hello {
+                    protocol_version: PROTOCOL_VERSION - 1,
+                    node_id: NodeId::new("stale-daemon"),
+                    display_name: "stale daemon".into(),
+                    session_id: uuid::Uuid::new_v4(),
+                    connection_role: Some(ConnectionRole::Client),
+                })
+                .await;
+        }
+    });
+
+    // B releases the spawn lock; A unblocks, probes the stale daemon, and
+    // must ultimately error — never remove the socket and spawn.
+    drop(lock_file);
+
+    let result = client_task.await.expect("join client task");
+    server_task.abort();
+
+    let error = match result {
+        Ok(_) => panic!("an incompatible daemon that appeared during lock contention must be reported, not connected to or replaced"),
+        Err(error) => error,
+    };
+    assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
+    assert!(socket_path.exists(), "the live daemon's socket must not be deleted (spawn path must not be reached)");
+}
+
+#[tokio::test]
+async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("daemon.sock");
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "skipping connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning: unix socket bind not permitted: {err}"
+            );
+            return;
+        }
+        Err(err) => panic!("bind listener: {err}"),
+    };
+
+    // Accept the connection and hold it open without ever sending a Hello —
+    // a wedged daemon from the caller's point of view.
+    let server_task = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.expect("accept client");
+        std::future::pending::<()>().await;
+    });
+
+    let error = match connect_or_spawn(&socket_path, dir.path(), None, Some(&socket_path)).await {
+        Ok(_) => panic!("a wedged daemon must surface an error, not hang or be replaced"),
+        Err(error) => error,
+    };
+    assert!(error.contains("did not complete the Hello handshake"), "unexpected error: {error}");
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn client_hello_rejects_daemon_protocol_version_mismatch() {
+    let (client, server) = message_session_pair();
+    let server_task = tokio::spawn(async move {
+        let hello = server.read().await.expect("read client hello").expect("client hello");
+        assert!(matches!(hello, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+        server
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                node_id: NodeId::new("stale-daemon"),
+                display_name: "stale daemon".into(),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+            })
+            .await
+            .expect("write stale daemon hello");
+    });
+
+    let error = do_client_hello(&client).await.expect_err("protocol mismatch should reject the daemon");
+    assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
+    assert!(error.contains(&(PROTOCOL_VERSION - 1).to_string()), "error should report the daemon version: {error}");
+    server_task.await.expect("join server task");
+}
+
+#[tokio::test]
+async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = dir.path().join("daemon.sock");
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch: unix socket bind not permitted: {err}");
+            return;
+        }
+        Err(err) => panic!("bind listener: {err}"),
+    };
+
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept client");
+        let session = unix_message_session(stream);
+        session
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION - 1,
+                node_id: NodeId::new("stale-daemon"),
+                display_name: "stale daemon".into(),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+            })
+            .await
+            .expect("write stale daemon hello");
+    });
+
+    let result = connect_or_spawn(&socket_path, dir.path(), None, Some(&socket_path)).await;
+    server_task.await.expect("join server task");
+
+    let error = match result {
+        Ok(_) => panic!("an existing incompatible daemon should be rejected instead of reused or replaced"),
+        Err(error) => error,
+    };
+    assert!(error.contains("protocol version mismatch"), "unexpected error: {error}");
 }
 
 #[tokio::test]

@@ -316,8 +316,18 @@ pub async fn connect_or_spawn(
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<Arc<SocketDaemon>, String> {
-    // Try to connect to existing daemon
-    if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+    // An existing socket must complete the stateful Hello handshake. A
+    // handshake failure means a daemon is listening but is incompatible or
+    // malformed; surface that error instead of treating the socket as stale
+    // and silently spawning a second daemon over the live process.
+    //
+    // Deliberately no retry at this probe, unlike the two probes below: those
+    // sit in windows where a *just-spawned* daemon is expected and an error is
+    // probably a startup race, while a steady-state daemon that fails a
+    // 5s-bounded handshake is a condition the caller should hear about
+    // immediately — this is the interactive path, and retries would only
+    // delay an error the user has to act on anyway.
+    if let Some(daemon) = connect_existing_stateful(socket_path).await? {
         return Ok(daemon);
     }
 
@@ -338,15 +348,31 @@ pub async fn connect_or_spawn(
                 break;
             }
             Ok(None) => {
-                // Another process spawned the daemon — retry connect.
-                if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
-                    return Ok(daemon);
-                }
+                // Another process spawned the daemon — retry connect. A
+                // handshake error here is most likely a race with that
+                // process's daemon still starting up, so it spends a retry
+                // attempt rather than aborting; but it must never fall
+                // through to the spawn path, which would delete the socket of
+                // a live (if unwell or incompatible) daemon.
+                let last_probe_error = match connect_existing_stateful(socket_path).await {
+                    Ok(Some(daemon)) => return Ok(daemon),
+                    Ok(None) => None,
+                    Err(e) => {
+                        warn!(attempt = attempt + 1, error = %e, "handshake with peer-spawned daemon failed");
+                        Some(e)
+                    }
+                };
                 // Their daemon didn't come up — retry lock acquisition rather than
                 // falling through to spawn without mutual exclusion.
                 if attempt + 1 < MAX_LOCK_RETRIES {
                     warn!(attempt = attempt + 1, "connect after lock wait failed, retrying lock");
                     continue;
+                }
+                // Retries exhausted. Only spawn if the last probe found no
+                // listener at all; a live daemon that kept failing the
+                // handshake is a reportable condition, not a stale socket.
+                if let Some(e) = last_probe_error {
+                    return Err(format!("a daemon is listening but the handshake kept failing across {MAX_LOCK_RETRIES} lock-wait attempts; last error: {e}"));
                 }
                 // Exhausted retries — acquire lock ourselves before spawning
                 // so we never spawn without mutual exclusion.
@@ -362,7 +388,7 @@ pub async fn connect_or_spawn(
                     }
                     Ok(None) => {
                         // Someone else spawned while we waited — one last connect attempt.
-                        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
+                        if let Some(daemon) = connect_existing_stateful(socket_path).await? {
                             return Ok(daemon);
                         }
                         return Err("daemon spawn failed: all lock attempts exhausted and connect still failing".into());
@@ -378,6 +404,22 @@ pub async fn connect_or_spawn(
         }
     }
 
+    // Final probe under the exclusively-held spawn lock. A daemon may have
+    // appeared (or kept failing the handshake) while we contended for the
+    // lock — in particular, a `continue` after a handshake error re-enters
+    // lock acquisition, which the releasing winner has left uncontended, so
+    // winning the lock says nothing about the socket being free. The lock
+    // makes this check race-free: nothing else may spawn while we hold it.
+    match connect_existing_stateful(socket_path).await {
+        Ok(Some(daemon)) => return Ok(daemon),
+        Ok(None) => {}
+        Err(e) => {
+            return Err(format!(
+                "won the spawn lock, but a live daemon is on the socket and failing the handshake — not spawning over it: {e}"
+            ));
+        }
+    }
+
     {
         // Clean up stale socket
         let _ = std::fs::remove_file(socket_path);
@@ -386,16 +428,55 @@ pub async fn connect_or_spawn(
         spawn_daemon(config_dir, config_dir_override, socket_override)?;
     }
 
-    // Poll for connection with a 10s deadline.
+    // Poll for connection with a 10s deadline (soft: the deadline is checked
+    // between probes, and a probe can block up to HELLO_HANDSHAKE_TIMEOUT, so
+    // the true worst-case is deadline + handshake timeout). Handshake errors here are
+    // retried rather than propagated: the daemon on this socket was spawned by
+    // us moments ago, so an error is far more likely a startup race (accepted
+    // before the serve loop is up) than a genuine incompatibility. The last
+    // error is surfaced if the deadline expires without a successful handshake.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_handshake_error: Option<String> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(daemon) = SocketDaemon::connect(socket_path).await {
-            return Ok(daemon);
+        match connect_existing_stateful(socket_path).await {
+            Ok(Some(daemon)) => return Ok(daemon),
+            Ok(None) => {}
+            Err(e) => last_handshake_error = Some(e),
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("timed out waiting for daemon to start (10s)".into());
+            return Err(match last_handshake_error {
+                Some(e) => format!("daemon spawned but handshake kept failing until the 10s deadline; last error: {e}"),
+                None => "timed out waiting for daemon to start (10s)".into(),
+            });
         }
+    }
+}
+
+/// Deadline for a listening daemon to complete the Hello handshake. Generous
+/// for a local Unix socket; only a wedged or badly stalled daemon exceeds it.
+const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connect to an existing socket and require the client Hello handshake.
+///
+/// `Ok(None)` means no daemon accepted the Unix-socket connection, so the
+/// caller may use the spawn path. Once connected, handshake failures are
+/// returned verbatim: a live but incompatible daemon must not be mistaken for
+/// a stale socket. The handshake is bounded — a daemon that accepts the
+/// connection but never replies is reported as an error rather than hanging
+/// the caller (or, worse, being treated as absent and spawned over).
+async fn connect_existing_stateful(socket_path: &Path) -> Result<Option<Arc<SocketDaemon>>, String> {
+    let session = match connect_unix_message_session(socket_path).await {
+        Ok(session) => session,
+        Err(_) => return Ok(None),
+    };
+    match tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful(session)).await {
+        Ok(result) => result.map(Some),
+        Err(_) => Err(format!(
+            "daemon at {} accepted the connection but did not complete the Hello handshake within {}s — it may be wedged; check or restart it",
+            socket_path.display(),
+            HELLO_HANDSHAKE_TIMEOUT.as_secs()
+        )),
     }
 }
 
