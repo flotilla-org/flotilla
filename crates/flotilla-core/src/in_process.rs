@@ -28,7 +28,7 @@ use flotilla_protocol::{
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, external_patches as convoy_external_patches, terminal_session_attach_target,
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, CrewSource,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
     Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, LifecycleAuthority,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, Resource,
     ResourceBackend, ResourceError, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
@@ -1137,6 +1137,33 @@ impl InProcessDaemon {
 
     pub async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().await.clone()
+    }
+
+    fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
+        let repo_identity = empty_repo_identity();
+        let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            command_id,
+            node_id: self.node_id.clone(),
+            repo_identity: repo_identity.clone(),
+            repo: None,
+            description,
+        });
+        repo_identity
+    }
+
+    fn finish_context_free_command(
+        &self,
+        command_id: u64,
+        repo_identity: flotilla_protocol::RepoIdentity,
+        result: flotilla_protocol::CommandValue,
+    ) {
+        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            command_id,
+            node_id: self.node_id.clone(),
+            repo_identity,
+            repo: None,
+            result,
+        });
     }
 
     pub async fn set_aggregator_projection_state(&self, state: AggregatorProjectionState) {
@@ -2395,28 +2422,24 @@ impl InProcessDaemon {
     }
 
     pub async fn crew_complete_internal(&self, requested: &CrewCommandContext, message: Option<String>) -> Result<(), String> {
-        let context = self.resolve_crew_context(requested).await?;
-        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
-        let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
-        let known_agent = convoy
-            .status
-            .as_ref()
-            .and_then(|status| status.crew_work.get(&context.vessel))
-            .is_some_and(|crew| crew.contains_key(&context.caller_role));
-        if !known_agent {
-            return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
-        }
-        apply_resource_status_patch(
-            &convoys,
-            &context.convoy,
-            &convoy_external_patches::mark_crew_completed(context.vessel, context.caller_role, chrono::Utc::now(), message),
-        )
+        self.apply_crew_work_patch(requested, |context| {
+            convoy_external_patches::mark_crew_completed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
+        })
         .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
     }
 
     pub async fn crew_fail_internal(&self, requested: &CrewCommandContext, message: String) -> Result<(), String> {
+        self.apply_crew_work_patch(requested, |context| {
+            convoy_external_patches::mark_crew_failed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
+        })
+        .await
+    }
+
+    async fn apply_crew_work_patch(
+        &self,
+        requested: &CrewCommandContext,
+        patch: impl FnOnce(&ResolvedCrewContext) -> ConvoyStatusPatch,
+    ) -> Result<(), String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
@@ -2428,14 +2451,7 @@ impl InProcessDaemon {
         if !known_agent {
             return Err(format!("crew work for role `{}` is not defined on vessel `{}`", context.caller_role, context.vessel));
         }
-        apply_resource_status_patch(
-            &convoys,
-            &context.convoy,
-            &convoy_external_patches::mark_crew_failed(context.vessel, context.caller_role, chrono::Utc::now(), message),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        apply_resource_status_patch(&convoys, &context.convoy, &patch(&context)).await.map(|_| ()).map_err(|err| err.to_string())
     }
 
     pub async fn crew_handoff_internal(&self, requested: &CrewCommandContext, target: &str, message: &str) -> Result<(), String> {
@@ -3067,83 +3083,37 @@ impl InProcessDaemon {
         }
 
         if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message } = &command.action {
-            let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.crew_handoff_internal(context, target, message).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
 
         if let flotilla_protocol::CommandAction::CrewComplete { context, message } = &command.action {
-            let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.crew_complete_internal(context, message.clone()).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
 
         if let flotilla_protocol::CommandAction::CrewFail { context, message } = &command.action {
-            let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.crew_fail_internal(context, message.clone()).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
 
         if let flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
-            let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity.clone(),
-                repo: None,
-                description: command.description().to_string(),
-            });
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
             let result = match convoys.get(convoy).await {
@@ -3167,13 +3137,7 @@ impl InProcessDaemon {
                 },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                command_id: id,
-                node_id: self.node_id.clone(),
-                repo_identity: empty_identity,
-                repo: None,
-                result,
-            });
+            self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
 

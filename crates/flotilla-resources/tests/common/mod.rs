@@ -216,11 +216,19 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
 }
 
 pub fn pending_task_state() -> WorkState {
-    WorkState { phase: WorkPhase::Pending, ready_at: None, started_at: None, finished_at: None, message: None, placement: None }
+    WorkState {
+        phase: WorkPhase::Pending,
+        completion_overridden: false,
+        ready_at: None,
+        started_at: None,
+        finished_at: None,
+        message: None,
+        placement: None,
+    }
 }
 
 pub fn pending_crew_work_state() -> CrewWorkState {
-    CrewWorkState { phase: CrewWorkPhase::Pending, started_at: None, finished_at: None, message: None }
+    CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()
 }
 
 pub fn valid_workflow_template_object(name: &str) -> ResourceObject<WorkflowTemplate> {

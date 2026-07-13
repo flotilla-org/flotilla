@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,10 @@ mod reconcile;
 pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ReconcileOutcome};
 
 define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch);
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoySpec {
@@ -87,6 +91,10 @@ pub enum ConvoyPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkState {
     pub phase: WorkPhase,
+    /// A human explicitly completed this vessel's work at the roll-up level.
+    /// Crew-owned state remains unchanged while this override is active.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    pub completion_overridden: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +155,10 @@ pub enum ConvoyStatusPatch {
         crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
         phase: ConvoyPhase,
         started_at: Option<DateTime<Utc>>,
+    },
+    BackfillCrewWork {
+        crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
+        completion_overrides: BTreeSet<String>,
     },
     FailInit {
         phase: ConvoyPhase,
@@ -230,6 +242,19 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.started_at.get_or_insert(*started_at);
                 }
             }
+            Self::BackfillCrewWork { crew_work, completion_overrides } => {
+                for (vessel, missing_crew) in crew_work {
+                    let crew = status.crew_work.entry(vessel.clone()).or_default();
+                    for (role, state) in missing_crew {
+                        crew.entry(role.clone()).or_insert_with(|| state.clone());
+                    }
+                }
+                for work in completion_overrides {
+                    if let Some(state) = status.work.get_mut(work) {
+                        state.completion_overridden = true;
+                    }
+                }
+            }
             Self::FailInit { phase, message, finished_at } => {
                 status.phase = *phase;
                 status.message = Some(message.clone());
@@ -276,6 +301,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::WorkRunning { work, started_at } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
+                    state.completion_overridden = false;
                 }
                 if let Some(crew) = status.crew_work.get_mut(work) {
                     for state in crew.values_mut().filter(|state| state.phase == CrewWorkPhase::Pending) {
@@ -287,15 +313,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::ForceWorkCompleted { work, finished_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Complete;
+                    state.completion_overridden = true;
                     state.finished_at.get_or_insert(*finished_at);
                     state.message = message.clone();
-                }
-                if let Some(crew) = status.crew_work.get_mut(work) {
-                    for state in crew.values_mut() {
-                        state.phase = CrewWorkPhase::Done;
-                        state.finished_at = Some(*finished_at);
-                        state.message = message.clone();
-                    }
                 }
             }
             Self::MarkWorkFailed { work, finished_at, message } => {
@@ -319,6 +339,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::MarkCrewFailed { vessel, role, finished_at, message } => {
+                if let Some(work) = status.work.get_mut(vessel) {
+                    work.completion_overridden = false;
+                }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.phase = CrewWorkPhase::Failed;
                     state.finished_at.get_or_insert(*finished_at);
@@ -326,6 +349,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message } => {
+                if let Some(work) = status.work.get_mut(vessel) {
+                    work.completion_overridden = false;
+                }
                 let Some(crew) = status.crew_work.get_mut(vessel) else {
                     return;
                 };
@@ -349,6 +375,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             Self::RollUpWork { work, phase, transitioned_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = *phase;
+                    state.completion_overridden = false;
                     state.message = message.clone();
                     match phase {
                         WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {
@@ -381,6 +408,13 @@ pub mod controller_patches {
 
     pub fn fail_init(phase: ConvoyPhase, message: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::FailInit { phase, message, finished_at }
+    }
+
+    pub fn backfill_crew_work(
+        crew_work: BTreeMap<String, BTreeMap<String, CrewWorkState>>,
+        completion_overrides: BTreeSet<String>,
+    ) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::BackfillCrewWork { crew_work, completion_overrides }
     }
 
     pub fn advance_work_to_ready(ready: BTreeMap<String, DateTime<Utc>>) -> ConvoyStatusPatch {

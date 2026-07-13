@@ -57,7 +57,7 @@ pub fn work_state(
     message: Option<String>,
     placement: Option<flotilla_resources::PlacementStatus>,
 ) -> WorkState {
-    WorkState { phase, ready_at, started_at, finished_at, message, placement }
+    WorkState { phase, completion_overridden: false, ready_at, started_at, finished_at, message, placement }
 }
 
 pub async fn create_convoy_with_single_task(

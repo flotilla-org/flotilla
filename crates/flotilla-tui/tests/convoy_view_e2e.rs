@@ -171,6 +171,7 @@ async fn x_then_enter_completes_work_via_palette() {
     let mut tasks = BTreeMap::new();
     tasks.insert("implement".to_string(), WorkState {
         phase: WorkPhase::Pending,
+        completion_overridden: false,
         ready_at: None,
         started_at: None,
         finished_at: None,

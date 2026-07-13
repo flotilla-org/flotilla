@@ -196,6 +196,44 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
 }
 
 #[test]
+fn existing_convoy_backfills_agent_work_without_inventing_tool_state() {
+    let mut status = bootstrapped_convoy_status();
+    status.crew_work.clear();
+    status.work.get_mut("implement").expect("implement work").phase = WorkPhase::Running;
+    status.work.get_mut("implement").expect("implement work").started_at = Some(timestamp(9));
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
+
+    let outcome = reconcile(&convoy, None, timestamp(10));
+    let Some(ConvoyStatusPatch::BackfillCrewWork { crew_work, completion_overrides }) = outcome.patch else {
+        panic!("expected crew work backfill");
+    };
+
+    assert_eq!(crew_work["implement"].keys().map(String::as_str).collect::<Vec<_>>(), vec!["coder"]);
+    assert_eq!(crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(crew_work["implement"]["coder"].started_at, Some(timestamp(9)));
+    assert_eq!(crew_work["review"].keys().map(String::as_str).collect::<Vec<_>>(), vec!["reviewer"]);
+    assert!(completion_overrides.is_empty());
+}
+
+#[test]
+fn existing_completed_work_backfills_as_a_rollup_override() {
+    let mut status = bootstrapped_convoy_status();
+    status.crew_work.clear();
+    let implement = status.work.get_mut("implement").expect("implement work");
+    implement.phase = WorkPhase::Complete;
+    implement.finished_at = Some(timestamp(9));
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
+
+    let outcome = reconcile(&convoy, None, timestamp(10));
+    let Some(ConvoyStatusPatch::BackfillCrewWork { crew_work, completion_overrides }) = outcome.patch else {
+        panic!("expected crew work backfill");
+    };
+
+    assert_eq!(crew_work["implement"]["coder"].phase, CrewWorkPhase::Pending);
+    assert!(completion_overrides.contains("implement"));
+}
+
+#[test]
 fn bootstrap_interpolates_tool_process_commands() {
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), None);
     let mut template = tool_only_workflow_template_object("review-and-fix");
@@ -612,6 +650,22 @@ fn support_only_work_does_not_complete_vacuously() {
     let outcome = reconcile(&convoy, None, timestamp(21));
 
     assert_eq!(outcome.patch, None);
+}
+
+#[test]
+fn human_completion_override_is_not_reopened_by_crew_rollup() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    let implement = status.work.get_mut("implement").expect("implement work");
+    implement.phase = WorkPhase::Complete;
+    implement.completion_overridden = true;
+    implement.finished_at = Some(timestamp(20));
+    status.crew_work.get_mut("implement").expect("implement crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
+    let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
+
+    let outcome = reconcile(&convoy, None, timestamp(21));
+
+    assert!(!matches!(outcome.patch, Some(ConvoyStatusPatch::RollUpWork { phase: WorkPhase::Running, .. })));
 }
 
 #[test]

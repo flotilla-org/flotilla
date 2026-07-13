@@ -49,11 +49,19 @@ fn sample_snapshot() -> WorkflowSnapshot {
 }
 
 fn pending_task() -> WorkState {
-    WorkState { phase: WorkPhase::Pending, ready_at: None, started_at: None, finished_at: None, message: None, placement: None }
+    WorkState {
+        phase: WorkPhase::Pending,
+        completion_overridden: false,
+        ready_at: None,
+        started_at: None,
+        finished_at: None,
+        message: None,
+        placement: None,
+    }
 }
 
 fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
-    CrewWorkState { phase, started_at: Some(ts(10)), finished_at: None, message: None }
+    CrewWorkState::builder().phase(phase).started_at(ts(10)).build()
 }
 
 #[test]
@@ -63,6 +71,7 @@ fn crew_completion_updates_only_the_calling_agent() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Running,
+            completion_overridden: false,
             ready_at: Some(ts(8)),
             started_at: Some(ts(9)),
             finished_at: None,
@@ -126,6 +135,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Complete,
+            completion_overridden: true,
             ready_at: Some(ts(8)),
             started_at: Some(ts(9)),
             finished_at: Some(ts(16)),
@@ -152,6 +162,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
     )
     .apply(&mut status);
 
+    assert!(!status.work["implement"].completion_overridden);
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["coder"].finished_at, None);
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::HandedBack);
@@ -168,6 +179,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Launching,
+            completion_overridden: false,
             ready_at: Some(ts(8)),
             started_at: Some(ts(9)),
             finished_at: None,
@@ -231,6 +243,7 @@ fn advance_work_to_ready_updates_only_selected_tasks() {
             ("implement".to_string(), pending_task()),
             ("review".to_string(), WorkState {
                 phase: WorkPhase::Complete,
+                completion_overridden: false,
                 ready_at: Some(ts(5)),
                 started_at: Some(ts(6)),
                 finished_at: Some(ts(7)),
@@ -263,6 +276,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         work: BTreeMap::from([
             ("implement".to_string(), WorkState {
                 phase: WorkPhase::Failed,
+                completion_overridden: false,
                 ready_at: Some(ts(10)),
                 started_at: Some(ts(11)),
                 finished_at: Some(ts(12)),
@@ -271,6 +285,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
             }),
             ("review".to_string(), WorkState {
                 phase: WorkPhase::Running,
+                completion_overridden: false,
                 ready_at: Some(ts(20)),
                 started_at: Some(ts(21)),
                 finished_at: None,
@@ -301,6 +316,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
 fn roll_up_phase_only_touches_convoy_level_fields() {
     let review = WorkState {
         phase: WorkPhase::Complete,
+        completion_overridden: false,
         ready_at: Some(ts(10)),
         started_at: Some(ts(11)),
         finished_at: Some(ts(12)),
@@ -335,6 +351,7 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("review".to_string(), WorkState {
             phase: WorkPhase::Running,
+            completion_overridden: false,
             ready_at: Some(ts(10)),
             started_at: Some(ts(11)),
             finished_at: None,
@@ -355,17 +372,19 @@ fn external_completion_marks_task_complete_without_touching_convoy_phase() {
 
     assert_eq!(status.phase, ConvoyPhase::Active);
     assert_eq!(status.work["review"].phase, WorkPhase::Complete);
+    assert!(status.work["review"].completion_overridden);
     assert_eq!(status.work["review"].finished_at, Some(ts(50)));
     assert_eq!(status.work["review"].message.as_deref(), Some("done"));
 }
 
 #[test]
-fn forced_work_completion_marks_all_agent_crew_done() {
+fn forced_work_completion_preserves_agent_owned_state() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,
         workflow_snapshot: Some(sample_snapshot()),
         work: BTreeMap::from([("implement".to_string(), WorkState {
             phase: WorkPhase::Running,
+            completion_overridden: false,
             ready_at: None,
             started_at: None,
             finished_at: None,
@@ -389,9 +408,10 @@ fn forced_work_completion_marks_all_agent_crew_done() {
     external_patches::force_work_completed("implement".to_string(), ts(50), Some("human override".to_string())).apply(&mut status);
 
     assert_eq!(status.work["implement"].phase, WorkPhase::Complete);
-    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Done);
-    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Done);
-    assert_eq!(status.crew_work["implement"]["reviewer"].finished_at, Some(ts(50)));
+    assert!(status.work["implement"].completion_overridden);
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::HandedBack);
+    assert_eq!(status.crew_work["implement"]["reviewer"].finished_at, None);
 }
 
 #[test]
