@@ -341,15 +341,31 @@ pub async fn connect_or_spawn(
                 break;
             }
             Ok(None) => {
-                // Another process spawned the daemon — retry connect.
-                if let Some(daemon) = connect_existing_stateful(socket_path).await? {
-                    return Ok(daemon);
-                }
+                // Another process spawned the daemon — retry connect. A
+                // handshake error here is most likely a race with that
+                // process's daemon still starting up, so it spends a retry
+                // attempt rather than aborting; but it must never fall
+                // through to the spawn path, which would delete the socket of
+                // a live (if unwell or incompatible) daemon.
+                let last_probe_error = match connect_existing_stateful(socket_path).await {
+                    Ok(Some(daemon)) => return Ok(daemon),
+                    Ok(None) => None,
+                    Err(e) => {
+                        warn!(attempt = attempt + 1, error = %e, "handshake with peer-spawned daemon failed");
+                        Some(e)
+                    }
+                };
                 // Their daemon didn't come up — retry lock acquisition rather than
                 // falling through to spawn without mutual exclusion.
                 if attempt + 1 < MAX_LOCK_RETRIES {
                     warn!(attempt = attempt + 1, "connect after lock wait failed, retrying lock");
                     continue;
+                }
+                // Retries exhausted. Only spawn if the last probe found no
+                // listener at all; a live daemon that kept failing the
+                // handshake is a reportable condition, not a stale socket.
+                if let Some(e) = last_probe_error {
+                    return Err(format!("a daemon is listening but the handshake kept failing across {MAX_LOCK_RETRIES} lock-wait attempts; last error: {e}"));
                 }
                 // Exhausted retries — acquire lock ourselves before spawning
                 // so we never spawn without mutual exclusion.
