@@ -3162,11 +3162,12 @@ impl InProcessDaemon {
             let result = match convoys.get(convoy).await {
                 Ok(current) => match current.status.as_ref() {
                     None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} has no status") },
-                    Some(status) if !status.work.contains_key(work) => {
-                        flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") }
-                    }
-                    Some(_) => {
-                        match apply_resource_status_patch(
+                    Some(status) => match status.work.get(work) {
+                        None => flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} does not contain work {work}") },
+                        Some(state) if state.phase.is_terminal() => {
+                            flotilla_protocol::CommandValue::Error { message: format!("convoy {convoy} work {work} is already terminal") }
+                        }
+                        Some(_) => match apply_resource_status_patch(
                             &convoys,
                             convoy,
                             &convoy_external_patches::force_work_completed(work.clone(), chrono::Utc::now(), message.clone()),
@@ -3175,8 +3176,8 @@ impl InProcessDaemon {
                         {
                             Ok(_) => flotilla_protocol::CommandValue::Ok,
                             Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
-                        }
-                    }
+                        },
+                    },
                 },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
             };

@@ -512,6 +512,7 @@ impl Aggregator {
             .depends_on(definition.depends_on.clone())
             .host(self.local_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
+            .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .build()
     }
 }
@@ -570,8 +571,11 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
     use flotilla_protocol::result_set::ResultSet;
-    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+    use flotilla_resources::{ConvoySpec, InMemoryBackend, ObjectMeta, ResourceBackend, WorkCompletionAuthority, WorkflowSnapshot};
 
     use super::*;
 
@@ -613,6 +617,93 @@ mod tests {
 
     fn convoy_names(rows: &Rows) -> Vec<&str> {
         rows.as_convoys().expect("convoy rows").iter().map(|row| row.name.as_str()).collect()
+    }
+
+    #[bon::builder]
+    fn convoy_with_work(convoy_phase: ResourceConvoyPhase, work_phase: Option<ResourceWorkPhase>) -> ResourceObject<Convoy> {
+        let definition = VesselRequirement::builder().name("implement".to_string()).crew(Vec::new()).build();
+        let work = work_phase
+            .map(|phase| {
+                ("implement".to_string(), WorkState {
+                    phase,
+                    completion_authority: WorkCompletionAuthority::CrewRollup,
+                    ready_at: None,
+                    started_at: None,
+                    finished_at: None,
+                    message: None,
+                    placement: None,
+                })
+            })
+            .into_iter()
+            .collect();
+        ResourceObject {
+            metadata: ObjectMeta {
+                name: "convoy-a".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+            },
+            spec: ConvoySpec {
+                workflow_ref: "scratch".to_string(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repository: None,
+                r#ref: None,
+                project_ref: None,
+                adopted_checkout_ref: None,
+            },
+            status: Some(ConvoyStatus {
+                phase: convoy_phase,
+                workflow_snapshot: Some(WorkflowSnapshot { vessels: vec![definition] }),
+                work,
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn emitted_vessel(convoy: ResourceObject<Convoy>) -> VesselRow {
+        let state = AggregatorProjectionState::new();
+        let (tx, mut rx) = broadcast::channel(1);
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), tx);
+
+        aggregator.apply_convoy_event(WatchEvent::Added(convoy)).await;
+
+        let DaemonEvent::ResultSet(result_set) = rx.recv().await.expect("initial result set") else {
+            panic!("expected result set");
+        };
+        let rows = result_set.rows.as_convoys().expect("convoy rows");
+        let convoy = rows.first().expect("convoy row");
+        convoy.vessels.first().expect("vessel row").clone()
+    }
+
+    #[tokio::test]
+    async fn terminal_work_is_not_completable() {
+        for phase in [ResourceWorkPhase::Complete, ResourceWorkPhase::Failed, ResourceWorkPhase::Cancelled] {
+            let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
+
+            assert!(!vessel.complete_work, "{phase:?} work must not expose the completion override");
+        }
+    }
+
+    #[tokio::test]
+    async fn work_missing_from_status_is_not_completable() {
+        let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).call()).await;
+
+        assert!(!vessel.complete_work);
+    }
+
+    #[tokio::test]
+    async fn non_terminal_work_is_completable() {
+        for phase in [ResourceWorkPhase::Pending, ResourceWorkPhase::Ready, ResourceWorkPhase::Launching, ResourceWorkPhase::Running] {
+            let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
+
+            assert!(vessel.complete_work, "{phase:?} work must expose the completion override");
+        }
     }
 
     #[tokio::test]
