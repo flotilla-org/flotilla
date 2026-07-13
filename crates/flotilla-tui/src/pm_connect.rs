@@ -22,9 +22,10 @@ use std::{
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_manifest::{
     keys::REASSERT_INTERVAL_MS,
+    pm::PmInstance,
     projection::{project_catalog, Catalog, CatalogInput},
     recipe::{AttachOnlyRecipes, RecipeMint},
-    sink::{PatchSink, UnixSocketSink, ZellijPipeSink},
+    sink::PatchSink,
     wire::MetadataPatch,
 };
 use flotilla_protocol::{
@@ -43,22 +44,15 @@ pub struct PmConnectOptions {
     pub flotilla_bin: String,
 }
 
-/// Detect the enclosing PM and build its transport. Explicit socket wins;
-/// otherwise `ZELLIJ` in the environment means we sit inside a zellij
-/// session and speak CLI pipes.
-pub fn detect_sink(options: &PmConnectOptions, env: &dyn Fn(&str) -> Option<String>) -> Result<Arc<dyn PatchSink>, String> {
-    if let Some(path) = &options.wheelhouse_socket {
-        return Ok(Arc::new(UnixSocketSink::new(path)));
+/// Resolve the PM this connector serves: explicit configuration wins, then
+/// environment detection.
+pub fn resolve_pm(options: &PmConnectOptions, env: &dyn Fn(&str) -> Option<String>) -> Result<PmInstance, String> {
+    if let Some(socket) = &options.wheelhouse_socket {
+        return Ok(PmInstance::wheelhouse(socket));
     }
-    if env("ZELLIJ").is_some() {
-        let bin = options.zellij_bin.clone().or_else(|| env("ZELLIJ_BIN")).unwrap_or_else(|| "zellij".to_owned());
-        let mut sink = ZellijPipeSink::new(bin);
-        if let Some(url) = &options.plugin_url {
-            sink = sink.with_plugin_url(url);
-        }
-        return Ok(Arc::new(sink));
-    }
-    Err("no presentation manager detected: run inside a zellij session or pass --wheelhouse-socket".to_owned())
+    PmInstance::detect(env)
+        .map(|pm| pm.with_zellij_bin(options.zellij_bin.clone()).with_plugin_url(options.plugin_url.clone()))
+        .ok_or_else(|| "no presentation manager detected: run inside one or pass --wheelhouse-socket".to_owned())
 }
 
 /// What applying one daemon event did to the connector's row state.
@@ -251,7 +245,7 @@ pub async fn run(
         )
         .with_writer(std::io::stderr)
         .try_init();
-    let sink = detect_sink(&options, &|key| std::env::var(key).ok())?;
+    let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
     let mint: Arc<dyn RecipeMint> = Arc::new(AttachOnlyRecipes::new(options.flotilla_bin.clone()));
     loop {
         let daemon = crate::socket::connect_or_spawn(socket_path, config_dir, config_dir_override, socket_override).await?;

@@ -1201,6 +1201,7 @@ dependencies = [
  "flotilla-commands",
  "flotilla-core",
  "flotilla-daemon",
+ "flotilla-manifest",
  "flotilla-protocol",
  "flotilla-tui",
  "libc",

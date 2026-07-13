@@ -1895,7 +1895,7 @@ mod tests {
         let revived_coder_id = revived_coder.status.as_ref().and_then(|status| status.crew.as_ref()).expect("revived identity").id.clone();
 
         let attach = daemon.resolve_attach_command_internal("crew-convoy/implement/coder").await.expect("attach coder");
-        assert!(attach.contains("attach terminal-crew-convoy-implement-coder"));
+        assert!(attach.command.contains("attach terminal-crew-convoy-implement-coder"));
 
         let mut rx = daemon.subscribe();
         let coder_recomplete_id = daemon

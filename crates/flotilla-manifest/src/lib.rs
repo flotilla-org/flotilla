@@ -20,7 +20,9 @@
 //! ([`keys`]), recipe minting ([`recipe`]), and send plumbing ([`sink`]).
 
 pub mod keys;
+pub mod pm;
 pub mod projection;
 pub mod recipe;
 pub mod sink;
+pub mod stamp;
 pub mod wire;

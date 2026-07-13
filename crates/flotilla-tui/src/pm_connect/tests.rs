@@ -233,18 +233,24 @@ fn sink_len_grew(sink: &Arc<RecordingSink>, seen: usize) -> bool {
     sink.recorded().len() > seen
 }
 
-#[tokio::test]
-async fn detect_sink_prefers_explicit_socket_then_zellij_env() {
+#[test]
+fn resolve_pm_prefers_explicit_socket_then_environment_detection() {
     let options = PmConnectOptions {
         zellij_bin: None,
         plugin_url: None,
         wheelhouse_socket: Some(PathBuf::from("/tmp/wheelhouse.sock")),
         flotilla_bin: "flotilla".to_owned(),
     };
-    assert!(detect_sink(&options, &|_| None).is_ok(), "explicit socket needs no PM environment");
+    assert!(matches!(resolve_pm(&options, &|_| None), Ok(PmInstance::Wheelhouse { .. })), "explicit socket needs no PM environment");
 
-    let zellij = PmConnectOptions { zellij_bin: None, plugin_url: None, wheelhouse_socket: None, flotilla_bin: "flotilla".to_owned() };
-    assert!(detect_sink(&zellij, &|key| (key == "ZELLIJ").then(|| "1".to_owned())).is_ok());
-    let error = detect_sink(&zellij, &|_| None).map(|_| ()).expect_err("no PM detected");
+    let detect = PmConnectOptions {
+        zellij_bin: Some("/opt/zellij".to_owned()),
+        plugin_url: None,
+        wheelhouse_socket: None,
+        flotilla_bin: "flotilla".to_owned(),
+    };
+    let pm = resolve_pm(&detect, &|key| (key == "ZELLIJ").then(|| "1".to_owned())).expect("zellij detected");
+    assert!(matches!(pm, PmInstance::Zellij { ref bin, .. } if bin == "/opt/zellij"), "options override the detected default");
+    let error = resolve_pm(&detect, &|_| None).map(|_| ()).expect_err("no PM detected");
     assert!(error.contains("no presentation manager detected"));
 }

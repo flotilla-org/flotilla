@@ -459,12 +459,15 @@ async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     match result {
-        CommandValue::AttachCommandResolved { command } => match format {
+        CommandValue::AttachCommandResolved { command, binding } => match format {
             OutputFormat::Json => {
-                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { command }));
+                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { command, binding }));
                 Ok(())
             }
-            OutputFormat::Human => exec_attach_command(&command),
+            OutputFormat::Human => {
+                stamp_pane_identity(reference, binding.as_ref()).await;
+                exec_attach_command(&command)
+            }
         },
         CommandValue::Error { message } => match format {
             OutputFormat::Json => {
@@ -477,6 +480,23 @@ async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<
             }
         },
         other => Err(color_eyre::eyre::eyre!("unexpected attach response: {other:?}")),
+    }
+}
+
+/// Publish pane ≙ identity into the enclosing PM's metadata plane before
+/// exec'ing the attach command — the one moment a process knows the binding
+/// (flotilla-org/flotilla#708, half 1). Best-effort: a PM-less or failed
+/// stamp never blocks the attach.
+async fn stamp_pane_identity(reference: &str, binding: Option<&flotilla_protocol::AttachBinding>) {
+    use flotilla_manifest::{pm::PmInstance, stamp::pane_stamp};
+    let Some(pm) = PmInstance::detect(&|key| std::env::var(key).ok()) else {
+        return;
+    };
+    let Some(pane) = pm.current_pane() else {
+        return;
+    };
+    if let Err(error) = pm.sink().send(&pane_stamp(pane, reference, binding)).await {
+        eprintln!("warning: could not stamp pane identity: {error}");
     }
 }
 

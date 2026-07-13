@@ -41,6 +41,7 @@ license.workspace = true
 flotilla-commands = { path = "crates/flotilla-commands" }
 flotilla-core = { path = "crates/flotilla-core" }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
+flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-tui = { path = "crates/flotilla-tui" }
 ratatui = "0.30"

@@ -1088,7 +1088,15 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
         .await
         .expect("attach query should execute");
 
-    assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach cleat-session-1".to_string() });
+    let CommandValue::AttachCommandResolved { command, binding } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert_eq!(command, "attach cleat-session-1");
+    let binding = binding.expect("local resolution carries the structured binding");
+    assert_eq!(binding.session.as_deref(), Some("terminal-convoy-a-implement-coder"));
+    assert_eq!(binding.convoy.as_deref(), Some("convoy-a"));
+    assert_eq!(binding.vessel.as_deref(), Some("implement"));
+    assert_eq!(binding.role.as_deref(), Some("coder"));
 }
 
 #[tokio::test]
@@ -1192,7 +1200,7 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command } = result else {
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
     assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the next host over SSH: {command}");
@@ -1241,7 +1249,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command } = result else {
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
     assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the replica host over SSH: {command}");
@@ -1262,7 +1270,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command } = result else {
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
     assert!(command.starts_with("ssh -t 'alice@feta.local' "), "bare role should resolve through the replica host: {command}");
@@ -1360,7 +1368,7 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
         .await
         .expect("attach query should execute");
 
-    let CommandValue::AttachCommandResolved { command } = result else {
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
     assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the routed next hop: {command}");
@@ -1413,7 +1421,11 @@ async fn attach_query_prefers_exact_reference_over_prefix_matches() {
         .await
         .expect("attach query should execute");
 
-    assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach session-exact".to_string() });
+    let CommandValue::AttachCommandResolved { command, binding } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert_eq!(command, "attach session-exact");
+    assert_eq!(binding.expect("binding present").session.as_deref(), Some("terminal-convoy-a-implement-coder"));
 }
 
 #[tokio::test]
