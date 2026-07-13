@@ -2028,7 +2028,14 @@ impl InProcessDaemon {
             if tracked_identity == identity {
                 return Ok((path, resolved_from));
             }
-            self.remove_repo(&path).await?;
+            if let Err(error) = self.remove_repo(&path).await {
+                // Another add_repo call may have removed or migrated this path
+                // after our identity lookup. Continue through the idempotent
+                // insertion path unless it is still tracked elsewhere.
+                if self.tracked_repo_identity_for_path(&path).await.is_some_and(|current| current != identity) {
+                    return Err(error);
+                }
+            }
         }
         let slug = repo_slug.clone();
         let mut model = RepoModel::new(
