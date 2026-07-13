@@ -327,7 +327,7 @@ pub async fn assert_watch_retention_expires_only_versions_below_floor_with_backe
         .expect_err("watch below compaction floor should expire");
     assert_eq!(expired, ResourceError::WatchExpired {
         requested_version: created.metadata.resource_version,
-        compacted_through: second.metadata.resource_version,
+        compacted_through: Some(second.metadata.resource_version),
     });
 }
 

@@ -359,7 +359,7 @@ impl InMemoryBackend {
             if replay_from.is_some_and(|version| version < store.compacted_through) {
                 return Err(ResourceError::WatchExpired {
                     requested_version: replay_from.expect("checked replay version").to_string(),
-                    compacted_through: store.compacted_through.to_string(),
+                    compacted_through: Some(store.compacted_through.to_string()),
                 });
             }
             let replay = match replay_from {

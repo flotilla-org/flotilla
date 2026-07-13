@@ -365,6 +365,13 @@ impl<R: Reconciler> ControllerLoop<R> {
         Ok(())
     }
 
+    fn accept_restartable_watch_exit(result: Result<(), ResourceError>) -> Result<(), ResourceError> {
+        match result {
+            Ok(()) | Err(ResourceError::WatchExpired { .. }) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     pub async fn run(self) -> Result<(), ResourceError>
     where
         <R::Resource as Resource>::Status: Default,
@@ -456,7 +463,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                 Some(exited) = watch_exited_rx.recv() => {
                     match exited {
                         WatchExited::Primary(result) => {
-                            result?;
+                            Self::accept_restartable_watch_exit(result)?;
                             let _respawn = Self::spawn_primary_watch(
                                 primary.clone(),
                                 sender.clone(),
@@ -465,7 +472,10 @@ impl<R: Reconciler> ControllerLoop<R> {
                             );
                         }
                         WatchExited::Secondary { index, result } => {
-                            result?;
+                            Self::accept_restartable_watch_exit(result)?;
+                            // Relisting a secondary can enqueue objects that still exist, but
+                            // cannot reveal a deletion missed while its watch was expired.
+                            Self::resync_all(&primary, &sender).await?;
                             let _respawn = Self::spawn_secondary_watch(
                                 index,
                                 secondary_templates[index].clone(),

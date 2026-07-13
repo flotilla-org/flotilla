@@ -75,7 +75,7 @@ pub fn terminal_session_attach_target(session: &ResourceObject<TerminalSession>)
     Ok(TerminalSessionAttachTarget { session_id, launch_command })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TerminalSessionSpec {
     pub env_ref: String,
     pub role: String,

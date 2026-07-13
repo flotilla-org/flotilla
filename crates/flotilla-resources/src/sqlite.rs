@@ -651,7 +651,7 @@ impl SqliteBackend {
         if replay_from < compacted_through {
             return Err(ResourceError::WatchExpired {
                 requested_version: replay_from.to_string(),
-                compacted_through: compacted_through.to_string(),
+                compacted_through: Some(compacted_through.to_string()),
             });
         }
         let mut statement = conn

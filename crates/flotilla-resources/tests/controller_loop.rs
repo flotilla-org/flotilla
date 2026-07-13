@@ -15,7 +15,10 @@ use flotilla_resources::{
     ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel, VesselSpec,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{mpsc, Notify},
+    time::timeout,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrimaryResource;
@@ -52,6 +55,17 @@ impl Resource for SecondaryResource {
 #[derive(Clone)]
 struct RecordingReconciler {
     reconciled: Arc<Mutex<Vec<String>>>,
+    notify: Arc<Notify>,
+}
+
+impl RecordingReconciler {
+    fn new(reconciled: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { reconciled, notify: Arc::new(Notify::new()) }
+    }
+
+    fn with_notify(reconciled: Arc<Mutex<Vec<String>>>, notify: Arc<Notify>) -> Self {
+        Self { reconciled, notify }
+    }
 }
 
 impl Reconciler for RecordingReconciler {
@@ -69,6 +83,7 @@ impl Reconciler for RecordingReconciler {
         _now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         self.reconciled.lock().expect("reconciled lock").push(obj.metadata.name.clone());
+        self.notify.notify_one();
         ReconcileOutcome::new(None)
     }
 
@@ -292,6 +307,58 @@ impl flotilla_resources::controller::SecondaryWatch for RestartingSecondaryWatch
 }
 
 #[derive(Clone)]
+struct ExpiringSecondaryWatch {
+    spawns: Arc<AtomicUsize>,
+    expire: Arc<Notify>,
+    spawned: Arc<Notify>,
+}
+
+impl flotilla_resources::controller::SecondaryWatch for ExpiringSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        _sender: mpsc::Sender<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let spawn = self.spawns.fetch_add(1, Ordering::SeqCst);
+            self.spawned.notify_one();
+            if spawn == 0 {
+                self.expire.notified().await;
+                return Err(ResourceError::WatchExpired { requested_version: "1".to_string(), compacted_through: Some("2".to_string()) });
+            }
+            std::future::pending().await
+        })
+    }
+}
+
+#[derive(Clone)]
+struct FailingSecondaryWatch;
+
+impl flotilla_resources::controller::SecondaryWatch for FailingSecondaryWatch {
+    type Primary = PrimaryResource;
+
+    fn clone_box(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(self.clone())
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        _sender: mpsc::Sender<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async { Err(ResourceError::other("secondary watch failed")) })
+    }
+}
+
+#[derive(Clone)]
 struct ActuatingReconciler {
     actuation: Actuation,
     reconciled: Option<Arc<Mutex<Vec<String>>>>,
@@ -358,7 +425,7 @@ async fn controller_loop_reconciles_existing_primary_objects_from_initial_list()
         ControllerLoop {
             primary: primaries,
             secondaries: Vec::new(),
-            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -395,7 +462,7 @@ async fn label_mapped_watch_enqueues_primary_named_in_secondary_label() {
                 label_key: "flotilla.work/primary",
                 _marker: std::marker::PhantomData,
             })],
-            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -465,7 +532,7 @@ async fn label_join_watch_enqueues_each_primary_sharing_the_label_value() {
                 label_key: "flotilla.work/group",
                 _marker: std::marker::PhantomData,
             })],
-            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -531,7 +598,7 @@ async fn duplicate_secondary_events_for_the_same_primary_are_deduped_per_burst()
                 label_key: "flotilla.work/primary",
                 _marker: std::marker::PhantomData,
             })],
-            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -819,7 +886,7 @@ async fn controller_loop_skips_reconcile_for_observed_and_adopted_resources() {
         ControllerLoop {
             primary: primaries,
             secondaries: Vec::new(),
-            reconciler: RecordingReconciler { reconciled: Arc::clone(&reconciled) },
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -939,7 +1006,7 @@ async fn secondary_watch_restart_is_backed_off() {
         ControllerLoop {
             primary: primaries,
             secondaries: vec![Box::new(RestartingSecondaryWatch { spawns: Arc::clone(&spawns) })],
-            reconciler: RecordingReconciler { reconciled: Arc::new(Mutex::new(Vec::new())) },
+            reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -966,6 +1033,75 @@ async fn secondary_watch_restart_is_backed_off() {
     .expect("secondary watch should restart once the backoff elapses");
 
     harness.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_secondary_watch_resyncs_primaries_without_restarting_controller_loop() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let expire = Arc::new(Notify::new());
+    let spawned = Arc::new(Notify::new());
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let reconciled_notify = Arc::new(Notify::new());
+    let first_spawned = spawned.notified();
+    let initially_reconciled = reconciled_notify.notified();
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(ExpiringSecondaryWatch {
+                spawns: Arc::clone(&spawns),
+                expire: Arc::clone(&expire),
+                spawned: Arc::clone(&spawned),
+            })],
+            reconciler: RecordingReconciler::with_notify(Arc::clone(&reconciled), Arc::clone(&reconciled_notify)),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), first_spawned).await.expect("secondary watch should start");
+    timeout(Duration::from_secs(1), initially_reconciled).await.expect("initial primary list should reconcile alpha");
+    assert_eq!(spawns.load(Ordering::SeqCst), 1, "watch should start immediately");
+    reconciled.lock().expect("reconciled lock").clear();
+
+    let resynced = reconciled_notify.notified();
+    expire.notify_one();
+    timeout(Duration::from_secs(1), resynced).await.expect("expiry should immediately resync all primaries");
+    assert!(reconciled.lock().expect("reconciled lock").contains(&"alpha".to_string()), "expiry should immediately resync all primaries");
+
+    let restarted = spawned.notified();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    timeout(Duration::from_secs(1), restarted).await.expect("expired secondary watch should restart in place");
+    assert_eq!(spawns.load(Ordering::SeqCst), 2, "expired secondary watch should restart in place");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_expiry_secondary_watch_error_still_exits_controller_loop() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let result = timeout(
+        Duration::from_secs(1),
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(FailingSecondaryWatch)],
+            reconciler: RecordingReconciler::new(Arc::new(Mutex::new(Vec::new()))),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    )
+    .await
+    .expect("controller loop should return the watch error")
+    .expect_err("non-expiry watch error should reach supervision");
+
+    assert_eq!(result, ResourceError::other("secondary watch failed"));
 }
 
 #[tokio::test]

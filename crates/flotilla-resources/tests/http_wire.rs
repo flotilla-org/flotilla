@@ -167,6 +167,42 @@ async fn watch_decodes_kubernetes_watch_events() {
 
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn stale_watch_maps_http_gone_to_typed_expiry() {
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Status",
+        "status": "Failure",
+        "message": "too old resource version: 6",
+        "reason": "Expired",
+        "code": 410
+    })
+    .to_string();
+    let (base_url, request_rx) = spawn_one_shot_server(response("410 Gone", &body)).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
+    let resolver = backend.using::<Convoy>("flotilla");
+
+    let error = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect_err("stale watch should expire");
+
+    assert_eq!(error, ResourceError::WatchExpired { requested_version: "6".to_string(), compacted_through: None });
+    let request = request_rx.await.expect("captured request");
+    assert!(request.contains("watch=true&resourceVersion=6"));
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn stale_watch_maps_http_gone_before_reading_a_truncated_body() {
+    let response = "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{";
+    let (base_url, _request_rx) = spawn_one_shot_server(response.to_string()).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
+    let resolver = backend.using::<Convoy>("flotilla");
+
+    let error = resolver.watch(WatchStart::FromVersion("6".to_string())).await.expect_err("stale watch should expire");
+
+    assert_eq!(error, ResourceError::WatchExpired { requested_version: "6".to_string(), compacted_through: None });
+}
+
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn watch_decodes_crlf_terminated_events() {
     let body =
         "{\"type\":\"ADDED\",\"object\":{\"apiVersion\":\"flotilla.work/v1\",\"kind\":\"Convoy\",\"metadata\":{\"name\":\"alpha\",\"namespace\":\"flotilla\",\"resourceVersion\":\"7\",\"labels\":{},\"annotations\":{},\"creationTimestamp\":\"2026-04-13T12:00:00Z\"},\"spec\":{\"workflow_ref\":\"review\",\"inputs\":{},\"placement_policy\":\"laptop-docker\"},\"status\":{\"phase\":\"Pending\"}}}\r\n";
