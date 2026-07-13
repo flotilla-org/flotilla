@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -1414,6 +1414,31 @@ async fn attach_query_prefers_exact_reference_over_prefix_matches() {
         .expect("attach query should execute");
 
     assert_eq!(result, CommandValue::AttachCommandResolved { command: "attach session-exact".to_string() });
+}
+
+#[tokio::test]
+async fn batch_attach_capabilities_return_only_resolvable_references() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
+        .await;
+    create_running_attach_session(&daemon, &env_ref, "terminal-convoy-b-review-reviewer", "session-b", "convoy-b", "review", "reviewer")
+        .await;
+
+    let references =
+        vec!["terminal-convoy-a-implement-coder".to_string(), "terminal-convoy-b-review-reviewer".to_string(), "missing".to_string()];
+    let resolved =
+        daemon.resolvable_attach_references_internal(&references).await.expect("batch attach capability resolution should succeed");
+
+    assert_eq!(
+        resolved,
+        HashSet::from(["terminal-convoy-a-implement-coder".to_string(), "terminal-convoy-b-review-reviewer".to_string(),])
+    );
 }
 
 #[tokio::test]
