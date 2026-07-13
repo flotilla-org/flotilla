@@ -237,7 +237,7 @@ pub struct VesselRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
     /// Capability fact: the daemon will accept completing this vessel's work.
-    #[builder(default = true)]
+    #[builder(default)]
     pub complete_work: bool,
 }
 
