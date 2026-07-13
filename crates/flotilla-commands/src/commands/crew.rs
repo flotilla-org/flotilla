@@ -4,19 +4,15 @@ use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
 use crate::{
     quote_value,
     resolved::{HostResolution, RepoContext},
-    subject::{resolve_subject, write_subject},
-    Resolved,
+    subject::SubjectInterpretation,
+    Resolved, SubjectArgs,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Parser)]
+#[derive(Debug, Clone, PartialEq, Eq, Parser, bon::Builder)]
 #[command(about = "Communicate with crew members")]
 pub struct CrewNoun {
-    /// Target crew role, or an unmarked crew command
-    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
-    pub subject: Option<String>,
-    /// Literal target subject; use for external names beginning with `@`
-    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
-    pub explicit_subject: Option<String>,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
     #[command(subcommand)]
     pub verb: Option<CrewVerb>,
     /// Explicit crew identity (normally read from FLOTILLA_CREW_ID)
@@ -54,17 +50,18 @@ impl CrewNoun {
             .maybe_vessel_ref(self.vessel_ref)
             .maybe_role(self.role)
             .build();
-        let subject = resolve_subject(self.subject, self.explicit_subject)?
-            .ok_or_else(|| "crew command requires a command or target subject".to_string())?;
-        let action = match (subject.value.as_str(), subject.forced, self.verb) {
-            ("list", false, None) if self.message.is_none() => CommandAction::QueryCrewList { context },
-            ("list", false, None) => return Err("`flotilla crew list` does not accept --message".to_string()),
-            ("complete", false, None) => CommandAction::CrewComplete { context, message: self.message },
-            ("fail", false, None) => CommandAction::CrewFail {
+        let subject = self.subjects.resolve()?.ok_or_else(|| "crew command requires a command or target subject".to_string())?;
+        let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
+            ("list", SubjectInterpretation::Ordinary, None) if self.message.is_none() => CommandAction::QueryCrewList { context },
+            ("list", SubjectInterpretation::Ordinary, None) => {
+                return Err("`flotilla crew list` does not accept --message".to_string());
+            }
+            ("complete", SubjectInterpretation::Ordinary, None) => CommandAction::CrewComplete { context, message: self.message },
+            ("fail", SubjectInterpretation::Ordinary, None) => CommandAction::CrewFail {
                 context,
                 message: self.message.ok_or_else(|| "`flotilla crew fail` requires --message".to_string())?,
             },
-            (reserved @ ("list" | "complete" | "fail"), false, Some(_)) => {
+            (reserved @ ("list" | "complete" | "fail"), SubjectInterpretation::Ordinary, Some(_)) => {
                 return Err(format!("`{reserved}` is a crew command; use `@{reserved}` to address the crew role"));
             }
             (_, _, Some(CrewVerb::Handoff { message })) => CommandAction::CrewHandoff { context, target: subject.value, message },
@@ -85,7 +82,7 @@ impl CrewNoun {
 impl std::fmt::Display for CrewNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "crew")?;
-        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
+        self.subjects.write(f)?;
         for (flag, value) in [
             ("--crew-id", self.crew_id.as_ref()),
             ("--namespace", self.namespace.as_ref()),

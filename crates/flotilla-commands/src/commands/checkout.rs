@@ -5,20 +5,15 @@ use flotilla_protocol::{CheckoutSelector, CheckoutTarget, Command, CommandAction
 
 use crate::{
     resolved::{HostResolution, RepoContext},
-    subject::{resolve_subject, write_subject},
-    Resolved,
+    Resolved, SubjectArgs,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Manage checkouts")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct CheckoutNoun {
-    /// Branch name or checkout path
-    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
-    pub subject: Option<String>,
-    /// Literal subject; use for external names beginning with `@`
-    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
-    pub explicit_subject: Option<String>,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
 
     #[command(subcommand)]
     pub verb: Option<CheckoutVerb>,
@@ -46,7 +41,7 @@ pub enum CheckoutVerb {
 
 impl CheckoutNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        let subject = self.subjects.resolve()?.map(|subject| subject.value);
         match (subject, self.verb) {
             (Some(_), Some(CheckoutVerb::Create { .. })) => {
                 Err("checkout create does not take a subject (repo comes from --repo or FLOTILLA_REPO)".into())
@@ -95,7 +90,7 @@ impl CheckoutNoun {
 impl fmt::Display for CheckoutNoun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "checkout")?;
-        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
+        self.subjects.write(f)?;
         if let Some(verb) = &self.verb {
             match verb {
                 CheckoutVerb::Create { branch, fresh } => {
@@ -131,7 +126,7 @@ mod tests {
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
+        Resolved, SubjectArgs,
     };
 
     fn parse(args: &[&str]) -> CheckoutNoun {
@@ -243,7 +238,7 @@ mod tests {
 
     #[test]
     fn checkout_remove_no_subject_errors() {
-        let noun = CheckoutNoun { subject: None, explicit_subject: None, verb: Some(super::CheckoutVerb::Remove) };
+        let noun = CheckoutNoun { subjects: SubjectArgs::default(), verb: Some(super::CheckoutVerb::Remove) };
         assert!(noun.resolve().is_err());
     }
 

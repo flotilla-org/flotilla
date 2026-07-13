@@ -3,20 +3,15 @@ use flotilla_protocol::{issue_query::IssueQuery, Command, CommandAction, RepoSel
 
 use crate::{
     resolved::{HostResolution, RepoContext},
-    subject::{resolve_subject, write_subject},
-    Resolved,
+    Resolved, SubjectArgs,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Issues")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct IssueNoun {
-    /// Issue ID or comma-separated IDs (e.g. "1,5,7")
-    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
-    pub subject: Option<String>,
-    /// Literal subject; use for external names beginning with `@`
-    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
-    pub explicit_subject: Option<String>,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
 
     #[command(subcommand)]
     pub verb: Option<IssueVerb>,
@@ -34,7 +29,7 @@ pub enum IssueVerb {
 
 impl IssueNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        let subject = self.subjects.resolve()?.map(|subject| subject.value);
         match (subject, self.verb) {
             (Some(subject), Some(IssueVerb::Open)) => Ok(Resolved::NeedsContext {
                 command: Command {
@@ -85,7 +80,7 @@ impl IssueNoun {
 impl std::fmt::Display for IssueNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "issue")?;
-        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
+        self.subjects.write(f)?;
         if let Some(verb) = &self.verb {
             match verb {
                 IssueVerb::Open => write!(f, " open")?,
@@ -111,7 +106,7 @@ mod tests {
     use crate::{
         resolved::{HostResolution, RepoContext},
         test_utils::assert_round_trip,
-        Resolved,
+        Resolved, SubjectArgs,
     };
 
     fn parse(args: &[&str]) -> IssueNoun {
@@ -186,7 +181,7 @@ mod tests {
 
     #[test]
     fn issue_open_no_subject_errors() {
-        let noun = IssueNoun { subject: None, explicit_subject: None, verb: Some(super::IssueVerb::Open) };
+        let noun = IssueNoun { subjects: SubjectArgs::default(), verb: Some(super::IssueVerb::Open) };
         assert!(noun.resolve().is_err());
     }
 

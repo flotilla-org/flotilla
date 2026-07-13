@@ -6,8 +6,7 @@ use flotilla_protocol::{Command, CommandAction, HostName, RepoSelector};
 use crate::{
     noun::NounCommand,
     resolved::{HostQueryKind, HostResolution, RepoContext},
-    subject::{resolve_subject, write_subject},
-    Refinable, Resolved,
+    Refinable, Resolved, SubjectArgs,
 };
 
 // ---------------------------------------------------------------------------
@@ -18,12 +17,8 @@ use crate::{
 #[command(about = "Manage and route to hosts")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct HostNounPartial {
-    /// Host name
-    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
-    pub subject: Option<String>,
-    /// Literal subject; use for external names beginning with `@`
-    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
-    pub explicit_subject: Option<String>,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
     #[command(subcommand)]
     pub verb: Option<HostVerbPartial>,
 }
@@ -70,7 +65,7 @@ impl Refinable for HostNounPartial {
     type Refined = HostNoun;
 
     fn refine(self) -> Result<HostNoun, String> {
-        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        let subject = self.subjects.resolve()?.map(|subject| subject.value);
         let verb = match self.verb {
             Some(HostVerbPartial::List) => HostVerb::List,
             Some(HostVerbPartial::Status) => HostVerb::Status,
@@ -145,7 +140,7 @@ impl HostNoun {
 impl fmt::Display for HostNounPartial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "host")?;
-        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
+        self.subjects.write(f)?;
         if let Some(verb) = &self.verb {
             match verb {
                 HostVerbPartial::List => write!(f, " list")?,

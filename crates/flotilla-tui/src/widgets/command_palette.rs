@@ -27,7 +27,10 @@ pub fn palette_prefill(item: &WorkItem) -> Option<String> {
     }
     if let Some(branch) = &item.branch {
         if item.checkout_key().is_some() {
-            return Some(format!("checkout {} ", flotilla_commands::address_subject_for_cli("checkout", branch)));
+            return Some(format!(
+                "checkout {} ",
+                flotilla_commands::address_subject_for_cli(flotilla_commands::SubjectNoun::Checkout, branch)
+            ));
         }
     }
     if let Some(issue_key) = item.issue_keys.first() {

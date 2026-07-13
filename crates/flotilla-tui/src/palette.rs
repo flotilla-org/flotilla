@@ -514,10 +514,10 @@ fn subject_completions(noun: &str, partial: &str, model: &TuiModel, namespaces: 
     items
         .into_iter()
         .filter(|(value, _)| lower.is_empty() || value.to_lowercase().starts_with(&lower))
-        .map(|(value, description)| PaletteCompletion {
-            value: flotilla_commands::address_subject_for_cli(noun, &value),
-            description,
-            key_hint: None,
+        .map(|(value, description)| {
+            let value = flotilla_commands::SubjectNoun::from_command_name(noun)
+                .map_or(value.clone(), |noun| flotilla_commands::address_subject_for_cli(noun, &value));
+            PaletteCompletion { value, description, key_hint: None }
         })
         .collect()
 }

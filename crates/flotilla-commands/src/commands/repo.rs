@@ -3,21 +3,14 @@ use std::{fmt, path::PathBuf};
 use clap::{Parser, Subcommand};
 use flotilla_protocol::{CheckoutTarget, Command, CommandAction, RepoSelector};
 
-use crate::{
-    subject::{resolve_subject, write_subject},
-    Resolved,
-};
+use crate::{Resolved, SubjectArgs};
 
 #[derive(Debug, Clone, PartialEq, Eq, Parser)]
 #[command(about = "Manage repositories")]
 #[command(subcommand_precedence_over_arg = true, subcommand_negates_reqs = true)]
 pub struct RepoNoun {
-    /// Repository slug (e.g. owner/repo)
-    #[arg(value_name = "SUBJECT", conflicts_with = "explicit_subject")]
-    pub subject: Option<String>,
-    /// Literal subject; use for external names beginning with `@`
-    #[arg(long = "subject", value_name = "SUBJECT", conflicts_with = "subject")]
-    pub explicit_subject: Option<String>,
+    #[command(flatten)]
+    pub subjects: SubjectArgs,
 
     #[command(subcommand)]
     pub verb: Option<RepoVerb>,
@@ -47,7 +40,7 @@ pub enum RepoVerb {
 
 impl RepoNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
-        let subject = resolve_subject(self.subject, self.explicit_subject)?.map(|subject| subject.value);
+        let subject = self.subjects.resolve()?.map(|subject| subject.value);
         match (subject, self.verb) {
             (_, Some(RepoVerb::Add { path })) => Ok(Resolved::Ready(Command {
                 node_id: None,
@@ -116,7 +109,7 @@ impl RepoNoun {
 impl fmt::Display for RepoNoun {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "repo")?;
-        write_subject(f, self.subject.as_ref(), self.explicit_subject.as_ref())?;
+        self.subjects.write(f)?;
         if let Some(verb) = &self.verb {
             match verb {
                 RepoVerb::Add { path } => write!(f, " add {}", path.display())?,
