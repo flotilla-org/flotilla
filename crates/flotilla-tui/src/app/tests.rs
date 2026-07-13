@@ -15,7 +15,7 @@ use flotilla_protocol::{
     provider_data::Issue,
     qualified_path::{HostId, QualifiedPath},
     Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId, NodeInfo, ProvisioningTarget, RepoIdentity,
-    RepoSelector, WorkItemIdentity,
+    RepoSelector, ViewAddress, WorkItemIdentity,
 };
 use tempfile::tempdir;
 use test_support::*;
@@ -187,6 +187,78 @@ async fn drain_until_issue_count(app: &mut App, repo: &RepoIdentity, expected_co
 
 // -- CommandQueue --
 
+/// The convoy scope of the seeded convoys tab (namespace "flotilla", no
+/// project/convoy restriction).
+fn test_convoy_scope() -> crate::app::ConvoyScope {
+    crate::app::ConvoyScope { namespace: "flotilla".to_string(), project: None, convoy: None, vessel: None }
+}
+
+#[test]
+fn project_view_scopes_visible_convoys_to_its_project() {
+    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
+
+    let mut app = stub_app();
+    let mut in_project = test_convoy("flotilla", "in-project", ConvoyPhase::Active, false);
+    in_project.project_ref = Some("island".to_string());
+    let out_of_project = test_convoy("flotilla", "elsewhere", ConvoyPhase::Active, false);
+    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![in_project, out_of_project],
+    })));
+
+    app.open_view("project/flotilla/island".parse().expect("valid address"));
+    let scope = app.active_convoy_scope().expect("project view has a convoy scope");
+    assert_eq!(scope.project.as_deref(), Some("island"));
+
+    let visible: Vec<_> = app.visible_convoys_scoped(&scope).map(|c| c.name.clone()).collect();
+    assert_eq!(visible, vec!["in-project".to_string()]);
+}
+
+#[test]
+fn vessel_view_pins_vessel_selection() {
+    let mut app = stub_app();
+    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
+    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("build"));
+    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
+}
+
+#[test]
+fn vessel_view_selection_never_moves_off_its_vessel() {
+    use crate::keymap::Action;
+
+    let mut app = stub_app();
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["build", "test"])]))));
+
+    // On the vessel view, j/k must not move the selection to a sibling —
+    // the view IS one vessel, and attach/complete target it.
+    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
+    app.dispatch_action(Action::SelectNext);
+    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("build"), "vessel view selection is pinned");
+
+    // Sanity: the single-convoy view DOES navigate its vessel tree.
+    app.open_view("convoy/flotilla/alpha".parse().expect("valid address"));
+    app.dispatch_action(Action::SelectNext);
+    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("test"));
+}
+
+#[test]
+fn scoped_pane_esc_navigates_back() {
+    use crate::keymap::Action;
+
+    let mut app = stub_app();
+    app.views = crate::app::OpenViews::scoped("convoy/flotilla/alpha".parse().expect("valid address"));
+    app.sync_active_view();
+
+    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
+    assert_eq!(app.views.len(), 1, "scoped panes navigate in place");
+
+    app.dispatch_action(Action::Dismiss);
+    assert_eq!(app.views.active_address(), Some(&"convoy/flotilla/alpha".parse().expect("valid address")));
+    // Scoped sessions never persist an open-view set.
+    assert!(app.config.load_open_views().is_none());
+}
+
 #[test]
 fn command_queue_push_and_take_fifo() {
     let mut q = CommandQueue::default();
@@ -229,7 +301,7 @@ fn from_repo_info_builds_correct_model() {
     let model = TuiModel::from_repo_info(repos_info);
     assert_eq!(model.repos.len(), 2);
     assert_eq!(model.repo_order.len(), 2);
-    assert_eq!(model.active_repo, 0);
+    assert_eq!(model.active_repo, None, "active_repo is synced from the open views, not set at construction");
     assert!(model.repos.values().any(|repo| repo.path.as_path() == Path::new("/tmp/repo-a")));
     assert!(model.repos.values().any(|repo| repo.path.as_path() == Path::new("/tmp/repo-b")));
     assert!(model.status_message.is_none());
@@ -792,8 +864,11 @@ fn handle_repo_added_adds_new_repo() {
     assert_eq!(app.model.repos.len(), 2);
     assert!(app.model.repos.values().any(|repo| repo.path.as_path() == Path::new("/tmp/new-repo")));
     assert_eq!(app.model.repos[app.model.repo_order.last().unwrap()].path, PathBuf::from("/tmp/new-repo"));
-    // Adding a repo should not switch to it (it may arrive asynchronously)
-    assert_eq!(app.model.active_repo, 0);
+    // Adding a repo should not switch to it, nor open a tab for it (it may
+    // arrive asynchronously, e.g. registered by another session or the CLI)
+    assert_eq!(app.views.active_index(), 2, "active tab unchanged");
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
+    assert!(app.views.find(&ViewAddress::Repo(app.model.repo_order[1].clone())).is_none(), "no tab opened for the new repo");
 }
 
 #[test]
@@ -818,28 +893,59 @@ fn handle_repo_removed_removes_repo() {
 }
 
 #[test]
-fn handle_repo_removed_last_repo_sets_quit() {
+fn handle_repo_removed_last_repo_keeps_app_alive() {
     let mut app = stub_app();
-    let path = app.model.repo_order[0].clone();
+    let identity = app.model.repo_order[0].clone();
 
-    app.handle_repo_removed(&path);
+    app.handle_repo_removed(&identity);
 
-    assert!(app.should_quit);
+    // Removing the last repo no longer quits the TUI (ADR 0012): the repo's
+    // tab stays open as a dangling error tab instead.
+    assert!(!app.should_quit);
+    assert!(app.model.repos.is_empty());
+    assert!(app.views.find(&ViewAddress::Repo(identity)).is_some(), "the removed repo's tab stays open as a dangling tab");
 }
 
 #[test]
-fn handle_repo_removed_adjusts_active_index() {
+fn handle_repo_removed_keeps_tab_open_as_dangling() {
     let mut app = stub_app_with_repos(3);
-    app.model.active_repo = 2;
-    let last_path = app.model.repo_order[2].clone();
+    activate_repo_tab(&mut app, 2);
+    let last_identity = app.model.repo_order[2].clone();
 
-    app.handle_repo_removed(&last_path);
+    app.handle_repo_removed(&last_identity);
 
-    assert_eq!(app.model.active_repo, 1);
+    // No silent tab pruning: the open-view set and active tab are untouched;
+    // the repo's data is gone so the tab renders its dangling-repo error page.
+    assert_eq!(app.views.active_index(), 4);
+    assert_eq!(app.views.len(), 5);
+    assert!(app.views.find(&ViewAddress::Repo(last_identity.clone())).is_some());
+    assert!(!app.model.repos.contains_key(&last_identity));
+    assert!(!app.screen.repo_pages.contains_key(&last_identity));
 }
 
 #[test]
-fn handle_repo_removed_syncs_layout_from_new_active_page() {
+fn handle_repo_removed_dismisses_modals_open_on_the_active_repo_tab() {
+    let mut app = stub_app_with_repos(2);
+    activate_repo_tab(&mut app, 0);
+    let active_identity = app.model.active_repo.clone().expect("repo tab active");
+    let other_identity = app.model.repo_order[1].clone();
+
+    // Stand-in for a modal that reads the active repo's labels
+    // unconditionally in render (the delete-confirm panic scenario from
+    // review) — any open modal must not outlive the repo it was opened on.
+    app.screen.modal_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
+
+    // Untracking a DIFFERENT repo leaves the modal alone…
+    app.handle_repo_removed(&other_identity);
+    assert!(app.has_modal(), "modal survives removal of an inactive repo");
+
+    // …untracking the ACTIVE tab's repo dismisses it.
+    app.handle_repo_removed(&active_identity);
+    assert!(!app.has_modal(), "modal must not outlive the active tab's repo");
+}
+
+#[test]
+fn closing_a_dangling_tab_syncs_layout_from_new_active_page() {
     let mut app = stub_app_with_repos(2);
     // Give the two repo pages different layouts.
     let repo0 = app.model.repo_order[0].clone();
@@ -847,12 +953,13 @@ fn handle_repo_removed_syncs_layout_from_new_active_page() {
     app.screen.repo_pages.get_mut(&repo0).expect("page 0").layout = RepoViewLayout::Zoom;
     app.screen.repo_pages.get_mut(&repo1).expect("page 1").layout = RepoViewLayout::Below;
 
-    // Active repo is 1 (Below layout). Remove it.
-    app.model.active_repo = 1;
+    // Active tab is repo-1 (Below layout). Removing the repo leaves the tab
+    // dangling; closing the dangling tab moves focus left onto repo-0.
+    activate_repo_tab(&mut app, 1);
     app.handle_repo_removed(&repo1);
+    assert!(app.close_active_tab());
 
-    // Active repo should now be 0, and ui.view_layout should match its page.
-    assert_eq!(app.model.active_repo, 0);
+    assert_eq!(app.model.active_repo, Some(repo0));
     assert_eq!(app.ui.view_layout, RepoViewLayout::Zoom);
 }
 
@@ -1489,6 +1596,7 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
         .initializing(convoy.initializing)
         .maybe_message(convoy.message)
         .maybe_repo(convoy.repo_hint)
+        .maybe_project_ref(convoy.project_ref)
         .maybe_started_at(convoy.started_at)
         .maybe_finished_at(convoy.finished_at)
         .maybe_observed_workflow_ref(convoy.observed_workflow_ref)
@@ -1534,6 +1642,7 @@ fn test_convoy(
         phase,
         message: None,
         repo_hint: None,
+        project_ref: None,
         vessels: vec![],
         started_at: None,
         finished_at: None,
@@ -1633,8 +1742,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     })));
 
     // Switch to the Convoys tab.
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     // Render into a test terminal.
     let backend = TestBackend::new(80, 24);
@@ -1651,6 +1759,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
             let convoys: Vec<&_> = crate::app::filter_convoys_by_str(raw.iter().copied(), &app.convoys_ui.filter).collect();
             let mut ctx = crate::widgets::RenderContext {
                 model: &app.model,
+                views: &app.views,
                 ui: &mut app.ui,
                 theme: &app.theme,
                 keymap: &app.keymap,
@@ -1687,8 +1796,7 @@ fn convoys_tab_select_next_advances_selection() {
 
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "first convoy should be auto-selected");
 
@@ -1702,7 +1810,7 @@ fn convoys_tab_select_next_advances_selection() {
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"), "should clamp at last convoy");
 
     // Also verify via convoys_tab_select_delta directly
-    app.convoys_tab_select_delta(-10);
+    app.convoys_tab_select_delta(&test_convoy_scope(), -10);
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "large negative delta clamps at first convoy");
 
     let _ = Action::SelectNext; // confirm Action is reachable in this module
@@ -1712,11 +1820,10 @@ fn convoys_tab_select_next_advances_selection() {
 fn convoys_tab_select_prev_moves_back() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     // Move to the end
-    app.convoys_tab_select_delta(2);
+    app.convoys_tab_select_delta(&test_convoy_scope(), 2);
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
 
     app.handle_key(key(KeyCode::Char('k')));
@@ -1743,11 +1850,10 @@ fn delta_removing_selected_convoy_reselects_to_adjacent() {
             test_convoy("flotilla", "c", crate::convoy_model::ConvoyPhase::Active, false),
         ],
     })));
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     // Move to "b"
-    app.convoys_tab_select_delta(1);
+    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
 
     // Delta removes "b"
@@ -1776,8 +1882,7 @@ fn delta_removing_all_convoys_clears_selection() {
         namespace: "flotilla".into(),
         convoys: vec![test_convoy("flotilla", "a", crate::convoy_model::ConvoyPhase::Active, false)],
     })));
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     assert!(app.selected_convoy_id().is_some(), "should have a selection after snapshot");
 
@@ -1807,6 +1912,7 @@ fn convoy_filter_narrows_visible_convoys() {
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
+            project_ref: None,
             vessels: vec![],
             started_at: None,
             finished_at: None,
@@ -1853,6 +1959,7 @@ fn convoy_filter_matches_repo_hint() {
         phase: ConvoyPhase::Active,
         message: None,
         repo_hint: Some(RepoKey("flotilla-org/flotilla".into())),
+        project_ref: None,
         vessels: vec![],
         started_at: None,
         finished_at: None,
@@ -1867,6 +1974,7 @@ fn convoy_filter_matches_repo_hint() {
         phase: ConvoyPhase::Active,
         message: None,
         repo_hint: None,
+        project_ref: None,
         vessels: vec![],
         started_at: None,
         finished_at: None,
@@ -1892,6 +2000,8 @@ fn convoy_filter_invalidates_hidden_selection() {
     use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
 
     let mut app = stub_app();
+    // The filter belongs to convoys-consuming views; activate the convoys tab.
+    app.switch_tab(1);
     app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
@@ -1902,7 +2012,7 @@ fn convoy_filter_invalidates_hidden_selection() {
     })));
 
     // Select bravo
-    app.convoys_tab_select_delta(1);
+    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"));
 
     // Filter to only show alpha — bravo is hidden, selection should move
@@ -1926,6 +2036,7 @@ fn select_next_stays_within_filtered_set() {
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
+            project_ref: None,
             vessels: vec![],
             started_at: None,
             finished_at: None,
@@ -1939,19 +2050,18 @@ fn select_next_stays_within_filtered_set() {
         namespace: "flotilla".into(),
         convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
     })));
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     // Apply a filter that matches only "bravo".
     app.set_convoy_filter("BRA");
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "filter should select the only visible convoy");
 
     // select_next has nowhere to go — should stay on bravo.
-    app.convoys_tab_select_delta(1);
+    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "next should clamp within filtered set");
 
     // select_prev also stays.
-    app.convoys_tab_select_delta(-1);
+    app.convoys_tab_select_delta(&test_convoy_scope(), -1);
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "prev should clamp within filtered set");
 }
 
@@ -1961,8 +2071,7 @@ fn select_next_stays_within_filtered_set() {
 fn command_palette_opens_on_convoys_tab() {
     // '/' is now in TabPage, which Convoys composes. Verify it opens the palette.
     let mut app = stub_app();
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char('/')));
 
@@ -1974,20 +2083,19 @@ fn tab_nav_works_on_convoys_tab() {
     // ']' (NextTab) is in TabPage and composed with Convoys.
     // With two repos, switching from Convoys to the next tab should land on a repo tab.
     let mut app = stub_app_with_repos(2);
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char(']')));
 
-    assert!(!app.ui.is_convoys, "pressing ']' on the Convoys tab should navigate to a repo tab");
+    assert_eq!(app.views.active_index(), 2, "pressing ']' on the Convoys tab should navigate to the first repo tab");
+    assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
 }
 
 #[test]
 fn quit_works_on_convoys_tab() {
     // 'q' is in TabPage and composed with Convoys.
     let mut app = stub_app();
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char('q')));
 
@@ -1999,8 +2107,6 @@ fn action_menu_overlay_masks_tab_nav() {
     // Overlay modes (ActionMenu) act as focus barriers — they should NOT let
     // tab-page globals (like ']') fall through.
     let mut app = stub_app_with_repos(2);
-    app.ui.is_config = false;
-    app.ui.is_convoys = false;
 
     // Open an action menu by pushing the widget directly.
     let items = Vec::new();
@@ -2008,29 +2114,41 @@ fn action_menu_overlay_masks_tab_nav() {
     app.screen.modal_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(items, dummy_item)));
     assert!(app.screen.has_modal());
 
-    let tab_before = app.model.active_repo;
+    let tab_before = app.views.active_index();
     app.handle_key(key(KeyCode::Char(']')));
-    let tab_after = app.model.active_repo;
+    let tab_after = app.views.active_index();
 
     assert_eq!(tab_before, tab_after, "tab navigation should be masked by the ActionMenu overlay");
 }
 
 #[test]
-fn move_tab_is_ignored_on_convoys_tab() {
-    // '{' (MoveTabLeft) and '}' (MoveTabRight) are in Normal, not TabPage.
-    // Pressing them on the Convoys tab must not mutate repo_order or active_repo.
+fn move_tab_on_convoys_tab_moves_the_convoys_tab() {
+    // '{' (MoveTabLeft) and '}' (MoveTabRight) are in TabPage now: they move
+    // the ACTIVE tab in the open-view order on every tab, guarded only by the
+    // pinned overview at index 0. Registration order is never touched.
     let mut app = stub_app_with_repos(2);
-    app.ui.is_config = false;
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     let order_before = app.model.repo_order.clone();
-    let active_before = app.model.active_repo;
+    let convoys = ViewAddress::Convoys { namespace: "flotilla".to_string() };
+    let repo0 = ViewAddress::Repo(app.model.repo_order[0].clone());
 
+    // '{' cannot displace the pinned overview — nothing changes.
     app.handle_key(key(KeyCode::Char('{')));
-    app.handle_key(key(KeyCode::Char('}')));
+    assert_eq!(app.views.active_index(), 1);
+    assert_eq!(app.views.get(1).and_then(|v| v.address()), Some(&convoys));
 
-    assert_eq!(app.model.repo_order, order_before, "{{ / }} must not reorder repos while on the Convoys tab");
-    assert_eq!(app.model.active_repo, active_before, "active_repo must be unchanged after {{ / }} on Convoys tab");
+    // '}' swaps the Convoys tab with the first repo tab; the moved tab stays active.
+    app.handle_key(key(KeyCode::Char('}')));
+    assert_eq!(app.views.active_index(), 2, "the convoys tab moved right and stayed active");
+    assert_eq!(app.views.get(1).and_then(|v| v.address()), Some(&repo0));
+    assert_eq!(app.views.get(2).and_then(|v| v.address()), Some(&convoys));
+
+    // Registration order is not tab order — it must be untouched.
+    assert_eq!(app.model.repo_order, order_before, "{{ / }} must not reorder repo registration order");
+    // The new tab order is persisted as open views.
+    let saved = app.config.load_open_views().expect("open views persisted after a move");
+    assert_eq!(saved[2].address, convoys.to_string());
 }
 
 // -- Convoy task selection state --
@@ -2069,12 +2187,12 @@ fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::con
 fn enter_tasks_focus_default_selects_first_task() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
     assert_eq!(app.selected_convoy_task(), None);
 
-    app.enter_convoy_vessels_focus("flotilla");
+    app.enter_convoy_vessels_focus(&test_convoy_scope());
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
     assert_eq!(app.selected_convoy_task(), Some("t1"));
@@ -2084,9 +2202,9 @@ fn enter_tasks_focus_default_selects_first_task() {
 fn enter_tasks_focus_noop_on_empty_tasks() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &[])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
-    app.enter_convoy_vessels_focus("flotilla");
+    app.enter_convoy_vessels_focus(&test_convoy_scope());
 
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "focus should stay on List when convoy has no tasks");
     assert_eq!(app.selected_convoy_task(), None);
@@ -2096,14 +2214,14 @@ fn enter_tasks_focus_noop_on_empty_tasks() {
 fn convoy_vessels_select_delta_clamps_within_tasks() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
-    app.ui.is_convoys = true;
-    app.enter_convoy_vessels_focus("flotilla");
+    app.switch_tab(1);
+    app.enter_convoy_vessels_focus(&test_convoy_scope());
 
-    app.convoy_vessels_select_delta("flotilla", 1);
+    app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
     assert_eq!(app.selected_convoy_task(), Some("t2"));
-    app.convoy_vessels_select_delta("flotilla", 5);
+    app.convoy_vessels_select_delta(&test_convoy_scope(), 5);
     assert_eq!(app.selected_convoy_task(), Some("t3"), "clamps at last task");
-    app.convoy_vessels_select_delta("flotilla", -10);
+    app.convoy_vessels_select_delta(&test_convoy_scope(), -10);
     assert_eq!(app.selected_convoy_task(), Some("t1"), "clamps at first task");
 }
 
@@ -2114,11 +2232,11 @@ fn switching_convoys_resets_task_state_and_focus() {
         convoy_with_vessels("alpha", &["a1"]),
         convoy_with_vessels("beta", &["b1"]),
     ]))));
-    app.ui.is_convoys = true;
-    app.enter_convoy_vessels_focus("flotilla");
+    app.switch_tab(1);
+    app.enter_convoy_vessels_focus(&test_convoy_scope());
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
-    app.convoys_tab_select_delta(1);
+    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
 
     assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("beta"));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "switching convoy snaps focus back to List");
@@ -2129,9 +2247,9 @@ fn switching_convoys_resets_task_state_and_focus() {
 fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.ui.is_convoys = true;
-    app.enter_convoy_vessels_focus("flotilla");
-    app.convoy_vessels_select_delta("flotilla", 1);
+    app.switch_tab(1);
+    app.enter_convoy_vessels_focus(&test_convoy_scope());
+    app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
     assert_eq!(app.selected_convoy_task(), Some("t2"));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
 
@@ -2157,9 +2275,9 @@ fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
 fn exit_tasks_focus_keeps_selected_vessel() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.ui.is_convoys = true;
-    app.enter_convoy_vessels_focus("flotilla");
-    app.convoy_vessels_select_delta("flotilla", 1);
+    app.switch_tab(1);
+    app.enter_convoy_vessels_focus(&test_convoy_scope());
+    app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
 
     app.exit_convoy_vessels_focus();
 
@@ -2171,7 +2289,7 @@ fn exit_tasks_focus_keeps_selected_vessel() {
 fn l_drills_in_then_esc_returns_to_list_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
 
     app.handle_key(key(KeyCode::Char('l')));
@@ -2186,7 +2304,7 @@ fn l_drills_in_then_esc_returns_to_list_focus() {
 fn h_returns_from_tasks_to_list_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
@@ -2199,7 +2317,7 @@ fn h_returns_from_tasks_to_list_focus() {
 fn enter_also_drills_into_tasks_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
@@ -2209,7 +2327,7 @@ fn enter_also_drills_into_tasks_focus() {
 fn right_and_left_arrows_navigate_focus() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Right));
     assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
@@ -2222,7 +2340,7 @@ fn right_and_left_arrows_navigate_focus() {
 fn arrow_keys_route_task_navigation_when_tasks_focused() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Right));
 
     app.handle_key(key(KeyCode::Down));
@@ -2235,7 +2353,7 @@ fn arrow_keys_route_task_navigation_when_tasks_focused() {
 fn jk_routes_to_task_navigation_when_tasks_focused() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("t1"));
@@ -2254,7 +2372,7 @@ fn jk_routes_to_task_navigation_when_tasks_focused() {
 fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement", "review"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('j')));
     assert_eq!(app.selected_convoy_task(), Some("review"));
@@ -2277,7 +2395,7 @@ fn x_in_tasks_focus_opens_palette_with_complete_prefill() {
 fn x_prefill_quotes_vessel_names_with_whitespace() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["fix my bug"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("fix my bug"));
 
@@ -2297,7 +2415,7 @@ fn x_prefill_quotes_vessel_names_with_whitespace() {
 fn x_then_enter_dispatches_convoy_task_complete() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement"])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
     app.handle_key(key(KeyCode::Enter));
@@ -2322,7 +2440,7 @@ fn x_then_enter_routes_remote_convoy_task_complete_to_its_host() {
     // origin host stamped on the vessel.
     convoy.vessels[0].host = Some(HostName::new("feta"));
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
     app.handle_key(key(KeyCode::Enter));
@@ -2337,7 +2455,7 @@ fn x_rejects_complete_intent_for_unknown_remote_host() {
     let mut convoy = convoy_with_vessels("remote-convoy", &["implement"]);
     convoy.vessels[0].host = Some(HostName::new("missing-host"));
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
 
@@ -2351,7 +2469,7 @@ fn x_is_unavailable_without_complete_intent() {
     let mut convoy = convoy_with_vessels("alpha", &["implement"]);
     convoy.vessels[0].completion_target = None;
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('x')));
 
@@ -2394,7 +2512,7 @@ fn a_on_task_with_workspace_ref_dispatches_select_workspace() {
         "implement",
         Some("ws://task-a-implement"),
     )])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("implement"));
 
@@ -2417,7 +2535,7 @@ fn a_on_remote_task_routes_select_workspace_to_its_host() {
     let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
     convoy.vessels[0].host = Some(HostName::new("feta"));
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('a')));
 
@@ -2431,7 +2549,7 @@ fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
     let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
     convoy.vessels[0].host = Some(HostName::new("missing-host"));
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     app.handle_key(key(KeyCode::Char('a')));
 
@@ -2443,7 +2561,7 @@ fn a_on_unknown_remote_task_does_not_fall_back_to_local_execution() {
 fn a_on_task_without_workspace_ref_sets_status_message() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[("implement", None)])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("implement"));
 
@@ -2462,7 +2580,7 @@ fn a_on_two_task_convoy_dispatches_correct_ws_ref_per_selection() {
         ("implement", Some("ws://impl")),
         ("review", Some("ws://rev")),
     ])]))));
-    app.ui.is_convoys = true;
+    app.switch_tab(1);
     app.handle_key(key(KeyCode::Char('l')));
     assert_eq!(app.selected_convoy_task(), Some("implement"));
 

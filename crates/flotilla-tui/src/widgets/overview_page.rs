@@ -42,10 +42,9 @@ impl InteractiveWidget for OverviewPage {
                 Outcome::Consumed
             }
             Action::Dismiss => {
-                // Switch back to Normal mode (leave the Flotilla tab).
-                // This mirrors the old BaseView Config-mode dismiss behaviour:
-                // pressing q/Esc on the overview page returns to the active repo tab.
-                *ctx.is_config = false;
+                // Pressing Esc on the overview returns to the previously
+                // active tab (the old Config-mode dismiss behaviour).
+                ctx.app_actions.push(super::AppAction::SwitchToLastView);
                 Outcome::Consumed
             }
             Action::Quit => {
@@ -92,7 +91,9 @@ impl InteractiveWidget for OverviewPage {
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
-        KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview])
+        // Kind-level modes only — Screen composes the shell layer
+        // (TabPage, and TabShell when the tab bar exists).
+        KeyBindingMode::Composed(vec![BindingModeId::Overview])
     }
 
     fn status_fragment(&self) -> StatusFragment {
@@ -139,6 +140,7 @@ mod tests {
                 let empty_namespaces = crate::app::NamespaceMap::new();
                 let mut ctx = RenderContext {
                     model: &harness.model,
+                    views: &harness.views,
                     ui: &mut ui,
                     theme: &theme,
                     keymap: &keymap,
@@ -174,25 +176,22 @@ mod tests {
     }
 
     #[test]
-    fn overview_page_dismiss_switches_to_normal() {
+    fn overview_page_dismiss_returns_to_last_view() {
         let mut page = OverviewPage::new();
         let mut harness = TestWidgetHarness::new();
-        harness.is_config = true;
+        harness.activate_overview();
 
-        {
-            let mut ctx = harness.ctx();
-            let outcome = page.handle_action(Action::Dismiss, &mut ctx);
-            assert!(matches!(outcome, Outcome::Consumed));
-            assert!(!ctx.app_actions.iter().any(|a| matches!(a, super::super::AppAction::Quit)));
-        }
-
-        assert!(!harness.is_config);
+        let mut ctx = harness.ctx();
+        let outcome = page.handle_action(Action::Dismiss, &mut ctx);
+        assert!(matches!(outcome, Outcome::Consumed));
+        assert!(!ctx.app_actions.iter().any(|a| matches!(a, super::super::AppAction::Quit)));
+        assert!(ctx.app_actions.iter().any(|a| matches!(a, super::super::AppAction::SwitchToLastView)));
     }
 
     #[test]
     fn overview_page_binding_mode_is_overview() {
         let page = OverviewPage::new();
-        assert_eq!(page.binding_mode(), KeyBindingMode::Composed(vec![BindingModeId::TabPage, BindingModeId::Overview]));
+        assert_eq!(page.binding_mode(), KeyBindingMode::Composed(vec![BindingModeId::Overview]));
     }
 
     #[test]

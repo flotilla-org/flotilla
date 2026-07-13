@@ -28,16 +28,10 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         app.handle_daemon_event(event);
     }
 
-    // Subscribe to the convoys query — the only named query the TUI renders
-    // today. The subscribe replay returns the initial result set.
-    let query_events = app
-        .daemon
-        .subscribe_queries(&[flotilla_protocol::QueryCursor { query: flotilla_protocol::QueryId::Convoys, since: None }])
-        .await
-        .unwrap_or_default();
-    for event in query_events {
-        app.handle_daemon_event(event);
-    }
+    // Subscribe the named queries the open Views consume — the tab set is
+    // the subscription set (ADR 0013). The subscribe replay returns the
+    // initial result sets.
+    resync_subscriptions(&mut app).await;
 
     execute!(stdout(), EnableMouseCapture)?;
     let mut events = event::EventHandler::new(Duration::from_millis(50));
@@ -138,9 +132,12 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
         app.drain_background_updates();
 
+        // ── Re-sync query subscriptions after tab-set changes ──
+        if app.subscriptions_dirty {
+            resync_subscriptions(&mut app).await;
+        }
+
         // ── Check quit before rendering ──
-        // handle_repo_removed sets should_quit when the last repo is removed,
-        // and rendering with an empty repo_order would panic in the status bar.
         if app.should_quit {
             break;
         }
@@ -153,6 +150,21 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     Ok(())
 }
 
+/// Replace the daemon-side query subscription set with the union the open
+/// Views consume, applying any replayed result sets for stale cursors.
+async fn resync_subscriptions(app: &mut App) {
+    let cursors = app.query_cursors();
+    app.subscriptions_dirty = false;
+    match app.daemon.subscribe_queries(&cursors).await {
+        Ok(events) => {
+            for event in events {
+                app.handle_daemon_event(event);
+            }
+        }
+        Err(e) => tracing::warn!(%e, "query subscription re-sync failed"),
+    }
+}
+
 /// Render one frame by calling `Screen::render()` which handles the base
 /// layer and all modals.
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
@@ -162,15 +174,18 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
         let convoys_selected_vessel = app.convoys_ui.selected_vessel.as_deref();
         let convoys_focus = app.convoys_ui.focus;
         let convoy_filter = app.convoys_ui.filter.as_str();
-        // Single-namespace MVP: all convoys live in "flotilla". Multi-namespace
-        // support will need a namespace scoping concept on ConvoysUiState —
-        // see issue #589 (arbitrary tabs).
+        // Pre-filter the convoy list for the active view's convoy scope
+        // (namespace, plus project restriction on project dashboards).
         // Borrow only the convoy-related fields to avoid a whole-struct borrow
         // conflict with `&mut app.ui` below.
-        let raw = app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
-        let convoys: Vec<&_> = crate::app::filter_convoys_by_str(raw.iter().copied(), &app.convoys_ui.filter).collect();
+        let scope = app.views.active_address().and_then(crate::app::view_kind::convoy_scope);
+        let (active_namespace, project) =
+            scope.as_ref().map(|s| (s.namespace.as_str(), s.project.as_deref())).unwrap_or(("flotilla", None));
+        let raw = app.namespaces.get(active_namespace).map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
+        let convoys: Vec<&_> = crate::app::filter_convoys_scoped(raw.iter().copied(), project, &app.convoys_ui.filter).collect();
         let mut ctx = crate::widgets::RenderContext {
             model: &app.model,
+            views: &app.views,
             ui: &mut app.ui,
             theme: &app.theme,
             keymap: &app.keymap,

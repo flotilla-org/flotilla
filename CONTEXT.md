@@ -246,7 +246,19 @@ A presentation client of Flotilla — the ratatui **TUI**, a future web UI, or
 **uishell** — that consumes the resource store + **Aggregator** + a shared
 **View Model** over HTTP-over-UDS and renders it in its own idiom. Surfaces own
 rendering; they do not own truth.
-_Avoid_: Frontend, client (too generic), view (that is the View Model).
+_Avoid_: Frontend, client (too generic). (A Surface *renders* **Views**; it is
+not one.)
+
+**View**:
+An addressable instance of a **ViewKind** with typed parameters — convoys in a
+namespace, one vessel, one repo dashboard, a welcome screen. The unit a
+**Surface** opens, deep-links to, and renders (via the **View Model**).
+Identity *is* kind + parameters: opening an already-open View's address focuses
+it, never duplicates it. Surface-agnostic: the TUI shows an open View as a tab,
+a Presentation Manager as a scoped pane, a web surface as a page. Its **label**
+is a display projection (short by default, disambiguated on collision,
+user-overridable) — never part of its identity.
+_Avoid_: Tab (the TUI-local container for an open View), page, screen, widget.
 
 **View Model**:
 A surface-agnostic description of what to show and what can be done — sections,

@@ -1,0 +1,255 @@
+//! Deep-link addresses for Views (ADR 0013).
+//!
+//! A `ViewAddress` names a View — an instance of a view kind with typed
+//! parameters — in a surface-agnostic, shell-friendly form. Addresses are a
+//! quasi-external contract: Presentation Manager materialise recipes hold
+//! copies of them. Once a kind ships, its name and positional parameter
+//! order are frozen; evolution is additive only (new kinds, new optional
+//! `?key=value` parameters).
+
+use std::{fmt, str::FromStr};
+
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::RepoIdentity;
+
+/// Optional URI scheme prefix, accepted and stripped on parse.
+pub const SCHEME_PREFIX: &str = "flotilla://";
+
+/// Characters percent-encoded inside a single address segment: the segment
+/// separator, reserved address syntax, and characters a shell or renderer
+/// would misread.
+const SEGMENT: &AsciiSet = &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b' ');
+
+/// The address of a View: kind + typed parameters. Identity for
+/// open-or-focus semantics and the persisted form in `open-views.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ViewAddress {
+    /// The overview/home view: registered repos, hosts, config.
+    Overview,
+    /// All convoys in one namespace.
+    Convoys { namespace: String },
+    /// One convoy: its vessel DAG, phases, and intents.
+    Convoy { namespace: String, name: String },
+    /// One vessel: crew, work state, attach.
+    Vessel { namespace: String, convoy: String, vessel: String },
+    /// A project dashboard: the work of one Project resource.
+    Project { namespace: String, name: String },
+    /// The per-repository view, identified by canonical remote identity.
+    Repo(RepoIdentity),
+}
+
+impl ViewAddress {
+    /// The frozen kind token this address starts with.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Convoys { .. } => "convoys",
+            Self::Convoy { .. } => "convoy",
+            Self::Vessel { .. } => "vessel",
+            Self::Project { .. } => "project",
+            Self::Repo(_) => "repo",
+        }
+    }
+}
+
+fn encode(segment: &str) -> impl fmt::Display + '_ {
+    utf8_percent_encode(segment, SEGMENT)
+}
+
+fn decode(segment: &str) -> Result<String, String> {
+    percent_decode_str(segment)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .map_err(|_| format!("invalid percent-encoding in address segment: {segment}"))
+}
+
+impl fmt::Display for ViewAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Overview => f.write_str("overview"),
+            Self::Convoys { namespace } => write!(f, "convoys/{}", encode(namespace)),
+            Self::Convoy { namespace, name } => write!(f, "convoy/{}/{}", encode(namespace), encode(name)),
+            Self::Vessel { namespace, convoy, vessel } => {
+                write!(f, "vessel/{}/{}/{}", encode(namespace), encode(convoy), encode(vessel))
+            }
+            Self::Project { namespace, name } => write!(f, "project/{}/{}", encode(namespace), encode(name)),
+            Self::Repo(identity) => {
+                write!(f, "repo/{}", encode(&identity.authority))?;
+                if identity.path.split('/').any(|part| part.is_empty()) {
+                    // Paths with empty components (e.g. the absolute-path
+                    // fallback identity of a remote-less local repo) cannot
+                    // render as pretty segments — encode the whole path as
+                    // one segment so the address still round-trips.
+                    write!(f, "/{}", encode(&identity.path))
+                } else {
+                    for part in identity.path.split('/') {
+                        write!(f, "/{}", encode(part))?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+impl FromStr for ViewAddress {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.strip_prefix(SCHEME_PREFIX).unwrap_or(s);
+        if s.is_empty() {
+            return Err("empty view address".to_string());
+        }
+        let segments: Vec<&str> = s.split('/').collect();
+        if segments.iter().any(|seg| seg.is_empty()) {
+            return Err(format!("view address has an empty segment: {s}"));
+        }
+        match segments[0] {
+            "overview" => match segments.len() {
+                1 => Ok(Self::Overview),
+                _ => Err(format!("overview takes no parameters: {s}")),
+            },
+            "convoys" => match segments[1..] {
+                [namespace] => Ok(Self::Convoys { namespace: decode(namespace)? }),
+                _ => Err(format!("convoys takes exactly one parameter (namespace): {s}")),
+            },
+            "convoy" => match segments[1..] {
+                [namespace, name] => Ok(Self::Convoy { namespace: decode(namespace)?, name: decode(name)? }),
+                _ => Err(format!("convoy takes exactly two parameters (namespace, name): {s}")),
+            },
+            "vessel" => match segments[1..] {
+                [namespace, convoy, vessel] => {
+                    Ok(Self::Vessel { namespace: decode(namespace)?, convoy: decode(convoy)?, vessel: decode(vessel)? })
+                }
+                _ => Err(format!("vessel takes exactly three parameters (namespace, convoy, vessel): {s}")),
+            },
+            "project" => match segments[1..] {
+                [namespace, name] => Ok(Self::Project { namespace: decode(namespace)?, name: decode(name)? }),
+                _ => Err(format!("project takes exactly two parameters (namespace, name): {s}")),
+            },
+            "repo" => match &segments[1..] {
+                [] | [_] => Err(format!("repo takes an authority and a path: {s}")),
+                [authority, path @ ..] => {
+                    let path = path.iter().map(|seg| decode(seg)).collect::<Result<Vec<_>, _>>()?.join("/");
+                    Ok(Self::Repo(RepoIdentity { authority: decode(authority)?, path }))
+                }
+            },
+            kind => Err(format!("unknown view kind: {kind}")),
+        }
+    }
+}
+
+impl Serialize for ViewAddress {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ViewAddress {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(authority: &str, path: &str) -> ViewAddress {
+        ViewAddress::Repo(RepoIdentity { authority: authority.to_string(), path: path.to_string() })
+    }
+
+    #[test]
+    fn overview_round_trips() {
+        assert_eq!("overview".parse::<ViewAddress>().expect("parse"), ViewAddress::Overview);
+        assert_eq!(ViewAddress::Overview.to_string(), "overview");
+    }
+
+    #[test]
+    fn convoys_round_trips() {
+        let addr = ViewAddress::Convoys { namespace: "flotilla".to_string() };
+        assert_eq!(addr.to_string(), "convoys/flotilla");
+        assert_eq!("convoys/flotilla".parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn repo_round_trips_with_multi_segment_path() {
+        let addr = repo("github.com", "flotilla-org/flotilla");
+        assert_eq!(addr.to_string(), "repo/github.com/flotilla-org/flotilla");
+        assert_eq!(addr.to_string().parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn repo_round_trips_absolute_path_fallback_identities() {
+        // A repo with no remote gets `{authority: "local", path: "/abs/path"}`;
+        // the leading slash means an empty component, so the path renders as
+        // one encoded segment.
+        let addr = repo("local", "/tmp/repo-0");
+        assert_eq!(addr.to_string(), "repo/local/%2Ftmp%2Frepo-0");
+        assert_eq!(addr.to_string().parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn node_scoped_kinds_round_trip() {
+        for (addr, s) in [
+            (ViewAddress::Convoy { namespace: "flotilla".into(), name: "manifest".into() }, "convoy/flotilla/manifest"),
+            (
+                ViewAddress::Vessel { namespace: "flotilla".into(), convoy: "manifest".into(), vessel: "leg-1".into() },
+                "vessel/flotilla/manifest/leg-1",
+            ),
+            (ViewAddress::Project { namespace: "flotilla".into(), name: "flotilla".into() }, "project/flotilla/flotilla"),
+        ] {
+            assert_eq!(addr.to_string(), s);
+            assert_eq!(s.parse::<ViewAddress>().expect("parse"), addr);
+        }
+    }
+
+    #[test]
+    fn node_scoped_kinds_reject_wrong_arity() {
+        assert!("convoy/ns".parse::<ViewAddress>().is_err());
+        assert!("convoy/ns/a/b".parse::<ViewAddress>().is_err());
+        assert!("vessel/ns/c".parse::<ViewAddress>().is_err());
+        assert!("project/ns".parse::<ViewAddress>().is_err());
+    }
+
+    #[test]
+    fn scheme_prefix_is_accepted() {
+        assert_eq!("flotilla://overview".parse::<ViewAddress>().expect("parse"), ViewAddress::Overview);
+        assert_eq!("flotilla://repo/github.com/o/r".parse::<ViewAddress>().expect("parse"), repo("github.com", "o/r"));
+    }
+
+    #[test]
+    fn segments_percent_encode_reserved_characters() {
+        let addr = ViewAddress::Convoys { namespace: "with/slash and space".to_string() };
+        let rendered = addr.to_string();
+        assert_eq!(rendered, "convoys/with%2Fslash%20and%20space");
+        assert_eq!(rendered.parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn unknown_kind_is_rejected() {
+        let err = "portal/xyz".parse::<ViewAddress>().expect_err("must fail");
+        assert!(err.contains("unknown view kind"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn wrong_arity_is_rejected() {
+        assert!("overview/extra".parse::<ViewAddress>().is_err());
+        assert!("convoys".parse::<ViewAddress>().is_err());
+        assert!("convoys/a/b".parse::<ViewAddress>().is_err());
+        assert!("repo/github.com".parse::<ViewAddress>().is_err());
+        assert!("".parse::<ViewAddress>().is_err());
+        assert!("convoys//x".parse::<ViewAddress>().is_err());
+    }
+
+    #[test]
+    fn serde_uses_the_string_form() {
+        let addr = repo("github.com", "o/r");
+        let json = serde_json::to_string(&addr).expect("serialize");
+        assert_eq!(json, "\"repo/github.com/o/r\"");
+        assert_eq!(serde_json::from_str::<ViewAddress>(&json).expect("deserialize"), addr);
+    }
+}

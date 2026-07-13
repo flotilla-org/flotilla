@@ -1,43 +1,89 @@
+use flotilla_protocol::ViewAddress;
+
 use super::App;
 
 impl App {
     pub fn switch_tab(&mut self, idx: usize) {
-        self.screen.tabs.switch_to(idx, &mut self.model, &mut self.ui);
-        self.sync_layout_from_active_page();
+        if self.views.switch_to(idx) {
+            self.dismiss_modals();
+            self.sync_active_view();
+        }
     }
 
     pub fn next_tab(&mut self) {
-        self.screen.tabs.next_tab(&mut self.model, &mut self.ui);
-        self.sync_layout_from_active_page();
+        self.dismiss_modals();
+        self.views.step(1);
+        self.sync_active_view();
     }
 
     pub fn prev_tab(&mut self) {
-        self.screen.tabs.prev_tab(&mut self.model, &mut self.ui);
-        self.sync_layout_from_active_page();
+        self.dismiss_modals();
+        self.views.step(-1);
+        self.sync_active_view();
     }
 
-    /// Update `ui.view_layout` from the newly-active RepoPage so the
-    /// status bar shows the correct layout indicator after a tab switch.
-    fn sync_layout_from_active_page(&mut self) {
-        if self.model.repo_order.is_empty() {
-            return;
+    /// Focus the View at `address`, opening a tab for it if needed. Scoped
+    /// sessions navigate in place (with a back stack) instead of growing a
+    /// tab set — the pane stays one View (ADR 0013).
+    pub fn open_view(&mut self, address: ViewAddress) {
+        self.dismiss_modals();
+        if self.views.open_or_focus(address) {
+            self.subscriptions_dirty = true;
+            self.persist_open_views();
         }
-        let identity = &self.model.repo_order[self.model.active_repo];
-        if let Some(page) = self.screen.repo_pages.get(identity) {
-            self.ui.view_layout = page.layout;
+        self.sync_active_view();
+    }
+
+    /// Scoped-mode back navigation: return to the View the last in-place
+    /// open left behind. Returns true if navigation happened.
+    pub fn scoped_back(&mut self) -> bool {
+        if self.views.back() {
+            self.dismiss_modals();
+            self.subscriptions_dirty = true;
+            self.sync_active_view();
+            true
+        } else {
+            false
         }
     }
 
+    /// Return to the previously active tab (overview dismiss).
+    pub fn switch_to_last_view(&mut self) {
+        if self.views.switch_to_last() {
+            self.dismiss_modals();
+            self.sync_active_view();
+        }
+    }
+
+    /// Move the active tab by `delta`. Returns true if the order changed.
     pub fn move_tab(&mut self, delta: isize) -> bool {
-        self.screen.tabs.move_tab(delta, &mut self.model)
+        let moved = self.views.move_tab(self.views.active_index(), delta).is_some();
+        if moved {
+            self.persist_open_views();
+        }
+        moved
+    }
+
+    /// Close the tab at `idx` (the pinned overview refuses). Returns true if
+    /// a tab was closed.
+    pub fn close_tab(&mut self, idx: usize) -> bool {
+        let closed = self.views.close(idx);
+        if closed {
+            self.dismiss_modals();
+            self.subscriptions_dirty = true;
+            self.sync_active_view();
+            self.persist_open_views();
+        }
+        closed
+    }
+
+    pub fn close_active_tab(&mut self) -> bool {
+        self.close_tab(self.views.active_index())
     }
 
     #[cfg(test)]
     pub(super) fn select_next(&mut self) {
-        if self.model.repo_order.is_empty() {
-            return;
-        }
-        let identity = self.model.repo_order[self.model.active_repo].clone();
+        let Some(identity) = self.model.active_repo.clone() else { return };
         if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
             let total = page.table.total_item_count();
             if total == 0 {
@@ -49,10 +95,7 @@ impl App {
 
     #[cfg(test)]
     pub(super) fn select_prev(&mut self) {
-        if self.model.repo_order.is_empty() {
-            return;
-        }
-        let identity = self.model.repo_order[self.model.active_repo].clone();
+        let Some(identity) = self.model.active_repo.clone() else { return };
         if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
             page.table.select_prev();
         }

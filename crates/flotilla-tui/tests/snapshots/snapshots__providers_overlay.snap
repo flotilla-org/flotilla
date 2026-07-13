@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 496
 expression: output
 ---
- ⚓  flotilla  |  🚢  convoys  | my-project | [+]
+ ⚓  flotilla  |  🚢  convoys  | my-project ×  | [+]
 ┌─────────────────────────────────────────────────────────────────── ✕ ┐┌ Preview ─────────────────────────────────────┐
 │Role             Provider                 Status                      ││                                              │
 │VCS              Git                                                  ││                                              │

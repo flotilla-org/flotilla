@@ -49,7 +49,10 @@ impl InteractiveWidget for BranchInputWidget {
                 let branch = self.input.value().to_string();
                 let issue_ids = std::mem::take(&mut self.pending_issue_ids);
                 if !branch.is_empty() {
-                    let repo_identity = ctx.repo_order[ctx.active_repo].clone();
+                    let Some(repo_identity) = ctx.model.active_repo.clone() else {
+                        ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
+                        return Outcome::Finished;
+                    };
                     let Ok(host) = ctx.model.resolve_host(ctx.provisioning_target.host()) else {
                         ctx.app_actions.push(AppAction::ShowStatus(format!("ambiguous host: {}", ctx.provisioning_target.host())));
                         return Outcome::Finished;

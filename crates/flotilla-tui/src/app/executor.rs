@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn terminal_prepared_ignores_originating_repo_for_follow_up_commands() {
         let mut app = crate::app::test_support::stub_app_with_repos(2);
-        app.model.active_repo = 1;
+        crate::app::test_support::activate_repo_tab(&mut app, 1);
 
         handle_result(
             CommandValue::TerminalPrepared {

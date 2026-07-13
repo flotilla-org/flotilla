@@ -51,29 +51,13 @@ pub struct PendingActionContext {
     pub repo_identity: RepoIdentity,
 }
 
-/// Identifies a clickable tab in the tab bar.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Identifies a clickable segment in the tab bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TabId {
-    /// The main flotilla app tab (config/home).
-    Flotilla,
-    /// Global convoy view — always present, shows all convoys across repos.
-    Convoys,
-    /// A repository tab, identified by index in repo_order.
-    Repo(usize),
+    /// An open View, by index into `App::views`.
+    View(usize),
     /// The [+] button for adding repos.
     Add,
-}
-
-impl TabId {
-    /// Label for the flotilla app tab.
-    pub const FLOTILLA_LABEL: &str = " ⚓ flotilla ";
-    /// Display width of the label (⚓ is 1 column, not 3 bytes).
-    pub const FLOTILLA_LABEL_WIDTH: u16 = 13;
-
-    /// Label for the convoys global tab.
-    pub const CONVOYS_LABEL: &str = " 🚢 convoys ";
-    /// Display width of the label (🚢 is 2 columns wide; space+🚢+space+convoys+space = 1+2+1+7+1 = 12).
-    pub const CONVOYS_LABEL_WIDTH: u16 = 12;
 }
 
 #[derive(Default)]
@@ -112,9 +96,6 @@ pub struct DragState {
 }
 
 pub struct UiState {
-    pub is_config: bool,
-    /// Whether the global Convoys tab is the active tab.
-    pub is_convoys: bool,
     pub provisioning_target: ProvisioningTarget,
     pub view_layout: RepoViewLayout,
     pub status_bar: StatusBarUiState,
@@ -129,8 +110,6 @@ pub struct UiState {
 impl UiState {
     pub fn new(_repo_ids: &[RepoIdentity]) -> Self {
         Self {
-            is_config: false,
-            is_convoys: false,
             provisioning_target: ProvisioningTarget::Host { host: HostName::local() },
             view_layout: RepoViewLayout::default(),
             status_bar: StatusBarUiState::default(),
@@ -162,7 +141,6 @@ mod tests {
     #[test]
     fn new_with_empty_paths() {
         let state = UiState::new(&[]);
-        assert!(!state.is_config);
         assert!(!state.show_debug);
         assert_eq!(state.view_layout, RepoViewLayout::Auto);
     }

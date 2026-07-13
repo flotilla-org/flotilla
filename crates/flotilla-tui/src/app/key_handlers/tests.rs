@@ -39,7 +39,7 @@ fn native_issue_row(id: &str) -> crate::widgets::section_table::IssueRow {
 }
 
 fn setup_native_issue_rows(app: &mut App, issue_ids: &[&str]) {
-    let repo_key = app.model.repo_order[app.model.active_repo].clone();
+    let repo_key = app.model.active_repo.clone().expect("active tab should be a repo view");
     if let Some(handle) = app.repo_data.get(&repo_key) {
         handle.mutate(|d| {
             d.work_items.clear();
@@ -54,25 +54,25 @@ fn setup_native_issue_rows(app: &mut App, issue_ids: &[&str]) {
 
 /// Read the active RepoPage's selected flat index.
 fn active_selection(app: &App) -> Option<usize> {
-    let identity = &app.model.repo_order[app.model.active_repo];
+    let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");
     app.screen.repo_pages.get(identity).and_then(|p| p.table.selected_flat_index())
 }
 
 /// Read the active RepoPage's show_providers flag.
 fn active_show_providers(app: &App) -> bool {
-    let identity = &app.model.repo_order[app.model.active_repo];
+    let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");
     app.screen.repo_pages.get(identity).is_some_and(|p| p.show_providers)
 }
 
 /// Read the active RepoPage's multi_selected set.
 fn active_multi_selected(app: &App) -> &std::collections::HashSet<WorkItemIdentity> {
-    let identity = &app.model.repo_order[app.model.active_repo];
+    let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");
     &app.screen.repo_pages[identity].multi_selected
 }
 
 /// Read the active RepoPage's active_search_query.
 fn active_search_query(app: &App) -> Option<&str> {
-    let identity = &app.model.repo_order[app.model.active_repo];
+    let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");
     app.screen.repo_pages.get(identity).and_then(|p| p.active_search_query.as_deref())
 }
 
@@ -137,9 +137,9 @@ fn select_next_moves_work_item_selection_via_widget() {
 }
 
 #[test]
-fn config_select_next_moves_event_log_via_widget() {
+fn overview_select_next_moves_event_log_via_widget() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     {
         let ov = &mut app.screen.overview_page;
         ov.event_log.count = 3;
@@ -262,7 +262,7 @@ fn resolve_action_maps_q_by_mode() {
 
     assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Quit));
 
-    app.ui.is_config = true;
+    app.switch_tab(0);
     assert_eq!(app.resolve_action(key(KeyCode::Char('q'))), Some(Action::Dismiss));
 }
 
@@ -331,42 +331,42 @@ fn esc_in_help_returns_to_normal() {
 fn tab_switch_blocked_while_modal_open() {
     let mut app = stub_app_with_repos(2);
     setup_table(&mut app, vec![make_work_item("a")]);
-    let initial_tab = app.model.active_repo;
+    let initial_tab = app.views.active_index();
     app.screen.modal_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
 
     // Press ] to switch tabs — should be blocked by the modal focus barrier
     app.handle_key(key(KeyCode::Char(']')));
 
     assert_eq!(app.screen.modal_stack.len(), 1, "modal should remain on stack");
-    assert_eq!(app.model.active_repo, initial_tab, "tab should not have changed");
+    assert_eq!(app.views.active_index(), initial_tab, "tab should not have changed");
 }
 
-// ── handle_config_key ────────────────────────────────────────────
+// ── overview tab key handling ────────────────────────────────────
 
 #[test]
-fn config_q_dismisses_to_normal() {
+fn overview_q_returns_to_last_tab() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     app.handle_key(key(KeyCode::Char('q')));
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     assert!(!app.should_quit);
-    assert!(!app.ui.is_config);
+    assert_eq!(app.views.active_index(), 2, "dismissing the overview returns to the previously active tab");
 }
 
 #[test]
-fn config_esc_dismisses_to_normal() {
+fn overview_esc_returns_to_last_tab() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     assert!(!app.should_quit);
-    assert!(!app.ui.is_config);
+    assert_eq!(app.views.active_index(), 2, "dismissing the overview returns to the previously active tab");
 }
 
 #[test]
-fn config_j_navigates_event_log_down() {
+fn overview_j_navigates_event_log_down() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     {
         let ov = &mut app.screen.overview_page;
         ov.event_log.count = 5;
@@ -377,9 +377,9 @@ fn config_j_navigates_event_log_down() {
 }
 
 #[test]
-fn config_k_navigates_event_log_up() {
+fn overview_k_navigates_event_log_up() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     {
         let ov = &mut app.screen.overview_page;
         ov.event_log.count = 5;
@@ -390,9 +390,9 @@ fn config_k_navigates_event_log_up() {
 }
 
 #[test]
-fn config_j_when_no_selection_jumps_to_last() {
+fn overview_j_when_no_selection_jumps_to_last() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     {
         let ov = &mut app.screen.overview_page;
         ov.event_log.count = 5;
@@ -403,9 +403,9 @@ fn config_j_when_no_selection_jumps_to_last() {
 }
 
 #[test]
-fn config_j_at_end_stays() {
+fn overview_j_at_end_stays() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     {
         let ov = &mut app.screen.overview_page;
         ov.event_log.count = 3;
@@ -416,9 +416,9 @@ fn config_j_at_end_stays() {
 }
 
 #[test]
-fn config_k_at_zero_stays() {
+fn overview_k_at_zero_stays() {
     let mut app = stub_app();
-    app.ui.is_config = true;
+    app.switch_tab(0);
     {
         let ov = &mut app.screen.overview_page;
         ov.event_log.count = 5;
@@ -429,17 +429,17 @@ fn config_k_at_zero_stays() {
 }
 
 #[test]
-fn config_bracket_switches_tabs() {
+fn overview_bracket_switches_tabs() {
     let mut app = stub_app();
-    app.ui.is_config = true;
-    // ] in Config mode should switch to Normal mode + first repo
+    app.switch_tab(0);
+    // ] from the overview steps to the next tab (convoys)
     app.handle_key(key(KeyCode::Char(']')));
     assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
-    assert_eq!(app.model.active_repo, 0);
+    assert_eq!(app.views.active_index(), 1);
 
-    // [ from first repo (index 0) goes back to Config
+    // [ from convoys goes back to the overview
     app.handle_key(key(KeyCode::Char('[')));
-    assert!(app.ui.is_config);
+    assert_eq!(app.views.active_index(), 0);
 }
 
 #[test]
@@ -461,7 +461,7 @@ fn brackets_do_not_switch_tabs_from_action_menu() {
 
     // Widget should still be on the stack, tab should not have switched
     assert_eq!(app.screen.modal_stack.len(), 1);
-    assert_eq!(app.model.active_repo, 0);
+    assert_eq!(app.views.active_index(), 2, "tab should not have switched");
 }
 
 #[test]
@@ -475,7 +475,7 @@ fn brackets_do_not_switch_tabs_while_branch_input_generating() {
         app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
         KeyBindingMode::from(BindingModeId::BranchInput)
     );
-    assert_eq!(app.model.active_repo, 0);
+    assert_eq!(app.views.active_index(), 2, "tab should not have switched");
 }
 
 // ── dismiss_modals ─────────────────────────────────────────────
@@ -506,10 +506,10 @@ fn has_modal_reflects_stack_depth() {
 #[test]
 fn global_tab_switch_blocked_when_modal_is_open() {
     let mut app = stub_app_with_repos(2);
-    let before = app.model.active_repo;
+    let before = app.views.active_index();
     app.screen.modal_stack.push(Box::new(crate::widgets::help::HelpWidget::new()));
     app.handle_key(key(KeyCode::Char(']'))); // NextTab
-    assert_eq!(app.model.active_repo, before, "tab switch must not fire through modal");
+    assert_eq!(app.views.active_index(), before, "tab switch must not fire through modal");
 }
 
 // ── handle_normal_key ────────────────────────────────────────────
@@ -759,16 +759,16 @@ fn clicking_gear_icon_toggles_providers() {
 }
 
 #[test]
-fn clicking_gear_icon_ignored_in_config_mode() {
+fn clicking_gear_icon_ignored_on_overview_tab() {
     let mut app = stub_app();
-    // Set gear area on the repo page's table — in Config mode the overview
-    // page handles events, so the gear click should not toggle providers.
+    // Set gear area on the repo page's table — on the overview tab the
+    // overview page handles events, so the gear click should not toggle providers.
     let repo_key = app.model.repo_order[0].clone();
     app.screen.repo_pages.get_mut(&repo_key).expect("repo page").table.gear_area = Some(Rect::new(75, 2, 3, 1));
-    app.ui.is_config = true;
+    app.switch_tab(0);
 
     app.handle_mouse(left_click(76, 2));
-    assert!(!active_show_providers(&app));
+    assert!(!app.screen.repo_pages.get(&repo_key).expect("repo page").show_providers);
 }
 
 #[test]

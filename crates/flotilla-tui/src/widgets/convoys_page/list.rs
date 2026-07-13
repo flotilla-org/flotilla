@@ -58,6 +58,7 @@ mod tests {
             phase,
             message: None,
             repo_hint: None,
+            project_ref: None,
             vessels: vec![],
             started_at: None,
             finished_at: None,

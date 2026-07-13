@@ -1,9 +1,8 @@
 ---
 source: crates/flotilla-tui/tests/snapshots.rs
-assertion_line: 29
 expression: output
 ---
- ⚓  flotilla  |  🚢  convoys  | empty | [+]
+ ⚓  flotilla  |  🚢  convoys  | empty ×  | [+]
                                                                     ⚙   ┌ Preview ─────────────────────────────────────┐
                                                                         │                                              │
                                                                         │                                              │

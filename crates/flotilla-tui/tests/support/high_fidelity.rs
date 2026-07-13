@@ -367,6 +367,7 @@ impl HighFidelityHarness {
                 let convoys: Vec<&_> = flotilla_tui::app::filter_convoys_by_str(raw.iter().copied(), &self.app.convoys_ui.filter).collect();
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.app.model,
+                    views: &self.app.views,
                     ui: &mut self.app.ui,
                     theme: &theme,
                     keymap: &self.app.keymap,

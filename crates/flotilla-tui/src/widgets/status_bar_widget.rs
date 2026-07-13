@@ -249,7 +249,7 @@ impl InteractiveWidget for StatusBarWidget {
 
 /// Resolve the active in-flight task description for the current repo.
 pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<TaskSection> {
-    let active_repo = model.repo_order.get(model.active_repo)?;
+    let active_repo = model.active_repo.as_ref()?;
     let repo_cmds: Vec<(&u64, &InFlightCommand)> = in_flight.iter().filter(|(_, cmd)| &cmd.repo_identity == active_repo).collect();
 
     // Highest command ID = most recently started (IDs are monotonically increasing AtomicU64).
@@ -354,8 +354,9 @@ mod tests {
     #[test]
     fn active_task_shows_most_recent_command_with_count_suffix() {
         let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let model = TuiModel::from_repo_info(vec![ri]);
+        let mut model = TuiModel::from_repo_info(vec![ri]);
         let repo_identity = model.repo_order[0].clone();
+        model.active_repo = Some(repo_identity.clone());
 
         let mut in_flight = HashMap::new();
         in_flight.insert(10, InFlightCommand {
@@ -377,8 +378,9 @@ mod tests {
     #[test]
     fn active_task_shows_single_command_without_suffix() {
         let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let model = TuiModel::from_repo_info(vec![ri]);
+        let mut model = TuiModel::from_repo_info(vec![ri]);
         let repo_identity = model.repo_order[0].clone();
+        model.active_repo = Some(repo_identity.clone());
 
         let mut in_flight = HashMap::new();
         in_flight.insert(42, InFlightCommand { repo_identity, repo: PathBuf::from("/tmp/test-repo"), description: "only command".into() });

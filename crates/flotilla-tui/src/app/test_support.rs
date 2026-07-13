@@ -19,7 +19,7 @@ use tui_input::Input;
 
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
 pub(crate) use super::test_builders::*;
-use super::{App, CommandQueue, DirEntry, InFlightCommand, TuiHostState, TuiModel};
+use super::{App, CommandQueue, DirEntry, InFlightCommand, OpenViews, TuiHostState, TuiModel};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
 pub(crate) struct StubDaemon {
@@ -115,6 +115,12 @@ pub(crate) fn active_repo_path(app: &App) -> PathBuf {
     app.model.active_repo_root().clone()
 }
 
+/// Switch the app to the tab of the i-th seeded repo. The seeded tab layout
+/// is `[overview, convoys, repo-0, repo-1, ...]`, so repo `i` is tab `i + 2`.
+pub(crate) fn activate_repo_tab(app: &mut App, repo_idx: usize) {
+    app.switch_tab(repo_idx + 2);
+}
+
 pub(crate) fn provider_error(category: &str, provider: &str, message: &str) -> ProviderError {
     ProviderError { category: category.into(), provider: provider.into(), message: message.into() }
 }
@@ -148,7 +154,7 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
 }
 
 pub(crate) fn set_active_table_items(app: &mut App, items: Vec<WorkItem>) {
-    let repo_key = app.model.repo_order[app.model.active_repo].clone();
+    let repo_key = app.model.active_repo.clone().expect("test requires an active repo tab");
     if let Some(page) = app.screen.repo_pages.get_mut(&repo_key) {
         let providers = flotilla_protocol::ProviderData::default();
         let labels = SectionLabels::default();
@@ -161,7 +167,7 @@ pub(crate) fn set_active_table_items(app: &mut App, items: Vec<WorkItem>) {
 
 pub(crate) fn setup_selectable_table(app: &mut App, items: Vec<WorkItem>) {
     // Populate Shared<RepoData> so the RepoPage can reconcile the items.
-    let repo_key = app.model.repo_order[app.model.active_repo].clone();
+    let repo_key = app.model.active_repo.clone().expect("test requires an active repo tab");
     if let Some(handle) = app.repo_data.get(&repo_key) {
         handle.mutate(|d| {
             d.work_items = items;
@@ -206,6 +212,7 @@ fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
 /// get a `WidgetContext` suitable for driving widget event handlers in tests.
 pub(crate) struct TestWidgetHarness {
     pub model: TuiModel,
+    pub views: OpenViews,
     pub keymap: Keymap,
     pub config: Arc<ConfigStore>,
     pub in_flight: HashMap<u64, InFlightCommand>,
@@ -213,7 +220,6 @@ pub(crate) struct TestWidgetHarness {
     pub provisioning_target: ProvisioningTarget,
     pub my_host: Option<HostName>,
     pub my_node_id: Option<NodeId>,
-    pub is_config: bool,
     pub active_repo_is_remote_only: bool,
     pub namespaces: crate::app::NamespaceMap,
 }
@@ -223,6 +229,7 @@ impl TestWidgetHarness {
         let app = stub_app();
         Self {
             model: app.model,
+            views: app.views,
             keymap: app.keymap,
             config: app.config,
             in_flight: app.in_flight,
@@ -230,10 +237,15 @@ impl TestWidgetHarness {
             provisioning_target: app.ui.provisioning_target.clone(),
             my_host: None,
             my_node_id: None,
-            is_config: false,
             active_repo_is_remote_only: false,
             namespaces: Default::default(),
         }
+    }
+
+    /// Make the overview the active tab (the old `is_config = true`).
+    pub fn activate_overview(&mut self) {
+        self.views.switch_to(0);
+        self.model.active_repo = self.views.active_repo_identity().cloned();
     }
 
     pub fn ctx(&mut self) -> WidgetContext<'_> {
@@ -245,11 +257,8 @@ impl TestWidgetHarness {
             provisioning_target: &self.provisioning_target,
             my_host: self.my_host.clone(),
             my_node_id: self.my_node_id.clone(),
-            active_repo: self.model.active_repo,
-            repo_order: &self.model.repo_order,
+            views: &self.views,
             commands: &mut self.commands,
-            is_config: &mut self.is_config,
-            is_convoys: false,
             active_repo_is_remote_only: self.active_repo_is_remote_only,
             namespaces: &self.namespaces,
             app_actions: Vec::new(),

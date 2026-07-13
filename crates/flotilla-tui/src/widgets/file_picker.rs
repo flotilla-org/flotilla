@@ -98,9 +98,12 @@ impl FilePickerWidget {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::TrackRepoPath { path: canonical },
+                action: CommandAction::TrackRepoPath { path: canonical.clone() },
             };
             ctx.commands.push(cmd);
+            // Adding via [+] both registers the repo and opens its tab once
+            // the daemon confirms with RepoTracked.
+            ctx.app_actions.push(super::AppAction::ExpectRepoOpen(canonical));
             return Outcome::Finished;
         } else if entry.is_dir {
             let new_path = format!("{}{}/", base, entry.name);

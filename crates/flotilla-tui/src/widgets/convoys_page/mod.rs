@@ -6,6 +6,7 @@
 mod detail;
 mod glyphs;
 mod list;
+mod vessel_detail;
 
 pub use detail::ConvoyDetail;
 pub use list::ConvoyList;
@@ -15,6 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+pub use vessel_detail::VesselDetail;
 
 use crate::convoy_model::{ConvoyId, ConvoySummary};
 
@@ -24,13 +26,24 @@ pub struct ConvoysPage<'a> {
     pub selected_vessel: Option<&'a str>,
     pub focus: crate::app::ConvoysFocus,
     pub filter: &'a str,
+    /// Set on project dashboards: the Project the list is scoped to.
+    pub project: Option<&'a str>,
 }
 
 impl<'a> ConvoysPage<'a> {
     pub fn render(&self, f: &mut Frame, area: Rect) {
         if self.convoys.is_empty() {
-            let block = Block::default().borders(Borders::ALL).title(" Convoys ");
-            let text = Line::from("No convoys. Create one via 'flotilla convoy create ...' (coming soon)");
+            let (title, text) = match self.project {
+                // The TUI has no projects query yet, so an empty project
+                // dashboard cannot distinguish "no launched work" from "no
+                // such project" — say so instead of implying either.
+                Some(project) => (
+                    format!(" Project {project} — Convoys "),
+                    Line::from(format!("No convoys in project '{project}' — or no such project (projects aren't queryable yet).")),
+                ),
+                None => (" Convoys ".to_string(), Line::from("No convoys. Create one via 'flotilla convoy create ...' (coming soon)")),
+            };
+            let block = Block::default().borders(Borders::ALL).title(title);
             f.render_widget(Paragraph::new(text).block(block), area);
             return;
         }

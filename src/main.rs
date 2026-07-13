@@ -50,6 +50,16 @@ enum SubCommand {
         #[arg(long, default_value = "300")]
         timeout: u64,
     },
+    /// Open the TUI scoped to one View (e.g. `flotilla view convoys/flotilla`).
+    ///
+    /// Scoped mode shows exactly that View: no tab bar, and the persisted
+    /// open-view set is untouched. This is the deep-link entry Presentation
+    /// Manager recipes embed (ADR 0013).
+    View {
+        /// View address: `overview`, `repo/<authority>/<path>`, `convoys/<namespace>`, ...
+        /// A `flotilla://` prefix is accepted.
+        address: String,
+    },
     /// Print repo list and state
     Status,
     /// Stream daemon events to stdout
@@ -182,6 +192,18 @@ async fn main() -> Result<()> {
     let command = cli.command.take();
 
     match command {
+        Some(SubCommand::View { address }) => {
+            // Parse before touching the terminal so a bad address in a
+            // recipe fails loudly at the shell (ADR 0013).
+            let address: flotilla_protocol::ViewAddress = match address.parse() {
+                Ok(address) => address,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(2);
+                }
+            };
+            run_tui(cli, Some(address)).await
+        }
         Some(SubCommand::Daemon { timeout }) => run_daemon(&cli, timeout).await,
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
@@ -220,11 +242,13 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        None => run_tui(cli).await,
+        None => run_tui(cli, None).await,
     }
 }
 
-async fn run_tui(cli: Cli) -> Result<()> {
+/// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
+/// no tab shell, no open-view persistence.
+async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
     let paths = PathPolicy::from_process_env();
     event_log::init_with_dir(paths.state_dir.as_path());
     let startup = std::time::Instant::now();
@@ -294,7 +318,10 @@ async fn run_tui(cli: Cli) -> Result<()> {
     }
 
     let repos_info = daemon.list_repos().await.unwrap_or_default();
-    let app = app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme);
+    let app = match scoped_view {
+        Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme, address),
+        None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme),
+    };
 
     flotilla_tui::run::run_event_loop(terminal, app).await
 }

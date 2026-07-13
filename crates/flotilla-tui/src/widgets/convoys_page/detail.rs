@@ -94,6 +94,7 @@ mod tests {
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
+            project_ref: None,
             vessels: vec![
                 VesselSummary {
                     name: "implement".into(),

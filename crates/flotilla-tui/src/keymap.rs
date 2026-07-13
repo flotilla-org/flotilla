@@ -27,6 +27,7 @@ pub enum Action {
     NextTab,
     MoveTabLeft,
     MoveTabRight,
+    CloseTab,
     ToggleHelp,
     ToggleMultiSelect,
     ToggleProviders,
@@ -72,6 +73,7 @@ impl Action {
                 | Action::NextTab
                 | Action::MoveTabLeft
                 | Action::MoveTabRight
+                | Action::CloseTab
                 | Action::CycleTheme
                 | Action::CycleLayout
                 | Action::CycleHost
@@ -97,6 +99,7 @@ impl Action {
             "next_tab" => Action::NextTab,
             "move_tab_left" => Action::MoveTabLeft,
             "move_tab_right" => Action::MoveTabRight,
+            "close_tab" => Action::CloseTab,
             "toggle_help" => Action::ToggleHelp,
             "toggle_multi_select" => Action::ToggleMultiSelect,
             "toggle_providers" => Action::ToggleProviders,
@@ -147,6 +150,7 @@ impl Action {
             Action::NextTab => "next_tab",
             Action::MoveTabLeft => "move_tab_left",
             Action::MoveTabRight => "move_tab_right",
+            Action::CloseTab => "close_tab",
             Action::ToggleHelp => "toggle_help",
             Action::ToggleMultiSelect => "toggle_multi_select",
             Action::ToggleProviders => "toggle_providers",
@@ -194,6 +198,7 @@ impl Action {
             Action::NextTab => "Switch to next tab",
             Action::MoveTabLeft => "Move current tab left",
             Action::MoveTabRight => "Move current tab right",
+            Action::CloseTab => "Close current tab",
             Action::ToggleHelp => "Toggle help screen",
             Action::ToggleMultiSelect => "Toggle multi-select",
             Action::ToggleProviders => "Toggle provider config",
@@ -279,6 +284,7 @@ impl Keymap {
         let mode_configs: &[(&std::collections::HashMap<String, String>, BindingModeId)] = &[
             (&config.normal, BindingModeId::Normal),
             (&config.tab_page, BindingModeId::TabPage),
+            (&config.tab_shell, BindingModeId::TabShell),
             (&config.help, BindingModeId::Help),
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
@@ -333,8 +339,9 @@ impl Keymap {
     /// by action, and organises into display sections with combined key names.
     pub fn help_sections(&self) -> Vec<HelpSection> {
         // Build the effective Normal-mode binding map: start with shared, then
-        // TabPage (app-global tab-level keys), then Normal (repo-tab specific).
-        // This mirrors the Composed([TabPage, Normal]) resolution order so the
+        // TabPage (app globals) and TabShell (tab management), then Normal
+        // (repo-tab specific). This mirrors the
+        // Composed([TabPage, TabShell, Normal]) resolution order so the
         // help screen accurately reflects what each key does in Normal mode.
         let mut effective: std::collections::HashMap<KeyCombination, Action> = std::collections::HashMap::new();
         if let Some(shared_bindings) = self.compiled.key_map.get(&BindingModeId::Shared) {
@@ -342,6 +349,9 @@ impl Keymap {
         }
         if let Some(tab_page_bindings) = self.compiled.key_map.get(&BindingModeId::TabPage) {
             effective.extend(tab_page_bindings);
+        }
+        if let Some(tab_shell_bindings) = self.compiled.key_map.get(&BindingModeId::TabShell) {
+            effective.extend(tab_shell_bindings);
         }
         if let Some(normal_bindings) = self.compiled.key_map.get(&BindingModeId::Normal) {
             effective.extend(normal_bindings);
