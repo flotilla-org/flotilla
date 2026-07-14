@@ -359,12 +359,19 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
 
     let running = sessions.get("terminal-yeoman").await.expect("running terminal session");
     sessions
-        .update_status(&running.metadata.name, &running.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Stopped,
-            ..Default::default()
-        })
+        .update(
+            &InputMeta::builder()
+                .name(running.metadata.name.clone())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+                    (VESSEL_LABEL.to_string(), "yeoman".to_string()),
+                ]))
+                .build(),
+            &running.metadata.resource_version,
+            &running.spec,
+        )
         .await
-        .expect("stop terminal session");
+        .expect("adopt terminal session into convoy");
     let removed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
@@ -375,7 +382,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         }
     })
     .await
-    .expect("timed out waiting for stopped session removal");
+    .expect("timed out waiting for adopted session removal");
     assert_eq!(removed.removed.len(), 1);
     assert_eq!(removed.removed[0].name, "terminal-yeoman");
 }

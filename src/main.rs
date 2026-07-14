@@ -82,6 +82,12 @@ enum SubCommand {
     Attach {
         /// Convoy, vessel, role, terminal session, or unique prefix
         reference: String,
+        /// Internal attach mode used by temporary TUI excursions.
+        #[arg(long, hide = true)]
+        transient: bool,
+        /// Restrict internal attach resolution to the daemon owning this row.
+        #[arg(long, hide = true)]
+        host: Option<String>,
     },
     /// Emit this host's store-backed fleet replica snapshot
     #[command(hide = true)]
@@ -243,7 +249,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
         Some(SubCommand::Topology) => run_topology_command(&cli, format).await,
         Some(SubCommand::Ls) => run_fleet_list(&cli, format).await,
-        Some(SubCommand::Attach { reference }) => run_attach(&cli, &reference, format).await,
+        Some(SubCommand::Attach { reference, transient, host }) => run_attach(&cli, &reference, transient, host.as_deref(), format).await,
         Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
         Some(SubCommand::Hook { harness, event_type }) => run_hook(&cli, &harness, &event_type).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
@@ -497,7 +503,7 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
-async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<()> {
+async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&str>, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
     let result = daemon
@@ -506,7 +512,11 @@ async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: reference.to_string() },
+                action: if transient {
+                    CommandAction::AttachTransient { reference: reference.to_string(), host: host.map(flotilla_protocol::HostName::new) }
+                } else {
+                    CommandAction::Attach { reference: reference.to_string() }
+                },
             },
             uuid::Uuid::new_v4(),
         )
@@ -520,7 +530,9 @@ async fn run_attach(cli: &Cli, reference: &str, format: OutputFormat) -> Result<
                 Ok(())
             }
             OutputFormat::Human => {
-                stamp_pane_identity(reference, binding.as_ref()).await;
+                if !transient {
+                    stamp_pane_identity(reference, binding.as_ref()).await;
+                }
                 exec_attach_command(&command)
             }
         },
@@ -1155,7 +1167,21 @@ mod tests {
     #[test]
     fn cli_parses_attach_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "attach", "convoy-a/implement/coder"]).expect("attach cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Attach { reference }) if reference == "convoy-a/implement/coder"));
+        assert!(matches!(
+            cli.command,
+            Some(SubCommand::Attach { reference, transient: false, host: None }) if reference == "convoy-a/implement/coder"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_internal_transient_attach_target() {
+        let cli = Cli::try_parse_from(["flotilla", "attach", "--transient", "--host", "feta", "terminal-scratch"])
+            .expect("transient attach cli should parse");
+        assert!(matches!(
+            cli.command,
+            Some(SubCommand::Attach { reference, transient: true, host: Some(host) })
+                if reference == "terminal-scratch" && host == "feta"
+        ));
     }
 
     #[test]

@@ -108,6 +108,13 @@ pub enum CommandAction {
     Attach {
         reference: String,
     },
+    /// Resolve an attach for a temporary foreground excursion. Unlike the
+    /// human-facing CLI attach, recursive hops must not stamp PM metadata.
+    AttachTransient {
+        reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<crate::HostName>,
+    },
     PrepareTerminalForCheckout {
         checkout_path: PathBuf,
         /// Role→command mappings from the requesting host's template.
@@ -271,6 +278,7 @@ impl CommandAction {
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::Attach { .. }
+                | CommandAction::AttachTransient { .. }
                 | CommandAction::QueryIssues { .. }
                 | CommandAction::QueryIssueFetchByIds { .. }
                 | CommandAction::QueryIssueOpenInBrowser { .. }
@@ -285,6 +293,7 @@ impl Command {
             CommandAction::CreateWorkspaceFromPreparedTerminal { .. } => "Creating workspace...",
             CommandAction::SelectWorkspace { .. } => "Switching workspace...",
             CommandAction::Attach { .. } => "Resolving attach target...",
+            CommandAction::AttachTransient { .. } => "Resolving temporary attach target...",
             CommandAction::PrepareTerminalForCheckout { .. } => "Preparing terminal...",
             CommandAction::Checkout { target, .. } => match target {
                 CheckoutTarget::Branch(_) => "Checking out branch...",
@@ -560,6 +569,12 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::Attach { reference: "convoy-a".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient { reference: "terminal-scratch".into(), host: Some(crate::HostName::new("feta")) },
             },
             Command {
                 node_id: None,

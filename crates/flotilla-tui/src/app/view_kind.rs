@@ -17,6 +17,7 @@ pub(crate) fn query(address: &ViewAddress) -> Option<QueryId> {
         ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } | ViewAddress::Project { .. } => {
             Some(QueryId::Convoys)
         }
+        ViewAddress::Independents => Some(QueryId::Independents),
         ViewAddress::Overview | ViewAddress::Repo(_) => None,
     }
 }
@@ -46,7 +47,13 @@ pub(crate) fn compose_with_shell(scoped: bool, kind_modes: impl IntoIterator<Ite
 pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
     match address {
         Some(ViewAddress::Overview) => vec![BindingModeId::Overview],
-        Some(ViewAddress::Convoys { .. } | ViewAddress::Project { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. }) => {
+        Some(
+            ViewAddress::Convoys { .. }
+            | ViewAddress::Independents
+            | ViewAddress::Project { .. }
+            | ViewAddress::Convoy { .. }
+            | ViewAddress::Vessel { .. },
+        ) => {
             vec![BindingModeId::Convoys]
         }
         Some(ViewAddress::Repo(_)) => vec![BindingModeId::Normal],

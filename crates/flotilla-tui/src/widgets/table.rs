@@ -31,8 +31,8 @@ impl TableWidget {
     fn projected(ctx: &WidgetContext<'_>) -> Result<TableView, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let filter = ctx.views.active_table_state().filter.clone();
-        let convoys = ctx.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();
-        table_view::project(address, &convoys).map(|view| view.filtered(&filter))
+        let rows = crate::app::table_rows(ctx.namespaces);
+        table_view::project(address, &rows).map(|view| view.filtered(&filter))
     }
 
     fn click_row(&self, mouse: MouseEvent, row_count: usize) -> Option<usize> {
@@ -237,8 +237,8 @@ impl InteractiveWidget for TableWidget {
         // the shared widget contract for direct embedding and test harnesses.
         let Some(address) = ctx.views.active_address().cloned() else { return };
         let filter = ctx.views.active_table_state().filter.clone();
-        let convoys = ctx.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();
-        let Ok(view) = table_view::project(&address, &convoys).map(|view| view.filtered(&filter)) else { return };
+        let rows = crate::app::table_rows(ctx.namespaces);
+        let Ok(view) = table_view::project(&address, &rows).map(|view| view.filtered(&filter)) else { return };
         let breadcrumbs = ctx.views.active().breadcrumb_addresses().into_iter().map(ToString::to_string).collect::<Vec<_>>();
         self.render_table(frame, area, ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
     }
@@ -335,7 +335,8 @@ mod tests {
             ),
         ];
         let rows = convoys.iter().collect::<Vec<_>>();
-        table_view::project(&"convoys/dev".parse().expect("valid address"), &rows).expect("project snapshot table")
+        table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows { convoys: rows, independents: vec![] })
+            .expect("project snapshot table")
     }
 
     #[test]
