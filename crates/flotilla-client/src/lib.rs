@@ -640,7 +640,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
         DaemonEvent::ResultDelta(delta) => {
             let query = delta.query();
             let seq = delta.seq;
-            let stream_key = StreamKey::Query { query };
+            let stream_key = StreamKey::Query { query: query.clone() };
             let local_seq = local_seqs.read().expect("sequence lock poisoned").get(&stream_key).copied();
 
             match local_seq {
@@ -763,7 +763,10 @@ async fn recover_from_gap(ctx: &EventContext) {
 fn encode_query_cursors(subscribed_queries: &QuerySet, local_seqs: &SeqMap) -> Vec<QueryCursor> {
     let subscribed = subscribed_queries.read().expect("subscribed queries lock poisoned");
     let seqs = local_seqs.read().expect("sequence lock poisoned");
-    subscribed.iter().map(|&query| QueryCursor { query, since: seqs.get(&StreamKey::Query { query }).copied() }).collect()
+    subscribed
+        .iter()
+        .map(|query| QueryCursor { query: query.clone(), since: seqs.get(&StreamKey::Query { query: query.clone() }).copied() })
+        .collect()
 }
 
 /// Seed local seq tracking from subscribe-replay result sets, monotonically —
@@ -910,12 +913,12 @@ impl DaemonHandle for SocketDaemon {
         Ok(events)
     }
 
-    async fn subscribe_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+    async fn subscribe_queries(&self, _subscriber_id: uuid::Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
         // Record the subscription before sending so a delta racing ahead of
         // the response finds the query known and recovery can re-subscribe.
         {
             let mut subscribed = self.subscribed_queries.write().expect("subscribed queries lock poisoned");
-            *subscribed = queries.iter().map(|cursor| cursor.query).collect();
+            *subscribed = queries.iter().map(|cursor| cursor.query.clone()).collect();
         }
         let events = match into_success_response(self.request(Request::SubscribeQueries { queries: queries.to_vec() }).await?)? {
             Response::SubscribeQueries(events) => events,
@@ -923,6 +926,11 @@ impl DaemonHandle for SocketDaemon {
         };
         seed_query_seqs(&self.local_seqs, &events);
         Ok(events)
+    }
+
+    async fn unsubscribe_queries(&self, _subscriber_id: uuid::Uuid) {
+        // The server owns this SocketDaemon connection's subscriber identity
+        // and tears it down when the connection closes.
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {

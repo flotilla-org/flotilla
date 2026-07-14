@@ -1,3 +1,4 @@
+pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
@@ -22,12 +23,6 @@ pub struct ProjectRepositorySpec {
     pub subpath: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueSource {
-    pub service: String,
-    pub scope: String,
 }
 
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {

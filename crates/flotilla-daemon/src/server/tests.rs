@@ -20,7 +20,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     qualified_path::QualifiedPath,
-    result_set::{QueryId, ResultDelta, Rows},
+    result_set::{QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
     CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId, NodeInfo,
     PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity,
@@ -2570,7 +2570,13 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
         other => panic!("expected ListRepos response, got {other:?}"),
     }
 
-    let result_delta = |seq| DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }));
+    let result_delta = |seq| {
+        DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq,
+            changes: QueryChanges::Convoys { changed: vec![], removed: vec![] },
+            state: None,
+        }))
+    };
     let marker = |command_id| DaemonEvent::CommandStarted {
         command_id,
         node_id: daemon.node_id().clone(),

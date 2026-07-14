@@ -44,7 +44,7 @@ use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
-    daemon::DaemonHandle,
+    daemon::{DaemonHandle, QuerySubscription},
     environment_manager::EnvironmentManager,
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
@@ -64,6 +64,7 @@ use crate::{
         ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
     },
+    query_registry::QueryRegistry,
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     repository_inspection::{GitRepositoryInspector, RepositoryInspection, RepositoryInspector},
@@ -1008,6 +1009,7 @@ pub struct InProcessDaemon {
     /// refresh captured before untracking cannot recreate deleted resources.
     observed_checkout_reconciliation: Mutex<()>,
     aggregator_projection_state: RwLock<AggregatorProjectionState>,
+    query_registry: QueryRegistry,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
@@ -1149,6 +1151,7 @@ impl InProcessDaemon {
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             observed_checkout_reconciliation: Mutex::new(()),
             aggregator_projection_state: RwLock::new(AggregatorProjectionState::new()),
+            query_registry: QueryRegistry::default(),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
             fleet_replica_tx,
@@ -2059,6 +2062,7 @@ impl InProcessDaemon {
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
+            repository_key: None,
             path: Some(synthetic_path.clone()),
             name: repo_name(&synthetic_path),
             labels: model.labels.clone(),
@@ -2503,6 +2507,7 @@ impl InProcessDaemon {
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
+            repository_key: None,
             path: Some(path.clone()),
             name: repo_name(&path),
             labels: root.model.labels.clone(),
@@ -4257,6 +4262,11 @@ impl DaemonHandle for InProcessDaemon {
         self.event_tx.subscribe()
     }
 
+    fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
+        let registry = self.query_registry.clone();
+        QuerySubscription::new(move || registry.remove(subscriber_id))
+    }
+
     async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
         let identity =
@@ -4275,6 +4285,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
+        let repository_keys = self.repository_keys_by_path.read().await;
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
         let mut result = Vec::new();
@@ -4282,6 +4293,7 @@ impl DaemonHandle for InProcessDaemon {
             if let Some(state) = repos.get(identity) {
                 result.push(RepoInfo {
                     identity: state.identity().clone(),
+                    repository_key: repository_keys.get(state.preferred_path()).cloned(),
                     path: Some(state.preferred_path().to_path_buf()),
                     name: repo_name(state.preferred_path()),
                     labels: state.labels().clone(),
@@ -4431,16 +4443,25 @@ impl DaemonHandle for InProcessDaemon {
         Ok(events)
     }
 
-    async fn subscribe_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+    async fn subscribe_queries(&self, subscriber_id: uuid::Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+        self.query_registry.replace(subscriber_id, queries);
         let state = self.aggregator_projection_state().await;
         let mut events = Vec::new();
         for cursor in queries {
-            let result_set = state.result_set_for(cursor.query).await;
+            let result_set = self
+                .query_registry
+                .result_set(&cursor.query)
+                .or(state.result_set_for(&cursor.query).await)
+                .ok_or_else(|| format!("query is not materialized: {}", cursor.query))?;
             if cursor.since.is_none_or(|seq| seq != result_set.seq) {
                 events.push(DaemonEvent::ResultSet(Box::new(result_set)));
             }
         }
         Ok(events)
+    }
+
+    async fn unsubscribe_queries(&self, subscriber_id: uuid::Uuid) {
+        self.query_registry.remove(subscriber_id);
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {

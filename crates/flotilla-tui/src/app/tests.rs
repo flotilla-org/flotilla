@@ -815,7 +815,7 @@ fn handle_repo_added_adds_new_repo() {
     // arrive asynchronously, e.g. registered by another session or the CLI)
     assert_eq!(app.views.active_index(), 2, "active tab unchanged");
     assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
-    assert!(app.views.find(&ViewAddress::Repo(app.model.repo_order[1].clone())).is_none(), "no tab opened for the new repo");
+    assert!(app.views.find(&ViewAddress::repo(app.model.repo_order[1].clone())).is_none(), "no tab opened for the new repo");
 }
 
 #[test]
@@ -850,7 +850,7 @@ fn handle_repo_removed_last_repo_keeps_app_alive() {
     // tab stays open as a dangling error tab instead.
     assert!(!app.should_quit);
     assert!(app.model.repos.is_empty());
-    assert!(app.views.find(&ViewAddress::Repo(identity)).is_some(), "the removed repo's tab stays open as a dangling tab");
+    assert!(app.views.find(&ViewAddress::repo(identity)).is_some(), "the removed repo's tab stays open as a dangling tab");
 }
 
 #[test]
@@ -865,7 +865,7 @@ fn handle_repo_removed_keeps_tab_open_as_dangling() {
     // the repo's data is gone so the tab renders its dangling-repo error page.
     assert_eq!(app.views.active_index(), 4);
     assert_eq!(app.views.len(), 5);
-    assert!(app.views.find(&ViewAddress::Repo(last_identity.clone())).is_some());
+    assert!(app.views.find(&ViewAddress::repo(last_identity.clone())).is_some());
     assert!(!app.model.repos.contains_key(&last_identity));
     assert!(!app.screen.repo_pages.contains_key(&last_identity));
 }
@@ -1563,20 +1563,28 @@ fn result_set_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnaps
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(ResultSet {
         seq: snapshot.seq,
         rows: Rows::Convoys(snapshot.convoys.into_iter().map(wire_convoy_row).collect()),
+        state: Default::default(),
     }))
 }
 
 fn result_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
     use flotilla_protocol::{
-        result_set::{ResultDelta, Rows},
+        result_set::{QueryChanges, ResultDelta},
         ResourceRef,
     };
 
     let delta = delta.as_ref().clone();
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(ResultDelta {
         seq: delta.seq,
-        changed: Rows::Convoys(delta.changed.into_iter().map(wire_convoy_row).collect()),
-        removed: delta.removed.into_iter().map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name())).collect(),
+        changes: QueryChanges::Convoys {
+            changed: delta.changed.into_iter().map(wire_convoy_row).collect(),
+            removed: delta
+                .removed
+                .into_iter()
+                .map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name()))
+                .collect(),
+        },
+        state: None,
     }))
 }
 
@@ -1595,6 +1603,7 @@ fn independent_result_set(seq: u64, rows: Vec<flotilla_protocol::IndependentRow>
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
         seq,
         rows: flotilla_protocol::Rows::Independents(rows),
+        state: Default::default(),
     }))
 }
 
@@ -1605,8 +1614,8 @@ fn independent_delta(
 ) -> flotilla_protocol::DaemonEvent {
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
         seq,
-        changed: flotilla_protocol::Rows::Independents(changed),
-        removed,
+        changes: flotilla_protocol::QueryChanges::Independents { changed, removed },
+        state: None,
     }))
 }
 
@@ -1816,7 +1825,7 @@ fn selected_table_name(app: &App) -> Option<String> {
     let name_column = match address {
         ViewAddress::Convoys { .. } | ViewAddress::Independents | ViewAddress::Project { .. } => 0,
         ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
-        ViewAddress::Overview | ViewAddress::Repo(_) => return None,
+        ViewAddress::Overview | ViewAddress::Repo { .. } => return None,
     };
     let rows = crate::app::table_rows(&app.namespaces);
     let view = crate::table_view::project(address, &rows).ok()?;

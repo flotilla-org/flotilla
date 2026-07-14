@@ -72,7 +72,7 @@ impl<R: QueryRow> QueryProjection<R> {
             let right = right.resource();
             (&left.namespace, &left.name, &left.host).cmp(&(&right.namespace, &right.name, &right.host))
         });
-        ResultSet { seq: self.seq, rows: R::into_rows(rows) }
+        ResultSet { seq: self.seq, rows: R::into_rows(rows), state: Default::default() }
     }
 }
 
@@ -149,24 +149,18 @@ impl AggregatorProjectionState {
         self.independents.read().await.local_result_set()
     }
 
-    /// This host's local result sets across all named queries, in the order
-    /// of [`QueryId::ALL`].
+    /// This host's local store-backed result sets. Demand-backed reference
+    /// data is never included in fleet replica snapshots.
     pub async fn local_result_sets(&self) -> Vec<ResultSet> {
-        let mut result_sets = Vec::with_capacity(QueryId::ALL.len());
-        for query in QueryId::ALL {
-            result_sets.push(match query {
-                QueryId::Convoys => self.local_result_set().await,
-                QueryId::Independents => self.local_independents_result_set().await,
-            });
-        }
-        result_sets
+        vec![self.local_result_set().await, self.local_independents_result_set().await]
     }
 
     /// The current fleet-merged result set for one named query.
-    pub async fn result_set_for(&self, query: QueryId) -> ResultSet {
+    pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {
-            QueryId::Convoys => self.result_set().await,
-            QueryId::Independents => self.independents_result_set().await,
+            QueryId::Convoys => Some(self.result_set().await),
+            QueryId::Independents => Some(self.independents_result_set().await),
+            QueryId::Issues { .. } => None,
         }
     }
 }

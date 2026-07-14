@@ -112,9 +112,9 @@ impl<'a> RequestDispatcher<'a> {
                 // delta that races ahead of the replayed result set.
                 {
                     let mut subscriptions = self.query_subscriptions.write().expect("query subscriptions lock poisoned");
-                    *subscriptions = queries.iter().map(|cursor| cursor.query).collect();
+                    *subscriptions = queries.iter().map(|cursor| cursor.query.clone()).collect();
                 }
-                match self.daemon.subscribe_queries(&queries).await {
+                match self.daemon.subscribe_queries(self.session_id, &queries).await {
                     Ok(events) => Message::ok_response(id, Response::SubscribeQueries(events)),
                     Err(e) => Message::error_response(id, e),
                 }

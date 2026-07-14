@@ -3,6 +3,9 @@
 **Status:** Accepted
 **Date:** 2026-07-13
 **Amends:** ADR 0005 (its wire-shape half; the composition-of-panels view model stands, but moves consumer-side)
+**Amended:** 2026-07-14 by issue #729 — typed rows imply typed changes:
+each query family owns its changed-row and removal-key types, and evolving
+set-level metadata/conditions travel beside those changes.
 
 The `Panel*` wire types (PR #664) welded three different things together: the
 *query* (`PanelSource`/`PanelScope`, consumed by nothing), the *result set*
@@ -17,14 +20,18 @@ named queries.**
 
 - A **named query** (`QueryId`, e.g. `convoys`: all Convoys, durable ∪
   observed, fleet-merged, joined with Presentation attach state) is maintained
-  by the daemon Aggregator as a `ResultSet { seq, rows }` updated by
-  `ResultDelta { seq, changed, removed }` events
+  by the daemon Aggregator as a `ResultSet { seq, rows, state }` updated by
+  `ResultDelta { seq, changes, state }` events
   (`flotilla-protocol/src/result_set.rs`). The query identity is **derived
   from the typed `Rows` variant** (`ResultSet::query()`), not carried as a
   separate field — a mismatched query/rows pair is unrepresentable and
   undeserializable, preserving the compile-time-safety rationale below as new
-  queries are added. A removal-only delta carries an empty `changed` variant,
-  which still tags the query.
+  queries are added. `QueryChanges` extends the same discipline to deltas:
+  each variant owns both its typed changed rows and its typed removal keys, so
+  issue removals use source-qualified `IssueRef`s while resource-backed
+  removals use `ResourceRef`s. A removal-only delta carries an empty changed
+  list inside its query variant, which still tags the query. Optional set
+  state evolves as a complete replacement alongside row changes.
 - **Layout never crosses the wire.** Columns, labels, titles, and tab
   composition are consumer config; #666 designs the per-kind table layer on
   top. ADR 0005's "tab is a composition of panels" remains the view model —

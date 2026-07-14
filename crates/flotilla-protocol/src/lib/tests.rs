@@ -591,7 +591,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![implement, review])
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]) }));
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]), state: Default::default() }));
 
     let encoded = serde_json::to_string(&event).expect("serialize result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize result set");
@@ -622,7 +622,7 @@ fn result_set_round_trips_independent_capabilities() {
         .attach("terminal-yeoman")
         .phase(SessionPhase::Running)
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 11, rows: Rows::Independents(vec![row]) }));
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 11, rows: Rows::Independents(vec![row]), state: Default::default() }));
 
     let encoded = serde_json::to_string(&event).expect("serialize independents result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize independents result set");

@@ -470,8 +470,8 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
                 "[query]     {}: delta (seq {}, {} changed, {} removed)",
                 delta.query(),
                 delta.seq,
-                delta.changed.len(),
-                delta.removed.len()
+                delta.changes.changed_len(),
+                delta.changes.removed_len()
             )
         }
     }
@@ -640,9 +640,13 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
     }
 
     // Subscribe to every named query so watch shows the full data plane.
-    let cursors: Vec<flotilla_protocol::QueryCursor> =
-        flotilla_protocol::QueryId::ALL.iter().map(|&query| flotilla_protocol::QueryCursor { query, since: None }).collect();
-    match daemon.subscribe_queries(&cursors).await {
+    let cursors: Vec<flotilla_protocol::QueryCursor> = flotilla_protocol::QueryId::ALWAYS_MATERIALIZED
+        .iter()
+        .cloned()
+        .map(|query| flotilla_protocol::QueryCursor { query, since: None })
+        .collect();
+    let subscriber_id = uuid::Uuid::new_v4();
+    match daemon.subscribe_queries(subscriber_id, &cursors).await {
         Ok(events) => print_bootstrap_events(&events, &mut replay_seqs, format),
         Err(e) => {
             eprintln!("warning: failed to subscribe to queries: {e}");
@@ -680,6 +684,7 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
         }
     }
 
+    daemon.unsubscribe_queries(subscriber_id).await;
     Ok(())
 }
 

@@ -6,19 +6,23 @@
 //! `widgets::screen` (rendering dispatch deliberately stays with the
 //! widgets).
 
-use flotilla_protocol::{QueryId, ViewAddress};
+use flotilla_protocol::{QueryId, QueryScope, ViewAddress};
 
 use crate::binding_table::{BindingModeId, KeyBindingMode};
 
 /// The named query a view kind consumes — the tab set IS the subscription
 /// set. Repo views ride the Plane-A repo streams and return None.
-pub(crate) fn query(address: &ViewAddress) -> Option<QueryId> {
+pub(crate) fn queries(address: &ViewAddress) -> Vec<QueryId> {
     match address {
-        ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } | ViewAddress::Project { .. } => {
-            Some(QueryId::Convoys)
+        ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys],
+        ViewAddress::Project { namespace, name } => {
+            vec![QueryId::Convoys, QueryId::Issues { scope: QueryScope::Project { namespace: namespace.clone(), name: name.clone() } }]
         }
-        ViewAddress::Independents => Some(QueryId::Independents),
-        ViewAddress::Overview | ViewAddress::Repo(_) => None,
+        ViewAddress::Independents => vec![QueryId::Independents],
+        ViewAddress::Repo { repository_key: Some(repository_key), .. } => {
+            vec![QueryId::Issues { scope: QueryScope::Repository(repository_key.clone()) }]
+        }
+        ViewAddress::Overview | ViewAddress::Repo { repository_key: None, .. } => vec![],
     }
 }
 
@@ -56,7 +60,7 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
         ) => {
             vec![BindingModeId::Convoys]
         }
-        Some(ViewAddress::Repo(_)) => vec![BindingModeId::Normal],
+        Some(ViewAddress::Repo { .. }) => vec![BindingModeId::Normal],
         None => vec![],
     }
 }
@@ -64,4 +68,28 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
 /// The full binding mode for the active View at the base layer.
 pub(crate) fn binding_mode(address: Option<&ViewAddress>, scoped: bool) -> KeyBindingMode {
     compose_with_shell(scoped, kind_modes(address))
+}
+
+#[cfg(test)]
+mod tests {
+    use flotilla_protocol::{RepoIdentity, RepositoryKey};
+
+    use super::*;
+
+    #[test]
+    fn project_view_composes_store_and_demand_backed_queries() {
+        let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+        assert_eq!(queries(&address), vec![QueryId::Convoys, QueryId::Issues {
+            scope: QueryScope::Project { namespace: "flotilla".into(), name: "roadmap".into() }
+        },]);
+    }
+
+    #[test]
+    fn repo_view_owns_its_typed_query_scope_in_the_address() {
+        let address = ViewAddress::repo_with_key(
+            RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() },
+            RepositoryKey("repo_abc".into()),
+        );
+        assert_eq!(queries(&address), vec![QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_abc".into())) }]);
+    }
 }

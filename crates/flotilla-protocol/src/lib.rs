@@ -6,6 +6,7 @@ pub mod framing;
 mod host;
 mod host_summary;
 pub mod issue_query;
+mod issue_ref;
 pub mod output;
 pub mod path_context;
 pub mod peer;
@@ -13,6 +14,7 @@ pub mod provider_data;
 mod provisioning_target;
 pub mod qualified_path;
 pub mod query;
+mod repository;
 pub mod resource_ref;
 pub mod result_set;
 pub mod snapshot;
@@ -29,9 +31,11 @@ pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
     DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,
 };
+pub use issue_ref::{IssueRef, IssueSource};
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
+pub use repository::RepositoryKey;
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
 pub use view_address::ViewAddress;
 
@@ -99,7 +103,8 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryId, ResultDelta, ResultSet, Rows, SessionPhase, VesselRow, WorkPhase,
+    ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope,
+    ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,7 +120,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.

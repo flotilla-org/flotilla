@@ -4,8 +4,10 @@
 //! active index, pinning policy, and the mapping to/from the persisted
 //! `open-views.toml` entries. It knows nothing about rendering or data.
 
+use std::collections::HashMap;
+
 use flotilla_core::config::OpenViewEntry;
-use flotilla_protocol::{RepoIdentity, ViewAddress};
+use flotilla_protocol::{RepoIdentity, RepositoryKey, ViewAddress};
 
 use crate::table_view::TableState;
 
@@ -141,15 +143,37 @@ impl OpenViews {
     /// the flotilla convoys view, and one repo view per registered repo —
     /// matching what the pre-View TUI always showed.
     pub fn seed(repos: impl IntoIterator<Item = RepoIdentity>) -> Self {
+        Self::seed_with_keys(repos.into_iter().map(|identity| (identity, None)))
+    }
+
+    pub fn seed_with_keys(repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>) -> Self {
         let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None }, OpenViewEntry {
             address: ViewAddress::Convoys { namespace: "flotilla".to_string() }.to_string(),
             label: None,
         }];
-        entries.extend(repos.into_iter().map(|identity| OpenViewEntry { address: ViewAddress::Repo(identity).to_string(), label: None }));
+        entries.extend(repos.into_iter().map(|(identity, repository_key)| {
+            OpenViewEntry {
+                address: match repository_key {
+                    Some(key) => ViewAddress::repo_with_key(identity, key),
+                    None => ViewAddress::repo(identity),
+                }
+                .to_string(),
+                label: None,
+            }
+        }));
         let mut views = Self::from_entries(entries);
         // Land on the first repo tab when there is one, like the old TUI did.
         views.active = if views.views.len() > 2 { 2 } else { views.views.len() - 1 };
         views
+    }
+
+    pub fn bind_repository_keys(&mut self, keys: &HashMap<RepoIdentity, RepositoryKey>) {
+        for view in &mut self.views {
+            let ViewTarget::View(ViewAddress::Repo { identity, repository_key }) = &mut view.target else { continue };
+            if repository_key.is_none() {
+                *repository_key = keys.get(identity).cloned();
+            }
+        }
     }
 
     /// A single-View set for scoped mode (`flotilla view <address>`): no
@@ -283,7 +307,7 @@ impl OpenViews {
     /// The repo identity of the active tab, when it is a repo view.
     pub fn active_repo_identity(&self) -> Option<&RepoIdentity> {
         match self.active_address() {
-            Some(ViewAddress::Repo(identity)) => Some(identity),
+            Some(ViewAddress::Repo { identity, .. }) => Some(identity),
             _ => None,
         }
     }

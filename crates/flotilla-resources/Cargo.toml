@@ -9,6 +9,7 @@ default = []
 skip-no-sandbox-tests = []
 
 [dependencies]
+flotilla-protocol = { path = "../flotilla-protocol" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }

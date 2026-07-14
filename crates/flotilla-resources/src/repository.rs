@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use flotilla_protocol::RepositoryKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -7,27 +8,6 @@ use crate::{
 };
 
 define_resource!(Repository, "repositories", RepositorySpec, RepositoryStatus, RepositoryStatusPatch, immutable_spec);
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RepositoryKey(pub String);
-
-impl RepositoryKey {
-    pub fn from_identity(identity: &RepositoryIdentity) -> Self {
-        match identity {
-            RepositoryIdentity::Remote { canonical_remote } => Self(crate::repo_key(canonical_remote)),
-            RepositoryIdentity::Local { host_ref, git_common_dir } => {
-                Self(crate::repo_key(&format!("local\0{host_ref}\0{git_common_dir}")))
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for RepositoryKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -75,7 +55,12 @@ impl RepositorySpec {
     }
 
     pub fn key(&self) -> RepositoryKey {
-        RepositoryKey::from_identity(&self.identity)
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => RepositoryKey(crate::repo_key(canonical_remote)),
+            RepositoryIdentity::Local { host_ref, git_common_dir } => {
+                RepositoryKey(crate::repo_key(&format!("local\0{host_ref}\0{git_common_dir}")))
+            }
+        }
     }
 
     pub fn identity(&self) -> &RepositoryIdentity {

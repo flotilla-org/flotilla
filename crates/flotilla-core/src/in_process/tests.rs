@@ -9,8 +9,8 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, IndependentRow, QueryId, ResultSet, Rows, SessionPhase},
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent,
-    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, QueryCursor, RepoSelector, ResourceRef,
-    SystemInfo, ToolInventory, TopologyRoute,
+    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, QueryCursor, QueryScope, RepoSelector,
+    RepositoryKey, ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -63,7 +63,7 @@ fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Opti
 }
 
 fn convoy_result_set(seq: u64, rows: Vec<ConvoyRow>) -> ResultSet {
-    ResultSet { seq, rows: Rows::Convoys(rows) }
+    ResultSet { seq, rows: Rows::Convoys(rows), state: Default::default() }
 }
 
 async fn set_local_convoy_rows(daemon: &InProcessDaemon, seq: u64, rows: Vec<ConvoyRow>) {
@@ -1349,7 +1349,7 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
             .collect();
         daemon.fleet_replica_cache.write().await.insert(host_name, FleetReplicaCacheEntry {
             rows: fleet_rows,
-            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]) }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]), state: Default::default() }],
             last_sync: Some(Utc::now()),
             generation: Some(format!("gen-{host}")),
             last_error: None,
@@ -2788,8 +2788,10 @@ async fn subscribe_queries_replays_result_set_from_aggregator_state() {
 
     set_local_convoy_rows(&daemon, 7, vec![convoy_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
 
-    let events =
-        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: None }]).await.expect("subscribe_queries should succeed");
+    let events = daemon
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: None }])
+        .await
+        .expect("subscribe_queries should succeed");
     let result_set = events
         .iter()
         .find_map(|e| match e {
@@ -2815,7 +2817,7 @@ async fn subscribe_queries_skips_replay_when_cursor_matches_seq() {
     set_local_convoy_rows(&daemon, 7, vec![convoy_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
 
     let events = daemon
-        .subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: Some(7) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(7) }])
         .await
         .expect("subscribe_queries should succeed");
     assert!(!events.iter().any(|event| matches!(event, DaemonEvent::ResultSet(_))));
@@ -2839,7 +2841,7 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
 
     // Client's cursor is ahead of the daemon's seq — simulates daemon restart.
     let events = daemon
-        .subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: Some(99) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(99) }])
         .await
         .expect("subscribe_queries should succeed");
     let result_set = events
@@ -2850,4 +2852,30 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
         })
         .expect("client ahead of daemon must still receive a result set");
     assert_eq!(result_set.seq, 2, "result set reflects the daemon's current seq, not the client's stale claim");
+}
+
+#[tokio::test]
+async fn issue_subscription_materializes_until_its_in_process_handle_drops() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let subscriber = uuid::Uuid::new_v4();
+    let subscription = daemon.query_subscription(subscriber);
+    let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_abc".into())) };
+
+    let events =
+        daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("subscribe to issue query");
+    let DaemonEvent::ResultSet(result) = events.into_iter().next().expect("issue result set") else {
+        panic!("expected issue result set");
+    };
+    assert_eq!(result.query(), query);
+    assert!(result.state.demand.is_some());
+    assert!(matches!(result.state.conditions.as_slice(), [ResultSetCondition::IssueSourceUnavailable { source: None, .. }]));
+    assert!(daemon.query_registry.result_set(&query).is_some());
+
+    drop(subscription);
+    assert!(daemon.query_registry.result_set(&query).is_none());
 }
