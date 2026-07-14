@@ -9,19 +9,13 @@ rounds:
     - feat-123
     - '--cwd'
     - /tmp
+    - '--'
+    - sh
+    - '-c'
+    - '{main_command}'
     cwd: '.'
     stdout: |
       1
-    exit_code: 0
-  - channel: command
-    cmd: zellij
-    args:
-    - action
-    - write-chars
-    - |
-      {main_command}
-    cwd: '.'
-    stdout: ''
     exit_code: 0
   - channel: command
     cmd: zellij
@@ -32,19 +26,13 @@ rounds:
     - fix-456
     - '--cwd'
     - /tmp
+    - '--'
+    - sh
+    - '-c'
+    - '{main_command}'
     cwd: '.'
     stdout: |
       2
-    exit_code: 0
-  - channel: command
-    cmd: zellij
-    args:
-    - action
-    - write-chars
-    - |
-      {main_command}
-    cwd: '.'
-    stdout: ''
     exit_code: 0
   - channel: command
     cmd: zellij

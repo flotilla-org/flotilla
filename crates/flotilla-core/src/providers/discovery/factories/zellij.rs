@@ -62,7 +62,7 @@ mod tests {
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("ZELLIJ", "0"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
-        let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.42.2".into())).build());
+        let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.44.1".into())).build());
         let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok());
     }
@@ -105,7 +105,7 @@ mod tests {
             .with(EnvironmentAssertion::env_var("ZELLIJ_SESSION_NAME", "my-session"));
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
-        let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.42.2".into())).build());
+        let runner = Arc::new(DiscoveryMockRunner::builder().on_run("zellij", &["--version"], Ok("zellij 0.44.1".into())).build());
         let result = ZellijPresentationManagerFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
         assert!(result.is_ok(), "factory should succeed when ZELLIJ_SESSION_NAME is set");
     }

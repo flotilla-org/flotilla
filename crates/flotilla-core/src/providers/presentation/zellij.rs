@@ -56,8 +56,9 @@ impl ZellijPresentationManager {
         }
     }
 
-    /// Check that `zellij --version` reports >= 0.40.
-    /// Parses output like "zellij 0.42.2".
+    /// Check that `zellij --version` reports >= 0.44.1, when stable tab and
+    /// pane targeting are available for workspace creation.
+    /// Parses output like "zellij 0.44.1".
     pub async fn check_version(runner: &dyn CommandRunner) -> Result<(), String> {
         let version_str = run!(runner, "zellij", &["--version"], Path::new("."))
             .map_err(|e| format!("failed to run zellij --version: {e}"))?
@@ -72,9 +73,15 @@ impl ZellijPresentationManager {
 
         let major: u32 = parts[0].parse().map_err(|_| format!("invalid major version: {}", parts[0]))?;
         let minor: u32 = parts[1].parse().map_err(|_| format!("invalid minor version: {}", parts[1]))?;
+        let patch: u32 = parts
+            .get(2)
+            .and_then(|part| part.split('-').next())
+            .ok_or_else(|| format!("cannot parse zellij version: {version_part}"))?
+            .parse()
+            .map_err(|_| format!("invalid patch version: {}", parts[2]))?;
 
-        if major == 0 && minor < 40 {
-            return Err(format!("zellij >= 0.40 required, found {version_part}"));
+        if (major, minor, patch) < (0, 44, 1) {
+            return Err(format!("zellij >= 0.44.1 required, found {version_part}"));
         }
 
         info!(version = %version_part, "zellij version OK");
@@ -89,12 +96,34 @@ impl ZellijPresentationManager {
             .ok_or_else(|| "zellij session name not resolved at probe time (ZELLIJ_SESSION_NAME was not set)".to_string())
     }
 
-    /// Append `-- sh -c "command"` to args if command is non-empty.
-    /// Uses sh -c to avoid quoting issues with complex commands.
+    /// Append a command in the form expected by Zellij's pane actions. Using
+    /// `sh -c` preserves template commands as a single shell expression.
     fn append_command_args<'a>(args: &mut Vec<&'a str>, command: &'a str) {
-        if !command.is_empty() {
-            args.extend(["--", "sh", "-c", command]);
-        }
+        args.extend(["--", "sh", "-c", command]);
+    }
+
+    fn parse_tab_id(output: &str) -> Result<u64, String> {
+        let tab_id = output.trim();
+        tab_id.parse::<u64>().map_err(|_| format!("zellij new-tab returned invalid tab id: {tab_id:?}"))
+    }
+
+    fn parse_pane_id(output: &str) -> Result<String, String> {
+        let pane_id = output.trim();
+        let numeric_id =
+            pane_id.strip_prefix("terminal_").ok_or_else(|| format!("zellij new-pane returned invalid terminal pane id: {pane_id:?}"))?;
+        numeric_id.parse::<u32>().map_err(|_| format!("zellij new-pane returned invalid terminal pane id: {pane_id:?}"))?;
+        Ok(pane_id.to_string())
+    }
+
+    async fn initial_terminal_pane_id(&self, tab_id: u64) -> Result<String, String> {
+        let output = self.zellij_action(&["list-panes", "--json", "--all"]).await?;
+        let panes: Vec<serde_json::Value> = serde_json::from_str(&output).map_err(|error| format!("zellij list-panes: {error}"))?;
+        let mut terminals =
+            panes.iter().filter(|pane| pane["tab_id"].as_u64() == Some(tab_id) && pane["is_plugin"].as_bool() == Some(false));
+        let first = terminals.next().ok_or_else(|| format!("zellij tab {tab_id} did not contain a terminal pane"))?;
+        let initial = std::iter::once(first).chain(terminals).find(|pane| pane["is_focused"].as_bool() == Some(true)).unwrap_or(first);
+        let pane_id = initial["id"].as_u64().ok_or_else(|| format!("zellij tab {tab_id} returned a terminal pane without an id"))?;
+        Ok(format!("terminal_{pane_id}"))
     }
 }
 
@@ -125,91 +154,67 @@ impl super::PresentationManager for ZellijPresentationManager {
         let rendered = super::resolve_template(config);
         let working_dir = config.working_directory.as_path().display().to_string();
 
-        // Create new tab — new-tab returns the tab_id to stdout
-        let tab_id_str = self.zellij_action(&["new-tab", "--name", &config.name, "--cwd", &working_dir]).await?;
-        let tab_id = tab_id_str.trim();
-        let session = self.session_name()?;
-        let ws_ref = format!("{session}:{tab_id}");
+        let mut new_tab_args = vec!["new-tab", "--name", &config.name, "--cwd", &working_dir];
+        if let Some(command) = rendered.panes.first().and_then(|pane| pane.surfaces.first()).map(|surface| surface.command.as_str()) {
+            if !command.is_empty() {
+                Self::append_command_args(&mut new_tab_args, command);
+            }
+        }
+        let tab_id = Self::parse_tab_id(&self.zellij_action(&new_tab_args).await?)?;
+        let tab_id_arg = tab_id.to_string();
 
         // The tab-id two-step: stamp the created tab into the PM's metadata
         // plane (scope, kind, factory id) so the manifest resolver can group
         // it. Best-effort — a missing metadata plane never fails creation.
         if let Some(stamp) = &config.stamp {
-            match tab_id.parse::<u64>() {
-                Ok(tab_id) => {
-                    let payload = flotilla_manifest::stamp::tab_stamp(tab_id, stamp).to_pipe_payload();
-                    let args = ["pipe", "--name", flotilla_manifest::keys::APPLY_METADATA_PATCH_PIPE, "--", &payload];
-                    if let Err(err) = run!(self.runner, "zellij", &args, Path::new(".")) {
-                        warn!(%err, %tab_id, "zellij: could not stamp workspace metadata");
-                    }
-                }
-                Err(_) => warn!(%tab_id, "zellij: new-tab output is not a tab id; skipping metadata stamp"),
+            let payload = flotilla_manifest::stamp::tab_stamp(tab_id, stamp).to_pipe_payload();
+            let args = ["pipe", "--name", flotilla_manifest::keys::APPLY_METADATA_PATCH_PIPE, "--", &payload];
+            if let Err(err) = run!(self.runner, "zellij", &args, Path::new(".")) {
+                warn!(%err, %tab_id, "zellij: could not stamp workspace metadata");
             }
         }
 
-        // Small delay to let zellij process the tab creation
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let created_pane_count = rendered.panes.iter().map(|pane| pane.surfaces.len()).sum::<usize>();
+        let focused_pane_index = rendered.panes.iter().position(|pane| pane.focus);
+        let first_pane_id =
+            if focused_pane_index == Some(0) && created_pane_count > 1 { Some(self.initial_terminal_pane_id(tab_id).await?) } else { None };
+        let mut focused_pane_id = first_pane_id.clone();
+        let mut active_pane_id = first_pane_id.clone();
 
-        // Zellij's --cwd on new-pane doesn't reliably set the default shell's
-        // working directory — the shell inherits the server's cwd instead. When
-        // no command is given, explicitly launch $SHELL so --cwd is honoured.
+        // The current Zellij forks accept a stable tab ID on every pane
+        // creation action. This keeps the entire sequence in the new tab even
+        // when another client changes the session's focus between commands.
         const SHELL_FALLBACK: &str = "exec \"${SHELL:-sh}\"";
+        for (pane_index, pane) in rendered.panes.iter().enumerate() {
+            let surfaces_to_skip = usize::from(pane_index == 0);
+            let mut pane_first_id = if pane_index == 0 { first_pane_id.clone() } else { None };
 
-        for (i, pane) in rendered.panes.iter().enumerate() {
-            if i == 0 {
-                // First pane is the tab's initial pane — send command via write-chars
-                // (--cwd on new-tab already sets working directory, so skip if no command)
-                if let Some(surface) = pane.surfaces.first() {
-                    if !surface.command.is_empty() {
-                        let text = format!("{}\n", surface.command);
-                        self.zellij_action(&["write-chars", &text]).await?;
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
+            for (surface_index, surface) in pane.surfaces.iter().enumerate().skip(surfaces_to_skip) {
+                let mut args = vec!["new-pane", "--tab-id", &tab_id_arg];
+                if surface_index == 0 {
+                    args.extend(["--direction", pane.split.as_deref().unwrap_or("right")]);
+                } else {
+                    args.push("--stacked");
                 }
+                args.extend(["--cwd", &working_dir]);
+                Self::append_command_args(&mut args, if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command });
 
-                // Additional surfaces in the first pane: stacked panes
-                for surface in pane.surfaces.iter().skip(1) {
-                    let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
-                    let cmd = if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command };
-                    Self::append_command_args(&mut args, cmd);
-                    self.zellij_action(&args).await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            } else {
-                let direction = pane.split.as_deref().unwrap_or("right");
+                let pane_id = Self::parse_pane_id(&self.zellij_action(&args).await?)?;
+                pane_first_id.get_or_insert_with(|| pane_id.clone());
+                active_pane_id = Some(pane_id);
+            }
 
-                if let Some(surface) = pane.surfaces.first() {
-                    let mut args: Vec<&str> = vec!["new-pane", "-d", direction, "--cwd", &working_dir];
-                    let cmd = if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command };
-                    Self::append_command_args(&mut args, cmd);
-                    self.zellij_action(&args).await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-
-                // Additional surfaces in this pane: stacked panes
-                for surface in pane.surfaces.iter().skip(1) {
-                    let mut args: Vec<&str> = vec!["new-pane", "--stacked", "--cwd", &working_dir];
-                    let cmd = if surface.command.is_empty() { SHELL_FALLBACK } else { &surface.command };
-                    Self::append_command_args(&mut args, cmd);
-                    self.zellij_action(&args).await?;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+            if focused_pane_index == Some(pane_index) {
+                focused_pane_id = pane_first_id;
             }
         }
 
-        // Focus the designated pane. Use focus-previous-pane which walks panes in
-        // reverse creation order regardless of split direction (unlike move-focus which
-        // is direction-specific and fails for mixed horizontal/vertical layouts).
-        let focus_index = rendered.panes.iter().position(|p| p.focus);
-        let total_panes: usize = rendered.panes.iter().map(|p| p.surfaces.len().max(1)).sum();
-        if let Some(fi) = focus_index {
-            let panes_before: usize = rendered.panes.iter().take(fi).map(|p| p.surfaces.len().max(1)).sum();
-            let moves_back = total_panes.saturating_sub(1).saturating_sub(panes_before);
-            for _ in 0..moves_back {
-                self.zellij_action(&["focus-previous-pane"]).await.ok();
-            }
+        if let Some(pane_id) = focused_pane_id.filter(|pane_id| Some(pane_id) != active_pane_id.as_ref()) {
+            self.zellij_action(&["focus-pane-id", &pane_id]).await?;
         }
 
+        let session = self.session_name()?;
+        let ws_ref = format!("{session}:{tab_id}");
         info!(workspace = %config.name, "zellij: workspace ready");
         Ok((ws_ref, Workspace { name: config.name.clone(), correlation_keys: vec![], attachable_set_id: None }))
     }
@@ -242,30 +247,14 @@ mod tests {
     use super::*;
     use crate::providers::{presentation::PresentationManager, replay};
 
-    #[test]
-    fn append_command_args_with_command() {
-        let mut args: Vec<&str> = vec!["new-pane"];
-        let cmd = "echo hello";
-        ZellijPresentationManager::append_command_args(&mut args, cmd);
-        assert_eq!(args, vec!["new-pane", "--", "sh", "-c", "echo hello"]);
-    }
+    #[tokio::test]
+    async fn version_check_requires_stable_pane_targeting() {
+        let too_old = crate::providers::testing::MockRunner::new(vec![Ok("zellij 0.44.0".to_string())]);
+        let error = ZellijPresentationManager::check_version(&too_old).await.expect_err("0.44.0 lacks stable tab and pane targeting");
+        assert_eq!(error, "zellij >= 0.44.1 required, found 0.44.0");
 
-    #[test]
-    fn append_command_args_empty_is_noop() {
-        let mut args: Vec<&str> = vec!["new-pane"];
-        ZellijPresentationManager::append_command_args(&mut args, "");
-        assert_eq!(args, vec!["new-pane"]);
-    }
-
-    #[test]
-    fn shell_fallback_produces_explicit_shell_launch() {
-        // Simulates the call-site logic: empty command -> SHELL_FALLBACK
-        const SHELL_FALLBACK: &str = "exec \"${SHELL:-sh}\"";
-        let command = "";
-        let cmd = if command.is_empty() { SHELL_FALLBACK } else { command };
-        let mut args: Vec<&str> = vec!["new-pane", "--cwd", "/tmp/repo"];
-        ZellijPresentationManager::append_command_args(&mut args, cmd);
-        assert_eq!(args, vec!["new-pane", "--cwd", "/tmp/repo", "--", "sh", "-c", "exec \"${SHELL:-sh}\""]);
+        let supported = crate::providers::testing::MockRunner::new(vec![Ok("zellij 0.44.1-162-gd262df5".to_string())]);
+        ZellijPresentationManager::check_version(&supported).await.expect("current Zellij supports stable tab and pane targeting");
     }
 
     fn fixture(name: &str) -> String {
@@ -429,5 +418,142 @@ mod tests {
         let mgr = ZellijPresentationManager::with_session_name(runner, "flotilla-test-zj".to_string());
 
         mgr.delete_workspace("flotilla-test-zj:7").await.expect("delete should succeed");
+    }
+
+    #[tokio::test]
+    async fn create_workspace_targets_every_pane_by_stable_id() {
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![
+            Ok("7\n".to_string()),
+            Ok("terminal_12\n".to_string()),
+            Ok("terminal_13\n".to_string()),
+            Ok(String::new()),
+        ]));
+        let mgr = ZellijPresentationManager::with_session_name(runner.clone(), "flotilla-test-zj".to_string());
+        let config = WorkspaceAttachRequest::builder()
+            .name("fix-709")
+            .working_directory(crate::path_context::ExecutionEnvironmentPath::new("/repo"))
+            .template_yaml(
+                r#"
+content:
+  - role: main
+  - role: agents
+layout:
+  - slot: main
+  - slot: agents
+    split: right
+    focus: true
+"#
+                .to_string(),
+            )
+            .attach_commands(vec![
+                ("main".to_string(), "cleat attach flotilla/fix-709/main".to_string()),
+                ("agents".to_string(), "cleat attach flotilla/fix-709/agent-1".to_string()),
+                ("agents".to_string(), "cleat attach flotilla/fix-709/agent-2".to_string()),
+            ])
+            .build();
+
+        let (ws_ref, workspace) = mgr.create_workspace(&config).await.expect("workspace should be created");
+
+        assert_eq!(ws_ref, "flotilla-test-zj:7");
+        assert_eq!(workspace.name, "fix-709");
+        let calls = runner.calls();
+        assert_eq!(calls[0].1, [
+            "action",
+            "new-tab",
+            "--name",
+            "fix-709",
+            "--cwd",
+            "/repo",
+            "--",
+            "sh",
+            "-c",
+            "cleat attach flotilla/fix-709/main"
+        ]);
+        assert_eq!(calls[1].1, [
+            "action",
+            "new-pane",
+            "--tab-id",
+            "7",
+            "--direction",
+            "right",
+            "--cwd",
+            "/repo",
+            "--",
+            "sh",
+            "-c",
+            "cleat attach flotilla/fix-709/agent-1",
+        ]);
+        assert_eq!(calls[2].1, [
+            "action",
+            "new-pane",
+            "--tab-id",
+            "7",
+            "--stacked",
+            "--cwd",
+            "/repo",
+            "--",
+            "sh",
+            "-c",
+            "cleat attach flotilla/fix-709/agent-2",
+        ]);
+        assert_eq!(calls[3].1, ["action", "focus-pane-id", "terminal_12"]);
+        assert_eq!(calls.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_refocuses_initial_pane_by_stable_id() {
+        let panes = r#"[
+            {"id": 4, "is_plugin": true, "is_focused": false, "tab_id": 7},
+            {"id": 11, "is_plugin": false, "is_focused": true, "tab_id": 7}
+        ]"#;
+        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![
+            Ok("7\n".to_string()),
+            Ok(panes.to_string()),
+            Ok("terminal_12\n".to_string()),
+            Ok(String::new()),
+        ]));
+        let mgr = ZellijPresentationManager::with_session_name(runner.clone(), "flotilla-test-zj".to_string());
+        let config = WorkspaceAttachRequest::builder()
+            .name("fix-709")
+            .working_directory(crate::path_context::ExecutionEnvironmentPath::new("/repo"))
+            .template_yaml(
+                r#"
+content:
+  - role: main
+  - role: agents
+layout:
+  - slot: main
+    focus: true
+  - slot: agents
+    split: right
+"#
+                .to_string(),
+            )
+            .attach_commands(vec![
+                ("main".to_string(), "cleat attach flotilla/fix-709/main".to_string()),
+                ("agents".to_string(), "cleat attach flotilla/fix-709/agent-1".to_string()),
+            ])
+            .build();
+
+        mgr.create_workspace(&config).await.expect("workspace should be created");
+
+        let calls = runner.calls();
+        assert_eq!(calls[1].1, ["action", "list-panes", "--json", "--all"]);
+        assert_eq!(calls[2].1, [
+            "action",
+            "new-pane",
+            "--tab-id",
+            "7",
+            "--direction",
+            "right",
+            "--cwd",
+            "/repo",
+            "--",
+            "sh",
+            "-c",
+            "cleat attach flotilla/fix-709/agent-1",
+        ]);
+        assert_eq!(calls[3].1, ["action", "focus-pane-id", "terminal_11"]);
+        assert_eq!(calls.len(), 4);
     }
 }
