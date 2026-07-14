@@ -81,6 +81,8 @@ async fn vessel_metadata_and_status_roundtrip() {
             terminal_session_refs: vec!["term-a".to_string()],
             started_at: Some(Utc::now()),
             ready_at: Some(Utc::now()),
+            requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
+            effective_stance: Some(flotilla_resources::Stance::Contained),
         })
         .await
         .expect("status update should succeed");

@@ -119,6 +119,8 @@ fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Opt
             terminal_session_refs: vec![format!("terminal-{task}-coder")],
             started_at: Some(timestamp(16)),
             ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
+            requested_stance: None,
+            effective_stance: None,
         }),
     }
 }
@@ -174,6 +176,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
             .iter()
             .map(|task| flotilla_resources::VesselRequirement {
                 name: task.name.clone(),
+                stance: task.stance,
                 depends_on: task.depends_on.clone(),
                 crew: task.crew.clone(),
             })
@@ -318,9 +321,24 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         vessels: vec![
-            flotilla_resources::VesselRequirement { name: "a".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "b".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "c".to_string(), depends_on: Vec::new(), crew: Vec::new() },
+            flotilla_resources::VesselRequirement {
+                name: "a".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "b".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "c".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
         ],
     });
     status.crew_work =
@@ -346,10 +364,21 @@ fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         vessels: vec![
-            flotilla_resources::VesselRequirement { name: "implement".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "verify".to_string(), depends_on: Vec::new(), crew: Vec::new() },
+            flotilla_resources::VesselRequirement {
+                name: "implement".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "verify".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
             flotilla_resources::VesselRequirement {
                 name: "review".to_string(),
+                stance: Default::default(),
                 depends_on: vec!["implement".to_string(), "verify".to_string()],
                 crew: Vec::new(),
             },
@@ -478,9 +507,24 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         vessels: vec![
-            flotilla_resources::VesselRequirement { name: "a".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "b".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "c".to_string(), depends_on: Vec::new(), crew: Vec::new() },
+            flotilla_resources::VesselRequirement {
+                name: "a".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "b".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "c".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
         ],
     });
     status.work =

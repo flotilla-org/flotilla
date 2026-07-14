@@ -26,8 +26,31 @@ pub struct VesselRequirement {
     pub name: String,
     #[builder(default)]
     #[serde(default)]
+    pub stance: Stance,
+    #[builder(default)]
+    #[serde(default)]
     pub depends_on: Vec<String>,
     pub crew: Vec<CrewSpec>,
+}
+
+/// The minimum isolation guarantee required while a vessel runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stance {
+    #[default]
+    Trusted,
+    WorkspaceWrite,
+    Contained,
+}
+
+impl std::fmt::Display for Stance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trusted => f.write_str("trusted"),
+            Self::WorkspaceWrite => f.write_str("workspace-write"),
+            Self::Contained => f.write_str("contained"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

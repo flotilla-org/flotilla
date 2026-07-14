@@ -67,6 +67,6 @@ pub use terminal_session::{
 pub use vessel::{Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch};
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
 pub use workflow_template::{
-    validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation, Selector, ValidationError,
+    validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation, Selector, Stance, ValidationError,
     VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };

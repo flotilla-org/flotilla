@@ -1,7 +1,7 @@
 mod common;
 
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
-use flotilla_resources::{validate, InterpolationField, InterpolationLocation, ValidationError, WorkflowTemplateSpec};
+use flotilla_resources::{validate, InterpolationField, InterpolationLocation, Stance, ValidationError, WorkflowTemplateSpec};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -243,4 +243,31 @@ fn parser_round_trip_preserves_sample_workflow() {
     let second: WorkflowTemplateSpec = serde_yml::from_str(&encoded).expect("re-parse workflow template spec");
 
     assert_eq!(second, first.spec);
+}
+
+#[test]
+fn parser_round_trip_preserves_all_stances() {
+    let yaml = r#"
+vessels:
+  - name: trusted
+    stance: trusted
+    crew: []
+  - name: workspace
+    stance: workspace-write
+    crew: []
+  - name: contained
+    stance: contained
+    crew: []
+"#;
+    let first = parse_spec(yaml);
+    assert_eq!(first.vessels.iter().map(|vessel| vessel.stance).collect::<Vec<_>>(), vec![
+        Stance::Trusted,
+        Stance::WorkspaceWrite,
+        Stance::Contained,
+    ]);
+
+    let encoded = serde_yml::to_string(&first).expect("serialize stances");
+    let second = parse_spec(&encoded);
+    assert_eq!(second, first);
+    assert!(validate(&second).is_ok());
 }

@@ -696,6 +696,12 @@ impl Aggregator {
     }
 
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
+        let requested_stance = definition.stance.to_string();
+        let effective_stance = state
+            .and_then(|state| state.placement.as_ref())
+            .and_then(|placement| placement.fields.get("effective_stance"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let crew = definition
             .crew
             .iter()
@@ -704,7 +710,12 @@ impl Aggregator {
                     CrewSource::Tool { command } => command.clone(),
                     CrewSource::Agent { selector, prompt } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
                 };
-                CrewMemberSummary { role: process.role.clone(), command_preview }
+                CrewMemberSummary {
+                    role: process.role.clone(),
+                    command_preview,
+                    requested_stance: Some(requested_stance.clone()),
+                    effective_stance: effective_stance.clone(),
+                }
             })
             .collect();
         VesselRow::builder()
@@ -716,6 +727,8 @@ impl Aggregator {
             .maybe_started_at(state.and_then(|state| state.started_at))
             .maybe_finished_at(state.and_then(|state| state.finished_at))
             .maybe_message(state.and_then(|state| state.message.clone()))
+            .requested_stance(requested_stance)
+            .maybe_effective_stance(effective_stance)
             .depends_on(definition.depends_on.clone())
             .host(self.local_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
@@ -803,8 +816,9 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::result_set::ResultSet;
     use flotilla_resources::{
-        ConvoySpec, InMemoryBackend, InputMeta, ObjectMeta, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend,
-        TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        ConvoySpec, CrewSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase, PresentationSpec,
+        PresentationStatus, ResourceBackend, Stance, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
+        WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -1120,6 +1134,30 @@ mod tests {
         let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).call()).await;
 
         assert!(!vessel.complete_work);
+    }
+
+    #[tokio::test]
+    async fn vessel_and_crew_rows_expose_requested_and_effective_stance() {
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+        let status = convoy.status.as_mut().expect("convoy status");
+        let definition = &mut status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0];
+        definition.stance = Stance::WorkspaceWrite;
+        definition
+            .crew
+            .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "cargo test".to_string() }).build());
+        status.work.get_mut("implement").expect("work state").placement = Some(PlacementStatus {
+            fields: BTreeMap::from([
+                ("requested_stance".to_string(), serde_json::json!("workspace-write")),
+                ("effective_stance".to_string(), serde_json::json!("contained")),
+            ]),
+        });
+
+        let vessel = emitted_vessel(convoy).await;
+
+        assert_eq!(vessel.requested_stance.as_deref(), Some("workspace-write"));
+        assert_eq!(vessel.effective_stance.as_deref(), Some("contained"));
+        assert_eq!(vessel.crew[0].requested_stance.as_deref(), Some("workspace-write"));
+        assert_eq!(vessel.crew[0].effective_stance.as_deref(), Some("contained"));
     }
 
     #[tokio::test]

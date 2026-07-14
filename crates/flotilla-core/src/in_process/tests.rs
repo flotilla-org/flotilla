@@ -324,11 +324,10 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
-                vessels: vec![VesselRequirement { name: "prepare".into(), depends_on: Vec::new(), crew: Vec::new() }, VesselRequirement {
-                    name: "implement".into(),
-                    depends_on: Vec::new(),
-                    crew: processes,
-                }],
+                vessels: vec![
+                    VesselRequirement { name: "prepare".into(), stance: Default::default(), depends_on: Vec::new(), crew: Vec::new() },
+                    VesselRequirement { name: "implement".into(), stance: Default::default(), depends_on: Vec::new(), crew: processes },
+                ],
             }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
                 phase: WorkPhase::Running,

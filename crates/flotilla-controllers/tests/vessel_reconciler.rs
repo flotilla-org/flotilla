@@ -16,7 +16,7 @@ use flotilla_resources::{
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec,
-    ResourceBackend, ResourceError, Selector, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    ResourceBackend, ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
     TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
     CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
@@ -26,6 +26,164 @@ const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "git@github.com:flotilla-org/flotilla.git";
 const GIT_REF: &str = "feat/task-provisioning";
 const HOST_REF: &str = "01HXYZ";
+
+#[tokio::test]
+async fn contained_requirement_rejects_host_direct_placement() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-contained", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy should have status");
+    status.workflow_snapshot.as_mut().expect("convoy should have workflow snapshot").vessels[0].stance = Stance::Contained;
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-contained", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("convoy status should update");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-host", HOST_REF, "cleat").await;
+    let workspace =
+        create_workspace(&backend, NAMESPACE, "workspace-contained", "convoy-contained", "implement", "policy-host", REPO_URL).await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message })
+            if message.contains("requires contained stance") && message.contains("host-direct")
+    ));
+    assert!(outcome.actuations.is_empty());
+}
+
+#[tokio::test]
+async fn ready_vessel_records_requested_and_effective_stance() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-stance", "implement", REPO_URL, GIT_REF).await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-stance", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    let clone_name =
+        format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
+    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    let checkout_path = "/Users/alice/dev/flotilla-repos/workspace-stance";
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-workspace-stance".to_string())
+            .env_ref(host_direct_env_name())
+            .git_ref(GIT_REF.to_string())
+            .path(checkout_path.to_string())
+            .maybe_worktree(Some(worktree_checkout_spec(&host_direct_env_name(), GIT_REF, checkout_path, &clone_name)))
+            .build(),
+    )
+    .await;
+    create_running_terminal(
+        &backend,
+        NAMESPACE,
+        "terminal-workspace-stance-coder",
+        &host_direct_env_name(),
+        "coder",
+        "cargo test",
+        checkout_path,
+        "cleat",
+    )
+    .await;
+    let workspace =
+        create_workspace(&backend, NAMESPACE, "workspace-stance", "convoy-stance", "implement", "policy-stance", REPO_URL).await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkReady { requested_stance: Stance::Trusted, effective_stance: Stance::Trusted, .. })
+    ));
+}
+
+#[tokio::test]
+async fn contained_requirement_runs_in_contained_docker_placement() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-docker-stance", "implement", REPO_URL, GIT_REF).await;
+    let mut status = convoy.status.expect("convoy should have status");
+    status.workflow_snapshot.as_mut().expect("convoy should have workflow snapshot").vessels[0].stance = Stance::Contained;
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-docker-stance", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("convoy status should update");
+    create_policy(
+        &backend,
+        NAMESPACE,
+        "policy-docker-stance",
+        PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                host_ref: HOST_REF.to_string(),
+                image: "ghcr.io/flotilla/dev:latest".to_string(),
+                default_cwd: None,
+                env: Default::default(),
+                checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+            })
+            .build(),
+    )
+    .await;
+    let environment_ref = "env-workspace-docker-stance";
+    create_ready_docker_environment(&backend, NAMESPACE, environment_ref, DockerEnvironmentSpec {
+        host_ref: HOST_REF.to_string(),
+        image: "ghcr.io/flotilla/dev:latest".to_string(),
+        mounts: Vec::new(),
+        env: Default::default(),
+    })
+    .await;
+    create_ready_checkout(
+        &backend,
+        NAMESPACE,
+        ReadyCheckoutFixture::builder()
+            .name("checkout-workspace-docker-stance".to_string())
+            .env_ref(environment_ref.to_string())
+            .git_ref(GIT_REF.to_string())
+            .path("/workspace".to_string())
+            .maybe_fresh_clone(Some(fresh_clone_checkout_spec(environment_ref, GIT_REF, "/workspace", REPO_URL)))
+            .build(),
+    )
+    .await;
+    create_running_terminal(
+        &backend,
+        NAMESPACE,
+        "terminal-workspace-docker-stance-coder",
+        environment_ref,
+        "coder",
+        "cargo test",
+        "/workspace",
+        "cleat",
+    )
+    .await;
+    let workspace = create_workspace(
+        &backend,
+        NAMESPACE,
+        "workspace-docker-stance",
+        "convoy-docker-stance",
+        "implement",
+        "policy-docker-stance",
+        REPO_URL,
+    )
+    .await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkReady {
+            requested_stance: Stance::Contained,
+            effective_stance: Stance::Contained,
+            ..
+        })
+    ));
+}
 
 #[tokio::test]
 async fn missing_placement_policy_marks_workspace_failed() {
@@ -694,6 +852,7 @@ async fn create_convoy_with_labeled_processes(
                 vessels: vec![
                     VesselRequirement {
                         name: "implement".to_string(),
+                        stance: Default::default(),
                         depends_on: Vec::new(),
                         crew: vec![CrewSpec::builder()
                             .role("coder".to_string())
@@ -702,6 +861,7 @@ async fn create_convoy_with_labeled_processes(
                     },
                     VesselRequirement {
                         name: "review".to_string(),
+                        stance: Default::default(),
                         depends_on: vec!["implement".to_string()],
                         crew: vec![
                             CrewSpec::builder()

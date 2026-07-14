@@ -360,7 +360,12 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
         vessels: tool_only_workflow_template_spec()
             .vessels
             .into_iter()
-            .map(|task| flotilla_resources::VesselRequirement { name: task.name, depends_on: task.depends_on, crew: task.crew })
+            .map(|task| flotilla_resources::VesselRequirement {
+                name: task.name,
+                stance: task.stance,
+                depends_on: task.depends_on,
+                crew: task.crew,
+            })
             .collect(),
     };
     let work = [("implement".to_string(), pending_task_state()), ("review".to_string(), pending_task_state())].into_iter().collect();

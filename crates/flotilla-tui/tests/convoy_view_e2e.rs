@@ -178,7 +178,9 @@ async fn x_then_enter_completes_work_via_palette() {
         message: None,
         placement: None,
     });
-    let snapshot = WorkflowSnapshot { vessels: vec![VesselRequirement { name: "implement".into(), depends_on: vec![], crew: vec![] }] };
+    let snapshot = WorkflowSnapshot {
+        vessels: vec![VesselRequirement { name: "implement".into(), stance: Default::default(), depends_on: vec![], crew: vec![] }],
+    };
     apply_status_patch(
         &convoys,
         "fix-bug-123",

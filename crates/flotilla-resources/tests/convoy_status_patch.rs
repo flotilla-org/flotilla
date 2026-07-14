@@ -16,6 +16,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
         vessels: vec![
             VesselRequirement {
                 name: "implement".to_string(),
+                stance: Default::default(),
                 depends_on: Vec::new(),
                 crew: vec![
                     CrewSpec {
@@ -35,6 +36,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
             },
             VesselRequirement {
                 name: "review".to_string(),
+                stance: Default::default(),
                 depends_on: vec!["implement".to_string()],
                 crew: vec![CrewSpec {
                     role: "reviewer".to_string(),

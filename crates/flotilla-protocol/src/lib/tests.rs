@@ -567,7 +567,12 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         .resource(implement_ref)
         .name("implement")
         .phase(WorkPhase::Running)
-        .crew(vec![CrewMemberSummary { role: "coder".into(), command_preview: "fix the bug".into() }])
+        .crew(vec![CrewMemberSummary {
+            role: "coder".into(),
+            command_preview: "fix the bug".into(),
+            requested_stance: None,
+            effective_stance: None,
+        }])
         .host(HostName::new("local"))
         .attach("ws-1".to_string())
         .complete_work(true)

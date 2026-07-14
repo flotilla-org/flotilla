@@ -86,6 +86,7 @@ pub async fn create_convoy_with_single_task(
             workflow_snapshot: Some(WorkflowSnapshot {
                 vessels: vec![VesselRequirement {
                     name: task.to_string(),
+                    stance: Default::default(),
                     depends_on: Vec::new(),
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())

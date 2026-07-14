@@ -285,6 +285,7 @@ fn bootstrap_outcome(
             .iter()
             .map(|vessel| VesselRequirement {
                 name: vessel.name.clone(),
+                stance: vessel.stance,
                 depends_on: vessel.depends_on.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
             })
@@ -777,6 +778,12 @@ fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {
             "placement_policy_ref",
             status.observed_policy_ref.clone().or_else(|| Some(workspace.spec.placement_policy_ref.clone())),
         );
+        if let Some(requested_stance) = status.requested_stance {
+            fields.insert("requested_stance".to_string(), json!(requested_stance));
+        }
+        if let Some(effective_stance) = status.effective_stance {
+            fields.insert("effective_stance".to_string(), json!(effective_stance));
+        }
     }
     PlacementStatus { fields }
 }

@@ -32,8 +32,8 @@ use flotilla_resources::{
     canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, repo_key, Clone, CloneSpec, Convoy,
     ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, TerminalSessionSource,
-    Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, Selector, Stance,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -265,21 +265,37 @@ async fn register_startup_resources(
 }
 
 fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
-    vec![(
-        "scratch",
-        WorkflowTemplateSpec::builder()
-            .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
-            .vessels(vec![VesselRequirement::builder()
-                .name("work".to_string())
-                .crew(vec![CrewSpec::builder()
-                    .role("shell".to_string())
-                    .source(CrewSource::Tool {
-                        command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
-                    })
+    vec![
+        (
+            "scratch",
+            WorkflowTemplateSpec::builder()
+                .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Trusted)
+                    .crew(vec![CrewSpec::builder()
+                        .role("shell".to_string())
+                        .source(CrewSource::Tool {
+                            command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
+                        })
+                        .build()])
                     .build()])
-                .build()])
-            .build(),
-    )]
+                .build(),
+        ),
+        (
+            "single-agent-contained",
+            WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .stance(Stance::Contained)
+                    .crew(vec![CrewSpec::builder()
+                        .role("coder".to_string())
+                        .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None })
+                        .build()])
+                    .build()])
+                .build(),
+        ),
+    ]
 }
 
 async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
@@ -1135,6 +1151,32 @@ mod tests {
             Arc::new(PassthroughTerminalPool),
         );
         Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn startup_seeding_preserves_existing_contained_template_definition() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let templates = backend.clone().using::<WorkflowTemplate>(NAMESPACE);
+        let custom = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("custom".to_string())
+                .stance(Stance::Contained)
+                .crew(vec![CrewSpec::builder()
+                    .role("maintainer".to_string())
+                    .source(CrewSource::Agent {
+                        selector: Selector { capability: "custom-code".to_string() },
+                        prompt: Some("Keep this definition".to_string()),
+                    })
+                    .build()])
+                .build()])
+            .build();
+        templates.create(&empty_meta("single-agent-contained"), &custom).await.expect("custom template create should succeed");
+
+        ensure_default_workflow_templates(&backend, NAMESPACE).await.expect("startup seeding should succeed");
+        ensure_default_workflow_templates(&backend, NAMESPACE).await.expect("restart seeding should succeed");
+
+        let preserved = templates.get("single-agent-contained").await.expect("template should remain");
+        assert_eq!(preserved.spec, custom);
     }
 
     fn manual_profile(host_id: &str, docker_available: bool) -> LocalProvisioningProfile {
