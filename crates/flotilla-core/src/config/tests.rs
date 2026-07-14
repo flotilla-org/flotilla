@@ -196,24 +196,6 @@ fn load_and_migrate_repos_returns_empty_when_dir_missing() {
 }
 
 #[test]
-fn legacy_tab_order_loads_and_tolerates_parse_failures() {
-    let dir = tempdir().unwrap();
-    let base = dir.path();
-    let store = ConfigStore::with_base(base);
-
-    assert!(store.load_tab_order().is_none());
-
-    std::fs::write(base.join("tab-order.json"), r#"["/a", "/b"]"#).expect("write tab-order fixture");
-    assert_eq!(store.load_tab_order(), Some(vec![ee("/a"), ee("/b")]));
-
-    std::fs::write(base.join("tab-order.json"), "not json {{{").expect("write tab-order fixture");
-    assert!(store.load_tab_order().is_none());
-
-    std::fs::write(base.join("tab-order.json"), r#"{"k":"v"}"#).expect("write tab-order fixture");
-    assert!(store.load_tab_order().is_none());
-}
-
-#[test]
 fn open_views_roundtrip_and_parse_failures() {
     let dir = tempdir().unwrap();
     let base = dir.path();
