@@ -167,7 +167,14 @@ impl InteractiveWidget for TableWidget {
             },
             Action::OpenActionMenu => match ctx.views.active_table_state().selected_row(&view) {
                 Some(row) if !row.actions.is_empty() => Outcome::Push(Box::new(TableActionMenuWidget::new(row.actions.clone()))),
-                _ => Outcome::Consumed,
+                Some(_) => {
+                    ctx.app_actions.push(AppAction::ShowStatus("No actions available for the selected row".into()));
+                    Outcome::Consumed
+                }
+                None => {
+                    ctx.app_actions.push(AppAction::ShowStatus("No table row selected".into()));
+                    Outcome::Consumed
+                }
             },
             _ => Outcome::Ignored,
         }
@@ -202,6 +209,7 @@ impl InteractiveWidget for TableWidget {
         let row = &view.rows[index];
         if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
             return if row.actions.is_empty() {
+                ctx.app_actions.push(AppAction::ShowStatus("No actions available for the selected row".into()));
                 Outcome::Consumed
             } else {
                 Outcome::Push(Box::new(TableActionMenuWidget::new(row.actions.clone())))
@@ -224,6 +232,9 @@ impl InteractiveWidget for TableWidget {
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
+        // `Screen` owns production base-page rendering so it can surface
+        // projection failures as an error page. This implementation satisfies
+        // the shared widget contract for direct embedding and test harnesses.
         let Some(address) = ctx.views.active_address().cloned() else { return };
         let filter = ctx.views.active_table_state().filter.clone();
         let convoys = ctx.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();

@@ -1797,6 +1797,17 @@ fn describe_opens_for_the_selected_table_row() {
 }
 
 #[test]
+fn action_menu_reports_when_the_selected_table_row_has_no_actions() {
+    let mut app = stub_app();
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["alpha"]))));
+    app.switch_tab(1);
+
+    app.handle_key(key(KeyCode::Char('.')));
+
+    assert_eq!(app.model.status_message.as_deref(), Some("No actions available for the selected row"));
+}
+
+#[test]
 fn generated_vessel_actions_execute_attach_and_force_complete() {
     let mut app = stub_app();
     let repo_identity = app.model.repo_order[0].clone();
