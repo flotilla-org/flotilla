@@ -11,6 +11,7 @@ flotilla-commands = { path = "../flotilla-commands" }
 flotilla-core = { path = "../flotilla-core" }
 flotilla-manifest = { path = "../flotilla-manifest" }
 flotilla-protocol = { path = "../flotilla-protocol" }
+flotilla-resources = { path = "../flotilla-resources" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 color-eyre = { workspace = true }
@@ -42,6 +43,5 @@ async-trait = { workspace = true }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 flotilla-daemon = { path = "../flotilla-daemon", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
-flotilla-resources = { path = "../flotilla-resources" }
 insta = "1"
 tempfile = "3"

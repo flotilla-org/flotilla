@@ -142,8 +142,8 @@ pub struct WidgetContext<'a> {
 
 /// Context provided to widgets during rendering.
 ///
-/// Mutable fields (`ui`) are needed because the base layer rendering updates
-/// table state and layout areas.
+/// Mutable fields are needed because rendering updates layout areas and
+/// reconciles per-View cursor/scroll state against the latest query rows.
 pub struct RenderContext<'a> {
     pub model: &'a TuiModel,
     /// The open tab set; drives the tab bar and page dispatch.

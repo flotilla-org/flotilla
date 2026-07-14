@@ -1799,6 +1799,7 @@ fn describe_opens_for_the_selected_table_row() {
 #[test]
 fn generated_vessel_actions_execute_attach_and_force_complete() {
     let mut app = stub_app();
+    let repo_identity = app.model.repo_order[0].clone();
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["implement"])]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Enter));
@@ -1807,6 +1808,7 @@ fn generated_vessel_actions_execute_attach_and_force_complete() {
     app.handle_key(key(KeyCode::Enter));
     let attach = app.proto_commands.take_next().expect("attach command").0;
     assert!(matches!(attach.action, flotilla_protocol::CommandAction::SelectWorkspace { ref ws_ref } if ws_ref == "ws://implement"));
+    assert_eq!(attach.context_repo, Some(RepoSelector::Identity(repo_identity)));
 
     app.handle_key(key(KeyCode::Char('.')));
     app.handle_key(key(KeyCode::Char('x')));
@@ -1816,11 +1818,13 @@ fn generated_vessel_actions_execute_attach_and_force_complete() {
         flotilla_protocol::CommandAction::ConvoyWorkForceComplete { ref convoy, ref work, message: None }
             if convoy == "alpha" && work == "implement"
     ));
+    assert_eq!(complete.context_repo, None, "force-complete remains a context-free command");
 }
 
 #[test]
 fn generated_vessel_actions_route_to_the_vessels_host() {
     let mut app = stub_app();
+    let repo_identity = app.model.repo_order[0].clone();
     insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
     let mut convoy = convoy_with_vessels("alpha", &["implement"]);
     convoy.vessels[0].host = Some(HostName::new("feta"));
@@ -1834,6 +1838,34 @@ fn generated_vessel_actions_route_to_the_vessels_host() {
 
     let command = app.proto_commands.take_next().expect("remote attach command").0;
     assert_eq!(command.node_id, Some(NodeId::new("node-feta-peer")));
+    assert_eq!(command.context_repo, Some(RepoSelector::Identity(repo_identity)));
+}
+
+#[test]
+fn generated_attach_uses_the_convoys_repo_hint() {
+    let mut app = stub_app_with_repos(2);
+    let expected_repo = app.model.repo_order[1].clone();
+    let mut convoy = convoy_with_vessels("alpha", &["implement"]);
+    convoy.repo_hint = Some(flotilla_protocol::RepoKey(expected_repo.path.clone()));
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
+    app.switch_tab(1);
+    app.handle_key(key(KeyCode::Enter));
+
+    app.handle_key(key(KeyCode::Char('.')));
+    app.handle_key(key(KeyCode::Enter));
+
+    let command = app.proto_commands.take_next().expect("attach command").0;
+    assert_eq!(command.context_repo, Some(RepoSelector::Identity(expected_repo)));
+}
+
+#[test]
+fn table_action_repo_hint_matches_remote_repo_identity() {
+    let identity = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
+
+    assert!(super::key_handlers::repo_identity_matches_hint(
+        &identity,
+        &flotilla_protocol::RepoKey("github-com-flotilla-org-flotilla".into())
+    ));
 }
 
 #[test]

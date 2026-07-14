@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, HostName, NodeId, WorkItem};
+use flotilla_protocol::{Command, CommandAction, HostName, NodeId, RepoIdentity, RepoKey, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
@@ -367,12 +367,16 @@ impl App {
     }
 
     pub(super) fn execute_table_intent(&mut self, intent: crate::table_view::TableIntent) {
-        let (action, host) = match intent {
-            crate::table_view::TableIntent::AttachWorkspace { workspace_ref, host } => {
-                (CommandAction::SelectWorkspace { ws_ref: workspace_ref }, host)
+        let (mut command, host) = match intent {
+            crate::table_view::TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
+                let Some(repo_identity) = self.table_action_repo(repo_hint.as_ref()) else {
+                    self.set_status_message(Some("Cannot attach workspace: the convoy does not identify a tracked repository".to_string()));
+                    return;
+                };
+                (self.repo_command_for_identity(repo_identity, CommandAction::SelectWorkspace { ws_ref: workspace_ref }), host)
             }
             crate::table_view::TableIntent::ForceCompleteWork { convoy, vessel, host } => {
-                (CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }, host)
+                (self.command(CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }), host)
             }
         };
         let node_id = match self.panel_target_node(&host) {
@@ -382,9 +386,14 @@ impl App {
                 return;
             }
         };
-        let mut command = self.command(action);
         command.node_id = node_id;
         self.proto_commands.push(command);
+    }
+
+    fn table_action_repo(&self, hint: Option<&RepoKey>) -> Option<RepoIdentity> {
+        hint.and_then(|hint| self.model.repo_order.iter().find(|identity| repo_identity_matches_hint(identity, hint)).cloned())
+            .or_else(|| self.model.active_repo.clone())
+            .or_else(|| (self.model.repo_order.len() == 1).then(|| self.model.repo_order[0].clone()))
     }
 
     fn panel_target_node(&self, host: &HostName) -> Result<Option<NodeId>, String> {
@@ -422,6 +431,17 @@ impl App {
 
         self.screen.modal_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(entries, item)));
     }
+}
+
+pub(super) fn repo_identity_matches_hint(identity: &RepoIdentity, hint: &RepoKey) -> bool {
+    if hint.0 == identity.path || hint.0 == format!("{}/{}", identity.authority, identity.path.trim_start_matches('/')) {
+        return true;
+    }
+    if matches!(identity.authority.as_str(), "local" | "unknown") {
+        return false;
+    }
+    let url = format!("https://{}/{}", identity.authority, identity.path.trim_start_matches('/'));
+    flotilla_resources::canonicalize_repo_url(&url).is_ok_and(|canonical| flotilla_resources::descriptive_repo_slug(&canonical) == hint.0)
 }
 
 #[cfg(test)]

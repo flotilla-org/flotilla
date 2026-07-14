@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flotilla_protocol::{HostName, ViewAddress};
+use flotilla_protocol::{HostName, RepoKey, ViewAddress};
 
 use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
 
@@ -191,7 +191,7 @@ pub struct DetailField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableIntent {
-    AttachWorkspace { workspace_ref: String, host: HostName },
+    AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
 }
 
@@ -233,6 +233,7 @@ impl TableView {
 struct VesselProjection {
     namespace: String,
     convoy: String,
+    repo_hint: Option<RepoKey>,
     vessel: VesselSummary,
 }
 
@@ -255,6 +256,7 @@ pub fn project(address: &ViewAddress, convoys: &[&ConvoySummary]) -> Result<Tabl
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
                 namespace: namespace.clone(),
                 convoy: name.clone(),
+                repo_hint: convoy.repo_hint.clone(),
                 vessel: vessel.clone(),
             });
             Ok(vessel_spec().project(format!("Convoy · {name}"), rows))
@@ -269,6 +271,7 @@ pub fn project(address: &ViewAddress, convoys: &[&ConvoySummary]) -> Result<Tabl
             Ok(vessel_spec().project(format!("Vessel · {vessel}"), [VesselProjection {
                 namespace: namespace.clone(),
                 convoy: convoy.clone(),
+                repo_hint: convoy_row.repo_hint.clone(),
                 vessel: vessel_row.clone(),
             }]))
         }
@@ -485,7 +488,11 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
 }
 
 fn attach_vessel(row: &VesselProjection) -> Option<TableIntent> {
-    Some(TableIntent::AttachWorkspace { workspace_ref: row.vessel.workspace_ref.clone()?, host: row.vessel.host.clone()? })
+    Some(TableIntent::AttachWorkspace {
+        workspace_ref: row.vessel.workspace_ref.clone()?,
+        host: row.vessel.host.clone()?,
+        repo_hint: row.repo_hint.clone(),
+    })
 }
 
 fn force_complete_vessel(row: &VesselProjection) -> Option<TableIntent> {
