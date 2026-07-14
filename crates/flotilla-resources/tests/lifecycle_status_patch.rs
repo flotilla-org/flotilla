@@ -6,8 +6,9 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use flotilla_resources::{
     ConvoyPhase, ConvoyStatus, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InnerCommandStatus, PlacementStatus, PresentationPhase,
-    PresentationStatus, PresentationStatusPatch, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch,
-    VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    PresentationStatus, PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
+    TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,6 +576,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     environment_ref: Some("env-a".to_string()),
                     checkout_ref: Some("checkout-a".to_string()),
                     terminal_session_refs: Vec::new(),
+                    requested_stance: Stance::WorkspaceWrite,
+                    effective_stance: Stance::Contained,
                     ready_at: ts(30),
                 };
                 apply_and_replay(&mut status, &patch);
