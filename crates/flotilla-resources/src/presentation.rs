@@ -43,9 +43,19 @@ pub struct PresentationStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresentationStatusPatch {
-    MarkActive { presentation_manager: String, workspace_ref: String, spec_hash: String, ready_at: DateTime<Utc> },
-    MarkTornDown { message: Option<String> },
-    MarkFailed { message: String },
+    /// Duplicate-safe while already active; from another phase this records a new realization attempt.
+    MarkActive {
+        presentation_manager: String,
+        workspace_ref: String,
+        spec_hash: String,
+        ready_at: DateTime<Utc>,
+    },
+    MarkTornDown {
+        message: Option<String>,
+    },
+    MarkFailed {
+        message: String,
+    },
 }
 
 impl StatusPatch<PresentationStatus> for PresentationStatusPatch {

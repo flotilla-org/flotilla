@@ -170,6 +170,8 @@ pub struct CrewSessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSessionStatusPatch {
+    /// Starts a new attempt after a stopped session by clearing the previous attempt's status.
+    /// Failed-session retry is not currently a legal controller transition.
     MarkStarting,
     MarkRunning {
         session_id: String,
