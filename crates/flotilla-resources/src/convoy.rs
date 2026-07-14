@@ -297,6 +297,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
+                // Derived Active roll-up is a continuation of the convoy voyage, not a new attempt.
                 status.phase = *phase;
                 if *phase == ConvoyPhase::Active {
                     status.finished_at = None;
@@ -350,6 +351,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::MarkCrewCompleted { vessel, role, finished_at, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    // Duplicate settlement is sticky; changing the settled outcome records its own time.
                     if state.phase != CrewWorkPhase::Done {
                         state.finished_at = None;
                     }
@@ -363,6 +365,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     work.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    // Duplicate settlement is sticky; changing the settled outcome records its own time.
                     if state.phase != CrewWorkPhase::Failed {
                         state.finished_at = None;
                     }
@@ -381,6 +384,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 let target_was_done = crew.get(target_role).is_some_and(|state| state.phase == CrewWorkPhase::Done);
                 if let Some(target) = crew.get_mut(target_role) {
                     if matches!(target.phase, CrewWorkPhase::Pending | CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
+                        // Hand-back continues the same crew process, preserving its original start.
                         target.phase = CrewWorkPhase::Working;
                         target.started_at.get_or_insert(*handed_off_at);
                         target.finished_at = None;
@@ -397,12 +401,17 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RollUpWork { work, phase, transitioned_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    // Work roll-up reports the same process across continuation and re-settlement.
+                    let previous_phase = state.phase;
                     state.phase = *phase;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = message.clone();
                     match phase {
                         WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {
-                            state.finished_at = Some(*transitioned_at);
+                            if previous_phase != *phase {
+                                state.finished_at = None;
+                            }
+                            state.finished_at.get_or_insert(*transitioned_at);
                         }
                         WorkPhase::Pending | WorkPhase::Ready | WorkPhase::Launching | WorkPhase::Running => {
                             state.finished_at = None;
