@@ -20,11 +20,13 @@ fi
 # Warn (don't block) when the dev binaries look ad-hoc signed: per #689 the
 # per-exec assessment cost on macOS 26.5.x wants a real identity. Signing is
 # deliberately manual; see the dev-signing notes.
-for bin in "$FLOTILLA_BIN" "$(dirname "$FLOTILLA_BIN")/flotillad"; do
-    if [[ -x "$bin" ]] && ! codesign -dv "$bin" 2>&1 | grep -q "Authority="; then
-        echo "warning: $bin appears ad-hoc signed — re-sign it (see #689 dev-signing notes)" >&2
-    fi
-done
+if command -v codesign >/dev/null 2>&1; then
+    for bin in "$FLOTILLA_BIN" "$(dirname "$FLOTILLA_BIN")/flotillad"; do
+        if [[ -x "$bin" ]] && ! codesign -dv "$bin" 2>&1 | grep -q "Authority="; then
+            echo "warning: $bin appears ad-hoc signed — re-sign it (see #689 dev-signing notes)" >&2
+        fi
+    done
+fi
 
 cargo build --manifest-path "$ANDAMENTO_ROOT/Cargo.toml" --workspace --target wasm32-wasip1 --release
 
