@@ -98,6 +98,16 @@ durable replica area, resume from the stored version on reconnect.
   plumbing (e.g. Presentation) does not replicate.
 - Relay serves the replica area over the same watch surface, namespaced by
   origin root, with identical mechanics.
+- **Replica durability is relative to the origin log's class (ADR 0004).**
+  The cross-root classes here are *merge* classes, orthogonal to storage
+  class: definitions, Repository, and home-bound runtime records ride the
+  durable managed log and replicate resumably across restarts on both ends.
+  Generational observed kinds (Host status, observed Checkouts) follow ADR
+  0004's rule — the replica survives the *holder's* restarts, but an origin
+  generation change forces discard + re-list. Origin *absence* is not a
+  generation change: the replica retains the last generation's facts as
+  last-known, staleness-stamped state until a new generation replaces them
+  — which is precisely the no-regress property durability exists for.
 - The `FleetReplicaSnapshot` broadcast path and the Plane-A peer transport
   under it are **subsumed and deletable** — the deletion ADR 0002 promised.
 
