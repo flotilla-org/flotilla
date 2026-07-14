@@ -16,14 +16,14 @@ use flotilla_resources::{
     ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec,
-    ResourceBackend, ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
-    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot,
+    WorkflowTemplate, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
 const NAMESPACE: &str = "flotilla";
-const REPO_URL: &str = "git@github.com:flotilla-org/flotilla.git";
+const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
 const GIT_REF: &str = "feat/task-provisioning";
 const HOST_REF: &str = "01HXYZ";
 
@@ -839,13 +839,18 @@ async fn create_convoy_with_labeled_processes(
     repo_url: &str,
     git_ref: &str,
 ) -> flotilla_resources::ResourceObject<Convoy> {
+    let repository_spec = RepositorySpec::remote(repo_url).expect("repository URL should be canonical");
+    let repository_key = repository_spec.key();
+    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
+        .await
+        .expect("repository create should succeed");
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
         .create(&meta(name), &ConvoySpec {
             workflow_ref: "wf".to_string(),
             inputs: Default::default(),
             placement_policy: None,
-            repository: Some(ConvoyRepositorySpec { url: repo_url.to_string() }),
+            repository: Some(ConvoyRepositorySpec { url: repo_url.to_string(), repo_ref: repository_key }),
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
             adopted_checkout_ref: None,

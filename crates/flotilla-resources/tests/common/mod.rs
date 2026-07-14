@@ -210,7 +210,12 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
 
 pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
     let mut spec = valid_convoy_spec();
-    spec.repository = Some(flotilla_resources::ConvoyRepositorySpec { url: "git@github.com:flotilla-org/flotilla.git".to_string() });
+    let repository = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git")
+        .expect("repository URL should be canonical");
+    spec.repository = Some(flotilla_resources::ConvoyRepositorySpec {
+        url: "https://github.com/flotilla-org/flotilla.git".to_string(),
+        repo_ref: repository.key(),
+    });
     spec.r#ref = Some("feat/task-provisioning".to_string());
     spec
 }

@@ -32,6 +32,10 @@ impl RepositoryInspection {
 #[async_trait]
 pub trait RepositoryInspector: Send + Sync {
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
+
+    async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        RepositorySpec::remote(remote)
+    }
 }
 
 pub struct GitRepositoryInspector {
@@ -105,9 +109,6 @@ impl GitRepositoryInspector {
         let Some(host) = ssh_remote_host(remote) else {
             return flotilla_resources::canonicalize_repo_url(remote);
         };
-        if host.contains('.') {
-            return flotilla_resources::canonicalize_repo_url(remote);
-        }
         let ssh_config = self
             .runner
             .run("ssh", &["-G", host], cwd, &ChannelLabel::Noop)
@@ -119,9 +120,16 @@ impl GitRepositoryInspector {
                 let (key, value) = line.trim().split_once(char::is_whitespace)?;
                 key.eq_ignore_ascii_case("hostname").then(|| value.trim())
             })
-            .filter(|resolved| !resolved.is_empty() && *resolved != host)
+            .filter(|resolved| !resolved.is_empty())
             .ok_or_else(|| format!("unrecognised remote host alias `{host}`"))?;
-        flotilla_resources::canonicalize_repo_url(&remote.replacen(host, resolved, 1))
+        if resolved == host {
+            if !host.contains('.') {
+                return Err(format!("unrecognised remote host alias `{host}`"));
+            }
+            flotilla_resources::canonicalize_repo_url(remote)
+        } else {
+            flotilla_resources::canonicalize_repo_url(&remote.replacen(host, resolved, 1))
+        }
     }
 }
 
@@ -156,6 +164,10 @@ impl RepositoryInspector for GitRepositoryInspector {
             },
             transport_url,
         })
+    }
+
+    async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        RepositorySpec::remote(self.canonical_remote(Path::new("/"), remote).await?)
     }
 }
 
@@ -229,6 +241,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dotted_ssh_alias_is_resolved_instead_of_assumed_to_be_a_hostname() {
+        let (_temp, root) = git_repo();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
+            .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Ok("main\n".to_string()))
+            .on_run("git", &["remote"], Ok("origin\n".to_string()))
+            .on_run("git", &["remote", "get-url", "origin"], Ok("github.work:org/repo.git\n".to_string()))
+            .on_run("ssh", &["-G", "github.work"], Ok("hostname github.com\nuser git\n".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+
+        let inspected = inspector.inspect_path(&root, None).await.expect("dotted alias should resolve");
+
+        assert!(matches!(
+            inspected.spec.identity(),
+            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
+        ));
+    }
+
+    #[tokio::test]
     async fn remote_less_worktrees_with_one_common_dir_converge() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let first = temp.path().join("first");
@@ -282,6 +314,8 @@ mod tests {
             .on_run("git", &["remote"], Ok("origin\nmirror\n".to_string()))
             .on_run("git", &["remote", "get-url", "origin"], Ok("https://github.com/org/repo.git\n".to_string()))
             .on_run("git", &["remote", "get-url", "mirror"], Ok("git@github.com:org/repo.git\n".to_string()))
+            .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
+            .on_run("ssh", &["-G", "github.com"], Ok("hostname github.com\nuser git\n".to_string()))
             .build();
         let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
 

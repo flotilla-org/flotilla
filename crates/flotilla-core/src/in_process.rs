@@ -1203,6 +1203,10 @@ impl InProcessDaemon {
         self.repository_inspector().await?.inspect_path(path, remote).await
     }
 
+    async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        self.repository_inspector().await?.resolve_remote(remote).await
+    }
+
     async fn inspect_adopted_checkout(
         &self,
         path: &Path,
@@ -3741,11 +3745,41 @@ impl InProcessDaemon {
                 }
                 None => None,
             };
+            let repository = if let Some(url) = repository_url {
+                let resolved = async {
+                    let repository_spec = self.resolve_repository_remote(&url).await?;
+                    let repo_ref = repository_spec.key();
+                    flotilla_resources::ensure_repository(
+                        &self.resource_backend.clone().using::<Repository>(&namespace),
+                        &repo_ref,
+                        &repository_spec,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok::<_, String>(ConvoyRepositorySpec { url, repo_ref })
+                }
+                .await;
+                match resolved {
+                    Ok(repository) => Some(repository),
+                    Err(message) => {
+                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                            command_id: id,
+                            node_id: self.node_id.clone(),
+                            repo_identity: empty_identity,
+                            repo: None,
+                            result: flotilla_protocol::CommandValue::Error { message },
+                        });
+                        return Ok(id);
+                    }
+                }
+            } else {
+                None
+            };
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
                 placement_policy,
-                repository: repository_url.map(|url| ConvoyRepositorySpec { url }),
+                repository,
                 r#ref,
                 project_ref: project_ref.clone(),
                 adopted_checkout_ref,

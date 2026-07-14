@@ -4,12 +4,12 @@ use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
-    canonicalize_repo_url, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase, CloneSpec, CloneStatus,
-    Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, ResourceBackend,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    canonicalize_repo_url, ensure_repository, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Clone, ClonePhase,
+    CloneSpec, CloneStatus, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy,
+    DockerEnvironmentSpec, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use tokio::{
     task::JoinHandle,
@@ -68,13 +68,19 @@ pub async fn create_convoy_with_single_task(
     repo_url: &str,
     git_ref: &str,
 ) -> flotilla_resources::ResourceObject<Convoy> {
+    let canonical_repo = canonicalize_repo_url(repo_url).expect("repository URL should canonicalize");
+    let repository_spec = RepositorySpec::remote(canonical_repo).expect("canonical repository identity should be valid");
+    let repository_key = repository_spec.key();
+    ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
+        .await
+        .expect("repository create should succeed");
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
         .create(&meta(name), &ConvoySpec {
             workflow_ref: "wf".to_string(),
             inputs: Default::default(),
             placement_policy: None,
-            repository: Some(ConvoyRepositorySpec { url: repo_url.to_string() }),
+            repository: Some(ConvoyRepositorySpec { url: repo_url.to_string(), repo_ref: repository_key }),
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
             adopted_checkout_ref: None,

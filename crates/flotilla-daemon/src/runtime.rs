@@ -8,9 +8,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, HopChainContext,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime,
-    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler,
+    ForgeDefaultBranchResolver, HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
+    RepositoryReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -30,10 +30,10 @@ use flotilla_core::{
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, descriptive_repo_slug, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
-    PlacementPolicySpec, Presentation, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel,
-    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
+    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -175,6 +175,23 @@ struct ControllerRuntimeState {
     host_direct_environment_name: String,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     active_sessions: Mutex<HashMap<String, ActiveSession>>,
+}
+
+struct GhForgeDefaultBranchResolver {
+    runner: Arc<dyn CommandRunner>,
+}
+
+#[async_trait]
+impl ForgeDefaultBranchResolver for GhForgeDefaultBranchResolver {
+    async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String> {
+        if forge.service_url.trim_end_matches('/') != "https://github.com" {
+            return Ok(None);
+        }
+        let endpoint = format!("repos/{}", forge.repository);
+        let output = self.runner.run("gh", &["api", &endpoint, "--jq", ".default_branch"], Path::new("/"), &ChannelLabel::Noop).await?;
+        let branch = output.trim();
+        Ok((!branch.is_empty()).then(|| branch.to_string()))
+    }
 }
 
 impl ControllerRuntimeState {
@@ -520,23 +537,33 @@ fn spawn_controller_loops(
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
     let observed_backend = state.daemon.observed_resource_backend();
+    let forge_default_branch_resolver = state
+        .daemon
+        .local_command_runner()
+        .map(|runner| Arc::new(GhForgeDefaultBranchResolver { runner }) as Arc<dyn ForgeDefaultBranchResolver>);
     let namespace_string = namespace.to_string();
     vec![
         tokio::spawn({
             let backend = backend.clone();
             let observed_backend = observed_backend.clone();
             let namespace_string = namespace_string.clone();
+            let forge_default_branch_resolver = forge_default_branch_resolver.clone();
             let supervision = supervision.clone();
             async move {
                 supervise("repository", supervision, move || {
                     let backend = backend.clone();
                     let observed_backend = observed_backend.clone();
                     let namespace_string = namespace_string.clone();
+                    let forge_default_branch_resolver = forge_default_branch_resolver.clone();
                     async move {
+                        let mut reconciler = RepositoryReconciler::new(backend.clone(), observed_backend.clone(), &namespace_string);
+                        if let Some(resolver) = forge_default_branch_resolver {
+                            reconciler = reconciler.with_forge_default_branch_resolver(resolver);
+                        }
                         ControllerLoop {
                             primary: backend.clone().using::<Repository>(&namespace_string),
                             secondaries: RepositoryReconciler::secondary_watches(observed_backend.clone(), &namespace_string),
-                            reconciler: RepositoryReconciler::new(backend.clone(), observed_backend, &namespace_string),
+                            reconciler,
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -1134,8 +1161,8 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
     use flotilla_resources::{
         Checkout as ResourceCheckout, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
-        PlacementPolicy, Selector, SqliteBackend, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase,
-        WorkflowTemplate, WorkflowTemplateSpec,
+        PlacementPolicy, RepositorySpec, Selector, SqliteBackend, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement,
+        WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -1287,6 +1314,11 @@ mod tests {
             )
             .await
             .expect("workflow template create should succeed");
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
+        let repository_key = repository_spec.key();
+        flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec)
+            .await
+            .expect("repository create should succeed");
         backend
             .clone()
             .using::<Convoy>(NAMESPACE)
@@ -1294,7 +1326,10 @@ mod tests {
                 workflow_ref: "wf-a".to_string(),
                 inputs: BTreeMap::new(),
                 placement_policy: Some(format!("host-direct-{host_id}")),
-                repository: Some(ConvoyRepositorySpec { url: "https://github.com/flotilla-org/flotilla.git".to_string() }),
+                repository: Some(ConvoyRepositorySpec {
+                    url: "https://github.com/flotilla-org/flotilla.git".to_string(),
+                    repo_ref: repository_key,
+                }),
                 r#ref: Some("main".to_string()),
                 project_ref: None,
                 adopted_checkout_ref: None,

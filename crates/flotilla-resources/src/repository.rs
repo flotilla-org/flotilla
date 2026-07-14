@@ -6,7 +6,7 @@ use crate::{
     resource::define_resource, status_patch::StatusPatch, InputMeta, LifecycleAuthority, ResourceError, ResourceObject, TypedResolver,
 };
 
-define_resource!(Repository, "repositories", RepositorySpec, RepositoryStatus, RepositoryStatusPatch);
+define_resource!(Repository, "repositories", RepositorySpec, RepositoryStatus, RepositoryStatusPatch, immutable_spec);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -52,8 +52,8 @@ pub struct RepositorySpec {
 impl RepositorySpec {
     pub fn remote(remote: impl Into<String>) -> Result<Self, String> {
         let remote = remote.into();
-        if let Some(alias) = unresolved_ssh_alias(&remote) {
-            return Err(format!("unrecognised remote host alias `{alias}`; resolve SSH host configuration before creating RepositorySpec"));
+        if let Some(host) = ssh_remote_host(&remote) {
+            return Err(format!("SSH remote host `{host}` must be resolved before creating RepositorySpec"));
         }
         let canonical_remote = crate::canonicalize_repo_url(&remote)?;
         let forge = forge_from_canonical_remote(&canonical_remote)?;
@@ -286,7 +286,7 @@ fn identity_description(identity: &RepositoryIdentity) -> String {
     }
 }
 
-fn unresolved_ssh_alias(remote: &str) -> Option<&str> {
+fn ssh_remote_host(remote: &str) -> Option<&str> {
     let host = if let Some(rest) = remote.strip_prefix("ssh://") {
         let authority = rest.split('/').next()?;
         authority.rsplit_once('@').map_or(authority, |(_, host)| host)
@@ -299,5 +299,5 @@ fn unresolved_ssh_alias(remote: &str) -> Option<&str> {
         }
         authority.rsplit_once('@').map_or(authority, |(_, host)| host)
     };
-    (!host.contains('.')).then_some(host)
+    Some(host)
 }

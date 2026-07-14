@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement};
+use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, RepositoryKey};
 
 mod reconcile;
 
@@ -34,6 +34,7 @@ pub struct ConvoySpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyRepositorySpec {
     pub url: String,
+    pub repo_ref: RepositoryKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,16 +3,16 @@ use std::{collections::BTreeMap, marker::PhantomData};
 use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key,
+    clone_key,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
-    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
-    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, RepositoryKey, Resource, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel,
-    VesselPhase, VesselStatusPatch, VESSEL_REF_LABEL,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, CrewSource, DockerCheckoutStrategy,
+    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
+    PlacementPolicySpec, Repository, RepositoryIdentity, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch,
+    VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -21,6 +21,7 @@ const ENV_LABEL: &str = "flotilla.work/env";
 
 pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
+    repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
     environments: TypedResolver<Environment>,
     clones: TypedResolver<Clone>,
@@ -33,6 +34,7 @@ impl VesselReconciler {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
         Self {
             convoys: backend.clone().using::<Convoy>(namespace),
+            repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             clones: backend.clone().using::<Clone>(namespace),
@@ -176,20 +178,32 @@ impl Reconciler for VesselReconciler {
             )));
         }
 
-        let repo_url = match convoy.spec.repository.as_ref().map(|repository| repository.url.clone()) {
-            Some(url) => url,
+        let convoy_repository = match convoy.spec.repository.as_ref() {
+            Some(repository) => repository,
             None => return Ok(VesselDeps::failed("convoy repository URL is missing".to_string())),
         };
+        let repo_url = convoy_repository.url.clone();
         let git_ref = match convoy.spec.r#ref.clone() {
             Some(git_ref) => git_ref,
             None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
         };
-        let canonical_repo = match canonicalize_repo_url(&repo_url) {
-            Ok(url) => url,
-            Err(err) => return Ok(VesselDeps::failed(err)),
+        let repository = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
+            Ok(repository) => repository,
+            Err(ResourceError::NotFound { .. }) => {
+                return Ok(VesselDeps::failed(format!("repository {} not found", convoy_repository.repo_ref)))
+            }
+            Err(err) => return Err(err),
         };
-        let repo_key = repo_key(&canonical_repo);
-        let repo_slug = descriptive_repo_slug(&canonical_repo);
+        if let Err(message) = repository.spec.verify_key(&convoy_repository.repo_ref) {
+            return Ok(VesselDeps::failed(message));
+        }
+        let canonical_repo = match repository.spec.identity() {
+            RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+            RepositoryIdentity::Local { .. } => return Ok(VesselDeps::failed("convoy repository must have a transport remote")),
+        };
+        let repository_key = convoy_repository.repo_ref.clone();
+        let repo_key = repository_key.to_string();
+        let repo_slug = repository.spec.catalog_slug();
         let adopted_checkout_ref = obj.spec.adopted_checkout_ref.clone();
 
         let clone_env_ref = host_direct_environment_name(strategy.host_ref());
@@ -215,11 +229,7 @@ impl Reconciler for VesselReconciler {
             let clone_path = format!("{}/{}", clone_env_spec.repo_default_dir.trim_end_matches('/'), repo_key);
             match self.clones.get(&clone_name).await {
                 Ok(existing) => {
-                    let existing_repo = match canonicalize_repo_url(&existing.spec.url) {
-                        Ok(url) => url,
-                        Err(err) => return Ok(VesselDeps::failed(err)),
-                    };
-                    if existing_repo != canonical_repo || existing.spec.env_ref != clone_env_ref {
+                    if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
                         return Ok(VesselDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
                     }
                     if existing.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
@@ -245,7 +255,7 @@ impl Reconciler for VesselReconciler {
                             ]))
                             .build(),
                         spec: CloneSpec {
-                            repo_ref: RepositoryKey(repo_key.clone()),
+                            repo_ref: repository_key.clone(),
                             url: repo_url.clone(),
                             env_ref: clone_env_ref.clone(),
                             path: clone_path,
@@ -354,7 +364,7 @@ impl Reconciler for VesselReconciler {
                 let spec = match &strategy {
                     PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                         CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                            repo_ref: RepositoryKey(repo_key.clone()),
+                            repo_ref: repository_key.clone(),
                             env_ref: clone_env_ref.clone(),
                             r#ref: git_ref,
                             target_path: checkout_target_path.clone(),
@@ -362,7 +372,7 @@ impl Reconciler for VesselReconciler {
                         })
                     }
                     PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                        repo_ref: RepositoryKey(repo_key.clone()),
+                        repo_ref: repository_key.clone(),
                         env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
                         r#ref: git_ref,
                         target_path: checkout_target_path.clone(),

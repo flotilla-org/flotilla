@@ -2361,7 +2361,10 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
         ResourceCheckoutSpec::Observed(spec) => {
             assert_eq!(spec.r#ref, "main");
             assert_eq!(spec.path, std::fs::canonicalize(&checkout_path).expect("canonical path").display().to_string());
-            assert_eq!(spec.repo_ref, flotilla_resources::RepositorySpec::remote(remote).expect("repository spec").key());
+            assert_eq!(
+                spec.repo_ref,
+                flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec").key()
+            );
         }
         other => panic!("expected observed checkout spec, got {other:?}"),
     }

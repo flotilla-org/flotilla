@@ -507,6 +507,7 @@ impl SqliteBackend {
             if object.metadata.resource_version != resource_version {
                 return Err(ResourceError::conflict(&meta.name, "stale resourceVersion"));
             }
+            T::validate_spec_update(&object.spec, &spec)?;
             if object.matches_update(&meta, &spec)? {
                 return Ok(object);
             }

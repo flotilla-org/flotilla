@@ -1,21 +1,32 @@
 use flotilla_resources::{
     normalize_project_spec, DefaultBranchObservation, DefaultBranchProvenance, InMemoryBackend, InputMeta, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend,
+    ProjectSpec, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, SqliteBackend,
 };
 
 #[tokio::test]
-async fn repository_roundtrips_and_verifies_its_derived_key() {
-    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-    let repositories = backend.using::<Repository>("flotilla");
-    let spec = RepositorySpec::remote("git@GitHub.com:flotilla-org/flotilla.git").expect("remote should normalize");
-    let key = spec.key();
+async fn repository_roundtrips_and_is_immutable_in_local_backends() {
+    let backends = [
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open")),
+    ];
+    for backend in backends {
+        let repositories = backend.using::<Repository>("flotilla");
+        let spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("remote should normalize");
+        let key = spec.key();
 
-    repositories.create(&InputMeta::builder().name(key.to_string()).build(), &spec).await.expect("repository should create");
-    let fetched = repositories.get(&key.to_string()).await.expect("repository should fetch");
+        repositories.create(&InputMeta::builder().name(key.to_string()).build(), &spec).await.expect("repository should create");
+        let fetched = repositories.get(&key.to_string()).await.expect("repository should fetch");
 
-    assert_eq!(fetched.spec, spec);
-    fetched.spec.verify_key(&key).expect("fetched identity should match key");
-    assert!(fetched.spec.verify_key(&RepositoryKey("wrong".to_string())).is_err());
+        assert_eq!(fetched.spec, spec);
+        fetched.spec.verify_key(&key).expect("fetched identity should match key");
+        assert!(fetched.spec.verify_key(&RepositoryKey("wrong".to_string())).is_err());
+
+        let replacement = RepositorySpec::remote("https://github.com/flotilla-org/other").expect("replacement spec");
+        let update = repositories
+            .update(&InputMeta::builder().name(key.to_string()).build(), &fetched.metadata.resource_version, &replacement)
+            .await;
+        assert!(update.expect_err("repository identity must be immutable").to_string().contains("immutable"));
+    }
 }
 
 #[test]
@@ -30,6 +41,7 @@ fn remote_less_worktrees_converge_on_host_and_git_common_directory() {
 #[test]
 fn repository_declarations_reject_unresolved_aliases_and_inconsistent_forges() {
     assert!(RepositorySpec::remote("work-github:flotilla-org/flotilla.git").is_err());
+    assert!(RepositorySpec::remote("git@github.com:flotilla-org/flotilla.git").is_err());
 
     let inconsistent = serde_json::json!({
         "identity": { "kind": "remote", "canonical_remote": "https://github.com/flotilla-org/flotilla" },
