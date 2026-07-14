@@ -1,0 +1,81 @@
+// Daily-driver layout: zellij + andamento + the flotilla manifest connector.
+//
+// This is the composed layout the PM-capability daily driver runs
+// (flotilla-org/flotilla#708). It is derived from andamento's own
+// layouts/andamento.kdl — which deliberately stays flotilla-free (the
+// git-watcher is the manifest architecture's independence proof) — plus one
+// pane running `flotilla pm connect`, the catalog half of the connector.
+//
+// Launch via scripts/run-daily-driver.sh, which sets the env vars used
+// below: ANDAMENTO_ROOT, FLOTILLA_BIN.
+
+plugins {
+    andamento-controller location="file:$ANDAMENTO_ROOT/target/wasm32-wasip1/release/andamento-controller.wasm" {
+        rail_structure "joined-cells"
+        rail_sizing "active-large"
+        rail_grouping "directory"
+        rail_segment_between_color "#282c34"
+        template_config_path "file:$ANDAMENTO_ROOT/templates/andamento-git.kdl"
+        grouping_config_path "file:$ANDAMENTO_ROOT/templates/andamento-git.kdl"
+    }
+    andamento-rail location="file:$ANDAMENTO_ROOT/target/wasm32-wasip1/release/andamento-rail.wasm" {
+        controller_plugin_url "andamento-controller"
+        config_plugin_url "andamento-config"
+        rail_placement "left"
+    }
+    andamento-config location="file:$ANDAMENTO_ROOT/target/wasm32-wasip1/release/andamento-config.wasm"
+}
+
+load_plugins {
+    andamento-controller
+}
+
+layout {
+    default_tab_template {
+        pane split_direction="vertical" {
+            pane size="23%" borderless=true {
+                plugin location="andamento-rail"
+            }
+            children
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    new_tab_template {
+        pane split_direction="vertical" {
+            pane size="23%" borderless=true {
+                plugin location="andamento-rail"
+            }
+            pane
+        }
+        pane size=2 borderless=true {
+            plugin location="status-bar"
+        }
+    }
+
+    tab name="main" {
+        pane split_direction="vertical" {
+            pane
+            pane split_direction="horizontal" {
+                pane size="40%" {
+                    plugin location="andamento-config" {
+                        close_on_hidden "false"
+                    }
+                }
+                pane command="$ANDAMENTO_ROOT/scripts/andamento-git-watcher.py" cwd="$ANDAMENTO_ROOT" {
+                    args "--interval" "5"
+                }
+                // The manifest metadata-patch connector: subscribes to the
+                // local daemon's named queries and publishes the catalog
+                // (projects/convoys/vessels, live + latent, badges) into
+                // andamento's metadata plane. Recipes it mints reference
+                // $FLOTILLA_BIN so activation works from fresh panes.
+                pane command="$FLOTILLA_BIN" {
+                    args "pm" "connect" "--flotilla-bin" "$FLOTILLA_BIN"
+                }
+            }
+        }
+    }
+}
