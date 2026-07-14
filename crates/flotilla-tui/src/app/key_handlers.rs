@@ -5,6 +5,7 @@ use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedS
 use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
+    table_view::TableIntent,
     widgets::InteractiveWidget,
 };
 
@@ -366,16 +367,20 @@ impl App {
         }
     }
 
-    pub(super) fn execute_table_intent(&mut self, intent: crate::table_view::TableIntent) {
+    pub(super) fn execute_table_intent(&mut self, intent: TableIntent) {
         let (mut command, host) = match intent {
-            crate::table_view::TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
+            TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
                 let Some(repo_identity) = self.table_action_repo(repo_hint.as_ref()) else {
                     self.set_status_message(Some("Cannot attach workspace: the convoy does not identify a tracked repository".to_string()));
                     return;
                 };
                 (self.repo_command_for_identity(repo_identity, CommandAction::SelectWorkspace { ws_ref: workspace_ref }), host)
             }
-            crate::table_view::TableIntent::ForceCompleteWork { convoy, vessel, host } => {
+            TableIntent::AttachPane { reference, host } => {
+                self.proto_commands.push(self.command(CommandAction::AttachTransient { reference, host: Some(host) }));
+                return;
+            }
+            TableIntent::ForceCompleteWork { convoy, vessel, host } => {
                 (self.command(CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }), host)
             }
         };

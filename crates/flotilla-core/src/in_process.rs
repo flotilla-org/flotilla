@@ -272,6 +272,9 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>)
 
 fn fleet_row_attach_reference_keys(row: &FleetListRow) -> Vec<String> {
     let mut refs = vec![row.convoy.clone(), row.vessel.clone(), row.crew.clone()];
+    if let Some(session) = &row.session {
+        refs.push(session.clone());
+    }
     if row.crew != "-" {
         refs.push(format!("{}/{}", row.convoy, row.crew));
         if let Some((_task, role)) = row.crew.rsplit_once('/') {
@@ -297,10 +300,10 @@ enum AttachTarget {
 }
 
 impl AttachTarget {
-    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<ResolvedAttach, String> {
+    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str, transient: bool) -> Result<ResolvedAttach, String> {
         match self {
             Self::Local(session) => {
-                let (command, host) = daemon.attach_command_for_session(reference, session).await?;
+                let (command, host) = daemon.attach_command_for_session(reference, session, transient).await?;
                 let labels = &session.metadata.labels;
                 let binding = AttachBinding::builder()
                     .host(host)
@@ -313,13 +316,13 @@ impl AttachTarget {
                 Ok(ResolvedAttach { command, binding: Some(binding) })
             }
             Self::Replica { row } => {
-                let command = daemon.recursive_attach_command_for_remote(&row.host, reference).await?;
+                let command = daemon.recursive_attach_command_for_remote(&row.host, reference, transient).await?;
                 // Replica rows carry crew as "vessel/role" (or a bare role)
                 // and the owning host's namespace + session name, so
                 // cross-host panes stamp the full join key.
                 let (vessel, role) = match row.crew.split_once('/') {
                     Some((vessel, role)) => (Some(vessel.to_owned()), Some(role.to_owned())),
-                    None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty())),
+                    None => (None, Some(row.crew.clone()).filter(|role| !role.is_empty() && role != "-")),
                 };
                 let binding = AttachBinding::builder()
                     .host(row.host.clone())
@@ -338,6 +341,7 @@ impl AttachTarget {
 struct AttachCandidate {
     label: String,
     references: Vec<String>,
+    host: HostName,
     target: AttachTarget,
 }
 
@@ -357,12 +361,18 @@ impl AttachCandidateIndex {
         Self { candidates, exact }
     }
 
-    async fn resolve(&self, daemon: &InProcessDaemon, reference: &str) -> Result<ResolvedAttach, String> {
+    async fn resolve(
+        &self,
+        daemon: &InProcessDaemon,
+        reference: &str,
+        host: Option<&HostName>,
+        transient: bool,
+    ) -> Result<ResolvedAttach, String> {
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
 
-        let matches = self.exact.get(reference).cloned().unwrap_or_else(|| {
+        let mut matches = self.exact.get(reference).cloned().unwrap_or_else(|| {
             self.candidates
                 .iter()
                 .enumerate()
@@ -370,9 +380,15 @@ impl AttachCandidateIndex {
                 .map(|(index, _)| index)
                 .collect()
         });
+        if let Some(host) = host {
+            matches.retain(|index| &self.candidates[*index].host == host);
+        }
         match matches.as_slice() {
-            [] => Err(format!("no attach target matching '{reference}'")),
-            [index] => self.candidates[*index].target.resolve(daemon, reference).await,
+            [] => match host {
+                Some(host) => Err(format!("no attach target matching '{reference}' on host '{host}'")),
+                None => Err(format!("no attach target matching '{reference}'")),
+            },
+            [index] => self.candidates[*index].target.resolve(daemon, reference, transient).await,
             _ => {
                 let mut labels: Vec<_> = matches.iter().map(|index| self.candidates[*index].label.clone()).collect();
                 labels.sort();
@@ -2903,7 +2919,19 @@ impl InProcessDaemon {
             return Err("attach reference is required".to_string());
         }
         let index = self.attach_candidate_index().await?;
-        index.resolve(self, reference).await
+        index.resolve(self, reference, None, false).await
+    }
+
+    pub async fn resolve_transient_attach_command_internal(
+        &self,
+        reference: &str,
+        host: Option<&HostName>,
+    ) -> Result<ResolvedAttach, String> {
+        if reference.trim().is_empty() {
+            return Err("attach reference is required".to_string());
+        }
+        let index = self.attach_candidate_index().await?;
+        index.resolve(self, reference, host, true).await
     }
 
     pub async fn resolvable_attach_references_internal(&self, references: &[String]) -> Result<HashSet<String>, String> {
@@ -2913,7 +2941,7 @@ impl InProcessDaemon {
         let index = self.attach_candidate_index().await?;
         let mut resolved = HashSet::new();
         for reference in references {
-            if index.resolve(self, reference).await.is_ok() {
+            if index.resolve(self, reference, Some(&self.host_name), false).await.is_ok() {
                 resolved.insert(reference.clone());
             }
         }
@@ -2944,6 +2972,7 @@ impl InProcessDaemon {
             candidates.push(AttachCandidate {
                 label: attach_reference_label(&session.metadata.name, &session.metadata.labels),
                 references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
+                host: self.host_name.clone(),
                 target: AttachTarget::Local(Box::new(session)),
             });
         }
@@ -2956,15 +2985,55 @@ impl InProcessDaemon {
         let cache = self.fleet_replica_cache.read().await;
         for host in configured_replica_hosts {
             if let Some(entry) = cache.get(&host) {
+                let independent_references = entry
+                    .result_sets
+                    .iter()
+                    .filter_map(|result_set| result_set.rows.as_independents())
+                    .flatten()
+                    .filter_map(|row| row.attach.as_deref())
+                    .collect::<HashSet<_>>();
+                let mut indexed_sessions = HashSet::new();
                 for row in &entry.rows {
                     if row.crew_state != "running" {
                         continue;
                     }
+                    if let Some(session) = &row.session {
+                        if independent_references.contains(session.as_str()) {
+                            continue;
+                        }
+                        indexed_sessions.insert(session.clone());
+                    }
                     candidates.push(AttachCandidate {
                         label: fleet_row_attach_reference_label(row),
                         references: fleet_row_attach_reference_keys(row),
+                        host: row.host.clone(),
                         target: AttachTarget::Replica { row: Box::new(row.clone()) },
                     });
+                }
+                for result_set in &entry.result_sets {
+                    let Rows::Independents(rows) = &result_set.rows else { continue };
+                    for row in rows {
+                        let Some(reference) = &row.attach else { continue };
+                        if row.phase != flotilla_protocol::SessionPhase::Running || !indexed_sessions.insert(reference.clone()) {
+                            continue;
+                        }
+                        let fleet_row = FleetListRow::builder()
+                            .convoy("-")
+                            .vessel("-")
+                            .crew("-")
+                            .crew_state("running")
+                            .host(host.clone())
+                            .namespace(row.resource.namespace.clone())
+                            .session(reference.clone())
+                            .staleness(FleetStaleness::Local)
+                            .build();
+                        candidates.push(AttachCandidate {
+                            label: format!("{} ({host})", row.name),
+                            references: vec![reference.clone()],
+                            host: host.clone(),
+                            target: AttachTarget::Replica { row: Box::new(fleet_row) },
+                        });
+                    }
                 }
             }
         }
@@ -2978,6 +3047,7 @@ impl InProcessDaemon {
         &self,
         reference: &str,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+        transient: bool,
     ) -> Result<(String, HostName), String> {
         let namespace = self.provisioning_namespace().await;
         let environments = self.resource_backend.clone().using::<ResourceEnvironment>(&namespace);
@@ -2994,7 +3064,7 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("environment {} has no host binding", session.spec.env_ref))?;
         let target_host = self.target_host_for_resource_ref(host_ref);
         if target_host != self.host_name {
-            let command = self.recursive_attach_command_for_remote(&target_host, reference).await?;
+            let command = self.recursive_attach_command_for_remote(&target_host, reference, transient).await?;
             return Ok((command, target_host));
         }
 
@@ -3002,18 +3072,26 @@ impl InProcessDaemon {
         Ok((command, self.host_name.clone()))
     }
 
-    async fn recursive_attach_command_for_remote(&self, target_host: &HostName, reference: &str) -> Result<String, String> {
+    async fn recursive_attach_command_for_remote(
+        &self,
+        target_host: &HostName,
+        reference: &str,
+        transient: bool,
+    ) -> Result<String, String> {
         let next_hop = self.host_registry.next_hop_host_for_target_host(target_host).await?.unwrap_or_else(|| target_host.clone());
         if next_hop == self.host_name {
             return Err(format!("unreachable next hop for host '{target_host}': route points back to local host"));
         }
 
         let resolver = ssh_resolver_from_config(self.config.base_path())?;
-        let command = vec![
-            flotilla_protocol::arg::Arg::Literal("flotilla".to_string()),
-            flotilla_protocol::arg::Arg::Literal("attach".to_string()),
-            flotilla_protocol::arg::Arg::Quoted(reference.to_string()),
-        ];
+        let mut command =
+            vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
+        if transient {
+            command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
+            command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
+            command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
+        }
+        command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
         let args = resolver
             .one_hop_command_args(&next_hop, command)
             .map_err(|err| format!("unreachable next hop '{next_hop}' for host '{target_host}': {err}"))?;
@@ -3905,6 +3983,14 @@ impl DaemonHandle for InProcessDaemon {
                 }
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
+            CommandAction::AttachTransient { reference, host } => {
+                match self.resolve_transient_attach_command_internal(reference, host.as_ref()).await {
+                    Ok(resolved) => {
+                        Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command: resolved.command, binding: resolved.binding })
+                    }
+                    Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+                }
+            }
             CommandAction::QueryIssues { repo, params, page, count } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
                 let service = self.get_issue_query_service(&repo_path).await?;

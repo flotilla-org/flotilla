@@ -19,6 +19,24 @@ use crate::widgets::{branch_input::BranchInputWidget, delete_confirm::DeleteConf
 pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>) {
     app.model.status_message = None;
 
+    // Pane attach is a synchronous query that resolves a command for the TUI
+    // process to run temporarily outside raw mode. It must not go through the
+    // ordinary command lifecycle (`execute` rejects query commands).
+    if matches!(&cmd.action, CommandAction::Attach { .. } | CommandAction::AttachTransient { .. }) {
+        match app.daemon.execute_query(cmd, app.session_id).await {
+            Ok(CommandValue::AttachCommandResolved { command, .. }) => {
+                app.pending_attach_command = Some(command);
+            }
+            Ok(CommandValue::Error { message }) | Err(message) => {
+                app.model.status_message = Some(message);
+            }
+            Ok(other) => {
+                app.model.status_message = Some(format!("unexpected attach response: {other:?}"));
+            }
+        }
+        return;
+    }
+
     // Route issue query commands through the background query path.
     if let CommandAction::QueryIssues { repo, params, page, count } = cmd.action {
         let repo_identity = match repo {
@@ -173,7 +191,27 @@ mod tests {
     };
 
     use super::*;
-    use crate::app::{test_support::stub_app, ui_state::BranchInputKind};
+    use crate::app::{
+        test_support::{stub_app, stub_app_with_query_result},
+        ui_state::BranchInputKind,
+    };
+
+    #[tokio::test]
+    async fn pane_attach_query_hands_the_resolved_command_to_the_event_loop() {
+        let mut app = stub_app_with_query_result(Ok(CommandValue::AttachCommandResolved {
+            command: "cleat attach terminal-scratch".to_string(),
+            binding: None,
+        }));
+        let command = app.command(CommandAction::AttachTransient {
+            reference: "terminal-scratch".to_string(),
+            host: Some(flotilla_protocol::HostName::new("kiwi")),
+        });
+
+        dispatch(command, &mut app, None).await;
+
+        assert_eq!(app.pending_attach_command.as_deref(), Some("cleat attach terminal-scratch"));
+        assert!(app.model.status_message.is_none());
+    }
 
     #[test]
     fn terminal_prepared_does_not_queue_follow_up_workspace_command() {

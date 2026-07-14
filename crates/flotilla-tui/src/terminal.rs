@@ -11,6 +11,41 @@ pub fn restore_terminal() {
     ratatui::restore();
 }
 
+fn reinitialize_terminal() -> ratatui::DefaultTerminal {
+    use crossterm::event::EnableMouseCapture;
+
+    let terminal = ratatui::init();
+    if let Err(error) = execute!(stdout(), EnableMouseCapture) {
+        tracing::warn!(%error, "failed to re-enable mouse capture");
+    }
+    terminal
+}
+
+/// Temporarily leave the TUI to inspect a terminal session, then restore it.
+///
+/// This deliberately does not stamp Presentation Manager metadata: the pane
+/// remains owned by its existing project/archipelago context while the attach
+/// is only a transient foreground excursion.
+pub fn run_temporary_attach(command: &str) -> (ratatui::DefaultTerminal, Result<(), String>) {
+    restore_terminal();
+    let result = std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(command)
+        .status()
+        .map_err(|error| format!("could not start attach command: {error}"))
+        .and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "attach command exited with status {}",
+                    status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
+                ))
+            }
+        });
+    (reinitialize_terminal(), result)
+}
+
 /// Install a panic hook that restores the terminal before printing the panic.
 ///
 /// Must be called after `ratatui::init()`. Wraps whatever hook is currently
@@ -49,8 +84,6 @@ pub fn install_sigterm_handler() {
 /// their existing terminal binding with this value.
 #[cfg(unix)]
 pub fn suspend_and_resume() -> ratatui::DefaultTerminal {
-    use crossterm::{event::EnableMouseCapture, execute};
-
     restore_terminal();
     // SAFETY: kill(0, SIGTSTP) sends the signal to the entire process group.
     // The process suspends at this point and resumes on SIGCONT.
@@ -59,9 +92,5 @@ pub fn suspend_and_resume() -> ratatui::DefaultTerminal {
         tracing::warn!(err = %std::io::Error::last_os_error(), "SIGTSTP delivery failed");
     }
     // Resumed — re-initialise terminal
-    let terminal = ratatui::init();
-    if let Err(e) = execute!(stdout(), EnableMouseCapture) {
-        tracing::warn!(err = %e, "failed to re-enable mouse capture after resume");
-    }
-    terminal
+    reinitialize_terminal()
 }

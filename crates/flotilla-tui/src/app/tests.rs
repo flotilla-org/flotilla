@@ -1575,6 +1575,36 @@ fn result_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>
     }))
 }
 
+fn independent_row(name: &str, attach: Option<&str>) -> flotilla_protocol::IndependentRow {
+    flotilla_protocol::IndependentRow::builder()
+        .resource(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", name))
+        .name(name)
+        .repo(flotilla_protocol::RepoKey("flotilla-org/flotilla".to_string()))
+        .host(HostName::local())
+        .maybe_attach(attach.map(ToString::to_string))
+        .phase(flotilla_protocol::SessionPhase::Running)
+        .build()
+}
+
+fn independent_result_set(seq: u64, rows: Vec<flotilla_protocol::IndependentRow>) -> flotilla_protocol::DaemonEvent {
+    flotilla_protocol::DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq,
+        rows: flotilla_protocol::Rows::Independents(rows),
+    }))
+}
+
+fn independent_delta(
+    seq: u64,
+    changed: Vec<flotilla_protocol::IndependentRow>,
+    removed: Vec<flotilla_protocol::ResourceRef>,
+) -> flotilla_protocol::DaemonEvent {
+    flotilla_protocol::DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
+        seq,
+        changed: flotilla_protocol::Rows::Independents(changed),
+        removed,
+    }))
+}
+
 fn test_convoy(
     namespace: &str,
     name: &str,
@@ -1665,6 +1695,27 @@ fn app_applies_panel_delta() {
         removed: vec![convoy.id.clone()],
     })));
     assert!(app.namespaces["flotilla"].convoys.is_empty());
+}
+
+#[test]
+fn app_applies_independent_sets_and_removal_deltas_without_disturbing_convoys() {
+    let mut app = stub_app();
+    let convoy = test_convoy("flotilla", "x", crate::convoy_model::ConvoyPhase::Active, false);
+    app.handle_daemon_event(result_set_event(Box::new(crate::convoy_model::ConvoyFixtureSnapshot {
+        seq: 1,
+        namespace: "flotilla".into(),
+        convoys: vec![convoy],
+    })));
+    let independent = independent_row("terminal-scratch", Some("terminal-scratch"));
+    let reference = independent.resource.clone();
+
+    app.handle_daemon_event(independent_result_set(4, vec![independent]));
+
+    assert_eq!(app.namespaces["flotilla"].independents.len(), 1);
+    assert_eq!(app.namespaces["flotilla"].convoys.len(), 1, "query snapshots replace only their own family");
+    app.handle_daemon_event(independent_delta(5, vec![], vec![reference]));
+    assert!(app.namespaces["flotilla"].independents.is_empty());
+    assert_eq!(app.namespaces["flotilla"].convoys.len(), 1);
 }
 
 // -- Convoys tab rendering --
@@ -1758,12 +1809,12 @@ fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::con
 fn selected_table_name(app: &App) -> Option<String> {
     let address = app.views.active_address()?;
     let name_column = match address {
-        ViewAddress::Convoys { .. } | ViewAddress::Project { .. } => 0,
+        ViewAddress::Convoys { .. } | ViewAddress::Independents | ViewAddress::Project { .. } => 0,
         ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
         ViewAddress::Overview | ViewAddress::Repo(_) => return None,
     };
-    let convoys = app.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();
-    let view = crate::table_view::project(address, &convoys).ok()?;
+    let rows = crate::app::table_rows(&app.namespaces);
+    let view = crate::table_view::project(address, &rows).ok()?;
     app.views.active_table_state().selected_row(&view).map(|row| row.cells[name_column].text.clone())
 }
 
@@ -1830,6 +1881,25 @@ fn generated_vessel_actions_execute_attach_and_force_complete() {
             if convoy == "alpha" && work == "implement"
     ));
     assert_eq!(complete.context_repo, None, "force-complete remains a context-free command");
+}
+
+#[test]
+fn independent_view_subscribes_and_generates_a_pane_attach_query() {
+    let mut app = stub_app();
+    app.open_view(ViewAddress::Independents);
+    app.handle_daemon_event(independent_result_set(7, vec![independent_row("terminal-scratch", Some("terminal-scratch"))]));
+
+    assert!(app.query_cursors().iter().any(|cursor| cursor.query == flotilla_protocol::QueryId::Independents && cursor.since == Some(7)));
+
+    app.handle_key(key(KeyCode::Char('.')));
+    assert_eq!(selected_table_name(&app).as_deref(), Some("terminal-scratch"));
+    app.handle_key(key(KeyCode::Enter));
+    let command = app.proto_commands.take_next().expect("attach query").0;
+    assert!(matches!(
+        command.action,
+        CommandAction::AttachTransient { ref reference, host: Some(ref host) }
+            if reference == "terminal-scratch" && host == &HostName::local()
+    ));
 }
 
 #[test]

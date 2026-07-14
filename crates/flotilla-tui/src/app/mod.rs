@@ -24,8 +24,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, ViewAddress,
-    WorkItem, WorkItemIdentity,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus,
+    ViewAddress, WorkItem, WorkItemIdentity,
 };
 use indexmap::IndexMap;
 pub use intent::Intent;
@@ -276,7 +276,15 @@ pub type NamespaceMap = HashMap<String, NamespaceModel>;
 #[derive(Default)]
 pub struct NamespaceModel {
     pub convoys: IndexMap<crate::convoy_model::ConvoyId, crate::convoy_model::ConvoySummary>,
+    pub independents: IndexMap<ResourceRef, flotilla_protocol::IndependentRow>,
     pub last_seq: u64,
+}
+
+pub fn table_rows(namespaces: &NamespaceMap) -> crate::table_view::TableRows<'_> {
+    crate::table_view::TableRows {
+        convoys: namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect(),
+        independents: namespaces.values().flat_map(|namespace| namespace.independents.values()).collect(),
+    }
 }
 
 /// A command that has been dispatched to the daemon and is awaiting completion.
@@ -385,6 +393,9 @@ pub struct App {
     /// Set when the open-view set changed and the daemon subscription no
     /// longer matches it. The event loop re-subscribes and clears this.
     pub subscriptions_dirty: bool,
+    /// A resolved pane attach waiting for the event loop to leave raw mode,
+    /// run it as a child process, and then restore the TUI.
+    pub pending_attach_command: Option<String>,
 }
 
 impl App {
@@ -453,6 +464,7 @@ impl App {
             pending_repo_opens: Vec::new(),
             query_seqs: HashMap::new(),
             subscriptions_dirty: true,
+            pending_attach_command: None,
         }
     }
 
@@ -1198,31 +1210,58 @@ impl App {
             }
             DaemonEvent::ResultSet(result_set) => {
                 self.query_seqs.insert(result_set.query(), result_set.seq);
-                let Some(rows) = result_set.rows.as_convoys() else { return };
-                self.namespaces.clear();
-                for row in rows {
-                    let convoy = ConvoySummary::from(row);
-                    let namespace = convoy.namespace.clone();
-                    let entry = self.namespaces.entry(namespace.clone()).or_default();
-                    entry.convoys.insert(convoy.id.clone(), convoy);
-                    entry.last_seq = result_set.seq;
+                match &result_set.rows {
+                    flotilla_protocol::Rows::Convoys(rows) => {
+                        for namespace in self.namespaces.values_mut() {
+                            namespace.convoys.clear();
+                        }
+                        for row in rows {
+                            let convoy = ConvoySummary::from(row);
+                            let namespace = convoy.namespace.clone();
+                            let entry = self.namespaces.entry(namespace).or_default();
+                            entry.convoys.insert(convoy.id.clone(), convoy);
+                            entry.last_seq = result_set.seq;
+                        }
+                    }
+                    flotilla_protocol::Rows::Independents(rows) => {
+                        for namespace in self.namespaces.values_mut() {
+                            namespace.independents.clear();
+                        }
+                        for row in rows {
+                            let entry = self.namespaces.entry(row.resource.namespace.clone()).or_default();
+                            entry.independents.insert(row.resource.clone(), row.clone());
+                        }
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
                 self.query_seqs.insert(delta.query(), delta.seq);
-                let Some(changed) = delta.changed.as_convoys() else { return };
-                for row in changed {
-                    let convoy = ConvoySummary::from(row);
-                    let namespace = convoy.namespace.clone();
-                    let entry = self.namespaces.entry(namespace.clone()).or_default();
-                    entry.convoys.insert(convoy.id.clone(), convoy);
-                    entry.last_seq = delta.seq;
-                }
-                for removed in &delta.removed {
-                    let namespace = removed.namespace.clone();
-                    if let Some(entry) = self.namespaces.get_mut(&namespace) {
-                        entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
-                        entry.last_seq = delta.seq;
+                match &delta.changed {
+                    flotilla_protocol::Rows::Convoys(changed) => {
+                        for row in changed {
+                            let convoy = ConvoySummary::from(row);
+                            let namespace = convoy.namespace.clone();
+                            let entry = self.namespaces.entry(namespace).or_default();
+                            entry.convoys.insert(convoy.id.clone(), convoy);
+                            entry.last_seq = delta.seq;
+                        }
+                        for removed in &delta.removed {
+                            if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
+                                entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
+                                entry.last_seq = delta.seq;
+                            }
+                        }
+                    }
+                    flotilla_protocol::Rows::Independents(changed) => {
+                        for row in changed {
+                            let entry = self.namespaces.entry(row.resource.namespace.clone()).or_default();
+                            entry.independents.insert(row.resource.clone(), row.clone());
+                        }
+                        for removed in &delta.removed {
+                            if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
+                                entry.independents.shift_remove(removed);
+                            }
+                        }
                     }
                 }
             }

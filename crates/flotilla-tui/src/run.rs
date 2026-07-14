@@ -130,6 +130,15 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         while let Some((cmd, pending_ctx)) = app.proto_commands.take_next() {
             app::executor::dispatch(cmd, &mut app, pending_ctx).await;
         }
+        if let Some(command) = app.pending_attach_command.take() {
+            events.pause_terminal_input().await;
+            let (next_terminal, result) = crate::terminal::run_temporary_attach(&command);
+            terminal = next_terminal;
+            events.resume_terminal_input();
+            if let Err(message) = result {
+                app.model.status_message = Some(message);
+            }
+        }
         app.drain_background_updates();
 
         // ── Re-sync query subscriptions after tab-set changes ──

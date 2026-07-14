@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, QueryId, ResultSet, Rows},
+    result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, IndependentRow, QueryId, ResultSet, Rows, SessionPhase},
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent,
     EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, QueryCursor, RepoSelector, ResourceRef,
     SystemInfo, ToolInventory, TopologyRoute,
@@ -1285,6 +1285,94 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
     assert!(command.starts_with("ssh -t 'alice@feta.local' "), "bare role should resolve through the replica host: {command}");
     assert!(command.contains("flotilla attach"), "bare role should recursively invoke flotilla attach: {command}");
     assert!(command.contains("coder"), "command should preserve the original bare role reference: {command}");
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::Attach { reference: "terminal-remote-coder".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command, .. } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "session name should resolve through the replica host: {command}");
+    assert!(command.contains("terminal-remote-coder"), "command should preserve the independent row's attach reference: {command}");
+}
+
+#[tokio::test]
+async fn transient_attach_selects_the_displayed_host_for_result_set_only_independents() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice")), ("gouda", "gouda.local", None)]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    for host in ["feta", "gouda"] {
+        let host_name = HostName::new(host);
+        let row = IndependentRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "dev", "terminal-scratch").on_host(host_name.clone()))
+            .name("terminal-scratch")
+            .host(host_name.clone())
+            .attach("terminal-scratch")
+            .phase(SessionPhase::Running)
+            .build();
+        let fleet_rows = (host == "feta")
+            .then(|| {
+                FleetListRow::builder()
+                    .convoy("-")
+                    .vessel("remote-environment")
+                    .crew("shell")
+                    .crew_state("running")
+                    .host(HostName::new("environment-host"))
+                    .namespace("dev")
+                    .session("terminal-scratch")
+                    .staleness(FleetStaleness::Local)
+                    .build()
+            })
+            .into_iter()
+            .collect();
+        daemon.fleet_replica_cache.write().await.insert(host_name, FleetReplicaCacheEntry {
+            rows: fleet_rows,
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]) }],
+            last_sync: Some(Utc::now()),
+            generation: Some(format!("gen-{host}")),
+            last_error: None,
+        });
+    }
+
+    let result = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient { reference: "terminal-scratch".to_string(), host: Some(HostName::new("feta")) },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("transient attach query should execute");
+
+    let CommandValue::AttachCommandResolved { command, binding } = result else {
+        panic!("expected attach command, got {result:?}");
+    };
+    let binding = binding.expect("replica resolution carries a structured binding");
+    assert_eq!(binding.host, HostName::new("feta"));
+    assert_eq!(binding.session.as_deref(), Some("terminal-scratch"));
+    assert_eq!(binding.convoy, None);
+    assert_eq!(binding.role, None);
+    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "selected row should route through feta: {command}");
+    assert!(command.contains("--transient"), "recursive attach must preserve the no-stamp mode: {command}");
+    assert!(command.contains("--host"), "recursive attach must preserve the owning host: {command}");
+    assert!(!command.contains("gouda.local"), "same-named row on another host must not make selection ambiguous: {command}");
 }
 
 #[tokio::test]

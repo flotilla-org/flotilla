@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flotilla_protocol::{HostName, RepoKey, ViewAddress};
+use flotilla_protocol::{HostName, IndependentRow, RepoKey, SessionPhase, ViewAddress};
 
 use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
 
@@ -192,6 +192,7 @@ pub struct DetailField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableIntent {
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
+    AttachPane { reference: String, host: HostName },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
 }
 
@@ -237,14 +238,35 @@ struct VesselProjection {
     vessel: VesselSummary,
 }
 
-pub fn project(address: &ViewAddress, convoys: &[&ConvoySummary]) -> Result<TableView, String> {
+/// Typed query rows currently available to the table registry. Surfaces build
+/// this once from their query caches; adding a query family grows this input
+/// without teaching the reusable widget about that family.
+#[derive(Default)]
+pub struct TableRows<'a> {
+    pub convoys: Vec<&'a ConvoySummary>,
+    pub independents: Vec<&'a IndependentRow>,
+}
+
+pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
     match address {
         ViewAddress::Convoys { namespace } => {
-            let rows = convoys.iter().copied().filter(|convoy| &convoy.namespace == namespace).cloned();
+            let rows = data.convoys.iter().copied().filter(|convoy| &convoy.namespace == namespace).cloned();
             Ok(convoy_spec().project(format!("Convoys · {namespace}"), rows))
         }
+        ViewAddress::Independents => {
+            let mut rows = data.independents.clone();
+            rows.sort_by(|left, right| {
+                (&left.name, left.host.as_str(), &left.resource.namespace).cmp(&(
+                    &right.name,
+                    right.host.as_str(),
+                    &right.resource.namespace,
+                ))
+            });
+            Ok(independent_spec().project("Independents".to_string(), rows.into_iter().cloned()))
+        }
         ViewAddress::Project { namespace, name } => {
-            let rows = convoys
+            let rows = data
+                .convoys
                 .iter()
                 .copied()
                 .filter(|convoy| &convoy.namespace == namespace && convoy.project_ref.as_deref() == Some(name))
@@ -252,7 +274,7 @@ pub fn project(address: &ViewAddress, convoys: &[&ConvoySummary]) -> Result<Tabl
             Ok(convoy_spec().project(format!("Project · {name}"), rows))
         }
         ViewAddress::Convoy { namespace, name } => {
-            let convoy = find_convoy(convoys, namespace, name)?;
+            let convoy = find_convoy(&data.convoys, namespace, name)?;
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
                 namespace: namespace.clone(),
                 convoy: name.clone(),
@@ -262,7 +284,7 @@ pub fn project(address: &ViewAddress, convoys: &[&ConvoySummary]) -> Result<Tabl
             Ok(vessel_spec().project(format!("Convoy · {name}"), rows))
         }
         ViewAddress::Vessel { namespace, convoy, vessel } => {
-            let convoy_row = find_convoy(convoys, namespace, convoy)?;
+            let convoy_row = find_convoy(&data.convoys, namespace, convoy)?;
             let vessel_row = convoy_row
                 .vessels
                 .iter()
@@ -323,6 +345,14 @@ fn vessel_spec() -> TableSpec<VesselProjection> {
         columns: &VESSEL_COLUMNS,
         actions: &VESSEL_ACTIONS,
         row: RowSpec { id: vessel_id, drill: vessel_drill, describe: vessel_description },
+    }
+}
+
+fn independent_spec() -> TableSpec<IndependentRow> {
+    TableSpec {
+        columns: &INDEPENDENT_COLUMNS,
+        actions: &INDEPENDENT_ACTIONS,
+        row: RowSpec { id: independent_id, drill: |_| None, describe: independent_description },
     }
 }
 
@@ -405,6 +435,47 @@ static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 2] =
         key: 'x',
         resolve: force_complete_vessel,
     }];
+
+static INDEPENDENT_COLUMNS: [ColumnSpec<IndependentRow>; 5] = [
+    ColumnSpec {
+        id: "name",
+        label: "NAME",
+        width: WidthHint::Flexible { minimum: 14, weight: 2 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(&row.name),
+    },
+    ColumnSpec {
+        id: "repo",
+        label: "REPO",
+        width: WidthHint::Flexible { minimum: 14, weight: 2 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(row.repo.as_ref().map(|repo| repo.0.as_str()).unwrap_or("—")),
+    },
+    ColumnSpec {
+        id: "host",
+        label: "HOST",
+        width: WidthHint::Flexible { minimum: 8, weight: 1 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(row.host.to_string()),
+    },
+    ColumnSpec { id: "phase", label: "PHASE", width: WidthHint::Fixed(9), alignment: Alignment::Left, extract: independent_phase },
+    ColumnSpec {
+        id: "attach",
+        label: "ATTACH",
+        width: WidthHint::Fixed(11),
+        alignment: Alignment::Left,
+        extract: |row| {
+            if row.attach.is_some() {
+                CellValue::toned("available", CellTone::Success)
+            } else {
+                CellValue::toned("unavailable", CellTone::Muted)
+            }
+        },
+    },
+];
+
+static INDEPENDENT_ACTIONS: [ActionSpec<IndependentRow>; 1] =
+    [ActionSpec { id: "attach", label: "Attach temporarily", key: 'a', resolve: attach_independent }];
 
 fn convoy_id(row: &ConvoySummary) -> RowId {
     RowId::new(row.id.as_str())
@@ -500,10 +571,45 @@ fn force_complete_vessel(row: &VesselProjection) -> Option<TableIntent> {
     Some(TableIntent::ForceCompleteWork { convoy: target.convoy.clone(), vessel: target.vessel.clone(), host: target.host.clone() })
 }
 
+fn independent_id(row: &IndependentRow) -> RowId {
+    RowId::new(format!("{}/{}/{}/{}@{}", row.resource.api_version, row.resource.kind, row.resource.namespace, row.resource.name, row.host))
+}
+
+fn independent_phase(row: &IndependentRow) -> CellValue {
+    let tone = match row.phase {
+        SessionPhase::Starting => CellTone::Warning,
+        SessionPhase::Running => CellTone::Success,
+        SessionPhase::Stopped => CellTone::Muted,
+        SessionPhase::Failed => CellTone::Error,
+    };
+    CellValue::toned(row.phase.to_string(), tone)
+}
+
+fn independent_description(row: &IndependentRow) -> Vec<DetailField> {
+    vec![
+        DetailField { label: "Namespace", value: row.resource.namespace.clone() },
+        DetailField { label: "Name", value: row.name.clone() },
+        DetailField { label: "Repository", value: row.repo.as_ref().map(|repo| repo.0.clone()).unwrap_or_else(|| "—".to_string()) },
+        DetailField { label: "Host", value: row.host.to_string() },
+        DetailField { label: "Phase", value: row.phase.to_string() },
+        DetailField { label: "Attach", value: if row.attach.is_some() { "available" } else { "unavailable" }.to_string() },
+    ]
+}
+
+fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
+    Some(TableIntent::AttachPane { reference: row.attach.clone()?, host: row.host.clone() })
+}
+
 #[cfg(test)]
 mod tests {
+    use flotilla_protocol::ResourceRef;
+
     use super::*;
     use crate::convoy_model::{ConvoyId, ProcessSummary, WorkCompletionTarget};
+
+    fn project_convoys(address: &str, convoys: &[&ConvoySummary]) -> Result<TableView, String> {
+        project(&address.parse().expect("valid address"), &TableRows { convoys: convoys.to_vec(), independents: vec![] })
+    }
 
     fn vessel(name: &str, depends_on: &[&str], phase: WorkPhase) -> VesselSummary {
         VesselSummary {
@@ -540,12 +646,23 @@ mod tests {
         }
     }
 
+    fn independent(name: &str, host: &str, attach: Option<&str>) -> IndependentRow {
+        IndependentRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "dev", name))
+            .name(name)
+            .repo(RepoKey("flotilla-org/flotilla".to_string()))
+            .host(HostName::new(host))
+            .maybe_attach(attach.map(ToString::to_string))
+            .phase(SessionPhase::Running)
+            .build()
+    }
+
     #[test]
     fn convoy_projection_exposes_honest_phase_message_and_drill_target() {
         let mut row = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
         row.phase = ConvoyPhase::Failed;
         row.message = Some("workspace launch failed: disk full".into());
-        let view = project(&"convoys/dev".parse().expect("valid address"), &[&row]).expect("project table");
+        let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
         assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec![
             "name", "workflow", "phase", "vessels", "scope", "message"
@@ -562,7 +679,7 @@ mod tests {
             vessel("docs", &[], WorkPhase::Ready),
             vessel("implement", &[], WorkPhase::Running),
         ]);
-        let view = project(&"convoy/dev/tables".parse().expect("valid address"), &[&row]).expect("project table");
+        let view = project_convoys("convoy/dev/tables", &[&row]).expect("project table");
 
         let names = view.rows.iter().map(|row| row.cells[1].text.as_str()).collect::<Vec<_>>();
         assert_eq!(names, vec!["docs", "implement", "review"]);
@@ -578,12 +695,10 @@ mod tests {
         elsewhere.name = "elsewhere".into();
         elsewhere.project_ref = Some("other".into());
 
-        let project_view =
-            project(&"project/dev/flotilla".parse().expect("valid address"), &[&in_project, &elsewhere]).expect("project table");
+        let project_view = project_convoys("project/dev/flotilla", &[&in_project, &elsewhere]).expect("project table");
         assert_eq!(project_view.rows.iter().map(|row| row.cells[0].text.as_str()).collect::<Vec<_>>(), vec!["tables"]);
 
-        let vessel =
-            project(&"vessel/dev/tables/review".parse().expect("valid address"), &[&in_project, &elsewhere]).expect("vessel table");
+        let vessel = project_convoys("vessel/dev/tables/review", &[&in_project, &elsewhere]).expect("vessel table");
         assert_eq!(vessel.rows.len(), 1);
         assert_eq!(vessel.rows[0].cells[1].text, "review");
     }
@@ -595,10 +710,28 @@ mod tests {
         actionable.completion_target =
             Some(WorkCompletionTarget { convoy: "tables".into(), vessel: "implement".into(), host: HostName::new("kiwi") });
         let row = convoy(vec![actionable, vessel("review", &["implement"], WorkPhase::Pending)]);
-        let view = project(&"convoy/dev/tables".parse().expect("valid address"), &[&row]).expect("project table");
+        let view = project_convoys("convoy/dev/tables", &[&row]).expect("project table");
 
         assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete"]);
         assert!(view.rows[1].actions.is_empty(), "unavailable actions must not render");
+    }
+
+    #[test]
+    fn independent_projection_has_typed_columns_and_truthful_attach_action() {
+        let available = independent("scratch", "kiwi", Some("terminal-scratch"));
+        let unavailable = independent("wedged", "feta", None);
+        let view = project(&ViewAddress::Independents, &TableRows { convoys: vec![], independents: vec![&unavailable, &available] })
+            .expect("independents table");
+
+        assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec!["name", "repo", "host", "phase", "attach"]);
+        assert_eq!(view.rows.iter().map(|row| row.cells[0].text.as_str()).collect::<Vec<_>>(), vec!["scratch", "wedged"]);
+        assert_eq!(view.rows[0].cells[4], CellValue::toned("available", CellTone::Success));
+        assert_eq!(view.rows[0].actions[0].intent, TableIntent::AttachPane {
+            reference: "terminal-scratch".to_string(),
+            host: HostName::new("kiwi")
+        });
+        assert_eq!(view.rows[1].cells[4], CellValue::toned("unavailable", CellTone::Muted));
+        assert!(view.rows[1].actions.is_empty(), "an unavailable attach must not render as an action");
     }
 
     #[test]
@@ -608,13 +741,13 @@ mod tests {
         second.id = ConvoyId::new("dev", "other");
         second.name = "other".into();
         let address = "convoys/dev".parse().expect("valid address");
-        let view = project(&address, &[&first, &second]).expect("project table");
+        let view = project(&address, &TableRows { convoys: vec![&first, &second], independents: vec![] }).expect("project table");
         let mut state = TableState::default();
         state.reconcile(&view);
         state.select_delta(&view, 1);
         assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other"));
 
-        let changed = project(&address, &[&first]).expect("project table");
+        let changed = project(&address, &TableRows { convoys: vec![&first], independents: vec![] }).expect("project table");
         state.reconcile(&changed);
         assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables"));
     }
@@ -629,7 +762,7 @@ mod tests {
             rows.push(row);
         }
         let refs = rows.iter().collect::<Vec<_>>();
-        let view = project(&"convoys/dev".parse().expect("valid address"), &refs).expect("project table");
+        let view = project_convoys("convoys/dev", &refs).expect("project table");
         let mut state = TableState::default();
         state.reconcile(&view);
         state.select_delta(&view, 3);
@@ -649,7 +782,7 @@ mod tests {
         let mut active = convoy(vec![]);
         active.id = ConvoyId::new("dev", "other");
         active.name = "other".into();
-        let view = project(&"convoys/dev".parse().expect("valid address"), &[&failed, &active]).expect("project table").filtered("DISK");
+        let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DISK");
 
         assert_eq!(view.rows.len(), 1);
         assert_eq!(view.rows[0].cells[0].text, "tables");

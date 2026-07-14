@@ -118,7 +118,11 @@ impl Screen {
         match &view.target {
             ViewTarget::View(ViewAddress::Overview) => ActivePage::Overview,
             ViewTarget::View(
-                ViewAddress::Convoys { .. } | ViewAddress::Project { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. },
+                ViewAddress::Convoys { .. }
+                | ViewAddress::Independents
+                | ViewAddress::Project { .. }
+                | ViewAddress::Convoy { .. }
+                | ViewAddress::Vessel { .. },
             ) => ActivePage::Table,
             ViewTarget::View(ViewAddress::Repo(identity)) => {
                 if repos.contains_key(identity) {
@@ -366,8 +370,8 @@ impl InteractiveWidget for Screen {
             ActivePage::Table => {
                 let address = ctx.views.active_address().cloned().expect("table page has a parsed address");
                 let filter = ctx.views.active_table_state().filter.clone();
-                let convoys = ctx.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();
-                match crate::table_view::project(&address, &convoys).map(|view| view.filtered(&filter)) {
+                let rows = crate::app::table_rows(ctx.namespaces);
+                match crate::table_view::project(&address, &rows).map(|view| view.filtered(&filter)) {
                     Ok(view) => {
                         let breadcrumbs =
                             ctx.views.active().breadcrumb_addresses().into_iter().map(ToString::to_string).collect::<Vec<_>>();
