@@ -1,17 +1,25 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     controller::{LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch, SecondaryWatch},
-    resolve_default_branch, Checkout, CheckoutSpec, Clone, DefaultBranchObservation, DefaultBranchProvenance, Environment,
-    LifecycleAuthority, Repository, RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch,
-    ResourceBackend, ResourceError, ResourceObject, TypedResolver, REPO_KEY_LABEL,
+    resolve_default_branch, Checkout, CheckoutSpec, Clone, DefaultBranchObservation, DefaultBranchProvenance, Environment, ForgeIdentity,
+    LifecycleAuthority, Repository, RepositoryCheckoutRef, RepositoryKey, RepositoryStatus, RepositoryStatusPatch, ResourceBackend,
+    ResourceError, ResourceObject, TypedResolver, REPO_KEY_LABEL,
 };
 
+#[async_trait]
+pub trait ForgeDefaultBranchResolver: Send + Sync {
+    async fn default_branch(&self, forge: &ForgeIdentity) -> Result<Option<String>, String>;
+}
+
+#[derive(bon::Builder)]
 pub struct RepositoryReconciler {
     checkout_sources: Vec<TypedResolver<Checkout>>,
     clones: TypedResolver<Clone>,
     environments: TypedResolver<Environment>,
+    forge_default_branch_resolver: Option<Arc<dyn ForgeDefaultBranchResolver>>,
 }
 
 impl RepositoryReconciler {
@@ -20,7 +28,13 @@ impl RepositoryReconciler {
             checkout_sources: vec![durable.clone().using::<Checkout>(namespace), observed.using::<Checkout>(namespace)],
             clones: durable.clone().using::<Clone>(namespace),
             environments: durable.using::<Environment>(namespace),
+            forge_default_branch_resolver: None,
         }
+    }
+
+    pub fn with_forge_default_branch_resolver(mut self, resolver: Arc<dyn ForgeDefaultBranchResolver>) -> Self {
+        self.forge_default_branch_resolver = Some(resolver);
+        self
     }
 
     pub fn secondary_watches(observed: ResourceBackend, namespace: &str) -> Vec<Box<dyn SecondaryWatch<Primary = Repository>>> {
@@ -68,6 +82,16 @@ impl Reconciler for RepositoryReconciler {
         obj.spec.verify_key(&repository_key).map_err(ResourceError::invalid)?;
         let mut status = RepositoryStatus::default();
 
+        if let (Some(forge), Some(resolver)) = (obj.spec.forge(), &self.forge_default_branch_resolver) {
+            match resolver.default_branch(forge).await {
+                Ok(Some(branch)) => {
+                    status.default_branch_observations.push(DefaultBranchObservation { branch, provenance: DefaultBranchProvenance::Forge })
+                }
+                Ok(None) => {}
+                Err(diagnostic) => status.diagnostics.push(format!("forge default branch observation failed: {diagnostic}")),
+            }
+        }
+
         for source in &self.checkout_sources {
             for checkout in source.list().await?.items {
                 if checkout.spec.repo_ref() != &repository_key {
@@ -80,19 +104,14 @@ impl Reconciler for RepositoryReconciler {
                         continue;
                     }
                 };
-                let kind = match &checkout.spec {
-                    CheckoutSpec::Observed(spec) => {
-                        if spec.is_main && matches!(spec.r#ref.as_str(), "main" | "master" | "trunk") {
-                            status.default_branch_observations.push(DefaultBranchObservation {
-                                branch: spec.r#ref.clone(),
-                                provenance: DefaultBranchProvenance::LocalTrunk,
-                            });
-                        }
-                        RepositoryCheckoutKind::Observed
+                if let CheckoutSpec::Observed(spec) = &checkout.spec {
+                    if spec.is_main && matches!(spec.r#ref.as_str(), "main" | "master" | "trunk") {
+                        status
+                            .default_branch_observations
+                            .push(DefaultBranchObservation { branch: spec.r#ref.clone(), provenance: DefaultBranchProvenance::LocalTrunk });
                     }
-                    CheckoutSpec::Worktree(_) => RepositoryCheckoutKind::Worktree,
-                    CheckoutSpec::FreshClone(_) => RepositoryCheckoutKind::FreshClone,
-                };
+                }
+                let kind = checkout.spec.repository_checkout_kind();
                 let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Managed);
                 status.checkouts_by_host.entry(host_ref).or_default().push(RepositoryCheckoutRef {
                     checkout_ref: checkout.metadata.name,

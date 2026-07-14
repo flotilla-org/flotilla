@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey};
+use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryCheckoutKind, RepositoryKey};
 
 define_resource!(Checkout, "checkouts", CheckoutSpec, CheckoutStatus, CheckoutStatusPatch);
 
@@ -36,9 +36,17 @@ impl CheckoutSpec {
             Self::Observed(spec) => &spec.repo_ref,
         }
     }
+
+    pub fn repository_checkout_kind(&self) -> RepositoryCheckoutKind {
+        match self {
+            Self::Worktree(_) => RepositoryCheckoutKind::Worktree,
+            Self::FreshClone(_) => RepositoryCheckoutKind::FreshClone,
+            Self::Observed(_) => RepositoryCheckoutKind::Observed,
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CheckoutWorktreeSpec {
     pub repo_ref: RepositoryKey,
     pub env_ref: String,
@@ -48,7 +56,7 @@ pub struct CheckoutWorktreeSpec {
     pub clone_ref: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct FreshCloneCheckoutSpec {
     pub repo_ref: RepositoryKey,
     pub env_ref: String,
@@ -58,7 +66,7 @@ pub struct FreshCloneCheckoutSpec {
     pub url: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ObservedCheckoutSpec {
     #[serde(rename = "ref")]
     pub r#ref: String,

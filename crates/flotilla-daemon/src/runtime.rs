@@ -29,11 +29,11 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Clone, CloneSpec, Convoy, ConvoyReconciler,
-    CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Repository, RepositoryKey, RepositorySpec, ResourceBackend,
-    ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    clone_key, controller::ControllerLoop, descriptive_repo_slug, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy,
+    PlacementPolicySpec, Presentation, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel,
+    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -299,28 +299,6 @@ async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace:
     Ok(())
 }
 
-async fn ensure_repository_exists(
-    backend: &ResourceBackend,
-    namespace: &str,
-    key: &RepositoryKey,
-    spec: &RepositorySpec,
-) -> Result<(), String> {
-    let repositories = backend.clone().using::<Repository>(namespace);
-    match repositories.create(&empty_meta(&key.to_string()), spec).await {
-        Ok(_) => Ok(()),
-        Err(ResourceError::Conflict { .. }) => {
-            let existing = repositories.get(&key.to_string()).await.map_err(|error| error.to_string())?;
-            existing.spec.verify_key(key)?;
-            if existing.spec == *spec {
-                Ok(())
-            } else {
-                Err(format!("repository key {key} already refers to a different canonical identity"))
-            }
-        }
-        Err(error) => Err(error.to_string()),
-    }
-}
-
 async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_name: &str) -> Result<(), String> {
     let hosts = backend.clone().using::<Host>(namespace);
     match hosts.get(host_name).await {
@@ -363,43 +341,33 @@ async fn discover_local_clones(
     namespace: &str,
     profile: &LocalProvisioningProfile,
 ) -> Result<(), String> {
-    let runner = daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
     let clones = backend.clone().using::<Clone>(namespace);
     let host_direct_env_ref = profile.host_direct_environment_name();
 
     for repo_path in daemon.tracked_repo_paths().await {
-        let repo_path_str = match repo_path.to_str() {
-            Some(path) => path,
-            None => {
-                warn!(path = %repo_path.display(), "skipping clone discovery for non-utf8 repo path");
-                continue;
-            }
-        };
-
-        let transport_url =
-            match runner.run("git", &["-C", repo_path_str, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await {
-                Ok(url) => url.trim().to_string(),
-                Err(err) => {
-                    warn!(path = %repo_path.display(), %err, "skipping clone discovery because origin remote is unavailable");
-                    continue;
-                }
-            };
-
-        let canonical_url = match canonicalize_repo_url(&transport_url) {
-            Ok(url) => url,
+        let inspection = match daemon.inspect_repository_path(&repo_path, None).await {
+            Ok(inspection) => inspection,
             Err(err) => {
-                warn!(path = %repo_path.display(), %err, "skipping clone discovery because canonical url resolution failed");
+                warn!(path = %repo_path.display(), %err, "skipping clone discovery because repository identity resolution failed");
                 continue;
             }
         };
-
-        let repository_spec = RepositorySpec::remote(&canonical_url).expect("already-canonical repository URL should remain valid");
+        let Some(transport_url) = inspection.transport_url else {
+            continue;
+        };
+        let canonical_url = match inspection.spec.identity() {
+            flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+            flotilla_resources::RepositoryIdentity::Local { .. } => continue,
+        };
+        let repository_spec = inspection.spec;
         let repository_key = repository_spec.key();
-        ensure_repository_exists(backend, namespace, &repository_key, &repository_spec).await?;
+        flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec)
+            .await
+            .map_err(|error| error.to_string())?;
         let repo_key_value = repository_key.to_string();
         let name = format!("clone-{}", clone_key(&canonical_url, &host_direct_env_ref));
         let expected_spec = CloneSpec {
-            repo_ref: repository_key,
+            repo_ref: repository_key.clone(),
             url: transport_url.clone(),
             env_ref: host_direct_env_ref.clone(),
             path: repo_path.display().to_string(),
@@ -416,14 +384,7 @@ async fn discover_local_clones(
                 if existing.metadata.deletion_timestamp.is_some() {
                     continue;
                 }
-                let existing_canonical = match canonicalize_repo_url(&existing.spec.url) {
-                    Ok(url) => url,
-                    Err(err) => {
-                        warn!(clone = %name, %err, "leaving discovered clone untouched because existing canonical url is invalid");
-                        continue;
-                    }
-                };
-                if existing_canonical != canonical_url || existing.spec.env_ref != host_direct_env_ref {
+                if existing.spec.repo_ref != repository_key || existing.spec.env_ref != host_direct_env_ref {
                     warn!(clone = %name, "leaving discovered clone untouched because the existing resource does not match the expected repo/env tuple");
                     continue;
                 }
@@ -1517,7 +1478,7 @@ mod tests {
         let clone_name = format!(
             "clone-{}",
             clone_key(
-                &canonicalize_repo_url("https://github.com/flotilla-org/flotilla.git").expect("canonical url"),
+                &flotilla_resources::canonicalize_repo_url("https://github.com/flotilla-org/flotilla.git").expect("canonical url"),
                 &format!("host-direct-{host_id}")
             )
         );

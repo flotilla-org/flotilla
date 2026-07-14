@@ -8,7 +8,7 @@ use flotilla_resources::{RepositoryKey, RepositorySpec};
 
 use crate::providers::{ChannelLabel, CommandRunner};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct LocalCheckoutInspection {
     pub path: PathBuf,
     pub host_ref: String,
@@ -20,6 +20,7 @@ pub struct LocalCheckoutInspection {
 pub struct RepositoryInspection {
     pub spec: RepositorySpec,
     pub checkout: LocalCheckoutInspection,
+    pub transport_url: Option<String>,
 }
 
 impl RepositoryInspection {
@@ -135,14 +136,14 @@ impl RepositoryInspector for GitRepositoryInspector {
         let branch = self.git(&top_level, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
         let git_ref = if branch == "HEAD" { self.git(&top_level, &["rev-parse", "HEAD"]).await? } else { branch.clone() };
         let selected_remote = self.selected_remote(&top_level, &branch, remote).await?;
-        let spec = match selected_remote {
-            Some(remote) => RepositorySpec::remote(self.canonical_remote(&top_level, &remote).await?)?,
+        let (spec, transport_url) = match selected_remote {
+            Some(remote) => (RepositorySpec::remote(self.canonical_remote(&top_level, &remote).await?)?, Some(remote)),
             None => {
                 let common_dir = PathBuf::from(self.git(&top_level, &["rev-parse", "--git-common-dir"]).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
                 let common_dir = std::fs::canonicalize(&common_dir)
                     .map_err(|error| format!("git common directory {} cannot be resolved: {error}", common_dir.display()))?;
-                RepositorySpec::local(&self.host_ref, common_dir.to_string_lossy())?
+                (RepositorySpec::local(&self.host_ref, common_dir.to_string_lossy())?, None)
             }
         };
         Ok(RepositoryInspection {
@@ -153,6 +154,7 @@ impl RepositoryInspector for GitRepositoryInspector {
                 git_ref: git_ref.clone(),
                 is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
             },
+            transport_url,
         })
     }
 }
@@ -204,8 +206,8 @@ mod tests {
         let inspected = inspector.inspect_path(&root, None).await.expect("inspection should succeed");
 
         assert!(matches!(
-            inspected.spec.identity,
-            RepositoryIdentity::Remote { ref canonical_remote } if canonical_remote == "https://github.com/org/repo"
+            inspected.spec.identity(),
+            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
         ));
     }
 
@@ -286,8 +288,8 @@ mod tests {
         let inspected = inspector.inspect_path(&root, None).await.expect("same identity should be unambiguous");
 
         assert!(matches!(
-            inspected.spec.identity,
-            RepositoryIdentity::Remote { ref canonical_remote } if canonical_remote == "https://github.com/org/repo"
+            inspected.spec.identity(),
+            RepositoryIdentity::Remote { canonical_remote } if canonical_remote == "https://github.com/org/repo"
         ));
     }
 }

@@ -26,6 +26,11 @@ spec:
             spec:
               type: object
               required: [identity]
+              x-kubernetes-validations:
+                - rule: "self.identity == oldSelf.identity"
+                  message: "repository identity is immutable after creation"
+                - rule: "self.forge == oldSelf.forge"
+                  message: "repository forge is immutable and identity-derived"
               properties:
                 identity:
                   type: object

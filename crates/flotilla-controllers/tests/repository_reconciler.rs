@@ -1,14 +1,26 @@
 mod common;
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use common::meta;
-use flotilla_controllers::reconcilers::RepositoryReconciler;
+use flotilla_controllers::reconcilers::{ForgeDefaultBranchResolver, RepositoryReconciler};
 use flotilla_resources::{
     controller::Reconciler, Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, CloneStatus, Environment,
-    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec, Repository,
-    RepositoryCheckoutKind, RepositorySpec, ResourceBackend,
+    EnvironmentSpec, ForgeIdentity, FreshCloneCheckoutSpec, HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec,
+    Repository, RepositoryCheckoutKind, RepositorySpec, ResourceBackend,
 };
 
 const NAMESPACE: &str = "flotilla";
+
+struct FixedForgeDefaultBranch(&'static str);
+
+#[async_trait]
+impl ForgeDefaultBranchResolver for FixedForgeDefaultBranch {
+    async fn default_branch(&self, _forge: &ForgeIdentity) -> Result<Option<String>, String> {
+        Ok(Some(self.0.to_string()))
+    }
+}
 
 #[tokio::test]
 async fn repository_status_groups_typed_checkout_associations_by_explicit_host() {
@@ -95,7 +107,8 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
         .await
         .expect("clone status");
 
-    let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE);
+    let reconciler = RepositoryReconciler::new(durable, observed, NAMESPACE)
+        .with_forge_default_branch_resolver(Arc::new(FixedForgeDefaultBranch("stable")));
     let status = reconciler.fetch_dependencies(&repository).await.expect("status projection");
 
     assert_eq!(status.checkouts_by_host["host-a"][0].checkout_ref, "managed-worktree");
@@ -103,7 +116,7 @@ async fn repository_status_groups_typed_checkout_associations_by_explicit_host()
     assert_eq!(status.checkouts_by_host["host-a"][1].kind, RepositoryCheckoutKind::FreshClone);
     assert_eq!(status.checkouts_by_host["host-b"][0].checkout_ref, "observed-main");
     assert_eq!(status.checkouts_by_host["host-b"][0].authority, LifecycleAuthority::Observed);
-    assert_eq!(status.default_branch.as_deref(), Some("main"), "remote symbolic HEAD outranks local trunk");
+    assert_eq!(status.default_branch.as_deref(), Some("stable"), "forge metadata outranks remote symbolic HEAD and local trunk");
     assert!(!status.diagnostics.is_empty(), "branch disagreement should be retained as a diagnostic");
 }
 

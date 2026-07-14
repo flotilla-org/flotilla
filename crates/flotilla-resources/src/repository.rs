@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, LifecycleAuthority};
+use crate::{
+    resource::define_resource, status_patch::StatusPatch, InputMeta, LifecycleAuthority, ResourceError, ResourceObject, TypedResolver,
+};
 
 define_resource!(Repository, "repositories", RepositorySpec, RepositoryStatus, RepositoryStatusPatch);
 
@@ -40,16 +42,20 @@ pub struct ForgeIdentity {
     pub repository: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepositorySpec {
-    pub identity: RepositoryIdentity,
+    identity: RepositoryIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forge: Option<ForgeIdentity>,
+    forge: Option<ForgeIdentity>,
 }
 
 impl RepositorySpec {
-    pub fn remote(canonical_remote: impl Into<String>) -> Result<Self, String> {
-        let canonical_remote = crate::canonicalize_repo_url(&canonical_remote.into())?;
+    pub fn remote(remote: impl Into<String>) -> Result<Self, String> {
+        let remote = remote.into();
+        if let Some(alias) = unresolved_ssh_alias(&remote) {
+            return Err(format!("unrecognised remote host alias `{alias}`; resolve SSH host configuration before creating RepositorySpec"));
+        }
+        let canonical_remote = crate::canonicalize_repo_url(&remote)?;
         let forge = forge_from_canonical_remote(&canonical_remote)?;
         Ok(Self { identity: RepositoryIdentity::Remote { canonical_remote }, forge: Some(forge) })
     }
@@ -70,6 +76,14 @@ impl RepositorySpec {
 
     pub fn key(&self) -> RepositoryKey {
         RepositoryKey::from_identity(&self.identity)
+    }
+
+    pub fn identity(&self) -> &RepositoryIdentity {
+        &self.identity
+    }
+
+    pub fn forge(&self) -> Option<&ForgeIdentity> {
+        self.forge.as_ref()
     }
 
     pub fn verify_key(&self, key: &RepositoryKey) -> Result<(), String> {
@@ -93,6 +107,71 @@ impl RepositorySpec {
                 .unwrap_or("repository")
                 .to_ascii_lowercase(),
         }
+    }
+
+    pub fn matches_catalog_target(&self, target: &str) -> bool {
+        if self.leaf_slug() == target {
+            return true;
+        }
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => {
+                self.forge.as_ref().is_some_and(|forge| forge.repository == target)
+                    || crate::descriptive_repo_slug(canonical_remote) == target
+            }
+            RepositoryIdentity::Local { .. } => false,
+        }
+    }
+
+    pub fn catalog_slug(&self) -> String {
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => crate::descriptive_repo_slug(canonical_remote),
+            RepositoryIdentity::Local { .. } => self.leaf_slug(),
+        }
+    }
+}
+
+pub async fn ensure_repository(
+    repositories: &TypedResolver<Repository>,
+    key: &RepositoryKey,
+    spec: &RepositorySpec,
+) -> Result<ResourceObject<Repository>, ResourceError> {
+    let repository = match repositories.create(&InputMeta::builder().name(key.to_string()).build(), spec).await {
+        Ok(created) => created,
+        Err(ResourceError::Conflict { .. }) => repositories.get(&key.to_string()).await?,
+        Err(error) => return Err(error),
+    };
+    repository.spec.verify_key(key).map_err(ResourceError::invalid)?;
+    if repository.spec != *spec {
+        return Err(ResourceError::invalid(format!("repository key {key} already refers to a different canonical identity")));
+    }
+    Ok(repository)
+}
+
+impl<'de> Deserialize<'de> for RepositorySpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct StoredRepositorySpec {
+            identity: RepositoryIdentity,
+            #[serde(default)]
+            forge: Option<ForgeIdentity>,
+        }
+
+        let stored = StoredRepositorySpec::deserialize(deserializer)?;
+        let normalized = match &stored.identity {
+            RepositoryIdentity::Remote { canonical_remote } => RepositorySpec::remote(canonical_remote),
+            RepositoryIdentity::Local { host_ref, git_common_dir } => RepositorySpec::local(host_ref, git_common_dir),
+        }
+        .map_err(serde::de::Error::custom)?;
+        if normalized.identity != stored.identity {
+            return Err(serde::de::Error::custom("repository identity is not canonical"));
+        }
+        if normalized.forge != stored.forge {
+            return Err(serde::de::Error::custom("repository forge must be the identity-derived forge"));
+        }
+        Ok(normalized)
     }
 }
 
@@ -125,7 +204,7 @@ pub struct RepositoryCheckoutRef {
     pub authority: LifecycleAuthority,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct RepositoryStatus {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkouts_by_host: BTreeMap<String, Vec<RepositoryCheckoutRef>>,
@@ -205,4 +284,20 @@ fn identity_description(identity: &RepositoryIdentity) -> String {
         RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
         RepositoryIdentity::Local { host_ref, git_common_dir } => format!("{host_ref}:{git_common_dir}"),
     }
+}
+
+fn unresolved_ssh_alias(remote: &str) -> Option<&str> {
+    let host = if let Some(rest) = remote.strip_prefix("ssh://") {
+        let authority = rest.split('/').next()?;
+        authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+    } else if remote.contains("://") {
+        return None;
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        if path.is_empty() {
+            return None;
+        }
+        authority.rsplit_once('@').map_or(authority, |(_, host)| host)
+    };
+    (!host.contains('.')).then_some(host)
 }

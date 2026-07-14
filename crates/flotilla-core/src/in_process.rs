@@ -66,7 +66,7 @@ use crate::{
     },
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
-    repository_inspection::{GitRepositoryInspector, RepositoryInspector},
+    repository_inspection::{GitRepositoryInspector, RepositoryInspection, RepositoryInspector},
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
@@ -521,47 +521,30 @@ fn adopted_checkout_name(convoy_name: &str) -> String {
     format!("adopted-checkout-{convoy_name}")
 }
 
-async fn git_stdout(runner: &dyn CommandRunner, checkout_path: &Path, args: &[&str], description: &str) -> Result<String, String> {
-    runner
-        .run("git", args, checkout_path, &ChannelLabel::Noop)
-        .await
-        .map(|stdout| stdout.trim().to_string())
-        .map_err(|err| format!("{description} for {}: {err}", checkout_path.display()))
-}
-
-async fn infer_adopted_checkout_ref(runner: &dyn CommandRunner, checkout_path: &Path) -> Result<String, String> {
-    let branch = git_stdout(runner, checkout_path, &["rev-parse", "--abbrev-ref", "HEAD"], "failed to read checkout ref").await?;
-    if branch != "HEAD" {
-        return Ok(branch);
-    }
-    git_stdout(runner, checkout_path, &["rev-parse", "HEAD"], "failed to read checkout commit").await
+#[derive(bon::Builder)]
+struct AdoptedCheckoutRequest<'a> {
+    namespace: &'a str,
+    convoy_name: &'a str,
+    checkout_path: &'a Path,
+    repository_spec: &'a RepositorySpec,
+    repository_url: &'a str,
+    git_ref: &'a str,
+    host_ref: &'a str,
 }
 
 async fn create_adopted_checkout_resource(
     backend: &ResourceBackend,
-    namespace: &str,
-    convoy_name: &str,
-    checkout_path: &Path,
-    repository_url: Option<&String>,
-    git_ref: Option<&String>,
-    runner: &dyn CommandRunner,
-    host_ref: &str,
+    request: AdoptedCheckoutRequest<'_>,
 ) -> Result<(String, String, String), String> {
+    let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, repository_url, git_ref, host_ref } = request;
     let path = std::fs::canonicalize(checkout_path)
         .map_err(|err| format!("adopted checkout path {} cannot be resolved: {err}", checkout_path.display()))?;
     let path_str = path.to_string_lossy().to_string();
-    let repo_url = match repository_url {
-        Some(url) => url.clone(),
-        None => git_stdout(runner, &path, &["config", "--get", "remote.origin.url"], "failed to read origin URL").await?,
-    };
-    let git_ref = match git_ref {
-        Some(git_ref) => git_ref.clone(),
-        None => infer_adopted_checkout_ref(runner, &path).await?,
-    };
     let checkout_ref = adopted_checkout_name(convoy_name);
-    let repository_spec = RepositorySpec::remote(&repo_url)?;
     let repository_key = repository_spec.key();
-    ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec).await?;
+    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
+        .await
+        .map_err(|error| error.to_string())?;
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let meta = InputMeta::builder()
         .name(checkout_ref.clone())
@@ -569,11 +552,11 @@ async fn create_adopted_checkout_resource(
         .build()
         .with_lifecycle_authority(LifecycleAuthority::Adopted);
     let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-        r#ref: git_ref.clone(),
+        r#ref: git_ref.to_string(),
         path: path_str.clone(),
         repo_ref: repository_key,
         host_ref: host_ref.to_string(),
-        is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
+        is_main: matches!(git_ref, "main" | "master" | "trunk"),
     });
 
     let checkout = match checkouts.create(&meta, &spec).await {
@@ -600,7 +583,7 @@ async fn create_adopted_checkout_resource(
         .await
         .map_err(|err| err.to_string())?;
 
-    Ok((checkout_ref, repo_url, git_ref))
+    Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
 }
 
 async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str) -> Option<String> {
@@ -984,6 +967,10 @@ pub struct InProcessDaemon {
     // repos/repo_order; add_repo intentionally takes it last while already
     // holding those write locks.
     path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
+    /// Repository identity last projected for each local tracked path.
+    /// Mutated under `observed_checkout_reconciliation` so removal deletes
+    /// observations using the identity that originally created them.
+    repository_keys_by_path: RwLock<HashMap<PathBuf, RepositoryKey>>,
     host_registry: crate::host_registry::HostRegistry,
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
@@ -1130,6 +1117,7 @@ impl InProcessDaemon {
             peer_providers: RwLock::new(HashMap::new()),
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
+            repository_keys_by_path: RwLock::new(HashMap::new()),
             host_registry: crate::host_registry::HostRegistry::new(
                 NodeInfo::new(local_node_id.clone(), host_name.to_string()),
                 local_host_summary,
@@ -1209,6 +1197,36 @@ impl InProcessDaemon {
         let runner = self.local_command_runner().ok_or_else(|| "local repository inspector is unavailable".to_string())?;
         let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?;
         Ok(Arc::new(GitRepositoryInspector::new(runner, host_ref.to_string())))
+    }
+
+    pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        self.repository_inspector().await?.inspect_path(path, remote).await
+    }
+
+    async fn inspect_adopted_checkout(
+        &self,
+        path: &Path,
+        repository_url: Option<&str>,
+        git_ref: Option<&str>,
+    ) -> Result<RepositoryInspection, String> {
+        if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
+            if let Ok(spec) = RepositorySpec::remote(repository_url) {
+                let path = std::fs::canonicalize(path)
+                    .map_err(|error| format!("adopted checkout path {} cannot be resolved: {error}", path.display()))?;
+                let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
+                return Ok(RepositoryInspection {
+                    spec,
+                    checkout: crate::repository_inspection::LocalCheckoutInspection {
+                        path,
+                        host_ref,
+                        git_ref: git_ref.to_string(),
+                        is_main: matches!(git_ref, "main" | "master" | "trunk"),
+                    },
+                    transport_url: Some(repository_url.to_string()),
+                });
+            }
+        }
+        self.inspect_repository_path(path, repository_url).await
     }
 
     pub fn local_environment_bag(&self) -> Option<EnvironmentBag> {
@@ -1821,15 +1839,44 @@ impl InProcessDaemon {
                 warn!(repo = %identity.path, "skipping observed checkout reconciliation after checkout discovery failed");
                 continue;
             }
-            let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-            let has_local_root = self.repos.read().await.get(identity).is_some_and(|state| !state.local_paths().is_empty());
-            if !has_local_root {
+            let local_root = self.repos.read().await.get(identity).and_then(|state| state.local_paths().into_iter().next());
+            let Some(local_root) = local_root else {
                 continue;
+            };
+            let inspection = match self.inspect_repository_path(&local_root, None).await {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    warn!(repo = %identity.path, %error, "failed to resolve repository identity for observed checkouts");
+                    continue;
+                }
+            };
+            let repository_key = inspection.key();
+            if let Err(error) = flotilla_resources::ensure_repository(
+                &self.resource_backend.clone().using::<Repository>(&namespace),
+                &repository_key,
+                &inspection.spec,
+            )
+            .await
+            {
+                warn!(repo = %identity.path, %error, "failed to ensure repository for observed checkouts");
+                continue;
+            }
+            let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+            let local_paths = self.repos.read().await.get(identity).map(RepoState::local_paths).unwrap_or_default();
+            if !local_paths.contains(&local_root) {
+                continue;
+            }
+            {
+                let mut keys_by_path = self.repository_keys_by_path.write().await;
+                for path in local_paths {
+                    keys_by_path.insert(path, repository_key.clone());
+                }
             }
             if let Err(error) = crate::observed_resources::reconcile_checkouts(
                 &self.observed_resource_backend,
                 &namespace,
-                identity,
+                &repository_key,
+                &inspection.spec.catalog_slug(),
                 local_providers,
                 &self.local_host_id().expect("local host id is established at daemon construction").to_string(),
             )
@@ -2099,37 +2146,7 @@ impl InProcessDaemon {
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`
 /// type by the daemon server peer-overlay code and by the `execute()` implementation.
 fn repository_matches_target(repository: &ResourceObject<Repository>, target: &str) -> bool {
-    if repository.metadata.name == target || repository.spec.leaf_slug() == target {
-        return true;
-    }
-    match &repository.spec.identity {
-        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => {
-            repository.spec.forge.as_ref().is_some_and(|forge| forge.repository == target)
-                || flotilla_resources::descriptive_repo_slug(canonical_remote) == target
-        }
-        flotilla_resources::RepositoryIdentity::Local { .. } => false,
-    }
-}
-
-async fn ensure_repository(
-    repositories: &flotilla_resources::TypedResolver<Repository>,
-    key: &RepositoryKey,
-    spec: &RepositorySpec,
-) -> Result<(), String> {
-    let meta = InputMeta::builder().name(key.to_string()).build();
-    match repositories.create(&meta, spec).await {
-        Ok(created) => created.spec.verify_key(key),
-        Err(ResourceError::Conflict { .. }) => {
-            let existing = repositories.get(&key.to_string()).await.map_err(|error| error.to_string())?;
-            existing.spec.verify_key(key)?;
-            if existing.spec == *spec {
-                Ok(())
-            } else {
-                Err(format!("repository key {key} already refers to a different canonical identity"))
-            }
-        }
-        Err(error) => Err(error.to_string()),
-    }
+    repository.metadata.name == target || repository.spec.matches_catalog_target(target)
 }
 
 async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
@@ -2158,6 +2175,24 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
         return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
     }
     Ok(normalized)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectTargetSyntax {
+    ExplicitPath,
+    QualifiedSlug,
+    Ambiguous,
+}
+
+fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
+    let path = Path::new(target);
+    if path.is_absolute() || target.starts_with("./") || target.starts_with("../") {
+        ProjectTargetSyntax::ExplicitPath
+    } else if target.contains('/') {
+        ProjectTargetSyntax::QualifiedSlug
+    } else {
+        ProjectTargetSyntax::Ambiguous
+    }
 }
 
 impl InProcessDaemon {
@@ -2202,8 +2237,10 @@ impl InProcessDaemon {
         let namespace = self.provisioning_namespace().await;
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let target_path = Path::new(target);
-        let path_is_explicit = target_path.is_absolute();
-        let path_candidate = if target_path.exists() {
+        let target_syntax = project_target_syntax(target);
+        let path_is_explicit = target_syntax == ProjectTargetSyntax::ExplicitPath;
+        let qualified_slug = target_syntax == ProjectTargetSyntax::QualifiedSlug;
+        let path_candidate = if !qualified_slug && target_path.exists() {
             Some(self.repository_inspector().await?.inspect_path(target_path, remote).await?)
         } else if path_is_explicit {
             return Err(format!("repository path {} does not exist", target_path.display()));
@@ -2252,7 +2289,7 @@ impl InProcessDaemon {
             (None, None) => return Err(format!("`{target}` is neither a repository path nor a repository catalog slug")),
         };
 
-        ensure_repository(&repositories, &key, &repository_spec).await?;
+        flotilla_resources::ensure_repository(&repositories, &key, &repository_spec).await.map_err(|error| error.to_string())?;
         if let Some(checkout) = checkout {
             self.ensure_project_checkout(&namespace, &key, &repository_spec, checkout).await?;
         }
@@ -2316,7 +2353,7 @@ impl InProcessDaemon {
             .name(checkout_name.clone())
             .labels(BTreeMap::from([
                 (REPO_KEY_LABEL.to_string(), repository_key.to_string()),
-                (REPO_LABEL.to_string(), repository_spec.leaf_slug()),
+                (REPO_LABEL.to_string(), repository_spec.catalog_slug()),
             ]))
             .build()
             .with_lifecycle_authority(LifecycleAuthority::Observed);
@@ -2495,6 +2532,10 @@ impl InProcessDaemon {
         let path = path.to_path_buf();
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
         let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
+        let repository_key = match self.repository_keys_by_path.read().await.get(&path).cloned() {
+            Some(key) => Some(key),
+            None => self.inspect_repository_path(&path, None).await.ok().map(|inspection| inspection.key()),
+        };
 
         let mut removed_identity = false;
         let removed_final_local_root;
@@ -2526,6 +2567,7 @@ impl InProcessDaemon {
 
         // Remove from identity map and peer overlay
         self.path_identities.write().await.remove(&path);
+        self.repository_keys_by_path.write().await.remove(&path);
         if removed_identity {
             let mut pp = self.peer_providers.write().await;
             pp.remove(&repo_identity);
@@ -2535,10 +2577,14 @@ impl InProcessDaemon {
 
         if removed_final_local_root {
             let namespace = self.provisioning_namespace().await;
-            if let Err(error) =
-                crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, &repo_identity).await
-            {
-                warn!(repo = %repo_identity.path, %error, "failed to delete observed checkouts for untracked repo");
+            if let Some(repository_key) = repository_key {
+                if let Err(error) =
+                    crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, &repository_key).await
+                {
+                    warn!(repo = %repo_identity.path, %error, "failed to delete observed checkouts for untracked repo");
+                }
+            } else {
+                warn!(repo = %repo_identity.path, "could not resolve repository identity while deleting observed checkouts");
             }
         }
         drop(observed_reconciliation);
@@ -3651,19 +3697,30 @@ impl InProcessDaemon {
             let mut repository_url = repository_url.clone();
             let mut r#ref = r#ref.clone();
             let adopted_checkout_ref = match adopted_checkout {
-                Some(path) => match self.local_command_runner() {
-                    Some(runner) => match create_adopted_checkout_resource(
-                        &self.resource_backend,
-                        &namespace,
-                        name,
-                        path.as_ref(),
-                        repository_url.as_ref(),
-                        r#ref.as_ref(),
-                        runner.as_ref(),
-                        &self.local_host_id().expect("local host id is established at daemon construction").to_string(),
-                    )
-                    .await
-                    {
+                Some(path) => {
+                    let adopted_result = async {
+                        let inspection = self.inspect_adopted_checkout(path.as_ref(), repository_url.as_deref(), r#ref.as_deref()).await?;
+                        let transport_url = inspection
+                            .transport_url
+                            .as_deref()
+                            .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
+                        let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
+                        create_adopted_checkout_resource(
+                            &self.resource_backend,
+                            AdoptedCheckoutRequest::builder()
+                                .namespace(&namespace)
+                                .convoy_name(name)
+                                .checkout_path(&inspection.checkout.path)
+                                .repository_spec(&inspection.spec)
+                                .repository_url(transport_url)
+                                .git_ref(git_ref)
+                                .host_ref(&inspection.checkout.host_ref)
+                                .build(),
+                        )
+                        .await
+                    }
+                    .await;
+                    match adopted_result {
                         Ok((checkout_ref, inferred_repository_url, inferred_ref)) => {
                             repository_url.get_or_insert(inferred_repository_url);
                             r#ref.get_or_insert(inferred_ref);
@@ -3680,19 +3737,8 @@ impl InProcessDaemon {
                             });
                             return Ok(id);
                         }
-                    },
-                    None => {
-                        let result = flotilla_protocol::CommandValue::Error { message: "local command runner unavailable".to_string() };
-                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                            command_id: id,
-                            node_id: self.node_id.clone(),
-                            repo_identity: empty_identity,
-                            repo: None,
-                            result,
-                        });
-                        return Ok(id);
                     }
-                },
+                }
                 None => None,
             };
             let spec = ConvoySpec {

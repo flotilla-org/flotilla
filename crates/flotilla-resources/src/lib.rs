@@ -54,8 +54,9 @@ pub use presentation::{Presentation, PresentationPhase, PresentationSpec, Presen
 pub use project::{normalize_project_spec, IssueSource, Project, ProjectRepositorySpec, ProjectSpec};
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use repository::{
-    resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository, RepositoryCheckoutKind,
-    RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus, RepositoryStatusPatch,
+    ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,
+    RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,
+    RepositoryStatusPatch,
 };
 pub use resource::{
     api_version, ApiPaths, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, K8sWatchEvent, ObjectMeta,

@@ -66,6 +66,7 @@ impl RepositoryInspector for FixedInspector {
                 git_ref: "main".to_string(),
                 is_main: true,
             },
+            transport_url: None,
         })
     }
 }

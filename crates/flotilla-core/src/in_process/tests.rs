@@ -43,6 +43,14 @@ use crate::{
     },
 };
 
+#[test]
+fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
+    assert_eq!(project_target_syntax("/srv/repos/example"), ProjectTargetSyntax::ExplicitPath);
+    assert_eq!(project_target_syntax("./org/repo"), ProjectTargetSyntax::ExplicitPath);
+    assert_eq!(project_target_syntax("org/repo"), ProjectTargetSyntax::QualifiedSlug);
+    assert_eq!(project_target_syntax("repo"), ProjectTargetSyntax::Ambiguous);
+}
+
 fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Option<&str>) -> ConvoyRow {
     ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name))

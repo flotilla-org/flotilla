@@ -24,7 +24,18 @@ fn remote_less_worktrees_converge_on_host_and_git_common_directory() {
     let second = RepositorySpec::local("host-01", "/srv/repos/flotilla/.git").expect("local identity");
 
     assert_eq!(first.key(), second.key());
-    assert!(matches!(first.identity, RepositoryIdentity::Local { .. }));
+    assert!(matches!(first.identity(), RepositoryIdentity::Local { .. }));
+}
+
+#[test]
+fn repository_declarations_reject_unresolved_aliases_and_inconsistent_forges() {
+    assert!(RepositorySpec::remote("work-github:flotilla-org/flotilla.git").is_err());
+
+    let inconsistent = serde_json::json!({
+        "identity": { "kind": "remote", "canonical_remote": "https://github.com/flotilla-org/flotilla" },
+        "forge": { "service_url": "https://gitlab.com", "repository": "other/repo" }
+    });
+    assert!(serde_json::from_value::<RepositorySpec>(inconsistent).is_err());
 }
 
 #[test]
