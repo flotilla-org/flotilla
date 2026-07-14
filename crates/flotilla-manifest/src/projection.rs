@@ -1,7 +1,7 @@
 //! The catalog projection: query result-set rows in, metadata patches out.
 //!
 //! Pure functions — no I/O, no clock. The connector loop feeds it the
-//! fleet-merged `convoys` and `sessions` rows and sends what comes back.
+//! fleet-merged `convoys` and `independents` rows and sends what comes back.
 //!
 //! Truthfulness rules (design §7 on flotilla-org/flotilla#667):
 //! - every path is published honestly; the PM's resolver decides
@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_protocol::result_set::{ConvoyPhase, ConvoyRow, SessionPhase, SessionRow, VesselRow, WorkPhase};
+use flotilla_protocol::result_set::{ConvoyPhase, ConvoyRow, IndependentRow, SessionPhase, VesselRow, WorkPhase};
 
 use crate::{
     keys::{
@@ -28,7 +28,7 @@ use crate::{
 /// The rows the catalog is projected from.
 pub struct CatalogInput<'a> {
     pub convoys: &'a [ConvoyRow],
-    pub sessions: &'a [SessionRow],
+    pub independents: &'a [IndependentRow],
 }
 
 /// A normalized badge: the frozen `status.state` vocabulary plus whether
@@ -162,8 +162,8 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     for convoy in input.convoys {
         project_convoy(&mut catalog, convoy, mint);
     }
-    for session in input.sessions {
-        project_session(&mut catalog, session, mint);
+    for independent in input.independents {
+        project_independent(&mut catalog, independent, mint);
     }
     catalog
 }
@@ -289,9 +289,9 @@ fn project_vessel(
     catalog.assert_facts(MetadataTarget::Group(path), facts, ordinal);
 }
 
-fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn RecipeMint) {
-    let namespace = &session.resource.namespace;
-    let project = project_segment(None, session.repo.as_ref().map(|repo| repo.0.as_str()));
+fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint: &dyn RecipeMint) {
+    let namespace = &independent.resource.namespace;
+    let project = project_segment(None, independent.repo.as_ref().map(|repo| repo.0.as_str()));
     let mut path = Vec::new();
     if let Some(segment) = &project {
         assert_project_group(catalog, segment);
@@ -302,18 +302,18 @@ fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn Recip
     // ordering semantics are gap §9.6 for the Leg-1 freeze).
     let ordinal = project.is_none().then_some(ARCHIPELAGO_ORDINAL);
 
-    path.push(GroupSegment::text(SEGMENT_VESSEL, session.name.clone()));
+    path.push(GroupSegment::text(SEGMENT_VESSEL, independent.name.clone()));
     let group_path = GroupPath(path);
-    let badge = session_badge(session.phase);
+    let badge = session_badge(independent.phase);
     let mut facts = vec![
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
-        (KEY_VESSEL_HOST, MetadataValue::text(session.host.to_string())),
-        (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:sessions/{namespace}/{}", session.name))),
+        (KEY_VESSEL_HOST, MetadataValue::text(independent.host.to_string())),
+        (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:independents/{namespace}/{}", independent.name))),
     ];
     if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
-    if let Some(recipe) = session.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
+    if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
         facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("pane")));
         facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
     }
@@ -322,7 +322,7 @@ fn project_session(catalog: &mut Catalog, session: &SessionRow, mint: &dyn Recip
     // The identity half of the pane → identity → group join: `flotilla
     // attach` stamps this identity on the pane; the scope fact published
     // here resolves the pane into its group.
-    let identity_value = format!("{}/{namespace}/{}", session.host, session.name);
+    let identity_value = format!("{}/{namespace}/{}", independent.host, independent.name);
     catalog.assert_facts(
         MetadataTarget::Identity(MetadataIdentity { key: KEY_SESSION.to_owned(), value: MetadataValue::text(identity_value) }),
         vec![(KEY_SCOPE, group_path.to_scope_value()), (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str()))],

@@ -99,7 +99,7 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    ConvoyPhase, ConvoyRow, CrewMemberSummary, QueryId, ResultDelta, ResultSet, Rows, SessionPhase, SessionRow, VesselRow, WorkPhase,
+    ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryId, ResultDelta, ResultSet, Rows, SessionPhase, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 
