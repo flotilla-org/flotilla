@@ -23,7 +23,6 @@ const DUPLICATE: &[LifecycleClass] = &[LifecycleClass::Duplicate];
 const CONTINUATION: &[LifecycleClass] = &[LifecycleClass::Continuation];
 const NEW_ATTEMPT: &[LifecycleClass] = &[LifecycleClass::NewAttempt];
 const DUPLICATE_NEW_ATTEMPT: &[LifecycleClass] = &[LifecycleClass::Duplicate, LifecycleClass::NewAttempt];
-const DUPLICATE_CONTINUATION: &[LifecycleClass] = &[LifecycleClass::Duplicate, LifecycleClass::Continuation];
 const DUPLICATE_RESETTLEMENT: &[LifecycleClass] = &[LifecycleClass::Duplicate, LifecycleClass::Resettlement];
 const DUPLICATE_CONTINUATION_RESETTLEMENT: &[LifecycleClass] =
     &[LifecycleClass::Duplicate, LifecycleClass::Continuation, LifecycleClass::Resettlement];
@@ -52,8 +51,8 @@ define_patch_kinds! {
     ConvoyBackfillCrewWork => NONE,
     ConvoyFailInit => DUPLICATE,
     ConvoyAdvanceWorkToReady => DUPLICATE,
-    ConvoyFail => DUPLICATE,
-    ConvoyRollUpPhase => DUPLICATE_CONTINUATION,
+    ConvoyFail => DUPLICATE_RESETTLEMENT,
+    ConvoyRollUpPhase => DUPLICATE_CONTINUATION_RESETTLEMENT,
     ConvoyWorkLaunching => DUPLICATE,
     ConvoyWorkRunning => DUPLICATE,
     ConvoyForceWorkCompleted => DUPLICATE,
@@ -726,6 +725,33 @@ fn new_attempt_transitions_replace_attempt_timestamps() {
 #[test]
 fn settling_again_after_a_continuation_records_the_new_outcome_time() {
     let cases = [
+        LifecycleCase {
+            name: "convoy roll-up changes settled outcome",
+            kind: PatchKind::ConvoyRollUpPhase,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Failed;
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::RollUpPhase { phase: ConvoyPhase::Completed, started_at: None, finished_at: Some(ts(30)) };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "convoy fail-fast changes settled outcome",
+            kind: PatchKind::ConvoyFail,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::FailConvoy {
+                    cancelled_work: BTreeMap::new(),
+                    finished_at: ts(30),
+                    message: Some("work failure detected".to_string()),
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
+            },
+        },
         LifecycleCase {
             name: "work completes after reopening",
             kind: PatchKind::ConvoyRollUpWork,

@@ -286,7 +286,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::FailConvoy { cancelled_work, finished_at, message } => {
+                let previous_phase = status.phase;
                 status.phase = ConvoyPhase::Failed;
+                if previous_phase != ConvoyPhase::Failed {
+                    status.finished_at = None;
+                }
                 status.finished_at.get_or_insert(*finished_at);
                 status.message = message.clone();
                 for (work, cancelled_at) in cancelled_work {
@@ -298,6 +302,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RollUpPhase { phase, started_at, finished_at } => {
                 // Derived Active roll-up is a continuation of the convoy voyage, not a new attempt.
+                let previous_phase = status.phase;
                 status.phase = *phase;
                 if *phase == ConvoyPhase::Active {
                     status.finished_at = None;
@@ -306,6 +311,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     status.started_at.get_or_insert(*started_at);
                 }
                 if let Some(finished_at) = finished_at {
+                    // A changed terminal outcome settles at its own transition time.
+                    if previous_phase != *phase {
+                        status.finished_at = None;
+                    }
                     status.finished_at.get_or_insert(*finished_at);
                 }
             }
