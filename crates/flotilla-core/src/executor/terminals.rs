@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use flotilla_protocol::{arg::Arg, HostName, HostPath, PreparedTerminalCommand, ResolvedPaneCommand};
+use flotilla_protocol::{arg::Arg, AttachableSetId, PreparedTerminalCommand, ResolvedPaneCommand};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -20,18 +20,9 @@ impl<'a> TerminalPreparationService<'a> {
         Self { terminal_manager, daemon_socket_path }
     }
 
-    pub(super) async fn resolve_workspace_commands(&self, config: &mut WorkspaceConfig) {
+    pub(super) async fn resolve_workspace_commands_in_set(&self, config: &mut WorkspaceConfig, set_id: &AttachableSetId) {
         let rendered = parse_workspace_template(config).render(&config.template_vars);
         info!(count = rendered.content.len(), "terminal manager: resolving content entries");
-        let host = HostName::local();
-        let checkout_path = HostPath::new(host.clone(), config.working_directory.clone().into_path_buf());
-        let set_id = match self.terminal_manager.allocate_set(host, checkout_path.into()) {
-            Ok(id) => id,
-            Err(err) => {
-                warn!(err = %err, "failed to allocate terminal set");
-                return;
-            }
-        };
         let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
         let mut resolved = Vec::new();
         for entry in &rendered.content {
@@ -80,15 +71,13 @@ impl<'a> TerminalPreparationService<'a> {
 
     pub(super) async fn prepare_terminal_commands(
         &self,
+        set_id: &AttachableSetId,
         branch: &str,
         checkout_path: &Path,
         requested_commands: &[PreparedTerminalCommand],
         workspace_config: impl FnOnce() -> WorkspaceConfig,
     ) -> Result<Vec<ResolvedPaneCommand>, String> {
         if !requested_commands.is_empty() {
-            let host = HostName::local();
-            let hp = HostPath::new(host.clone(), checkout_path.to_path_buf());
-            let set_id = self.terminal_manager.allocate_set(host, hp.into())?;
             let socket_str = self.daemon_socket_path.map(|p| p.display().to_string());
 
             let mut resolved = Vec::new();
@@ -135,7 +124,7 @@ impl<'a> TerminalPreparationService<'a> {
         }
 
         let mut config = workspace_config();
-        self.resolve_workspace_commands(&mut config).await;
+        self.resolve_workspace_commands_in_set(&mut config, set_id).await;
 
         let commands = if let Some(resolved) = config.resolved_commands { resolved } else { render_template_commands(&config) };
 

@@ -44,21 +44,32 @@ impl<'a> WorkspaceOrchestrator<'a> {
         Self { repo_root, registry, config_base, attachable_store, daemon_socket_path, local_host, terminal_manager }
     }
 
-    pub(super) async fn create_workspace_for_teleport(&self, checkout_path: &Path, label: &str, teleport_cmd: &str) -> Result<(), String> {
+    pub(super) async fn create_workspace_for_teleport(
+        &self,
+        checkout_path: &Path,
+        checkout_key: Option<&QualifiedPath>,
+        label: &str,
+        teleport_cmd: &str,
+    ) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
             return Ok(());
         };
 
+        let attachable_set_id = self.ensure_attachable_set_for_checkout(self.local_host, checkout_path, checkout_key, None);
         let mut config = workspace_config(self.repo_root, label, checkout_path, teleport_cmd, self.config_base);
-        if let Some(tm) = self.terminal_manager {
+        if let (Some(tm), Some(set_id)) = (self.terminal_manager, attachable_set_id.as_ref()) {
             let terminal_preparation = TerminalPreparationService::new(tm, self.daemon_socket_path);
-            terminal_preparation.resolve_workspace_commands(&mut config).await;
+            terminal_preparation.resolve_workspace_commands_in_set(&mut config, set_id).await;
         }
         let attach_request = workspace_attach_request_from_config(config);
 
         match ws_mgr.create_workspace(&attach_request).await {
             Ok((ws_ref, _workspace)) => {
-                self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path, None);
+                if let Some(set_id) = attachable_set_id.as_ref() {
+                    self.persist_workspace_binding_for_set(provider_name, &ws_ref, set_id, self.local_host, checkout_path, checkout_key);
+                } else {
+                    self.persist_workspace_binding(provider_name, &ws_ref, self.local_host, checkout_path, checkout_key);
+                }
                 Ok(())
             }
             Err(err) => Err(err),
