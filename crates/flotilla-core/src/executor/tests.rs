@@ -2492,7 +2492,8 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
     let providers_data = Arc::new(data);
-    let cb = config_base();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cb = DaemonHostPath::new(temp.path());
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
     let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
@@ -2555,7 +2556,8 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     let registry = Arc::new(registry);
     let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
     let providers_data = Arc::new(empty_data());
-    let cb = config_base();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cb = DaemonHostPath::new(temp.path());
     let attachable = test_attachable_store(&cb);
     let lh = local_host();
     let repo = RepoExecutionContext { identity: repo_identity(), root: repo_root() };
