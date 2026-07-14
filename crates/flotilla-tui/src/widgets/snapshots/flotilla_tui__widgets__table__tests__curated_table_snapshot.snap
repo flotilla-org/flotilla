@@ -1,0 +1,16 @@
+---
+source: crates/flotilla-tui/src/widgets/table.rs
+expression: terminal.backend()
+---
+"┌ Convoys · dev ───────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+"│convoys/dev                                                                                                           │"
+"│CONVOY                     WORKFLOW          PHASE          VESSELS PROJECT / REPO      MESSAGE                       │"
+"│tables                     implement-review  initializing       0/2 flotilla            waiting for workflow status   │"
+"│release                    implement-review  active             1/3 flotilla            review is running             │"
+"│docs                       implement-review  completed          2/2 flotilla                                          │"
+"│deploy                     implement-review  failed             1/2 flotilla            workspace launch failed       │"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
+"│                                                                                                                      │"
+"└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"

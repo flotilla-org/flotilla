@@ -3,8 +3,8 @@ pub mod branch_input;
 pub mod close_confirm;
 pub mod columns;
 pub mod command_palette;
-pub mod convoys_page;
 pub mod delete_confirm;
+pub mod describe;
 pub mod event_log;
 pub mod file_picker;
 pub mod help;
@@ -16,6 +16,8 @@ pub mod screen;
 pub mod section_table;
 pub mod split_table;
 pub mod status_bar_widget;
+pub mod table;
+pub mod table_action_menu;
 pub mod tabs;
 
 use std::{any::Any, collections::HashMap};
@@ -74,6 +76,11 @@ pub enum AppAction {
     SwitchToTab(usize),
     /// Focus the View at this address, opening a tab for it if needed.
     OpenView(flotilla_protocol::ViewAddress),
+    /// Drill into a View by mutating the active tab and pushing its history.
+    DrillView(flotilla_protocol::ViewAddress),
+    /// Pop the active tab's in-place navigation history.
+    BackView,
+    ExecuteTableIntent(crate::table_view::TableIntent),
     /// Return to the previously active tab (overview dismiss).
     SwitchToLastView,
     /// Close the open View at this tab index (pinned overview refuses).
@@ -125,7 +132,7 @@ pub struct WidgetContext<'a> {
     pub my_node_id: Option<NodeId>,
     /// The open tab set; the active View decides page dispatch and which
     /// contextual commands apply.
-    pub views: &'a OpenViews,
+    pub views: &'a mut OpenViews,
     pub commands: &'a mut CommandQueue,
     pub active_repo_is_remote_only: bool,
     /// Per-namespace convoy model — used by the command palette for convoy/work completions.
@@ -135,30 +142,18 @@ pub struct WidgetContext<'a> {
 
 /// Context provided to widgets during rendering.
 ///
-/// Mutable fields (`ui`) are needed because the base layer rendering updates
-/// table state and layout areas.
+/// Mutable fields are needed because rendering updates layout areas and
+/// reconciles per-View cursor/scroll state against the latest query rows.
 pub struct RenderContext<'a> {
     pub model: &'a TuiModel,
     /// The open tab set; drives the tab bar and page dispatch.
-    pub views: &'a OpenViews,
+    pub views: &'a mut OpenViews,
     pub ui: &'a mut UiState,
     pub theme: &'a Theme,
     pub keymap: &'a Keymap,
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
     /// Per-namespace convoy model, keyed by namespace string.
     pub namespaces: &'a crate::app::NamespaceMap,
-    /// Currently selected convoy id for the Convoys tab.
-    pub convoys_selected: Option<crate::convoy_model::ConvoyId>,
-    /// Currently selected vessel name within the selected convoy, if any.
-    pub convoys_selected_vessel: Option<&'a str>,
-    /// Which pane (list / vessels) currently has focus on the Convoys tab.
-    pub convoys_focus: crate::app::ConvoysFocus,
-    /// Active filter string for the Convoys tab.
-    pub convoy_filter: &'a str,
-    /// Pre-filtered convoy list for the Convoys tab.
-    /// Produced once by `App` via `visible_convoys("flotilla")` so the filter
-    /// lives in a single place and `screen.rs` can consume it directly.
-    pub convoys: Vec<&'a crate::convoy_model::ConvoySummary>,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.

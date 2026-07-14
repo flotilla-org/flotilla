@@ -34,17 +34,34 @@ impl App {
         self.sync_active_view();
     }
 
-    /// Scoped-mode back navigation: return to the View the last in-place
-    /// open left behind. Returns true if navigation happened.
-    pub fn scoped_back(&mut self) -> bool {
+    /// Navigate in place inside the active tab. The previous address and its
+    /// table state remain on that tab's history stack.
+    pub fn drill_view(&mut self, address: ViewAddress) {
+        self.dismiss_modals();
+        if self.views.drill(address) {
+            self.subscriptions_dirty = true;
+            self.persist_open_views();
+            self.sync_active_view();
+        }
+    }
+
+    /// Pop the active tab's in-place navigation history.
+    pub fn back_view(&mut self) -> bool {
         if self.views.back() {
             self.dismiss_modals();
             self.subscriptions_dirty = true;
+            self.persist_open_views();
             self.sync_active_view();
             true
         } else {
             false
         }
+    }
+
+    /// Scoped-mode back navigation: return to the View the last in-place
+    /// open left behind. Returns true if navigation happened.
+    pub fn scoped_back(&mut self) -> bool {
+        self.back_view()
     }
 
     /// Return to the previously active tab (overview dismiss).

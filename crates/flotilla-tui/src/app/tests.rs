@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
@@ -17,11 +17,13 @@ use flotilla_protocol::{
     Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId, NodeInfo, ProvisioningTarget, RepoIdentity,
     RepoSelector, ViewAddress, WorkItemIdentity,
 };
+use ratatui::{backend::TestBackend, Terminal};
 use tempfile::tempdir;
 use test_support::*;
 use tokio::sync::{watch, Mutex as TokioMutex, Semaphore};
 
 use super::*;
+use crate::widgets::InteractiveWidget;
 
 fn insert_host(
     model: &mut TuiModel,
@@ -186,61 +188,6 @@ async fn drain_until_issue_count(app: &mut App, repo: &RepoIdentity, expected_co
 }
 
 // -- CommandQueue --
-
-/// The convoy scope of the seeded convoys tab (namespace "flotilla", no
-/// project/convoy restriction).
-fn test_convoy_scope() -> crate::app::ConvoyScope {
-    crate::app::ConvoyScope { namespace: "flotilla".to_string(), project: None, convoy: None, vessel: None }
-}
-
-#[test]
-fn project_view_scopes_visible_convoys_to_its_project() {
-    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
-
-    let mut app = stub_app();
-    let mut in_project = test_convoy("flotilla", "in-project", ConvoyPhase::Active, false);
-    in_project.project_ref = Some("island".to_string());
-    let out_of_project = test_convoy("flotilla", "elsewhere", ConvoyPhase::Active, false);
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![in_project, out_of_project],
-    })));
-
-    app.open_view("project/flotilla/island".parse().expect("valid address"));
-    let scope = app.active_convoy_scope().expect("project view has a convoy scope");
-    assert_eq!(scope.project.as_deref(), Some("island"));
-
-    let visible: Vec<_> = app.visible_convoys_scoped(&scope).map(|c| c.name.clone()).collect();
-    assert_eq!(visible, vec!["in-project".to_string()]);
-}
-
-#[test]
-fn vessel_view_pins_vessel_selection() {
-    let mut app = stub_app();
-    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
-    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("build"));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-}
-
-#[test]
-fn vessel_view_selection_never_moves_off_its_vessel() {
-    use crate::keymap::Action;
-
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["build", "test"])]))));
-
-    // On the vessel view, j/k must not move the selection to a sibling —
-    // the view IS one vessel, and attach/complete target it.
-    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
-    app.dispatch_action(Action::SelectNext);
-    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("build"), "vessel view selection is pinned");
-
-    // Sanity: the single-convoy view DOES navigate its vessel tree.
-    app.open_view("convoy/flotilla/alpha".parse().expect("valid address"));
-    app.dispatch_action(Action::SelectNext);
-    assert_eq!(app.convoys_ui.selected_vessel.as_deref(), Some("test"));
-}
 
 #[test]
 fn scoped_pane_esc_navigates_back() {
@@ -1669,7 +1616,7 @@ fn app_applies_panel_snapshot() {
 }
 
 #[test]
-fn empty_panel_snapshot_clears_convoy_selection() {
+fn empty_panel_snapshot_clears_convoys() {
     use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
 
     let mut app = stub_app();
@@ -1678,12 +1625,11 @@ fn empty_panel_snapshot_clears_convoy_selection() {
         namespace: "flotilla".into(),
         convoys: vec![test_convoy("flotilla", "x", ConvoyPhase::Active, false)],
     })));
-    assert!(app.selected_convoy_id().is_some());
+    assert_eq!(app.convoys("flotilla").len(), 1);
 
     app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot { seq: 2, namespace: "flotilla".into(), convoys: vec![] })));
 
     assert!(app.convoys("flotilla").is_empty());
-    assert!(app.selected_convoy_id().is_none());
 }
 
 #[test]
@@ -1709,7 +1655,7 @@ fn app_applies_panel_delta() {
         changed: vec![modified],
         removed: vec![],
     })));
-    assert_eq!(app.convoys("flotilla")[0].phase, ConvoyPhase::Active);
+    assert_eq!(app.namespaces["flotilla"].convoys.values().next().expect("convoy").phase, ConvoyPhase::Active);
 
     // Remove via delta
     app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
@@ -1718,7 +1664,7 @@ fn app_applies_panel_delta() {
         changed: vec![],
         removed: vec![convoy.id.clone()],
     })));
-    assert!(app.convoys("flotilla").is_empty());
+    assert!(app.namespaces["flotilla"].convoys.is_empty());
 }
 
 // -- Convoys tab rendering --
@@ -1748,28 +1694,17 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).expect("terminal");
 
-    let convoys_selected = app.convoys_ui.selected.clone();
-    let convoys_selected_vessel = app.convoys_ui.selected_vessel.clone();
-    let convoys_focus = app.convoys_ui.focus;
-    let convoy_filter = app.convoys_ui.filter.clone();
     terminal
         .draw(|f| {
             let area = f.area();
-            let raw = app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
-            let convoys: Vec<&_> = crate::app::filter_convoys_by_str(raw.iter().copied(), &app.convoys_ui.filter).collect();
             let mut ctx = crate::widgets::RenderContext {
                 model: &app.model,
-                views: &app.views,
+                views: &mut app.views,
                 ui: &mut app.ui,
                 theme: &app.theme,
                 keymap: &app.keymap,
                 in_flight: &app.in_flight,
                 namespaces: &app.namespaces,
-                convoys_selected,
-                convoys_selected_vessel: convoys_selected_vessel.as_deref(),
-                convoys_focus,
-                convoy_filter: &convoy_filter,
-                convoys,
             };
             app.screen.render(f, area, &mut ctx);
         })
@@ -1780,391 +1715,28 @@ fn screen_renders_convoys_page_on_convoys_tab() {
     assert!(rendered.contains("demo"), "expected convoy name 'demo' in rendered output, got: {rendered}");
 }
 
-// -- Convoys tab selection --
+// -- Curated table navigation and actions (#733) --
 
 fn make_convoy_fixture_snapshot(names: &[&str]) -> crate::convoy_model::ConvoyFixtureSnapshot {
     crate::convoy_model::ConvoyFixtureSnapshot {
         seq: 1,
         namespace: "flotilla".into(),
-        convoys: names.iter().map(|n| test_convoy("flotilla", n, crate::convoy_model::ConvoyPhase::Active, false)).collect(),
+        convoys: names.iter().map(|name| test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false)).collect(),
     }
 }
-
-#[test]
-fn convoys_tab_select_next_advances_selection() {
-    use crate::keymap::Action;
-
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
-    app.switch_tab(1);
-
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "first convoy should be auto-selected");
-
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
-
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
-
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"), "should clamp at last convoy");
-
-    // Also verify via convoys_tab_select_delta directly
-    app.convoys_tab_select_delta(&test_convoy_scope(), -10);
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "large negative delta clamps at first convoy");
-
-    let _ = Action::SelectNext; // confirm Action is reachable in this module
-}
-
-#[test]
-fn convoys_tab_select_prev_moves_back() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["a", "b", "c"]))));
-    app.switch_tab(1);
-
-    // Move to the end
-    app.convoys_tab_select_delta(&test_convoy_scope(), 2);
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("c"));
-
-    app.handle_key(key(KeyCode::Char('k')));
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
-
-    app.handle_key(key(KeyCode::Char('k')));
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"));
-
-    app.handle_key(key(KeyCode::Char('k')));
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("a"), "should clamp at first convoy");
-}
-
-#[test]
-fn delta_removing_selected_convoy_reselects_to_adjacent() {
-    use crate::convoy_model::{ConvoyFixtureDelta, ConvoyFixtureSnapshot, ConvoyId};
-
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![
-            test_convoy("flotilla", "a", crate::convoy_model::ConvoyPhase::Active, false),
-            test_convoy("flotilla", "b", crate::convoy_model::ConvoyPhase::Active, false),
-            test_convoy("flotilla", "c", crate::convoy_model::ConvoyPhase::Active, false),
-        ],
-    })));
-    app.switch_tab(1);
-
-    // Move to "b"
-    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("b"));
-
-    // Delta removes "b"
-    app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
-        seq: 2,
-        namespace: "flotilla".into(),
-        changed: vec![],
-        removed: vec![ConvoyId::new("flotilla", "b")],
-    })));
-
-    let selected = app.selected_convoy_id().expect("must still have a selection after removing 'b'");
-    assert!(
-        matches!(selected.name(), "a" | "c"),
-        "after removing 'b', selection should fall back to an adjacent remaining convoy, got {}",
-        selected.name()
-    );
-}
-
-#[test]
-fn delta_removing_all_convoys_clears_selection() {
-    use crate::convoy_model::{ConvoyFixtureDelta, ConvoyFixtureSnapshot, ConvoyId};
-
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![test_convoy("flotilla", "a", crate::convoy_model::ConvoyPhase::Active, false)],
-    })));
-    app.switch_tab(1);
-
-    assert!(app.selected_convoy_id().is_some(), "should have a selection after snapshot");
-
-    app.handle_daemon_event(result_delta_event(Box::new(ConvoyFixtureDelta {
-        seq: 2,
-        namespace: "flotilla".into(),
-        changed: vec![],
-        removed: vec![ConvoyId::new("flotilla", "a")],
-    })));
-
-    assert!(app.selected_convoy_id().is_none(), "removing the last convoy should clear selection");
-}
-
-// -- Convoy filter --
-
-#[test]
-fn convoy_filter_narrows_visible_convoys() {
-    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyId, ConvoyPhase, ConvoySummary};
-
-    let mut app = stub_app();
-    fn convoy(name: &str) -> ConvoySummary {
-        ConvoySummary {
-            id: ConvoyId::new("flotilla", name),
-            namespace: "flotilla".into(),
-            name: name.into(),
-            workflow_ref: "wf".into(),
-            phase: ConvoyPhase::Active,
-            message: None,
-            repo_hint: None,
-            project_ref: None,
-            vessels: vec![],
-            started_at: None,
-            finished_at: None,
-            observed_workflow_ref: None,
-            initializing: false,
-        }
-    }
-
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
-    })));
-
-    // No filter — all three visible.
-    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
-    assert_eq!(visible.len(), 3);
-
-    // Filter matches a substring case-insensitively.
-    app.set_convoy_filter("BRA");
-    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].name, "bravo");
-
-    // Empty filter restores all.
-    app.set_convoy_filter("");
-    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
-    assert_eq!(visible.len(), 3);
-}
-
-#[test]
-fn convoy_filter_matches_repo_hint() {
-    use flotilla_protocol::snapshot::RepoKey;
-
-    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyId, ConvoyPhase, ConvoySummary};
-
-    let mut app = stub_app();
-
-    let c1 = ConvoySummary {
-        id: ConvoyId::new("flotilla", "one"),
-        namespace: "flotilla".into(),
-        name: "one".into(),
-        workflow_ref: "wf".into(),
-        phase: ConvoyPhase::Active,
-        message: None,
-        repo_hint: Some(RepoKey("flotilla-org/flotilla".into())),
-        project_ref: None,
-        vessels: vec![],
-        started_at: None,
-        finished_at: None,
-        observed_workflow_ref: None,
-        initializing: false,
-    };
-    let c2 = ConvoySummary {
-        id: ConvoyId::new("flotilla", "two"),
-        namespace: "flotilla".into(),
-        name: "two".into(),
-        workflow_ref: "wf".into(),
-        phase: ConvoyPhase::Active,
-        message: None,
-        repo_hint: None,
-        project_ref: None,
-        vessels: vec![],
-        started_at: None,
-        finished_at: None,
-        observed_workflow_ref: None,
-        initializing: false,
-    };
-
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![c1, c2],
-    })));
-
-    app.set_convoy_filter("flotilla-org");
-
-    let visible: Vec<_> = app.visible_convoys("flotilla").collect();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].name, "one");
-}
-
-#[test]
-fn convoy_filter_invalidates_hidden_selection() {
-    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyPhase};
-
-    let mut app = stub_app();
-    // The filter belongs to convoys-consuming views; activate the convoys tab.
-    app.switch_tab(1);
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![
-            test_convoy("flotilla", "alpha", ConvoyPhase::Active, false),
-            test_convoy("flotilla", "bravo", ConvoyPhase::Active, false),
-        ],
-    })));
-
-    // Select bravo
-    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"));
-
-    // Filter to only show alpha — bravo is hidden, selection should move
-    app.set_convoy_filter("alp");
-    let selected_name = app.selected_convoy_id().map(|id| id.name().to_string());
-    // The visible set contains only "alpha"; selection must have moved
-    assert_eq!(selected_name.as_deref(), Some("alpha"), "filter should invalidate hidden selection");
-}
-
-#[test]
-fn select_next_stays_within_filtered_set() {
-    use crate::convoy_model::{ConvoyFixtureSnapshot, ConvoyId, ConvoyPhase, ConvoySummary};
-
-    let mut app = stub_app();
-    fn convoy(name: &str) -> ConvoySummary {
-        ConvoySummary {
-            id: ConvoyId::new("flotilla", name),
-            namespace: "flotilla".into(),
-            name: name.into(),
-            workflow_ref: "wf".into(),
-            phase: ConvoyPhase::Active,
-            message: None,
-            repo_hint: None,
-            project_ref: None,
-            vessels: vec![],
-            started_at: None,
-            finished_at: None,
-            observed_workflow_ref: None,
-            initializing: false,
-        }
-    }
-
-    app.handle_daemon_event(result_set_event(Box::new(ConvoyFixtureSnapshot {
-        seq: 1,
-        namespace: "flotilla".into(),
-        convoys: vec![convoy("alpha"), convoy("bravo"), convoy("charlie")],
-    })));
-    app.switch_tab(1);
-
-    // Apply a filter that matches only "bravo".
-    app.set_convoy_filter("BRA");
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "filter should select the only visible convoy");
-
-    // select_next has nowhere to go — should stay on bravo.
-    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "next should clamp within filtered set");
-
-    // select_prev also stays.
-    app.convoys_tab_select_delta(&test_convoy_scope(), -1);
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("bravo"), "prev should clamp within filtered set");
-}
-
-// -- TabPage binding mode: app-global keys work on the Convoys tab --
-
-#[test]
-fn command_palette_opens_on_convoys_tab() {
-    // '/' is now in TabPage, which Convoys composes. Verify it opens the palette.
-    let mut app = stub_app();
-    app.switch_tab(1);
-
-    app.handle_key(key(KeyCode::Char('/')));
-
-    assert!(app.screen.has_modal(), "pressing '/' on the Convoys tab should open the command palette modal");
-}
-
-#[test]
-fn tab_nav_works_on_convoys_tab() {
-    // ']' (NextTab) is in TabPage and composed with Convoys.
-    // With two repos, switching from Convoys to the next tab should land on a repo tab.
-    let mut app = stub_app_with_repos(2);
-    app.switch_tab(1);
-
-    app.handle_key(key(KeyCode::Char(']')));
-
-    assert_eq!(app.views.active_index(), 2, "pressing ']' on the Convoys tab should navigate to the first repo tab");
-    assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
-}
-
-#[test]
-fn quit_works_on_convoys_tab() {
-    // 'q' is in TabPage and composed with Convoys.
-    let mut app = stub_app();
-    app.switch_tab(1);
-
-    app.handle_key(key(KeyCode::Char('q')));
-
-    assert!(app.should_quit, "pressing 'q' on the Convoys tab should quit the app");
-}
-
-#[test]
-fn action_menu_overlay_masks_tab_nav() {
-    // Overlay modes (ActionMenu) act as focus barriers — they should NOT let
-    // tab-page globals (like ']') fall through.
-    let mut app = stub_app_with_repos(2);
-
-    // Open an action menu by pushing the widget directly.
-    let items = Vec::new();
-    let dummy_item = checkout_item("feat", "/wt", false);
-    app.screen.modal_stack.push(Box::new(crate::widgets::action_menu::ActionMenuWidget::new(items, dummy_item)));
-    assert!(app.screen.has_modal());
-
-    let tab_before = app.views.active_index();
-    app.handle_key(key(KeyCode::Char(']')));
-    let tab_after = app.views.active_index();
-
-    assert_eq!(tab_before, tab_after, "tab navigation should be masked by the ActionMenu overlay");
-}
-
-#[test]
-fn move_tab_on_convoys_tab_moves_the_convoys_tab() {
-    // '{' (MoveTabLeft) and '}' (MoveTabRight) are in TabPage now: they move
-    // the ACTIVE tab in the open-view order on every tab, guarded only by the
-    // pinned overview at index 0. Registration order is never touched.
-    let mut app = stub_app_with_repos(2);
-    app.switch_tab(1);
-
-    let order_before = app.model.repo_order.clone();
-    let convoys = ViewAddress::Convoys { namespace: "flotilla".to_string() };
-    let repo0 = ViewAddress::Repo(app.model.repo_order[0].clone());
-
-    // '{' cannot displace the pinned overview — nothing changes.
-    app.handle_key(key(KeyCode::Char('{')));
-    assert_eq!(app.views.active_index(), 1);
-    assert_eq!(app.views.get(1).and_then(|v| v.address()), Some(&convoys));
-
-    // '}' swaps the Convoys tab with the first repo tab; the moved tab stays active.
-    app.handle_key(key(KeyCode::Char('}')));
-    assert_eq!(app.views.active_index(), 2, "the convoys tab moved right and stayed active");
-    assert_eq!(app.views.get(1).and_then(|v| v.address()), Some(&repo0));
-    assert_eq!(app.views.get(2).and_then(|v| v.address()), Some(&convoys));
-
-    // Registration order is not tab order — it must be untouched.
-    assert_eq!(app.model.repo_order, order_before, "{{ / }} must not reorder repo registration order");
-    // The new tab order is persisted as open views.
-    let saved = app.config.load_open_views().expect("open views persisted after a move");
-    assert_eq!(saved[2].address, convoys.to_string());
-}
-
-// -- Convoy vessel selection state --
 
 fn convoy_with_vessels(name: &str, vessel_names: &[&str]) -> crate::convoy_model::ConvoySummary {
-    let mut c = test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false);
-    c.vessels = vessel_names
+    let mut convoy = test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false);
+    convoy.vessels = vessel_names
         .iter()
         .map(|vessel_name| crate::convoy_model::VesselSummary {
             name: (*vessel_name).into(),
             depends_on: vec![],
-            phase: crate::convoy_model::WorkPhase::Pending,
+            phase: crate::convoy_model::WorkPhase::Running,
             crew: vec![],
-            host: None,
+            host: Some(HostName::local()),
             checkout: None,
-            workspace_ref: None,
+            workspace_ref: Some(format!("ws://{vessel_name}")),
             completion_target: Some(crate::convoy_model::WorkCompletionTarget {
                 convoy: name.to_string(),
                 vessel: (*vessel_name).to_string(),
@@ -2176,427 +1748,194 @@ fn convoy_with_vessels(name: &str, vessel_names: &[&str]) -> crate::convoy_model
             message: None,
         })
         .collect();
-    c
+    convoy
 }
 
 fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::convoy_model::ConvoyFixtureSnapshot {
     crate::convoy_model::ConvoyFixtureSnapshot { seq: 1, namespace: "flotilla".into(), convoys }
 }
 
-#[test]
-fn enter_vessels_focus_default_selects_first_vessel() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.switch_tab(1);
-
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-    assert_eq!(app.selected_convoy_vessel(), None);
-
-    app.enter_convoy_vessels_focus(&test_convoy_scope());
-
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
+fn selected_table_name(app: &App) -> Option<String> {
+    let address = app.views.active_address()?;
+    let name_column = match address {
+        ViewAddress::Convoys { .. } | ViewAddress::Project { .. } => 0,
+        ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
+        ViewAddress::Overview | ViewAddress::Repo(_) => return None,
+    };
+    let convoys = app.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();
+    let view = crate::table_view::project(address, &convoys).ok()?;
+    app.views.active_table_state().selected_row(&view).map(|row| row.cells[name_column].text.clone())
 }
 
 #[test]
-fn enter_vessels_focus_noop_on_empty_vessels() {
+fn keyboard_uses_one_cursor_and_drills_with_tab_local_back_history() {
     let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &[])]))));
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["alpha", "bravo"]))));
     app.switch_tab(1);
 
-    app.enter_convoy_vessels_focus(&test_convoy_scope());
+    app.handle_key(key(KeyCode::Char('j')));
+    assert_eq!(selected_table_name(&app).as_deref(), Some("bravo"));
 
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "focus should stay on List when convoy has no vessels");
-    assert_eq!(app.selected_convoy_vessel(), None);
-}
-
-#[test]
-fn convoy_vessels_select_delta_clamps_within_vessels() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
-    app.switch_tab(1);
-    app.enter_convoy_vessels_focus(&test_convoy_scope());
-
-    app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
-    app.convoy_vessels_select_delta(&test_convoy_scope(), 5);
-    assert_eq!(app.selected_convoy_vessel(), Some("t3"), "clamps at last vessel");
-    app.convoy_vessels_select_delta(&test_convoy_scope(), -10);
-    assert_eq!(app.selected_convoy_vessel(), Some("t1"), "clamps at first vessel");
-}
-
-#[test]
-fn switching_convoys_resets_vessel_state_and_focus() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![
-        convoy_with_vessels("alpha", &["a1"]),
-        convoy_with_vessels("beta", &["b1"]),
-    ]))));
-    app.switch_tab(1);
-    app.enter_convoy_vessels_focus(&test_convoy_scope());
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-
-    app.convoys_tab_select_delta(&test_convoy_scope(), 1);
-
-    assert_eq!(app.selected_convoy_id().map(|id| id.name()), Some("beta"));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List, "switching convoy snaps focus back to List");
-    assert_eq!(app.selected_convoy_vessel(), None, "switching convoy clears vessel selection");
-}
-
-#[test]
-fn delta_removing_selected_vessel_clamps_to_none_and_drops_focus() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.switch_tab(1);
-    app.enter_convoy_vessels_focus(&test_convoy_scope());
-    app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
-    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-
-    // Remove t2 via delta.
-    let mut shrunk = convoy_with_vessels("alpha", &["t1"]);
-    shrunk.id = crate::convoy_model::ConvoyId::new("flotilla", "alpha");
-    app.handle_daemon_event(result_delta_event(Box::new(crate::convoy_model::ConvoyFixtureDelta {
-        seq: 2,
-        namespace: "flotilla".into(),
-        changed: vec![shrunk],
-        removed: vec![],
-    })));
-
-    assert_eq!(app.selected_convoy_vessel(), None, "selected_vessel is reset when it disappears from the convoy");
-    assert_eq!(
-        app.convoys_focus(),
-        crate::app::ConvoysFocus::List,
-        "focus snaps back to List so the vessel pane isn't focused with no row selected"
-    );
-}
-
-#[test]
-fn exit_vessels_focus_keeps_selected_vessel() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.switch_tab(1);
-    app.enter_convoy_vessels_focus(&test_convoy_scope());
-    app.convoy_vessels_select_delta(&test_convoy_scope(), 1);
-
-    app.exit_convoy_vessels_focus();
-
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-    assert_eq!(app.selected_convoy_vessel(), Some("t2"), "selected_vessel survives exit so re-entering picks up the same row");
-}
-
-#[test]
-fn l_drills_in_then_esc_returns_to_list_focus() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2"])]))));
-    app.switch_tab(1);
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.views.active_address(), Some(&"convoy/flotilla/bravo".parse().expect("valid address")));
+    assert_eq!(app.views.len(), 3, "drill mutates the tab rather than opening another one");
 
     app.handle_key(key(KeyCode::Esc));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+    assert_eq!(app.views.active_address(), Some(&"convoys/flotilla".parse().expect("valid address")));
+    assert_eq!(selected_table_name(&app).as_deref(), Some("bravo"), "back restores the prior cursor");
 }
 
 #[test]
-fn h_returns_from_vessels_to_list_focus() {
+fn describe_opens_for_the_selected_table_row() {
     let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["alpha"]))));
     app.switch_tab(1);
 
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
+    app.handle_key(key(KeyCode::Char('y')));
 
-    app.handle_key(key(KeyCode::Char('h')));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
+    assert!(app.screen.modal_stack.last().is_some_and(|widget| widget.as_any().is::<crate::widgets::describe::DescribeWidget>()));
 }
 
 #[test]
-fn enter_also_drills_into_vessels_focus() {
+fn action_menu_reports_when_the_selected_table_row_has_no_actions() {
     let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["alpha"]))));
     app.switch_tab(1);
 
-    app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
+    app.handle_key(key(KeyCode::Char('.')));
+
+    assert_eq!(app.model.status_message.as_deref(), Some("No actions available for the selected row"));
 }
 
 #[test]
-fn right_and_left_arrows_navigate_focus() {
+fn generated_vessel_actions_execute_attach_and_force_complete() {
     let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1"])]))));
+    let repo_identity = app.model.repo_order[0].clone();
+    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["implement"])]))));
     app.switch_tab(1);
-
-    app.handle_key(key(KeyCode::Right));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::Vessels);
-
-    app.handle_key(key(KeyCode::Left));
-    assert_eq!(app.convoys_focus(), crate::app::ConvoysFocus::List);
-}
-
-#[test]
-fn arrow_keys_route_vessel_navigation_when_vessels_focused() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Right));
-
-    app.handle_key(key(KeyCode::Down));
-    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
-    app.handle_key(key(KeyCode::Up));
-    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
-}
-
-#[test]
-fn jk_routes_to_vessel_navigation_when_vessels_focused() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("alpha", &["t1", "t2", "t3"])]))));
-    app.switch_tab(1);
-
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_vessel(), Some("t1"));
-
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
-
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_vessel(), Some("t3"));
-
-    app.handle_key(key(KeyCode::Char('k')));
-    assert_eq!(app.selected_convoy_vessel(), Some("t2"));
-}
-
-#[test]
-fn x_in_vessels_focus_opens_palette_with_complete_prefill() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement", "review"])]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_vessel(), Some("review"));
-
-    app.handle_key(key(KeyCode::Char('x')));
-
-    assert!(app.screen.has_modal(), "pressing 'x' on a vessel should open the command palette modal");
-    let palette = app
-        .screen
-        .modal_stack
-        .last()
-        .expect("modal pushed")
-        .as_any()
-        .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
-        .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy fix-bug-123 work review complete --force ");
-}
-
-#[test]
-fn x_prefill_quotes_vessel_names_with_whitespace() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["fix my bug"])]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_vessel(), Some("fix my bug"));
-
-    app.handle_key(key(KeyCode::Char('x')));
-    let palette = app
-        .screen
-        .modal_stack
-        .last()
-        .expect("modal pushed")
-        .as_any()
-        .downcast_ref::<crate::widgets::command_palette::CommandPaletteWidget>()
-        .expect("top modal is CommandPaletteWidget");
-    assert_eq!(palette.input_value(), "convoy fix-bug-123 work \"fix my bug\" complete --force ");
-}
-
-#[test]
-fn x_then_enter_dispatches_convoy_work_complete() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessels("fix-bug-123", &["implement"])]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('x')));
     app.handle_key(key(KeyCode::Enter));
 
-    let cmd = app.proto_commands.take_next().expect("expected a command after Enter on palette");
-    match &cmd.0.action {
-        flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } => {
-            assert_eq!(convoy, "fix-bug-123");
-            assert_eq!(work, "implement");
-            assert_eq!(*message, None);
-        }
-        other => panic!("expected ConvoyWorkForceComplete, got {other:?}"),
-    }
+    app.handle_key(key(KeyCode::Char('.')));
+    app.handle_key(key(KeyCode::Enter));
+    let attach = app.proto_commands.take_next().expect("attach command").0;
+    assert!(matches!(attach.action, flotilla_protocol::CommandAction::SelectWorkspace { ref ws_ref } if ws_ref == "ws://implement"));
+    assert_eq!(attach.context_repo, Some(RepoSelector::Identity(repo_identity)));
+
+    app.handle_key(key(KeyCode::Char('.')));
+    app.handle_key(key(KeyCode::Char('x')));
+    let complete = app.proto_commands.take_next().expect("force-complete command").0;
+    assert!(matches!(
+        complete.action,
+        flotilla_protocol::CommandAction::ConvoyWorkForceComplete { ref convoy, ref work, message: None }
+            if convoy == "alpha" && work == "implement"
+    ));
+    assert_eq!(complete.context_repo, None, "force-complete remains a context-free command");
 }
 
 #[test]
-fn x_then_enter_routes_remote_convoy_work_complete_to_its_host() {
+fn generated_vessel_actions_route_to_the_vessels_host() {
     let mut app = stub_app();
+    let repo_identity = app.model.repo_order[0].clone();
     insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
-    let mut convoy = convoy_with_vessels("remote-convoy", &["implement"]);
-    // The vessel's host routes capability actions; a replica row carries the
-    // origin host stamped on the vessel.
-    convoy.vessels[0].host = Some(HostName::new("feta"));
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('x')));
-    app.handle_key(key(KeyCode::Enter));
-
-    let cmd = app.proto_commands.take_next().expect("expected remote completion command");
-    assert_eq!(cmd.0.node_id, Some(NodeId::new("node-feta-peer")));
-}
-
-#[test]
-fn x_rejects_complete_intent_for_unknown_remote_host() {
-    let mut app = stub_app();
-    let mut convoy = convoy_with_vessels("remote-convoy", &["implement"]);
-    convoy.vessels[0].host = Some(HostName::new("missing-host"));
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('x')));
-
-    assert!(!app.screen.has_modal());
-    assert_eq!(app.model.status_message.as_deref(), Some("host 'missing-host' is not connected"));
-}
-
-#[test]
-fn x_is_unavailable_without_complete_intent() {
-    let mut app = stub_app();
     let mut convoy = convoy_with_vessels("alpha", &["implement"]);
-    convoy.vessels[0].completion_target = None;
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('x')));
-
-    assert!(!app.screen.has_modal());
-    assert_eq!(app.model.status_message.as_deref(), Some("completion unavailable for vessel 'implement'"));
-}
-
-// -- Convoy vessel attach (`a`) --
-
-fn convoy_with_vessel_refs(name: &str, vessel_refs: &[(&str, Option<&str>)]) -> crate::convoy_model::ConvoySummary {
-    let mut c = test_convoy("flotilla", name, crate::convoy_model::ConvoyPhase::Active, false);
-    c.vessels = vessel_refs
-        .iter()
-        .map(|(vessel_name, workspace_ref)| crate::convoy_model::VesselSummary {
-            name: (*vessel_name).into(),
-            depends_on: vec![],
-            phase: crate::convoy_model::WorkPhase::Running,
-            crew: vec![],
-            host: None,
-            checkout: None,
-            workspace_ref: workspace_ref.map(str::to_string),
-            completion_target: Some(crate::convoy_model::WorkCompletionTarget {
-                convoy: name.to_string(),
-                vessel: (*vessel_name).to_string(),
-                host: HostName::local(),
-            }),
-            ready_at: None,
-            started_at: None,
-            finished_at: None,
-            message: None,
-        })
-        .collect();
-    c
-}
-
-#[test]
-fn a_on_vessel_with_workspace_ref_dispatches_select_workspace() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[(
-        "implement",
-        Some("ws://vessel-a-implement"),
-    )])]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_vessel(), Some("implement"));
-
-    app.handle_key(key(KeyCode::Char('a')));
-
-    let cmd = app.proto_commands.take_next().expect("expected a SelectWorkspace command");
-    match &cmd.0.action {
-        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => {
-            assert_eq!(ws_ref, "ws://vessel-a-implement");
-        }
-        other => panic!("expected SelectWorkspace, got {other:?}"),
-    }
-    assert!(app.model.status_message.is_none(), "no status message when workspace_ref is present");
-}
-
-#[test]
-fn a_on_remote_vessel_routes_select_workspace_to_its_host() {
-    let mut app = stub_app();
-    insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
-    let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
     convoy.vessels[0].host = Some(HostName::new("feta"));
+    convoy.vessels[0].completion_target.as_mut().expect("completion capability").host = HostName::new("feta");
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('a')));
+    app.handle_key(key(KeyCode::Enter));
 
-    let cmd = app.proto_commands.take_next().expect("expected remote SelectWorkspace command");
-    assert_eq!(cmd.0.node_id, Some(NodeId::new("node-feta-peer")));
+    app.handle_key(key(KeyCode::Char('.')));
+    app.handle_key(key(KeyCode::Enter));
+
+    let command = app.proto_commands.take_next().expect("remote attach command").0;
+    assert_eq!(command.node_id, Some(NodeId::new("node-feta-peer")));
+    assert_eq!(command.context_repo, Some(RepoSelector::Identity(repo_identity)));
 }
 
 #[test]
-fn a_on_unknown_remote_vessel_does_not_fall_back_to_local_execution() {
-    let mut app = stub_app();
-    let mut convoy = convoy_with_vessel_refs("alpha", &[("implement", Some("ws://remote"))]);
-    convoy.vessels[0].host = Some(HostName::new("missing-host"));
+fn generated_attach_uses_the_convoys_repo_hint() {
+    let mut app = stub_app_with_repos(2);
+    let expected_repo = app.model.repo_order[1].clone();
+    let mut convoy = convoy_with_vessels("alpha", &["implement"]);
+    convoy.repo_hint = Some(flotilla_protocol::RepoKey(expected_repo.path.clone()));
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    app.handle_key(key(KeyCode::Char('a')));
+    app.handle_key(key(KeyCode::Enter));
 
-    assert!(app.proto_commands.take_next().is_none());
-    assert_eq!(app.model.status_message.as_deref(), Some("host 'missing-host' is not connected"));
+    app.handle_key(key(KeyCode::Char('.')));
+    app.handle_key(key(KeyCode::Enter));
+
+    let command = app.proto_commands.take_next().expect("attach command").0;
+    assert_eq!(command.context_repo, Some(RepoSelector::Identity(expected_repo)));
 }
 
 #[test]
-fn a_on_vessel_without_workspace_ref_sets_status_message() {
-    let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[("implement", None)])]))));
-    app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_vessel(), Some("implement"));
+fn table_action_repo_hint_matches_remote_repo_identity() {
+    let identity = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
 
-    app.handle_key(key(KeyCode::Char('a')));
-
-    assert!(app.proto_commands.take_next().is_none(), "no command dispatched when workspace_ref is None");
-    let msg = app.model.status_message.as_deref().expect("expected a transient status message");
-    assert!(msg.contains("implement"), "status message should reference the vessel name, got: {msg}");
-    assert!(msg.contains("no workspace yet"), "status message should explain no workspace yet, got: {msg}");
+    assert!(super::key_handlers::repo_identity_matches_hint(
+        &identity,
+        &flotilla_protocol::RepoKey("github-com-flotilla-org-flotilla".into())
+    ));
 }
 
 #[test]
-fn a_on_two_vessel_convoy_dispatches_correct_ws_ref_per_selection() {
+fn mouse_click_selects_and_double_click_drills() {
     let mut app = stub_app();
-    app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy_with_vessel_refs("alpha", &[
-        ("implement", Some("ws://impl")),
-        ("review", Some("ws://rev")),
-    ])]))));
+    app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["alpha", "bravo"]))));
     app.switch_tab(1);
-    app.handle_key(key(KeyCode::Char('l')));
-    assert_eq!(app.selected_convoy_vessel(), Some("implement"));
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let mut ctx = crate::widgets::RenderContext {
+                model: &app.model,
+                views: &mut app.views,
+                ui: &mut app.ui,
+                theme: &app.theme,
+                keymap: &app.keymap,
+                in_flight: &app.in_flight,
+                namespaces: &app.namespaces,
+            };
+            app.screen.render(frame, frame.area(), &mut ctx);
+        })
+        .expect("draw");
+    app.handle_mouse(MouseEvent { kind: MouseEventKind::ScrollDown, column: 3, row: 0, modifiers: KeyModifiers::NONE });
+    assert_eq!(selected_table_name(&app).as_deref(), Some("alpha"), "wheel events outside the table do not move its cursor");
 
-    app.handle_key(key(KeyCode::Char('a')));
-    let first = app.proto_commands.take_next().expect("first dispatch");
-    match &first.0.action {
-        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws://impl"),
-        other => panic!("expected SelectWorkspace, got {other:?}"),
-    }
+    let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 3, row: 5, modifiers: KeyModifiers::NONE };
 
-    app.handle_key(key(KeyCode::Char('j')));
-    assert_eq!(app.selected_convoy_vessel(), Some("review"));
-    app.handle_key(key(KeyCode::Char('a')));
-    let second = app.proto_commands.take_next().expect("second dispatch");
-    match &second.0.action {
-        flotilla_protocol::CommandAction::SelectWorkspace { ws_ref } => assert_eq!(ws_ref, "ws://rev"),
-        other => panic!("expected SelectWorkspace, got {other:?}"),
-    }
+    app.handle_mouse(click);
+    assert_eq!(selected_table_name(&app).as_deref(), Some("bravo"));
+    app.handle_mouse(click);
+    assert_eq!(app.views.active_address(), Some(&"convoy/flotilla/bravo".parse().expect("valid address")));
+}
+
+#[test]
+fn table_page_keeps_shell_palette_tab_and_quit_bindings() {
+    let mut app = stub_app_with_repos(1);
+    app.switch_tab(1);
+    app.handle_key(key(KeyCode::Char('/')));
+    assert!(app.screen.has_modal());
+    app.dismiss_modals();
+
+    app.handle_key(key(KeyCode::Char(']')));
+    assert_eq!(app.views.active_index(), 2);
+    app.switch_tab(1);
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
+}
+
+#[test]
+fn table_refresh_requests_a_fresh_named_query_snapshot() {
+    let mut app = stub_app();
+    app.switch_tab(1);
+    app.query_seqs.insert(flotilla_protocol::QueryId::Convoys, 42);
+    app.subscriptions_dirty = false;
+
+    app.handle_key(key(KeyCode::Char('r')));
+
+    assert!(!app.query_seqs.contains_key(&flotilla_protocol::QueryId::Convoys));
+    assert!(app.subscriptions_dirty);
+    assert!(app.proto_commands.take_next().is_none(), "table refresh resubscribes instead of dispatching a repo command");
 }

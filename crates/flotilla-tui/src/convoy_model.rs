@@ -1,8 +1,8 @@
-//! TUI-local model used by the established convoy widgets.
+//! TUI-owned typed adapter for the surface-agnostic convoy table registry.
 //!
 //! The daemon wire contract is the typed convoys query result set
 //! ([`flotilla_protocol::result_set`]). This adapter model is intentionally
-//! surface-owned and may evolve with the ratatui presentation.
+//! surface-owned and may evolve with consumer-side view requirements.
 
 use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, RepoKey, ResourceRef};
 

@@ -170,32 +170,14 @@ async fn resync_subscriptions(app: &mut App) {
 fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     terminal.draw(|f| {
         let area = f.area();
-        let convoys_selected = app.convoys_ui.selected.clone();
-        let convoys_selected_vessel = app.convoys_ui.selected_vessel.as_deref();
-        let convoys_focus = app.convoys_ui.focus;
-        let convoy_filter = app.convoys_ui.filter.as_str();
-        // Pre-filter the convoy list for the active view's convoy scope
-        // (namespace, plus project restriction on project dashboards).
-        // Borrow only the convoy-related fields to avoid a whole-struct borrow
-        // conflict with `&mut app.ui` below.
-        let scope = app.views.active_address().and_then(crate::app::view_kind::convoy_scope);
-        let (active_namespace, project) =
-            scope.as_ref().map(|s| (s.namespace.as_str(), s.project.as_deref())).unwrap_or(("flotilla", None));
-        let raw = app.namespaces.get(active_namespace).map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
-        let convoys: Vec<&_> = crate::app::filter_convoys_scoped(raw.iter().copied(), project, &app.convoys_ui.filter).collect();
         let mut ctx = crate::widgets::RenderContext {
             model: &app.model,
-            views: &app.views,
+            views: &mut app.views,
             ui: &mut app.ui,
             theme: &app.theme,
             keymap: &app.keymap,
             in_flight: &app.in_flight,
             namespaces: &app.namespaces,
-            convoys_selected,
-            convoys_selected_vessel,
-            convoys_focus,
-            convoy_filter,
-            convoys,
         };
         app.screen.render(f, area, &mut ctx);
     })?;

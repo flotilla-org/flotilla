@@ -14,6 +14,7 @@ pub mod shared;
 mod shimmer;
 pub mod splash;
 pub mod status_bar;
+pub mod table_view;
 pub mod terminal;
 pub mod theme;
 pub mod ui_helpers;

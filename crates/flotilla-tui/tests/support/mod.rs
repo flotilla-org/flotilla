@@ -186,17 +186,12 @@ impl TestHarness {
                 let area = frame.area();
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.model,
-                    views: &self.views,
+                    views: &mut self.views,
                     ui: &mut self.ui,
                     theme: &theme,
                     keymap: &keymap,
                     in_flight: &self.in_flight,
                     namespaces: &empty_namespaces,
-                    convoys_selected: None,
-                    convoys_selected_vessel: None,
-                    convoys_focus: flotilla_tui::app::ConvoysFocus::List,
-                    convoy_filter: "",
-                    convoys: vec![],
                 };
                 self.screen.render(frame, area, &mut ctx);
             })

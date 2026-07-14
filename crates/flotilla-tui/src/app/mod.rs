@@ -279,28 +279,6 @@ pub struct NamespaceModel {
     pub last_seq: u64,
 }
 
-/// Which pane has focus on the Convoys tab — the convoy list (left) or the
-/// vessel tree (right). `j/k` semantics depend on this: in `List` they move
-/// between convoys; in `Vessels` they move between vessels of the selected convoy.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConvoysFocus {
-    #[default]
-    List,
-    Vessels,
-}
-
-/// UI state for the Convoys tab.
-#[derive(Default)]
-pub struct ConvoysUiState {
-    pub selected: Option<crate::convoy_model::ConvoyId>,
-    /// Name of the selected vessel within `selected`. Cleared when the convoy
-    /// selection changes; clamped against the convoy's vessel list on every
-    /// snapshot/delta apply.
-    pub selected_vessel: Option<String>,
-    pub focus: ConvoysFocus,
-    pub filter: String,
-}
-
 /// A command that has been dispatched to the daemon and is awaiting completion.
 pub struct InFlightCommand {
     pub repo_identity: RepoIdentity,
@@ -345,46 +323,6 @@ pub fn collect_visible_status_items(model: &TuiModel, ui: &UiState) -> Vec<Visib
     }
 
     items.into_iter().filter(|item| !ui.status_bar.dismissed_status_ids.contains(&item.id)).collect()
-}
-
-/// The convoy-data scope of the active View, for view kinds that consume the
-/// convoys query (ADR 0013).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConvoyScope {
-    pub namespace: String,
-    /// Restrict the visible list to convoys of this Project (project views).
-    pub project: Option<String>,
-    /// Pin to exactly one convoy (single-convoy and vessel views).
-    pub convoy: Option<String>,
-    /// Pin to exactly one vessel (vessel views): selection never moves, and
-    /// vessel intents (attach, complete) target this vessel only.
-    pub vessel: Option<String>,
-}
-
-/// Filter a slice of convoy summaries by a case-insensitive substring `filter`.
-///
-/// Matches against convoy name and `repo_hint`. An empty filter passes everything.
-/// This is the single source of truth for the Convoys tab filter — call sites that
-/// need a pre-filtered list (e.g. `render_frame`) should invoke this directly with
-/// field-level borrows rather than going through `App::visible_convoys` (which
-/// borrows all of `self`).
-pub fn filter_convoys_by_str<'a>(
-    convoys: impl IntoIterator<Item = &'a crate::convoy_model::ConvoySummary>,
-    filter: &str,
-) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> {
-    let f = filter.to_lowercase();
-    convoys.into_iter().filter(move |c| {
-        f.is_empty() || c.name.to_lowercase().contains(&f) || c.repo_hint.as_ref().is_some_and(|r| r.0.to_lowercase().contains(&f))
-    })
-}
-
-/// Filter convoys to a project scope (when set) and the text filter.
-pub fn filter_convoys_scoped<'a>(
-    convoys: impl IntoIterator<Item = &'a crate::convoy_model::ConvoySummary>,
-    project: Option<&'a str>,
-    filter: &str,
-) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> {
-    filter_convoys_by_str(convoys, filter).filter(move |c| project.is_none() || c.project_ref.as_deref() == project)
 }
 
 /// Log provider errors and format them into a status message.
@@ -439,9 +377,6 @@ pub struct App {
     /// Per-namespace convoy state. Keyed by namespace string. Populated from
     /// `DaemonEvent::ResultSet` / `ResultDelta`.
     pub namespaces: HashMap<String, NamespaceModel>,
-    /// Convoys tab UI state (selection, filter). Shared by all convoys views
-    /// for now; keyed per view address when more convoy-scoped kinds land.
-    pub convoys_ui: ConvoysUiState,
     /// Repo paths this TUI asked the daemon to track (the [+] flow), whose
     /// `RepoTracked` events should open a tab on arrival.
     pub pending_repo_opens: Vec<PathBuf>,
@@ -515,7 +450,6 @@ impl App {
             issue_update_rx,
             session_id: uuid::Uuid::new_v4(),
             namespaces: HashMap::new(),
-            convoys_ui: ConvoysUiState::default(),
             pending_repo_opens: Vec::new(),
             query_seqs: HashMap::new(),
             subscriptions_dirty: true,
@@ -741,12 +675,6 @@ impl App {
                 self.ui.view_layout = page.layout;
             }
         }
-        // A vessel view pins the vessel selection to its own vessel so
-        // vessel intents (attach, complete) target it.
-        if let Some(ViewAddress::Vessel { vessel, .. }) = self.views.active_address() {
-            self.convoys_ui.selected_vessel = Some(vessel.clone());
-            self.convoys_ui.focus = ConvoysFocus::Vessels;
-        }
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
@@ -952,7 +880,7 @@ impl App {
             provisioning_target: &self.ui.provisioning_target,
             my_host,
             my_node_id,
-            views: &self.views,
+            views: &mut self.views,
             commands: &mut self.proto_commands,
             active_repo_is_remote_only,
             namespaces: &self.namespaces,
@@ -1082,6 +1010,15 @@ impl App {
                 AppAction::OpenView(address) => {
                     self.open_view(address);
                 }
+                AppAction::DrillView(address) => {
+                    self.drill_view(address);
+                }
+                AppAction::BackView => {
+                    self.back_view();
+                }
+                AppAction::ExecuteTableIntent(intent) => {
+                    self.execute_table_intent(intent);
+                }
                 AppAction::SwitchToLastView => {
                     self.switch_to_last_view();
                 }
@@ -1113,7 +1050,10 @@ impl App {
                     self.move_tab(1);
                 }
                 AppAction::Refresh => {
-                    if let Some(repo) = self.model.active_repo_root_opt().cloned() {
+                    if let Some(query) = self.views.active_address().and_then(view_kind::query) {
+                        self.query_seqs.remove(&query);
+                        self.subscriptions_dirty = true;
+                    } else if let Some(repo) = self.model.active_repo_root_opt().cloned() {
                         self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
                     } else {
                         self.set_status_message(Some("No active repo".into()));
@@ -1259,10 +1199,6 @@ impl App {
             DaemonEvent::ResultSet(result_set) => {
                 self.query_seqs.insert(result_set.query(), result_set.seq);
                 let Some(rows) = result_set.rows.as_convoys() else { return };
-                let mut touched: Vec<_> = self.namespaces.keys().cloned().collect();
-                if touched.is_empty() {
-                    touched.push("flotilla".to_string());
-                }
                 self.namespaces.clear();
                 for row in rows {
                     let convoy = ConvoySummary::from(row);
@@ -1270,27 +1206,17 @@ impl App {
                     let entry = self.namespaces.entry(namespace.clone()).or_default();
                     entry.convoys.insert(convoy.id.clone(), convoy);
                     entry.last_seq = result_set.seq;
-                    if !touched.contains(&namespace) {
-                        touched.push(namespace);
-                    }
-                }
-                for namespace in touched {
-                    self.refresh_convoy_selection(&namespace);
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
                 self.query_seqs.insert(delta.query(), delta.seq);
                 let Some(changed) = delta.changed.as_convoys() else { return };
-                let mut touched = Vec::new();
                 for row in changed {
                     let convoy = ConvoySummary::from(row);
                     let namespace = convoy.namespace.clone();
                     let entry = self.namespaces.entry(namespace.clone()).or_default();
                     entry.convoys.insert(convoy.id.clone(), convoy);
                     entry.last_seq = delta.seq;
-                    if !touched.contains(&namespace) {
-                        touched.push(namespace);
-                    }
                 }
                 for removed in &delta.removed {
                     let namespace = removed.namespace.clone();
@@ -1298,12 +1224,6 @@ impl App {
                         entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
                         entry.last_seq = delta.seq;
                     }
-                    if !touched.contains(&namespace) {
-                        touched.push(namespace);
-                    }
-                }
-                for namespace in touched {
-                    self.refresh_convoy_selection(&namespace);
                 }
             }
         }
@@ -1541,193 +1461,9 @@ impl App {
         self.repo_command(action)
     }
 
-    /// Returns convoys for the given namespace in insertion order.
+    /// Returns convoys for a namespace in daemon-provided order.
     pub fn convoys(&self, namespace: &str) -> Vec<&crate::convoy_model::ConvoySummary> {
-        self.namespaces.get(namespace).map(|m| m.convoys.values().collect()).unwrap_or_default()
-    }
-
-    /// Returns the selected convoy id for the Convoys tab, if any.
-    pub fn selected_convoy_id(&self) -> Option<&crate::convoy_model::ConvoyId> {
-        self.convoys_ui.selected.as_ref()
-    }
-
-    /// Returns the convoy filter string for the Convoys tab.
-    pub fn convoy_filter_str(&self) -> &str {
-        &self.convoys_ui.filter
-    }
-
-    /// Returns the selected vessel name within the selected convoy, if any.
-    pub fn selected_convoy_vessel(&self) -> Option<&str> {
-        self.convoys_ui.selected_vessel.as_deref()
-    }
-
-    /// Returns the current focus pane for the Convoys tab.
-    pub fn convoys_focus(&self) -> ConvoysFocus {
-        self.convoys_ui.focus
-    }
-
-    /// Validate the current convoy selection and default-select when needed.
-    ///
-    /// Called after every namespace snapshot or delta:
-    /// - Clears selection when there are no convoys.
-    /// - Replaces a dangling selection (removed convoy) with the first available convoy.
-    /// - Sets the first convoy as the default when no selection is set yet.
-    /// - Resets vessel focus state when the selected convoy changes.
-    /// - Clamps `selected_vessel` against the selected convoy's current vessel list.
-    fn refresh_convoy_selection(&mut self, namespace: &str) {
-        let prior_selected = self.convoys_ui.selected.clone();
-        let Some(model) = self.namespaces.get(namespace) else {
-            self.convoys_ui.selected = None;
-            self.reset_convoy_vessel_state();
-            return;
-        };
-        if model.convoys.is_empty() {
-            self.convoys_ui.selected = None;
-            self.reset_convoy_vessel_state();
-            return;
-        }
-        let still_valid = self.convoys_ui.selected.as_ref().is_some_and(|id| model.convoys.contains_key(id));
-        if !still_valid {
-            self.convoys_ui.selected = Some(model.convoys.keys().next().cloned().expect("non-empty checked above"));
-        }
-        if self.convoys_ui.selected != prior_selected {
-            self.reset_convoy_vessel_state();
-        }
-        self.clamp_selected_vessel(namespace);
-    }
-
-    fn reset_convoy_vessel_state(&mut self) {
-        self.convoys_ui.selected_vessel = None;
-        self.convoys_ui.focus = ConvoysFocus::List;
-    }
-
-    /// If `selected_vessel` no longer matches a vessel in the selected convoy,
-    /// reset it (`None`) and snap focus back to the convoy list. Otherwise the
-    /// vessel pane would render with bold borders but no selected row — visual
-    /// limbo until the user pressed `j`/`k`.
-    fn clamp_selected_vessel(&mut self, namespace: &str) {
-        let Some(vessel) = self.convoys_ui.selected_vessel.clone() else { return };
-        let still_valid =
-            self.selected_convoy_summary(namespace).is_some_and(|c| c.vessels.iter().any(|candidate| candidate.name == vessel));
-        if !still_valid {
-            self.convoys_ui.selected_vessel = None;
-            self.convoys_ui.focus = ConvoysFocus::List;
-        }
-    }
-
-    fn selected_convoy_summary<'a>(&'a self, namespace: &str) -> Option<&'a crate::convoy_model::ConvoySummary> {
-        let id = self.convoys_ui.selected.as_ref()?;
-        self.namespaces.get(namespace)?.convoys.get(id)
-    }
-
-    /// The convoy-data scope of the active View, when it consumes the
-    /// convoys query. None on overview/repo/broken tabs.
-    pub(crate) fn active_convoy_scope(&self) -> Option<ConvoyScope> {
-        view_kind::convoy_scope(self.views.active_address()?)
-    }
-
-    /// The convoy a scope acts on: the pinned convoy for single-convoy and
-    /// vessel views, otherwise the list selection.
-    pub(crate) fn scoped_convoy_summary<'a>(&'a self, scope: &ConvoyScope) -> Option<&'a crate::convoy_model::ConvoySummary> {
-        match &scope.convoy {
-            Some(name) => self.namespaces.get(&scope.namespace)?.convoys.values().find(|c| &c.name == name),
-            None => self.selected_convoy_summary(&scope.namespace),
-        }
-    }
-
-    /// Switch focus to the vessel tree, defaulting to the first vessel if none selected.
-    /// No-op when no convoy is selected or the convoy has no vessels.
-    pub fn enter_convoy_vessels_focus(&mut self, scope: &ConvoyScope) {
-        let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
-        if convoy.vessels.is_empty() {
-            return;
-        }
-        if self.convoys_ui.selected_vessel.is_none() {
-            self.convoys_ui.selected_vessel = Some(convoy.vessels[0].name.clone());
-        }
-        self.convoys_ui.focus = ConvoysFocus::Vessels;
-    }
-
-    /// Return focus to the convoy list. Keeps `selected_vessel` so re-entering Vessels
-    /// resumes at the same row.
-    pub fn exit_convoy_vessels_focus(&mut self) {
-        self.convoys_ui.focus = ConvoysFocus::List;
-    }
-
-    /// Move vessel selection within the scoped convoy by `delta` (positive = down).
-    /// Clamps at both ends. No-op when no vessels are visible.
-    pub fn convoy_vessels_select_delta(&mut self, scope: &ConvoyScope, delta: isize) {
-        let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
-        if convoy.vessels.is_empty() {
-            self.convoys_ui.selected_vessel = None;
-            return;
-        }
-        let names: Vec<String> = convoy.vessels.iter().map(|t| t.name.clone()).collect();
-        let current_idx = self.convoys_ui.selected_vessel.as_ref().and_then(|n| names.iter().position(|m| m == n)).unwrap_or(0);
-        let new_idx = (current_idx as isize + delta).clamp(0, (names.len() - 1) as isize) as usize;
-        self.convoys_ui.selected_vessel = Some(names[new_idx].clone());
-    }
-
-    /// Move the convoy selection by `delta` positions (positive = down, negative = up).
-    ///
-    /// Operates on the *filtered* visible set of the given scope so j/k never
-    /// lands on a hidden convoy. Clamps at both ends. No-ops when there are
-    /// no visible convoys.
-    pub(crate) fn convoys_tab_select_delta(&mut self, scope: &ConvoyScope, delta: isize) {
-        let prior_selected = self.convoys_ui.selected.clone();
-        let ids: Vec<crate::convoy_model::ConvoyId> = self.visible_convoys_scoped(scope).map(|c| c.id.clone()).collect();
-        if ids.is_empty() {
-            self.convoys_ui.selected = None;
-            self.reset_convoy_vessel_state();
-            return;
-        }
-        let current_idx = self.convoys_ui.selected.as_ref().and_then(|id| ids.iter().position(|candidate| candidate == id)).unwrap_or(0);
-        let new_idx = (current_idx as isize + delta).clamp(0, (ids.len() - 1) as isize) as usize;
-        self.convoys_ui.selected = Some(ids[new_idx].clone());
-        if self.convoys_ui.selected != prior_selected {
-            self.reset_convoy_vessel_state();
-        }
-    }
-
-    /// Set the filter string for the active convoys-consuming view.
-    ///
-    /// Updates the stored filter and invalidates the current selection if it is
-    /// no longer visible under the new filter.
-    pub fn set_convoy_filter(&mut self, f: impl Into<String>) {
-        self.convoys_ui.filter = f.into();
-        if let Some(scope) = self.active_convoy_scope() {
-            self.refresh_convoy_selection_for_filter(&scope.namespace);
-        }
-    }
-
-    /// Iterate over convoys in the given namespace, filtered by the active
-    /// filter string (case-insensitive substring match on name and repo_hint).
-    pub fn visible_convoys<'a>(&'a self, namespace: &str) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> + 'a {
-        filter_convoys_by_str(self.convoys(namespace), &self.convoys_ui.filter)
-    }
-
-    /// Iterate over the convoys visible in a scope: its namespace, restricted
-    /// to its project when set, under the active text filter.
-    pub fn visible_convoys_scoped<'a>(
-        &'a self,
-        scope: &'a ConvoyScope,
-    ) -> impl Iterator<Item = &'a crate::convoy_model::ConvoySummary> + 'a {
-        filter_convoys_scoped(self.convoys(&scope.namespace), scope.project.as_deref(), &self.convoys_ui.filter)
-    }
-
-    /// When the filter changes, check whether the current selection is still
-    /// visible. If not, default to the first visible convoy (or `None`).
-    fn refresh_convoy_selection_for_filter(&mut self, namespace: &str) {
-        let prior_selected = self.convoys_ui.selected.clone();
-        let visible_ids: Vec<_> = self.visible_convoys(namespace).map(|c| c.id.clone()).collect();
-        let current_visible = self.convoys_ui.selected.as_ref().is_some_and(|id| visible_ids.contains(id));
-        if !current_visible {
-            self.convoys_ui.selected = visible_ids.into_iter().next();
-        }
-        if self.convoys_ui.selected != prior_selected {
-            self.reset_convoy_vessel_state();
-        }
-        self.clamp_selected_vessel(namespace);
+        self.namespaces.get(namespace).map(|model| model.convoys.values().collect()).unwrap_or_default()
     }
 
     pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
