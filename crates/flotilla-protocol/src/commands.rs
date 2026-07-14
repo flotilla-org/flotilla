@@ -108,6 +108,13 @@ pub enum CommandAction {
     Attach {
         reference: String,
     },
+    /// Resolve an attach for a temporary foreground excursion. Unlike the
+    /// human-facing CLI attach, recursive hops must not stamp PM metadata.
+    AttachTransient {
+        reference: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<crate::HostName>,
+    },
     PrepareTerminalForCheckout {
         checkout_path: PathBuf,
         /// Role→command mappings from the requesting host's template.
@@ -189,16 +196,14 @@ pub enum CommandAction {
         name: String,
         spec_yaml: String,
     },
-    ProjectCreate {
-        name: String,
+    ProjectAdd {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        repository_url: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subpath: Option<String>,
-        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
-        r#ref: Option<String>,
+        remote: Option<String>,
     },
     ProjectApply {
         name: String,
@@ -271,6 +276,7 @@ impl CommandAction {
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::Attach { .. }
+                | CommandAction::AttachTransient { .. }
                 | CommandAction::QueryIssues { .. }
                 | CommandAction::QueryIssueFetchByIds { .. }
                 | CommandAction::QueryIssueOpenInBrowser { .. }
@@ -285,6 +291,7 @@ impl Command {
             CommandAction::CreateWorkspaceFromPreparedTerminal { .. } => "Creating workspace...",
             CommandAction::SelectWorkspace { .. } => "Switching workspace...",
             CommandAction::Attach { .. } => "Resolving attach target...",
+            CommandAction::AttachTransient { .. } => "Resolving temporary attach target...",
             CommandAction::PrepareTerminalForCheckout { .. } => "Preparing terminal...",
             CommandAction::Checkout { target, .. } => match target {
                 CheckoutTarget::Branch(_) => "Checking out branch...",
@@ -304,7 +311,7 @@ impl Command {
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
-            CommandAction::ProjectCreate { .. } => "Creating project...",
+            CommandAction::ProjectAdd { .. } => "Adding project...",
             CommandAction::ProjectApply { .. } => "Applying project...",
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
@@ -429,7 +436,7 @@ pub enum CommandValue {
     WorkflowTemplateApplied {
         name: String,
     },
-    ProjectCreated {
+    ProjectAdded {
         name: String,
     },
     ProjectApplied {
@@ -564,6 +571,12 @@ mod tests {
             Command {
                 node_id: None,
                 provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::AttachTransient { reference: "terminal-scratch".into(), host: Some(crate::HostName::new("feta")) },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
                 context_repo: Some(RepoSelector::Query("owner/repo".into())),
                 action: CommandAction::OpenChangeRequest { id: "99".into() },
             },
@@ -663,12 +676,11 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ProjectCreate {
-                    name: "my-project".into(),
+                action: CommandAction::ProjectAdd {
+                    target: "/src/flotilla".into(),
+                    name: Some("my-project".into()),
                     display_name: Some("My Project".into()),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
-                    subpath: Some("apps/frontend".into()),
-                    r#ref: Some("main".into()),
+                    remote: Some("origin".into()),
                 },
             },
             Command {
@@ -960,7 +972,7 @@ mod tests {
             CommandValue::IssuesByIds { items: vec![] },
             CommandValue::ConvoyCreated { name: "my-convoy".into() },
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
-            CommandValue::ProjectCreated { name: "my-project".into() },
+            CommandValue::ProjectAdded { name: "my-project".into() },
             CommandValue::ProjectApplied { name: "my-project".into() },
         ];
 

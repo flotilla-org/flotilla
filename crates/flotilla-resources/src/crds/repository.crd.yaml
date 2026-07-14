@@ -1,0 +1,48 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: repositories.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: repositories
+    singular: repository
+    kind: Repository
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Default Branch
+          type: string
+          jsonPath: .status.default_branch
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [identity]
+              x-kubernetes-validations:
+                - rule: "self.identity == oldSelf.identity"
+                  message: "repository identity is immutable after creation"
+                - rule: "self.forge == oldSelf.forge"
+                  message: "repository forge is immutable and identity-derived"
+              properties:
+                identity:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                forge:
+                  type: object
+                  required: [service_url, repository]
+                  properties:
+                    service_url:
+                      type: string
+                    repository:
+                      type: string
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 
-use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData, RepoIdentity};
+use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
 use flotilla_resources::{
-    canonicalize_repo_url, descriptive_repo_slug, repo_key, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec, ResourceBackend, ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey,
+    ResourceBackend, ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
 use sha2::{Digest, Sha256};
 
@@ -16,10 +16,12 @@ use sha2::{Digest, Sha256};
 pub async fn reconcile_checkouts(
     backend: &ResourceBackend,
     namespace: &str,
-    repo_identity: &RepoIdentity,
+    repository_key: &RepositoryKey,
+    repository_slug: &str,
     providers: &ProviderData,
+    host_ref: &str,
 ) -> Result<(), ResourceError> {
-    let scope = observed_checkout_scope(repo_identity)?;
+    let scope = ObservedCheckoutScope { repo_key: repository_key.clone(), repo_slug: repository_slug.to_string() };
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let selector = scope.selector();
     let mut existing: HashMap<_, _> = checkouts
@@ -32,11 +34,12 @@ pub async fn reconcile_checkouts(
 
     for (path, checkout) in &providers.checkouts {
         let name = observed_checkout_name(&scope.repo_key, path);
-        let meta = observed_checkout_meta(&name, &scope.repo_key, &scope.repo_ref);
+        let meta = observed_checkout_meta(&name, &scope.repo_key, &scope.repo_slug);
         let spec = ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: checkout.branch.clone(),
             path: path.path.to_string_lossy().into_owned(),
-            repo_ref: scope.repo_ref.clone(),
+            repo_ref: scope.repo_key.clone(),
+            host_ref: host_ref.to_string(),
             is_main: checkout.is_main,
         });
 
@@ -65,9 +68,9 @@ pub async fn reconcile_checkouts(
 pub async fn delete_observed_checkouts(
     backend: &ResourceBackend,
     namespace: &str,
-    repo_identity: &RepoIdentity,
+    repository_key: &RepositoryKey,
 ) -> Result<(), ResourceError> {
-    let scope = observed_checkout_scope(repo_identity)?;
+    let scope = ObservedCheckoutScope { repo_key: repository_key.clone(), repo_slug: String::new() };
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let selector = scope.selector();
 
@@ -79,43 +82,31 @@ pub async fn delete_observed_checkouts(
 }
 
 struct ObservedCheckoutScope {
-    repo_key: String,
-    repo_ref: String,
+    repo_key: RepositoryKey,
+    repo_slug: String,
 }
 
 impl ObservedCheckoutScope {
     fn selector(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
             (AUTHORITY_LABEL.to_string(), LifecycleAuthority::Observed.as_label_value().to_string()),
-            (REPO_KEY_LABEL.to_string(), self.repo_key.clone()),
+            (REPO_KEY_LABEL.to_string(), self.repo_key.to_string()),
         ])
     }
 }
 
-fn observed_checkout_scope(repo_identity: &RepoIdentity) -> Result<ObservedCheckoutScope, ResourceError> {
-    let canonical_repo = canonical_repo_url(repo_identity).map_err(ResourceError::invalid)?;
-    Ok(ObservedCheckoutScope { repo_key: repo_key(&canonical_repo), repo_ref: descriptive_repo_slug(&canonical_repo) })
-}
-
-fn canonical_repo_url(identity: &RepoIdentity) -> Result<String, String> {
-    if matches!(identity.authority.as_str(), "local" | "unknown") {
-        return Err("cannot derive observed checkout identity without a recognized repository remote".to_string());
-    }
-    canonicalize_repo_url(&format!("https://{}/{}", identity.authority, identity.path.trim_start_matches('/')))
-}
-
-fn observed_checkout_meta(name: &str, repo_key: &str, repo_ref: &str) -> InputMeta {
+fn observed_checkout_meta(name: &str, repo_key: &RepositoryKey, repo_slug: &str) -> InputMeta {
     InputMeta::builder()
         .name(name.to_string())
-        .labels(BTreeMap::from([(REPO_KEY_LABEL.to_string(), repo_key.to_string()), (REPO_LABEL.to_string(), repo_ref.to_string())]))
+        .labels(BTreeMap::from([(REPO_KEY_LABEL.to_string(), repo_key.to_string()), (REPO_LABEL.to_string(), repo_slug.to_string())]))
         .build()
         .with_lifecycle_authority(LifecycleAuthority::Observed)
 }
 
-fn observed_checkout_name(repo_key: &str, path: &QualifiedPath) -> String {
+fn observed_checkout_name(repo_key: &RepositoryKey, path: &QualifiedPath) -> String {
     let mut hash = Sha256::new();
     hash.update(b"observed-checkout-v1\0");
-    hash.update(repo_key.as_bytes());
+    hash.update(repo_key.0.as_bytes());
     hash.update([0]);
     hash.update(path.to_string().as_bytes());
     let digest = format!("{:x}", hash.finalize());
@@ -126,81 +117,54 @@ fn observed_checkout_name(repo_key: &str, path: &QualifiedPath) -> String {
 mod tests {
     use flotilla_protocol::{
         qualified_path::{HostId, QualifiedPath},
-        HostName, ProviderData, RepoIdentity,
+        Checkout, HostName, ProviderData,
     };
-    use flotilla_resources::{
-        Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec,
-        ResourceBackend, ResourceError,
-    };
+    use flotilla_resources::{Checkout as ResourceCheckout, InMemoryBackend, RepositoryKey, ResourceBackend};
 
-    use super::{canonical_repo_url, observed_checkout_name, reconcile_checkouts};
+    use super::{observed_checkout_name, reconcile_checkouts};
 
     #[test]
     fn observed_checkout_names_are_stable_and_host_scoped() {
         let path = "/workspace/flotilla";
-        let first = observed_checkout_name("repo-key", &QualifiedPath::host(HostId::new("host-a"), path));
-        let second = observed_checkout_name("repo-key", &QualifiedPath::host(HostId::new("host-a"), path));
-        let other_host = observed_checkout_name("repo-key", &QualifiedPath::from_host_name(&HostName::new("host-b"), path));
+        let repo_key = RepositoryKey("repo-key".to_string());
+        let first = observed_checkout_name(&repo_key, &QualifiedPath::host(HostId::new("host-a"), path));
+        let second = observed_checkout_name(&repo_key, &QualifiedPath::host(HostId::new("host-a"), path));
+        let other_host = observed_checkout_name(&repo_key, &QualifiedPath::from_host_name(&HostName::new("host-b"), path));
 
         assert_eq!(first, second);
         assert_ne!(first, other_host);
         assert!(first.len() <= 63);
     }
 
-    #[test]
-    fn canonical_repo_url_normalizes_the_remote_identity() {
-        let identity = RepoIdentity { authority: "github.com".to_string(), path: "flotilla-org/flotilla".to_string() };
-
-        assert_eq!(canonical_repo_url(&identity).expect("canonical repo URL"), "https://github.com/flotilla-org/flotilla");
-    }
-
-    #[test]
-    fn canonical_repo_url_normalizes_authority_case() {
-        let identity = RepoIdentity { authority: "GitHub.com".to_string(), path: "flotilla-org/flotilla".to_string() };
-
-        assert_eq!(canonical_repo_url(&identity).expect("canonical repo URL"), "https://github.com/flotilla-org/flotilla");
-    }
-
-    #[test]
-    fn canonical_repo_url_rejects_unknown_repo_identity() {
-        let identity = RepoIdentity { authority: "unknown".to_string(), path: "not-a-remote".to_string() };
-
-        assert!(canonical_repo_url(&identity).is_err());
-    }
-
-    #[test]
-    fn canonical_repo_url_rejects_local_path_identity() {
-        let identity = RepoIdentity { authority: "local".to_string(), path: "/Users/alice/dev/project".to_string() };
-
-        assert!(canonical_repo_url(&identity).is_err());
-    }
-
     #[tokio::test]
-    async fn unknown_repo_identity_leaves_existing_observed_checkouts_untouched() {
+    async fn explicit_repository_identity_supports_remote_less_observations() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
         let checkouts = backend.using::<ResourceCheckout>("flotilla");
-        checkouts
-            .create(
-                &InputMeta::builder().name("existing".to_string()).build(),
-                &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
-                    r#ref: "main".to_string(),
-                    path: "/workspace/repo".to_string(),
-                    repo_ref: "existing-repo".to_string(),
-                    is_main: true,
-                }),
-            )
+        let repository_key = RepositoryKey("local-repository".to_string());
+        let path = QualifiedPath::host(HostId::new("host-01"), "/workspace/repo");
+        let providers = ProviderData {
+            checkouts: [(path, Checkout {
+                branch: "main".to_string(),
+                is_main: true,
+                trunk_ahead_behind: None,
+                remote_ahead_behind: None,
+                working_tree: None,
+                last_commit: None,
+                correlation_keys: Vec::new(),
+                association_keys: Vec::new(),
+                host_name: None,
+                environment_id: None,
+            })]
+            .into_iter()
+            .collect(),
+            ..ProviderData::default()
+        };
+
+        reconcile_checkouts(&backend, "flotilla", &repository_key, "local-repo", &providers, "host-01")
             .await
-            .expect("existing checkout should be created");
+            .expect("remote-less observation should reconcile");
 
-        let result = reconcile_checkouts(
-            &backend,
-            "flotilla",
-            &RepoIdentity { authority: "unknown".to_string(), path: "not-a-remote".to_string() },
-            &ProviderData::default(),
-        )
-        .await;
-
-        assert!(matches!(result, Err(ResourceError::Invalid { .. })));
-        assert_eq!(checkouts.list().await.expect("checkout list should succeed").items.len(), 1);
+        let stored = checkouts.list().await.expect("checkout list should succeed").items;
+        assert!(matches!(stored.as_slice(), [checkout] if checkout.spec.repo_ref() == &repository_key));
     }
 }

@@ -20,9 +20,17 @@ happens. Realised concretely as the **Project** resource.
 _Avoid_: using "Island" as a code/identifier name — it is the metaphor, not the type.
 
 **Project**:
-The resource that structurally groups work (convoys) belonging to one
-repository/codebase. The concrete form of the **Island** metaphor.
+The definition resource that structurally groups work (convoys) belonging to
+one codebase, which may span one or more **Repositories** or repository slices.
+The concrete form of the **Island** metaphor.
 _Avoid_: Repo (a Project may span more than the bare git remote), Workspace.
+
+**Repository**:
+The machine-independent identity of one source repository, shared by every
+checkout, clone, and Project reference to it. A Repository persists even when
+no checkout currently exists.
+_Avoid_: Project (the stewarded work context), Checkout (one materialisation),
+Repo (too easily conflates all three).
 
 **Convoy**:
 A named instance of a workflow — the primary unit of *launched* work. What a
@@ -148,6 +156,18 @@ lifecycle of — **ChangeRequest** (PR), **Issue**. Not resources: they live in 
 cache layer, fetched per external-service+repo (not per host), and the
 **Aggregator** links them to resources for views.
 _Avoid_: Resource (they are not), entity.
+
+**Forge**:
+The external service and repository scope hosting a **Repository**'s source
+collaboration — change requests and, by default, issues. It is a portable
+external identity, not a local provider implementation or credential choice.
+_Avoid_: Tracker binding, provider, remote (a Git transport spelling).
+
+**Issue Source**:
+An external service and scope supplying issues. A **Project** may select one
+override (for example, a Linear project); otherwise each constituent
+Repository's Forge is its Issue Source.
+_Avoid_: Tracker binding, issue cache, provider.
 
 **Demand-backed Query**:
 An **Aggregator** query family materialized only while subscribed, fetched

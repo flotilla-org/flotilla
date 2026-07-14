@@ -11,6 +11,31 @@ use crate::{
 };
 
 macro_rules! define_resource {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, immutable_spec) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+
+            fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), $crate::ResourceError> {
+                let current = serde_json::to_value(current)
+                    .map_err(|error| $crate::ResourceError::decode(format!("serialize current spec: {error}")))?;
+                let requested = serde_json::to_value(requested)
+                    .map_err(|error| $crate::ResourceError::decode(format!("serialize requested spec: {error}")))?;
+                if current == requested {
+                    Ok(())
+                } else {
+                    Err($crate::ResourceError::invalid(concat!(stringify!($name), " spec is immutable after creation")))
+                }
+            }
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -42,6 +67,10 @@ pub trait Resource: Send + Sync + 'static {
     type StatusPatch: StatusPatch<Self::Status>;
 
     const API_PATHS: ApiPaths;
+
+    fn validate_spec_update(_current: &Self::Spec, _requested: &Self::Spec) -> Result<(), ResourceError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

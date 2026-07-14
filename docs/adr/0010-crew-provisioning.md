@@ -84,6 +84,11 @@ the resolver gets smarter.
   fanning over docker and host-direct keeps one effective permission stance
   or fails visibly. Over-confinement is permitted and **recorded**: effective
   stance lands on vessel/crew status for `ls`/panels.
+- **Names do not confer confinement**: no WorkflowTemplate may be described or
+  seeded as `contained` until placement actually enforces that floor and fails
+  under-realization. The stock single-agent contained workflow is an ordinary
+  create-if-absent WorkflowTemplate once that enforcement exists, not a second
+  hard-coded workflow mechanism.
 - **Non-lock-in note:** the walls confine the *task execution environment*
   (actuator). Where the *agent loop pump* (turn generator) runs is
   deliberately unconstrained — today's harnesses conflate the two, but

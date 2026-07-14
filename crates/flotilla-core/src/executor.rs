@@ -327,7 +327,7 @@ pub async fn build_plan(
         | CommandAction::CrewHandoff { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::WorkflowTemplateApply { .. }
-        | CommandAction::ProjectCreate { .. }
+        | CommandAction::ProjectAdd { .. }
         | CommandAction::ProjectApply { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }
@@ -342,6 +342,7 @@ pub async fn build_plan(
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }
         | CommandAction::Attach { .. }
+        | CommandAction::AttachTransient { .. }
         | CommandAction::QueryIssues { .. }
         | CommandAction::QueryIssueFetchByIds { .. }
         | CommandAction::QueryIssueOpenInBrowser { .. } => {

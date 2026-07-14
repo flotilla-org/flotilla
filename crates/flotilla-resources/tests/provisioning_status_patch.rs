@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use flotilla_resources::{
     CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus, CloneStatusPatch, EnvironmentPhase, EnvironmentStatus,
     EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, PresentationPhase, PresentationStatus,
-    PresentationStatusPatch, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase,
+    PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase,
     VesselStatus, VesselStatusPatch,
 };
 
@@ -157,6 +157,8 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         environment_ref: Some("env-a".to_string()),
         checkout_ref: Some("checkout-a".to_string()),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
+        requested_stance: Stance::WorkspaceWrite,
+        effective_stance: Stance::Contained,
         ready_at,
     }
     .apply(&mut status);
@@ -167,10 +169,14 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         environment_ref: Some("env-a".to_string()),
         checkout_ref: Some("checkout-a".to_string()),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
+        requested_stance: Stance::WorkspaceWrite,
+        effective_stance: Stance::Contained,
         ready_at: Utc.timestamp_opt(21, 0).single().expect("timestamp"),
     }
     .apply(&mut status);
     assert_eq!(status.ready_at, Some(ready_at), "reconcile must not restamp an established Ready transition");
+    assert_eq!(status.requested_stance, Some(Stance::WorkspaceWrite));
+    assert_eq!(status.effective_stance, Some(Stance::Contained));
 
     VesselStatusPatch::MarkFailed { message: "clone failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, VesselPhase::Failed);

@@ -32,6 +32,7 @@ use flotilla_core::{
         types::{ChangeRequest, CloudAgentSession, RepoCriteria, SessionStatus, Workspace},
         ChannelLabel, CommandRunner,
     },
+    repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
@@ -41,8 +42,8 @@ use flotilla_protocol::{
     TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, TypedResolver,
-    REPO_KEY_LABEL, REPO_LABEL,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec,
+    RepositorySpec, TypedResolver, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -54,6 +55,35 @@ struct FixedRemoteHostDetector {
 struct MutableRemoteHostDetector {
     owner: &'static str,
     repo: Arc<std::sync::RwLock<String>>,
+}
+
+struct TestRepositoryInspector {
+    repository: Arc<std::sync::RwLock<String>>,
+    fixed_repository_by_path: HashMap<PathBuf, String>,
+}
+
+#[async_trait]
+impl RepositoryInspector for TestRepositoryInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        let repository = match self.fixed_repository_by_path.get(path) {
+            Some(repository) => repository.clone(),
+            None => self.repository.read().map_err(|_| "test repository identity lock poisoned".to_string())?.clone(),
+        };
+        Ok(RepositoryInspection {
+            spec: RepositorySpec::remote(format!("https://github.com/owner/{repository}"))?,
+            checkout: LocalCheckoutInspection {
+                path: path.to_path_buf(),
+                host_ref: "host-test".to_string(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+            transport_url: Some(format!("https://github.com/owner/{repository}")),
+        })
+    }
+}
+
+async fn install_test_repository_inspector(daemon: &InProcessDaemon, repository: Arc<std::sync::RwLock<String>>) {
+    daemon.set_repository_inspector(Arc::new(TestRepositoryInspector { repository, fixed_repository_by_path: HashMap::new() })).await;
 }
 
 fn qpath(host: &HostName, path: impl Into<PathBuf>) -> QualifiedPath {
@@ -538,6 +568,7 @@ async fn daemon_for_plain_dir_with_discovery(discovery: DiscoveryRuntime) -> (te
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     (temp, repo, daemon)
 }
 
@@ -1352,6 +1383,7 @@ async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathB
 
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     (temp, repo_a, repo_b, daemon)
 }
 
@@ -1677,6 +1709,7 @@ async fn repo_refresh_reconciles_observed_checkouts() {
 
     let daemon =
         InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 
@@ -1700,7 +1733,7 @@ async fn repo_refresh_reconciles_observed_checkouts() {
     assert_eq!(main.metadata.labels.get(REPO_LABEL).map(String::as_str), Some("github-com-owner-repo"));
     assert_eq!(main.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
     match &main.spec {
-        ResourceCheckoutSpec::Observed(spec) => assert_eq!(spec.repo_ref, "github-com-owner-repo"),
+        ResourceCheckoutSpec::Observed(spec) => assert_eq!(spec.repo_ref, flotilla_resources::RepositoryKey(repo_key.clone())),
         other => panic!("expected observed checkout spec, got {other:?}"),
     }
 
@@ -1716,10 +1749,10 @@ async fn repo_refresh_reconciles_observed_checkouts() {
     assert_eq!(second.items.len(), 1);
     assert_eq!(second.items[0].metadata.name, feature_name, "checkout identity should follow its stable path");
     match &second.items[0].spec {
-        ResourceCheckoutSpec::Observed(ObservedCheckoutSpec { r#ref, path, repo_ref, is_main }) => {
+        ResourceCheckoutSpec::Observed(ObservedCheckoutSpec { r#ref, path, repo_ref, is_main, .. }) => {
             assert_eq!(r#ref, "feature-renamed");
             assert_eq!(path, &feature_path_string);
-            assert_eq!(repo_ref, "github-com-owner-repo");
+            assert_eq!(repo_ref, &flotilla_resources::RepositoryKey(repo_key.clone()));
             assert!(!is_main);
         }
         other => panic!("expected observed checkout spec, got {other:?}"),
@@ -1731,13 +1764,14 @@ async fn repo_refresh_reconciles_observed_checkouts() {
                 .name("adopted-checkout-feature".to_string())
                 .labels(std::collections::BTreeMap::from([
                     (flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string()),
-                    (REPO_KEY_LABEL.to_string(), repo_key),
+                    (REPO_KEY_LABEL.to_string(), repo_key.clone()),
                 ]))
                 .build(),
             &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: "feature-renamed".to_string(),
                 path: feature_path_string,
-                repo_ref: "github-com-owner-repo".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey(repo_key.clone()),
+                host_ref: "host-01".to_string(),
                 is_main: false,
             }),
         )
@@ -1766,6 +1800,7 @@ async fn removing_final_local_root_deletes_observed_checkouts() {
 
     let daemon =
         InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 
@@ -1789,6 +1824,7 @@ async fn removing_final_local_root_preserves_adopted_checkouts() {
 
     let daemon =
         InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 
@@ -1801,13 +1837,14 @@ async fn removing_final_local_root_preserves_adopted_checkouts() {
                 .name("adopted-checkout".to_string())
                 .labels(std::collections::BTreeMap::from([
                     (flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string()),
-                    (REPO_KEY_LABEL.to_string(), repo_key),
+                    (REPO_KEY_LABEL.to_string(), repo_key.clone()),
                 ]))
                 .build(),
             &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: repo.to_string_lossy().into_owned(),
-                repo_ref: "github-com-owner-repo".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey(repo_key.clone()),
+                host_ref: "host-01".to_string(),
                 is_main: true,
             }),
         )
@@ -1871,6 +1908,7 @@ async fn removing_final_local_root_deletes_observed_checkouts_when_virtual_root_
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
     let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     let identity = RepoIdentity { authority: "github.com".to_string(), path: "owner/repo".to_string() };
     daemon.add_virtual_repo(identity.clone(), virtual_repo.clone(), vec![], 0).await.expect("add virtual root");
     daemon.add_repo(&repo).await.expect("add local root");
@@ -1899,6 +1937,7 @@ async fn repository_identity_change_removes_old_repo_key_observed_checkouts() {
 
     let daemon =
         InProcessDaemon::new(vec![repo.clone()], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::clone(&discovered_repo)).await;
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 
@@ -1940,6 +1979,12 @@ async fn repository_identity_change_reconciles_old_identity_shared_by_another_ro
         HostName::local(),
     )
     .await;
+    daemon
+        .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            repository: Arc::clone(&discovered_repo),
+            fixed_repository_by_path: HashMap::from([(repo_b.clone(), "old-repo".to_string())]),
+        }))
+        .await;
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 

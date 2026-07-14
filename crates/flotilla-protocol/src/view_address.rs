@@ -30,6 +30,8 @@ pub enum ViewAddress {
     Overview,
     /// All convoys in one namespace.
     Convoys { namespace: String },
+    /// All terminal sessions that are not associated with a Convoy.
+    Independents,
     /// One convoy: its vessel DAG, phases, and intents.
     Convoy { namespace: String, name: String },
     /// One vessel: crew, work state, attach.
@@ -46,6 +48,7 @@ impl ViewAddress {
         match self {
             Self::Overview => "overview",
             Self::Convoys { .. } => "convoys",
+            Self::Independents => "independents",
             Self::Convoy { .. } => "convoy",
             Self::Vessel { .. } => "vessel",
             Self::Project { .. } => "project",
@@ -70,6 +73,7 @@ impl fmt::Display for ViewAddress {
         match self {
             Self::Overview => f.write_str("overview"),
             Self::Convoys { namespace } => write!(f, "convoys/{}", encode(namespace)),
+            Self::Independents => f.write_str("independents"),
             Self::Convoy { namespace, name } => write!(f, "convoy/{}/{}", encode(namespace), encode(name)),
             Self::Vessel { namespace, convoy, vessel } => {
                 write!(f, "vessel/{}/{}/{}", encode(namespace), encode(convoy), encode(vessel))
@@ -114,6 +118,10 @@ impl FromStr for ViewAddress {
             "convoys" => match segments[1..] {
                 [namespace] => Ok(Self::Convoys { namespace: decode(namespace)? }),
                 _ => Err(format!("convoys takes exactly one parameter (namespace): {s}")),
+            },
+            "independents" => match segments.len() {
+                1 => Ok(Self::Independents),
+                _ => Err(format!("independents takes no parameters: {s}")),
             },
             "convoy" => match segments[1..] {
                 [namespace, name] => Ok(Self::Convoy { namespace: decode(namespace)?, name: decode(name)? }),
@@ -173,6 +181,12 @@ mod tests {
         let addr = ViewAddress::Convoys { namespace: "flotilla".to_string() };
         assert_eq!(addr.to_string(), "convoys/flotilla");
         assert_eq!("convoys/flotilla".parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn independents_round_trips() {
+        assert_eq!("independents".parse::<ViewAddress>().expect("parse"), ViewAddress::Independents);
+        assert_eq!(ViewAddress::Independents.to_string(), "independents");
     }
 
     #[test]
@@ -240,6 +254,7 @@ mod tests {
         assert!("overview/extra".parse::<ViewAddress>().is_err());
         assert!("convoys".parse::<ViewAddress>().is_err());
         assert!("convoys/a/b".parse::<ViewAddress>().is_err());
+        assert!("independents/extra".parse::<ViewAddress>().is_err());
         assert!("repo/github.com".parse::<ViewAddress>().is_err());
         assert!("".parse::<ViewAddress>().is_err());
         assert!("convoys//x".parse::<ViewAddress>().is_err());

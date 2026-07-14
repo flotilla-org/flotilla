@@ -286,6 +286,10 @@ pub struct VesselRow {
     pub finished_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_stance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stance: Option<String>,
     /// Names of sibling vessels this vessel depends on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
@@ -307,4 +311,8 @@ pub struct VesselRow {
 pub struct CrewMemberSummary {
     pub role: String,
     pub command_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_stance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stance: Option<String>,
 }

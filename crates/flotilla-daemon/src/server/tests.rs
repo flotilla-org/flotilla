@@ -326,7 +326,8 @@ async fn daemon_server_observed_resource_backend_is_ephemeral_per_restart() {
             &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: "/Users/alice/dev/flotilla".to_string(),
-                repo_ref: "project-flotilla".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
+                host_ref: "host-01".to_string(),
                 is_main: true,
             }),
         )

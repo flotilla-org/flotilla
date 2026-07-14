@@ -72,10 +72,20 @@ fn convoy_with_project_ref_projects_the_full_spine() {
                 .resource(reference.subresource("vessels/implement"))
                 .name("implement")
                 .phase(WorkPhase::Running)
-                .crew(vec![CrewMemberSummary { role: "coder".to_owned(), command_preview: "implement it".to_owned() }, CrewMemberSummary {
-                    role: "reviewer".to_owned(),
-                    command_preview: "review it".to_owned(),
-                }])
+                .crew(vec![
+                    CrewMemberSummary {
+                        role: "coder".to_owned(),
+                        command_preview: "implement it".to_owned(),
+                        requested_stance: None,
+                        effective_stance: None,
+                    },
+                    CrewMemberSummary {
+                        role: "reviewer".to_owned(),
+                        command_preview: "review it".to_owned(),
+                        requested_stance: None,
+                        effective_stance: None,
+                    },
+                ])
                 .host(HostName::new("feta"))
                 .attach("workspace-1")
                 .build(),

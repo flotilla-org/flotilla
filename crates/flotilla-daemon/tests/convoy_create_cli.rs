@@ -8,7 +8,7 @@ use flotilla_core::{
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
-use flotilla_resources::{Convoy, ConvoyPhase, InMemoryBackend, ResourceBackend, SqliteBackend, WorkflowTemplate};
+use flotilla_resources::{Convoy, ConvoyPhase, CrewSource, InMemoryBackend, ResourceBackend, SqliteBackend, Stance, WorkflowTemplate};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
@@ -85,6 +85,16 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
     assert_eq!(scratch.metadata.name, "scratch");
     assert_eq!(scratch.spec.vessels.len(), 1);
     assert_eq!(scratch.spec.vessels[0].name, "work");
+
+    let contained = templates.get("single-agent-contained").await.expect("contained template should be seeded");
+    assert_eq!(contained.spec.vessels.len(), 1);
+    assert_eq!(contained.spec.vessels[0].stance, Stance::Contained);
+    assert!(matches!(
+        contained.spec.vessels[0].crew.as_slice(),
+        [crew]
+            if crew.role == "coder"
+                && matches!(&crew.source, CrewSource::Agent { selector, .. } if selector.capability == "code")
+    ));
 }
 
 #[tokio::test]
