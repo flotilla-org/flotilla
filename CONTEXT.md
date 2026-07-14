@@ -232,6 +232,41 @@ domain semantics; the whole product family uses it. Named for a tender boat —
 it ferries and services connections between ship and shore.
 _Avoid_: Bridge, peer, gateway, proxy, router, tug.
 
+**Convergent Facts**:
+The cross-root resource class whose records are natural-keyed and true
+everywhere at once — **Repository**, Host status, observed **Checkouts**.
+Duplication across roots is harmless and union is the entire merge; no
+conflicts are possible. (ADR 0016.)
+_Avoid_: Reference data (that is external, per ADR 0006), observed data
+(broader).
+
+**Definition (resource class)**:
+The cross-root resource class of human-named, human-authored records —
+**Project**, **WorkflowTemplate**, Host spec. Replicated everywhere,
+editable from any root including offline; merged field-by-field: a write
+made having seen the current value supersedes silently, concurrent
+same-field writes surface as conflicts and are never auto-resolved; deletes
+are permanent tombstones. (ADR 0016.)
+_Avoid_: Config, global resource, CRDT-as-a-noun.
+
+**Home-bound Runtime**:
+The cross-root resource class reconciled only at its home, which is fixed at
+birth where the work runs — **Convoy** records at their coordinating root,
+**Vessels** at their placement host, **TerminalSessions** with their PTYs.
+Elsewhere it is a read-only, staleness-stamped replica. A convoy spans logs
+by construction; its record and its vessels never share a fate. Death of the
+home yields readable memory and a truthful inventory, never resurrection.
+(ADR 0016.)
+_Avoid_: Local resource, host-pinned.
+
+**Succession**:
+How a **Convoy** record changes home: a new home authors a successor record
+(`succeeded_from` ref) and each vessel's host repoints its convoy ref —
+cooperatively for a live handoff, unilaterally after `host declare-lost`.
+Succession moves coordination only; work itself changes hosts exclusively by
+re-provisioning from durable inputs (pushed branch + Brief). (ADR 0016.)
+_Avoid_: Migration, re-home, failover.
+
 **Aggregator**:
 A view-time component that pieces observed resources together (across hosts or
 providers) on demand, for a particular reason — an event, a view. Where any
