@@ -1517,7 +1517,12 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
             let crew = vessel
                 .crew
                 .into_iter()
-                .map(|process| CrewMemberSummary { role: process.role, command_preview: process.command_preview })
+                .map(|process| CrewMemberSummary {
+                    role: process.role,
+                    command_preview: process.command_preview,
+                    requested_stance: None,
+                    effective_stance: None,
+                })
                 .collect();
             VesselRow::builder()
                 .resource(resource.subresource(format!("vessels/{}", vessel.name)))

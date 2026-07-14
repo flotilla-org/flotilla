@@ -26,8 +26,31 @@ pub struct VesselRequirement {
     pub name: String,
     #[builder(default)]
     #[serde(default)]
+    pub stance: Stance,
+    #[builder(default)]
+    #[serde(default)]
     pub depends_on: Vec<String>,
     pub crew: Vec<CrewSpec>,
+}
+
+/// The minimum isolation guarantee required while a vessel runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Stance {
+    #[default]
+    Trusted,
+    WorkspaceWrite,
+    Contained,
+}
+
+impl std::fmt::Display for Stance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Trusted => f.write_str("trusted"),
+            Self::WorkspaceWrite => f.write_str("workspace-write"),
+            Self::Contained => f.write_str("contained"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -56,6 +79,19 @@ pub enum CrewSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selector {
     pub capability: String,
+}
+
+pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
+    WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Contained)
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None })
+                .build()])
+            .build()])
+        .build()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

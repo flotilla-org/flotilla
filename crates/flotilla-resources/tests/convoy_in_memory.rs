@@ -226,6 +226,8 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             terminal_session_refs: vec!["terminal-implement-coder".to_string()],
             started_at: Some(timestamp(18)),
             ready_at: Some(timestamp(19)),
+            requested_stance: None,
+            effective_stance: None,
         })
         .await
         .expect("workspace status update should succeed");

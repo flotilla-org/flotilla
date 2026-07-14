@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch};
+use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey};
 
 define_resource!(Clone, "clones", CloneSpec, CloneStatus, CloneStatusPatch);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CloneSpec {
+    pub repo_ref: RepositoryKey,
     pub url: String,
     pub env_ref: String,
     pub path: String,

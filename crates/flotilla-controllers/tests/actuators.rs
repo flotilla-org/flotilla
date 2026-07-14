@@ -134,6 +134,7 @@ async fn terminal_actuator_uses_literal_command_and_cwd() {
 #[tokio::test]
 async fn checkout_actuator_exposes_fresh_clone_transport_url() {
     let spec = FreshCloneCheckoutSpec {
+        repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
         env_ref: "env-a".to_string(),
         r#ref: "main".to_string(),
         target_path: "/workspace".to_string(),

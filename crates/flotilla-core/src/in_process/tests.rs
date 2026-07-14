@@ -43,6 +43,14 @@ use crate::{
     },
 };
 
+#[test]
+fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
+    assert_eq!(project_target_syntax("/srv/repos/example"), ProjectTargetSyntax::ExplicitPath);
+    assert_eq!(project_target_syntax("./org/repo"), ProjectTargetSyntax::ExplicitPath);
+    assert_eq!(project_target_syntax("org/repo"), ProjectTargetSyntax::QualifiedSlug);
+    assert_eq!(project_target_syntax("repo"), ProjectTargetSyntax::Ambiguous);
+}
+
 fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Option<&str>) -> ConvoyRow {
     ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name))
@@ -279,7 +287,8 @@ async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &s
             &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: "/repo".to_string(),
-                repo_ref: "git@example.com:owner/repo.git".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                host_ref: "host-01".to_string(),
                 is_main: true,
             }),
         )
@@ -324,11 +333,10 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
-                vessels: vec![VesselRequirement { name: "prepare".into(), depends_on: Vec::new(), crew: Vec::new() }, VesselRequirement {
-                    name: "implement".into(),
-                    depends_on: Vec::new(),
-                    crew: processes,
-                }],
+                vessels: vec![
+                    VesselRequirement { name: "prepare".into(), stance: Default::default(), depends_on: Vec::new(), crew: Vec::new() },
+                    VesselRequirement { name: "implement".into(), stance: Default::default(), depends_on: Vec::new(), crew: processes },
+                ],
             }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
                 phase: WorkPhase::Running,
@@ -2441,7 +2449,10 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
         ResourceCheckoutSpec::Observed(spec) => {
             assert_eq!(spec.r#ref, "main");
             assert_eq!(spec.path, std::fs::canonicalize(&checkout_path).expect("canonical path").display().to_string());
-            assert_eq!(spec.repo_ref, remote);
+            assert_eq!(
+                spec.repo_ref,
+                flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec").key()
+            );
         }
         other => panic!("expected observed checkout spec, got {other:?}"),
     }

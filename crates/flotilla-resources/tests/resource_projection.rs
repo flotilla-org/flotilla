@@ -106,6 +106,7 @@ fn checkout_spec_worktree_variant_roundtrips_through_k8s_projection() {
     let object = ResourceObject::<Checkout> {
         metadata: common::object_meta("checkout-a", "flotilla", "3"),
         spec: CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+            repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
             env_ref: "env-a".to_string(),
             r#ref: "feature-a".to_string(),
             target_path: "/worktrees/feature-a".to_string(),
@@ -132,7 +133,8 @@ fn checkout_spec_observed_variant_carries_only_observed_facts() {
         spec: CheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: "main".to_string(),
             path: "/Users/dev/flotilla".to_string(),
-            repo_ref: "project-flotilla".to_string(),
+            repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
+            host_ref: "host-01".to_string(),
             is_main: true,
         }),
         status: None,

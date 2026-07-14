@@ -8,12 +8,10 @@ use common::{
     workflow_template_meta,
 };
 use flotilla_resources::{
-    canonicalize_repo_url,
     controller::{Actuation, Reconciler},
-    controller_patches, reconcile, repo_key, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, CrewSource,
-    CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend,
-    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_LABEL,
+    controller_patches, reconcile, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, CrewSource, CrewWorkPhase,
+    InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, ValidationError, Vessel,
+    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
 };
 
 async fn reconcile_once_with_resources(
@@ -78,13 +76,14 @@ async fn reconcile_once_with_resources(
 }
 
 fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
-    let canonical_repo = canonicalize_repo_url("git@github.com:flotilla-org/flotilla.git").expect("repo url should canonicalize");
+    let repository_key =
+        flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();
     InputMeta {
         name: name.to_string(),
         labels: [
             ("flotilla.work/convoy".to_string(), convoy_name.to_string()),
             ("flotilla.work/vessel".to_string(), task.to_string()),
-            ("flotilla.work/repo-key".to_string(), repo_key(&canonical_repo)),
+            ("flotilla.work/repo-key".to_string(), repository_key.to_string()),
         ]
         .into_iter()
         .collect(),
@@ -119,6 +118,8 @@ fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Opt
             terminal_session_refs: vec![format!("terminal-{task}-coder")],
             started_at: Some(timestamp(16)),
             ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
+            requested_stance: None,
+            effective_stance: None,
         }),
     }
 }
@@ -174,6 +175,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
             .iter()
             .map(|task| flotilla_resources::VesselRequirement {
                 name: task.name.clone(),
+                stance: task.stance,
                 depends_on: task.depends_on.clone(),
                 crew: task.crew.clone(),
             })
@@ -318,9 +320,24 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         vessels: vec![
-            flotilla_resources::VesselRequirement { name: "a".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "b".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "c".to_string(), depends_on: Vec::new(), crew: Vec::new() },
+            flotilla_resources::VesselRequirement {
+                name: "a".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "b".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "c".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
         ],
     });
     status.crew_work =
@@ -346,10 +363,21 @@ fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         vessels: vec![
-            flotilla_resources::VesselRequirement { name: "implement".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "verify".to_string(), depends_on: Vec::new(), crew: Vec::new() },
+            flotilla_resources::VesselRequirement {
+                name: "implement".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "verify".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
             flotilla_resources::VesselRequirement {
                 name: "review".to_string(),
+                stance: Default::default(),
                 depends_on: vec!["implement".to_string(), "verify".to_string()],
                 crew: Vec::new(),
             },
@@ -478,9 +506,24 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
         vessels: vec![
-            flotilla_resources::VesselRequirement { name: "a".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "b".to_string(), depends_on: Vec::new(), crew: Vec::new() },
-            flotilla_resources::VesselRequirement { name: "c".to_string(), depends_on: Vec::new(), crew: Vec::new() },
+            flotilla_resources::VesselRequirement {
+                name: "a".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "b".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
+            flotilla_resources::VesselRequirement {
+                name: "c".to_string(),
+                stance: Default::default(),
+                depends_on: Vec::new(),
+                crew: Vec::new(),
+            },
         ],
     });
     status.work =
@@ -720,11 +763,11 @@ async fn ready_task_emits_vessel_creation_actuation() {
         .expect("task workspace actuation should be present")
     {
         Actuation::CreateVessel { meta, spec } => {
-            let canonical_repo = canonicalize_repo_url("git@github.com:flotilla-org/flotilla.git").expect("repo url should canonicalize");
+            let repository_key = convoy.spec.repository.as_ref().expect("repository association").repo_ref.to_string();
             assert_eq!(meta.name, "convoy-a-implement");
             assert_eq!(meta.labels.get("flotilla.work/convoy").map(String::as_str), Some("convoy-a"));
             assert_eq!(meta.labels.get("flotilla.work/vessel").map(String::as_str), Some("implement"));
-            assert_eq!(meta.labels.get("flotilla.work/repo-key").map(String::as_str), Some(repo_key(&canonical_repo).as_str()));
+            assert_eq!(meta.labels.get("flotilla.work/repo-key").map(String::as_str), Some(repository_key.as_str()));
             assert_eq!(meta.owner_references.len(), 1);
             assert_eq!(meta.owner_references[0].kind, "Convoy");
             assert_eq!(meta.owner_references[0].name, "convoy-a");

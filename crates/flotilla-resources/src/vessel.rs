@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch};
+use crate::{resource::define_resource, status_patch::StatusPatch, Stance};
 
 define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch);
 
@@ -44,14 +44,31 @@ pub struct VesselStatus {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_stance: Option<Stance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stance: Option<Stance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VesselStatusPatch {
-    MarkProvisioning { observed_policy_ref: String, observed_policy_version: String, started_at: DateTime<Utc> },
-    MarkReady { environment_ref: Option<String>, checkout_ref: Option<String>, terminal_session_refs: Vec<String>, ready_at: DateTime<Utc> },
+    MarkProvisioning {
+        observed_policy_ref: String,
+        observed_policy_version: String,
+        started_at: DateTime<Utc>,
+    },
+    MarkReady {
+        environment_ref: Option<String>,
+        checkout_ref: Option<String>,
+        terminal_session_refs: Vec<String>,
+        requested_stance: Stance,
+        effective_stance: Stance,
+        ready_at: DateTime<Utc>,
+    },
     MarkTearingDown,
-    MarkFailed { message: String },
+    MarkFailed {
+        message: String,
+    },
 }
 
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
@@ -64,11 +81,13 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.started_at.get_or_insert(*started_at);
                 status.message = None;
             }
-            Self::MarkReady { environment_ref, checkout_ref, terminal_session_refs, ready_at } => {
+            Self::MarkReady { environment_ref, checkout_ref, terminal_session_refs, requested_stance, effective_stance, ready_at } => {
                 status.phase = VesselPhase::Ready;
                 status.environment_ref = environment_ref.clone();
                 status.checkout_ref = checkout_ref.clone();
                 status.terminal_session_refs = terminal_session_refs.clone();
+                status.requested_stance = Some(*requested_stance);
+                status.effective_stance = Some(*effective_stance);
                 status.ready_at.get_or_insert(*ready_at);
                 status.message = None;
             }

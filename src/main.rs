@@ -1260,7 +1260,7 @@ mod tests {
 
     #[test]
     fn cli_parses_project_noun() {
-        let cli = Cli::try_parse_from(["flotilla", "project", "my-project", "create", "--repo", "https://example.com/repo.git"])
+        let cli = Cli::try_parse_from(["flotilla", "project", "add", "https://example.com/repo.git", "--name", "my-project"])
             .expect("project cli should parse");
         assert!(matches!(cli.command, Some(SubCommand::Project(_))));
     }

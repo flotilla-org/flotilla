@@ -13,6 +13,7 @@ mod placement_policy;
 mod presentation;
 mod project;
 mod provisioning_identity;
+mod repository;
 mod resource;
 mod retention;
 mod sqlite;
@@ -50,8 +51,13 @@ pub use placement_policy::{
     PlacementPolicy, PlacementPolicySpec,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
-pub use project::{Project, ProjectRepositorySpec, ProjectSpec};
+pub use project::{normalize_project_spec, IssueSource, Project, ProjectRepositorySpec, ProjectSpec};
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
+pub use repository::{
+    ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,
+    RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,
+    RepositoryStatusPatch,
+};
 pub use resource::{
     api_version, ApiPaths, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, K8sWatchEvent, ObjectMeta,
     OwnerReference, Resource, ResourceObject,
@@ -67,6 +73,6 @@ pub use terminal_session::{
 pub use vessel::{Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch};
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
 pub use workflow_template::{
-    validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation, Selector, ValidationError,
-    VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation,
+    Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };

@@ -11,7 +11,6 @@ use super::{
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
-    canonicalize_repo_url,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler,
         SecondaryWatch,
@@ -285,6 +284,7 @@ fn bootstrap_outcome(
             .iter()
             .map(|vessel| VesselRequirement {
                 name: vessel.name.clone(),
+                stance: vessel.stance,
                 depends_on: vessel.depends_on.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
             })
@@ -675,19 +675,9 @@ fn cleanup_actuations(
     actuations
 }
 
-fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
+fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
     let placement_policy_ref = convoy.spec.placement_policy.clone()?;
-    let repo_url = convoy.spec.repository.as_ref()?.url.clone();
-    let canonical_repo = match canonicalize_repo_url(&repo_url) {
-        Ok(canonical_repo) => canonical_repo,
-        Err(message) => {
-            return Some(InternalReconcileOutcome {
-                patch: Some(ConvoyStatusPatch::MarkWorkFailed { work: vessel.to_string(), finished_at: now, message }),
-                actuations: Vec::new(),
-                events: vec![ConvoyEvent::WorkPhaseChanged { work: vessel.to_string(), from: WorkPhase::Ready, to: WorkPhase::Failed }],
-            })
-        }
-    };
+    let repository_key = convoy.spec.repository.as_ref()?.repo_ref.to_string();
 
     Some(InternalReconcileOutcome {
         patch: None,
@@ -697,7 +687,7 @@ fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, now: Dat
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
                     (VESSEL_LABEL.to_string(), vessel.to_string()),
-                    (REPO_KEY_LABEL.to_string(), crate::repo_key(&canonical_repo)),
+                    (REPO_KEY_LABEL.to_string(), repository_key),
                 ]))
                 .owner_references(vec![OwnerReference {
                     api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
@@ -777,6 +767,12 @@ fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {
             "placement_policy_ref",
             status.observed_policy_ref.clone().or_else(|| Some(workspace.spec.placement_policy_ref.clone())),
         );
+        if let Some(requested_stance) = status.requested_stance {
+            fields.insert("requested_stance".to_string(), json!(requested_stance));
+        }
+        if let Some(effective_stance) = status.effective_stance {
+            fields.insert("effective_stance".to_string(), json!(effective_stance));
+        }
     }
     PlacementStatus { fields }
 }
