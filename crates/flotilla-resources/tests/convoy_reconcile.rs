@@ -8,12 +8,10 @@ use common::{
     workflow_template_meta,
 };
 use flotilla_resources::{
-    canonicalize_repo_url,
     controller::{Actuation, Reconciler},
-    controller_patches, reconcile, repo_key, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, CrewSource,
-    CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend,
-    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowTemplate, CONVOY_LABEL,
-    VESSEL_LABEL,
+    controller_patches, reconcile, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, CrewSource, CrewWorkPhase,
+    InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, ValidationError, Vessel,
+    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
 };
 
 async fn reconcile_once_with_resources(
@@ -78,13 +76,14 @@ async fn reconcile_once_with_resources(
 }
 
 fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
-    let canonical_repo = canonicalize_repo_url("git@github.com:flotilla-org/flotilla.git").expect("repo url should canonicalize");
+    let repository_key =
+        flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();
     InputMeta {
         name: name.to_string(),
         labels: [
             ("flotilla.work/convoy".to_string(), convoy_name.to_string()),
             ("flotilla.work/vessel".to_string(), task.to_string()),
-            ("flotilla.work/repo-key".to_string(), repo_key(&canonical_repo)),
+            ("flotilla.work/repo-key".to_string(), repository_key.to_string()),
         ]
         .into_iter()
         .collect(),
@@ -764,11 +763,11 @@ async fn ready_task_emits_vessel_creation_actuation() {
         .expect("task workspace actuation should be present")
     {
         Actuation::CreateVessel { meta, spec } => {
-            let canonical_repo = canonicalize_repo_url("git@github.com:flotilla-org/flotilla.git").expect("repo url should canonicalize");
+            let repository_key = convoy.spec.repository.as_ref().expect("repository association").repo_ref.to_string();
             assert_eq!(meta.name, "convoy-a-implement");
             assert_eq!(meta.labels.get("flotilla.work/convoy").map(String::as_str), Some("convoy-a"));
             assert_eq!(meta.labels.get("flotilla.work/vessel").map(String::as_str), Some("implement"));
-            assert_eq!(meta.labels.get("flotilla.work/repo-key").map(String::as_str), Some(repo_key(&canonical_repo).as_str()));
+            assert_eq!(meta.labels.get("flotilla.work/repo-key").map(String::as_str), Some(repository_key.as_str()));
             assert_eq!(meta.owner_references.len(), 1);
             assert_eq!(meta.owner_references[0].kind, "Convoy");
             assert_eq!(meta.owner_references[0].name, "convoy-a");

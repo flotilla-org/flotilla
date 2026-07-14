@@ -232,6 +232,14 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
 async fn clone_controller_marks_clone_ready() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
+    let repository_spec = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    flotilla_resources::ensure_repository(
+        &backend.clone().using::<flotilla_resources::Repository>(NAMESPACE),
+        &repository_spec.key(),
+        &repository_spec,
+    )
+    .await
+    .expect("repository create should succeed");
 
     let clones = backend.clone().using::<Clone>(NAMESPACE);
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
@@ -655,7 +663,7 @@ fn clone_harness(backend: ResourceBackend) -> ControllerLoopHarness {
         ControllerLoop {
             primary: backend.clone().using::<Clone>(NAMESPACE),
             secondaries: vec![],
-            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime)),
+            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.clone().using(NAMESPACE)),
             resync_interval: Duration::from_millis(50),
             backend,
         }
@@ -700,7 +708,7 @@ fn full_controller_harness(backend: ResourceBackend) -> ControllerLoopHarness {
         ControllerLoop {
             primary: backend.clone().using::<Clone>(NAMESPACE),
             secondaries: vec![],
-            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime)),
+            reconciler: CloneReconciler::new(Arc::new(FakeCloneRuntime), backend.clone().using(NAMESPACE)),
             resync_interval: Duration::from_millis(50),
             backend: backend.clone(),
         }

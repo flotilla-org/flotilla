@@ -613,7 +613,10 @@ fn spawn_controller_loops(
                         ControllerLoop {
                             primary: backend.clone().using::<Clone>(&namespace_string),
                             secondaries: vec![],
-                            reconciler: CloneReconciler::new(Arc::new(CloneControllerRuntime { runner })),
+                            reconciler: CloneReconciler::new(
+                                Arc::new(CloneControllerRuntime { runner }),
+                                backend.clone().using::<Repository>(&namespace_string),
+                            ),
                             resync_interval: controller_resync_interval,
                             backend,
                         }

@@ -19,6 +19,7 @@ const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
 const REPO_LABEL: &str = "flotilla.work/repo";
 const ENV_LABEL: &str = "flotilla.work/env";
 
+#[derive(bon::Builder)]
 pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
