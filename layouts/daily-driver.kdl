@@ -9,8 +9,12 @@
 // Launch via scripts/run-daily-driver.sh, which sets the env vars used
 // below: ANDAMENTO_ROOT, FLOTILLA_BIN.
 
+// Native (Rust-linked) andamento plugins — the wasm plugin path has
+// unacceptable serde/runtime overhead for daily driving. Requires the
+// spike/native-plugins zellij built with native-plugins-all (see
+// scripts/run-daily-driver.sh); plugin names resolve via the native registry.
 plugins {
-    andamento-controller location="file:$ANDAMENTO_ROOT/target/wasm32-wasip1/release/andamento-controller.wasm" {
+    andamento-controller location="native:andamento-controller" {
         rail_structure "joined-cells"
         rail_sizing "active-large"
         rail_grouping "directory"
@@ -18,12 +22,12 @@ plugins {
         template_config_path "file:$ANDAMENTO_ROOT/templates/andamento-git.kdl"
         grouping_config_path "file:$ANDAMENTO_ROOT/templates/andamento-git.kdl"
     }
-    andamento-rail location="file:$ANDAMENTO_ROOT/target/wasm32-wasip1/release/andamento-rail.wasm" {
+    andamento-rail location="native:andamento-rail" {
         controller_plugin_url "andamento-controller"
         config_plugin_url "andamento-config"
         rail_placement "left"
     }
-    andamento-config location="file:$ANDAMENTO_ROOT/target/wasm32-wasip1/release/andamento-config.wasm"
+    andamento-config location="native:andamento-config"
 }
 
 load_plugins {

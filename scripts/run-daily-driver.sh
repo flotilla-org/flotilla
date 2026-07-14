@@ -2,15 +2,19 @@
 # Launch the daily-driver zellij session: andamento rail + git-watcher +
 # the flotilla manifest connector (layouts/daily-driver.kdl, #708).
 #
-# Builds the andamento plugins, checks the flotilla dev binaries exist and
-# are properly signed (macOS 26.5.x syspolicyd mitigation, #689 — signing
-# itself stays a manual step), then execs zellij with the composed layout.
+# Uses the native-plugins zellij (spike/native-plugins worktree) with
+# andamento compiled in — the wasm plugin path has unacceptable perf for
+# daily driving. Builds that zellij via its build-native-andamento script,
+# checks the flotilla dev binaries exist and are properly signed (macOS
+# 26.5.x syspolicyd mitigation, #689 — signing itself stays a manual step),
+# then execs zellij with the composed layout.
 set -euo pipefail
 
 FLOTILLA_ROOT=${FLOTILLA_ROOT:-"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"}
 export ANDAMENTO_ROOT=${ANDAMENTO_ROOT:-"$HOME/dev/andamento"}
 export FLOTILLA_BIN=${FLOTILLA_BIN:-"$FLOTILLA_ROOT/target/debug/flotilla"}
-ZELLIJ_BIN=${ZELLIJ_BIN:-"$HOME/dev/zellij/target/dev-opt/zellij"}
+ZELLIJ_NATIVE_ROOT=${ZELLIJ_NATIVE_ROOT:-"$HOME/dev/zellij.native-plugins"}
+ZELLIJ_BIN=${ZELLIJ_BIN:-"$ZELLIJ_NATIVE_ROOT/target/dev-opt/zellij"}
 
 if [[ ! -x "$FLOTILLA_BIN" ]]; then
     echo "error: flotilla binary not found at $FLOTILLA_BIN — run cargo build first" >&2
@@ -28,6 +32,16 @@ if command -v codesign >/dev/null 2>&1; then
     done
 fi
 
-cargo build --manifest-path "$ANDAMENTO_ROOT/Cargo.toml" --workspace --target wasm32-wasip1 --release
+# Build the native-plugins zellij with andamento compiled in. The worktree's
+# script handles the zellij-tile package-identity patching; skip it entirely
+# when the caller points ZELLIJ_BIN somewhere else.
+if [[ "$ZELLIJ_BIN" == "$ZELLIJ_NATIVE_ROOT/target/dev-opt/zellij" ]]; then
+    if [[ ! -x "$ZELLIJ_NATIVE_ROOT/scripts/build-native-andamento" ]]; then
+        echo "error: native-plugins zellij worktree not found at $ZELLIJ_NATIVE_ROOT" >&2
+        echo "       (set ZELLIJ_NATIVE_ROOT, or set ZELLIJ_BIN to skip the built-in build)" >&2
+        exit 1
+    fi
+    "$ZELLIJ_NATIVE_ROOT/scripts/build-native-andamento"
+fi
 
 exec "$ZELLIJ_BIN" --layout "$FLOTILLA_ROOT/layouts/daily-driver.kdl"
