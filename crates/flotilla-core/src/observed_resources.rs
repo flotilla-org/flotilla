@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData, RepoIdentity};
 use flotilla_resources::{
     canonicalize_repo_url, descriptive_repo_slug, repo_key, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec, ResourceBackend, ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey, ResourceBackend, ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
 use sha2::{Digest, Sha256};
 
@@ -18,6 +18,7 @@ pub async fn reconcile_checkouts(
     namespace: &str,
     repo_identity: &RepoIdentity,
     providers: &ProviderData,
+    host_ref: &str,
 ) -> Result<(), ResourceError> {
     let scope = observed_checkout_scope(repo_identity)?;
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
@@ -36,7 +37,8 @@ pub async fn reconcile_checkouts(
         let spec = ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
             r#ref: checkout.branch.clone(),
             path: path.path.to_string_lossy().into_owned(),
-            repo_ref: scope.repo_ref.clone(),
+            repo_ref: RepositoryKey(scope.repo_key.clone()),
+            host_ref: host_ref.to_string(),
             is_main: checkout.is_main,
         });
 
@@ -185,7 +187,8 @@ mod tests {
                 &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
                     r#ref: "main".to_string(),
                     path: "/workspace/repo".to_string(),
-                    repo_ref: "existing-repo".to_string(),
+                    repo_ref: flotilla_resources::RepositoryKey("existing-repo".to_string()),
+                    host_ref: "host-01".to_string(),
                     is_main: true,
                 }),
             )
@@ -197,6 +200,7 @@ mod tests {
             "flotilla",
             &RepoIdentity { authority: "unknown".to_string(), path: "not-a-remote".to_string() },
             &ProviderData::default(),
+            "host-01",
         )
         .await;
 

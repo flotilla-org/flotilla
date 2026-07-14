@@ -27,14 +27,14 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
-    external_patches as convoy_external_patches, terminal_session_attach_target, Checkout as ResourceCheckout,
+    external_patches as convoy_external_patches, normalize_project_spec, terminal_session_attach_target, Checkout as ResourceCheckout,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
     Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment,
     InMemoryBackend, InputMeta, InputValue, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
-    Project, ProjectRepositorySpec, ProjectSpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
-    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WorkflowTemplate,
-    WorkflowTemplateSpec, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -66,6 +66,7 @@ use crate::{
     },
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
+    repository_inspection::{GitRepositoryInspector, RepositoryInspector},
     step::{
         run_step_plan_with_remote_executor, RemoteStepBatchRequest, RemoteStepExecutor, RemoteStepProgressSink, StepOutcome, StepResolver,
     },
@@ -544,6 +545,7 @@ async fn create_adopted_checkout_resource(
     repository_url: Option<&String>,
     git_ref: Option<&String>,
     runner: &dyn CommandRunner,
+    host_ref: &str,
 ) -> Result<(String, String, String), String> {
     let path = std::fs::canonicalize(checkout_path)
         .map_err(|err| format!("adopted checkout path {} cannot be resolved: {err}", checkout_path.display()))?;
@@ -557,6 +559,9 @@ async fn create_adopted_checkout_resource(
         None => infer_adopted_checkout_ref(runner, &path).await?,
     };
     let checkout_ref = adopted_checkout_name(convoy_name);
+    let repository_spec = RepositorySpec::remote(&repo_url)?;
+    let repository_key = repository_spec.key();
+    ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, &repository_spec).await?;
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let meta = InputMeta::builder()
         .name(checkout_ref.clone())
@@ -566,7 +571,8 @@ async fn create_adopted_checkout_resource(
     let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
         r#ref: git_ref.clone(),
         path: path_str.clone(),
-        repo_ref: repo_url.clone(),
+        repo_ref: repository_key,
+        host_ref: host_ref.to_string(),
         is_main: matches!(git_ref.as_str(), "main" | "master" | "trunk"),
     });
 
@@ -1005,6 +1011,7 @@ pub struct InProcessDaemon {
     provisioning_namespace: RwLock<String>,
     fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
     fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
+    repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
@@ -1141,6 +1148,7 @@ impl InProcessDaemon {
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
             fleet_replica_tx,
+            repository_inspector: RwLock::new(None),
         });
 
         // Spawn self-driving poll loop with a Weak reference.
@@ -1188,6 +1196,19 @@ impl InProcessDaemon {
 
     pub fn local_command_runner(&self) -> Option<Arc<dyn CommandRunner>> {
         self.environment_manager.environment_runner(&self.local_environment_id)
+    }
+
+    pub async fn set_repository_inspector(&self, inspector: Arc<dyn RepositoryInspector>) {
+        *self.repository_inspector.write().await = Some(inspector);
+    }
+
+    async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
+        if let Some(inspector) = self.repository_inspector.read().await.clone() {
+            return Ok(inspector);
+        }
+        let runner = self.local_command_runner().ok_or_else(|| "local repository inspector is unavailable".to_string())?;
+        let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?;
+        Ok(Arc::new(GitRepositoryInspector::new(runner, host_ref.to_string())))
     }
 
     pub fn local_environment_bag(&self) -> Option<EnvironmentBag> {
@@ -1805,8 +1826,14 @@ impl InProcessDaemon {
             if !has_local_root {
                 continue;
             }
-            if let Err(error) =
-                crate::observed_resources::reconcile_checkouts(&self.observed_resource_backend, &namespace, identity, local_providers).await
+            if let Err(error) = crate::observed_resources::reconcile_checkouts(
+                &self.observed_resource_backend,
+                &namespace,
+                identity,
+                local_providers,
+                &self.local_host_id().expect("local host id is established at daemon construction").to_string(),
+            )
+            .await
             {
                 warn!(repo = %identity.path, %error, "failed to reconcile observed checkouts");
             }
@@ -2071,7 +2098,254 @@ impl InProcessDaemon {
 
 /// Non-trait methods that are called directly on the concrete `InProcessDaemon`
 /// type by the daemon server peer-overlay code and by the `execute()` implementation.
+fn repository_matches_target(repository: &ResourceObject<Repository>, target: &str) -> bool {
+    if repository.metadata.name == target || repository.spec.leaf_slug() == target {
+        return true;
+    }
+    match &repository.spec.identity {
+        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => {
+            repository.spec.forge.as_ref().is_some_and(|forge| forge.repository == target)
+                || flotilla_resources::descriptive_repo_slug(canonical_remote) == target
+        }
+        flotilla_resources::RepositoryIdentity::Local { .. } => false,
+    }
+}
+
+async fn ensure_repository(
+    repositories: &flotilla_resources::TypedResolver<Repository>,
+    key: &RepositoryKey,
+    spec: &RepositorySpec,
+) -> Result<(), String> {
+    let meta = InputMeta::builder().name(key.to_string()).build();
+    match repositories.create(&meta, spec).await {
+        Ok(created) => created.spec.verify_key(key),
+        Err(ResourceError::Conflict { .. }) => {
+            let existing = repositories.get(&key.to_string()).await.map_err(|error| error.to_string())?;
+            existing.spec.verify_key(key)?;
+            if existing.spec == *spec {
+                Ok(())
+            } else {
+                Err(format!("repository key {key} already refers to a different canonical identity"))
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
+    let templates = backend.clone().using::<WorkflowTemplate>(namespace);
+    let meta = InputMeta::builder().name("single-agent-contained".to_string()).build();
+    match templates.create(&meta, &flotilla_resources::single_agent_contained_workflow_spec()).await {
+        Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn normalize_project_name(name: &str) -> Result<String, String> {
+    let normalized = name
+        .trim()
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if normalized.is_empty() {
+        return Err("project name must contain an alphanumeric character".to_string());
+    }
+    if normalized != name {
+        return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
+    }
+    Ok(normalized)
+}
+
 impl InProcessDaemon {
+    async fn validate_project_readiness(&self, namespace: &str, project_ref: &str) -> Result<(), String> {
+        let project = self
+            .resource_backend
+            .clone()
+            .using::<Project>(namespace)
+            .get(project_ref)
+            .await
+            .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
+        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+        let mut unresolved = Vec::new();
+        for entry in &project.spec.repositories {
+            match repositories.get(&entry.repo.to_string()).await {
+                Ok(repository) => {
+                    if let Err(error) = repository.spec.verify_key(&entry.repo) {
+                        unresolved.push(error);
+                    }
+                }
+                Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
+            }
+        }
+        if let Err(error) = self.resource_backend.clone().using::<WorkflowTemplate>(namespace).get(&project.spec.default_workflow_ref).await
+        {
+            unresolved.push(format!("workflow template {}: {error}", project.spec.default_workflow_ref));
+        }
+        if unresolved.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("project {project_ref} is not ready: {}", unresolved.join("; ")))
+        }
+    }
+
+    async fn project_add(
+        &self,
+        target: &str,
+        explicit_name: Option<&str>,
+        explicit_display_name: Option<&str>,
+        remote: Option<&str>,
+    ) -> Result<String, String> {
+        let namespace = self.provisioning_namespace().await;
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let target_path = Path::new(target);
+        let path_is_explicit = target_path.is_absolute();
+        let path_candidate = if target_path.exists() {
+            Some(self.repository_inspector().await?.inspect_path(target_path, remote).await?)
+        } else if path_is_explicit {
+            return Err(format!("repository path {} does not exist", target_path.display()));
+        } else {
+            None
+        };
+
+        let catalog_matches = if path_is_explicit {
+            Vec::new()
+        } else {
+            repositories
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|repository| repository_matches_target(repository, target))
+                .collect::<Vec<_>>()
+        };
+        let mut catalog_by_key = BTreeMap::new();
+        for repository in catalog_matches {
+            let key = RepositoryKey(repository.metadata.name.clone());
+            repository.spec.verify_key(&key)?;
+            catalog_by_key.insert(key, repository.spec);
+        }
+        if catalog_by_key.len() > 1 {
+            return Err(format!(
+                "repository slug `{target}` is ambiguous: {}",
+                catalog_by_key.keys().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let catalog_candidate = catalog_by_key.into_iter().next();
+        if remote.is_some() && path_candidate.is_none() && catalog_candidate.is_some() {
+            return Err("--remote can only select identity while inspecting a local repository path".to_string());
+        }
+
+        let (key, repository_spec, checkout) = match (path_candidate, catalog_candidate) {
+            (Some(inspection), Some((catalog_key, _))) if inspection.key() != catalog_key => {
+                return Err(format!(
+                    "`{target}` resolves to different path and catalog repositories: {} and {catalog_key}",
+                    inspection.key()
+                ));
+            }
+            (Some(inspection), _) => (inspection.key(), inspection.spec, Some(inspection.checkout)),
+            (None, Some((key, spec))) => (key, spec, None),
+            (None, None) => return Err(format!("`{target}` is neither a repository path nor a repository catalog slug")),
+        };
+
+        ensure_repository(&repositories, &key, &repository_spec).await?;
+        if let Some(checkout) = checkout {
+            self.ensure_project_checkout(&namespace, &key, &repository_spec, checkout).await?;
+        }
+        ensure_single_agent_contained_workflow(&self.resource_backend, &namespace).await?;
+
+        let default_name = normalize_project_name(&repository_spec.leaf_slug())?;
+        let project_name = explicit_name.map(str::to_string).unwrap_or(default_name.clone());
+        normalize_project_name(&project_name)?;
+        let projects = self.resource_backend.clone().using::<Project>(&namespace);
+        match projects.get(&project_name).await {
+            Ok(existing) => {
+                let same_whole_repository = matches!(
+                    existing.spec.repositories.as_slice(),
+                    [entry] if entry.repo == key && entry.subpath.is_none()
+                );
+                if !same_whole_repository {
+                    return Err(format!("project {project_name} already exists with a different repository definition"));
+                }
+                if explicit_display_name.is_some_and(|display_name| display_name != existing.spec.display_name) {
+                    return Err(format!(
+                        "project {project_name} already exists with display name `{}`; use project apply to change it",
+                        existing.spec.display_name
+                    ));
+                }
+                return Ok(project_name);
+            }
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+
+        let spec = normalize_project_spec(ProjectSpec {
+            display_name: explicit_display_name.map(str::to_string).unwrap_or(default_name),
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: key, subpath: None, default_branch: None }],
+        })?;
+        projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
+        Ok(project_name)
+    }
+
+    async fn ensure_project_checkout(
+        &self,
+        namespace: &str,
+        repository_key: &RepositoryKey,
+        repository_spec: &RepositorySpec,
+        checkout: crate::repository_inspection::LocalCheckoutInspection,
+    ) -> Result<(), String> {
+        let checkouts = self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let checkout_name = format!(
+            "checkout-{}",
+            flotilla_resources::repo_key(&format!("{}\0{}\0{}", repository_key, checkout.host_ref, checkout.path.display()))
+        );
+        let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+            r#ref: checkout.git_ref,
+            path: checkout.path.to_string_lossy().into_owned(),
+            repo_ref: repository_key.clone(),
+            host_ref: checkout.host_ref,
+            is_main: checkout.is_main,
+        });
+        let meta = InputMeta::builder()
+            .name(checkout_name.clone())
+            .labels(BTreeMap::from([
+                (REPO_KEY_LABEL.to_string(), repository_key.to_string()),
+                (REPO_LABEL.to_string(), repository_spec.leaf_slug()),
+            ]))
+            .build()
+            .with_lifecycle_authority(LifecycleAuthority::Observed);
+        let stored = match checkouts.create(&meta, &spec).await {
+            Ok(created) => created,
+            Err(ResourceError::Conflict { .. }) => {
+                let existing = checkouts.get(&checkout_name).await.map_err(|error| error.to_string())?;
+                if existing.spec != spec {
+                    return Err(format!("checkout {checkout_name} already exists with a different observation"));
+                }
+                existing
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        checkouts
+            .update_status(&checkout_name, &stored.metadata.resource_version, &ResourceCheckoutStatus {
+                phase: ResourceCheckoutPhase::Ready,
+                path: spec.target_path().map(str::to_string).or_else(|| match &spec {
+                    ResourceCheckoutSpec::Observed(observed) => Some(observed.path.clone()),
+                    _ => None,
+                }),
+                commit: None,
+                message: None,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<(), String> {
         let repo = self.resolve_repo_selector(repo).await?;
         {
@@ -3358,6 +3632,18 @@ impl InProcessDaemon {
                     return Ok(id);
                 }
             }
+            if let Some(project_ref) = project_ref {
+                if let Err(message) = self.validate_project_readiness(&namespace, project_ref).await {
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result: flotilla_protocol::CommandValue::Error { message },
+                    });
+                    return Ok(id);
+                }
+            }
             let placement_policy = match placement_policy {
                 Some(policy) => Some(policy.clone()),
                 None => default_convoy_placement_policy(&self.resource_backend, &namespace).await,
@@ -3374,6 +3660,7 @@ impl InProcessDaemon {
                         repository_url.as_ref(),
                         r#ref.as_ref(),
                         runner.as_ref(),
+                        &self.local_host_id().expect("local host id is established at daemon construction").to_string(),
                     )
                     .await
                     {
@@ -3468,7 +3755,7 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ProjectCreate { name, display_name, repository_url, subpath, r#ref } = &command.action {
+        if let flotilla_protocol::CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
             let empty_identity = empty_repo_identity();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
@@ -3477,17 +3764,9 @@ impl InProcessDaemon {
                 repo: None,
                 description: command.description().to_string(),
             });
-            let namespace = self.provisioning_namespace().await;
-            let projects = self.resource_backend.clone().using::<Project>(&namespace);
-            let repositories = match repository_url {
-                Some(url) => vec![ProjectRepositorySpec { repo: url.clone(), subpath: subpath.clone(), default_branch: r#ref.clone() }],
-                None => vec![],
-            };
-            let spec = ProjectSpec { display_name: display_name.clone(), repositories };
-            let meta = InputMeta::builder().name(name.clone()).build();
-            let result = match projects.create(&meta, &spec).await {
-                Ok(_) => flotilla_protocol::CommandValue::ProjectCreated { name: name.clone() },
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            let result = match self.project_add(target, name.as_deref(), display_name.as_deref(), remote.as_deref()).await {
+                Ok(name) => flotilla_protocol::CommandValue::ProjectAdded { name },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -3510,19 +3789,22 @@ impl InProcessDaemon {
             });
             let namespace = self.provisioning_namespace().await;
             let projects = self.resource_backend.clone().using::<Project>(&namespace);
-            let result = match parse_project_yaml(spec_yaml) {
-                Ok(spec) => {
-                    let meta = InputMeta::builder().name(name.clone()).build();
-                    let outcome = match projects.get(name).await {
-                        Ok(existing) => projects.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
-                        Err(ResourceError::NotFound { .. }) => projects.create(&meta, &spec).await.map(|_| ()),
-                        Err(err) => Err(err),
-                    };
-                    match outcome {
-                        Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
-                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            let result = match normalize_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
+                Ok(spec) => match normalize_project_spec(spec) {
+                    Ok(spec) => {
+                        let meta = InputMeta::builder().name(name.clone()).build();
+                        let outcome = match projects.get(name).await {
+                            Ok(existing) => projects.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
+                            Err(ResourceError::NotFound { .. }) => projects.create(&meta, &spec).await.map(|_| ()),
+                            Err(err) => Err(err),
+                        };
+                        match outcome {
+                            Ok(()) => flotilla_protocol::CommandValue::ProjectApplied { name: name.clone() },
+                            Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                        }
                     }
-                }
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {

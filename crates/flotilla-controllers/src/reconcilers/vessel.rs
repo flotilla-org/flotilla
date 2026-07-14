@@ -10,9 +10,9 @@ use flotilla_resources::{
     descriptive_repo_slug, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
     EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
-    Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
-    VesselStatusPatch, VESSEL_REF_LABEL,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, RepositoryKey, Resource, ResourceBackend, ResourceError,
+    ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel,
+    VesselPhase, VesselStatusPatch, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -244,7 +244,12 @@ impl Reconciler for VesselReconciler {
                                 (REPO_LABEL.to_string(), repo_slug.clone()),
                             ]))
                             .build(),
-                        spec: CloneSpec { url: repo_url.clone(), env_ref: clone_env_ref.clone(), path: clone_path },
+                        spec: CloneSpec {
+                            repo_ref: RepositoryKey(repo_key.clone()),
+                            url: repo_url.clone(),
+                            env_ref: clone_env_ref.clone(),
+                            path: clone_path,
+                        },
                     });
                     return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
                 }
@@ -349,6 +354,7 @@ impl Reconciler for VesselReconciler {
                 let spec = match &strategy {
                     PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                         CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                            repo_ref: RepositoryKey(repo_key.clone()),
                             env_ref: clone_env_ref.clone(),
                             r#ref: git_ref,
                             target_path: checkout_target_path.clone(),
@@ -356,6 +362,7 @@ impl Reconciler for VesselReconciler {
                         })
                     }
                     PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                        repo_ref: RepositoryKey(repo_key.clone()),
                         env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
                         r#ref: git_ref,
                         target_path: checkout_target_path.clone(),
@@ -364,7 +371,11 @@ impl Reconciler for VesselReconciler {
                 };
                 let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
                 actuations.push(Actuation::CreateCheckout {
-                    meta: owned_child_meta(&checkout_name, obj, BTreeMap::from([(ENV_LABEL.to_string(), env_ref)])),
+                    meta: owned_child_meta(
+                        &checkout_name,
+                        obj,
+                        BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key.clone())]),
+                    ),
                     spec,
                 });
                 return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));

@@ -113,6 +113,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
         }),
     };
     let checkout_spec = CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+        repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
         env_ref: "env-a".to_string(),
         r#ref: "feat/convoy-resource".to_string(),
         target_path: "/workspace".to_string(),

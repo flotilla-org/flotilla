@@ -1700,7 +1700,7 @@ async fn repo_refresh_reconciles_observed_checkouts() {
     assert_eq!(main.metadata.labels.get(REPO_LABEL).map(String::as_str), Some("github-com-owner-repo"));
     assert_eq!(main.metadata.lifecycle_authority().expect("authority label should parse"), Some(LifecycleAuthority::Observed));
     match &main.spec {
-        ResourceCheckoutSpec::Observed(spec) => assert_eq!(spec.repo_ref, "github-com-owner-repo"),
+        ResourceCheckoutSpec::Observed(spec) => assert_eq!(spec.repo_ref, flotilla_resources::RepositoryKey(repo_key.clone())),
         other => panic!("expected observed checkout spec, got {other:?}"),
     }
 
@@ -1716,10 +1716,10 @@ async fn repo_refresh_reconciles_observed_checkouts() {
     assert_eq!(second.items.len(), 1);
     assert_eq!(second.items[0].metadata.name, feature_name, "checkout identity should follow its stable path");
     match &second.items[0].spec {
-        ResourceCheckoutSpec::Observed(ObservedCheckoutSpec { r#ref, path, repo_ref, is_main }) => {
+        ResourceCheckoutSpec::Observed(ObservedCheckoutSpec { r#ref, path, repo_ref, is_main, .. }) => {
             assert_eq!(r#ref, "feature-renamed");
             assert_eq!(path, &feature_path_string);
-            assert_eq!(repo_ref, "github-com-owner-repo");
+            assert_eq!(repo_ref, &flotilla_resources::RepositoryKey(repo_key.clone()));
             assert!(!is_main);
         }
         other => panic!("expected observed checkout spec, got {other:?}"),
@@ -1731,13 +1731,14 @@ async fn repo_refresh_reconciles_observed_checkouts() {
                 .name("adopted-checkout-feature".to_string())
                 .labels(std::collections::BTreeMap::from([
                     (flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string()),
-                    (REPO_KEY_LABEL.to_string(), repo_key),
+                    (REPO_KEY_LABEL.to_string(), repo_key.clone()),
                 ]))
                 .build(),
             &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: "feature-renamed".to_string(),
                 path: feature_path_string,
-                repo_ref: "github-com-owner-repo".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey(repo_key.clone()),
+                host_ref: "host-01".to_string(),
                 is_main: false,
             }),
         )
@@ -1801,13 +1802,14 @@ async fn removing_final_local_root_preserves_adopted_checkouts() {
                 .name("adopted-checkout".to_string())
                 .labels(std::collections::BTreeMap::from([
                     (flotilla_resources::AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string()),
-                    (REPO_KEY_LABEL.to_string(), repo_key),
+                    (REPO_KEY_LABEL.to_string(), repo_key.clone()),
                 ]))
                 .build(),
             &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: repo.to_string_lossy().into_owned(),
-                repo_ref: "github-com-owner-repo".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey(repo_key.clone()),
+                host_ref: "host-01".to_string(),
                 is_main: true,
             }),
         )

@@ -44,7 +44,11 @@ the parameters are **scope**: a project reference or repo key. A project
 scope expands to its constituent repos inside the Aggregator — consumers
 never learn a project's composition. Scope rides the View address per ADR
 0013's `?key=value` channel. Global (unscoped) forms remain for fleet-wide
-tables. Subscription cost scales with what is on screen.
+tables. Subscription cost scales with what is on screen. For issue queries,
+a Project-level **Issue Source** override supplies one unified feed; without
+one, Project scope expands to each constituent Repository's Forge-backed issue
+source. The absence of a configured source is surfaced as unavailable, never
+as an ordinary empty issue set.
 
 ## Two materialization classes, one wire contract
 
@@ -74,14 +78,17 @@ not these adapters.
 
 ## Issues are never replicated
 
-The forge is the system of record. Flotilla holds exactly two forms of issue
-data: **references-on-work** — a repo key + issue number on a convoy/branch
-plus a small display snapshot (title, state, `as_of`) so boards render
-offline, bounded by active work — and the transient demand-backed windows
-above. Triage/board intelligence ("what should I or the governor pick up
-next") is add-on-program territory consuming these queries, never core
-features. Growing issue mutation/comment/label features in core is the
-reimplementing-the-tracker failure mode this section exists to forbid.
+The Forge or Project Issue Source is the system of record. Flotilla holds
+exactly two forms of issue data: **references-on-work** — a source-qualified,
+opaque external ID associated with the relevant repo key, plus a small display
+snapshot (title, state, `as_of`) so boards render offline, bounded by active
+work — and the transient demand-backed windows above. GitHub's `728` and
+Linear's `WIDGET-123` are both opaque IDs; no model assumes issues are numeric
+or that the Forge must supply them. Triage/board intelligence ("what should I
+or the governor pick up next") is add-on-program territory consuming these
+queries, never core features. Growing issue mutation/comment/label features in
+core is the reimplementing-the-tracker failure mode this section exists to
+forbid.
 
 ## `independents`, not `sessions`
 
@@ -97,12 +104,27 @@ in `independents`, never both.
 
 Scopes are made of repo identity, so repo identity becomes a real referent:
 **Repository is a resource** (convergent-facts class per the #688 model),
-natural-keyed by normalized canonical remote, with `host:path` fallback for
-remote-less repos. Remotes move as ordinary project lifecycle (transfers,
-renames, forge migrations), so the model commits to **`moved` pointers
-(old key → new key) and referent repair**; no referent shape anywhere may
-assume repo keys are immortal. The repair mechanism is built when first
-needed; the commitment is binding now.
+natural-keyed by normalized canonical remote. Remote-less repos use the stable
+Host identity plus normalized Git common directory, so worktrees of one local
+repo do not mint separate identities. Machine-local SSH aliases are resolved
+through host configuration; an alias that cannot be resolved is an
+"unrecognised remote", never a globally meaningful repo key.
+
+Repository remains genuinely convergent: its declaration holds immutable
+canonical identity and derived Forge identity; its status is a provenance-
+carrying union of default-branch observations and references to all associated
+Checkout resources, grouped by Host. Mutable human choices do not masquerade
+as convergent facts: branch overrides and the optional single Issue Source
+belong to the definitions-class Project. Repository persists with empty status
+when no checkout exists, including cloud-only Projects between ephemeral
+clones.
+
+Storage-safe typed Repository keys derive from the canonical identity, and
+every lookup verifies the referent. Remotes nevertheless move as ordinary
+project lifecycle (transfers, renames, forge migrations), so the model commits
+to **`moved` pointers (old key → new key) and referent repair**; no referent
+shape anywhere may assume repo keys are immortal. The repair mechanism is
+built when first needed; the commitment is binding now.
 
 ## Consequences
 

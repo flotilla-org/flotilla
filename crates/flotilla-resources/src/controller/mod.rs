@@ -154,6 +154,44 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
 }
 
 #[derive(Clone)]
+pub struct ResolverLabelMappedWatch<W: Resource, P: Resource> {
+    pub label_key: &'static str,
+    pub resolver: TypedResolver<W>,
+    pub _marker: PhantomData<P>,
+}
+
+impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P> {
+    type Primary = P;
+
+    fn clone_box(&self) -> Box<dyn SecondaryWatch<Primary = Self::Primary>> {
+        Box::new(Self { label_key: self.label_key, resolver: self.resolver.clone(), _marker: PhantomData })
+    }
+
+    fn spawn(
+        self: Box<Self>,
+        _backend: ResourceBackend,
+        _namespace: String,
+        sender: mpsc::Sender<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let listed = self.resolver.list().await?;
+            for object in &listed.items {
+                LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, object).await?;
+            }
+            let mut watch = self.resolver.watch(WatchStart::FromVersion(listed.resource_version)).await?;
+            while let Some(event) = watch.next().await {
+                match event? {
+                    WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
+                        LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, &object).await?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct LabelJoinWatch<W: Resource, P: Resource> {
     pub label_key: &'static str,
     pub _marker: PhantomData<(W, P)>,

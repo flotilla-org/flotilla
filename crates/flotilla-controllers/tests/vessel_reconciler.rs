@@ -810,6 +810,9 @@ fn host_direct_env_name() -> String {
 
 fn worktree_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, clone_ref: &str) -> CheckoutWorktreeSpec {
     CheckoutWorktreeSpec {
+        repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key(
+            &canonicalize_repo_url(REPO_URL).expect("repo canonicalization"),
+        )),
         env_ref: env_ref.to_string(),
         r#ref: git_ref.to_string(),
         target_path: target_path.to_string(),
@@ -819,6 +822,9 @@ fn worktree_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, clone
 
 fn fresh_clone_checkout_spec(env_ref: &str, git_ref: &str, target_path: &str, url: &str) -> flotilla_resources::FreshCloneCheckoutSpec {
     flotilla_resources::FreshCloneCheckoutSpec {
+        repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key(
+            &canonicalize_repo_url(REPO_URL).expect("repo canonicalization"),
+        )),
         env_ref: env_ref.to_string(),
         r#ref: git_ref.to_string(),
         target_path: target_path.to_string(),
@@ -976,7 +982,8 @@ async fn create_labeled_adopted_checkout(backend: &ResourceBackend, namespace: &
             &CheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: GIT_REF.to_string(),
                 path: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
-                repo_ref: "repo-flotilla".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo-flotilla".to_string()),
+                host_ref: HOST_REF.to_string(),
                 is_main: false,
             }),
         )
@@ -992,7 +999,8 @@ async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &st
             &CheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: GIT_REF.to_string(),
                 path: path.to_string(),
-                repo_ref: "repo-flotilla".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo-flotilla".to_string()),
+                host_ref: HOST_REF.to_string(),
                 is_main: false,
             }),
         )
@@ -1017,7 +1025,8 @@ async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBa
             &CheckoutSpec::Observed(ObservedCheckoutSpec {
                 r#ref: GIT_REF.to_string(),
                 path: "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-observed".to_string(),
-                repo_ref: "repo-flotilla".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo-flotilla".to_string()),
+                host_ref: HOST_REF.to_string(),
                 is_main: false,
             }),
         )

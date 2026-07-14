@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, HopChainContext,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselReconciler,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -29,11 +29,11 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, repo_key, Clone, CloneSpec, Convoy,
-    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, descriptive_repo_slug, Clone, CloneSpec, Convoy, ConvoyReconciler,
+    CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, ResourceBackend, ResourceError, ResourceObject, Selector, Stance,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Repository, RepositoryKey, RepositorySpec, ResourceBackend,
+    ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -282,19 +282,7 @@ fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
                     .build()])
                 .build(),
         ),
-        (
-            "single-agent-contained",
-            WorkflowTemplateSpec::builder()
-                .vessels(vec![VesselRequirement::builder()
-                    .name("work".to_string())
-                    .stance(Stance::Contained)
-                    .crew(vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None })
-                        .build()])
-                    .build()])
-                .build(),
-        ),
+        ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
     ]
 }
 
@@ -309,6 +297,28 @@ async fn ensure_default_workflow_templates(backend: &ResourceBackend, namespace:
         templates.create(&empty_meta(name), &spec).await.map(|_| ()).map_err(|err| format!("seed workflow template {name}: {err}"))?;
     }
     Ok(())
+}
+
+async fn ensure_repository_exists(
+    backend: &ResourceBackend,
+    namespace: &str,
+    key: &RepositoryKey,
+    spec: &RepositorySpec,
+) -> Result<(), String> {
+    let repositories = backend.clone().using::<Repository>(namespace);
+    match repositories.create(&empty_meta(&key.to_string()), spec).await {
+        Ok(_) => Ok(()),
+        Err(ResourceError::Conflict { .. }) => {
+            let existing = repositories.get(&key.to_string()).await.map_err(|error| error.to_string())?;
+            existing.spec.verify_key(key)?;
+            if existing.spec == *spec {
+                Ok(())
+            } else {
+                Err(format!("repository key {key} already refers to a different canonical identity"))
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_name: &str) -> Result<(), String> {
@@ -383,10 +393,17 @@ async fn discover_local_clones(
             }
         };
 
-        let repo_key_value = repo_key(&canonical_url);
+        let repository_spec = RepositorySpec::remote(&canonical_url).expect("already-canonical repository URL should remain valid");
+        let repository_key = repository_spec.key();
+        ensure_repository_exists(backend, namespace, &repository_key, &repository_spec).await?;
+        let repo_key_value = repository_key.to_string();
         let name = format!("clone-{}", clone_key(&canonical_url, &host_direct_env_ref));
-        let expected_spec =
-            CloneSpec { url: transport_url.clone(), env_ref: host_direct_env_ref.clone(), path: repo_path.display().to_string() };
+        let expected_spec = CloneSpec {
+            repo_ref: repository_key,
+            url: transport_url.clone(),
+            env_ref: host_direct_env_ref.clone(),
+            path: repo_path.display().to_string(),
+        };
         let expected_labels = BTreeMap::from([
             ("flotilla.work/discovered".to_string(), "true".to_string()),
             ("flotilla.work/repo-key".to_string(), repo_key_value),
@@ -541,8 +558,34 @@ fn spawn_controller_loops(
     supervision: ControllerSupervision,
 ) -> Vec<JoinHandle<()>> {
     let backend = state.daemon.resource_backend();
+    let observed_backend = state.daemon.observed_resource_backend();
     let namespace_string = namespace.to_string();
     vec![
+        tokio::spawn({
+            let backend = backend.clone();
+            let observed_backend = observed_backend.clone();
+            let namespace_string = namespace_string.clone();
+            let supervision = supervision.clone();
+            async move {
+                supervise("repository", supervision, move || {
+                    let backend = backend.clone();
+                    let observed_backend = observed_backend.clone();
+                    let namespace_string = namespace_string.clone();
+                    async move {
+                        ControllerLoop {
+                            primary: backend.clone().using::<Repository>(&namespace_string),
+                            secondaries: RepositoryReconciler::secondary_watches(observed_backend.clone(), &namespace_string),
+                            reconciler: RepositoryReconciler::new(backend.clone(), observed_backend, &namespace_string),
+                            resync_interval: controller_resync_interval,
+                            backend,
+                        }
+                        .run()
+                        .await
+                    }
+                })
+                .await;
+            }
+        }),
         tokio::spawn({
             let backend = backend.clone();
             let namespace_string = namespace_string.clone();

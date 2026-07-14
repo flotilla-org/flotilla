@@ -237,6 +237,7 @@ async fn clone_controller_marks_clone_ready() {
     let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/flotilla", "host-direct-01HXYZ"));
     clones
         .create(&controller_meta().name(&clone_name).call(), &CloneSpec {
+            repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
             url: "git@github.com:flotilla-org/flotilla.git".to_string(),
             env_ref: "host-direct-01HXYZ".to_string(),
             path: "/Users/alice/dev/flotilla".to_string(),
@@ -322,6 +323,7 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
         .create(
             &controller_meta().name("checkout-a").call(),
             &flotilla_resources::CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
                 env_ref: "host-direct-01HXYZ".to_string(),
                 r#ref: "feat/convoy-resource".to_string(),
                 target_path: "/Users/alice/dev/flotilla.feat-123".to_string(),
@@ -556,6 +558,7 @@ async fn vessel_controller_finalizer_deletes_labeled_children_on_delete() {
                 .labels([(VESSEL_REF_LABEL.to_string(), "workspace-delete".to_string())].into_iter().collect())
                 .call(),
             &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
                 env_ref: "host-direct-01HXYZ".to_string(),
                 r#ref: "feat/task-provisioning".to_string(),
                 target_path: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),

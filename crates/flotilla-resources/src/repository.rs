@@ -1,0 +1,208 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{resource::define_resource, status_patch::StatusPatch, LifecycleAuthority};
+
+define_resource!(Repository, "repositories", RepositorySpec, RepositoryStatus, RepositoryStatusPatch);
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepositoryKey(pub String);
+
+impl RepositoryKey {
+    pub fn from_identity(identity: &RepositoryIdentity) -> Self {
+        match identity {
+            RepositoryIdentity::Remote { canonical_remote } => Self(crate::repo_key(canonical_remote)),
+            RepositoryIdentity::Local { host_ref, git_common_dir } => {
+                Self(crate::repo_key(&format!("local\0{host_ref}\0{git_common_dir}")))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RepositoryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepositoryIdentity {
+    Remote { canonical_remote: String },
+    Local { host_ref: String, git_common_dir: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeIdentity {
+    pub service_url: String,
+    pub repository: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySpec {
+    pub identity: RepositoryIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeIdentity>,
+}
+
+impl RepositorySpec {
+    pub fn remote(canonical_remote: impl Into<String>) -> Result<Self, String> {
+        let canonical_remote = crate::canonicalize_repo_url(&canonical_remote.into())?;
+        let forge = forge_from_canonical_remote(&canonical_remote)?;
+        Ok(Self { identity: RepositoryIdentity::Remote { canonical_remote }, forge: Some(forge) })
+    }
+
+    pub fn local(host_ref: impl Into<String>, git_common_dir: impl Into<String>) -> Result<Self, String> {
+        let host_ref = host_ref.into();
+        let git_common_dir = git_common_dir.into();
+        if host_ref.trim().is_empty() {
+            return Err("local repository host_ref cannot be empty".to_string());
+        }
+        let path = std::path::Path::new(&git_common_dir);
+        if !path.is_absolute() {
+            return Err("local repository git_common_dir must be absolute".to_string());
+        }
+        let normalized = normalize_absolute_path(path)?;
+        Ok(Self { identity: RepositoryIdentity::Local { host_ref, git_common_dir: normalized }, forge: None })
+    }
+
+    pub fn key(&self) -> RepositoryKey {
+        RepositoryKey::from_identity(&self.identity)
+    }
+
+    pub fn verify_key(&self, key: &RepositoryKey) -> Result<(), String> {
+        let actual = self.key();
+        if &actual == key {
+            Ok(())
+        } else {
+            Err(format!("repository key {key} resolves to identity {}, expected {actual}", identity_description(&self.identity)))
+        }
+    }
+
+    pub fn leaf_slug(&self) -> String {
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => {
+                canonical_remote.split('/').next_back().unwrap_or("repository").trim_end_matches(".git").to_ascii_lowercase()
+            }
+            RepositoryIdentity::Local { git_common_dir, .. } => std::path::Path::new(git_common_dir)
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("repository")
+                .to_ascii_lowercase(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultBranchProvenance {
+    LocalTrunk,
+    RemoteSymbolicHead,
+    Forge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DefaultBranchObservation {
+    pub branch: String,
+    pub provenance: DefaultBranchProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryCheckoutKind {
+    Observed,
+    Worktree,
+    FreshClone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryCheckoutRef {
+    pub checkout_ref: String,
+    pub kind: RepositoryCheckoutKind,
+    pub authority: LifecycleAuthority,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryStatus {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub checkouts_by_host: BTreeMap<String, Vec<RepositoryCheckoutRef>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_branch_observations: Vec<DefaultBranchObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryStatusPatch {
+    Replace(RepositoryStatus),
+}
+
+impl StatusPatch<RepositoryStatus> for RepositoryStatusPatch {
+    fn apply(&self, status: &mut RepositoryStatus) {
+        match self {
+            Self::Replace(replacement) => *status = replacement.clone(),
+        }
+    }
+}
+
+pub fn resolve_default_branch(observations: &[DefaultBranchObservation]) -> (Option<String>, Vec<String>) {
+    let mut diagnostics = Vec::new();
+    let all_branches = observations.iter().map(|observation| observation.branch.as_str()).collect::<BTreeSet<_>>();
+    if all_branches.len() > 1 {
+        diagnostics.push(format!("default branch observations disagree: {}", all_branches.into_iter().collect::<Vec<_>>().join(", ")));
+    }
+
+    for provenance in [DefaultBranchProvenance::Forge, DefaultBranchProvenance::RemoteSymbolicHead, DefaultBranchProvenance::LocalTrunk] {
+        let candidates = observations
+            .iter()
+            .filter(|observation| observation.provenance == provenance)
+            .map(|observation| observation.branch.clone())
+            .collect::<BTreeSet<_>>();
+        if candidates.len() == 1 {
+            return (candidates.into_iter().next(), diagnostics);
+        }
+        if candidates.len() > 1 {
+            diagnostics.push(format!("ambiguous {provenance:?} default branch observations"));
+            return (None, diagnostics);
+        }
+    }
+    (None, diagnostics)
+}
+
+fn forge_from_canonical_remote(canonical_remote: &str) -> Result<ForgeIdentity, String> {
+    let (scheme, rest) =
+        canonical_remote.split_once("://").ok_or_else(|| format!("canonical repository remote has no scheme: {canonical_remote}"))?;
+    let (host, repository) =
+        rest.split_once('/').ok_or_else(|| format!("canonical repository remote has no repository path: {canonical_remote}"))?;
+    Ok(ForgeIdentity { service_url: format!("{scheme}://{host}"), repository: repository.to_string() })
+}
+
+fn normalize_absolute_path(path: &std::path::Path) -> Result<String, String> {
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR.to_string()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!("path escapes its root: {}", path.display()));
+                }
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+        }
+    }
+    Ok(normalized.to_string_lossy().into_owned())
+}
+
+fn identity_description(identity: &RepositoryIdentity) -> String {
+    match identity {
+        RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+        RepositoryIdentity::Local { host_ref, git_common_dir } => format!("{host_ref}:{git_common_dir}"),
+    }
+}

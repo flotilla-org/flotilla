@@ -1,16 +1,26 @@
-//! Integration tests for the `ProjectCreate` + `ProjectApply` daemon actions
-//! and the `project_ref` field on `ConvoyCreate`.
+//! Integration tests for ProjectAdd/ProjectApply and Project-backed convoy metadata.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use flotilla_core::{
-    config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
+    config::ConfigStore,
+    daemon::DaemonHandle,
+    in_process::InProcessDaemon,
+    providers::discovery::test_support::fake_discovery,
+    repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
-use flotilla_resources::{Convoy, InMemoryBackend, Project, ResourceBackend};
+use flotilla_resources::{
+    Checkout, Convoy, InMemoryBackend, InputMeta, IssueSource, Project, Repository, RepositoryKey, RepositorySpec, ResourceBackend,
+};
 
-fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
+fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&dir).expect("create config dir");
     std::fs::write(dir.join("daemon.toml"), "machine_id = \"test-project-cli\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(dir))
@@ -39,6 +49,27 @@ async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigSto
     (daemon, backend, config, runtime, tmp)
 }
 
+#[derive(Clone)]
+struct FixedInspector {
+    spec: RepositorySpec,
+    host_ref: String,
+}
+
+#[async_trait]
+impl RepositoryInspector for FixedInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.spec.clone(),
+            checkout: LocalCheckoutInspection {
+                path: path.to_path_buf(),
+                host_ref: self.host_ref.clone(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+        })
+    }
+}
+
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -52,52 +83,163 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
     }
 }
 
-#[tokio::test]
-async fn project_create_command_creates_project_resource() {
-    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
-    let mut rx = daemon.subscribe();
-
+async fn execute_project_add(
+    daemon: &Arc<InProcessDaemon>,
+    rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>,
+    target: String,
+    name: Option<&str>,
+    display_name: Option<&str>,
+) -> CommandValue {
     let id = daemon
         .execute(Command {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ProjectCreate {
-                name: "my-project".into(),
-                display_name: Some("My Project".into()),
-                repository_url: Some("https://github.com/org/repo.git".into()),
-                subpath: Some("apps/frontend".into()),
-                r#ref: Some("main".into()),
+            action: CommandAction::ProjectAdd {
+                target,
+                name: name.map(str::to_string),
+                display_name: display_name.map(str::to_string),
+                remote: None,
             },
         })
         .await
         .expect("execute");
-
-    let result = await_command_result(&mut rx, id).await;
-    assert_eq!(result, CommandValue::ProjectCreated { name: "my-project".into() });
-
-    let projects = backend.using::<Project>("flotilla");
-    let project = projects.get("my-project").await.expect("project should exist");
-    assert_eq!(project.spec.display_name.as_deref(), Some("My Project"));
-    assert_eq!(project.spec.repositories.len(), 1);
-    assert_eq!(project.spec.repositories[0].repo, "https://github.com/org/repo.git");
-    assert_eq!(project.spec.repositories[0].subpath.as_deref(), Some("apps/frontend"));
-    assert_eq!(project.spec.repositories[0].default_branch.as_deref(), Some("main"));
+    await_command_result(rx, id).await
 }
 
 #[tokio::test]
-async fn project_apply_supports_multi_repo() {
-    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_project() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let repository_spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec.clone(), host_ref: "host-01".to_string() })).await;
+    let checkout_path = tmp.path().join("repo");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
     let mut rx = daemon.subscribe();
 
+    let result =
+        execute_project_add(&daemon, &mut rx, checkout_path.to_string_lossy().into_owned(), Some("my-project"), Some("My Project")).await;
+
+    assert_eq!(result, CommandValue::ProjectAdded { name: "my-project".into() });
+    let repository =
+        backend.clone().using::<Repository>("flotilla").get(&repository_key.to_string()).await.expect("repository should exist");
+    assert_eq!(repository.spec, repository_spec);
+    repository.spec.verify_key(&repository_key).expect("repository key should verify");
+    let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list");
+    assert_eq!(checkouts.items.len(), 1);
+    let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
+    assert_eq!(project.spec.display_name, "My Project");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+    assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
+        repo: repository_key,
+        subpath: None,
+        default_branch: None,
+    }]);
+}
+
+#[tokio::test]
+async fn project_add_catalog_slug_needs_no_local_checkout() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let spec = RepositorySpec::remote("https://github.com/org/catalog-only.git").expect("repository spec");
+    let key = spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("repository create");
+    let mut rx = daemon.subscribe();
+
+    let result = execute_project_add(&daemon, &mut rx, "catalog-only".to_string(), None, None).await;
+
+    assert_eq!(result, CommandValue::ProjectAdded { name: "catalog-only".into() });
+    assert!(daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("checkout list").items.is_empty());
+    let project = backend.using::<Project>("flotilla").get("catalog-only").await.expect("project should exist");
+    assert_eq!(project.spec.repositories[0].repo, key);
+}
+
+#[tokio::test]
+async fn concurrent_project_adds_of_one_identity_converge_on_one_verified_repository() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let spec = RepositorySpec::remote("https://github.com/org/shared.git").expect("repository spec");
+    let key = spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: spec.clone(), host_ref: "host-01".to_string() })).await;
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    std::fs::create_dir(&first).expect("first checkout");
+    std::fs::create_dir(&second).expect("second checkout");
+    let mut first_rx = daemon.subscribe();
+    let mut second_rx = daemon.subscribe();
+    let command = |target: &Path, name: &str| Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::ProjectAdd {
+            target: target.to_string_lossy().into_owned(),
+            name: Some(name.to_string()),
+            display_name: None,
+            remote: None,
+        },
+    };
+
+    let (first_id, second_id) = tokio::join!(daemon.execute(command(&first, "first")), daemon.execute(command(&second, "second")));
+    let first_id = first_id.expect("first execute");
+    let second_id = second_id.expect("second execute");
+
+    assert_eq!(await_command_result(&mut first_rx, first_id).await, CommandValue::ProjectAdded { name: "first".into() });
+    assert_eq!(await_command_result(&mut second_rx, second_id).await, CommandValue::ProjectAdded { name: "second".into() });
+    let repositories = backend.using::<Repository>("flotilla").list().await.expect("repository list");
+    assert_eq!(repositories.items.len(), 1);
+    repositories.items[0].spec.verify_key(&key).expect("repository identity should verify");
+}
+
+#[tokio::test]
+async fn repeated_project_add_preserves_evolved_definition() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
+    let key = spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("repository create");
+    let mut rx = daemon.subscribe();
+    assert_eq!(execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), None).await, CommandValue::ProjectAdded {
+        name: "core".into()
+    });
+    let projects = backend.clone().using::<Project>("flotilla");
+    let original = projects.get("core").await.expect("project");
+    let mut evolved = original.spec.clone();
+    evolved.display_name = "Evolved".to_string();
+    evolved.default_workflow_ref = "governor-refined".to_string();
+    evolved.issue_source = Some(IssueSource { service: "linear".to_string(), scope: "FLOT".to_string() });
+    projects
+        .update(&InputMeta::builder().name("core".to_string()).build(), &original.metadata.resource_version, &evolved)
+        .await
+        .expect("evolve project");
+
+    assert_eq!(execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), None).await, CommandValue::ProjectAdded {
+        name: "core".into()
+    });
+    assert_eq!(projects.get("core").await.expect("project").spec, evolved);
+    assert!(matches!(
+        execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), Some("Contradiction")).await,
+        CommandValue::Error { message } if message.contains("project apply")
+    ));
+}
+
+#[tokio::test]
+async fn project_apply_normalizes_typed_multi_repo_definition() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
     let yaml = r#"
-display_name: "Cross-Project Demo"
+display_name: Cross-Project Demo
+default_workflow_ref: single-agent-contained
 repositories:
-  - repo: https://github.com/org/repo-a.git
-    default_branch: main
-  - repo: https://github.com/org/repo-b.git
-    subpath: services/api
-    default_branch: develop
+  - repo: b
+    subpath: ./services/api
+  - repo: a
 "#;
 
     let id = daemon
@@ -111,53 +253,27 @@ repositories:
         .expect("execute");
 
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "cross".into() });
-
-    let projects = backend.using::<Project>("flotilla");
-    let project = projects.get("cross").await.expect("project should exist");
-    assert_eq!(project.spec.repositories.len(), 2);
-    assert_eq!(project.spec.repositories[0].repo, "https://github.com/org/repo-a.git");
+    let project = backend.using::<Project>("flotilla").get("cross").await.expect("project should exist");
+    assert_eq!(project.spec.repositories[0].repo, RepositoryKey("a".to_string()));
     assert_eq!(project.spec.repositories[1].subpath.as_deref(), Some("services/api"));
-}
-
-#[tokio::test]
-async fn project_apply_updates_existing() {
-    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
-    let mut rx = daemon.subscribe();
-
-    // First apply.
-    let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply { name: "iter".into(), spec_yaml: "display_name: V1\nrepositories: []\n".into() },
-        })
-        .await
-        .expect("first apply");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "iter".into() });
-
-    // Second apply same name, different content.
-    let id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ProjectApply { name: "iter".into(), spec_yaml: "display_name: V2\nrepositories: []\n".into() },
-        })
-        .await
-        .expect("second apply");
-    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "iter".into() });
-
-    let projects = backend.using::<Project>("flotilla");
-    let project = projects.get("iter").await.expect("project should exist");
-    assert_eq!(project.spec.display_name.as_deref(), Some("V2"));
 }
 
 #[tokio::test]
 async fn convoy_create_carries_project_ref() {
     let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
-
+    let repository_spec = RepositorySpec::remote("https://github.com/org/linked-repo.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("repository create");
+    assert_eq!(
+        execute_project_add(&daemon, &mut rx, "linked-repo".to_string(), Some("my-project"), None).await,
+        CommandValue::ProjectAdded { name: "my-project".into() }
+    );
     let id = daemon
         .execute(Command {
             node_id: None,
@@ -176,55 +292,71 @@ async fn convoy_create_carries_project_ref() {
         })
         .await
         .expect("execute");
-
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked".into() });
-
-    let convoys = backend.using::<Convoy>("flotilla");
-    let convoy = convoys.get("linked").await.expect("convoy should exist");
-    assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
+    assert_eq!(backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy").spec.project_ref.as_deref(), Some("my-project"));
 }
 
 #[tokio::test]
-async fn project_apply_rejects_invalid_yaml() {
-    let (daemon, _backend, _config, _runtime, _tmp) = start_daemon().await;
+async fn unresolved_replicated_project_refs_store_but_block_convoy_admission() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
-
-    let id = daemon
+    let apply_id = daemon
         .execute(Command {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
             action: CommandAction::ProjectApply {
-                name: "broken".into(),
-                spec_yaml: "this is: not {valid yaml structure for: a project".into(),
+                name: "waiting".into(),
+                spec_yaml: "display_name: Waiting\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: missing\n".into(),
             },
         })
         .await
-        .expect("execute");
+        .expect("apply execute");
+    assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "waiting".into() });
+    assert!(backend.using::<Project>("flotilla").get("waiting").await.is_ok(), "definition should persist before its referent");
 
-    let result = await_command_result(&mut rx, id).await;
-    assert!(matches!(result, CommandValue::Error { .. }), "expected Error, got {result:?}");
-}
-
-#[tokio::test]
-async fn project_apply_rejects_wrong_shape_yaml() {
-    // Valid YAML, but a `repositories` entry is missing the required `repo` field.
-    let (daemon, _backend, _config, _runtime, _tmp) = start_daemon().await;
-    let mut rx = daemon.subscribe();
-
-    let id = daemon
+    let convoy_id = daemon
         .execute(Command {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ProjectApply {
-                name: "shapeless".into(),
-                spec_yaml: "repositories:\n  - subpath: apps/x\n    default_branch: main\n".into(),
+            action: CommandAction::ConvoyCreate {
+                name: "blocked".into(),
+                workflow_ref: "scratch".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: Some("waiting".into()),
+                placement_policy: None,
+                adopted_checkout: None,
             },
         })
         .await
-        .expect("execute");
+        .expect("convoy execute");
+    assert!(matches!(
+        await_command_result(&mut rx, convoy_id).await,
+        CommandValue::Error { message } if message.contains("project waiting is not ready") && message.contains("missing")
+    ));
+}
 
-    let result = await_command_result(&mut rx, id).await;
-    assert!(matches!(result, CommandValue::Error { .. }), "expected Error, got {result:?}");
+#[tokio::test]
+async fn project_apply_rejects_invalid_or_incomplete_definitions() {
+    let (daemon, _backend, _config, _runtime, _tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    for spec_yaml in [
+        "this is: not {valid yaml structure for: a project",
+        "display_name: Missing workflow\nrepositories:\n  - repo: a\n",
+        "display_name: Empty repos\ndefault_workflow_ref: wf\nrepositories: []\n",
+    ] {
+        let id = daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ProjectApply { name: "broken".into(), spec_yaml: spec_yaml.into() },
+            })
+            .await
+            .expect("execute");
+        assert!(matches!(await_command_result(&mut rx, id).await, CommandValue::Error { .. }));
+    }
 }

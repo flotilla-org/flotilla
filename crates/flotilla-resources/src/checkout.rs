@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch};
+use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey};
 
 define_resource!(Checkout, "checkouts", CheckoutSpec, CheckoutStatus, CheckoutStatusPatch);
 
@@ -28,10 +28,19 @@ impl CheckoutSpec {
             Self::Observed(_) => None,
         }
     }
+
+    pub fn repo_ref(&self) -> &RepositoryKey {
+        match self {
+            Self::Worktree(spec) => &spec.repo_ref,
+            Self::FreshClone(spec) => &spec.repo_ref,
+            Self::Observed(spec) => &spec.repo_ref,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckoutWorktreeSpec {
+    pub repo_ref: RepositoryKey,
     pub env_ref: String,
     #[serde(rename = "ref")]
     pub r#ref: String,
@@ -41,6 +50,7 @@ pub struct CheckoutWorktreeSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FreshCloneCheckoutSpec {
+    pub repo_ref: RepositoryKey,
     pub env_ref: String,
     #[serde(rename = "ref")]
     pub r#ref: String,
@@ -53,7 +63,8 @@ pub struct ObservedCheckoutSpec {
     #[serde(rename = "ref")]
     pub r#ref: String,
     pub path: String,
-    pub repo_ref: String,
+    pub repo_ref: RepositoryKey,
+    pub host_ref: String,
     pub is_main: bool,
 }
 

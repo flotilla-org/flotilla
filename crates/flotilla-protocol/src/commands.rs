@@ -189,16 +189,14 @@ pub enum CommandAction {
         name: String,
         spec_yaml: String,
     },
-    ProjectCreate {
-        name: String,
+    ProjectAdd {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        repository_url: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        subpath: Option<String>,
-        #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
-        r#ref: Option<String>,
+        remote: Option<String>,
     },
     ProjectApply {
         name: String,
@@ -304,7 +302,7 @@ impl Command {
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
-            CommandAction::ProjectCreate { .. } => "Creating project...",
+            CommandAction::ProjectAdd { .. } => "Adding project...",
             CommandAction::ProjectApply { .. } => "Applying project...",
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
@@ -429,7 +427,7 @@ pub enum CommandValue {
     WorkflowTemplateApplied {
         name: String,
     },
-    ProjectCreated {
+    ProjectAdded {
         name: String,
     },
     ProjectApplied {
@@ -663,12 +661,11 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ProjectCreate {
-                    name: "my-project".into(),
+                action: CommandAction::ProjectAdd {
+                    target: "/src/flotilla".into(),
+                    name: Some("my-project".into()),
                     display_name: Some("My Project".into()),
-                    repository_url: Some("https://github.com/flotilla-org/flotilla.git".into()),
-                    subpath: Some("apps/frontend".into()),
-                    r#ref: Some("main".into()),
+                    remote: Some("origin".into()),
                 },
             },
             Command {
@@ -960,7 +957,7 @@ mod tests {
             CommandValue::IssuesByIds { items: vec![] },
             CommandValue::ConvoyCreated { name: "my-convoy".into() },
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
-            CommandValue::ProjectCreated { name: "my-project".into() },
+            CommandValue::ProjectAdded { name: "my-project".into() },
             CommandValue::ProjectApplied { name: "my-project".into() },
         ];
 

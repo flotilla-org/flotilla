@@ -231,7 +231,12 @@ pub async fn create_ready_clone(
 ) -> flotilla_resources::ResourceObject<Clone> {
     let clones = backend.clone().using::<Clone>(namespace);
     let created = clones
-        .create(&meta(name), &CloneSpec { url: repo_url.to_string(), env_ref: env_ref.to_string(), path: path.to_string() })
+        .create(&meta(name), &CloneSpec {
+            repo_ref: flotilla_resources::RepositoryKey(repo_key(&canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"))),
+            url: repo_url.to_string(),
+            env_ref: env_ref.to_string(),
+            path: path.to_string(),
+        })
         .await
         .expect("clone create should succeed");
     clones

@@ -1,0 +1,50 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: projects.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: projects
+    singular: project
+    kind: Project
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [display_name, default_workflow_ref, repositories]
+              properties:
+                display_name:
+                  type: string
+                  minLength: 1
+                default_workflow_ref:
+                  type: string
+                  minLength: 1
+                issue_source:
+                  type: object
+                  required: [service, scope]
+                  properties:
+                    service:
+                      type: string
+                    scope:
+                      type: string
+                repositories:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [repo]
+                    properties:
+                      repo:
+                        type: string
+                      subpath:
+                        type: string
+                      default_branch:
+                        type: string

@@ -279,7 +279,8 @@ async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &s
             &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
                 r#ref: "main".to_string(),
                 path: "/repo".to_string(),
-                repo_ref: "git@example.com:owner/repo.git".to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                host_ref: "host-01".to_string(),
                 is_main: true,
             }),
         )
@@ -2352,7 +2353,7 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
         ResourceCheckoutSpec::Observed(spec) => {
             assert_eq!(spec.r#ref, "main");
             assert_eq!(spec.path, std::fs::canonicalize(&checkout_path).expect("canonical path").display().to_string());
-            assert_eq!(spec.repo_ref, remote);
+            assert_eq!(spec.repo_ref, flotilla_resources::RepositorySpec::remote(remote).expect("repository spec").key());
         }
         other => panic!("expected observed checkout spec, got {other:?}"),
     }

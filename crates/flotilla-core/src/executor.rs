@@ -327,7 +327,7 @@ pub async fn build_plan(
         | CommandAction::CrewHandoff { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::WorkflowTemplateApply { .. }
-        | CommandAction::ProjectCreate { .. }
+        | CommandAction::ProjectAdd { .. }
         | CommandAction::ProjectApply { .. }
         | CommandAction::TrackRepoPath { .. }
         | CommandAction::UntrackRepo { .. }

@@ -27,6 +27,7 @@ async fn mismatched_clone_name_fails() {
     let resolver = backend.using::<flotilla_resources::Clone>("flotilla");
     let clone = resolver
         .create(&meta("clone-wrong"), &CloneSpec {
+            repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
             url: "git@github.com:flotilla-org/flotilla.git".to_string(),
             env_ref: "host-direct-01HXYZ".to_string(),
             path: "/Users/alice/dev/flotilla".to_string(),
