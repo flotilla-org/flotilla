@@ -29,7 +29,7 @@ use flotilla_manifest::{
     wire::MetadataPatch,
 };
 use flotilla_protocol::{
-    result_set::{ConvoyRow, ResultDelta, ResultSet, Rows, SessionRow},
+    result_set::{ConvoyRow, IndependentRow, ResultDelta, ResultSet, Rows},
     DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -74,7 +74,7 @@ pub enum Applied {
 #[derive(Default)]
 pub struct ConnectorState {
     convoys: HashMap<ResourceRef, ConvoyRow>,
-    sessions: HashMap<ResourceRef, SessionRow>,
+    independents: HashMap<ResourceRef, IndependentRow>,
     seqs: HashMap<QueryId, u64>,
     catalog: Catalog,
 }
@@ -95,7 +95,7 @@ impl ConnectorState {
         }
         match &set.rows {
             Rows::Convoys(rows) => self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
-            Rows::Sessions(rows) => self.sessions = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
+            Rows::Independents(rows) => self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
         }
         self.seqs.insert(query, set.seq);
         Applied::Updated
@@ -118,9 +118,9 @@ impl ConnectorState {
                     self.convoys.insert(row.resource.clone(), row.clone());
                 }
             }
-            Rows::Sessions(rows) => {
+            Rows::Independents(rows) => {
                 for row in rows {
-                    self.sessions.insert(row.resource.clone(), row.clone());
+                    self.independents.insert(row.resource.clone(), row.clone());
                 }
             }
         }
@@ -129,8 +129,8 @@ impl ConnectorState {
                 QueryId::Convoys => {
                     self.convoys.remove(removed);
                 }
-                QueryId::Sessions => {
-                    self.sessions.remove(removed);
+                QueryId::Independents => {
+                    self.independents.remove(removed);
                 }
             }
         }
@@ -142,8 +142,8 @@ impl ConnectorState {
     /// move the PM from the previously published catalog to the new one.
     pub fn rebuild(&mut self, mint: &dyn RecipeMint) -> Vec<MetadataPatch> {
         let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
-        let sessions: Vec<SessionRow> = self.sessions.values().cloned().collect();
-        let next = project_catalog(&CatalogInput { convoys: &convoys, sessions: &sessions }, mint);
+        let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
+        let next = project_catalog(&CatalogInput { convoys: &convoys, independents: &independents }, mint);
         let patches = next.diff_patches(&self.catalog);
         self.catalog = next;
         patches

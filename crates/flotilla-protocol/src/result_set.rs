@@ -24,19 +24,19 @@ pub enum QueryId {
     /// All Convoys — durable ∪ observed, fleet-merged, joined with
     /// Presentation attach state. Rows are [`ConvoyRow`].
     Convoys,
-    /// Free-floating TerminalSessions with no Convoy association. Rows are
-    /// [`SessionRow`].
-    Sessions,
+    /// TerminalSessions with no Convoy association. Rows are
+    /// [`IndependentRow`].
+    Independents,
 }
 
 impl QueryId {
     /// Every query the Aggregator maintains.
-    pub const ALL: &'static [QueryId] = &[QueryId::Convoys, QueryId::Sessions];
+    pub const ALL: &'static [QueryId] = &[QueryId::Convoys, QueryId::Independents];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Convoys => "convoys",
-            Self::Sessions => "sessions",
+            Self::Independents => "independents",
         }
     }
 }
@@ -89,21 +89,21 @@ impl ResultDelta {
 #[serde(tag = "kind", content = "rows", rename_all = "snake_case")]
 pub enum Rows {
     Convoys(Vec<ConvoyRow>),
-    Sessions(Vec<SessionRow>),
+    Independents(Vec<IndependentRow>),
 }
 
 impl Rows {
     pub fn query(&self) -> QueryId {
         match self {
             Self::Convoys(_) => QueryId::Convoys,
-            Self::Sessions(_) => QueryId::Sessions,
+            Self::Independents(_) => QueryId::Independents,
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
             Self::Convoys(rows) => rows.len(),
-            Self::Sessions(rows) => rows.len(),
+            Self::Independents(rows) => rows.len(),
         }
     }
 
@@ -118,15 +118,15 @@ impl Rows {
         }
     }
 
-    pub fn as_sessions(&self) -> Option<&[SessionRow]> {
+    pub fn as_independents(&self) -> Option<&[IndependentRow]> {
         match self {
-            Self::Sessions(rows) => Some(rows),
+            Self::Independents(rows) => Some(rows),
             _ => None,
         }
     }
 }
 
-/// Lifecycle phase of a free-floating terminal session.
+/// Lifecycle phase of an independent terminal session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionPhase {
@@ -154,10 +154,10 @@ impl fmt::Display for SessionPhase {
     }
 }
 
-/// One row of the [`QueryId::Sessions`] result set.
+/// One row of the [`QueryId::Independents`] result set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
-pub struct SessionRow {
+pub struct IndependentRow {
     /// Row identity and merge key across hosts.
     pub resource: ResourceRef,
     pub name: String,

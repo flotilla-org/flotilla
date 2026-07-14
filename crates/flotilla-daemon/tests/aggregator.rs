@@ -13,12 +13,14 @@ use flotilla_core::{
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
-    result_set::{ConvoyRow, QueryId, ResultSet, SessionRow},
+    result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet},
     DaemonEvent, HostName, QueryCursor,
 };
 use flotilla_resources::{
-    ConvoySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ResourceBackend, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, CONVOY_LABEL, REPO_LABEL,
+    Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
+    InMemoryBackend, InputMeta, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_LABEL,
+    VESSEL_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -54,8 +56,8 @@ fn convoy_rows(result_set: &ResultSet) -> &[ConvoyRow] {
     result_set.rows.as_convoys().expect("convoy rows")
 }
 
-fn session_rows(result_set: &ResultSet) -> &[SessionRow] {
-    result_set.rows.as_sessions().expect("session rows")
+fn independent_rows(result_set: &ResultSet) -> &[IndependentRow] {
+    result_set.rows.as_independents().expect("independent rows")
 }
 
 #[tokio::test]
@@ -115,7 +117,7 @@ async fn aggregator_emits_result_set_events() {
 }
 
 #[tokio::test]
-async fn running_convoyless_session_emits_attachable_session_row() {
+async fn running_convoyless_session_emits_attachable_independent_row() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -144,7 +146,10 @@ async fn running_convoyless_session_emits_attachable_session_row() {
         .create(
             &InputMeta::builder()
                 .name("terminal-convoy-coder".to_string())
-                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+                    (VESSEL_LABEL.to_string(), "coder".to_string()),
+                ]))
                 .build(),
             &TerminalSessionSpec {
                 env_ref: "host-direct-local".to_string(),
@@ -164,6 +169,19 @@ async fn running_convoyless_session_emits_attachable_session_row() {
         })
         .await
         .expect("mark convoy terminal session running");
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.create(&convoy_meta("convoy-a"), &convoy_spec("scratch")).await.expect("create convoy for bound terminal session");
+    convoys
+        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            workflow_snapshot: Some(WorkflowSnapshot {
+                vessels: vec![VesselRequirement::builder().name("coder".to_string()).crew(Vec::new()).build()],
+            }),
+            work: BTreeMap::from([("coder".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+            ..Default::default()
+        })
+        .await
+        .expect("mark convoy vessel running");
     let unresolvable = sessions
         .create(&InputMeta::builder().name("terminal-unresolvable".to_string()).build(), &TerminalSessionSpec {
             env_ref: "missing-environment".to_string(),
@@ -219,14 +237,14 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     let rows = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Sessions => {
-                    let rows = session_rows(&result_set);
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Independents => {
+                    let rows = independent_rows(&result_set);
                     if !rows.is_empty() {
                         return rows.to_vec();
                     }
                 }
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
-                    let rows = delta.changed.as_sessions().expect("session rows");
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
+                    let rows = delta.changed.as_independents().expect("independent rows");
                     if !rows.is_empty() {
                         return rows.to_vec();
                     }
@@ -237,7 +255,23 @@ async fn running_convoyless_session_emits_attachable_session_row() {
         }
     })
     .await
-    .expect("timed out waiting for sessions result rows");
+    .expect("timed out waiting for independents result rows");
+
+    assert!(
+        rows.iter().all(|row| row.name != "terminal-convoy-coder"),
+        "convoy-bound terminal sessions surface on vessel rows, never in independents",
+    );
+    let convoy_replay =
+        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: None }]).await.expect("subscribe to convoys query");
+    let convoy_rows = convoy_replay
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys => Some(convoy_rows(result_set)),
+            _ => None,
+        })
+        .expect("convoys replay result set");
+    let convoy = convoy_rows.iter().find(|row| row.name == "convoy-a").expect("convoy row for bound terminal session");
+    assert!(convoy.vessels.iter().any(|vessel| vessel.name == "coder"), "convoy-bound terminal session surfaces on its vessel row");
 
     let row = rows.iter().find(|row| row.name == "terminal-yeoman").expect("attachable session row");
     assert_eq!(row.repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
@@ -248,37 +282,39 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     assert_eq!(unresolvable.attach, None);
     assert!(daemon.resolve_attach_command_internal("terminal-yeoman").await.is_ok());
 
-    let replay =
-        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Sessions, since: None }]).await.expect("subscribe to sessions query");
+    let replay = daemon
+        .subscribe_queries(&[QueryCursor { query: QueryId::Independents, since: None }])
+        .await
+        .expect("subscribe to independents query");
     let replayed = replay
         .iter()
         .find_map(|event| match event {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Sessions => Some(session_rows(result_set)),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Independents => Some(independent_rows(result_set)),
             _ => None,
         })
-        .expect("sessions replay result set");
+        .expect("independents replay result set");
     assert_eq!(replayed.len(), 2);
     let unresolvable = replayed.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
     assert_eq!(unresolvable.attach, None);
 
     let replica = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot");
-    let local_sessions = replica
+    let local_independents = replica
         .result_sets
         .iter()
-        .find(|result_set| result_set.query() == QueryId::Sessions)
-        .map(session_rows)
-        .expect("local sessions result set");
-    assert_eq!(local_sessions.len(), 2);
+        .find(|result_set| result_set.query() == QueryId::Independents)
+        .map(independent_rows)
+        .expect("local independents result set");
+    assert_eq!(local_independents.len(), 2);
 
     environments.delete(&environment_name).await.expect("delete attach environment");
     let unavailable = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
                     if let Some(row) = delta
                         .changed
-                        .as_sessions()
-                        .expect("session rows")
+                        .as_independents()
+                        .expect("independent rows")
                         .iter()
                         .find(|row| row.name == "terminal-yeoman" && row.attach.is_none())
                     {
@@ -301,11 +337,11 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     let available = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions => {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
                     if let Some(row) = delta
                         .changed
-                        .as_sessions()
-                        .expect("session rows")
+                        .as_independents()
+                        .expect("independent rows")
                         .iter()
                         .find(|row| row.name == "terminal-yeoman" && row.attach.as_deref() == Some("terminal-yeoman"))
                     {
@@ -332,7 +368,7 @@ async fn running_convoyless_session_emits_attachable_session_row() {
     let removed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Sessions && !delta.removed.is_empty() => return delta,
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents && !delta.removed.is_empty() => return delta,
                 Ok(_) => continue,
                 Err(err) => panic!("broadcast receive error: {err}"),
             }

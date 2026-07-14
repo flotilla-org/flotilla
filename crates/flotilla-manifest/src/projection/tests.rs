@@ -27,8 +27,8 @@ fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, attach: Option<&st
 }
 
 #[bon::builder]
-fn session(namespace: &str, name: &str, phase: SessionPhase, repo: Option<&str>, attach: Option<&str>) -> SessionRow {
-    SessionRow::builder()
+fn independent(namespace: &str, name: &str, phase: SessionPhase, repo: Option<&str>, attach: Option<&str>) -> IndependentRow {
+    IndependentRow::builder()
         .resource(session_ref(namespace, name))
         .name(name)
         .maybe_repo(repo.map(|repo| RepoKey(repo.to_owned())))
@@ -82,7 +82,7 @@ fn convoy_with_project_ref_projects_the_full_spine() {
             vessel().convoy(&reference).name("review").phase(WorkPhase::Complete).call(),
         ])
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     // project_ref wins over the repo as the project segment value.
@@ -129,7 +129,7 @@ fn failed_convoy_surfaces_attention_and_message() {
         .message("vessel checkout failed: disk full")
         .repo(RepoKey("flotilla-org/flotilla".to_owned()))
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let project_segment = GroupSegment::text(SEGMENT_PROJECT, "flotilla-org/flotilla");
@@ -149,7 +149,7 @@ fn initializing_convoy_reads_waiting_whatever_its_phase() {
         .phase(ConvoyPhase::Active)
         .initializing(true)
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let convoy_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_CONVOY, "dev/warming-up")]));
@@ -167,7 +167,7 @@ fn ready_vessel_waits_with_attention() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![vessel().convoy(&reference).name("implement").phase(WorkPhase::Ready).call()])
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let implement =
@@ -177,15 +177,15 @@ fn ready_vessel_waits_with_attention() {
 }
 
 #[test]
-fn session_with_repo_groups_under_project_and_publishes_identity() {
-    let session = session()
+fn independent_with_repo_groups_under_project_and_publishes_identity() {
+    let independent = independent()
         .namespace("dev")
         .name("terminal-scratch")
         .phase(SessionPhase::Running)
         .repo("flotilla-org/flotilla")
         .attach("terminal-scratch")
         .call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
+    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let project_segment = GroupSegment::text(SEGMENT_PROJECT, "flotilla-org/flotilla");
@@ -194,8 +194,8 @@ fn session_with_repo_groups_under_project_and_publishes_identity() {
     assert_eq!(text(group_patch, KEY_STATUS_STATE), "active");
     assert_eq!(text(group_patch, KEY_MATERIALIZE_TARGET), "pane");
     assert_eq!(text(group_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach terminal-scratch");
-    assert_eq!(text(group_patch, KEY_FACTORY_ID), "flotilla:sessions/dev/terminal-scratch");
-    assert_eq!(group_patch.set[KEY_STATUS_STATE].ordinal, None, "project-parented sessions are not archipelago-ordered");
+    assert_eq!(text(group_patch, KEY_FACTORY_ID), "flotilla:independents/dev/terminal-scratch");
+    assert_eq!(group_patch.set[KEY_STATUS_STATE].ordinal, None, "project-parented independents are not archipelago-ordered");
 
     let project = find(&patches, &group(vec![project_segment.clone()]));
     assert_eq!(text(project, KEY_PROJECT_NAME), "flotilla", "repo fallback labels the project with the short name");
@@ -212,9 +212,9 @@ fn session_with_repo_groups_under_project_and_publishes_identity() {
 }
 
 #[test]
-fn session_without_repo_is_archipelago_ordered_first() {
-    let session = session().namespace("dev").name("yeoman").phase(SessionPhase::Running).attach("yeoman").call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
+fn independent_without_repo_is_archipelago_ordered_first() {
+    let independent = independent().namespace("dev").name("yeoman").phase(SessionPhase::Running).attach("yeoman").call();
+    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let group_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_VESSEL, "yeoman")]));
@@ -227,9 +227,9 @@ fn session_without_repo_is_archipelago_ordered_first() {
 }
 
 #[test]
-fn session_without_attach_lists_without_recipe() {
-    let session = session().namespace("dev").name("wedged").phase(SessionPhase::Failed).repo("flotilla-org/flotilla").call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
+fn independent_without_attach_lists_without_recipe() {
+    let independent = independent().namespace("dev").name("wedged").phase(SessionPhase::Failed).repo("flotilla-org/flotilla").call();
+    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let group_patch = find(
@@ -251,12 +251,12 @@ fn diff_sets_changes_and_unsets_disappearances() {
         .phase(ConvoyPhase::Failed)
         .message("boom")
         .build();
-    let old_session = session().namespace("dev").name("scratch").phase(SessionPhase::Running).attach("scratch").call();
-    let previous = project_catalog(&CatalogInput { convoys: &[failed], sessions: &[old_session] }, &mint());
+    let old_independent = independent().namespace("dev").name("scratch").phase(SessionPhase::Running).attach("scratch").call();
+    let previous = project_catalog(&CatalogInput { convoys: &[failed], independents: &[old_independent] }, &mint());
 
     let recovered =
         ConvoyRow::builder().resource(reference).name("auth").workflow_ref("implement-review").phase(ConvoyPhase::Active).build();
-    let current = project_catalog(&CatalogInput { convoys: &[recovered], sessions: &[] }, &mint());
+    let current = project_catalog(&CatalogInput { convoys: &[recovered], independents: &[] }, &mint());
 
     let patches = current.diff_patches(&previous);
 
@@ -268,11 +268,11 @@ fn diff_sets_changes_and_unsets_disappearances() {
     assert!(convoy_patch.unset.contains(&KEY_STATUS_ATTENTION.to_owned()));
     assert!(convoy_patch.unset.contains(&KEY_CONVOY_MESSAGE.to_owned()));
 
-    // The vanished session is explicitly unset on both its targets.
-    let session_group = find(&patches, &group(vec![GroupSegment::text(SEGMENT_VESSEL, "scratch")]));
-    assert!(session_group.set.is_empty());
-    assert!(session_group.unset.contains(&KEY_STATUS_STATE.to_owned()));
-    assert!(session_group.unset.contains(&KEY_MATERIALIZE_RECIPE.to_owned()));
+    // The vanished independent is explicitly unset on both its targets.
+    let independent_group = find(&patches, &group(vec![GroupSegment::text(SEGMENT_VESSEL, "scratch")]));
+    assert!(independent_group.set.is_empty());
+    assert!(independent_group.unset.contains(&KEY_STATUS_STATE.to_owned()));
+    assert!(independent_group.unset.contains(&KEY_MATERIALIZE_RECIPE.to_owned()));
     let identity_patch = find(&patches, &session_identity("feta/dev/scratch"));
     assert!(identity_patch.set.is_empty());
     assert!(identity_patch.unset.contains(&KEY_SCOPE.to_owned()));
@@ -282,11 +282,11 @@ fn diff_sets_changes_and_unsets_disappearances() {
 
 #[test]
 fn reassert_covers_every_target() {
-    let session =
-        session().namespace("dev").name("scratch").phase(SessionPhase::Running).repo("flotilla-org/flotilla").attach("scratch").call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], sessions: &[session] }, &mint());
+    let independent =
+        independent().namespace("dev").name("scratch").phase(SessionPhase::Running).repo("flotilla-org/flotilla").attach("scratch").call();
+    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
-    assert_eq!(patches.len(), 3, "project group + session group + session identity");
+    assert_eq!(patches.len(), 3, "project group + independent group + independent identity");
     assert!(patches.iter().all(|patch| patch.unset.is_empty()));
     assert!(patches.iter().all(|patch| patch.source_id == SOURCE_CONNECTOR));
 }
@@ -302,7 +302,7 @@ fn shared_spine_helpers_match_the_catalog_targets() {
         .repo(RepoKey("flotilla-org/flotilla".to_owned()))
         .vessels(vec![vessel().convoy(&reference).name("implement").phase(WorkPhase::Running).call()])
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], sessions: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     // The actuator's tab stamp builds its scope with these helpers; they

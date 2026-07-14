@@ -8,7 +8,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use flotilla_protocol::{
-    result_set::{ConvoyRow, QueryId, ResultSet, Rows, SessionRow},
+    result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet, Rows},
     HostName, ResourceRef,
 };
 use tokio::sync::{RwLock, RwLockWriteGuard};
@@ -29,13 +29,13 @@ impl QueryRow for ConvoyRow {
     }
 }
 
-impl QueryRow for SessionRow {
+impl QueryRow for IndependentRow {
     fn resource(&self) -> &ResourceRef {
         &self.resource
     }
 
     fn into_rows(rows: Vec<Self>) -> Rows {
-        Rows::Sessions(rows)
+        Rows::Independents(rows)
     }
 }
 
@@ -109,7 +109,7 @@ impl<R: QueryRow + PartialEq> QueryProjection<R> {
 #[derive(Debug, Default, Clone)]
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
-    sessions: Arc<RwLock<QueryProjection<SessionRow>>>,
+    independents: Arc<RwLock<QueryProjection<IndependentRow>>>,
 }
 
 impl AggregatorProjectionState {
@@ -133,20 +133,20 @@ impl AggregatorProjectionState {
         self.convoys.read().await.local_result_set()
     }
 
-    pub async fn write_sessions(&self) -> RwLockWriteGuard<'_, QueryProjection<SessionRow>> {
-        self.sessions.write().await
+    pub async fn write_independents(&self) -> RwLockWriteGuard<'_, QueryProjection<IndependentRow>> {
+        self.independents.write().await
     }
 
-    pub async fn sessions_result_set(&self) -> ResultSet {
-        self.sessions.read().await.result_set()
+    pub async fn independents_result_set(&self) -> ResultSet {
+        self.independents.read().await.result_set()
     }
 
-    pub async fn sessions_seq(&self) -> u64 {
-        self.sessions.read().await.seq
+    pub async fn independents_seq(&self) -> u64 {
+        self.independents.read().await.seq
     }
 
-    pub async fn local_sessions_result_set(&self) -> ResultSet {
-        self.sessions.read().await.local_result_set()
+    pub async fn local_independents_result_set(&self) -> ResultSet {
+        self.independents.read().await.local_result_set()
     }
 
     /// This host's local result sets across all named queries, in the order
@@ -156,7 +156,7 @@ impl AggregatorProjectionState {
         for query in QueryId::ALL {
             result_sets.push(match query {
                 QueryId::Convoys => self.local_result_set().await,
-                QueryId::Sessions => self.local_sessions_result_set().await,
+                QueryId::Independents => self.local_independents_result_set().await,
             });
         }
         result_sets
@@ -166,7 +166,7 @@ impl AggregatorProjectionState {
     pub async fn result_set_for(&self, query: QueryId) -> ResultSet {
         match query {
             QueryId::Convoys => self.result_set().await,
-            QueryId::Sessions => self.sessions_result_set().await,
+            QueryId::Independents => self.independents_result_set().await,
         }
     }
 }
