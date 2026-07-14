@@ -149,6 +149,31 @@ cache layer, fetched per external-service+repo (not per host), and the
 **Aggregator** links them to resources for views.
 _Avoid_: Resource (they are not), entity.
 
+**Demand-backed Query**:
+An **Aggregator** query family materialized only while subscribed, fetched
+from an external system of record (issues, change requests), staleness-stamped
+(`as_of`), windowed with fetch-more, discarded on unsubscribe. Contrast
+**store-backed** queries (convoys, independents, checkouts): incrementally
+maintained over the resource store, always warm and complete. Same wire
+contract for both.
+_Avoid_: Cache sync, mirror, replication (nothing persists).
+
+**Completion**:
+The admission-time stage of a create verb that fills what the caller's
+*intent* left blank (branch + convoy names, workflow default) before the spec
+persists — the store never holds a half-spec. Meta-agents are upstream
+completers proposing fuller specs; admission remains the backstop.
+_Avoid_: Defaulting webhook, enrichment, the governor's job.
+
+**Independent**:
+A terminal session with no **Convoy** association — sailing alone, per the
+convoy-era term. Adopted attachables, persistent agents, loose work sessions.
+Appears in the `independents` query and nowhere else; joining a Convoy removes
+it there (convoy-bound sessions surface on vessel rows instead), so nothing is
+ever double-listed.
+_Avoid_: Session (maximally overloaded — cloud agents, cleat, tmux, zellij all
+claim it), free-floating session, loose session.
+
 **External Result**:
 An artifact a **Convoy** produces in an external service — a PR, a CMS article, a
 YouTube video. Producing one is an action with an external result that Flotilla
