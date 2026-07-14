@@ -257,7 +257,7 @@ impl TestWidgetHarness {
             provisioning_target: &self.provisioning_target,
             my_host: self.my_host.clone(),
             my_node_id: self.my_node_id.clone(),
-            views: &self.views,
+            views: &mut self.views,
             commands: &mut self.commands,
             active_repo_is_remote_only: self.active_repo_is_remote_only,
             namespaces: &self.namespaces,

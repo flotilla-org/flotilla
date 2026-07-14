@@ -17,54 +17,15 @@ impl App {
     ///
     /// Called when the base layer widget (Normal mode_id) is on top.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.convoys_focus(), self.views.is_scoped());
+        let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.views.is_scoped());
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
     }
 
     /// Handle actions that the widget stack returned `Ignored` for.
     ///
     /// These are actions that need `&mut App` context the widget doesn't
-    /// have: confirm/enter, action menu, file picker, dispatch intent, and
-    /// convoy selection navigation.
+    /// have: confirm/enter, action menu, file picker, and dispatch intent.
     pub(super) fn dispatch_action(&mut self, action: Action) {
-        if let Some(scope) = self.active_convoy_scope() {
-            // A convoy-pinned view (convoy/vessel kinds) is the vessel tree;
-            // list navigation doesn't apply. A vessel-pinned view never
-            // moves its selection at all — it IS one vessel.
-            let convoy_pinned = scope.convoy.is_some();
-            let vessel_pinned = scope.vessel.is_some();
-            match action {
-                Action::SelectNext | Action::SelectPrev if vessel_pinned => {}
-                Action::SelectNext => match (convoy_pinned, self.convoys_focus()) {
-                    (false, super::ConvoysFocus::List) => self.convoys_tab_select_delta(&scope, 1),
-                    _ => self.convoy_vessels_select_delta(&scope, 1),
-                },
-                Action::SelectPrev => match (convoy_pinned, self.convoys_focus()) {
-                    (false, super::ConvoysFocus::List) => self.convoys_tab_select_delta(&scope, -1),
-                    _ => self.convoy_vessels_select_delta(&scope, -1),
-                },
-                // On the convoy list, Confirm (enter / l / right) drills into the vessel tree.
-                // In the vessel tree, Confirm is currently a no-op.
-                Action::Confirm => {
-                    if !convoy_pinned && matches!(self.convoys_focus(), super::ConvoysFocus::List) {
-                        self.enter_convoy_vessels_focus(&scope);
-                    }
-                }
-                // In the vessel tree, Dismiss (esc / left) returns to the
-                // convoy list; otherwise, scoped panes navigate back.
-                Action::Dismiss => {
-                    if !convoy_pinned && matches!(self.convoys_focus(), super::ConvoysFocus::Vessels) {
-                        self.exit_convoy_vessels_focus();
-                    } else if self.views.is_scoped() {
-                        self.scoped_back();
-                    }
-                }
-                Action::CompleteConvoyWork => self.open_complete_convoy_work_palette(&scope),
-                Action::AttachConvoyVessel => self.attach_selected_convoy_vessel(&scope),
-                _ => {}
-            }
-            return;
-        }
         // Scoped panes: Esc walks the in-place navigation history.
         if action == Action::Dismiss && self.views.is_scoped() {
             self.scoped_back();
@@ -405,65 +366,25 @@ impl App {
         }
     }
 
-    /// Open the command palette pre-filled with `convoy <id> work <vessel> complete --force `.
-    /// No-op when no convoy or vessel is selected. Convoy ids and vessel names are
-    /// arbitrary strings (no validation), so they are routed through the
-    /// palette's quoting helper to round-trip whitespace and special characters.
-    pub(super) fn open_complete_convoy_work_palette(&mut self, scope: &crate::app::ConvoyScope) {
-        let Some(convoy) = self.scoped_convoy_summary(scope) else { return };
-        // A vessel-pinned view targets its own vessel, never the shared selection.
-        let Some(vessel) = scope.vessel.as_ref().or(self.convoys_ui.selected_vessel.as_ref()) else { return };
-        let selected_vessel = vessel.clone();
-        let completion_target =
-            convoy.vessels.iter().find(|candidate| candidate.name == *vessel).and_then(|candidate| candidate.completion_target.clone());
-        let Some(completion_target) = completion_target else {
-            self.set_status_message(Some(format!("completion unavailable for vessel '{selected_vessel}'")));
-            return;
+    pub(super) fn execute_table_intent(&mut self, intent: crate::table_view::TableIntent) {
+        let (action, host) = match intent {
+            crate::table_view::TableIntent::AttachWorkspace { workspace_ref, host } => {
+                (CommandAction::SelectWorkspace { ws_ref: workspace_ref }, host)
+            }
+            crate::table_view::TableIntent::ForceCompleteWork { convoy, vessel, host } => {
+                (CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }, host)
+            }
         };
-        let target_node_id = match self.panel_target_node(&completion_target.host) {
-            Ok(target) => target,
+        let node_id = match self.panel_target_node(&host) {
+            Ok(node_id) => node_id,
             Err(message) => {
                 self.set_status_message(Some(message));
                 return;
             }
         };
-        let prefill = format!(
-            "convoy {} work {} complete --force ",
-            crate::palette::quote_palette_token(&completion_target.convoy),
-            crate::palette::quote_palette_token(&completion_target.vessel),
-        );
-        let widget = crate::widgets::command_palette::CommandPaletteWidget::with_prefill_on_node(prefill, target_node_id);
-        self.screen.modal_stack.push(Box::new(widget));
-    }
-
-    /// Dispatch `SelectWorkspace` for the selected vessel's workspace, or show a transient status when none exists yet.
-    pub(super) fn attach_selected_convoy_vessel(&mut self, scope: &crate::app::ConvoyScope) {
-        // A vessel-pinned view targets its own vessel, never the shared selection.
-        let Some(vessel) = scope.vessel.clone().or_else(|| self.convoys_ui.selected_vessel.clone()) else { return };
-        let target = self
-            .scoped_convoy_summary(scope)
-            .and_then(|convoy| convoy.vessels.iter().find(|candidate| candidate.name == vessel))
-            .map(|candidate| (candidate.workspace_ref.clone(), candidate.host.clone()));
-        match target {
-            Some((Some(ws_ref), host)) => {
-                // Convoy views carry no repo context; fall back to a
-                // context-free command rather than requiring an active repo.
-                let action = flotilla_protocol::CommandAction::SelectWorkspace { ws_ref };
-                let mut cmd = match self.model.active_repo.clone() {
-                    Some(identity) => self.repo_command_for_identity(identity, action),
-                    None => self.command(action),
-                };
-                cmd.node_id = match host.as_ref().map(|host| self.panel_target_node(host)).transpose() {
-                    Ok(target) => target.flatten(),
-                    Err(message) => {
-                        self.set_status_message(Some(message));
-                        return;
-                    }
-                };
-                self.proto_commands.push(cmd);
-            }
-            _ => self.set_status_message(Some(format!("no workspace yet for vessel '{vessel}'"))),
-        }
+        let mut command = self.command(action);
+        command.node_id = node_id;
+        self.proto_commands.push(command);
     }
 
     fn panel_target_node(&self, host: &HostName) -> Result<Option<NodeId>, String> {

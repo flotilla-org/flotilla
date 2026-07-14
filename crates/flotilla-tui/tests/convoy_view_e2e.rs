@@ -124,7 +124,7 @@ async fn tui_shows_convoys_from_daemon() {
 }
 
 #[tokio::test]
-async fn x_then_enter_completes_work_via_palette() {
+async fn generated_table_action_completes_work() {
     use std::collections::BTreeMap;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -227,9 +227,9 @@ async fn x_then_enter_completes_work_via_palette() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
     }
 
-    app.handle_key(key('l')); // drill into vessel focus
-    app.handle_key(key('x')); // open palette pre-filled
-    app.handle_key(enter()); // confirm — dispatch ConvoyWorkForceComplete
+    app.handle_key(enter()); // drill from the convoy row to its vessels
+    app.handle_key(key('.')); // open the selected vessel's generated actions
+    app.handle_key(enter()); // dispatch ConvoyWorkForceComplete
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;

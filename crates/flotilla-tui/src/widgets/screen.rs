@@ -10,10 +10,10 @@ use ratatui::{
 };
 
 use super::{
-    convoys_page::ConvoysPage,
     overview_page::OverviewPage,
     repo_page::RepoPage,
     status_bar_widget::{self, StatusBarWidget},
+    table::TableWidget,
     tabs::Tabs,
     AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
@@ -29,22 +29,7 @@ use crate::{
 /// event/frame — the View's kind, not stateful flags, decides the page.
 enum ActivePage {
     Overview,
-    /// A convoy list view: the convoys of a namespace, or of one project.
-    Convoys {
-        /// Set for project dashboards — scopes the list and its empty state.
-        project: Option<String>,
-    },
-    /// One convoy's vessel tree, full width.
-    Convoy {
-        namespace: String,
-        name: String,
-    },
-    /// One vessel's detail.
-    Vessel {
-        namespace: String,
-        convoy: String,
-        vessel: String,
-    },
+    Table,
     Repo(RepoIdentity),
     /// A repo view whose repo is no longer tracked, or an address that
     /// failed to parse: renders its own error, handles only shell actions.
@@ -71,6 +56,7 @@ pub struct Screen {
     pub modal_stack: Vec<Box<dyn InteractiveWidget>>,
     pub repo_pages: HashMap<RepoIdentity, RepoPage>,
     pub overview_page: OverviewPage,
+    pub table: TableWidget,
 }
 
 impl Default for Screen {
@@ -87,6 +73,7 @@ impl Screen {
             modal_stack: Vec::new(),
             repo_pages: HashMap::new(),
             overview_page: OverviewPage::new(),
+            table: TableWidget::default(),
         }
     }
 
@@ -130,17 +117,9 @@ impl Screen {
     fn active_page(&self, view: &crate::app::OpenView, repos: &HashMap<RepoIdentity, crate::app::TuiRepoModel>) -> ActivePage {
         match &view.target {
             ViewTarget::View(ViewAddress::Overview) => ActivePage::Overview,
-            ViewTarget::View(ViewAddress::Convoys { .. }) => ActivePage::Convoys { project: None },
-            // Project dashboards render the convoy list scoped to the
-            // project (the scope filter is applied upstream, in the
-            // pre-filtered `RenderContext::convoys`).
-            ViewTarget::View(ViewAddress::Project { name, .. }) => ActivePage::Convoys { project: Some(name.clone()) },
-            ViewTarget::View(ViewAddress::Convoy { namespace, name }) => {
-                ActivePage::Convoy { namespace: namespace.clone(), name: name.clone() }
-            }
-            ViewTarget::View(ViewAddress::Vessel { namespace, convoy, vessel }) => {
-                ActivePage::Vessel { namespace: namespace.clone(), convoy: convoy.clone(), vessel: vessel.clone() }
-            }
+            ViewTarget::View(
+                ViewAddress::Convoys { .. } | ViewAddress::Project { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. },
+            ) => ActivePage::Table,
             ViewTarget::View(ViewAddress::Repo(identity)) => {
                 if repos.contains_key(identity) {
                     ActivePage::Repo(identity.clone())
@@ -247,12 +226,15 @@ impl InteractiveWidget for Screen {
         // Phase 3: No modal — dispatch to the active View's page.
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_action(action, ctx),
-            // Convoy-family and error pages have no interactive widget —
-            // only the shell-level actions apply here (convoy navigation is
-            // App-level dispatch).
-            ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
-                Self::fallback_page_action(action, ctx)
+            ActivePage::Table => {
+                let outcome = self.table.handle_action(action, ctx);
+                if matches!(outcome, Outcome::Ignored) {
+                    Self::fallback_page_action(action, ctx)
+                } else {
+                    outcome
+                }
             }
+            ActivePage::Error { .. } => Self::fallback_page_action(action, ctx),
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_action(action, ctx),
                 None => Self::fallback_page_action(action, ctx),
@@ -279,9 +261,7 @@ impl InteractiveWidget for Screen {
         // No modal — dispatch to the active View's page
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_raw_key(key, ctx),
-            ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
-                Outcome::Ignored
-            }
+            ActivePage::Table | ActivePage::Error { .. } => Outcome::Ignored,
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_raw_key(key, ctx),
                 None => Outcome::Ignored,
@@ -352,9 +332,8 @@ impl InteractiveWidget for Screen {
         // Dispatch to the active View's page for content area mouse events
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_mouse(mouse, ctx),
-            ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } | ActivePage::Error { .. } => {
-                Outcome::Ignored
-            }
+            ActivePage::Table => self.table.handle_mouse(mouse, ctx),
+            ActivePage::Error { .. } => Outcome::Ignored,
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_mouse(mouse, ctx),
                 None => Outcome::Ignored,
@@ -384,51 +363,20 @@ impl InteractiveWidget for Screen {
         // 2. Content: dispatch to the active View's page
         let active_page = self.active_page(ctx.views.active(), &ctx.model.repos);
         match &active_page {
-            ActivePage::Convoys { project } => {
-                let selected = ctx.convoys_selected.as_ref();
-                ConvoysPage {
-                    convoys: ctx.convoys.clone(),
-                    selected,
-                    selected_vessel: ctx.convoys_selected_vessel,
-                    focus: ctx.convoys_focus,
-                    filter: ctx.convoy_filter,
-                    project: project.as_deref(),
+            ActivePage::Table => {
+                let address = ctx.views.active_address().cloned().expect("table page has a parsed address");
+                let filter = ctx.views.active_table_state().filter.clone();
+                let convoys = ctx.namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect::<Vec<_>>();
+                match crate::table_view::project(&address, &convoys).map(|view| view.filtered(&filter)) {
+                    Ok(view) => {
+                        let breadcrumbs =
+                            ctx.views.active().breadcrumb_addresses().into_iter().map(ToString::to_string).collect::<Vec<_>>();
+                        self.table.render_table(frame, chunks[1], ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
+                    }
+                    Err(detail) => Self::render_error_page(frame, chunks[1], ctx.theme, "table view unavailable", &detail),
                 }
-                .render(frame, chunks[1]);
             }
             ActivePage::Overview => self.overview_page.render(frame, chunks[1], ctx),
-            ActivePage::Convoy { namespace, name } => {
-                match ctx.namespaces.get(namespace).and_then(|m| m.convoys.values().find(|c| &c.name == name)) {
-                    Some(convoy) => {
-                        super::convoys_page::ConvoyDetail { convoy, selected_vessel: ctx.convoys_selected_vessel, focused: true }
-                            .render(frame, chunks[1])
-                    }
-                    None => Self::render_error_page(
-                        frame,
-                        chunks[1],
-                        ctx.theme,
-                        &format!("convoy not found: {namespace}/{name}"),
-                        "It may not have started yet, or it has been deleted.",
-                    ),
-                }
-            }
-            ActivePage::Vessel { namespace, convoy, vessel } => {
-                let found = ctx
-                    .namespaces
-                    .get(namespace)
-                    .and_then(|m| m.convoys.values().find(|c| &c.name == convoy))
-                    .and_then(|c| c.vessels.iter().find(|v| &v.name == vessel).map(|v| (c, v)));
-                match found {
-                    Some((convoy, vessel)) => super::convoys_page::VesselDetail { convoy, vessel }.render(frame, chunks[1]),
-                    None => Self::render_error_page(
-                        frame,
-                        chunks[1],
-                        ctx.theme,
-                        &format!("vessel not found: {namespace}/{convoy}/{vessel}"),
-                        "It may not have materialised yet, or its convoy has been deleted.",
-                    ),
-                }
-            }
             ActivePage::Repo(identity) => {
                 let identity = identity.clone();
                 match self.repo_pages.get_mut(&identity) {
@@ -466,9 +414,7 @@ impl InteractiveWidget for Screen {
                     Some(page) => (view_kind::compose_with_shell(scoped, page.binding_mode().modes()), page.status_fragment()),
                     None => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
                 },
-                ActivePage::Convoys { .. } | ActivePage::Convoy { .. } | ActivePage::Vessel { .. } => {
-                    (view_kind::binding_mode(address, ctx.convoys_focus, scoped), StatusFragment::default())
-                }
+                ActivePage::Table => (view_kind::binding_mode(address, scoped), StatusFragment::default()),
                 ActivePage::Error { .. } => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
             }
         };

@@ -156,15 +156,18 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Normal, "u", Action::ToggleArchived),
     b(BindingModeId::Normal, "d", Action::Dispatch(Intent::RemoveCheckout)),
     b(BindingModeId::Normal, "p", Action::Dispatch(Intent::OpenChangeRequest)),
-    // ── Convoys (outer focus: convoy list) ──
-    // j/k/up/down come from Shared (SelectNext/SelectPrev). enter comes from Shared (Confirm).
-    // l and right are vim-style and arrow-style synonyms for "drill into the vessel tree" — the
-    // app dispatches Confirm on the Convoys list to enter vessel focus.
-    h(BindingModeId::Convoys, "l", Action::Confirm, "Vessels"),
+    // ── Curated tables ──
+    // j/k/up/down and Enter/Esc come from Shared. Every table uses one cursor
+    // regime; Enter drills and Esc pops the active tab's history.
+    hk(BindingModeId::Convoys, "enter", "ENT", Action::Confirm, "Drill"),
+    h(BindingModeId::Convoys, ".", Action::OpenActionMenu, "Actions"),
+    h(BindingModeId::Convoys, "y", Action::Describe, "Describe"),
+    h(BindingModeId::Convoys, "l", Action::Confirm, "Drill"),
     b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
-    // ── ConvoyVessels (inner focus: vessel tree) ──
+    // Legacy mode retained only so existing user keybinding files still parse
+    // while the table slices land; no View selects it after #733.
     // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to
     // enter the vessel tree; the app dispatches Dismiss in Vessels focus to return to the list.
     b(BindingModeId::ConvoyVessels, "h", Action::Dismiss),

@@ -356,28 +356,17 @@ impl HighFidelityHarness {
         let backend = TestBackend::new(WIDTH, HEIGHT);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let theme = self.app.theme.clone();
-        let convoys_selected = self.app.convoys_ui.selected.clone();
-        let convoys_selected_vessel = self.app.convoys_ui.selected_vessel.clone();
-        let convoys_focus = self.app.convoys_ui.focus;
-        let convoy_filter_str = self.app.convoys_ui.filter.clone();
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let raw = self.app.namespaces.get("flotilla").map(|m| m.convoys.values().collect::<Vec<_>>()).unwrap_or_default();
-                let convoys: Vec<&_> = flotilla_tui::app::filter_convoys_by_str(raw.iter().copied(), &self.app.convoys_ui.filter).collect();
                 let mut ctx = flotilla_tui::widgets::RenderContext {
                     model: &self.app.model,
-                    views: &self.app.views,
+                    views: &mut self.app.views,
                     ui: &mut self.app.ui,
                     theme: &theme,
                     keymap: &self.app.keymap,
                     in_flight: &self.app.in_flight,
                     namespaces: &self.app.namespaces,
-                    convoys_selected,
-                    convoys_selected_vessel: convoys_selected_vessel.as_deref(),
-                    convoys_focus,
-                    convoy_filter: &convoy_filter_str,
-                    convoys,
                 };
                 self.app.screen.render(frame, area, &mut ctx);
             })

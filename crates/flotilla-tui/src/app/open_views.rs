@@ -7,6 +7,8 @@
 use flotilla_core::config::OpenViewEntry;
 use flotilla_protocol::{RepoIdentity, ViewAddress};
 
+use crate::table_view::TableState;
+
 /// What an open tab points at: a parsed View address, or the raw entry that
 /// failed to parse. A broken entry renders an error view in place — it never
 /// invalidates the rest of the tab set (ADR 0013 loud-failure rule).
@@ -22,6 +24,16 @@ pub struct OpenView {
     pub target: ViewTarget,
     /// User-set label. Display-only; never part of view identity.
     pub label_override: Option<String>,
+    pub table_state: TableState,
+    /// Addresses left behind by in-place drill navigation in this tab.
+    /// History is ephemeral and deliberately not persisted.
+    pub(crate) history: Vec<NavigationFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavigationFrame {
+    target: ViewTarget,
+    table_state: TableState,
 }
 
 impl OpenView {
@@ -30,11 +42,11 @@ impl OpenView {
             Ok(address) => ViewTarget::View(address),
             Err(error) => ViewTarget::Broken { raw: entry.address, error },
         };
-        Self { target, label_override: entry.label }
+        Self { target, label_override: entry.label, table_state: TableState::default(), history: Vec::new() }
     }
 
     fn of(address: ViewAddress) -> Self {
-        Self { target: ViewTarget::View(address), label_override: None }
+        Self { target: ViewTarget::View(address), label_override: None, table_state: TableState::default(), history: Vec::new() }
     }
 
     pub fn address(&self) -> Option<&ViewAddress> {
@@ -42,6 +54,21 @@ impl OpenView {
             ViewTarget::View(address) => Some(address),
             ViewTarget::Broken { .. } => None,
         }
+    }
+
+    pub fn breadcrumb_addresses(&self) -> Vec<&ViewAddress> {
+        self.history
+            .iter()
+            .filter_map(|frame| match &frame.target {
+                ViewTarget::View(address) => Some(address),
+                ViewTarget::Broken { .. } => None,
+            })
+            .chain(self.address())
+            .collect()
+    }
+
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
     }
 
     /// The string persisted for this view — broken entries keep their raw
@@ -78,9 +105,6 @@ pub struct OpenViews {
     /// The previously active index, for "dismiss overview" style returns.
     last_active: Option<usize>,
     mode: TabSetMode,
-    /// Scoped-mode navigation history: addresses left behind by in-place
-    /// opens, popped by [`OpenViews::back`]. Always empty in tabbed mode.
-    back_stack: Vec<ViewAddress>,
 }
 
 impl OpenViews {
@@ -110,7 +134,7 @@ impl OpenViews {
             }
             None => true,
         });
-        Self { views, active: 0, last_active: None, mode: TabSetMode::Tabbed, back_stack: Vec::new() }
+        Self { views, active: 0, last_active: None, mode: TabSetMode::Tabbed }
     }
 
     /// The default set for a config with no `open-views.toml`: overview,
@@ -131,7 +155,7 @@ impl OpenViews {
     /// A single-View set for scoped mode (`flotilla view <address>`): no
     /// pinned overview, no tab shell; opens navigate in place.
     pub fn scoped(address: ViewAddress) -> Self {
-        Self { views: vec![OpenView::of(address)], active: 0, last_active: None, mode: TabSetMode::Scoped, back_stack: Vec::new() }
+        Self { views: vec![OpenView::of(address)], active: 0, last_active: None, mode: TabSetMode::Scoped }
     }
 
     pub fn mode(&self) -> TabSetMode {
@@ -151,13 +175,59 @@ impl OpenViews {
         }
     }
 
-    /// Scoped-mode back navigation: return to the address the last in-place
-    /// open left behind. Returns true if navigation happened.
-    pub fn back(&mut self) -> bool {
-        let Some(address) = self.back_stack.pop() else { return false };
-        self.views = vec![OpenView::of(address)];
-        self.active = 0;
+    /// Remove another tab currently holding `address` so in-place navigation
+    /// preserves ADR 0013's one-open-View-per-address invariant.
+    fn remove_other_address(&mut self, address: &ViewAddress) -> bool {
+        let Some(index) = self.find(address) else { return true };
+        if index == self.active {
+            return true;
+        }
+        if self.is_pinned_index(index) {
+            return false;
+        }
+        self.views.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
         self.last_active = None;
+        true
+    }
+
+    /// Return to the address the active tab's last in-place drill left behind.
+    /// Returns true if navigation happened.
+    pub fn back(&mut self) -> bool {
+        let Some(frame) = self.views.get(self.active).and_then(|view| view.history.last()) else { return false };
+        let target_address = match &frame.target {
+            ViewTarget::View(address) => Some(address.clone()),
+            ViewTarget::Broken { .. } => None,
+        };
+        if let Some(address) = target_address {
+            if !self.remove_other_address(&address) {
+                return false;
+            }
+        }
+        let Some(view) = self.views.get_mut(self.active) else { return false };
+        let Some(frame) = view.history.pop() else { return false };
+        view.target = frame.target;
+        view.table_state = frame.table_state;
+        true
+    }
+
+    /// Drill into `address` in the active tab, preserving the current target
+    /// on that tab's history stack. This never grows or switches the tab set.
+    pub fn drill(&mut self, address: ViewAddress) -> bool {
+        if self.views.get(self.active).and_then(OpenView::address) == Some(&address) {
+            return false;
+        }
+        if !self.remove_other_address(&address) {
+            return false;
+        }
+        let Some(view) = self.views.get_mut(self.active) else { return false };
+        let previous = NavigationFrame {
+            target: std::mem::replace(&mut view.target, ViewTarget::View(address)),
+            table_state: std::mem::take(&mut view.table_state),
+        };
+        view.history.push(previous);
         true
     }
 
@@ -191,6 +261,18 @@ impl OpenViews {
 
     pub fn active(&self) -> &OpenView {
         &self.views[self.active]
+    }
+
+    pub fn active_mut(&mut self) -> &mut OpenView {
+        &mut self.views[self.active]
+    }
+
+    pub fn active_table_state(&self) -> &TableState {
+        &self.active().table_state
+    }
+
+    pub fn active_table_state_mut(&mut self) -> &mut TableState {
+        &mut self.active_mut().table_state
     }
 
     /// The active View's address, if the active tab isn't broken.
@@ -244,13 +326,7 @@ impl OpenViews {
             return false;
         }
         if self.is_scoped() {
-            if let Some(previous) = self.active_address().cloned() {
-                self.back_stack.push(previous);
-            }
-            self.views = vec![OpenView::of(address)];
-            self.active = 0;
-            self.last_active = None;
-            return true;
+            return self.drill(address);
         }
         if let Some(idx) = self.find(&address) {
             self.switch_to(idx);
@@ -464,6 +540,72 @@ mod tests {
         assert!(views.back());
         assert_eq!(views.active_address(), Some(&addr("convoy/flotilla/manifest")));
         assert!(!views.back());
+    }
+
+    #[test]
+    fn tabbed_drill_mutates_only_the_active_tab_and_back_restores_it() {
+        let mut views = three_tabs();
+        views.switch_to(1);
+
+        assert!(views.drill(addr("convoy/flotilla/manifest")));
+        assert_eq!(views.len(), 3, "drill must not grow the tab set");
+        assert_eq!(views.active_address(), Some(&addr("convoy/flotilla/manifest")));
+
+        views.switch_to(2);
+        assert_eq!(views.active_address(), Some(&addr("repo/github.com/o/r")), "another tab keeps its own current address");
+        assert!(!views.back(), "another tab has no history of the first tab's drill");
+
+        views.switch_to(1);
+        assert!(views.back());
+        assert_eq!(views.active_address(), Some(&addr("convoys/flotilla")));
+    }
+
+    #[test]
+    fn back_restores_the_table_state_owned_by_the_previous_view() {
+        let mut views = three_tabs();
+        views.switch_to(1);
+        views.active_table_state_mut().filter = "failed".into();
+
+        views.drill(addr("convoy/flotilla/manifest"));
+        assert!(views.active_table_state().filter.is_empty(), "a drilled view starts with independent state");
+        views.active_table_state_mut().filter = "review".into();
+
+        assert!(views.back());
+        assert_eq!(views.active_table_state().filter, "failed");
+    }
+
+    #[test]
+    fn drill_removes_an_existing_target_tab_before_mutating_the_active_tab() {
+        let mut views = OpenViews::from_entries(vec![
+            entry("overview"),
+            entry("convoys/flotilla"),
+            entry("convoy/flotilla/manifest"),
+            entry("repo/github.com/o/r"),
+        ]);
+        views.switch_to(1);
+
+        assert!(views.drill(addr("convoy/flotilla/manifest")));
+        assert_eq!(views.active_index(), 1);
+        assert_eq!(views.active_address(), Some(&addr("convoy/flotilla/manifest")));
+        assert_eq!(views.iter().filter(|view| view.address() == Some(&addr("convoy/flotilla/manifest"))).count(), 1);
+        assert_eq!(views.len(), 3);
+    }
+
+    #[test]
+    fn back_removes_a_new_tab_that_collides_with_the_history_target() {
+        let mut views = three_tabs();
+        views.switch_to(1);
+        assert!(views.drill(addr("convoy/flotilla/manifest")));
+
+        assert!(views.open_or_focus(addr("convoys/flotilla")));
+        assert_eq!(views.len(), 4);
+        views.switch_to(1);
+
+        assert!(views.back());
+        assert_eq!(views.active_index(), 1);
+        assert_eq!(views.active_address(), Some(&addr("convoys/flotilla")));
+        assert_eq!(views.iter().filter(|view| view.address() == Some(&addr("convoys/flotilla"))).count(), 1);
+        assert_eq!(views.len(), 3);
     }
 
     #[test]

@@ -129,7 +129,7 @@ mod tests {
         let mut page = OverviewPage::new();
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).expect("terminal creation should succeed");
-        let harness = TestWidgetHarness::new();
+        let mut harness = TestWidgetHarness::new();
         let theme = Theme::classic();
         let keymap = Keymap::defaults();
         let in_flight = HashMap::new();
@@ -140,17 +140,12 @@ mod tests {
                 let empty_namespaces = crate::app::NamespaceMap::new();
                 let mut ctx = RenderContext {
                     model: &harness.model,
-                    views: &harness.views,
+                    views: &mut harness.views,
                     ui: &mut ui,
                     theme: &theme,
                     keymap: &keymap,
                     in_flight: &in_flight,
                     namespaces: &empty_namespaces,
-                    convoys_selected: None,
-                    convoys_selected_vessel: None,
-                    convoys_focus: crate::app::ConvoysFocus::List,
-                    convoy_filter: "",
-                    convoys: vec![],
                 };
                 page.render(frame, frame.area(), &mut ctx);
             })
