@@ -297,7 +297,14 @@ fn select_startup_repo_roots(cli_roots: &[PathBuf], cwd_repo_root: Option<PathBu
     if cli_roots.is_empty() {
         cwd_repo_root.into_iter().collect()
     } else {
-        cli_roots.iter().map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone())).collect()
+        let mut roots = Vec::with_capacity(cli_roots.len());
+        for root in cli_roots {
+            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            if !roots.contains(&canonical) {
+                roots.push(canonical);
+            }
+        }
+        roots
     }
 }
 
@@ -1082,6 +1089,15 @@ mod tests {
         let roots = select_startup_repo_roots(&explicit, Some(PathBuf::from("/repos/current")));
 
         assert_eq!(roots, explicit);
+    }
+
+    #[test]
+    fn explicit_repo_roots_are_deduplicated_in_argument_order() {
+        let explicit = vec![PathBuf::from("/repos/one"), PathBuf::from("/repos/two"), PathBuf::from("/repos/one")];
+
+        let roots = select_startup_repo_roots(&explicit, None);
+
+        assert_eq!(roots, vec![PathBuf::from("/repos/one"), PathBuf::from("/repos/two")]);
     }
 
     #[test]
