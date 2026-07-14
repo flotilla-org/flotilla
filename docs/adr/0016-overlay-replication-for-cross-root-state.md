@@ -5,7 +5,9 @@
 **Relates to:** ADR 0002 (federation — this ADR is the mechanism for its
 "materialized replica" primitive), ADR 0006 (resources vs reference data),
 ADR 0007 (requirements-first placement — per-vessel re-provision rides it),
-ADR 0012 (tables — conflict badges), ADR 0014 (Repository as a
+ADR 0012 (tables — the conflict UX assumes a small badge-with-actions
+extension to its column model, not yet specified there), ADR 0014
+(Repository as a
 convergent-facts resource; mortal keys), issue #688 (the scenario-first
 semantics grill whose expectations this mechanism must deliver).
 
@@ -138,16 +140,31 @@ excludes it; the compaction roster shrinks. Survivors keep relaying its log
 forever. A declared-lost host heard from again is a **loud surfaced
 event**, never a silent rejoin.
 
-**Definitions need no adoption step.** A dead root's authored definitions
-remain readable (replicas are permanent) and remain *editable*: an edit on
-a survivor is written to the survivor's own log with a seen-vector covering
+**Definitions need no takeover step.** (Deliberately not "adoption" — that
+word is the Observed→Adopted→Managed lifecycle-authority axis of ADR 0003,
+which is unrelated here.) A dead root's authored definitions remain
+readable (replicas are permanent) and remain *editable*: an edit on a
+survivor is written to the survivor's own log with a seen-vector covering
 the dead root's dots, superseding cleanly. Authorship is not ownership;
 there is nothing to transfer.
 
-## Vessels home at placement; convoy records succeed, atoms re-provision
+**A wrongful declaration cannot fork.** If a host is declared lost while
+actually alive — still reconciling a convoy it homes — and a survivor
+performs unilateral succession in the meantime, the causal record decides:
+the successor (`succeeded_from` C, authored after the decree) is visible in
+replicas when the "dead" host resurfaces and syncs, and **a home that
+learns of a successor to its own record stands down** — it stops
+reconciling, marks its record superseded, and its partition-era writes
+surface as part of the loud return-from-dead event (readable memory, never
+silently discarded, hand-back available as another ordinary succession).
+Two *concurrent* unilateral successors are detectable by construction (two
+records claiming `succeeded_from` the same C) and surface as a conflict
+like any other; never-fork holds one level up.
 
-A convoy is coordination state plus atoms spread across hosts, and the two
-must not share a fate. "Home follows the work" applied honestly:
+## Vessels home at placement; convoy records succeed, work re-provisions
+
+A convoy is coordination state plus running work spread across hosts, and
+the two must not share a fate. "Home follows the work" applied honestly:
 
 - **Vessels are home-bound to their placement host**, their records
   authored in that host's log and reconciled by that host's reconcilers
@@ -172,7 +189,7 @@ must not share a fate. "Home follows the work" applied honestly:
 - **Re-provisioning is the only way work itself changes hosts**: rebuild
   from durable inputs (last-pushed branch + Brief, which lives in the
   checkout and pushes with the work). There is no mechanism that pretends
-  atoms move. Single-vessel convoys default their home to the placement
+  running state moves. Single-vessel convoys default their home to the placement
   host at birth, so for the common case succession and re-provision
   coincide.
 
@@ -185,8 +202,9 @@ must not share a fate. "Home follows the work" applied honestly:
   with all sibling values and provenance; `flotilla <kind> <name> resolve
   <field> --take <root>` (or `--value`) performs the ordinary superseding
   write. Generated for every definitions-class kind.
-- **TUI**: a conflict badge on the affected row in existing tables (ADR
-  0012 badge-with-actions), opening the same siblings+provenance view. **No
+- **TUI**: a conflict badge on the affected row in existing tables (a
+  small badge-with-actions extension to ADR 0012's column model), opening
+  the same siblings+provenance view. **No
   new query family** — conflicted-ness is row data; a fleet-wide conflict
   roll-up is add-on-program territory (ADR 0014's ruling), likely never
   needed at this cardinality.
