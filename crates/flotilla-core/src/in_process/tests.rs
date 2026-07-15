@@ -2537,6 +2537,42 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
 }
 
 #[tokio::test]
+async fn direct_repository_admission_does_not_guess_a_default_branch() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "unresolved-direct-repository".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: Some("https://github.com/example/main-repository".to_string()),
+                r#ref: Some("main".to_string()),
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    let result = wait_for_command_result(&mut events, command_id).await;
+    assert!(matches!(
+        result,
+        CommandValue::Error { message } if message.contains("has no resolved default branch")
+    ));
+}
+
+#[tokio::test]
 async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");

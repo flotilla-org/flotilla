@@ -541,7 +541,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     assert_eq!(outcome.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateClone { .. })).count(), 1);
@@ -555,6 +555,54 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .expect("scoped checkout should be created");
     assert_eq!(checkout.repo_ref(), &cleat.key());
     assert_eq!(checkout.target_path(), Some("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-cleat.workspace-scoped"));
+
+    let adopted_path = "/Users/alice/dev/cleat-existing";
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let adopted = checkouts
+        .create(
+            &meta("adopted-cleat-scoped").with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "feature/scoped".to_string(),
+                path: adopted_path.to_string(),
+                repo_ref: cleat.key(),
+                host_ref: HOST_REF.to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("adopted checkout should create");
+    checkouts
+        .update_status("adopted-cleat-scoped", &adopted.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some(adopted_path.to_string()),
+            commit: Some("abc123".to_string()),
+            message: None,
+        })
+        .await
+        .expect("adopted checkout should become ready");
+    let adopted_vessel = backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(&meta("workspace-scoped-adopted"), &VesselSpec {
+            convoy_ref: "convoy-scoped".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-scoped".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(cleat.key(), "adopted-cleat-scoped".to_string())]),
+        })
+        .await
+        .expect("adopted vessel should create");
+
+    let deps = reconciler.fetch_dependencies(&adopted_vessel).await.expect("adopted deps should load");
+    let outcome = reconciler.reconcile(&adopted_vessel, &deps, Utc::now());
+    assert!(outcome
+        .actuations
+        .iter()
+        .all(|actuation| !matches!(actuation, Actuation::CreateClone { .. } | Actuation::CreateCheckout { .. })));
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkReady { checkout_refs, .. })
+            if checkout_refs == BTreeMap::from([(cleat.key(), "adopted-cleat-scoped".to_string())])
+    ));
 }
 
 #[tokio::test]

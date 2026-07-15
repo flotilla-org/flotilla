@@ -934,6 +934,18 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
+        let has_origin =
+            self.runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok();
+        if has_origin {
+            let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+            if let Err(error) =
+                self.runner.run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop).await
+            {
+                if !is_missing_remote_ref(&error) {
+                    return Err(format!("fetch convoy branch {branch}: {error}"));
+                }
+            }
+        }
         let local_exists = self
             .runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Noop)
@@ -946,26 +958,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             .is_ok();
 
         if local_exists {
-            if self
-                .runner
-                .run("git", &["-C", clone_path, "worktree", "add", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
-                .await
-                .is_err()
-            {
-                // A convoy can have several vessels for the same repository and
-                // branch. Git only permits a branch to be attached to one worktree,
-                // so later vessels use the exact branch tip in detached mode.
-                self.runner
-                    .run(
-                        "git",
-                        &["-C", clone_path, "worktree", "add", "--detach", target_path, branch],
-                        Path::new("/"),
-                        &ChannelLabel::Noop,
-                    )
-                    .await?;
-            }
+            // Multiple vessels can intentionally share the convoy branch. `--force`
+            // overrides Git's protection against attaching it to another worktree.
+            self.runner
+                .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .await?;
         } else if remote_exists {
-            let _ = self.runner.run("git", &["-C", clone_path, "fetch", "origin", branch], Path::new("/"), &ChannelLabel::Noop).await;
             self.runner
                 .run(
                     "git",
@@ -1057,6 +1055,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
     let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await?;
     Ok(Some(commit.trim().to_string()))
+}
+
+fn is_missing_remote_ref(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("couldn't find remote ref") || error.contains("could not find remote ref")
 }
 
 struct TerminalControllerRuntime {
@@ -1280,6 +1283,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_runtime_attaches_the_convoy_branch_to_multiple_worktrees() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let first_target = temp.path().join("workspace/first");
+        let second_target = temp.path().join("workspace/second");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        for target in [&first_target, &second_target] {
+            runtime
+                .create_worktree(
+                    clone.path().to_str().expect("utf-8 clone path"),
+                    "feature/shared",
+                    Some("main"),
+                    target.to_str().expect("utf-8 target path"),
+                )
+                .await
+                .expect("worktree should create");
+        }
+
+        for target in [&first_target, &second_target] {
+            let branch = ProcessCommand::new("git")
+                .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+                .output()
+                .expect("git should run");
+            assert!(branch.status.success());
+            assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/shared");
+        }
+    }
+
+    #[tokio::test]
     async fn checkout_runtime_resolves_a_remote_only_snapshotted_base() {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
@@ -1367,6 +1400,55 @@ mod tests {
             .output()
             .expect("git should run");
         assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/existing");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_fetches_a_convoy_branch_created_after_the_clone() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let source_path = source.path().to_str().expect("utf-8 source path");
+        let clone_path = temp.path().join("clone");
+        assert!(ProcessCommand::new("git")
+            .args(["clone", "--branch", "main", source_path, clone_path.to_str().expect("utf-8 clone path")])
+            .status()
+            .expect("git clone should run")
+            .success());
+
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "switch", "-c", "feature/created-later"])
+            .status()
+            .expect("git switch should run")
+            .success());
+        fs::write(source.path().join("created-later.txt"), "remote branch\n").expect("write feature file");
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "add", "created-later.txt"])
+            .status()
+            .expect("git add should run")
+            .success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "commit", "-m", "later branch commit"])
+            .status()
+            .expect("git commit should run")
+            .success());
+
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        runtime
+            .create_worktree(
+                clone_path.to_str().expect("utf-8 clone path"),
+                "feature/created-later",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+
+        assert_eq!(fs::read_to_string(target.join("created-later.txt")).expect("feature file should exist"), "remote branch\n");
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/created-later");
     }
 
     #[tokio::test]

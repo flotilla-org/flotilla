@@ -3877,17 +3877,6 @@ impl InProcessDaemon {
             };
             let mut direct_repository_url = repository_url.clone();
             let mut r#ref = r#ref.clone();
-            if adopted_checkout.is_some() && project_repositories.as_ref().is_some_and(|repositories| repositories.len() > 1) {
-                let message = "adopted checkouts are not supported for multi-repository project convoys".to_string();
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result: flotilla_protocol::CommandValue::Error { message },
-                });
-                return Ok(id);
-            }
             let adopted_checkout = match adopted_checkout {
                 Some(path) => {
                     let adopted_result = async {
@@ -3955,11 +3944,7 @@ impl InProcessDaemon {
                         .status
                         .as_ref()
                         .and_then(|status| status.default_branch.clone())
-                        .or_else(|| {
-                            r#ref
-                                .clone()
-                                .filter(|git_ref| adopted_checkout.is_some() || matches!(git_ref.as_str(), "main" | "master" | "trunk"))
-                        })
+                        .or_else(|| if adopted_checkout.is_some() { r#ref.clone() } else { None })
                         .ok_or_else(|| format!("repository {repo_ref} has no resolved default branch"))?;
                     Ok::<_, String>(vec![ConvoyRepositorySpec {
                         url,
