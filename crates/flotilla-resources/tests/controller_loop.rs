@@ -1172,7 +1172,7 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
             convoy_ref: "alpha".to_string(),
             vessel_name: "implement".to_string(),
             placement_policy_ref: "local".to_string(),
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: Default::default(),
         })
         .await
         .expect("task workspace create should succeed");
@@ -1257,7 +1257,7 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
             convoy_ref: "alpha".to_string(),
             vessel_name: "implement".to_string(),
             placement_policy_ref: "local".to_string(),
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: Default::default(),
         })
         .await
         .expect("task workspace create should succeed");

@@ -80,10 +80,16 @@ pub async fn create_convoy_with_single_task(
             workflow_ref: "wf".to_string(),
             inputs: Default::default(),
             placement_policy: None,
-            repository: Some(ConvoyRepositorySpec { url: repo_url.to_string(), repo_ref: repository_key }),
+            repositories: vec![ConvoyRepositorySpec {
+                url: repo_url.to_string(),
+                repo_ref: repository_key,
+                base_ref: git_ref.to_string(),
+                workspace_slug: repository_spec.leaf_slug(),
+                subpaths: Vec::new(),
+            }],
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("convoy create should succeed");
@@ -94,6 +100,7 @@ pub async fn create_convoy_with_single_task(
                     name: task.to_string(),
                     stance: Default::default(),
                     depends_on: Vec::new(),
+                    repository_refs: None,
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
                         .source(CrewSource::Tool { command: "cargo test".to_string() })
@@ -122,7 +129,7 @@ pub async fn create_workspace(
             convoy_ref: convoy_ref.to_string(),
             vessel_name: task.to_string(),
             placement_policy_ref: placement_policy_ref.to_string(),
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("workspace create should succeed")

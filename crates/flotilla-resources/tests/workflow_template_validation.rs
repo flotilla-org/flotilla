@@ -1,7 +1,9 @@
 mod common;
 
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
-use flotilla_resources::{validate, InterpolationField, InterpolationLocation, Stance, ValidationError, WorkflowTemplateSpec};
+use flotilla_resources::{
+    validate, InterpolationField, InterpolationLocation, RepositoryKey, Stance, ValidationError, WorkflowTemplateSpec,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -270,4 +272,26 @@ vessels:
     let second = parse_spec(&encoded);
     assert_eq!(second, first);
     assert!(validate(&second).is_ok());
+}
+
+#[test]
+fn repository_scope_must_be_non_empty_and_unique() {
+    let spec = parse_spec(
+        r#"
+vessels:
+  - name: empty
+    repository_refs: []
+    crew: []
+  - name: duplicate
+    repository_refs: [repo-a, repo-a]
+    crew: []
+"#,
+    );
+
+    let errors = validate(&spec).expect_err("invalid repository scopes should fail validation");
+    assert_has_error(&errors, &ValidationError::EmptyRepositoryScope { vessel: "empty".to_string() });
+    assert_has_error(&errors, &ValidationError::DuplicateRepositoryRef {
+        vessel: "duplicate".to_string(),
+        repo_ref: RepositoryKey("repo-a".to_string()),
+    });
 }

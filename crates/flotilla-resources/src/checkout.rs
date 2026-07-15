@@ -52,6 +52,8 @@ pub struct CheckoutWorktreeSpec {
     pub env_ref: String,
     #[serde(rename = "ref")]
     pub r#ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
     pub target_path: String,
     pub clone_ref: String,
 }
@@ -62,6 +64,8 @@ pub struct FreshCloneCheckoutSpec {
     pub env_ref: String,
     #[serde(rename = "ref")]
     pub r#ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
     pub target_path: String,
     pub url: String,
 }

@@ -74,11 +74,23 @@ struct FakeCheckoutRuntime;
 
 #[async_trait]
 impl CheckoutRuntime for FakeCheckoutRuntime {
-    async fn create_worktree(&self, _clone_path: &str, _branch: &str, _target_path: &str) -> Result<Option<String>, String> {
+    async fn create_worktree(
+        &self,
+        _clone_path: &str,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target_path: &str,
+    ) -> Result<Option<String>, String> {
         Ok(Some("44982740".to_string()))
     }
 
-    async fn create_fresh_clone(&self, _repo_url: &str, _branch: &str, _target_path: &str) -> Result<Option<String>, String> {
+    async fn create_fresh_clone(
+        &self,
+        _repo_url: &str,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target_path: &str,
+    ) -> Result<Option<String>, String> {
         Ok(Some("44982740".to_string()))
     }
 
@@ -214,7 +226,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let status = workspace.status.expect("workspace status should be present");
     assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.environment_ref.as_deref(), Some("host-direct-01HXYZ"));
-    assert_eq!(status.checkout_ref.as_deref(), Some("checkout-workspace-a"));
+    assert_eq!(status.checkout_refs.values().next().map(String::as_str), Some("checkout-workspace-a"));
     assert_eq!(status.terminal_session_refs, vec!["terminal-workspace-a-coder".to_string()]);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -334,6 +346,7 @@ async fn checkout_controller_marks_worktree_checkout_ready() {
                 repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
                 env_ref: "host-direct-01HXYZ".to_string(),
                 r#ref: "feat/convoy-resource".to_string(),
+                base_ref: None,
                 target_path: "/Users/alice/dev/flotilla.feat-123".to_string(),
                 clone_ref: "clone-a".to_string(),
             }),
@@ -569,6 +582,7 @@ async fn vessel_controller_finalizer_deletes_labeled_children_on_delete() {
                 repo_ref: flotilla_resources::RepositoryKey(flotilla_resources::repo_key("https://github.com/flotilla-org/flotilla")),
                 env_ref: "host-direct-01HXYZ".to_string(),
                 r#ref: "feat/task-provisioning".to_string(),
+                base_ref: None,
                 target_path: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),
                 clone_ref: "clone-a".to_string(),
             }),

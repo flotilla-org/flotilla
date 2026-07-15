@@ -137,6 +137,7 @@ async fn checkout_actuator_exposes_fresh_clone_transport_url() {
         repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
         env_ref: "env-a".to_string(),
         r#ref: "main".to_string(),
+        base_ref: None,
         target_path: "/workspace".to_string(),
         url: "git@github.com:flotilla-org/flotilla.git".to_string(),
     };
