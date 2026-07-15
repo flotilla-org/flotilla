@@ -63,6 +63,7 @@ fn test_context(
         session: Arc::clone(session),
         pending: Arc::clone(pending),
         next_id: Arc::clone(next_id),
+        initial_sync_complete: Arc::new(AtomicBool::new(true)),
     }
 }
 
@@ -1232,4 +1233,11 @@ fn into_success_response_returns_response_for_success() {
     })
     .expect("should succeed");
     assert!(matches!(response, Response::GetTopology(TopologyResponse { routes, .. }) if routes.is_empty()));
+}
+
+#[test]
+fn unknown_repo_delta_warns_only_after_initial_sync() {
+    assert_eq!(repo_gap_log_level(None, false), tracing::Level::DEBUG);
+    assert_eq!(repo_gap_log_level(None, true), tracing::Level::WARN);
+    assert_eq!(repo_gap_log_level(Some(4), false), tracing::Level::WARN, "a known-repo sequence gap is never startup noise");
 }

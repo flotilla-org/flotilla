@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -93,6 +93,7 @@ pub struct SocketDaemon {
     /// Updated by replay_since (seeding) and the background reader (live events).
     local_seqs: Arc<SeqMap>,
     subscribed_queries: Arc<QuerySet>,
+    initial_sync_complete: Arc<AtomicBool>,
 }
 
 impl SocketDaemon {
@@ -123,6 +124,7 @@ impl SocketDaemon {
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let subscribed_queries: Arc<QuerySet> = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let initial_sync_complete = Arc::new(AtomicBool::new(false));
         let recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>> = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
         // Spawn background reader task
@@ -135,6 +137,7 @@ impl SocketDaemon {
             session: Arc::clone(&session),
             pending: Arc::clone(&pending),
             next_id: Arc::clone(&next_id),
+            initial_sync_complete: Arc::clone(&initial_sync_complete),
         };
         let reader_task = tokio::spawn(async move {
             loop {
@@ -190,6 +193,7 @@ impl SocketDaemon {
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             local_seqs: Arc::clone(&local_seqs),
             subscribed_queries: Arc::clone(&subscribed_queries),
+            initial_sync_complete,
         });
 
         Ok(daemon)
@@ -539,6 +543,15 @@ struct EventContext {
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     next_id: Arc<AtomicU64>,
+    initial_sync_complete: Arc<AtomicBool>,
+}
+
+fn repo_gap_log_level(local_seq: Option<u64>, initial_sync_complete: bool) -> tracing::Level {
+    if local_seq.is_some() || initial_sync_complete {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::DEBUG
+    }
 }
 
 /// Handle a daemon event in the background reader: update local seq tracking,
@@ -591,8 +604,10 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
 
                     if let Some(ls) = local_seq {
                         warn!(repo_identity = %repo_identity, repo = ?repo, local_seq = ls, %prev_seq, "seq gap, requesting replay");
-                    } else {
+                    } else if repo_gap_log_level(None, ctx.initial_sync_complete.load(Ordering::Acquire)) == tracing::Level::WARN {
                         warn!(repo_identity = %repo_identity, repo = ?repo, "received delta for unknown repo, requesting replay");
+                    } else {
+                        debug!(repo_identity = %repo_identity, repo = ?repo, "received startup delta before initial sync, requesting replay");
                     }
 
                     let ctx = ctx.clone();
@@ -906,6 +921,7 @@ impl DaemonHandle for SocketDaemon {
                 seqs.entry(stream_key).and_modify(|s| *s = (*s).max(seq)).or_insert(seq);
             }
         }
+        self.initial_sync_complete.store(true, Ordering::Release);
 
         Ok(events)
     }
@@ -922,6 +938,7 @@ impl DaemonHandle for SocketDaemon {
             other => return Err(format!("unexpected response for subscribe_queries: {other:?}")),
         };
         seed_query_seqs(&self.local_seqs, &events);
+        self.initial_sync_complete.store(true, Ordering::Release);
         Ok(events)
     }
 
