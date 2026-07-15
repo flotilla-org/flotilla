@@ -11,7 +11,7 @@ use crate::{
         change_request::{github::GitHubChangeRequest, ChangeRequestTracker},
         discovery::{EnvironmentBag, Factory, HostPlatform, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         github_api::GhApiClient,
-        issue_tracker::{github::GitHubIssueTracker, IssueProvider},
+        issue_tracker::{github::GitHubIssueProvider, IssueProvider},
         CommandRunner,
     },
 };
@@ -85,13 +85,15 @@ impl Factory for GitHubIssueProviderFactory {
     async fn probe(
         &self,
         env: &EnvironmentBag,
-        _config: &ConfigStore,
+        config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
-        let repo_slug = github_repo_slug(env)?;
+        if env.find_binary("gh").is_none() {
+            return Err(vec![UnmetRequirement::MissingBinary("gh".into())]);
+        }
         let api = Arc::new(GhApiClient::new(runner.clone()));
-        Ok(Arc::new(GitHubIssueTracker::new("github".into(), repo_slug, api, runner)))
+        Ok(Arc::new(GitHubIssueProvider::new(api, runner, config.base_path().as_path())))
     }
 }
 
@@ -102,6 +104,8 @@ impl Factory for GitHubIssueProviderFactory {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use flotilla_protocol::{IssueRef, IssueSource};
 
     use super::{GitHubChangeRequestFactory, GitHubIssueProviderFactory};
     use crate::{
@@ -214,15 +218,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_issue_tracker_factory_missing_remote() {
+    async fn github_issue_provider_factory_does_not_require_a_repository_remote() {
         let bag = bag_with_gh_binary_only();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = GitHubIssueProviderFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
-        let unmet = result.err().expect("should fail without remote host");
-        assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
-        assert!(!unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
+        assert!(result.is_ok(), "a source-addressed provider should be available without repository detector state");
+    }
+
+    #[tokio::test]
+    async fn github_issue_provider_uses_host_config_root_not_probe_checkout() {
+        let bag = bag_with_gh_binary_only();
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let config = ConfigStore::with_base(dir.path());
+        let runner = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run(
+                    "gh",
+                    &["api", "--include", "repos/owner/repo/issues/42"],
+                    Ok("HTTP/2.0 200 OK\n\n{\"number\":42,\"title\":\"Issue\",\"body\":null,\"state\":\"open\",\"labels\":[]}".into()),
+                )
+                .build(),
+        );
+        let probe_checkout = ExecutionEnvironmentPath::new("/first-checkout");
+        let provider = GitHubIssueProviderFactory
+            .probe(&bag, &config, &probe_checkout, runner.clone())
+            .await
+            .expect("GitHub issue provider should be available");
+
+        provider
+            .fetch_by_id(&IssueRef {
+                source: IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() },
+                id: "42".into(),
+            })
+            .await
+            .expect("source-addressed fetch should succeed");
+
+        assert!(runner.saw_cwd(config.base_path().as_path()));
+        assert!(!runner.saw_cwd(probe_checkout.as_path()));
     }
 
     #[tokio::test]
@@ -232,10 +266,9 @@ mod tests {
         let config = ConfigStore::with_base(dir.path());
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let result = GitHubIssueProviderFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
-        let unmet = result.err().expect("should fail with both missing");
+        let unmet = result.err().expect("should fail without gh");
         assert!(unmet.contains(&UnmetRequirement::MissingBinary("gh".into())));
-        assert!(unmet.contains(&UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub)));
-        assert_eq!(unmet.len(), 2);
+        assert_eq!(unmet.len(), 1);
     }
 
     #[tokio::test]

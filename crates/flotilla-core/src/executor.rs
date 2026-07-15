@@ -33,7 +33,8 @@ use crate::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{
-        discovery::EnvVars, registry::ProviderRegistry, run, types::WorkspaceConfig, vcs::write_branch_issue_links, CommandRunner,
+        discovery::EnvVars, issue_tracker::forge_issue_source, registry::ProviderRegistry, run, types::WorkspaceConfig,
+        vcs::write_branch_issue_links, CommandRunner,
     },
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
     terminal_manager::TerminalManager,
@@ -155,6 +156,7 @@ pub async fn build_plan(
     let target_node_id = node_id.unwrap_or_else(|| local_node_id.clone());
     let checkout_host = StepExecutionContext::Host(target_node_id.clone());
     let target_display_host = provisioning_target.as_ref().map(|target| target.host().clone());
+    let issue_source = forge_issue_source(&repo.identity);
 
     match action {
         CommandAction::Checkout { target, issue_ids, .. } => {
@@ -200,6 +202,7 @@ pub async fn build_plan(
                 branch,
                 checkout_key,
                 repo.root,
+                issue_source,
                 registry,
                 providers_data,
                 config_base,
@@ -554,6 +557,7 @@ async fn build_teleport_session_plan(
     branch: Option<String>,
     checkout_key: Option<PathBuf>,
     repo_root: ExecutionEnvironmentPath,
+    issue_source: flotilla_protocol::IssueSource,
     registry: Arc<ProviderRegistry>,
     providers_data: Arc<ProviderData>,
     config_base: DaemonHostPath,
@@ -565,6 +569,7 @@ async fn build_teleport_session_plan(
     let checkout_key_ee = checkout_key.map(ExecutionEnvironmentPath::new);
     let teleport_flow = TeleportFlow::new(
         &repo_root,
+        issue_source,
         registry.as_ref(),
         providers_data.as_ref(),
         &config_base,
@@ -684,6 +689,7 @@ impl StepResolver for ExecutorStepResolver {
             StepExecutionContext::Environment(_, env_id) => Some(env_id.clone()),
             _ => None,
         };
+        let issue_source = forge_issue_source(&self.repo.identity);
 
         match action {
             StepAction::CreateCheckout { branch, create_branch, intent, .. } => {
@@ -731,6 +737,7 @@ impl StepResolver for ExecutorStepResolver {
                 let tm = self.terminal_manager();
                 let service = TeleportSessionActionService::new(
                     &self.repo.root,
+                    issue_source.clone(),
                     self.registry.as_ref(),
                     self.providers_data.as_ref(),
                     &self.config_base,
@@ -764,6 +771,7 @@ impl StepResolver for ExecutorStepResolver {
                 let tm = self.terminal_manager();
                 let service = TeleportSessionActionService::new(
                     &self.repo.root,
+                    issue_source.clone(),
                     self.registry.as_ref(),
                     self.providers_data.as_ref(),
                     &self.config_base,
@@ -780,7 +788,7 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::ArchiveSession { session_id } => {
                 let session_actions =
-                    ReadOnlySessionActionService::new(&effective_repo_root, effective_registry.as_ref(), effective_providers_data.as_ref());
+                    ReadOnlySessionActionService::new(issue_source.clone(), effective_registry.as_ref(), effective_providers_data.as_ref());
                 match session_actions.archive_session_result(&session_id).await {
                     CommandValue::Error { message } => Err(message),
                     result => Ok(StepOutcome::CompletedWith(result)),
@@ -788,7 +796,7 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::GenerateBranchName { issue_keys } => {
                 let session_actions =
-                    ReadOnlySessionActionService::new(&effective_repo_root, effective_registry.as_ref(), effective_providers_data.as_ref());
+                    ReadOnlySessionActionService::new(issue_source.clone(), effective_registry.as_ref(), effective_providers_data.as_ref());
                 Ok(StepOutcome::CompletedWith(session_actions.generate_branch_name_result(&issue_keys).await))
             }
             StepAction::PrepareWorkspace { checkout_path: explicit_path, label, display_host } => {
@@ -1056,8 +1064,8 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::OpenIssue { id } => {
                 debug!(%id, "opening issue in browser");
-                if let Some(it) = self.registry.issue_trackers.preferred() {
-                    let _ = it.open_in_browser(self.repo.root.as_path(), &id).await;
+                if let Some(provider) = self.registry.issue_provider_for(&issue_source) {
+                    let _ = provider.open_in_browser(&flotilla_protocol::IssueRef { source: issue_source.clone(), id }).await;
                 }
                 Ok(StepOutcome::Completed)
             }

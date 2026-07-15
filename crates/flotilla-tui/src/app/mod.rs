@@ -43,13 +43,14 @@ use crate::{
     widgets::{
         repo_page::{RepoData, RepoPage},
         section_table::IssueRow,
+        split_table::SelectedRow,
     },
 };
 
 /// Owned version of `SelectedRow` for use when the borrow can't be held.
 pub(super) enum OwnedSelectedRow {
     WorkItem(Box<WorkItem>),
-    IssueRow(IssueRow),
+    IssueRow(Box<IssueRow>),
 }
 
 /// Per-provider auth/health status from last refresh.
@@ -1490,8 +1491,8 @@ impl App {
         let identity = self.model.active_repo.as_ref()?;
         let page = self.screen.repo_pages.get(identity)?;
         match page.table.selected_row()? {
-            crate::widgets::split_table::SelectedRow::WorkItem(item) => Some(OwnedSelectedRow::WorkItem(Box::new(item.clone()))),
-            crate::widgets::split_table::SelectedRow::Issue(row) => Some(OwnedSelectedRow::IssueRow(row.clone())),
+            SelectedRow::WorkItem(item) => Some(OwnedSelectedRow::WorkItem(Box::new(item.clone()))),
+            SelectedRow::Issue(row) => Some(OwnedSelectedRow::IssueRow(Box::new(row.clone()))),
         }
     }
 

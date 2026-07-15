@@ -36,10 +36,11 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
+    test_support::TestIssue,
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
     EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId,
-    Issue, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory,
-    TopologyRoute, WorkItemKind,
+    IssueRef, IssueSource, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo,
+    ToolInventory, TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec,
@@ -576,6 +577,28 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
+}
+
+#[tokio::test]
+async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let reference =
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "747".into() };
+    let mut issue = TestIssue::new("Source-addressed issue fetch seam").build();
+    issue.reference = reference.clone();
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider.add_issues(vec![(reference.id.clone(), issue)]).await;
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new()
+            .with_issue_tracker(provider.clone() as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+    );
+    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+
+    let fetched = daemon.fetch_issue_by_ref(&reference).await.expect("source-addressed fetch should succeed");
+
+    assert_eq!(fetched.reference, reference);
+    assert_eq!(fetched.title, "Source-addressed issue fetch seam");
+    assert!(daemon.list_repos().await.expect("list repos").is_empty());
 }
 
 fn static_ssh_test_discovery(runner: Arc<dyn CommandRunner>) -> DiscoveryRuntime {
@@ -4531,15 +4554,7 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
 
     // Create an issue tracker that has issue #42 available
     let issue_tracker = Arc::new(FakeIssueProvider::new());
-    issue_tracker
-        .add_issues(vec![("42".into(), Issue {
-            title: "Fix the widget".into(),
-            labels: vec!["bug".into()],
-            association_keys: vec![AssociationKey::IssueRef("fake-issues".into(), "42".into())],
-            provider_name: "fake-issues".into(),
-            provider_display_name: "Fake Issues".into(),
-        })])
-        .await;
+    issue_tracker.add_issues(vec![("42".into(), TestIssue::new("Fix the widget").with_labels(vec!["bug".into()]).build())]).await;
 
     let discovery = fake_discovery_with_providers(
         Some(checkout_manager.clone() as Arc<dyn flotilla_core::providers::vcs::CheckoutManager>),
@@ -4560,7 +4575,7 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
     // Trigger a refresh. The refresh loop will:
     // 1. Call FakeCheckoutManager::list_checkouts → checkout with IssueRef("42")
     // 2. Broadcast initial snapshot (no issues yet)
-    // 3. Call fetch_missing_linked_issues → finds "42" missing → calls fetch_issues_by_id
+    // 3. Call fetch_missing_linked_issues → finds "42" missing → calls fetch_by_ids
     // 4. Broadcast updated snapshot with pinned issue
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh should succeed");
 
@@ -4604,10 +4619,10 @@ async fn linked_issue_pinning_fetches_and_broadcasts_missing_issues() {
     assert_eq!(issue.title, "Fix the widget");
     assert_eq!(issue.labels, vec!["bug".to_string()]);
 
-    // Verify fetch_issues_by_id was actually called (not just paginated)
+    // Verify fetch_by_ids was actually called (not just paginated)
     let fetched: Vec<Vec<String>> = issue_tracker.fetched_by_id.lock().await.clone();
-    assert!(!fetched.is_empty(), "fetch_issues_by_id should have been called");
-    assert!(fetched.iter().any(|ids| ids.contains(&"42".to_string())), "fetch_issues_by_id should have been called with id '42'");
+    assert!(!fetched.is_empty(), "fetch_by_ids should have been called");
+    assert!(fetched.iter().any(|ids| ids.contains(&"42".to_string())), "fetch_by_ids should have been called with id '42'");
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,8 @@ pub enum CorrelationKey {
 /// Two PRs referencing the same issue are separate work streams.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AssociationKey {
+    /// Legacy per-repository association key. Cross-source issue collections
+    /// must use the canonical `Issue::reference` instead.
     IssueRef(String, String), // (provider_name, issue_id)
 }
 
@@ -95,10 +98,33 @@ impl std::fmt::Display for ChangeRequestStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IssueSource {
+    pub service: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct IssueRef {
+    pub source: IssueSource,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueState {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct Issue {
+    pub reference: IssueRef,
     pub title: String,
+    pub body: Option<String>,
+    pub state: IssueState,
     pub labels: Vec<String>,
+    pub as_of: DateTime<Utc>,
     pub association_keys: Vec<AssociationKey>,
     #[serde(default)]
     pub provider_name: String,
@@ -106,21 +132,14 @@ pub struct Issue {
     pub provider_display_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IssuePage {
-    pub issues: Vec<(String, Issue)>,
-    pub total_count: Option<u32>,
-    pub has_more: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueChangeset {
-    pub updated: Vec<(String, Issue)>,
-    pub closed_ids: Vec<String>,
+    pub updated: Vec<Issue>,
+    pub closed: Vec<IssueRef>,
     /// Whether the provider had more changes than it returned. When true,
     /// the caller should discard this changeset and perform a full re-fetch
     /// instead of applying it incrementally. This differs from
-    /// `IssuePage::has_more`, which signals additional pages to paginate.
+    /// query result `has_more`, which signals additional pages to paginate.
     pub has_more: bool,
 }
 
@@ -348,6 +367,9 @@ pub struct ProviderData {
     #[serde(with = "crate::qualified_path::qualified_path_map")]
     pub checkouts: IndexMap<QualifiedPath, Checkout>,
     pub change_requests: IndexMap<String, ChangeRequest>,
+    /// Legacy Plane-A snapshot for one repository. Keys are source-local IDs;
+    /// never union this map across sources. Use each issue's canonical
+    /// `Issue::reference` for project-level collections.
     pub issues: IndexMap<String, Issue>,
     pub sessions: IndexMap<String, CloudAgentSession>,
     pub branches: IndexMap<String, crate::delta::Branch>,
@@ -363,6 +385,20 @@ pub struct ProviderData {
 mod tests {
     use super::*;
     use crate::{test_helpers::assert_roundtrip, test_support::qp};
+
+    fn issue(id: &str, title: &str) -> Issue {
+        Issue {
+            reference: IssueRef { source: IssueSource { service: "test".into(), scope: "owner/repo".into() }, id: id.into() },
+            title: title.into(),
+            body: None,
+            state: IssueState::Open,
+            labels: vec![],
+            as_of: "2026-07-15T09:30:00Z".parse().expect("valid timestamp"),
+            association_keys: vec![],
+            provider_name: String::new(),
+            provider_display_name: String::new(),
+        }
+    }
 
     #[test]
     fn key_types_roundtrip_all_variants() {
@@ -462,22 +498,59 @@ mod tests {
     }
 
     #[test]
+    fn issue_reference_roundtrip_preserves_source_and_opaque_id() {
+        let reference = IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "WIDGET-123".into(),
+        };
+
+        assert_roundtrip(&reference);
+        let json = serde_json::to_value(&reference).expect("serialize issue reference");
+        assert_eq!(json["source"]["service"], "https://github.com");
+        assert_eq!(json["source"]["scope"], "flotilla-org/flotilla");
+        assert_eq!(json["id"], "WIDGET-123");
+    }
+
+    #[test]
+    fn issue_references_do_not_collide_across_repository_scopes() {
+        let references = std::collections::BTreeSet::from([
+            IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "owner/alpha".into() }, id: "42".into() },
+            IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "owner/beta".into() }, id: "42".into() },
+        ]);
+
+        assert_eq!(references.len(), 2);
+    }
+
+    #[test]
+    fn normalized_issue_roundtrip_includes_snapshot_fields() {
+        let as_of = "2026-07-15T09:30:00Z".parse().expect("valid timestamp");
+        let issue = Issue {
+            reference: IssueRef {
+                source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "747".into(),
+            },
+            title: "Source-addressed issue fetch seam".into(),
+            body: Some("Build the shared issue-data substrate.".into()),
+            state: IssueState::Open,
+            labels: vec!["enhancement".into(), "provider".into()],
+            as_of,
+            association_keys: vec![AssociationKey::IssueRef("github".into(), "747".into())],
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        };
+
+        assert_roundtrip(&issue);
+    }
+
+    #[test]
     fn issue_session_and_workspace_roundtrip() {
         let issue_cases = vec![
             Issue {
-                title: "Fix the bug".into(),
                 labels: vec!["bug".into(), "P1".into()],
                 association_keys: vec![AssociationKey::IssueRef("gh".into(), "42".into())],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
+                ..issue("42", "Fix the bug")
             },
-            Issue {
-                title: "T".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            },
+            issue("1", "T"),
         ];
         for case in &issue_cases {
             assert_roundtrip(case);
@@ -582,20 +655,14 @@ mod tests {
     #[test]
     fn issue_changeset_roundtrip() {
         let changeset = IssueChangeset {
-            updated: vec![("42".into(), Issue {
-                title: "Updated issue".into(),
-                labels: vec!["bug".into()],
-                association_keys: vec![],
-                provider_name: String::new(),
-                provider_display_name: String::new(),
-            })],
-            closed_ids: vec!["7".into(), "13".into()],
+            updated: vec![Issue { labels: vec!["bug".into()], ..issue("42", "Updated issue") }],
+            closed: vec![issue("7", "Closed issue").reference, issue("13", "Another closed issue").reference],
             has_more: false,
         };
         assert_roundtrip(&changeset);
 
         // Empty changeset
-        let empty = IssueChangeset { updated: vec![], closed_ids: vec![], has_more: false };
+        let empty = IssueChangeset { updated: vec![], closed: vec![], has_more: false };
         assert_roundtrip(&empty);
     }
 

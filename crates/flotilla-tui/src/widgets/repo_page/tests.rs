@@ -1,4 +1,4 @@
-use flotilla_protocol::{provider_data::Issue, CloudAgentSession, ProviderData, RepoLabels, SessionStatus, WorkItemIdentity};
+use flotilla_protocol::{test_support::TestIssue, CloudAgentSession, ProviderData, RepoLabels, SessionStatus, WorkItemIdentity};
 
 use super::*;
 use crate::app::test_support::{issue_item, session_item, TestWidgetHarness};
@@ -22,16 +22,7 @@ fn test_repo_data(items: Vec<WorkItem>) -> Shared<RepoData> {
 }
 
 fn native_issue_row(id: &str) -> IssueRow {
-    IssueRow {
-        id: id.to_string(),
-        issue: Issue {
-            title: format!("Issue {id}"),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: "github".into(),
-            provider_display_name: "GitHub".into(),
-        },
-    }
+    IssueRow { id: id.to_string(), issue: TestIssue::new(&format!("Issue {id}")).build() }
 }
 
 fn test_repo_data_with_issue_rows(issue_rows: Vec<IssueRow>) -> Shared<RepoData> {
