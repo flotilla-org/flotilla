@@ -9,8 +9,20 @@ use flotilla_resources::{
 
 #[async_trait]
 pub trait CheckoutRuntime: Send + Sync {
-    async fn create_worktree(&self, clone_path: &str, branch: &str, target_path: &str) -> Result<Option<String>, String>;
-    async fn create_fresh_clone(&self, repo_url: &str, branch: &str, target_path: &str) -> Result<Option<String>, String>;
+    async fn create_worktree(
+        &self,
+        clone_path: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<Option<String>, String>;
+    async fn create_fresh_clone(
+        &self,
+        repo_url: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<Option<String>, String>;
     async fn remove_checkout(&self, target_path: &str) -> Result<(), String>;
 }
 
@@ -57,15 +69,17 @@ where
                 if clone.spec.env_ref != spec.env_ref {
                     return Ok(CheckoutDeps::Failed("worktree clone env_ref mismatch".to_string()));
                 }
-                Ok(match self.runtime.create_worktree(&clone.spec.path, &spec.r#ref, &spec.target_path).await {
+                Ok(match self.runtime.create_worktree(&clone.spec.path, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
                     Ok(commit) => CheckoutDeps::Ready { commit },
                     Err(err) => CheckoutDeps::Failed(err),
                 })
             }
-            CheckoutSpec::FreshClone(spec) => Ok(match self.runtime.create_fresh_clone(&spec.url, &spec.r#ref, &spec.target_path).await {
-                Ok(commit) => CheckoutDeps::Ready { commit },
-                Err(err) => CheckoutDeps::Failed(err),
-            }),
+            CheckoutSpec::FreshClone(spec) => {
+                Ok(match self.runtime.create_fresh_clone(&spec.url, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
+                    Ok(commit) => CheckoutDeps::Ready { commit },
+                    Err(err) => CheckoutDeps::Failed(err),
+                })
+            }
             // Observed checkouts are facts from the observed-resource backend.
             // The managed checkout reconciler must not actuate or patch them.
             CheckoutSpec::Observed(_) => Ok(CheckoutDeps::None),

@@ -201,10 +201,10 @@ pub fn valid_convoy_spec() -> RealConvoySpec {
         .into_iter()
         .collect(),
         placement_policy: Some("laptop-docker".to_string()),
-        repository: None,
+        repositories: Vec::new(),
         r#ref: None,
         project_ref: None,
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: BTreeMap::new(),
     }
 }
 
@@ -212,10 +212,13 @@ pub fn task_provisioning_convoy_spec() -> RealConvoySpec {
     let mut spec = valid_convoy_spec();
     let repository = flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git")
         .expect("repository URL should be canonical");
-    spec.repository = Some(flotilla_resources::ConvoyRepositorySpec {
+    spec.repositories = vec![flotilla_resources::ConvoyRepositorySpec {
         url: "git@github.work:flotilla-org/flotilla.git".to_string(),
         repo_ref: repository.key(),
-    });
+        base_ref: "main".to_string(),
+        workspace_slug: repository.leaf_slug(),
+        subpaths: Vec::new(),
+    }];
     spec.r#ref = Some("feat/task-provisioning".to_string());
     spec
 }
@@ -369,6 +372,7 @@ pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
                 name: task.name,
                 stance: task.stance,
                 depends_on: task.depends_on,
+                repository_refs: task.repository_refs,
                 crew: task.crew,
             })
             .collect(),

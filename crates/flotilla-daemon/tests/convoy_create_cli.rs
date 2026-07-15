@@ -128,7 +128,7 @@ async fn convoy_create_command_creates_convoy_resource() {
     let convoy = convoys.get("my-scratch").await.expect("convoy should exist");
     assert_eq!(convoy.spec.workflow_ref, "scratch");
     assert_eq!(convoy.spec.inputs.len(), 1);
-    assert!(convoy.spec.repository.is_none());
+    assert!(convoy.spec.repositories.is_empty());
     assert!(
         convoy.spec.placement_policy.as_deref().is_some_and(|policy| policy.starts_with("host-direct-")),
         "convoy create should default to the seeded host-direct placement policy: {convoy:?}"

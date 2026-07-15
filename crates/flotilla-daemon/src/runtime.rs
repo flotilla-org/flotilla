@@ -922,7 +922,13 @@ struct CheckoutControllerRuntime {
 
 #[async_trait]
 impl CheckoutRuntime for CheckoutControllerRuntime {
-    async fn create_worktree(&self, clone_path: &str, branch: &str, target_path: &str) -> Result<Option<String>, String> {
+    async fn create_worktree(
+        &self,
+        clone_path: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<Option<String>, String> {
         let clone_path = utf8_path(clone_path)?;
         let target_path = utf8_path(target_path)?;
 
@@ -953,6 +959,15 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     &ChannelLabel::Noop,
                 )
                 .await?;
+        } else if let Some(base_ref) = base_ref {
+            self.runner
+                .run(
+                    "git",
+                    &["-C", clone_path, "worktree", "add", "-b", branch, target_path, base_ref],
+                    Path::new("/"),
+                    &ChannelLabel::Noop,
+                )
+                .await?;
         } else {
             self.runner
                 .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
@@ -962,9 +977,36 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         resolve_head_commit(&*self.runner, target_path).await
     }
 
-    async fn create_fresh_clone(&self, repo_url: &str, branch: &str, target_path: &str) -> Result<Option<String>, String> {
+    async fn create_fresh_clone(
+        &self,
+        repo_url: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        target_path: &str,
+    ) -> Result<Option<String>, String> {
         let target_path = utf8_path(target_path)?;
-        self.runner.run("git", &["clone", "--branch", branch, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        let clone_ref = base_ref.unwrap_or(branch);
+        self.runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        if clone_ref != branch {
+            let remote_ref = format!("refs/remotes/origin/{branch}");
+            let remote_exists = self
+                .runner
+                .run("git", &["-C", target_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
+                .await
+                .is_ok();
+            if remote_exists {
+                self.runner
+                    .run(
+                        "git",
+                        &["-C", target_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
+                        Path::new("/"),
+                        &ChannelLabel::Noop,
+                    )
+                    .await?;
+            } else {
+                self.runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+            }
+        }
         resolve_head_commit(&*self.runner, target_path).await
     }
 
@@ -1150,15 +1192,18 @@ mod test_git_repo;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs, process::Command as ProcessCommand, sync::Arc};
 
     use flotilla_core::{
         config::ConfigStore,
         daemon::DaemonHandle,
         in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
-        providers::discovery::{
-            test_support::{fake_discovery_with_provider_set, git_process_discovery, FakeDiscoveryProviders, FakeTerminalPool},
-            EnvironmentAssertion, EnvironmentBag,
+        providers::{
+            discovery::{
+                test_support::{fake_discovery_with_provider_set, git_process_discovery, FakeDiscoveryProviders, FakeTerminalPool},
+                EnvironmentAssertion, EnvironmentBag,
+            },
+            ProcessCommandRunner,
         },
     };
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
@@ -1170,6 +1215,76 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{test_git_repo::TestGitRepo, *};
+
+    #[tokio::test]
+    async fn checkout_runtime_creates_convoy_branch_from_snapshotted_base() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/multi-repo",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert!(branch.status.success());
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/multi-repo");
+    }
+
+    #[tokio::test]
+    async fn fresh_clone_checkout_creates_convoy_branch_from_snapshotted_base() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("fresh-clone");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_fresh_clone(
+                source.path().to_str().expect("utf-8 source path"),
+                "feature/multi-repo",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("fresh clone should create");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert!(branch.status.success());
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/multi-repo");
+    }
+
+    #[tokio::test]
+    async fn fresh_clone_checkout_preserves_an_existing_convoy_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let source_path = source.path().to_str().expect("utf-8 source path");
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "switch", "-c", "feature/existing"]).status().unwrap().success());
+        fs::write(source.path().join("feature.txt"), "existing branch\n").expect("write feature file");
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "add", "feature.txt"]).status().unwrap().success());
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "commit", "-m", "feature commit"]).status().unwrap().success());
+        let target = temp.path().join("fresh-clone");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_fresh_clone(source_path, "feature/existing", Some("main"), target.to_str().expect("utf-8 target path"))
+            .await
+            .expect("fresh clone should create");
+
+        assert_eq!(fs::read_to_string(target.join("feature.txt")).expect("feature file should be checked out"), "existing branch\n");
+    }
 
     fn passthrough_registry() -> Arc<ProviderRegistry> {
         use flotilla_core::providers::{
@@ -1329,13 +1444,16 @@ mod tests {
                 workflow_ref: "wf-a".to_string(),
                 inputs: BTreeMap::new(),
                 placement_policy: Some(format!("host-direct-{host_id}")),
-                repository: Some(ConvoyRepositorySpec {
+                repositories: vec![ConvoyRepositorySpec {
                     url: "https://github.com/flotilla-org/flotilla.git".to_string(),
                     repo_ref: repository_key,
-                }),
+                    base_ref: "main".to_string(),
+                    workspace_slug: repository_spec.leaf_slug(),
+                    subpaths: Vec::new(),
+                }],
                 r#ref: Some("main".to_string()),
                 project_ref: None,
-                adopted_checkout_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
             })
             .await
             .expect("convoy create should succeed");

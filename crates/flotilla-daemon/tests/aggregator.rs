@@ -45,10 +45,10 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         workflow_ref: workflow_ref.to_string(),
         inputs: BTreeMap::new(),
         placement_policy: None,
-        repository: None,
+        repositories: Vec::new(),
         r#ref: None,
         project_ref: None,
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: BTreeMap::new(),
     }
 }
 

@@ -19,22 +19,27 @@ pub struct ConvoySpec {
     pub inputs: BTreeMap<String, InputValue>,
     #[serde(default)]
     pub placement_policy: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository: Option<ConvoyRepositorySpec>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<ConvoyRepositorySpec>,
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub r#ref: Option<String>,
-    /// Grouping reference to a [`Project`](crate::Project) resource. Metadata only in v1 —
-    /// the reconciler does not consult it. Future: substitute repository/ref from project.
+    /// The [`Project`](crate::Project) whose repository set was snapshotted at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adopted_checkout_ref: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyRepositorySpec {
     pub url: String,
     pub repo_ref: RepositoryKey,
+    pub base_ref: String,
+    pub workspace_slug: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subpaths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

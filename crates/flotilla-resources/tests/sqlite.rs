@@ -394,7 +394,7 @@ fn restart_vessel_spec() -> VesselSpec {
         convoy_ref: "convoy-restart".to_string(),
         vessel_name: "implement".to_string(),
         placement_policy_ref: "policy-restart".to_string(),
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: Default::default(),
     }
 }
 

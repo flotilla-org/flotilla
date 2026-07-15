@@ -4,15 +4,13 @@ use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
 use flotilla_resources::{
     clone_key,
-    controller::{
-        delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
-    },
+    controller::{delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, CrewSource, DockerCheckoutStrategy,
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryIdentity, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch,
-    VESSEL_REF_LABEL,
+    PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, Stance,
+    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
+    VesselStatusPatch, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -50,7 +48,6 @@ impl VesselReconciler {
             Box::new(LabelMappedWatch::<Environment, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Checkout, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
-            Box::new(LabelJoinWatch::<Clone, Vessel> { label_key: REPO_KEY_LABEL, _marker: PhantomData }),
         ]
     }
 }
@@ -88,7 +85,7 @@ enum PlannedPatch {
     },
     Ready {
         environment_ref: String,
-        checkout_ref: String,
+        checkout_refs: BTreeMap<RepositoryKey, String>,
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
         effective_stance: Stance,
@@ -115,14 +112,14 @@ impl VesselDeps {
 
     fn ready(
         environment_ref: String,
-        checkout_ref: String,
+        checkout_refs: BTreeMap<RepositoryKey, String>,
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
         effective_stance: Stance,
         actuations: Vec<Actuation>,
     ) -> Self {
         Self {
-            patch: PlannedPatch::Ready { environment_ref, checkout_ref, terminal_session_refs, requested_stance, effective_stance },
+            patch: PlannedPatch::Ready { environment_ref, checkout_refs, terminal_session_refs, requested_stance, effective_stance },
             actuations,
         }
     }
@@ -179,38 +176,39 @@ impl Reconciler for VesselReconciler {
             )));
         }
 
-        let convoy_repository = match convoy.spec.repository.as_ref() {
-            Some(repository) => repository,
-            None => return Ok(VesselDeps::failed("convoy repository URL is missing".to_string())),
-        };
-        let repo_url = convoy_repository.url.clone();
-        let git_ref = match convoy.spec.r#ref.clone() {
-            Some(git_ref) => git_ref,
-            None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
-        };
-        let repository = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
-            Ok(repository) => repository,
-            Err(ResourceError::NotFound { .. }) => {
-                return Ok(VesselDeps::failed(format!("repository {} not found", convoy_repository.repo_ref)))
-            }
-            Err(err) => return Err(err),
-        };
-        if let Err(message) = repository.spec.verify_key(&convoy_repository.repo_ref) {
-            return Ok(VesselDeps::failed(message));
+        let repository_refs = requirement
+            .repository_refs
+            .clone()
+            .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
+        if repository_refs.is_empty() && requirement.repository_refs.is_some() {
+            return Ok(VesselDeps::failed(format!("vessel {} has an empty repository scope", obj.spec.vessel_name)));
         }
-        let canonical_repo = match repository.spec.identity() {
-            RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
-            RepositoryIdentity::Local { .. } => return Ok(VesselDeps::failed("convoy repository must have a transport remote")),
+        let git_ref = if repository_refs.is_empty() {
+            None
+        } else {
+            match convoy.spec.r#ref.clone() {
+                Some(git_ref) => Some(git_ref),
+                None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
+            }
         };
-        let repository_key = convoy_repository.repo_ref.clone();
-        let repo_key = repository_key.to_string();
-        let repo_slug = repository.spec.catalog_slug();
-        let adopted_checkout_ref = obj.spec.adopted_checkout_ref.clone();
+        let mut convoy_repositories = Vec::new();
+        for repo_ref in &repository_refs {
+            let Some(repository) = convoy.spec.repositories.iter().find(|repository| &repository.repo_ref == repo_ref) else {
+                return Ok(VesselDeps::failed(format!(
+                    "vessel {} references repository {repo_ref} outside its convoy",
+                    obj.spec.vessel_name
+                )));
+            };
+            if convoy_repositories.iter().any(|existing: &&flotilla_resources::ConvoyRepositorySpec| existing.repo_ref == *repo_ref) {
+                return Ok(VesselDeps::failed(format!("vessel {} repository scope contains duplicate {repo_ref}", obj.spec.vessel_name)));
+            }
+            convoy_repositories.push(repository);
+        }
+        let multi_repository = convoy_repositories.len() > 1;
 
         let clone_env_ref = host_direct_environment_name(strategy.host_ref());
         let mut actuations = Vec::new();
-
-        let clone_name = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
+        let shared_clone_root = if strategy.needs_shared_clone() {
             let clone_env = match self.environments.get(&clone_env_ref).await {
                 Ok(environment) => environment,
                 Err(ResourceError::NotFound { .. }) => {
@@ -225,49 +223,7 @@ impl Reconciler for VesselReconciler {
             if clone_env.status.as_ref().map(|status| status.phase) != Some(EnvironmentPhase::Ready) {
                 return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
             }
-
-            let clone_name = format!("clone-{}", clone_key(&canonical_repo, &clone_env_ref));
-            let clone_path = format!("{}/{}", clone_env_spec.repo_default_dir.trim_end_matches('/'), repo_key);
-            match self.clones.get(&clone_name).await {
-                Ok(existing) => {
-                    if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
-                        return Ok(VesselDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
-                    }
-                    if existing.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
-                        let message = existing
-                            .status
-                            .as_ref()
-                            .and_then(|status| status.message.clone())
-                            .unwrap_or_else(|| format!("clone {clone_name} failed"));
-                        return Ok(VesselDeps::failed(message));
-                    }
-                    if existing.status.as_ref().map(|status| status.phase) != Some(ClonePhase::Ready) {
-                        return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
-                    }
-                }
-                Err(ResourceError::NotFound { .. }) => {
-                    actuations.push(Actuation::CreateClone {
-                        meta: InputMeta::builder()
-                            .name(clone_name.clone())
-                            .labels(BTreeMap::from([
-                                (REPO_KEY_LABEL.to_string(), repo_key.clone()),
-                                (ENV_LABEL.to_string(), clone_env_ref.clone()),
-                                (REPO_LABEL.to_string(), repo_slug.clone()),
-                            ]))
-                            .build(),
-                        spec: CloneSpec {
-                            repo_ref: repository_key.clone(),
-                            url: repo_url.clone(),
-                            env_ref: clone_env_ref.clone(),
-                            path: clone_path,
-                        },
-                    });
-                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
-                }
-                Err(err) => return Err(err),
-            }
-
-            Some(clone_name)
+            Some(clone_env_spec.repo_default_dir.clone())
         } else {
             None
         };
@@ -311,88 +267,187 @@ impl Reconciler for VesselReconciler {
             _ => None,
         };
 
-        let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| checkout_name(&obj.metadata.name));
-        let checkout_target_path = match &strategy {
-            PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
-                let clone_env = match self.environments.get(&clone_env_ref).await {
-                    Ok(environment) => environment,
-                    Err(ResourceError::NotFound { .. }) => {
-                        return Ok(VesselDeps::failed(format!("host-direct environment {clone_env_ref} not found")))
-                    }
-                    Err(err) => return Err(err),
-                };
-                let clone_env_spec = match clone_env.spec.host_direct.as_ref() {
-                    Some(spec) => spec,
-                    None => return Ok(VesselDeps::failed(format!("environment {clone_env_ref} is not a host_direct environment"))),
-                };
-                checkout_target_path(&clone_env_spec.repo_default_dir, &repo_slug, &obj.metadata.name)
+        let workspace_root = if multi_repository {
+            match &strategy {
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                    format!(
+                        "{}/{}",
+                        shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
+                        obj.metadata.name
+                    )
+                }
+                PlacementStrategy::DockerFreshCloneInContainer { clone_path, .. } => clone_path.clone(),
             }
-            PlacementStrategy::DockerFreshCloneInContainer { clone_path, .. } => clone_path.clone(),
+        } else {
+            String::new()
         };
-
-        let checkout_ready_path;
-        match self.checkouts.get(&checkout_name).await {
-            Ok(existing) => {
-                if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
-                    return Ok(VesselDeps::failed(format!("checkout {checkout_name} is not adopted")));
+        let mut checkout_refs = BTreeMap::new();
+        let mut checkout_paths = BTreeMap::new();
+        let mut waiting_for_checkouts = false;
+        for convoy_repository in convoy_repositories {
+            let repository = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
+                Ok(repository) => repository,
+                Err(ResourceError::NotFound { .. }) => {
+                    return Ok(VesselDeps::failed(format!("repository {} not found", convoy_repository.repo_ref)))
                 }
-                if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
-                    let message = existing
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.message.clone())
-                        .unwrap_or_else(|| format!("checkout {checkout_name} failed"));
-                    return Ok(VesselDeps::failed(message));
-                }
-                if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
-                    let Some(path) = existing
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.path.clone())
-                        .or_else(|| existing.spec.target_path().map(str::to_string))
-                    else {
-                        return Ok(VesselDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
-                    };
-                    checkout_ready_path = path;
-                } else {
-                    return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
-                }
+                Err(err) => return Err(err),
+            };
+            if let Err(message) = repository.spec.verify_key(&convoy_repository.repo_ref) {
+                return Ok(VesselDeps::failed(message));
             }
-            Err(ResourceError::NotFound { .. }) => {
-                if adopted_checkout_ref.is_some() {
-                    return Ok(VesselDeps::failed(format!("adopted checkout {checkout_name} not found")));
-                }
-                let spec = match &strategy {
-                    PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
-                        CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                            repo_ref: repository_key.clone(),
-                            env_ref: clone_env_ref.clone(),
-                            r#ref: git_ref,
-                            target_path: checkout_target_path.clone(),
-                            clone_ref: clone_name.clone().expect("shared-clone strategy requires clone name"),
-                        })
+            let canonical_repo = match repository.spec.identity() {
+                RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+                RepositoryIdentity::Local { .. } => return Ok(VesselDeps::failed("convoy repository must have a transport remote")),
+            };
+            let repository_key = convoy_repository.repo_ref.clone();
+            let repo_key = repository_key.to_string();
+            let adopted_checkout_ref = obj.spec.adopted_checkout_refs.get(&repository_key).cloned();
+            let clone_name = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
+                let clone_name = format!("clone-{}", clone_key(&canonical_repo, &clone_env_ref));
+                let clone_path = format!(
+                    "{}/{}",
+                    shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
+                    repo_key
+                );
+                match self.clones.get(&clone_name).await {
+                    Ok(existing) => {
+                        if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
+                            return Ok(VesselDeps::failed(format!("clone {clone_name} does not match expected repo/env tuple")));
+                        }
+                        if existing.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Failed) {
+                            let message = existing
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.message.clone())
+                                .unwrap_or_else(|| format!("clone {clone_name} failed"));
+                            return Ok(VesselDeps::failed(message));
+                        }
                     }
-                    PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
-                        repo_ref: repository_key.clone(),
-                        env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
-                        r#ref: git_ref,
-                        target_path: checkout_target_path.clone(),
-                        url: repo_url.clone(),
+                    Err(ResourceError::NotFound { .. }) => actuations.push(Actuation::CreateClone {
+                        meta: InputMeta::builder()
+                            .name(clone_name.clone())
+                            .labels(BTreeMap::from([
+                                (REPO_KEY_LABEL.to_string(), repo_key.clone()),
+                                (ENV_LABEL.to_string(), clone_env_ref.clone()),
+                                (REPO_LABEL.to_string(), convoy_repository.workspace_slug.clone()),
+                            ]))
+                            .build(),
+                        spec: CloneSpec {
+                            repo_ref: repository_key.clone(),
+                            url: convoy_repository.url.clone(),
+                            env_ref: clone_env_ref.clone(),
+                            path: clone_path,
+                        },
                     }),
-                };
-                let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
-                actuations.push(Actuation::CreateCheckout {
-                    meta: owned_child_meta(
-                        &checkout_name,
-                        obj,
-                        BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key.clone())]),
-                    ),
-                    spec,
-                });
-                return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+                    Err(err) => return Err(err),
+                }
+                Some(clone_name)
+            } else {
+                None
+            };
+            let checkout_name = adopted_checkout_ref
+                .clone()
+                .unwrap_or_else(|| checkout_name(&obj.metadata.name, &convoy_repository.workspace_slug, multi_repository));
+            let checkout_target_path = match &strategy {
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                    if multi_repository {
+                        format!("{workspace_root}/{}", convoy_repository.workspace_slug)
+                    } else {
+                        checkout_target_path(
+                            shared_clone_root.as_deref().expect("shared-clone placement has a root"),
+                            &repository.spec.catalog_slug(),
+                            &obj.metadata.name,
+                        )
+                    }
+                }
+                PlacementStrategy::DockerFreshCloneInContainer { clone_path, .. } => {
+                    if multi_repository {
+                        format!("{}/{}", clone_path.trim_end_matches('/'), convoy_repository.workspace_slug)
+                    } else {
+                        clone_path.clone()
+                    }
+                }
+            };
+            match self.checkouts.get(&checkout_name).await {
+                Ok(existing) => {
+                    if existing.spec.repo_ref() != &repository_key {
+                        return Ok(VesselDeps::failed(format!("checkout {checkout_name} belongs to a different repository")));
+                    }
+                    if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
+                        return Ok(VesselDeps::failed(format!("checkout {checkout_name} is not adopted")));
+                    }
+                    if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
+                        let message = existing
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.message.clone())
+                            .unwrap_or_else(|| format!("checkout {checkout_name} failed"));
+                        return Ok(VesselDeps::failed(message));
+                    }
+                    if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Ready) {
+                        let Some(path) = existing
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.path.clone())
+                            .or_else(|| existing.spec.target_path().map(str::to_string))
+                        else {
+                            return Ok(VesselDeps::failed(format!("checkout {checkout_name} is ready but has no target path")));
+                        };
+                        checkout_refs.insert(repository_key.clone(), checkout_name);
+                        checkout_paths.insert(repository_key, path);
+                    } else {
+                        waiting_for_checkouts = true;
+                    }
+                }
+                Err(ResourceError::NotFound { .. }) => {
+                    if adopted_checkout_ref.is_some() {
+                        return Ok(VesselDeps::failed(format!("adopted checkout {checkout_name} not found")));
+                    }
+                    let spec = match &strategy {
+                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                            CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                                repo_ref: repository_key.clone(),
+                                env_ref: clone_env_ref.clone(),
+                                r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
+                                base_ref: Some(convoy_repository.base_ref.clone()),
+                                target_path: checkout_target_path,
+                                clone_ref: clone_name.expect("shared-clone strategy requires clone name"),
+                            })
+                        }
+                        PlacementStrategy::DockerFreshCloneInContainer { .. } => CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+                            repo_ref: repository_key,
+                            env_ref: precreated_environment_ref.clone().expect("fresh-clone strategy should precreate environment"),
+                            r#ref: git_ref.clone().expect("repository checkout requires a convoy ref"),
+                            base_ref: Some(convoy_repository.base_ref.clone()),
+                            target_path: checkout_target_path,
+                            url: convoy_repository.url.clone(),
+                        }),
+                    };
+                    let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
+                    actuations.push(Actuation::CreateCheckout {
+                        meta: owned_child_meta(
+                            &checkout_name,
+                            obj,
+                            BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]),
+                        ),
+                        spec,
+                    });
+                    waiting_for_checkouts = true;
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => return Err(err),
         }
+        if waiting_for_checkouts {
+            return Ok(VesselDeps::provisioning(obj, &placement_policy, actuations));
+        }
+        let has_repositories = !repository_refs.is_empty();
+        let workspace_root = if multi_repository {
+            workspace_root
+        } else if let Some(path) = checkout_paths.values().next() {
+            path.clone()
+        } else {
+            shared_clone_root.clone().unwrap_or_default()
+        };
 
         let resolved_environment_ref = match &strategy {
             PlacementStrategy::HostDirect { host_ref, .. } => {
@@ -436,11 +491,14 @@ impl Reconciler for VesselReconciler {
                                 docker: Some(DockerEnvironmentSpec {
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
-                                    mounts: vec![EnvironmentMount {
-                                        source_path: checkout_ready_path.clone(),
-                                        target_path: mount_path.clone(),
-                                        mode: EnvironmentMountMode::Rw,
-                                    }],
+                                    mounts: has_repositories
+                                        .then(|| EnvironmentMount {
+                                            source_path: workspace_root.clone(),
+                                            target_path: mount_path.clone(),
+                                            mode: EnvironmentMountMode::Rw,
+                                        })
+                                        .into_iter()
+                                        .collect(),
                                     env: env.clone(),
                                 }),
                             },
@@ -532,7 +590,7 @@ impl Reconciler for VesselReconciler {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),
                             source,
-                            cwd: strategy.terminal_cwd(&checkout_ready_path),
+                            cwd: strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories),
                             pool: strategy.pool().to_string(),
                         },
                     });
@@ -542,7 +600,7 @@ impl Reconciler for VesselReconciler {
             }
         }
 
-        Ok(VesselDeps::ready(resolved_environment_ref, checkout_name, terminal_refs, requirement.stance, effective_stance, actuations))
+        Ok(VesselDeps::ready(resolved_environment_ref, checkout_refs, terminal_refs, requirement.stance, effective_stance, actuations))
     }
 
     fn reconcile(
@@ -558,10 +616,10 @@ impl Reconciler for VesselReconciler {
                 observed_policy_version: observed_policy_version.clone(),
                 started_at: now,
             }),
-            PlannedPatch::Ready { environment_ref, checkout_ref, terminal_session_refs, requested_stance, effective_stance } => {
+            PlannedPatch::Ready { environment_ref, checkout_refs, terminal_session_refs, requested_stance, effective_stance } => {
                 Some(VesselStatusPatch::MarkReady {
                     environment_ref: Some(environment_ref.clone()),
-                    checkout_ref: Some(checkout_ref.clone()),
+                    checkout_refs: checkout_refs.clone(),
                     terminal_session_refs: terminal_session_refs.clone(),
                     requested_stance: *requested_stance,
                     effective_stance: *effective_stance,
@@ -637,8 +695,12 @@ fn environment_name(vessel_name: &str) -> String {
     format!("env-{vessel_name}")
 }
 
-fn checkout_name(vessel_name: &str) -> String {
-    format!("checkout-{vessel_name}")
+fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool) -> String {
+    if multi_repository {
+        format!("checkout-{vessel_name}-{workspace_slug}")
+    } else {
+        format!("checkout-{vessel_name}")
+    }
 }
 
 fn checkout_target_path(repo_default_dir: &str, repo_slug: &str, vessel_name: &str) -> String {
@@ -695,11 +757,27 @@ impl PlacementStrategy {
         !matches!(self, Self::DockerFreshCloneInContainer { .. })
     }
 
-    fn terminal_cwd(&self, checkout_path: &str) -> String {
+    fn terminal_cwd(&self, workspace_root: &str, multi_repository: bool, has_repositories: bool) -> String {
         match self {
-            Self::HostDirect { .. } => checkout_path.to_string(),
-            Self::DockerWorktreeOnHostAndMount { mount_path, default_cwd, .. } => default_cwd.clone().unwrap_or_else(|| mount_path.clone()),
-            Self::DockerFreshCloneInContainer { clone_path, default_cwd, .. } => default_cwd.clone().unwrap_or_else(|| clone_path.clone()),
+            Self::HostDirect { .. } => workspace_root.to_string(),
+            Self::DockerWorktreeOnHostAndMount { mount_path, default_cwd, .. } => {
+                if !has_repositories {
+                    default_cwd.clone().unwrap_or_else(|| "/".to_string())
+                } else if multi_repository {
+                    mount_path.clone()
+                } else {
+                    default_cwd.clone().unwrap_or_else(|| mount_path.clone())
+                }
+            }
+            Self::DockerFreshCloneInContainer { clone_path, default_cwd, .. } => {
+                if !has_repositories {
+                    default_cwd.clone().unwrap_or_else(|| "/".to_string())
+                } else if multi_repository {
+                    clone_path.clone()
+                } else {
+                    default_cwd.clone().unwrap_or_else(|| clone_path.clone())
+                }
+            }
         }
     }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -291,10 +291,10 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
             workflow_ref: "scratch".to_string(),
             inputs: Default::default(),
             placement_policy: None,
-            repository: None,
+            repositories: Vec::new(),
             r#ref: None,
             project_ref: None,
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("convoy create should succeed");

@@ -1,9 +1,11 @@
 mod common;
 
+use std::collections::BTreeMap;
+
 use common::{convoy_object, convoy_spec, convoy_status, timestamp};
 use flotilla_resources::{
-    Checkout, CheckoutSpec, CheckoutWorktreeSpec, Convoy, ConvoyPhase, InputMeta, K8sResourceObject, LifecycleAuthority,
-    ObservedCheckoutSpec, ResourceError, ResourceObject, AUTHORITY_LABEL,
+    Checkout, CheckoutSpec, CheckoutWorktreeSpec, Convoy, ConvoyPhase, ConvoyRepositorySpec, InputMeta, K8sResourceObject,
+    LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, AUTHORITY_LABEL,
 };
 
 #[test]
@@ -35,6 +37,25 @@ fn k8s_object_projection_roundtrips_to_typed_resource_object() {
     assert_eq!(roundtripped.metadata.creation_timestamp, timestamp(1));
     assert_eq!(roundtripped.spec.workflow_ref, "review");
     assert_eq!(roundtripped.status.expect("status").phase, ConvoyPhase::Active);
+}
+
+#[test]
+fn convoy_repository_snapshot_roundtrips_every_repository_field() {
+    let mut spec = convoy_spec("review");
+    let repo_ref = RepositoryKey("repo-flotilla".to_string());
+    spec.repositories = vec![ConvoyRepositorySpec {
+        url: "https://github.com/flotilla-org/flotilla".to_string(),
+        repo_ref: repo_ref.clone(),
+        base_ref: "main".to_string(),
+        workspace_slug: "flotilla".to_string(),
+        subpaths: vec!["crates/core".to_string(), "crates/tui".to_string()],
+    }];
+    spec.adopted_checkout_refs = BTreeMap::from([(repo_ref, "checkout-existing".to_string())]);
+    let object = convoy_object("alpha", spec.clone(), None);
+
+    let roundtripped = ResourceObject::<Convoy>::from_k8s_object(object.to_k8s_object()).expect("projection should roundtrip");
+
+    assert_eq!(roundtripped.spec, spec);
 }
 
 #[test]
@@ -109,6 +130,7 @@ fn checkout_spec_worktree_variant_roundtrips_through_k8s_projection() {
             repo_ref: flotilla_resources::RepositoryKey("project-flotilla".to_string()),
             env_ref: "env-a".to_string(),
             r#ref: "feature-a".to_string(),
+            base_ref: None,
             target_path: "/worktrees/feature-a".to_string(),
             clone_ref: "clone-a".to_string(),
         }),

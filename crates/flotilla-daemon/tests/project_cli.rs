@@ -17,7 +17,8 @@ use flotilla_core::{
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, InMemoryBackend, InputMeta, IssueSource, Project, Repository, RepositoryKey, RepositorySpec, ResourceBackend,
+    Checkout, Convoy, InMemoryBackend, InputMeta, IssueSource, Project, Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
+    ResourceBackend,
 };
 
 fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
@@ -265,12 +266,21 @@ async fn convoy_create_carries_project_ref() {
     let mut rx = daemon.subscribe();
     let repository_spec = RepositorySpec::remote("https://github.com/org/linked-repo.git").expect("repository spec");
     let repository_key = repository_spec.key();
-    backend
+    let repository = backend
         .clone()
         .using::<Repository>("flotilla")
         .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
         .await
         .expect("repository create");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .update_status(&repository.metadata.name, &repository.metadata.resource_version, &RepositoryStatus {
+            default_branch: Some("main".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("repository status update");
     assert_eq!(
         execute_project_add(&daemon, &mut rx, "linked-repo".to_string(), Some("my-project"), None).await,
         CommandValue::ProjectAdded { name: "my-project".into() }
@@ -294,7 +304,10 @@ async fn convoy_create_carries_project_ref() {
         .await
         .expect("execute");
     assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ConvoyCreated { name: "linked".into() });
-    assert_eq!(backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy").spec.project_ref.as_deref(), Some("my-project"));
+    let convoy = backend.using::<Convoy>("flotilla").get("linked").await.expect("convoy");
+    assert_eq!(convoy.spec.project_ref.as_deref(), Some("my-project"));
+    assert_eq!(convoy.spec.repositories.len(), 1);
+    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
 }
 
 #[tokio::test]

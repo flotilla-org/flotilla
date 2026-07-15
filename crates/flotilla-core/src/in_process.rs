@@ -4,7 +4,7 @@
 //! and broadcasts events — all within the same process.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -2216,7 +2216,7 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
 }
 
 impl InProcessDaemon {
-    async fn validate_project_readiness(&self, namespace: &str, project_ref: &str) -> Result<(), String> {
+    async fn snapshot_project_repositories(&self, namespace: &str, project_ref: &str) -> Result<Vec<ConvoyRepositorySpec>, String> {
         let project = self
             .resource_backend
             .clone()
@@ -2226,11 +2226,30 @@ impl InProcessDaemon {
             .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
         let repositories = self.resource_backend.clone().using::<Repository>(namespace);
         let mut unresolved = Vec::new();
+        let mut snapshots = BTreeMap::<RepositoryKey, (String, String, String, Option<String>, BTreeSet<String>)>::new();
         for entry in &project.spec.repositories {
             match repositories.get(&entry.repo.to_string()).await {
                 Ok(repository) => {
                     if let Err(error) = repository.spec.verify_key(&entry.repo) {
                         unresolved.push(error);
+                        continue;
+                    }
+                    let url = match repository.spec.identity() {
+                        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+                        flotilla_resources::RepositoryIdentity::Local { .. } => {
+                            unresolved.push(format!("repository {} has no transport remote", entry.repo));
+                            continue;
+                        }
+                    };
+                    let base_ref = entry.default_branch.clone().or_else(|| repository.status.as_ref()?.default_branch.clone());
+                    let snapshot = snapshots.entry(entry.repo.clone()).or_insert_with(|| {
+                        (url, repository.spec.leaf_slug(), repository.spec.catalog_slug(), base_ref.clone(), BTreeSet::new())
+                    });
+                    if snapshot.3 != base_ref {
+                        unresolved.push(format!("repository {} has conflicting project default branches", entry.repo));
+                    }
+                    if let Some(subpath) = &entry.subpath {
+                        snapshot.4.insert(subpath.clone());
                     }
                 }
                 Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
@@ -2240,11 +2259,31 @@ impl InProcessDaemon {
         {
             unresolved.push(format!("workflow template {}: {error}", project.spec.default_workflow_ref));
         }
-        if unresolved.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("project {project_ref} is not ready: {}", unresolved.join("; ")))
+        for (repo_ref, (_, _, _, base_ref, _)) in &snapshots {
+            if base_ref.is_none() {
+                unresolved.push(format!("repository {repo_ref} has no resolved default branch"));
+            }
         }
+        if !unresolved.is_empty() {
+            return Err(format!("project {project_ref} is not ready: {}", unresolved.join("; ")));
+        }
+
+        let mut slug_counts = BTreeMap::<String, usize>::new();
+        for (_, leaf_slug, _, _, _) in snapshots.values() {
+            *slug_counts.entry(leaf_slug.clone()).or_default() += 1;
+        }
+        let mut repositories = snapshots
+            .into_iter()
+            .map(|(repo_ref, (url, leaf_slug, catalog_slug, base_ref, subpaths))| ConvoyRepositorySpec {
+                url,
+                repo_ref,
+                base_ref: base_ref.expect("missing base refs were rejected"),
+                workspace_slug: if slug_counts[&leaf_slug] == 1 { leaf_slug } else { catalog_slug },
+                subpaths: subpaths.into_iter().collect(),
+            })
+            .collect::<Vec<_>>();
+        repositories.sort_by(|left, right| left.workspace_slug.cmp(&right.workspace_slug).then_with(|| left.repo_ref.cmp(&right.repo_ref)));
+        Ok(repositories)
     }
 
     async fn project_add(
@@ -3760,34 +3799,52 @@ impl InProcessDaemon {
                     return Ok(id);
                 }
             }
-            if let Some(project_ref) = project_ref {
-                if let Err(message) = self.validate_project_readiness(&namespace, project_ref).await {
-                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                        command_id: id,
-                        node_id: self.node_id.clone(),
-                        repo_identity: empty_identity,
-                        repo: None,
-                        result: flotilla_protocol::CommandValue::Error { message },
-                    });
-                    return Ok(id);
+            let project_repositories = if let Some(project_ref) = project_ref {
+                match self.snapshot_project_repositories(&namespace, project_ref).await {
+                    Ok(repositories) => Some(repositories),
+                    Err(message) => {
+                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                            command_id: id,
+                            node_id: self.node_id.clone(),
+                            repo_identity: empty_identity,
+                            repo: None,
+                            result: flotilla_protocol::CommandValue::Error { message },
+                        });
+                        return Ok(id);
+                    }
                 }
+            } else {
+                None
+            };
+            if project_repositories.is_some() && repository_url.is_some() {
+                let message = "convoy repository selection is not allowed when a project is supplied".to_string();
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result: flotilla_protocol::CommandValue::Error { message },
+                });
+                return Ok(id);
             }
             let placement_policy = match placement_policy {
                 Some(policy) => Some(policy.clone()),
                 None => default_convoy_placement_policy(&self.resource_backend, &namespace).await,
             };
-            let mut repository_url = repository_url.clone();
+            let mut direct_repository_url = repository_url.clone();
             let mut r#ref = r#ref.clone();
-            let adopted_checkout_ref = match adopted_checkout {
+            let adopted_checkout = match adopted_checkout {
                 Some(path) => {
                     let adopted_result = async {
-                        let inspection = self.inspect_adopted_checkout(path.as_ref(), repository_url.as_deref(), r#ref.as_deref()).await?;
+                        let inspection =
+                            self.inspect_adopted_checkout(path.as_ref(), direct_repository_url.as_deref(), r#ref.as_deref()).await?;
+                        let repo_ref = inspection.spec.key();
                         let transport_url = inspection
                             .transport_url
                             .as_deref()
                             .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
                         let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
-                        create_adopted_checkout_resource(
+                        let (checkout_ref, inferred_repository_url, inferred_ref) = create_adopted_checkout_resource(
                             &self.resource_backend,
                             AdoptedCheckoutRequest::builder()
                                 .namespace(&namespace)
@@ -3799,14 +3856,17 @@ impl InProcessDaemon {
                                 .host_ref(&inspection.checkout.host_ref)
                                 .build(),
                         )
-                        .await
+                        .await?;
+                        Ok::<_, String>((repo_ref, checkout_ref, inferred_repository_url, inferred_ref))
                     }
                     .await;
                     match adopted_result {
-                        Ok((checkout_ref, inferred_repository_url, inferred_ref)) => {
-                            repository_url.get_or_insert(inferred_repository_url);
+                        Ok((repo_ref, checkout_ref, inferred_repository_url, inferred_ref)) => {
+                            if project_repositories.is_none() {
+                                direct_repository_url.get_or_insert(inferred_repository_url);
+                            }
                             r#ref.get_or_insert(inferred_ref);
-                            Some(checkout_ref)
+                            Some((repo_ref, checkout_ref))
                         }
                         Err(message) => {
                             let result = flotilla_protocol::CommandValue::Error { message };
@@ -3823,7 +3883,9 @@ impl InProcessDaemon {
                 }
                 None => None,
             };
-            let repository = if let Some(url) = repository_url {
+            let repositories = if let Some(repositories) = project_repositories {
+                repositories
+            } else if let Some(url) = direct_repository_url {
                 let resolved = async {
                     let repository_spec = self.resolve_repository_remote(&url).await?;
                     let repo_ref = repository_spec.key();
@@ -3834,11 +3896,17 @@ impl InProcessDaemon {
                     )
                     .await
                     .map_err(|error| error.to_string())?;
-                    Ok::<_, String>(ConvoyRepositorySpec { url, repo_ref })
+                    Ok::<_, String>(vec![ConvoyRepositorySpec {
+                        url,
+                        repo_ref,
+                        base_ref: "HEAD".to_string(),
+                        workspace_slug: repository_spec.leaf_slug(),
+                        subpaths: Vec::new(),
+                    }])
                 }
                 .await;
                 match resolved {
-                    Ok(repository) => Some(repository),
+                    Ok(repositories) => repositories,
                     Err(message) => {
                         let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                             command_id: id,
@@ -3851,16 +3919,32 @@ impl InProcessDaemon {
                     }
                 }
             } else {
-                None
+                Vec::new()
             };
+            let mut adopted_checkout_refs = BTreeMap::new();
+            if let Some((repo_ref, checkout_ref)) = adopted_checkout {
+                if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
+                    let message =
+                        format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result: flotilla_protocol::CommandValue::Error { message },
+                    });
+                    return Ok(id);
+                }
+                adopted_checkout_refs.insert(repo_ref, checkout_ref);
+            }
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
                 inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
                 placement_policy,
-                repository,
+                repositories,
                 r#ref,
                 project_ref: project_ref.clone(),
-                adopted_checkout_ref,
+                adopted_checkout_refs,
             };
             let meta = InputMeta::builder().name(name.clone()).build();
             let result = match convoys.create(&meta, &spec).await {

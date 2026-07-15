@@ -24,8 +24,6 @@ use crate::{
     InputMeta, InputValue, OwnerReference, PlacementStatus, Resource, ResourceError, TypedResolver,
 };
 
-const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
     pub patch: Option<ConvoyStatusPatch>,
@@ -286,6 +284,7 @@ fn bootstrap_outcome(
                 name: vessel.name.clone(),
                 stance: vessel.stance,
                 depends_on: vessel.depends_on.clone(),
+                repository_refs: vessel.repository_refs.clone(),
                 crew: vessel.crew.iter().map(|member| instantiate_process(convoy, member)).collect(),
             })
             .collect(),
@@ -677,7 +676,18 @@ fn cleanup_actuations(
 
 fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
     let placement_policy_ref = convoy.spec.placement_policy.clone()?;
-    let repository_key = convoy.spec.repository.as_ref()?.repo_ref.to_string();
+    let requirement = convoy.status.as_ref()?.workflow_snapshot.as_ref()?.vessels.iter().find(|requirement| requirement.name == vessel)?;
+    let repository_refs = requirement
+        .repository_refs
+        .clone()
+        .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
+    let adopted_checkout_refs = convoy
+        .spec
+        .adopted_checkout_refs
+        .iter()
+        .filter(|(repo_ref, _)| repository_refs.contains(repo_ref))
+        .map(|(repo_ref, checkout_ref)| (repo_ref.clone(), checkout_ref.clone()))
+        .collect();
 
     Some(InternalReconcileOutcome {
         patch: None,
@@ -687,7 +697,6 @@ fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: Da
                 .labels(BTreeMap::from([
                     (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
                     (VESSEL_LABEL.to_string(), vessel.to_string()),
-                    (REPO_KEY_LABEL.to_string(), repository_key),
                 ]))
                 .owner_references(vec![OwnerReference {
                     api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
@@ -700,7 +709,7 @@ fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: Da
                 convoy_ref: convoy.metadata.name.clone(),
                 vessel_name: vessel.to_string(),
                 placement_policy_ref,
-                adopted_checkout_ref: convoy.spec.adopted_checkout_ref.clone(),
+                adopted_checkout_refs,
             },
         }],
         events: Vec::new(),
@@ -758,7 +767,9 @@ fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {
     let mut fields = BTreeMap::from([("vessel_ref".to_string(), json!(workspace.metadata.name))]);
     if let Some(status) = workspace.status.as_ref() {
         insert_optional_field(&mut fields, "environment_ref", status.environment_ref.clone());
-        insert_optional_field(&mut fields, "checkout_ref", status.checkout_ref.clone());
+        if !status.checkout_refs.is_empty() {
+            fields.insert("checkout_refs".to_string(), json!(status.checkout_refs));
+        }
         if !status.terminal_session_refs.is_empty() {
             fields.insert("terminal_session_refs".to_string(), json!(status.terminal_session_refs));
         }

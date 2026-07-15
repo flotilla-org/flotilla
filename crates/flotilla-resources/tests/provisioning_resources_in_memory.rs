@@ -67,7 +67,7 @@ async fn vessel_metadata_and_status_roundtrip() {
         convoy_ref: "fix-bug-123".to_string(),
         vessel_name: "implement".to_string(),
         placement_policy_ref: "docker-on-01HXYZ".to_string(),
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: Default::default(),
     };
     let created = resolver.create(&vessel_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
     let updated = resolver
@@ -77,7 +77,7 @@ async fn vessel_metadata_and_status_roundtrip() {
             observed_policy_ref: Some("docker-on-01HXYZ".to_string()),
             observed_policy_version: Some("12".to_string()),
             environment_ref: Some("env-a".to_string()),
-            checkout_ref: Some("checkout-a".to_string()),
+            checkout_refs: Default::default(),
             terminal_session_refs: vec!["term-a".to_string()],
             started_at: Some(Utc::now()),
             ready_at: Some(Utc::now()),
@@ -116,6 +116,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
         repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
         env_ref: "env-a".to_string(),
         r#ref: "feat/convoy-resource".to_string(),
+        base_ref: None,
         target_path: "/workspace".to_string(),
         url: "git@github.com:flotilla-org/flotilla.git".to_string(),
     });
