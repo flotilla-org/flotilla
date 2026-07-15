@@ -1804,6 +1804,43 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
     assert_eq!(data.issue_rows[0].issue.reference.id, "LINEAR-2");
 }
 
+#[tokio::test]
+async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
+    let mut app = stub_app();
+    let identity = app.model.repo_order[0].clone();
+    let repository_key = flotilla_protocol::RepositoryKey("repo_materialized".into());
+    app.model.repos.get_mut(&identity).expect("repo model").repository_key = Some(repository_key.clone());
+    let scope = flotilla_protocol::QueryScope::Repository(repository_key);
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone() };
+    let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+    let rows = (1..=50)
+        .map(|id| {
+            let mut issue = TestIssue::new(&format!("Materialized issue {id}")).id(id.to_string()).build();
+            issue.reference.source = source.clone();
+            flotilla_protocol::IssueRow { reference: issue.reference.clone(), issue }
+        })
+        .collect();
+
+    app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq: 1,
+        rows: flotilla_protocol::Rows::Issues { scope, rows },
+        state: flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-15T12:00:00Z".parse().expect("timestamp"),
+                has_more: true,
+            }),
+            conditions: vec![],
+        },
+    })));
+
+    let page = app.screen.repo_pages.get_mut(&identity).expect("repo page");
+    page.reconcile_if_changed();
+    page.table.select_flat_index(44);
+    app.handle_key(key(KeyCode::Char('j')));
+
+    assert!(app.pending_fetch_more.contains(&query));
+}
+
 // -- Convoys tab rendering --
 
 #[test]

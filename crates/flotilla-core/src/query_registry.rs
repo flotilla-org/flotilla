@@ -17,19 +17,21 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct QueryRegistry {
     inner: Arc<Mutex<RegistryState>>,
-    demand_tx: watch::Sender<HashSet<QueryId>>,
-    fetch_more_tx: broadcast::Sender<QueryId>,
+    demand_tx: watch::Sender<HashMap<QueryId, u64>>,
+    fetch_more_tx: broadcast::Sender<(QueryId, u64)>,
 }
 
 #[derive(Default, Debug)]
 struct RegistryState {
     subscribers: HashMap<Uuid, HashSet<QueryId>>,
     demand_backed: HashMap<QueryId, ResultSet>,
+    generations: HashMap<QueryId, u64>,
+    next_generation: u64,
 }
 
 impl Default for QueryRegistry {
     fn default() -> Self {
-        let (demand_tx, _) = watch::channel(HashSet::new());
+        let (demand_tx, _) = watch::channel(HashMap::new());
         let (fetch_more_tx, _) = broadcast::channel(32);
         Self { inner: Arc::new(Mutex::new(RegistryState::default())), demand_tx, fetch_more_tx }
     }
@@ -62,9 +64,12 @@ impl QueryRegistry {
 
     /// Replace the current window of a live issue materialization. A fetch
     /// that completes after the last subscriber left is discarded.
-    pub fn replace_issues(&self, query: &QueryId, rows: Vec<IssueRow>, result_state: ResultSetState) -> Option<ResultSet> {
+    pub fn replace_issues(&self, query: &QueryId, generation: u64, rows: Vec<IssueRow>, result_state: ResultSetState) -> Option<ResultSet> {
         let QueryId::Issues { scope } = query else { return None };
         let mut state = self.inner.lock().expect("query registry lock poisoned");
+        if state.generations.get(query) != Some(&generation) {
+            return None;
+        }
         let current = state.demand_backed.get_mut(query)?;
         *current = ResultSet { seq: current.seq.saturating_add(1), rows: Rows::Issues { scope: scope.clone(), rows }, state: result_state };
         Some(current.clone())
@@ -75,12 +80,16 @@ impl QueryRegistry {
     pub fn apply_issue_changes(
         &self,
         query: &QueryId,
+        generation: u64,
         changed: Vec<IssueRow>,
         removed: Vec<IssueRef>,
         result_state: ResultSetState,
     ) -> Option<ResultDelta> {
         let QueryId::Issues { scope } = query else { return None };
         let mut registry = self.inner.lock().expect("query registry lock poisoned");
+        if registry.generations.get(query) != Some(&generation) {
+            return None;
+        }
         let current = registry.demand_backed.get_mut(query)?;
         let Rows::Issues { rows, .. } = &mut current.rows else { return None };
         let mut by_reference = rows.drain(..).map(|row| (row.reference.clone(), row)).collect::<HashMap<_, _>>();
@@ -101,11 +110,11 @@ impl QueryRegistry {
         })
     }
 
-    pub fn subscribe_demand(&self) -> watch::Receiver<HashSet<QueryId>> {
+    pub fn subscribe_demand(&self) -> watch::Receiver<HashMap<QueryId, u64>> {
         self.demand_tx.subscribe()
     }
 
-    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<QueryId> {
+    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<(QueryId, u64)> {
         self.fetch_more_tx.subscribe()
     }
 
@@ -115,12 +124,13 @@ impl QueryRegistry {
         if !result.state.demand.as_ref().is_some_and(|metadata| metadata.has_more) {
             return Err(format!("query has no more rows: {query}"));
         }
+        let generation = *state.generations.get(query).ok_or_else(|| format!("query has no materialization generation: {query}"))?;
         drop(state);
-        self.fetch_more_tx.send(query.clone()).map(|_| ()).map_err(|_| "issue materializer is unavailable".to_string())
+        self.fetch_more_tx.send((query.clone(), generation)).map(|_| ()).map_err(|_| "issue materializer is unavailable".to_string())
     }
 
     fn publish_demand(&self, state: &RegistryState) {
-        let demanded = state.demand_backed.keys().cloned().collect();
+        let demanded = state.generations.clone();
         if *self.demand_tx.borrow() != demanded {
             self.demand_tx.send_replace(demanded);
         }
@@ -129,6 +139,11 @@ impl QueryRegistry {
     #[cfg(test)]
     fn subscriber_count(&self, query: &QueryId) -> usize {
         self.inner.lock().expect("query registry lock poisoned").subscribers.values().filter(|queries| queries.contains(query)).count()
+    }
+
+    #[cfg(test)]
+    fn generation(&self, query: &QueryId) -> u64 {
+        *self.inner.lock().expect("query registry lock poisoned").generations.get(query).expect("live query generation")
     }
 }
 
@@ -141,9 +156,13 @@ fn reconcile_demand(state: &mut RegistryState) -> HashSet<QueryId> {
         .cloned()
         .collect();
     state.demand_backed.retain(|query, _| demanded.contains(query));
+    state.generations.retain(|query, _| demanded.contains(query));
     let mut created = HashSet::new();
     for query in demanded {
         if !state.demand_backed.contains_key(&query) {
+            state.next_generation = state.next_generation.saturating_add(1);
+            let generation = state.next_generation;
+            state.generations.insert(query.clone(), generation);
             state.demand_backed.insert(query.clone(), unavailable_issues_result_set(query.clone()));
             created.insert(query);
         }
@@ -224,9 +243,16 @@ mod tests {
         let query = issues("recreated");
 
         assert_eq!(registry.replace(subscriber, &[cursor(query.clone())]), HashSet::from([query.clone()]));
+        let first_generation = registry.generation(&query);
         assert!(registry.replace(subscriber, &[cursor(query.clone())]).is_empty());
         registry.remove(subscriber);
-        assert_eq!(registry.replace(subscriber, &[cursor(query.clone())]), HashSet::from([query]));
+        assert_eq!(registry.replace(subscriber, &[cursor(query.clone())]), HashSet::from([query.clone()]));
+        let second_generation = registry.generation(&query);
+
+        assert!(second_generation > first_generation);
+        let ready = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }), conditions: vec![] };
+        assert!(registry.replace_issues(&query, first_generation, vec![], ready.clone()).is_none());
+        assert!(registry.replace_issues(&query, second_generation, vec![], ready).is_some());
     }
 
     #[test]
@@ -238,7 +264,7 @@ mod tests {
 
         registry.replace(subscriber, &[cursor(query.clone())]);
         assert!(demand.has_changed().expect("demand sender remains live"));
-        assert_eq!(*demand.borrow_and_update(), HashSet::from([query]));
+        assert_eq!(demand.borrow_and_update().keys().cloned().collect::<HashSet<_>>(), HashSet::from([query]));
 
         registry.remove(subscriber);
         assert!(demand.has_changed().expect("demand sender remains live"));
@@ -252,7 +278,7 @@ mod tests {
         registry.replace(Uuid::new_v4(), &[cursor(query.clone())]);
 
         let mut demand = registry.subscribe_demand();
-        assert_eq!(*demand.borrow_and_update(), HashSet::from([query]));
+        assert_eq!(demand.borrow_and_update().keys().cloned().collect::<HashSet<_>>(), HashSet::from([query]));
     }
 
     #[test]
@@ -260,7 +286,7 @@ mod tests {
         let registry = QueryRegistry::default();
         let query = issues("paged");
         registry.replace(Uuid::new_v4(), &[cursor(query.clone())]);
-        registry.replace_issues(&query, vec![], ResultSetState {
+        registry.replace_issues(&query, registry.generation(&query), vec![], ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
             conditions: vec![],
         });
@@ -268,6 +294,28 @@ mod tests {
 
         registry.request_fetch_more(&query).expect("live paged query accepts fetch-more");
 
-        assert_eq!(intents.try_recv().expect("fetch-more intent"), query);
+        assert_eq!(intents.try_recv().expect("fetch-more intent"), (query.clone(), registry.generation(&query)));
+    }
+
+    #[test]
+    fn queued_fetch_more_intent_retains_its_original_materialization_generation() {
+        let registry = QueryRegistry::default();
+        let subscriber = Uuid::new_v4();
+        let query = issues("recreated-paged");
+        let mut intents = registry.subscribe_fetch_more();
+        registry.replace(subscriber, &[cursor(query.clone())]);
+        let first_generation = registry.generation(&query);
+        registry.replace_issues(&query, first_generation, vec![], ResultSetState {
+            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
+            conditions: vec![],
+        });
+        registry.request_fetch_more(&query).expect("first lifetime accepts fetch-more");
+
+        registry.remove(subscriber);
+        registry.replace(subscriber, &[cursor(query.clone())]);
+        let second_generation = registry.generation(&query);
+
+        assert!(second_generation > first_generation);
+        assert_eq!(intents.try_recv().expect("queued fetch-more intent"), (query, first_generation));
     }
 }

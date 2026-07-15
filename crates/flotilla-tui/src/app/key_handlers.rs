@@ -156,19 +156,26 @@ impl App {
     fn check_infinite_scroll(&mut self) {
         let Some(repo_identity) = self.model.active_repo.clone() else { return };
         let Some(page) = self.screen.repo_pages.get(&repo_identity) else { return };
-        let total_items = page.table.total_item_count();
-        let Some(flat_idx) = page.table.selected_flat_index() else { return };
+        let Some((issue_idx, issue_count)) = page.table.selected_issue_position() else { return };
 
-        if self.issue_views.get(&repo_identity).and_then(|view| view.search.as_ref()).is_none() {
-            let Some(repository_key) = self.model.repos.get(&repo_identity).and_then(|repo| repo.repository_key.clone()) else { return };
+        let materialized_repository_key = self
+            .model
+            .repos
+            .get(&repo_identity)
+            .and_then(|repo| repo.repository_key.clone())
+            .filter(|_| self.issue_views.get(&repo_identity).and_then(|view| view.search.as_ref()).is_none());
+        if let Some(repository_key) = materialized_repository_key {
             let query = flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::Repository(repository_key) };
             let has_more = self
                 .materialized_issue_states
                 .get(&query)
                 .and_then(|state| state.demand.as_ref())
                 .is_some_and(|metadata| metadata.has_more);
-            let issue_count = self.materialized_issue_rows.get(&query).map_or(0, Vec::len);
-            if !has_more || issue_count == 0 || flat_idx + 5 < total_items || !self.pending_fetch_more.insert(query.clone()) {
+            if !has_more
+                || issue_count == 0
+                || issue_count.saturating_sub(issue_idx + 1) > 5
+                || !self.pending_fetch_more.insert(query.clone())
+            {
                 return;
             }
             let daemon = Arc::clone(&self.daemon);
@@ -189,7 +196,7 @@ impl App {
         if issue_count == 0 {
             return;
         }
-        if flat_idx + 5 >= total_items {
+        if issue_count.saturating_sub(issue_idx + 1) <= 5 {
             let params = active.params.clone();
             let next_page = active.next_page;
             if !self.begin_issue_page_fetch(&repo_identity, &params, next_page) {

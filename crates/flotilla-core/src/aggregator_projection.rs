@@ -176,11 +176,11 @@ impl AggregatorProjectionState {
 
     /// Observe the complete set of live demand-backed query identities.
     /// The Aggregator uses this to start and stop source materializers.
-    pub fn subscribe_demand(&self) -> watch::Receiver<HashSet<QueryId>> {
+    pub fn subscribe_demand(&self) -> watch::Receiver<HashMap<QueryId, u64>> {
         self.demand_backed.subscribe_demand()
     }
 
-    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<QueryId> {
+    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<(QueryId, u64)> {
         self.demand_backed.subscribe_fetch_more()
     }
 
@@ -190,18 +190,19 @@ impl AggregatorProjectionState {
 
     /// Replace the fetched window for a live issue materialization. Results
     /// racing with teardown are ignored by the registry.
-    pub fn replace_issues(&self, query: &QueryId, rows: Vec<IssueRow>, state: ResultSetState) -> Option<ResultSet> {
-        self.demand_backed.replace_issues(query, rows, state)
+    pub fn replace_issues(&self, query: &QueryId, generation: u64, rows: Vec<IssueRow>, state: ResultSetState) -> Option<ResultSet> {
+        self.demand_backed.replace_issues(query, generation, rows, state)
     }
 
     pub fn apply_issue_changes(
         &self,
         query: &QueryId,
+        generation: u64,
         changed: Vec<IssueRow>,
         removed: Vec<IssueRef>,
         state: ResultSetState,
     ) -> Option<ResultDelta> {
-        self.demand_backed.apply_issue_changes(query, changed, removed, state)
+        self.demand_backed.apply_issue_changes(query, generation, changed, removed, state)
     }
 
     /// The current fleet-merged result set for one named query.
