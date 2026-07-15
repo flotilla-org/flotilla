@@ -59,6 +59,17 @@ fn convoy_repository_snapshot_roundtrips_every_repository_field() {
 }
 
 #[test]
+fn convoy_crd_allows_omitted_empty_repository_subpaths() {
+    let crd: serde_json::Value = serde_yml::from_str(include_str!("../src/crds/convoy.crd.yaml")).expect("CRD should parse");
+    let required = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["repositories"]["items"]
+        ["required"]
+        .as_array()
+        .expect("repository required fields");
+
+    assert!(!required.iter().any(|field| field == "subpaths"));
+}
+
+#[test]
 fn k8s_object_projection_rejects_wrong_resource_identity() {
     let object = convoy_object("alpha", convoy_spec("review"), None);
     let mut projected = object.to_k8s_object();

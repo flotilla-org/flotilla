@@ -45,6 +45,17 @@ use crate::{
 };
 
 #[test]
+fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
+    let normalized = normalize_workspace_slug("My_repo...with spaces");
+    assert_eq!(normalized, "my-repo-with-spaces");
+    assert!(normalize_workspace_slug(&"a".repeat(100)).len() <= 48);
+
+    let left = disambiguate_workspace_slug("same-repo", &flotilla_resources::RepositoryKey("abcdefgh1111".to_string()));
+    let right = disambiguate_workspace_slug("same-repo", &flotilla_resources::RepositoryKey("ijklmnop2222".to_string()));
+    assert_ne!(left, right);
+}
+
+#[test]
 fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
     assert_eq!(project_target_syntax("/srv/repos/example"), ProjectTargetSyntax::ExplicitPath);
     assert_eq!(project_target_syntax("./org/repo"), ProjectTargetSyntax::ExplicitPath);
@@ -2476,6 +2487,53 @@ async fn convoy_admission_snapshots_every_project_repository() {
     assert_eq!(convoy.spec.repositories[1].base_ref, "main");
     assert_eq!(convoy.spec.repositories[1].workspace_slug, "flotilla");
     assert_eq!(convoy.spec.repositories[1].subpaths, ["crates/flotilla-core", "crates/flotilla-tui"]);
+}
+
+#[tokio::test]
+async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let created =
+        repositories.create(&empty_input_meta(&repository.key().to_string()), &repository).await.expect("repository should create");
+    repositories
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &RepositoryStatus {
+            default_branch: Some("main".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("repository status should update");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "direct-repository".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: Some("https://github.com/flotilla-org/flotilla".to_string()),
+                r#ref: Some("feature/direct".to_string()),
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated {
+        name: "direct-repository".to_string()
+    });
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("direct-repository").await.expect("convoy");
+    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
 }
 
 #[tokio::test]

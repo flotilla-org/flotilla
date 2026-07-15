@@ -32,7 +32,7 @@ pub struct ConvoySpec {
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyRepositorySpec {
     pub url: String,
     pub repo_ref: RepositoryKey,

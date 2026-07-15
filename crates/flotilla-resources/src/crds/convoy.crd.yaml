@@ -53,7 +53,7 @@ spec:
                   type: array
                   items:
                     type: object
-                    required: [url, repo_ref, base_ref, workspace_slug, subpaths]
+                    required: [url, repo_ref, base_ref, workspace_slug]
                     properties:
                       url:
                         type: string

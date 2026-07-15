@@ -191,6 +191,9 @@ impl Reconciler for VesselReconciler {
                 None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
             }
         };
+        if repository_refs.len() > 1 && !obj.spec.adopted_checkout_refs.is_empty() {
+            return Ok(VesselDeps::failed("adopted checkouts are not supported for multi-repository vessel workspaces".to_string()));
+        }
         let mut convoy_repositories = Vec::new();
         for repo_ref in &repository_refs {
             let Some(repository) = convoy.spec.repositories.iter().find(|repository| &repository.repo_ref == repo_ref) else {

@@ -78,7 +78,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
 
@@ -219,7 +219,10 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     repository_refs: None,
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
-                        .source(CrewSource::Tool { command: "cargo test".to_string() })
+                        .source(CrewSource::Agent {
+                            selector: Selector { capability: "coding".to_string() },
+                            prompt: Some("Work across both repositories.".to_string()),
+                        })
                         .build()],
                 }],
             }),
@@ -292,7 +295,13 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
     let deps = reconciler.fetch_dependencies(&current).await.expect("deps should reload");
     let outcome = reconciler.reconcile(&current, &deps, Utc::now());
     assert!(outcome.actuations.iter().any(|actuation| {
-        matches!(actuation, Actuation::CreateTerminalSession { spec, .. } if spec.cwd == "/Users/alice/dev/flotilla-repos/workspace-multi")
+        matches!(
+            actuation,
+            Actuation::CreateTerminalSession { spec, .. }
+                if spec.cwd == "/Users/alice/dev/flotilla-repos/workspace-multi"
+                    && matches!(&spec.source, TerminalSessionSource::Agent { brief, .. }
+                        if brief.path == ".flotilla/briefs/coder.md")
+        )
     }));
 
     create_running_terminal(
@@ -390,24 +399,24 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
     .await;
     create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
 
-    let mut adopted_checkout_refs = BTreeMap::new();
     for (repository, slug) in [(&repositories[0], "flotilla"), (&repositories[1], "cleat")] {
-        let name = format!("adopted-multi-{slug}");
+        let name = format!("checkout-workspace-multi-docker-{slug}");
         let path = format!("/Users/alice/dev/flotilla-repos/workspace-multi-docker/{slug}");
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
         let created = checkouts
             .create(
-                &meta(&name).with_lifecycle_authority(LifecycleAuthority::Adopted),
-                &CheckoutSpec::Observed(ObservedCheckoutSpec {
-                    r#ref: "feature/multi".to_string(),
-                    path: path.clone(),
+                &meta(&name),
+                &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                     repo_ref: repository.key(),
-                    host_ref: HOST_REF.to_string(),
-                    is_main: false,
+                    env_ref: host_direct_env_name(),
+                    r#ref: "feature/multi".to_string(),
+                    base_ref: Some("main".to_string()),
+                    target_path: path.clone(),
+                    clone_ref: format!("clone-{slug}"),
                 }),
             )
             .await
-            .expect("adopted checkout should create");
+            .expect("checkout should create");
         checkouts
             .update_status(&name, &created.metadata.resource_version, &CheckoutStatus {
                 phase: CheckoutPhase::Ready,
@@ -416,8 +425,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
                 message: None,
             })
             .await
-            .expect("adopted checkout should become ready");
-        adopted_checkout_refs.insert(repository.key(), name);
+            .expect("checkout should become ready");
     }
     let vessel = backend
         .clone()
@@ -426,12 +434,12 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
             convoy_ref: "convoy-multi-docker".to_string(),
             vessel_name: "implement".to_string(),
             placement_policy_ref: "policy-multi-docker".to_string(),
-            adopted_checkout_refs,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     let mounts = outcome.actuations.iter().find_map(|actuation| match actuation {
@@ -442,6 +450,25 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/workspace-multi-docker");
     assert_eq!(mounts[0].target_path, "/workspace");
+
+    let mixed = backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(&meta("workspace-multi-mixed"), &VesselSpec {
+            convoy_ref: "convoy-multi-docker".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-multi-docker".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(repositories[0].key(), "checkout-workspace-multi-docker-flotilla".to_string())]),
+        })
+        .await
+        .expect("mixed vessel should create");
+    let deps = reconciler.fetch_dependencies(&mixed).await.expect("mixed deps should load");
+    let outcome = reconciler.reconcile(&mixed, &deps, Utc::now());
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::VesselStatusPatch::MarkFailed { message })
+            if message == "adopted checkouts are not supported for multi-repository vessel workspaces"
+    ));
 }
 
 #[tokio::test]

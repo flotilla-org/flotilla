@@ -946,24 +946,58 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             .is_ok();
 
         if local_exists {
-            self.runner
-                .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
-                .await?;
+            if self
+                .runner
+                .run("git", &["-C", clone_path, "worktree", "add", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
+                .await
+                .is_err()
+            {
+                // A convoy can have several vessels for the same repository and
+                // branch. Git only permits a branch to be attached to one worktree,
+                // so later vessels use the exact branch tip in detached mode.
+                self.runner
+                    .run(
+                        "git",
+                        &["-C", clone_path, "worktree", "add", "--detach", target_path, branch],
+                        Path::new("/"),
+                        &ChannelLabel::Noop,
+                    )
+                    .await?;
+            }
         } else if remote_exists {
             let _ = self.runner.run("git", &["-C", clone_path, "fetch", "origin", branch], Path::new("/"), &ChannelLabel::Noop).await;
             self.runner
                 .run(
                     "git",
-                    &["-C", clone_path, "worktree", "add", "--detach", target_path, &format!("origin/{branch}")],
+                    &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
                     Path::new("/"),
                     &ChannelLabel::Noop,
                 )
                 .await?;
         } else if let Some(base_ref) = base_ref {
+            let local_base_ref = format!("refs/heads/{base_ref}");
+            let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
+            let resolved_base_ref = if self
+                .runner
+                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Noop)
+                .await
+                .is_ok()
+            {
+                base_ref.to_string()
+            } else if self
+                .runner
+                .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref], Path::new("/"), &ChannelLabel::Noop)
+                .await
+                .is_ok()
+            {
+                format!("origin/{base_ref}")
+            } else {
+                base_ref.to_string()
+            };
             self.runner
                 .run(
                     "git",
-                    &["-C", clone_path, "worktree", "add", "-b", branch, target_path, base_ref],
+                    &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
                     Path::new("/"),
                     &ChannelLabel::Noop,
                 )
@@ -986,7 +1020,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     ) -> Result<Option<String>, String> {
         let target_path = utf8_path(target_path)?;
         let clone_ref = base_ref.unwrap_or(branch);
-        self.runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        if clone_ref == "HEAD" {
+            self.runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        } else {
+            self.runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        }
         if clone_ref != branch {
             let remote_ref = format!("refs/remotes/origin/{branch}");
             let remote_exists = self
@@ -1242,6 +1280,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_runtime_resolves_a_remote_only_snapshotted_base() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let source_path = source.path().to_str().expect("utf-8 source path");
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "switch", "-c", "stable"])
+            .status()
+            .expect("git switch should run")
+            .success());
+        fs::write(source.path().join("stable.txt"), "stable base\n").expect("write stable file");
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "add", "stable.txt"]).status().expect("git add should run").success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "commit", "-m", "stable commit"])
+            .status()
+            .expect("git commit should run")
+            .success());
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "switch", "main"]).status().expect("git switch should run").success());
+        let clone_path = temp.path().join("clone");
+        assert!(ProcessCommand::new("git")
+            .args(["clone", "--branch", "main", source_path, clone_path.to_str().expect("utf-8 clone path")])
+            .status()
+            .expect("git clone should run")
+            .success());
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_worktree(
+                clone_path.to_str().expect("utf-8 clone path"),
+                "feature/remote-base",
+                Some("stable"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+
+        assert_eq!(fs::read_to_string(target.join("stable.txt")).expect("stable file should exist"), "stable base\n");
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/remote-base");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_attaches_an_existing_remote_convoy_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let source_path = source.path().to_str().expect("utf-8 source path");
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "switch", "-c", "feature/existing"])
+            .status()
+            .expect("git switch should run")
+            .success());
+        fs::write(source.path().join("feature.txt"), "existing branch\n").expect("write feature file");
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "add", "feature.txt"]).status().expect("git add should run").success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "commit", "-m", "feature commit"])
+            .status()
+            .expect("git commit should run")
+            .success());
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "switch", "main"]).status().expect("git switch should run").success());
+        let clone_path = temp.path().join("clone");
+        assert!(ProcessCommand::new("git")
+            .args(["clone", "--branch", "main", source_path, clone_path.to_str().expect("utf-8 clone path")])
+            .status()
+            .expect("git clone should run")
+            .success());
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_worktree(
+                clone_path.to_str().expect("utf-8 clone path"),
+                "feature/existing",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+
+        assert_eq!(fs::read_to_string(target.join("feature.txt")).expect("feature file should exist"), "existing branch\n");
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/existing");
+    }
+
+    #[tokio::test]
     async fn fresh_clone_checkout_creates_convoy_branch_from_snapshotted_base() {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
@@ -1267,14 +1395,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_clone_checkout_treats_head_as_the_remote_default() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("fresh-clone");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_fresh_clone(
+                source.path().to_str().expect("utf-8 source path"),
+                "feature/from-head",
+                Some("HEAD"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("fresh clone should create");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/from-head");
+    }
+
+    #[tokio::test]
     async fn fresh_clone_checkout_preserves_an_existing_convoy_branch() {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let source_path = source.path().to_str().expect("utf-8 source path");
-        assert!(ProcessCommand::new("git").args(["-C", source_path, "switch", "-c", "feature/existing"]).status().unwrap().success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "switch", "-c", "feature/existing"])
+            .status()
+            .expect("git switch should run")
+            .success());
         fs::write(source.path().join("feature.txt"), "existing branch\n").expect("write feature file");
-        assert!(ProcessCommand::new("git").args(["-C", source_path, "add", "feature.txt"]).status().unwrap().success());
-        assert!(ProcessCommand::new("git").args(["-C", source_path, "commit", "-m", "feature commit"]).status().unwrap().success());
+        assert!(ProcessCommand::new("git").args(["-C", source_path, "add", "feature.txt"]).status().expect("git add should run").success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", source_path, "commit", "-m", "feature commit"])
+            .status()
+            .expect("git commit should run")
+            .success());
         let target = temp.path().join("fresh-clone");
         let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
