@@ -934,23 +934,28 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
-        let has_origin =
-            self.runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok();
-        if has_origin {
-            let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
-            if let Err(error) =
-                self.runner.run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop).await
-            {
-                if !is_missing_remote_ref(&error) {
-                    return Err(format!("fetch convoy branch {branch}: {error}"));
-                }
-            }
-        }
         let local_exists = self
             .runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
+        if !local_exists
+            && self.runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+        {
+            let remote_head = format!("refs/heads/{branch}");
+            let advertised = self
+                .runner
+                .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Noop)
+                .await
+                .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
+            if !advertised.trim().is_empty() {
+                let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
+                self.runner
+                    .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop)
+                    .await
+                    .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
+            }
+        }
         let remote_exists = self
             .runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
@@ -1055,11 +1060,6 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
     let commit = runner.run("git", &["-C", path, "rev-parse", "HEAD"], Path::new("/"), &ChannelLabel::Noop).await?;
     Ok(Some(commit.trim().to_string()))
-}
-
-fn is_missing_remote_ref(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("couldn't find remote ref") || error.contains("could not find remote ref")
 }
 
 struct TerminalControllerRuntime {
@@ -1310,6 +1310,34 @@ mod tests {
             assert!(branch.status.success());
             assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/shared");
         }
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_does_not_contact_origin_for_an_existing_local_branch() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing_origin = temp.path().join("missing-origin.git");
+        let clone = TestGitRepo::init(temp.path().join("clone"))
+            .with_initial_commit()
+            .with_origin(missing_origin.to_str().expect("utf-8 origin path"));
+        let target = temp.path().join("workspace/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "main",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("local branch should not require its origin");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
+            .output()
+            .expect("git should run");
+        assert!(branch.status.success());
+        assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "main");
     }
 
     #[tokio::test]
