@@ -26,6 +26,8 @@ impl GitHubIssueProvider {
 }
 
 fn is_github_source(source: &IssueSource) -> bool {
+    // Bare service names are valid for explicit Project issue-source overrides;
+    // Forge-derived sources use the canonical URL form.
     matches!(source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
 }
 
