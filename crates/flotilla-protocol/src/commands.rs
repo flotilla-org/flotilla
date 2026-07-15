@@ -428,7 +428,7 @@ pub enum CommandValue {
     },
     IssuePage(IssueResultPage),
     IssuesByIds {
-        items: Vec<(String, crate::provider_data::Issue)>,
+        items: Vec<crate::provider_data::Issue>,
     },
     ConvoyCreated {
         name: String,

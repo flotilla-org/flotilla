@@ -8,14 +8,16 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     providers::{
         discovery::test_support::{fake_discovery_with_provider_set, FakeDiscoveryProviders},
-        issue_query::{IssueQuery, IssueQueryService, IssueResultPage},
+        issue_tracker::IssueProvider,
     },
 };
 use flotilla_protocol::{
+    issue_query::{IssueQuery, IssueResultPage},
     provider_data::Issue,
     qualified_path::{HostId, QualifiedPath},
-    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, NodeId, NodeInfo, ProvisioningTarget, RepoIdentity,
-    RepoSelector, ViewAddress, WorkItemIdentity,
+    test_support::TestIssue,
+    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, IssueChangeset, IssueRef, IssueSource, NodeId,
+    NodeInfo, ProvisioningTarget, RepoIdentity, RepoSelector, ViewAddress, WorkItemIdentity,
 };
 use ratatui::{backend::TestBackend, Terminal};
 use tempfile::tempdir;
@@ -70,12 +72,12 @@ struct QueryStep {
     result: IssueResultPage,
 }
 
-struct ScriptedIssueQueryService {
+struct ScriptedIssueProvider {
     steps: TokioMutex<VecDeque<QueryStep>>,
     requests: watch::Sender<Vec<u32>>,
 }
 
-impl ScriptedIssueQueryService {
+impl ScriptedIssueProvider {
     fn new(steps: Vec<QueryStep>) -> Self {
         Self { steps: TokioMutex::new(steps.into()), requests: watch::channel(Vec::new()).0 }
     }
@@ -86,8 +88,12 @@ impl ScriptedIssueQueryService {
 }
 
 #[async_trait]
-impl IssueQueryService for ScriptedIssueQueryService {
-    async fn query(&self, _repo: &Path, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
+impl IssueProvider for ScriptedIssueProvider {
+    fn supports(&self, _source: &IssueSource) -> bool {
+        true
+    }
+
+    async fn query(&self, _source: &IssueSource, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
         self.requests.send_modify(|requests| requests.push(page));
         let step = self.steps.lock().await.pop_front().expect("unexpected issue query");
         assert_eq!(step.expected_page, page, "unexpected page requested");
@@ -97,23 +103,21 @@ impl IssueQueryService for ScriptedIssueQueryService {
         Ok(step.result)
     }
 
-    async fn fetch_by_ids(&self, _repo: &Path, _ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
-        Ok(vec![])
+    async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+        Err(format!("issue {} not found", reference.id))
     }
 
-    async fn open_in_browser(&self, _repo: &Path, _id: &str) -> Result<(), String> {
+    async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+        Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+    }
+
+    async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
         Ok(())
     }
 }
 
-fn issue_row(id: usize) -> (String, Issue) {
-    (id.to_string(), Issue {
-        title: format!("Issue {id}"),
-        labels: vec![],
-        association_keys: vec![],
-        provider_name: "fake".into(),
-        provider_display_name: "Fake".into(),
-    })
+fn issue_row(id: usize) -> Issue {
+    TestIssue::new(&format!("Issue {id}")).id(id.to_string()).build()
 }
 
 fn issue_page(range: std::ops::RangeInclusive<usize>, has_more: bool) -> IssueResultPage {
@@ -126,12 +130,12 @@ fn daemon_test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     Arc::new(ConfigStore::with_base(config_dir))
 }
 
-async fn app_with_issue_query_service(service: Arc<dyn IssueQueryService>) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, App) {
+async fn app_with_issue_provider(service: Arc<dyn IssueProvider>) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, App) {
     let temp = tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 
-    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_query_service(service));
+    let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_issue_tracker(service));
     let daemon =
         InProcessDaemon::new(vec![repo.clone()], daemon_test_config_store(temp.path().join("daemon-config")), discovery, HostName::local())
             .await;
@@ -143,7 +147,7 @@ async fn app_with_issue_query_service(service: Arc<dyn IssueQueryService>) -> (t
     (temp, repo, daemon, app)
 }
 
-async fn drain_until_requests(app: &mut App, service: &ScriptedIssueQueryService, expected: &[u32]) {
+async fn drain_until_requests(app: &mut App, service: &ScriptedIssueProvider, expected: &[u32]) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             app.drain_background_updates();
@@ -355,11 +359,11 @@ fn apply_snapshot_updates_provider_data() {
 #[tokio::test]
 async fn repeated_snapshots_do_not_queue_duplicate_initial_issue_pages() {
     let page_one_gate = Arc::new(Semaphore::new(0));
-    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+    let service = Arc::new(ScriptedIssueProvider::new(vec![
         QueryStep { expected_page: 1, gate: Some(Arc::clone(&page_one_gate)), result: issue_page(1..=50, true) },
         QueryStep { expected_page: 1, gate: Some(Arc::clone(&page_one_gate)), result: issue_page(1..=50, true) },
     ]));
-    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+    let (_temp, repo, daemon, mut app) = app_with_issue_provider(service.clone()).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot.clone())));
@@ -376,11 +380,11 @@ async fn repeated_snapshots_do_not_queue_duplicate_initial_issue_pages() {
 #[tokio::test]
 async fn manual_refresh_replaces_default_issue_page_when_fresh_results_arrive() {
     let refreshed_page_gate = Arc::new(Semaphore::new(0));
-    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+    let service = Arc::new(ScriptedIssueProvider::new(vec![
         QueryStep { expected_page: 1, gate: None, result: issue_page(1..=1, false) },
         QueryStep { expected_page: 1, gate: Some(Arc::clone(&refreshed_page_gate)), result: issue_page(2..=2, false) },
     ]));
-    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+    let (_temp, repo, daemon, mut app) = app_with_issue_provider(service.clone()).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
@@ -416,11 +420,11 @@ async fn manual_refresh_replaces_default_issue_page_when_fresh_results_arrive() 
 
 #[tokio::test]
 async fn periodic_refresh_completion_replaces_default_issue_page() {
-    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+    let service = Arc::new(ScriptedIssueProvider::new(vec![
         QueryStep { expected_page: 1, gate: None, result: issue_page(1..=1, false) },
         QueryStep { expected_page: 1, gate: None, result: issue_page(2..=2, false) },
     ]));
-    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+    let (_temp, repo, daemon, mut app) = app_with_issue_provider(service.clone()).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
@@ -436,12 +440,12 @@ async fn periodic_refresh_completion_replaces_default_issue_page() {
 #[tokio::test]
 async fn refresh_during_issue_pagination_runs_after_the_page_completes() {
     let page_two_gate = Arc::new(Semaphore::new(0));
-    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+    let service = Arc::new(ScriptedIssueProvider::new(vec![
         QueryStep { expected_page: 1, gate: None, result: issue_page(1..=50, true) },
         QueryStep { expected_page: 2, gate: Some(Arc::clone(&page_two_gate)), result: issue_page(51..=60, false) },
         QueryStep { expected_page: 1, gate: None, result: issue_page(101..=101, false) },
     ]));
-    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+    let (_temp, repo, daemon, mut app) = app_with_issue_provider(service.clone()).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo.clone())).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
@@ -466,11 +470,11 @@ async fn refresh_during_issue_pagination_runs_after_the_page_completes() {
 
 #[tokio::test]
 async fn infinite_scroll_appends_the_next_issue_page_without_duplicates() {
-    let service = Arc::new(ScriptedIssueQueryService::new(vec![
+    let service = Arc::new(ScriptedIssueProvider::new(vec![
         QueryStep { expected_page: 1, gate: None, result: issue_page(1..=50, true) },
         QueryStep { expected_page: 2, gate: None, result: issue_page(51..=60, false) },
     ]));
-    let (_temp, repo, daemon, mut app) = app_with_issue_query_service(service.clone()).await;
+    let (_temp, repo, daemon, mut app) = app_with_issue_provider(service.clone()).await;
 
     let snapshot = daemon.get_state(&RepoSelector::Path(repo)).await.expect("repo snapshot");
     app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
@@ -486,7 +490,7 @@ async fn infinite_scroll_appends_the_next_issue_page_without_duplicates() {
     drain_until_issue_count(&mut app, &repo_identity, 60).await;
 
     let default = app.issue_views.get(&repo_identity).and_then(|view| view.default.as_ref()).expect("default issue view");
-    let ids: Vec<&str> = default.items.iter().map(|(id, _)| id.as_str()).collect();
+    let ids: Vec<&str> = default.items.iter().map(|issue| issue.reference.id.as_str()).collect();
     let unique_ids: std::collections::HashSet<&str> = ids.iter().copied().collect();
     assert_eq!(service.requests(), vec![1, 2], "scrolling near the bottom should request exactly one next page");
     assert_eq!(ids.len(), 60, "the first two pages should be appended together");

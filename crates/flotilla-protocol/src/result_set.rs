@@ -476,7 +476,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{DemandBackedMetadata, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSetState};
-    use crate::{provider_data::Issue, IssueRef, IssueSource, RepositoryKey};
+    use crate::{provider_data::Issue, IssueRef, IssueSource, IssueState, RepositoryKey};
 
     #[test]
     fn issues_query_round_trips_with_owned_project_scope() {
@@ -508,8 +508,12 @@ mod tests {
                 changed: vec![IssueRow {
                     reference: reference.clone(),
                     issue: Issue {
+                        reference: reference.clone(),
                         title: "Opaque identifiers survive".into(),
+                        body: None,
+                        state: IssueState::Open,
                         labels: vec!["protocol".into()],
+                        as_of: Utc.with_ymd_and_hms(2026, 7, 15, 9, 30, 0).unwrap(),
                         association_keys: vec![],
                         provider_name: "linear".into(),
                         provider_display_name: "Linear".into(),

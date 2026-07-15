@@ -40,10 +40,11 @@ fn desc(name: &str) -> ProviderDescriptor {
 use async_trait::async_trait;
 use flotilla_protocol::{
     arg::Arg,
+    issue_query::{IssueQuery, IssueResultPage},
     qualified_path::{HostId, QualifiedPath},
     test_support::{TestCheckout, TestIssue, TestSession},
-    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, NodeId, PreparedTerminalCommand,
-    RepoSelector, ResolvedPaneCommand, TerminalStatus,
+    CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, HostName, HostPath, IssueChangeset, IssueRef, IssueSource,
+    NodeId, PreparedTerminalCommand, RepoSelector, ResolvedPaneCommand, TerminalStatus,
 };
 
 fn hp(path: &str) -> HostPath {
@@ -229,16 +230,43 @@ impl MockIssueProvider {
 
 #[async_trait]
 impl IssueProvider for MockIssueProvider {
-    async fn list_issues(&self, _repo_root: &Path, _limit: usize) -> Result<Vec<(String, Issue)>, String> {
-        Ok(vec![])
-    }
-    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
-        Ok(())
+    fn supports(&self, _source: &IssueSource) -> bool {
+        true
     }
 
-    async fn fetch_issues_by_id(&self, _repo_root: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
+    async fn query(&self, _source: &IssueSource, _params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
+        Ok(IssueResultPage { items: vec![], total: Some(0), has_more: false })
+    }
+
+    async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+        self.fetched_by_id.lock().await.push(vec![reference.id.clone()]);
+        self.fetched_issues
+            .iter()
+            .find(|(id, _)| id == &reference.id)
+            .map(|(_, issue)| issue.clone())
+            .ok_or_else(|| format!("issue {} not found", reference.id))
+    }
+
+    async fn fetch_by_ids(&self, source: &IssueSource, ids: &[String]) -> Result<Vec<Issue>, String> {
         self.fetched_by_id.lock().await.push(ids.to_vec());
-        Ok(self.fetched_issues.iter().filter(|(id, _)| ids.iter().any(|requested| requested == id)).cloned().collect())
+        Ok(self
+            .fetched_issues
+            .iter()
+            .filter(|(id, _)| ids.iter().any(|requested| requested == id))
+            .map(|(id, issue)| {
+                let mut issue = issue.clone();
+                issue.reference = IssueRef { source: source.clone(), id: id.clone() };
+                issue
+            })
+            .collect())
+    }
+
+    async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+        Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+    }
+
+    async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -1733,13 +1761,7 @@ async fn generate_branch_name_multiple_issues() {
 async fn generate_branch_name_fetches_missing_issue_details() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/from-fetched-issue")));
-    let fetched_issue = Issue {
-        title: "Fix login redirect".to_string(),
-        labels: vec!["bug".to_string(), "auth".to_string()],
-        association_keys: vec![],
-        provider_name: "github".to_string(),
-        provider_display_name: "GitHub".to_string(),
-    };
+    let fetched_issue = TestIssue::new("Fix login redirect").with_labels(vec!["bug".into(), "auth".into()]).build();
     registry.issue_trackers.insert(
         "github",
         desc("github"),

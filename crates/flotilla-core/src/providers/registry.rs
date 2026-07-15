@@ -8,9 +8,8 @@ use crate::{
         ai_utility::AiUtility,
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
-        discovery::{ProviderDescriptor, ServiceDescriptor},
-        issue_query::IssueQueryService,
-        issue_tracker::IssueProvider,
+        discovery::ProviderDescriptor,
+        issue_tracker::{provider_for_source, IssueProvider},
         presentation::PresentationManager,
         terminal::TerminalPool,
         vcs::{CheckoutManager, CloneProvisioner, Vcs},
@@ -19,25 +18,13 @@ use crate::{
 
 /// Common accessors shared by all descriptor types.
 ///
-/// Both `ProviderDescriptor` and `ServiceDescriptor` carry at least a `backend`
-/// and `display_name`. This trait lets `TypedSet` methods operate generically
-/// over either descriptor kind.
+/// Descriptor fields used by typed provider sets.
 pub trait DescriptorFields {
     fn backend(&self) -> &str;
     fn display_name(&self) -> &str;
 }
 
 impl DescriptorFields for ProviderDescriptor {
-    fn backend(&self) -> &str {
-        &self.backend
-    }
-
-    fn display_name(&self) -> &str {
-        &self.display_name
-    }
-}
-
-impl DescriptorFields for ServiceDescriptor {
     fn backend(&self) -> &str {
         &self.backend
     }
@@ -58,8 +45,6 @@ pub struct TypedSet<D, T: ?Sized> {
 }
 
 pub type ProviderSet<T> = TypedSet<ProviderDescriptor, T>;
-pub type ServiceSet<T> = TypedSet<ServiceDescriptor, T>;
-
 impl<D, T: ?Sized> TypedSet<D, T> {
     pub fn new() -> Self {
         Self { inner: IndexMap::new() }
@@ -166,7 +151,6 @@ pub struct ProviderRegistry {
     pub presentation_managers: ProviderSet<dyn PresentationManager>,
     pub terminal_pools: ProviderSet<dyn TerminalPool>,
     pub environment_providers: ProviderSet<dyn crate::providers::environment::EnvironmentProvider>,
-    pub issue_query_services: ServiceSet<dyn IssueQueryService>,
 }
 
 impl ProviderRegistry {
@@ -183,7 +167,6 @@ impl ProviderRegistry {
             presentation_managers: ProviderSet::new(),
             terminal_pools: ProviderSet::new(),
             environment_providers: ProviderSet::new(),
-            issue_query_services: ServiceSet::new(),
         }
     }
 }
@@ -195,6 +178,10 @@ impl Default for ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    pub fn issue_provider_for(&self, source: &flotilla_protocol::IssueSource) -> Option<Arc<dyn IssueProvider>> {
+        provider_for_source(self.issue_trackers.iter().map(|(_, provider)| provider), source)
+    }
+
     /// Build a list of provider info summaries for all registered providers.
     /// Category strings match the keys used in `compute_provider_health`.
     pub fn provider_infos(&self) -> Vec<(String, String)> {

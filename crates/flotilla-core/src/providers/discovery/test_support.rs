@@ -13,8 +13,9 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::{
-    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset,
-    IssuePage, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
+    issue_query::{IssueQuery, IssueResultPage},
+    AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset, IssueRef,
+    IssueSource, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -113,7 +114,6 @@ pub struct FakeDiscoveryProviders {
     pub checkout_manager: Option<Arc<dyn CheckoutManager>>,
     pub change_request: Option<Arc<dyn ChangeRequestTracker>>,
     pub issue_tracker: Option<Arc<dyn IssueProvider>>,
-    pub issue_query_service: Option<Arc<dyn crate::providers::issue_query::IssueQueryService>>,
     pub presentation_manager: Option<Arc<dyn PresentationManager>>,
     pub terminal_pool: Option<Arc<dyn TerminalPool>>,
     pub attachable_store: Option<SharedAttachableStore>,
@@ -136,11 +136,6 @@ impl FakeDiscoveryProviders {
 
     pub fn with_issue_tracker(mut self, provider: Arc<dyn IssueProvider>) -> Self {
         self.issue_tracker = Some(provider);
-        self
-    }
-
-    pub fn with_issue_query_service(mut self, service: Arc<dyn crate::providers::issue_query::IssueQueryService>) -> Self {
-        self.issue_query_service = Some(service);
         self
     }
 
@@ -284,7 +279,7 @@ fn minimal_discovery_runtime(follower: bool, runner: std::sync::Arc<dyn CommandR
 pub struct FakeIssueProvider {
     /// Shared issue store: Vec<(id, Issue)> preserving insertion order.
     pub issues: Arc<TokioMutex<Vec<(String, Issue)>>>,
-    /// IDs that were requested via `fetch_issues_by_id`, for test assertions.
+    /// IDs that were requested via `fetch_by_ids`, for test assertions.
     pub fetched_by_id: Arc<TokioMutex<Vec<Vec<String>>>>,
 }
 
@@ -307,38 +302,67 @@ impl FakeIssueProvider {
 
 #[async_trait::async_trait]
 impl IssueProvider for FakeIssueProvider {
-    async fn list_issues(&self, _repo_root: &Path, limit: usize) -> Result<Vec<(String, Issue)>, String> {
+    fn supports(&self, _source: &IssueSource) -> bool {
+        true
+    }
+
+    async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
         let store = self.issues.lock().await;
-        Ok(store.iter().take(limit).cloned().collect())
+        let matching = store
+            .iter()
+            .filter(|(_, issue)| params.search.as_ref().is_none_or(|query| issue.title.to_lowercase().contains(&query.to_lowercase())))
+            .cloned()
+            .collect::<Vec<_>>();
+        let start = (page.saturating_sub(1) as usize) * count;
+        let items = matching
+            .iter()
+            .skip(start)
+            .take(count)
+            .map(|(id, issue)| {
+                let mut issue = issue.clone();
+                issue.reference = IssueRef { source: source.clone(), id: id.clone() };
+                issue
+            })
+            .collect();
+        let has_more = start + count < matching.len();
+        Ok(IssueResultPage { items, total: u32::try_from(matching.len()).ok(), has_more })
     }
 
-    async fn open_in_browser(&self, _repo_root: &Path, _id: &str) -> Result<(), String> {
-        Ok(())
-    }
-
-    async fn list_issues_page(&self, _repo_root: &Path, page: u32, per_page: usize) -> Result<IssuePage, String> {
+    async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+        self.fetched_by_id.lock().await.push(vec![reference.id.clone()]);
         let store = self.issues.lock().await;
-        let start = (page.saturating_sub(1) as usize) * per_page;
-        let issues: Vec<_> = store.iter().skip(start).take(per_page).cloned().collect();
-        let has_more = start + per_page < store.len();
-        Ok(IssuePage { issues, total_count: Some(store.len() as u32), has_more })
+        store
+            .iter()
+            .find(|(id, _)| id == &reference.id)
+            .map(|(id, issue)| {
+                let mut issue = issue.clone();
+                issue.reference = IssueRef { source: reference.source.clone(), id: id.clone() };
+                issue
+            })
+            .ok_or_else(|| format!("issue {} not found", reference.id))
     }
 
-    async fn fetch_issues_by_id(&self, _repo_root: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
+    async fn fetch_by_ids(&self, source: &IssueSource, ids: &[String]) -> Result<Vec<Issue>, String> {
         self.fetched_by_id.lock().await.push(ids.to_vec());
         let store = self.issues.lock().await;
-        Ok(store.iter().filter(|(id, _)| ids.contains(id)).cloned().collect())
+        Ok(store
+            .iter()
+            .filter(|(id, _)| ids.contains(id))
+            .map(|(id, issue)| {
+                let mut issue = issue.clone();
+                issue.reference = IssueRef { source: source.clone(), id: id.clone() };
+                issue
+            })
+            .collect())
     }
 
-    async fn search_issues(&self, _repo_root: &Path, query: &str, limit: usize) -> Result<Vec<(String, Issue)>, String> {
-        let store = self.issues.lock().await;
-        let query_lower = query.to_lowercase();
-        Ok(store.iter().filter(|(_, issue)| issue.title.to_lowercase().contains(&query_lower)).take(limit).cloned().collect())
+    async fn list_changed_since(&self, source: &IssueSource, _since: &str, count: usize) -> Result<IssueChangeset, String> {
+        let page = self.query(source, &IssueQuery::default(), 1, count).await?;
+        Ok(IssueChangeset { updated: page.items, closed: vec![], has_more: page.has_more })
     }
 
-    async fn list_issues_changed_since(&self, repo_root: &Path, _since: &str, per_page: usize) -> Result<IssueChangeset, String> {
-        let page = self.list_issues_page(repo_root, 1, per_page).await?;
-        Ok(IssueChangeset { updated: page.issues, closed_ids: vec![], has_more: page.has_more })
+    async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -1021,34 +1045,6 @@ impl Factory for FakePresentationManagerFactory {
     }
 }
 
-/// Factory that always returns a pre-constructed IssueQueryService.
-pub struct FakeIssueQueryServiceFactory(pub Arc<dyn crate::providers::issue_query::IssueQueryService>);
-
-#[async_trait::async_trait]
-impl Factory for FakeIssueQueryServiceFactory {
-    type Descriptor = super::ServiceDescriptor;
-    type Output = dyn crate::providers::issue_query::IssueQueryService;
-
-    fn descriptor(&self) -> super::ServiceDescriptor {
-        super::ServiceDescriptor {
-            category: super::ServiceCategory::IssueQuery,
-            backend: "fake-issue-query".into(),
-            implementation: "fake-issue-query".into(),
-            display_name: "Fake Issue Query".into(),
-        }
-    }
-
-    async fn probe(
-        &self,
-        _env: &EnvironmentBag,
-        _config: &ConfigStore,
-        _repo_root: &ExecutionEnvironmentPath,
-        _runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<dyn crate::providers::issue_query::IssueQueryService>, Vec<UnmetRequirement>> {
-        Ok(Arc::clone(&self.0))
-    }
-}
-
 pub struct FakeTerminalPoolFactory(pub Arc<dyn TerminalPool>);
 
 #[async_trait::async_trait]
@@ -1175,11 +1171,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         terminal_pool_factories.push(Box::new(FakeTerminalPoolFactory(pool)));
     }
 
-    let mut issue_query_service_factories: Vec<Box<super::IssueQueryServiceFactory>> = Vec::new();
-    if let Some(iqs) = providers.issue_query_service {
-        issue_query_service_factories.push(Box::new(FakeIssueQueryServiceFactory(iqs)));
-    }
-
     let attachable_store = std::sync::OnceLock::new();
     if let Some(store) = providers.attachable_store {
         let _ = attachable_store.set(store);
@@ -1200,7 +1191,6 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
             presentation_managers: presentation_manager_factories,
             terminal_pools: terminal_pool_factories,
             environment_providers: vec![],
-            issue_query_services: issue_query_service_factories,
         },
         attachable_store,
         host_scoped_providers: Default::default(),

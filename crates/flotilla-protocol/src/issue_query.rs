@@ -13,7 +13,7 @@ pub struct IssueQuery {
 /// A single page of query results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueResultPage {
-    pub items: Vec<(String, Issue)>,
+    pub items: Vec<Issue>,
     pub total: Option<u32>,
     pub has_more: bool,
 }
@@ -21,6 +21,7 @@ pub struct IssueResultPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_data::{IssueRef, IssueSource, IssueState};
 
     #[test]
     fn issue_query_default_has_no_search() {
@@ -31,13 +32,20 @@ mod tests {
     #[test]
     fn issue_result_page_serde_roundtrip() {
         let page = IssueResultPage {
-            items: vec![("1".into(), Issue {
+            items: vec![Issue {
+                reference: IssueRef {
+                    source: IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() },
+                    id: "1".into(),
+                },
                 title: "Bug".into(),
+                body: None,
+                state: IssueState::Open,
                 labels: vec![],
+                as_of: "2026-07-15T09:30:00Z".parse().expect("valid timestamp"),
                 association_keys: vec![],
                 provider_name: "github".into(),
                 provider_display_name: "GitHub".into(),
-            })],
+            }],
             total: Some(42),
             has_more: true,
         };

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{
-    qualified_path::HostId, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, EnvironmentId, HostName, HostPath, NodeId, NodeInfo,
-    ProvisioningTarget, WorkItemIdentity,
+    qualified_path::HostId, test_support::TestIssue, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, EnvironmentId, HostName,
+    HostPath, NodeId, NodeInfo, ProvisioningTarget, WorkItemIdentity,
 };
 use ratatui::layout::Rect;
 
@@ -19,23 +19,15 @@ use crate::{
         PeerStatus, TuiHostState,
     },
     status_bar::{StatusBarAction, StatusBarTarget},
+    widgets::section_table::IssueRow,
 };
 
 fn hp(path: &str) -> HostPath {
     HostPath::new(HostName::local(), PathBuf::from(path))
 }
 
-fn native_issue_row(id: &str) -> crate::widgets::section_table::IssueRow {
-    crate::widgets::section_table::IssueRow {
-        id: id.to_string(),
-        issue: flotilla_protocol::provider_data::Issue {
-            title: format!("Issue {id}"),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: "github".into(),
-            provider_display_name: "GitHub".into(),
-        },
-    }
+fn native_issue_row(id: &str) -> IssueRow {
+    IssueRow { id: id.to_string(), issue: TestIssue::new(&format!("Issue {id}")).build() }
 }
 
 fn setup_native_issue_rows(app: &mut App, issue_ids: &[&str]) {
@@ -1729,13 +1721,7 @@ fn set_search_query_resets_search_paging_state() {
     view.search_query = Some("alpha".into());
     view.search = Some(IssuePagingState {
         params: IssueQuery { search: Some("alpha".into()) },
-        items: vec![("1".into(), flotilla_protocol::provider_data::Issue {
-            title: "Alpha result".into(),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: "gh".into(),
-            provider_display_name: "GitHub".into(),
-        })],
+        items: vec![TestIssue::new("Alpha result").id("1").build()],
         next_page: 2,
         total: Some(10),
         has_more: true,
@@ -1782,13 +1768,7 @@ fn stale_search_results_discarded_by_drain() {
             params: IssueQuery { search: Some("alpha".into()) },
             requested_page: 1,
             page: IssueResultPage {
-                items: vec![("stale".into(), flotilla_protocol::provider_data::Issue {
-                    title: "Stale alpha result".into(),
-                    labels: vec![],
-                    association_keys: vec![],
-                    provider_name: "gh".into(),
-                    provider_display_name: "GitHub".into(),
-                })],
+                items: vec![TestIssue::new("Stale alpha result").id("stale").build()],
                 total: Some(1),
                 has_more: false,
             },
@@ -1801,17 +1781,7 @@ fn stale_search_results_discarded_by_drain() {
             repo: repo.clone(),
             params: IssueQuery { search: Some("beta".into()) },
             requested_page: 1,
-            page: IssueResultPage {
-                items: vec![("fresh".into(), flotilla_protocol::provider_data::Issue {
-                    title: "Fresh beta result".into(),
-                    labels: vec![],
-                    association_keys: vec![],
-                    provider_name: "gh".into(),
-                    provider_display_name: "GitHub".into(),
-                })],
-                total: Some(1),
-                has_more: false,
-            },
+            page: IssueResultPage { items: vec![TestIssue::new("Fresh beta result").id("fresh").build()], total: Some(1), has_more: false },
         })
         .expect("send");
 
@@ -1820,8 +1790,8 @@ fn stale_search_results_discarded_by_drain() {
     let view = app.issue_views.get(&repo).expect("view should exist");
     let search = view.search.as_ref().expect("search state should exist from beta result");
     assert_eq!(search.items.len(), 1, "only the matching beta result should be present");
-    assert_eq!(search.items[0].0, "fresh", "the stale alpha result should have been discarded");
-    assert_eq!(search.items[0].1.title, "Fresh beta result");
+    assert_eq!(search.items[0].reference.id, "fresh", "the stale alpha result should have been discarded");
+    assert_eq!(search.items[0].title, "Fresh beta result");
 }
 
 #[test]

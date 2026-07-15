@@ -61,6 +61,7 @@ use crate::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
         },
+        issue_tracker::{forge_issue_source, IssueProvider},
         ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
     },
@@ -1267,6 +1268,27 @@ impl InProcessDaemon {
         self.environment_manager.environment_bag(&self.local_environment_id)
     }
 
+    pub async fn fetch_issue_by_ref(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
+        let host_bag = self
+            .environment_manager
+            .environment_bag(&self.local_environment_id)
+            .ok_or_else(|| format!("environment not found: {}", self.local_environment_id))?;
+        let runner = self
+            .environment_manager
+            .environment_runner(&self.local_environment_id)
+            .ok_or_else(|| format!("environment runner not found: {}", self.local_environment_id))?;
+        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
+        let host_scoped = self
+            .discovery
+            .host_scoped_providers
+            .discover_for_environment(&self.local_environment_id, &host_bag, &self.discovery.factories, &self.config, &probe_root, runner)
+            .await;
+        let provider = host_scoped
+            .issue_provider_for(&reference.source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", reference.source.service, reference.source.scope))?;
+        provider.fetch_by_id(reference).await
+    }
+
     pub fn command_runner_for_environment(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
         self.environment_manager.environment_runner(env_id)
     }
@@ -2022,16 +2044,17 @@ impl InProcessDaemon {
         };
 
         for (identity, path, missing, registry) in tasks {
-            let Some(tracker) = registry.issue_trackers.preferred() else {
+            let source = forge_issue_source(&identity);
+            let Some(tracker) = registry.issue_provider_for(&source) else {
                 continue;
             };
-            match tracker.fetch_issues_by_id(&path, &missing).await {
+            match tracker.fetch_by_ids(&source, &missing).await {
                 Ok(fetched) if !fetched.is_empty() => {
                     {
                         let mut repos = self.repos.write().await;
                         if let Some(state) = repos.get_mut(&identity) {
-                            for (id, issue) in &fetched {
-                                state.last_local_providers.issues.insert(id.clone(), issue.clone());
+                            for issue in &fetched {
+                                state.last_local_providers.issues.insert(issue.reference.id.clone(), issue.clone());
                             }
                         }
                     }
@@ -3587,16 +3610,16 @@ impl InProcessDaemon {
         summary
     }
 
-    async fn get_issue_query_service(&self, repo: &Path) -> Result<Arc<dyn crate::providers::issue_query::IssueQueryService>, String> {
+    async fn get_issue_provider_for_repo(&self, repo: &Path) -> Result<(Arc<dyn IssueProvider>, flotilla_protocol::IssueSource), String> {
         let identity = self.tracked_repo_identity_for_path(repo).await.ok_or_else(|| "no tracked repo for path".to_string())?;
         let repos = self.repos.read().await;
         let state = repos.get(&identity).ok_or_else(|| "repo not found".to_string())?;
-        state
+        let source = forge_issue_source(state.identity());
+        let provider = state
             .registry()
-            .issue_query_services
-            .preferred()
-            .cloned()
-            .ok_or_else(|| "no issue query service available on this host".to_string())
+            .issue_provider_for(&source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
+        Ok((provider, source))
     }
 
     pub async fn execute_with_remote_executor(
@@ -4436,20 +4459,20 @@ impl DaemonHandle for InProcessDaemon {
             }
             CommandAction::QueryIssues { repo, params, page, count } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
-                let service = self.get_issue_query_service(&repo_path).await?;
-                let page = service.query(&repo_path, params, *page, *count).await?;
+                let (provider, source) = self.get_issue_provider_for_repo(&repo_path).await?;
+                let page = provider.query(&source, params, *page, *count).await?;
                 Ok(flotilla_protocol::CommandValue::IssuePage(page))
             }
             CommandAction::QueryIssueFetchByIds { repo, ids } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
-                let service = self.get_issue_query_service(&repo_path).await?;
-                let items = service.fetch_by_ids(&repo_path, ids).await?;
+                let (provider, source) = self.get_issue_provider_for_repo(&repo_path).await?;
+                let items = provider.fetch_by_ids(&source, ids).await?;
                 Ok(flotilla_protocol::CommandValue::IssuesByIds { items })
             }
             CommandAction::QueryIssueOpenInBrowser { repo, id } => {
                 let repo_path = self.resolve_repo_selector(repo).await?;
-                let service = self.get_issue_query_service(&repo_path).await?;
-                service.open_in_browser(&repo_path, id).await?;
+                let (provider, source) = self.get_issue_provider_for_repo(&repo_path).await?;
+                provider.open_in_browser(&flotilla_protocol::IssueRef { source, id: id.clone() }).await?;
                 Ok(flotilla_protocol::CommandValue::Ok)
             }
             other => Err(format!("execute_query not implemented for this command type: {:?}", std::mem::discriminant(other))),

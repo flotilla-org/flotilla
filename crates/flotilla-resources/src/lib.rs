@@ -51,7 +51,10 @@ pub use placement_policy::{
     PlacementPolicy, PlacementPolicySpec,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
-pub use project::{normalize_project_spec, IssueSource, Project, ProjectRepositorySpec, ProjectSpec};
+pub use project::{
+    normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,
+    ProjectRepositorySpec, ProjectSpec,
+};
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use repository::{
     ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,

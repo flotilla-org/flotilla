@@ -1,4 +1,8 @@
 use async_trait::async_trait;
+use flotilla_protocol::{
+    issue_query::{IssueQuery, IssueResultPage},
+    IssueChangeset, IssueRef, IssueSource,
+};
 
 use super::*;
 use crate::{
@@ -104,10 +108,23 @@ impl ChangeRequestTracker for StubChangeRequestTracker {
 struct StubIssueProvider;
 #[async_trait]
 impl IssueProvider for StubIssueProvider {
-    async fn list_issues(&self, _: &Path, _: usize) -> Result<Vec<(String, Issue)>, String> {
-        Ok(vec![])
+    fn supports(&self, _: &IssueSource) -> bool {
+        true
     }
-    async fn open_in_browser(&self, _: &Path, _: &str) -> Result<(), String> {
+
+    async fn query(&self, _: &IssueSource, _: &IssueQuery, _: u32, _: usize) -> Result<IssueResultPage, String> {
+        Ok(IssueResultPage { items: vec![], total: Some(0), has_more: false })
+    }
+
+    async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+        Err(format!("issue {} not found", reference.id))
+    }
+
+    async fn list_changed_since(&self, _: &IssueSource, _: &str, _: usize) -> Result<IssueChangeset, String> {
+        Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+    }
+
+    async fn open_in_browser(&self, _: &IssueRef) -> Result<(), String> {
         Ok(())
     }
 }

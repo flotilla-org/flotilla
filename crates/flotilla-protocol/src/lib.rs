@@ -6,7 +6,6 @@ pub mod framing;
 mod host;
 mod host_summary;
 pub mod issue_query;
-mod issue_ref;
 pub mod output;
 pub mod path_context;
 pub mod peer;
@@ -31,7 +30,6 @@ pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
     DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,
 };
-pub use issue_ref::{IssueRef, IssueSource};
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
@@ -92,8 +90,8 @@ pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AheadBehind, AssociationKey, AttachableId,
     AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
-    IssueChangeset, IssuePage, ManagedTerminal, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus, TerminalStatus,
-    WorkingTreeStatus, Workspace,
+    IssueChangeset, IssueRef, IssueSource, IssueState, ManagedTerminal, ProviderData, RemoteAccessPoint, RemoteAccessType, SessionStatus,
+    TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
     CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
