@@ -91,8 +91,7 @@ impl DaemonRuntime {
             daemon.set_daemon_socket_path(path.clone()).await;
         }
         daemon.set_provisioning_namespace(options.namespace.clone()).await;
-        let aggregator_projection_state = AggregatorProjectionState::new();
-        daemon.set_aggregator_projection_state(aggregator_projection_state.clone()).await;
+        let aggregator_projection_state = daemon.aggregator_projection_state().await;
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;

@@ -170,6 +170,15 @@ impl Aggregator {
             observed_presentations,
             observed_sessions,
         } = sources;
+        // Subscribe before any source bootstrap awaits so demand arriving
+        // during recovery remains observable. Also consume the initial value
+        // for demand that predates Aggregator startup; #747's source-backed
+        // reconciler plugs into this same initial/change path.
+        let mut demand_rx = self.state.subscribe_demand();
+        let initial_demand = demand_rx.borrow_and_update().clone();
+        if !initial_demand.is_empty() {
+            tracing::debug!(queries = ?initial_demand, "Aggregator started with demand-backed queries");
+        }
         self.bootstrapping = true;
         {
             let mut view = self.state.write().await;
@@ -199,6 +208,12 @@ impl Aggregator {
 
         loop {
             tokio::select! {
+                demand = demand_rx.changed() => {
+                    if demand.is_err() {
+                        return Err(ResourceError::other("aggregator demand registry closed"));
+                    }
+                    tracing::debug!(queries = ?*demand_rx.borrow_and_update(), "demand-backed query set changed");
+                }
                 event = durable_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Durable, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {

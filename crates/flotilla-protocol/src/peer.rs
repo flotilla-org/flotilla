@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{delta::Change, provider_data::ProviderData, CommandValue, HostSummary, NodeId, RepoIdentity, Step, StepOutcome, StepStatus};
+use crate::{
+    delta::Change, provider_data::ProviderData, CommandValue, HostSummary, NodeId, RepoIdentity, RepositoryKey, Step, StepOutcome,
+    StepStatus,
+};
 
 /// Logical clock for causal ordering and deduplication of peer messages.
 ///
@@ -55,6 +58,8 @@ pub struct PeerDataMessage {
     pub origin_node_id: NodeId,
     pub repo_identity: RepoIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<RepositoryKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_repo_root: Option<PathBuf>,
     /// Vector clock for causal ordering and deduplication.
     #[serde(default)]
@@ -97,6 +102,8 @@ pub enum RoutedPeerMessage {
         responder_node_id: NodeId,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_key: Option<RepositoryKey>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host_repo_root: Option<PathBuf>,
         clock: VectorClock,
@@ -331,6 +338,7 @@ mod tests {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            repository_key: Some(RepositoryKey("repo_opaque".into())),
             host_repo_root: Some(PathBuf::from("/home/dev/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
@@ -349,6 +357,7 @@ mod tests {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("desktop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            repository_key: None,
             host_repo_root: None,
             clock: VectorClock::default(),
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
@@ -364,6 +373,7 @@ mod tests {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("cloud"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            repository_key: None,
             host_repo_root: Some(PathBuf::from("/opt/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::RequestResync { since_seq: 5 },
@@ -408,6 +418,7 @@ mod tests {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("laptop"),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            repository_key: None,
             host_repo_root: Some(PathBuf::from("/home/dev/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::Delta {

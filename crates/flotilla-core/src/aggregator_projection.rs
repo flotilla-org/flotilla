@@ -5,13 +5,19 @@
 //! counter per query. Each named query instantiates it with that query's
 //! typed row.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use flotilla_protocol::{
     result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet, Rows},
-    HostName, ResourceRef,
+    HostName, QueryCursor, ResourceRef,
 };
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::{watch, RwLock, RwLockWriteGuard};
+use uuid::Uuid;
+
+use crate::query_registry::QueryRegistry;
 
 /// A typed row of some named query's result set.
 pub trait QueryRow: Clone {
@@ -110,6 +116,9 @@ impl<R: QueryRow + PartialEq> QueryProjection<R> {
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
     independents: Arc<RwLock<QueryProjection<IndependentRow>>>,
+    /// Subscriber ownership and demand-backed materializations belong to the
+    /// Aggregator state, shared with the daemon's subscription transport.
+    demand_backed: QueryRegistry,
 }
 
 impl AggregatorProjectionState {
@@ -155,12 +164,28 @@ impl AggregatorProjectionState {
         vec![self.local_result_set().await, self.local_independents_result_set().await]
     }
 
+    /// Replace one subscriber's complete demand and return queries whose
+    /// materialization lifetime was newly created.
+    pub fn replace_subscriber(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
+        self.demand_backed.replace(subscriber, cursors)
+    }
+
+    pub fn remove_subscriber(&self, subscriber: Uuid) {
+        self.demand_backed.remove(subscriber);
+    }
+
+    /// Observe the complete set of live demand-backed query identities.
+    /// The Aggregator uses this to start and stop source materializers.
+    pub fn subscribe_demand(&self) -> watch::Receiver<HashSet<QueryId>> {
+        self.demand_backed.subscribe_demand()
+    }
+
     /// The current fleet-merged result set for one named query.
     pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {
             QueryId::Convoys => Some(self.result_set().await),
             QueryId::Independents => Some(self.independents_result_set().await),
-            QueryId::Issues { .. } => None,
+            QueryId::Issues { .. } => self.demand_backed.result_set(query),
         }
     }
 }

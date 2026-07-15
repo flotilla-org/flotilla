@@ -169,9 +169,9 @@ impl OpenViews {
 
     pub fn bind_repository_keys(&mut self, keys: &HashMap<RepoIdentity, RepositoryKey>) {
         for view in &mut self.views {
-            let ViewTarget::View(ViewAddress::Repo { identity, repository_key }) = &mut view.target else { continue };
-            if repository_key.is_none() {
-                *repository_key = keys.get(identity).cloned();
+            bind_repository_key(&mut view.target, keys);
+            for frame in &mut view.history {
+                bind_repository_key(&mut frame.target, keys);
             }
         }
     }
@@ -415,6 +415,13 @@ impl OpenViews {
     }
 }
 
+fn bind_repository_key(target: &mut ViewTarget, keys: &HashMap<RepoIdentity, RepositoryKey>) {
+    let ViewTarget::View(ViewAddress::Repo { identity, repository_key }) = target else { return };
+    if repository_key.is_none() {
+        *repository_key = keys.get(identity).cloned();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +589,19 @@ mod tests {
         views.switch_to(1);
         assert!(views.back());
         assert_eq!(views.active_address(), Some(&addr("convoys/flotilla")));
+    }
+
+    #[test]
+    fn repository_key_binding_updates_a_repo_address_in_navigation_history() {
+        let identity = RepoIdentity { authority: "github.com".into(), path: "o/r".into() };
+        let key = RepositoryKey("repo_history".into());
+        let mut views = OpenViews::scoped(ViewAddress::repo(identity.clone()));
+        assert!(views.drill(addr("convoy/flotilla/manifest")));
+
+        views.bind_repository_keys(&HashMap::from([(identity.clone(), key.clone())]));
+        assert!(views.back());
+
+        assert_eq!(views.active_address(), Some(&ViewAddress::repo_with_key(identity, key)));
     }
 
     #[test]

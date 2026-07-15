@@ -451,6 +451,7 @@ fn message_peer_data_roundtrip() {
     let msg = Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
         origin_node_id: NodeId::new("desktop"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repository_key: Some(RepositoryKey("repo_peer".into())),
         host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 7 },
@@ -481,6 +482,7 @@ fn message_peer_routed_resync_snapshot_roundtrip() {
         responder_node_id: NodeId::new("desktop"),
         remaining_hops: 4,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repository_key: Some(RepositoryKey("repo_peer".into())),
         host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         seq: 13,

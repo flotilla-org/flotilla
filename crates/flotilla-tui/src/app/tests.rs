@@ -828,6 +828,22 @@ fn handle_repo_added_duplicate_is_noop() {
 }
 
 #[test]
+fn handle_repo_added_enriches_an_existing_repo_with_its_query_key() {
+    let mut app = stub_app();
+    let identity = app.model.repo_order[0].clone();
+    let mut info = repo_info(app.model.repos[&identity].path.clone(), "resolved", RepoLabels::default());
+    let key = flotilla_protocol::RepositoryKey("repo_resolved".into());
+    info.repository_key = Some(key.clone());
+    app.subscriptions_dirty = false;
+
+    app.handle_repo_added(info);
+
+    assert_eq!(app.model.repos[&identity].repository_key, Some(key.clone()));
+    assert!(app.views.find(&ViewAddress::repo_with_key(identity, key)).is_some());
+    assert!(app.subscriptions_dirty);
+}
+
+#[test]
 fn handle_repo_removed_removes_repo() {
     let mut app = stub_app_with_repos(2);
     let path = app.model.repo_order[0].clone();

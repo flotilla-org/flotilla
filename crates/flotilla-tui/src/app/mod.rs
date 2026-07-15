@@ -1439,7 +1439,14 @@ impl App {
 
     fn handle_repo_added(&mut self, info: RepoInfo) {
         let identity = info.identity.clone();
-        if self.model.repos.contains_key(&identity) {
+        if let Some(existing) = self.model.repos.get_mut(&identity) {
+            if existing.repository_key.is_none() {
+                if let Some(key) = info.repository_key {
+                    existing.repository_key = Some(key.clone());
+                    self.views.bind_repository_keys(&HashMap::from([(identity, key)]));
+                    self.subscriptions_dirty = true;
+                }
+            }
             return;
         }
         let path = TuiModel::display_path(&identity, info.path.clone());

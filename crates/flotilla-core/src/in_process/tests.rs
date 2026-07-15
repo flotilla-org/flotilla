@@ -2874,8 +2874,26 @@ async fn issue_subscription_materializes_until_its_in_process_handle_drops() {
     assert_eq!(result.query(), query);
     assert!(result.state.demand.is_some());
     assert!(matches!(result.state.conditions.as_slice(), [ResultSetCondition::IssueSourceUnavailable { source: None, .. }]));
-    assert!(daemon.query_registry.result_set(&query).is_some());
+    assert!(daemon.aggregator_projection_state().await.result_set_for(&query).await.is_some());
 
     drop(subscription);
-    assert!(daemon.query_registry.result_set(&query).is_none());
+    assert!(daemon.aggregator_projection_state().await.result_set_for(&query).await.is_none());
+}
+
+#[tokio::test]
+async fn recreated_issue_materialization_replays_even_when_cursor_matches_initial_seq() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let subscriber = uuid::Uuid::new_v4();
+    let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_recreated".into())) };
+
+    daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("initial subscription");
+    daemon.unsubscribe_queries(subscriber).await;
+
+    let events = daemon.subscribe_queries(subscriber, &[QueryCursor { query, since: Some(1) }]).await.expect("recreated subscription");
+    assert!(matches!(events.as_slice(), [DaemonEvent::ResultSet(_)]));
 }

@@ -64,7 +64,6 @@ use crate::{
         ssh_runner::SshCommandRunner,
         ChannelLabel, CommandRunner,
     },
-    query_registry::QueryRegistry,
     refresh::RefreshSnapshot,
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     repository_inspection::{GitRepositoryInspector, RepositoryInspection, RepositoryInspector},
@@ -1008,8 +1007,7 @@ pub struct InProcessDaemon {
     /// Serializes observed Checkout publication with repository removal so a
     /// refresh captured before untracking cannot recreate deleted resources.
     observed_checkout_reconciliation: Mutex<()>,
-    aggregator_projection_state: RwLock<AggregatorProjectionState>,
-    query_registry: QueryRegistry,
+    aggregator_projection_state: AggregatorProjectionState,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
@@ -1050,6 +1048,7 @@ impl InProcessDaemon {
         let mut repos: HashMap<flotilla_protocol::RepoIdentity, RepoState> = HashMap::new();
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
+        let mut repository_keys_by_path = HashMap::new();
 
         let daemon_config = config.load_daemon_config().expect("failed to load daemon config");
         let config_machine_id = daemon_config.machine_id.as_deref();
@@ -1067,6 +1066,7 @@ impl InProcessDaemon {
             Arc::new(EnvironmentManager::new_local(&discovery, local_environment_id.clone(), local_host_id.clone()).await);
         register_static_ssh_direct_environments(&config, &discovery, &environment_manager).await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
+        let startup_repository_inspector = GitRepositoryInspector::new(discovery.runner.clone(), local_host_id.to_string());
 
         for path in repo_paths {
             if path_identities.contains_key(&path) {
@@ -1088,6 +1088,14 @@ impl InProcessDaemon {
             }
 
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+            match startup_repository_inspector.inspect_path(&path, None).await {
+                Ok(inspection) => {
+                    repository_keys_by_path.insert(path.clone(), inspection.key());
+                }
+                Err(error) => {
+                    warn!(repo = %path.display(), %error, "repository key is unavailable during daemon startup");
+                }
+            }
             let slug = repo_slug.clone();
             let mut model = RepoModel::new(
                 path.clone(),
@@ -1135,7 +1143,7 @@ impl InProcessDaemon {
             peer_providers: RwLock::new(HashMap::new()),
             peer_overlay_versions: RwLock::new(HashMap::new()),
             path_identities: RwLock::new(path_identities),
-            repository_keys_by_path: RwLock::new(HashMap::new()),
+            repository_keys_by_path: RwLock::new(repository_keys_by_path),
             host_registry: crate::host_registry::HostRegistry::new(
                 NodeInfo::new(local_node_id.clone(), host_name.to_string()),
                 local_host_summary,
@@ -1150,8 +1158,7 @@ impl InProcessDaemon {
             resource_backend,
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             observed_checkout_reconciliation: Mutex::new(()),
-            aggregator_projection_state: RwLock::new(AggregatorProjectionState::new()),
-            query_registry: QueryRegistry::default(),
+            aggregator_projection_state: AggregatorProjectionState::new(),
             provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
             fleet_replica_tx,
@@ -1220,6 +1227,10 @@ impl InProcessDaemon {
 
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         self.repository_inspector().await?.inspect_path(path, remote).await
+    }
+
+    pub async fn repository_key_for_path(&self, path: &Path) -> Option<RepositoryKey> {
+        self.repository_keys_by_path.read().await.get(path).cloned()
     }
 
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
@@ -1351,12 +1362,8 @@ impl InProcessDaemon {
         });
     }
 
-    pub async fn set_aggregator_projection_state(&self, state: AggregatorProjectionState) {
-        *self.aggregator_projection_state.write().await = state;
-    }
-
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
-        self.aggregator_projection_state.read().await.clone()
+        self.aggregator_projection_state.clone()
     }
 
     pub fn subscribe_fleet_replicas(&self) -> broadcast::Receiver<Vec<FleetReplicaSnapshot>> {
@@ -1857,6 +1864,7 @@ impl InProcessDaemon {
         }
 
         let namespace = self.provisioning_namespace().await;
+        let mut key_enrichments = HashSet::new();
         for (identity, local_providers, snapshot, _) in &updates {
             if snapshot.errors.iter().any(|error| error.category == "checkouts") {
                 warn!(repo = %identity.path, "skipping observed checkout reconciliation after checkout discovery failed");
@@ -1889,11 +1897,16 @@ impl InProcessDaemon {
             if !local_paths.contains(&local_root) {
                 continue;
             }
-            {
+            let key_became_available = {
                 let mut keys_by_path = self.repository_keys_by_path.write().await;
+                let mut changed = false;
                 for path in local_paths {
-                    keys_by_path.insert(path, repository_key.clone());
+                    changed |= keys_by_path.insert(path, repository_key.clone()).as_ref() != Some(&repository_key);
                 }
+                changed
+            };
+            if key_became_available {
+                key_enrichments.insert(identity.clone());
             }
             if let Err(error) = crate::observed_resources::reconcile_checkouts(
                 &self.observed_resource_backend,
@@ -1973,6 +1986,10 @@ impl InProcessDaemon {
 
         drop(repos);
 
+        for identity in key_enrichments {
+            self.publish_repo_info_update(&identity).await;
+        }
+
         self.fetch_missing_linked_issues().await;
     }
 
@@ -2045,16 +2062,24 @@ impl InProcessDaemon {
     pub async fn add_virtual_repo(
         &self,
         identity: flotilla_protocol::RepoIdentity,
+        repository_key: Option<RepositoryKey>,
         synthetic_path: PathBuf,
         peers: Vec<(NodeInfo, ProviderData)>,
         overlay_version: u64,
     ) -> Result<(), String> {
-        // Check if already tracked
-        {
-            let repos = self.repos.read().await;
-            if repos.contains_key(&identity) {
-                return Ok(());
+        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+        let existing_path = self.repos.read().await.get(&identity).map(|state| state.preferred_path().to_path_buf());
+        if let Some(existing_path) = existing_path {
+            let key_became_available = if let Some(repository_key) = repository_key {
+                self.repository_keys_by_path.write().await.insert(existing_path, repository_key.clone()).as_ref() != Some(&repository_key)
+            } else {
+                false
+            };
+            drop(_reconciliation);
+            if key_became_available {
+                self.publish_repo_info_update(&identity).await;
             }
+            return Ok(());
         }
 
         let mut model = RepoModel::new_virtual();
@@ -2062,7 +2087,7 @@ impl InProcessDaemon {
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
-            repository_key: None,
+            repository_key: repository_key.clone(),
             path: Some(synthetic_path.clone()),
             name: repo_name(&synthetic_path),
             labels: model.labels.clone(),
@@ -2096,6 +2121,9 @@ impl InProcessDaemon {
         }
 
         self.path_identities.write().await.insert(synthetic_path.clone(), identity);
+        if let Some(repository_key) = repository_key {
+            self.repository_keys_by_path.write().await.insert(synthetic_path.clone(), repository_key);
+        }
 
         // Virtual repos are not persisted to config — they come and go
         // with peer connections.
@@ -2457,6 +2485,16 @@ impl InProcessDaemon {
         }
     }
 
+    async fn publish_repo_info_update(&self, identity: &flotilla_protocol::RepoIdentity) {
+        if let Ok(repo_infos) = self.list_repos().await {
+            if let Some(info) = repo_infos.into_iter().find(|info| info.identity == *identity) {
+                // RepoTracked also carries late identity enrichment: surfaces
+                // treat an existing identity as an update.
+                let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(info)));
+            }
+        }
+    }
+
     /// Add a repo to tracking, returning `(tracked_path, resolved_from)`.
     ///
     /// If `path` is a git worktree, the main repo root is resolved via
@@ -2479,9 +2517,36 @@ impl InProcessDaemon {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
         let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+        // Resolve the storage identity before publishing RepoTracked so a
+        // surface can subscribe to issues{repository} immediately. The
+        // background refresh still ensures the Repository resource and
+        // reconciles observed Checkouts.
+        let repository_key = match self.inspect_repository_path(&path, None).await {
+            Ok(inspection) => Some(inspection.key()),
+            Err(error) => {
+                warn!(repo = %path.display(), %error, "repository key is unavailable while tracking repo");
+                None
+            }
+        };
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
             if tracked_identity == identity {
-                return Ok((path, resolved_from));
+                let key_became_available = {
+                    let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+                    if self.tracked_repo_identity_for_path(&path).await.as_ref() != Some(&identity) {
+                        false
+                    } else if let Some(repository_key) = repository_key.as_ref() {
+                        self.repository_keys_by_path.write().await.insert(path.clone(), repository_key.clone()).as_ref()
+                            != Some(repository_key)
+                    } else {
+                        false
+                    }
+                };
+                if key_became_available {
+                    self.publish_repo_info_update(&identity).await;
+                }
+                if self.tracked_repo_identity_for_path(&path).await.as_ref() == Some(&identity) {
+                    return Ok((path, resolved_from));
+                }
             }
             if let Err(error) = self.remove_repo(&path).await {
                 // Another add_repo call may have removed or migrated this path
@@ -2507,7 +2572,7 @@ impl InProcessDaemon {
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
-            repository_key: None,
+            repository_key: repository_key.clone(),
             path: Some(path.clone()),
             name: repo_name(&path),
             labels: root.model.labels.clone(),
@@ -2522,6 +2587,7 @@ impl InProcessDaemon {
         // Insert under write lock — re-check to avoid TOCTOU duplicate
         let mut added_new_identity = false;
         let mut preferred_changed = false;
+        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
         let already_tracked = self.path_identities.read().await.contains_key(&path);
         if already_tracked {
             return Ok((path, resolved_from));
@@ -2537,6 +2603,9 @@ impl InProcessDaemon {
                 added_new_identity = true;
             }
             self.path_identities.write().await.insert(path.clone(), identity.clone());
+        }
+        if let Some(repository_key) = repository_key {
+            self.repository_keys_by_path.write().await.insert(path.clone(), repository_key);
         }
 
         // Persist to config. Tab order is Surface-owned (open-views.toml,
@@ -4263,8 +4332,8 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
-        let registry = self.query_registry.clone();
-        QuerySubscription::new(move || registry.remove(subscriber_id))
+        let state = self.aggregator_projection_state.clone();
+        QuerySubscription::new(move || state.remove_subscriber(subscriber_id))
     }
 
     async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
@@ -4444,16 +4513,13 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn subscribe_queries(&self, subscriber_id: uuid::Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
-        self.query_registry.replace(subscriber_id, queries);
         let state = self.aggregator_projection_state().await;
+        let newly_materialized = state.replace_subscriber(subscriber_id, queries);
         let mut events = Vec::new();
         for cursor in queries {
-            let result_set = self
-                .query_registry
-                .result_set(&cursor.query)
-                .or(state.result_set_for(&cursor.query).await)
-                .ok_or_else(|| format!("query is not materialized: {}", cursor.query))?;
-            if cursor.since.is_none_or(|seq| seq != result_set.seq) {
+            let result_set =
+                state.result_set_for(&cursor.query).await.ok_or_else(|| format!("query is not materialized: {}", cursor.query))?;
+            if newly_materialized.contains(&cursor.query) || cursor.since.is_none_or(|seq| seq != result_set.seq) {
                 events.push(DaemonEvent::ResultSet(Box::new(result_set)));
             }
         }
@@ -4461,7 +4527,7 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn unsubscribe_queries(&self, subscriber_id: uuid::Uuid) {
-        self.query_registry.remove(subscriber_id);
+        self.aggregator_projection_state().await.remove_subscriber(subscriber_id);
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
