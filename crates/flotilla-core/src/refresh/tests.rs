@@ -1074,3 +1074,58 @@ fn project_attachable_data_set_appears_without_terminal_scan() {
 
     assert_eq!(pd.attachable_sets.len(), 1, "set should appear without terminal scan");
 }
+
+#[tokio::test]
+async fn refresh_correlates_discovered_attachable_set_from_member_working_directories() {
+    let checkout_path = PathBuf::from("/repo/wt-feat");
+    let host = flotilla_protocol::HostName::local();
+    let checkout = flotilla_protocol::HostPath::new(host.clone(), checkout_path.clone());
+    let checkout_key: QualifiedPath = checkout.clone().into();
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let set_id = flotilla_protocol::AttachableSetId::new("discovered-set");
+    let attachable_id = flotilla_protocol::AttachableId::new("discovered-terminal");
+
+    {
+        let mut store = store.lock().expect("lock attachable store");
+        store.insert_set(flotilla_protocol::AttachableSet {
+            id: set_id.clone(),
+            host_affinity: Some(host),
+            checkout: None,
+            template_identity: None,
+            environment_id: None,
+            members: vec![attachable_id.clone()],
+        });
+        store.insert_attachable(crate::attachable::Attachable {
+            id: attachable_id,
+            set_id: set_id.clone(),
+            content: crate::attachable::AttachableContent::Terminal(crate::attachable::TerminalAttachable {
+                purpose: crate::attachable::TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+                command: "bash".into(),
+                working_directory: ExecutionEnvironmentPath::new(&checkout_path),
+                status: flotilla_protocol::TerminalStatus::Running,
+            }),
+        });
+    }
+
+    let mut registry = ProviderRegistry::new();
+    let mut checkout_data = TestCheckout::new("feat").build();
+    checkout_data.correlation_keys = vec![flotilla_protocol::CorrelationKey::CheckoutPath(checkout_key)];
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::ok(vec![(checkout_path, checkout_data)])));
+    let handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        store,
+        test_agent_state_store(),
+        Duration::from_secs(3600),
+    );
+
+    let mut snapshots = handle.snapshot_rx.clone();
+    let snapshot = wait_for_snapshot(&mut snapshots).await;
+
+    assert_eq!(snapshot.providers.attachable_sets.get(&set_id).and_then(|set| set.checkout.as_ref()), Some(&checkout.into()));
+    assert_eq!(snapshot.work_items.len(), 1, "checkout and discovered set should form one correlated work item");
+    assert_eq!(snapshot.work_items[0].attachable_set_id(), Some(&set_id));
+}

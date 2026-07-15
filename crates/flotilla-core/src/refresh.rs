@@ -585,6 +585,47 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
         }
     }
 
+    // A discovered set may predate the registry (or have been reconstructed
+    // without going through the executor), while its member terminals still
+    // carry the checkout directory as an observed fact. Adopt that fact when
+    // every member agrees and it identifies exactly one checkout in this repo.
+    let inferred_checkouts: Vec<_> = store
+        .registry()
+        .sets
+        .iter()
+        .filter(|(_, set)| set.checkout.is_none() && !set.members.is_empty())
+        .filter_map(|(set_id, set)| {
+            let working_directories: Option<Vec<&Path>> = set
+                .members
+                .iter()
+                .map(|member_id| {
+                    store.registry().attachables.get(member_id).map(|attachable| match &attachable.content {
+                        crate::attachable::AttachableContent::Terminal(terminal) => terminal.working_directory.as_path(),
+                    })
+                })
+                .collect();
+            let working_directories = working_directories?;
+            let shared_directory = working_directories.first()?;
+            if !working_directories.iter().all(|directory| directory == shared_directory) {
+                return None;
+            }
+            let mut matches = pd.checkouts.keys().filter(|checkout| checkout.path == *shared_directory);
+            let checkout = matches.next()?.clone();
+            matches.next().is_none().then(|| (set_id.clone(), checkout))
+        })
+        .collect();
+    for (set_id, checkout) in &inferred_checkouts {
+        if let Some(mut set) = store.registry().sets.get(set_id).cloned() {
+            set.checkout = Some(checkout.clone());
+            store.insert_set(set);
+        }
+    }
+    if !inferred_checkouts.is_empty() {
+        if let Err(err) = store.save() {
+            tracing::warn!(err = %err, "failed to persist inferred attachable-set checkouts");
+        }
+    }
+
     // Set selection: project sets whose checkout matches a repo checkout
     let checkout_paths: std::collections::HashSet<PathBuf> = pd.checkouts.keys().map(|path| path.path.clone()).collect();
     pd.attachable_sets = store
