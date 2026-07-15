@@ -85,7 +85,7 @@ fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
             0 => format!("⛰ {name}"),
             _ => format!("⛰ {namespace}/{name}"),
         },
-        ViewTarget::View(ViewAddress::Repo(identity)) => repo_label(identity, model, level),
+        ViewTarget::View(ViewAddress::Repo { identity, .. }) => repo_label(identity, model, level),
         ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
     }
 }

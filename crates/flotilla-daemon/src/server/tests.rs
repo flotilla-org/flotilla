@@ -20,7 +20,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     qualified_path::QualifiedPath,
-    result_set::{QueryId, ResultDelta, Rows},
+    result_set::{QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
     CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId, NodeInfo,
     PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity,
@@ -207,6 +207,7 @@ fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, che
     PeerDataMessage {
         origin_node_id: NodeId::new(host),
         repo_identity: repo_identity.clone(),
+        repository_key: None,
         host_repo_root: Some(repo_path.to_path_buf()),
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot {
@@ -2115,6 +2116,7 @@ fn test_peer_msg(host: &str) -> PeerDataMessage {
     PeerDataMessage {
         origin_node_id: NodeId::new(host),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repository_key: None,
         host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::RequestResync { since_seq: 0 },
@@ -2570,7 +2572,13 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
         other => panic!("expected ListRepos response, got {other:?}"),
     }
 
-    let result_delta = |seq| DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }));
+    let result_delta = |seq| {
+        DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq,
+            changes: QueryChanges::Convoys { changed: vec![], removed: vec![] },
+            state: None,
+        }))
+    };
     let marker = |command_id| DaemonEvent::CommandStarted {
         command_id,
         node_id: daemon.node_id().clone(),
@@ -2777,6 +2785,7 @@ async fn handle_remote_restart_if_needed_clears_stale_remote_only_peer_state() {
     daemon
         .add_virtual_repo(
             repo_identity.clone(),
+            None,
             synthetic.clone(),
             vec![
                 (NodeInfo::new(NodeId::new("peer-a"), "peer-a"), ProviderData {
@@ -3159,6 +3168,7 @@ async fn clear_peer_data_rebuilds_remote_only_repo_without_stale_first_event() {
     daemon
         .add_virtual_repo(
             repo_identity.clone(),
+            None,
             synthetic.clone(),
             vec![
                 (NodeInfo::new(NodeId::new("peer-a"), "peer-a"), ProviderData {

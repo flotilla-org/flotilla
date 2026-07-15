@@ -143,6 +143,7 @@ pub fn repo_info(path: impl Into<PathBuf>, name: impl Into<String>, labels: Repo
     let path = path.into();
     RepoInfo {
         identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: path.display().to_string() },
+        repository_key: None,
         path: Some(path),
         name: name.into(),
         labels,

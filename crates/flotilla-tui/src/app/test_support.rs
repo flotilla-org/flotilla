@@ -96,7 +96,11 @@ impl DaemonHandle for StubDaemon {
         Ok(vec![])
     }
 
-    async fn subscribe_queries(&self, _queries: &[flotilla_protocol::QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+    async fn subscribe_queries(
+        &self,
+        _subscriber_id: uuid::Uuid,
+        _queries: &[flotilla_protocol::QueryCursor],
+    ) -> Result<Vec<DaemonEvent>, String> {
         Ok(vec![])
     }
 

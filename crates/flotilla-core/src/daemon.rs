@@ -8,12 +8,41 @@ use flotilla_protocol::{
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+/// Lifetime token for an in-process query subscriber. Dropping it tears the
+/// subscriber out of the registry; socket implementations return a no-op
+/// token because connection teardown owns that lifecycle.
+pub struct QuerySubscription {
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl QuerySubscription {
+    pub fn noop() -> Self {
+        Self { cleanup: None }
+    }
+
+    pub(crate) fn new(cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self { cleanup: Some(Box::new(cleanup)) }
+    }
+}
+
+impl Drop for QuerySubscription {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
 /// The boundary between daemon and client.
 /// Both InProcessDaemon and SocketDaemon implement this.
 #[async_trait]
 pub trait DaemonHandle: Send + Sync {
     /// Subscribe to daemon events (snapshots, repo changes).
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent>;
+
+    fn query_subscription(&self, _subscriber_id: Uuid) -> QuerySubscription {
+        QuerySubscription::noop()
+    }
 
     /// Get full current state for a repo.
     ///
@@ -50,7 +79,18 @@ pub trait DaemonHandle: Send + Sync {
     /// Delivery restriction is a transport concern: `SocketDaemon`
     /// connections only receive events for subscribed queries, while
     /// `InProcessDaemon`'s shared broadcast may over-deliver.
-    async fn subscribe_queries(&self, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String>;
+    async fn subscribe_queries(&self, subscriber_id: Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String>;
+
+    /// Remove a subscriber and tear down demand-backed materializations that
+    /// no longer have an owner. Socket transports call this on disconnect;
+    /// in-process consumers call it when their explicit session ends.
+    async fn unsubscribe_queries(&self, _subscriber_id: Uuid) {}
+
+    /// Request the next page for a live demand-backed query. Consumers keep
+    /// one result set and observe the extension on the event stream.
+    async fn fetch_more(&self, _query: &flotilla_protocol::QueryId) -> Result<(), String> {
+        Err("fetch-more is unsupported by this daemon".to_string())
+    }
 
     /// Execute a query command synchronously. Returns the result directly
     /// without broadcasting. Only valid for commands where `action.is_query()`.

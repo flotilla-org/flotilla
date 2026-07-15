@@ -539,6 +539,17 @@ impl SplitTable {
         Some(prior_items + selected_idx)
     }
 
+    /// Position of the selected row within the native issue section.
+    ///
+    /// Returns `(selected_index, issue_count)`, or `None` when the active row
+    /// belongs to another section. Pagination uses this instead of flat table
+    /// coordinates so unrelated checkout or session rows do not shift the
+    /// issue-page boundary.
+    pub fn selected_issue_position(&self) -> Option<(usize, usize)> {
+        let (_, AnySection::Issues(table)) = self.sections.get(self.active_section)? else { return None };
+        Some((table.selected_idx?, table.items.len()))
+    }
+
     /// Select an item by flat index (across all sections). Used by tests.
     pub fn select_flat_index(&mut self, flat_idx: usize) {
         let mut remaining = flat_idx;

@@ -115,8 +115,9 @@ impl ClientConnection {
     }
 
     /// Common teardown: abort event relay, decrement client count.
-    async fn finish_session(&self, event_task: tokio::task::JoinHandle<()>, _session_id: uuid::Uuid) {
+    async fn finish_session(&self, event_task: tokio::task::JoinHandle<()>, session_id: uuid::Uuid) {
         event_task.abort();
+        self.daemon.unsubscribe_queries(session_id).await;
 
         let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
         info!(%count, "client disconnected");

@@ -12,10 +12,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CommitInfo, CorrelationKey, Issue, IssueChangeset, IssueRef,
-    IssueSource, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
+    IssueSource, IssueState, RepoIdentity, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 use tokio::sync::Mutex as TokioMutex;
 
@@ -308,11 +309,13 @@ impl IssueProvider for FakeIssueProvider {
 
     async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
         let store = self.issues.lock().await;
-        let matching = store
+        let mut matching = store
             .iter()
+            .filter(|(_, issue)| issue.state == IssueState::Open)
             .filter(|(_, issue)| params.search.as_ref().is_none_or(|query| issue.title.to_lowercase().contains(&query.to_lowercase())))
             .cloned()
             .collect::<Vec<_>>();
+        matching.sort_by(|(left_id, left), (right_id, right)| right.as_of.cmp(&left.as_of).then_with(|| left_id.cmp(right_id)));
         let start = (page.saturating_sub(1) as usize) * count;
         let items = matching
             .iter()
@@ -356,9 +359,25 @@ impl IssueProvider for FakeIssueProvider {
             .collect())
     }
 
-    async fn list_changed_since(&self, source: &IssueSource, _since: &str, count: usize) -> Result<IssueChangeset, String> {
-        let page = self.query(source, &IssueQuery::default(), 1, count).await?;
-        Ok(IssueChangeset { updated: page.items, closed: vec![], has_more: page.has_more })
+    async fn list_changed_since(&self, source: &IssueSource, since: &str, count: usize) -> Result<IssueChangeset, String> {
+        let since =
+            DateTime::parse_from_rfc3339(since).map_err(|error| format!("invalid changed-since cursor: {error}"))?.with_timezone(&Utc);
+        let store = self.issues.lock().await;
+        let mut changes = store.iter().filter(|(_, issue)| issue.as_of > since).cloned().collect::<Vec<_>>();
+        changes.sort_by(|(left_id, left), (right_id, right)| right.as_of.cmp(&left.as_of).then_with(|| left_id.cmp(right_id)));
+        let has_more = changes.len() > count;
+        let mut updated = Vec::new();
+        let mut closed = Vec::new();
+        for (id, mut issue) in changes.into_iter().take(count) {
+            let reference = IssueRef { source: source.clone(), id };
+            if issue.state == IssueState::Open {
+                issue.reference = reference;
+                updated.push(issue);
+            } else {
+                closed.push(reference);
+            }
+        }
+        Ok(IssueChangeset { updated, closed, has_more })
     }
 
     async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
@@ -1211,8 +1230,13 @@ pub fn fake_vcs_discovery(state: Arc<RwLock<FakeVcsState>>) -> DiscoveryRuntime 
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
+
     use super::*;
-    use crate::providers::discovery::{run_host_detectors, EnvironmentAssertion};
+    use crate::providers::{
+        discovery::{run_host_detectors, EnvironmentAssertion},
+        issue_tracker::tests::assert_provider_contract,
+    };
 
     #[tokio::test]
     async fn fake_discovery_uses_only_git_host_detector() {
@@ -1224,5 +1248,37 @@ mod tests {
             [EnvironmentAssertion::BinaryAvailable { name, version, .. }]
             if name == "git" && version.as_deref() == Some("2.43.0")
         ));
+    }
+
+    #[tokio::test]
+    async fn fake_issue_provider_satisfies_the_shared_provider_contract() {
+        let provider = FakeIssueProvider::new();
+        let source = IssueSource { service: "fake".into(), scope: "owner/repo".into() };
+        let mut older = flotilla_protocol::test_support::TestIssue::new("Older").id("opaque-A").build();
+        older.as_of = Utc::now() - Duration::minutes(2);
+        let mut newer = flotilla_protocol::test_support::TestIssue::new("Newer").id("opaque-B").build();
+        newer.as_of = Utc::now() - Duration::minutes(1);
+        let mut closed = flotilla_protocol::test_support::TestIssue::new("Closed").id("opaque-C").build();
+        closed.state = IssueState::Closed;
+        closed.as_of = Utc::now();
+        let cutoff = older.as_of.to_rfc3339();
+        provider.add_issues(vec![("opaque-A".into(), older), ("opaque-B".into(), newer), ("opaque-C".into(), closed)]).await;
+
+        assert_provider_contract(&provider, &source, "opaque-A", "1970-01-01T00:00:00Z").await;
+
+        let first = provider.query(&source, &IssueQuery::default(), 1, 1).await.expect("first page");
+        assert_eq!(first.items[0].reference.id, "opaque-B");
+        assert!(first.has_more);
+        let second = provider.query(&source, &IssueQuery::default(), 2, 1).await.expect("second page");
+        assert_eq!(second.items[0].reference.id, "opaque-A");
+        assert!(!second.has_more);
+        let search = provider.query(&source, &IssueQuery { search: Some("newer".into()) }, 1, 10).await.expect("search");
+        assert_eq!(search.items[0].reference.id, "opaque-B");
+
+        let changes = provider.list_changed_since(&source, &cutoff, 10).await.expect("cutoff changes");
+        assert_eq!(changes.updated.iter().map(|issue| issue.reference.id.as_str()).collect::<Vec<_>>(), vec!["opaque-B"]);
+        assert_eq!(changes.closed, vec![IssueRef { source: source.clone(), id: "opaque-C".into() }]);
+        assert!(!changes.has_more);
+        assert!(provider.list_changed_since(&source, "1970-01-01T00:00:00Z", 1).await.expect("paged changes").has_more);
     }
 }

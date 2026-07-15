@@ -155,6 +155,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         render_frame(&mut terminal, &mut app)?;
     }
 
+    app.daemon.unsubscribe_queries(app.session_id).await;
     crate::terminal::restore_terminal();
     Ok(())
 }
@@ -164,7 +165,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 async fn resync_subscriptions(app: &mut App) {
     let cursors = app.query_cursors();
     app.subscriptions_dirty = false;
-    match app.daemon.subscribe_queries(&cursors).await {
+    match app.daemon.subscribe_queries(app.session_id, &cursors).await {
         Ok(events) => {
             for event in events {
                 app.handle_daemon_event(event);

@@ -254,7 +254,7 @@ async fn sqlite_backed_runtime_reconciles_convoy_create_into_namespace_view() {
             {
                 break;
             }
-            DaemonEvent::ResultDelta(delta) if delta.changed.as_convoys().is_some_and(|rows| rows.iter().any(sqlite_scratch_ready)) => {
+            DaemonEvent::ResultDelta(delta) if delta.changes.as_convoys().is_some_and(|rows| rows.iter().any(sqlite_scratch_ready)) => {
                 break;
             }
             _ => {}

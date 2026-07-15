@@ -8,7 +8,7 @@ use flotilla_core::{
     daemon::DaemonHandle, in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest,
 };
 use flotilla_protocol::{
-    DaemonEvent, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RoutedPeerMessage,
+    DaemonEvent, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepositoryKey, RoutedPeerMessage,
 };
 use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
@@ -26,6 +26,7 @@ pub(super) enum ForwardResult {
 enum PostHandleAction {
     Updated {
         updated_repo_id: RepoIdentity,
+        repository_key: Option<RepositoryKey>,
         overlay_version: u64,
         peers: Vec<(NodeInfo, flotilla_protocol::ProviderData)>,
     },
@@ -321,6 +322,10 @@ impl PeerRuntime {
                                 let post_handle_action = match pm.handle_inbound(env).await {
                                     HandleResult::Updated(updated_repo_id) => {
                                         let overlay_version = pm.overlay_version();
+                                        let repository_key = pm
+                                            .get_peer_data()
+                                            .values()
+                                            .find_map(|repos| repos.get(&updated_repo_id).and_then(|state| state.repository_key.clone()));
                                         let peers: Vec<(NodeInfo, flotilla_protocol::ProviderData)> = pm
                                             .get_peer_data()
                                             .iter()
@@ -329,7 +334,7 @@ impl PeerRuntime {
                                                     .map(|state| (NodeInfo::new(node_id.clone(), node_id.to_string()), state.provider_data.clone()))
                                             })
                                             .collect();
-                                        PostHandleAction::Updated { updated_repo_id, overlay_version, peers }
+                                        PostHandleAction::Updated { updated_repo_id, repository_key, overlay_version, peers }
                                     }
                                     HandleResult::ResyncRequested { request_id, requester_node_id, reply_via, repo, since_seq: _ } => {
                                         let local_node_id = pm.local_node_id().clone();
@@ -420,14 +425,22 @@ impl PeerRuntime {
                             dispatch_pending_sends(pending_sends).await;
 
                             match post_handle_action {
-                                PostHandleAction::Updated { updated_repo_id, overlay_version, peers } => {
+                                PostHandleAction::Updated { updated_repo_id, repository_key, overlay_version, peers } => {
                                     if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(&updated_repo_id).await {
                                         peer_daemon.set_peer_providers(&local_path, peers, overlay_version).await;
                                     } else {
                                         let synthetic =
                                             crate::peer::synthetic_repo_path(&origin, &updated_repo_id, host_repo_root.as_deref());
                                         if let Err(e) =
-                                            peer_daemon.add_virtual_repo(updated_repo_id.clone(), synthetic.clone(), peers, overlay_version).await
+                                            peer_daemon
+                                                .add_virtual_repo(
+                                                    updated_repo_id.clone(),
+                                                    repository_key,
+                                                    synthetic.clone(),
+                                                    peers,
+                                                    overlay_version,
+                                                )
+                                                .await
                                         {
                                             warn!(repo = %updated_repo_id, err = %e, "failed to add virtual repo");
                                         } else {
@@ -446,6 +459,7 @@ impl PeerRuntime {
                                 } => {
                                     if let Some(local_path) = peer_daemon.preferred_local_path_for_identity(&repo).await {
                                         if let Some((local_providers, seq)) = peer_daemon.get_local_providers(&local_path).await {
+                                            let repository_key = peer_daemon.repository_key_for_path(&local_path).await;
                                             reply_clock.tick(&local_node_id);
                                             let response_clock = reply_clock.clone();
                                             match reply_sender {
@@ -457,6 +471,7 @@ impl PeerRuntime {
                                                             responder_node_id: local_node_id,
                                                             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                                                             repo_identity: repo,
+                                                            repository_key,
                                                             host_repo_root: Some(local_path),
                                                             clock: response_clock,
                                                             seq,
@@ -871,6 +886,7 @@ pub(super) async fn send_local_to_peers(
     let msg = PeerDataMessage {
         origin_node_id: node_id.clone(),
         repo_identity: identity,
+        repository_key: daemon.repository_key_for_path(repo_path).await,
         host_repo_root: Some(repo_path.to_path_buf()),
         clock: clock.clone(),
         kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(local_providers), seq: local_data_version },
@@ -940,6 +956,7 @@ pub(super) async fn send_local_to_peer(
         let msg = PeerDataMessage {
             origin_node_id: node_id.clone(),
             repo_identity: identity,
+            repository_key: daemon.repository_key_for_path(&repo_path).await,
             host_repo_root: Some(repo_path.clone()),
             clock: clock.clone(),
             kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(local_providers), seq: version },

@@ -66,7 +66,6 @@ pub async fn resolve_project_issue_sources(repositories: &TypedResolver<Reposito
         IssueSourceResolution::Available { sources: sources.into_iter().collect() }
     }
 }
-
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {
     spec.display_name = required_value(spec.display_name, "display_name")?;
     spec.default_workflow_ref = required_value(spec.default_workflow_ref, "default_workflow_ref")?;

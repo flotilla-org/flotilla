@@ -31,7 +31,7 @@ fn is_github_source(source: &IssueSource) -> bool {
     matches!(source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
 }
 
-fn parse_issue(source: &IssueSource, v: &serde_json::Value, as_of: DateTime<Utc>) -> Option<Issue> {
+fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime<Utc>) -> Option<Issue> {
     let number = v["number"].as_i64()?;
     let title = v["title"].as_str()?.to_string();
     let body = v["body"].as_str().map(str::to_string);
@@ -45,6 +45,7 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, as_of: DateTime<Utc>
         .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let id = number.to_string();
+    let as_of = v["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).unwrap_or(fetched_at);
     let reference = IssueRef { source: source.clone(), id: id.clone() };
     let association_keys = vec![AssociationKey::IssueRef("github".to_string(), id)];
     Some(
@@ -73,7 +74,8 @@ impl super::IssueProvider for GitHubIssueProvider {
         let as_of = Utc::now();
         let (items, has_more, total) = match &params.search {
             None => {
-                let endpoint = format!("repos/{}/issues?state=open&per_page={}&page={}", source.scope, per_page, page);
+                let endpoint =
+                    format!("repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}", source.scope, per_page, page);
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
                 let raw_items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
                 let issues = raw_items
@@ -86,7 +88,7 @@ impl super::IssueProvider for GitHubIssueProvider {
             Some(search_term) => {
                 let raw_query = format!("repo:{} is:issue is:open {}", source.scope, search_term);
                 let encoded_query = urlencoding::encode(&raw_query);
-                let endpoint = format!("search/issues?q={}&per_page={}&page={}", encoded_query, per_page, page);
+                let endpoint = format!("search/issues?q={}&sort=updated&order=desc&per_page={}&page={}", encoded_query, per_page, page);
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
                 let parsed: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
                 let total = parsed["total_count"].as_u64().and_then(|value| u32::try_from(value).ok());
@@ -131,12 +133,10 @@ impl super::IssueProvider for GitHubIssueProvider {
             }
         }
 
-        // Escalate when there are more pages AND at least one real issue
-        // on this page — remaining pages likely contain more issues too.
-        // When issue_count == 0 (all PRs), don't escalate: there are no
-        // issue changes to miss.
-        let issue_count = updated.len() + closed.len();
-        Ok(IssueChangeset { updated, closed, has_more: response.has_next_page && issue_count > 0 })
+        // A raw page containing only pull requests says nothing about later
+        // pages. Escalate whenever GitHub has another page so the caller does
+        // not advance its cursor past unseen issue changes.
+        Ok(IssueChangeset { updated, closed, has_more: response.has_next_page })
     }
 
     async fn open_in_browser(&self, reference: &IssueRef) -> Result<(), String> {
@@ -153,7 +153,7 @@ mod tests {
     use crate::providers::{
         github_api::{GhApi, GhApiResponse},
         github_test_support::{build_api_and_runner, repo_root_for_recording},
-        issue_tracker::IssueProvider,
+        issue_tracker::{tests::assert_provider_contract, IssueProvider},
         replay::{self, Masks},
         testing::MockRunner,
         ChannelLabel,
@@ -204,26 +204,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_replay_query_and_fetch_issue_by_id() {
+    async fn record_replay_satisfies_provider_contract() {
         let session = replay::test_session(&fixture("github_issues.yaml"), Masks::new());
         let repo_root = if session.is_live() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
         let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
         let provider = GitHubIssueProvider::new(api, runner, repo_root);
 
-        let page = provider.query(&source, &IssueQuery::default(), 1, 30).await.expect("replay query should succeed");
-        assert!(!page.items.is_empty(), "expected at least one open issue in flotilla-org/flotilla");
-        for issue in &page.items {
-            assert!(!issue.reference.id.is_empty());
-            assert!(!issue.title.is_empty());
-            assert_eq!(issue.reference.source, source);
-        }
-
-        let issue =
-            provider.fetch_by_id(&IssueRef { source: source.clone(), id: "747".into() }).await.expect("replay fetch-by-id should succeed");
-        assert_eq!(issue.reference, IssueRef { source, id: "747".into() });
-        assert!(!issue.title.is_empty());
-        assert!(issue.body.is_some());
+        assert_provider_contract(&provider, &source, "747", "2026-07-01T00:00:00Z").await;
 
         session.finish();
     }
@@ -336,9 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_since_has_more_ignores_pr_heavy_pages() {
-        // Page is full (has_next_page) but all items are PRs — has_more should be false
-        // because the filtered issue count is 0, not >= per_page.
+    async fn changed_since_escalates_on_pr_only_page_with_more_raw_results() {
         let body = r#"[
             {"number": 10, "title": "PR A", "state": "open", "labels": [], "pull_request": {"url": "..."}},
             {"number": 11, "title": "PR B", "state": "open", "labels": [], "pull_request": {"url": "..."}}
@@ -356,7 +342,7 @@ mod tests {
 
         assert!(changeset.updated.is_empty());
         assert!(changeset.closed.is_empty());
-        assert!(!changeset.has_more, "should not escalate when all items are PRs");
+        assert!(changeset.has_more, "later raw pages may contain issue changes");
     }
 
     #[tokio::test]

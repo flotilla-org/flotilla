@@ -345,6 +345,7 @@ mod tests {
         PeerWireMessage::Data(PeerDataMessage {
             origin_node_id: NodeId::new(origin),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+            repository_key: None,
             host_repo_root: Some(PathBuf::from("/repo")),
             clock: VectorClock::default(),
             kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq },

@@ -20,6 +20,7 @@ fn snapshot_msg(origin: &str, seq: u64) -> PeerDataMessage {
     PeerDataMessage {
         origin_node_id: NodeId::new(origin),
         repo_identity: test_repo(),
+        repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq },
@@ -65,7 +66,9 @@ fn remote_node(node_id: &str, display_name: &str) -> NodeInfo {
 #[tokio::test]
 async fn handle_snapshot_stores_data() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
-    let msg = snapshot_msg("remote", 1);
+    let mut msg = snapshot_msg("remote", 1);
+    let repository_key = RepositoryKey("repo_peer_opaque".into());
+    msg.repository_key = Some(repository_key.clone());
 
     let result = handle_test_peer_data(&mut mgr, msg, MockPeerSender::discard).await;
     assert_eq!(result, HandleResult::Updated(test_repo()));
@@ -76,6 +79,7 @@ async fn handle_snapshot_stores_data() {
     let repo_state = &peer_data[&remote_host][&test_repo()];
     assert_eq!(repo_state.seq, 1);
     assert_eq!(repo_state.host_repo_root, Some(PathBuf::from("/home/dev/repo")));
+    assert_eq!(repo_state.repository_key, Some(repository_key));
 }
 
 #[tokio::test]
@@ -102,6 +106,7 @@ async fn handle_snapshot_without_host_repo_root_stores_none() {
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("remote"),
         repo_identity: test_repo(),
+        repository_key: None,
         host_repo_root: None,
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
@@ -122,6 +127,7 @@ async fn legacy_direct_request_resync_is_ignored() {
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("remote"),
         repo_identity: test_repo(),
+        repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::RequestResync { since_seq: 3 },
@@ -143,6 +149,7 @@ async fn handle_delta_returns_needs_resync() {
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("remote"),
         repo_identity: test_repo(),
+        repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::Delta {
@@ -231,6 +238,7 @@ async fn relay_skips_peers_already_in_clock() {
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("F1"),
         repo_identity: test_repo(),
+        repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
         clock,
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 1 },
@@ -688,6 +696,7 @@ async fn late_resync_snapshot_is_dropped_without_pending_request() {
                 responder_node_id: NodeId::new("target"),
                 remaining_hops: 3,
                 repo_identity: test_repo(),
+                repository_key: None,
                 host_repo_root: Some(PathBuf::from("/home/dev/repo")),
                 clock: VectorClock::default(),
                 seq: 1,
@@ -1021,6 +1030,7 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
                 responder_node_id: NodeId::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
+                repository_key: None,
                 host_repo_root: baseline.host_repo_root.clone(),
                 clock: baseline.clock.clone(),
                 seq: 1,
@@ -1084,6 +1094,7 @@ async fn failover_resync_accepts_snapshot_without_host_repo_root() {
                 responder_node_id: NodeId::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
+                repository_key: None,
                 host_repo_root: None,
                 clock: baseline.clock.clone(),
                 seq: 1,
@@ -1204,6 +1215,7 @@ async fn failover_resync_clears_stale_and_rebinds_provenance() {
                 responder_node_id: NodeId::new("target"),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
+                repository_key: None,
                 host_repo_root: baseline.host_repo_root.clone(),
                 clock: baseline.clock.clone(),
                 seq: 1,

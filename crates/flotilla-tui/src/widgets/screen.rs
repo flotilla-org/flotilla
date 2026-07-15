@@ -124,13 +124,13 @@ impl Screen {
                 | ViewAddress::Convoy { .. }
                 | ViewAddress::Vessel { .. },
             ) => ActivePage::Table,
-            ViewTarget::View(ViewAddress::Repo(identity)) => {
+            ViewTarget::View(ViewAddress::Repo { identity, .. }) => {
                 if repos.contains_key(identity) {
                     ActivePage::Repo(identity.clone())
                 } else {
                     ActivePage::Error {
                         title: format!("repo not tracked: {}/{}", identity.authority, identity.path),
-                        detail: format!("view address: {}", ViewAddress::Repo(identity.clone())),
+                        detail: format!("view address: {}", ViewAddress::repo(identity.clone())),
                     }
                 }
             }

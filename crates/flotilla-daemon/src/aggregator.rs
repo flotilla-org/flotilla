@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{
-        ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryId, ResultDelta, Rows, SessionPhase, VesselRow, WorkPhase,
+        ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, ResultDelta, Rows, SessionPhase, VesselRow,
+        WorkPhase,
     },
     DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
 };
@@ -20,6 +21,8 @@ use flotilla_resources::{
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
+
+use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer};
 
 type PresentationKey = (String, String, String);
 type SessionKey = (String, String);
@@ -99,6 +102,8 @@ pub struct Aggregator {
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
+    #[builder(skip)]
+    issue_materializer: Option<IssueMaterializer>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
@@ -117,6 +122,7 @@ impl Aggregator {
             bootstrapping: false,
             emitted_queries: HashSet::new(),
             attach_resolver: None,
+            issue_materializer: None,
             event_tx,
         }
     }
@@ -126,6 +132,14 @@ impl Aggregator {
         R: AttachCapabilityResolver + 'static,
     {
         self.attach_resolver = Some(resolver);
+        self
+    }
+
+    pub(crate) fn with_issue_resolver<R>(mut self, resolver: Arc<R>) -> Self
+    where
+        R: IssueMaterializationResolver + 'static,
+    {
+        self.issue_materializer = Some(IssueMaterializer::new(self.state.clone(), resolver, self.event_tx.clone()));
         self
     }
 
@@ -169,6 +183,16 @@ impl Aggregator {
             observed_presentations,
             observed_sessions,
         } = sources;
+        // Subscribe before any source bootstrap awaits so demand arriving
+        // during recovery remains observable. Also consume the initial value
+        // for demand that predates Aggregator startup; #747's source-backed
+        // reconciler plugs into this same initial/change path.
+        let mut demand_rx = self.state.subscribe_demand();
+        let mut fetch_more_rx = self.state.subscribe_fetch_more();
+        let initial_demand = demand_rx.borrow_and_update().clone();
+        if let Some(materializer) = &mut self.issue_materializer {
+            materializer.reconcile(initial_demand);
+        }
         self.bootstrapping = true;
         {
             let mut view = self.state.write().await;
@@ -192,12 +216,34 @@ impl Aggregator {
         let mut observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
         let mut observed_session_stream = self.recover_session_watch(LocalSource::Observed, observed_sessions).await?;
         self.bootstrapping = false;
-        self.emitted_queries.extend(QueryId::ALL.iter().copied());
+        self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set().await)));
 
         loop {
             tokio::select! {
+                demand = demand_rx.changed() => {
+                    if demand.is_err() {
+                        return Err(ResourceError::other("aggregator demand registry closed"));
+                    }
+                    let demanded = demand_rx.borrow_and_update().clone();
+                    if let Some(materializer) = &mut self.issue_materializer {
+                        materializer.reconcile(demanded);
+                    }
+                }
+                intent = fetch_more_rx.recv() => match intent {
+                    Ok((query, generation)) => {
+                        if let Some(materializer) = &self.issue_materializer {
+                            materializer.fetch_more(&query, generation);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "aggregator lagged behind fetch-more intents");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(ResourceError::other("aggregator fetch-more intent channel closed"));
+                    }
+                },
                 event = durable_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Durable, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -585,6 +631,9 @@ impl Aggregator {
                             independent_rows.insert(row.resource.clone(), row);
                         }
                     }
+                    Rows::Issues { .. } => {
+                        tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
+                    }
                 }
             }
             convoy_replacements.insert(host.clone(), convoy_rows);
@@ -620,12 +669,14 @@ impl Aggregator {
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
-        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(changed), removed })));
+        let changes = QueryChanges::Convoys { changed, removed };
+        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
     }
 
     async fn emit_independent_delta(&self, changed: Vec<IndependentRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.independents_seq().await;
-        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Independents(changed), removed })));
+        let changes = QueryChanges::Independents { changed, removed };
+        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
     }
 
     fn convoy_ref(&self, namespace: &str, name: &str) -> ResourceRef {
@@ -1042,7 +1093,7 @@ mod tests {
             host,
             generation: Some(generation.to_string()),
             rows: Vec::new(),
-            result_sets: vec![ResultSet { seq: 1, rows: Rows::Convoys(vec![row]) }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Convoys(vec![row]), state: Default::default() }],
         }
     }
 
@@ -1060,7 +1111,7 @@ mod tests {
             host,
             generation: Some(generation.to_string()),
             rows: Vec::new(),
-            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]) }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]), state: Default::default() }],
         }
     }
 
@@ -1186,9 +1237,12 @@ mod tests {
 
         aggregator.apply_replica_cache(vec![remote_snapshot("feta", "generation-2", "new")]).await;
         let DaemonEvent::ResultDelta(delta) = rx.recv().await.expect("replacement event") else { panic!("expected result delta") };
-        assert_eq!(convoy_names(&delta.changed), vec!["new"]);
-        assert_eq!(delta.removed.len(), 1);
-        assert_eq!(delta.removed[0].name, "old");
+        assert_eq!(delta.changes.as_convoys().expect("convoy changes").iter().map(|row| row.name.as_str()).collect::<Vec<_>>(), vec![
+            "new"
+        ]);
+        let removed = delta.changes.removed_resources().expect("convoy removals");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "old");
 
         let result_set = state.result_set().await;
         assert_eq!(convoy_names(&result_set.rows), vec!["new"]);
@@ -1237,9 +1291,10 @@ mod tests {
 
         aggregator.apply_replica_cache(Vec::new()).await;
         let DaemonEvent::ResultDelta(delta) = rx.recv().await.expect("removal event") else { panic!("expected result delta") };
-        assert!(delta.changed.is_empty());
-        assert_eq!(delta.removed.len(), 1);
-        assert_eq!(delta.removed[0].name, "feta-convoy");
+        assert!(delta.changes.as_convoys().expect("convoy changes").is_empty());
+        let removed = delta.changes.removed_resources().expect("convoy removals");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "feta-convoy");
         assert!(state.result_set().await.rows.is_empty());
     }
 
@@ -1322,8 +1377,9 @@ mod tests {
 
         let removal = recv_query_event(&mut event_rx, QueryId::Convoys, "relist delta timeout").await;
         let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected relist delta") };
-        assert_eq!(removal.removed.len(), 1);
-        assert_eq!(removal.removed[0].name, "deleted-while-watch-expired");
+        let removed = removal.changes.removed_resources().expect("convoy removals");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "deleted-while-watch-expired");
         assert!(state.result_set().await.rows.is_empty());
         assert_eq!(durable_convoys.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 2);
@@ -1372,8 +1428,9 @@ mod tests {
 
         let removal = recv_query_event(&mut event_rx, QueryId::Independents, "independents relist delta timeout").await;
         let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected independents relist delta") };
-        assert_eq!(removal.removed.len(), 1);
-        assert_eq!(removal.removed[0].name, "deleted-while-watch-expired");
+        let removed = removal.changes.removed_resources().expect("independent removals");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "deleted-while-watch-expired");
         assert!(state.independents_result_set().await.rows.is_empty());
         assert_eq!(durable_sessions.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(durable_sessions.watch_calls.load(Ordering::SeqCst), 2);
@@ -1468,9 +1525,9 @@ mod tests {
 
         let update = recv_query_event(&mut event_rx, QueryId::Convoys, "relist delta timeout").await;
         let DaemonEvent::ResultDelta(update) = update else { panic!("expected relist delta") };
-        let changed = update.changed.as_convoys().expect("changed convoy rows").first().expect("changed convoy row");
+        let changed = update.changes.as_convoys().expect("changed convoy rows").first().expect("changed convoy row");
         assert_eq!(changed.vessels.first().expect("changed vessel row").attach, None);
-        assert!(update.removed.is_empty());
+        assert!(update.changes.removed_resources().expect("convoy removals").is_empty());
         assert_eq!(durable_presentations.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(durable_presentations.watch_calls.load(Ordering::SeqCst), 2);
         assert_eq!(durable_convoys.watch_calls.load(Ordering::SeqCst), 1, "healthy watch must not restart");

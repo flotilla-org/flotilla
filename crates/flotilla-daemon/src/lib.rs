@@ -1,4 +1,5 @@
 mod aggregator;
+mod issue_materializer;
 pub use aggregator::{Aggregator, AggregatorResolvers};
 
 pub mod cli;

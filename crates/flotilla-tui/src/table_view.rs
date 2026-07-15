@@ -297,7 +297,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 vessel: vessel_row.clone(),
             }]))
         }
-        ViewAddress::Overview | ViewAddress::Repo(_) => Err(format!("view is not table-backed: {address}")),
+        ViewAddress::Overview | ViewAddress::Repo { .. } => Err(format!("view is not table-backed: {address}")),
     }
 }
 

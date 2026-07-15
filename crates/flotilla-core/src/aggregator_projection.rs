@@ -5,13 +5,19 @@
 //! counter per query. Each named query instantiates it with that query's
 //! typed row.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use flotilla_protocol::{
-    result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet, Rows},
-    HostName, ResourceRef,
+    result_set::{ConvoyRow, IndependentRow, IssueRow, QueryId, ResultDelta, ResultSet, ResultSetState, Rows},
+    HostName, IssueRef, QueryCursor, ResourceRef,
 };
-use tokio::sync::{RwLock, RwLockWriteGuard};
+use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
+use uuid::Uuid;
+
+use crate::query_registry::QueryRegistry;
 
 /// A typed row of some named query's result set.
 pub trait QueryRow: Clone {
@@ -72,7 +78,7 @@ impl<R: QueryRow> QueryProjection<R> {
             let right = right.resource();
             (&left.namespace, &left.name, &left.host).cmp(&(&right.namespace, &right.name, &right.host))
         });
-        ResultSet { seq: self.seq, rows: R::into_rows(rows) }
+        ResultSet { seq: self.seq, rows: R::into_rows(rows), state: Default::default() }
     }
 }
 
@@ -110,6 +116,9 @@ impl<R: QueryRow + PartialEq> QueryProjection<R> {
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
     independents: Arc<RwLock<QueryProjection<IndependentRow>>>,
+    /// Subscriber ownership and demand-backed materializations belong to the
+    /// Aggregator state, shared with the daemon's subscription transport.
+    demand_backed: QueryRegistry,
 }
 
 impl AggregatorProjectionState {
@@ -149,24 +158,59 @@ impl AggregatorProjectionState {
         self.independents.read().await.local_result_set()
     }
 
-    /// This host's local result sets across all named queries, in the order
-    /// of [`QueryId::ALL`].
+    /// This host's local store-backed result sets. Demand-backed reference
+    /// data is never included in fleet replica snapshots.
     pub async fn local_result_sets(&self) -> Vec<ResultSet> {
-        let mut result_sets = Vec::with_capacity(QueryId::ALL.len());
-        for query in QueryId::ALL {
-            result_sets.push(match query {
-                QueryId::Convoys => self.local_result_set().await,
-                QueryId::Independents => self.local_independents_result_set().await,
-            });
-        }
-        result_sets
+        vec![self.local_result_set().await, self.local_independents_result_set().await]
+    }
+
+    /// Replace one subscriber's complete demand and return queries whose
+    /// materialization lifetime was newly created.
+    pub fn replace_subscriber(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
+        self.demand_backed.replace(subscriber, cursors)
+    }
+
+    pub fn remove_subscriber(&self, subscriber: Uuid) {
+        self.demand_backed.remove(subscriber);
+    }
+
+    /// Observe the complete set of live demand-backed query identities.
+    /// The Aggregator uses this to start and stop source materializers.
+    pub fn subscribe_demand(&self) -> watch::Receiver<HashMap<QueryId, u64>> {
+        self.demand_backed.subscribe_demand()
+    }
+
+    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<(QueryId, u64)> {
+        self.demand_backed.subscribe_fetch_more()
+    }
+
+    pub fn request_fetch_more(&self, query: &QueryId) -> Result<(), String> {
+        self.demand_backed.request_fetch_more(query)
+    }
+
+    /// Replace the fetched window for a live issue materialization. Results
+    /// racing with teardown are ignored by the registry.
+    pub fn replace_issues(&self, query: &QueryId, generation: u64, rows: Vec<IssueRow>, state: ResultSetState) -> Option<ResultSet> {
+        self.demand_backed.replace_issues(query, generation, rows, state)
+    }
+
+    pub fn apply_issue_changes(
+        &self,
+        query: &QueryId,
+        generation: u64,
+        changed: Vec<IssueRow>,
+        removed: Vec<IssueRef>,
+        state: ResultSetState,
+    ) -> Option<ResultDelta> {
+        self.demand_backed.apply_issue_changes(query, generation, changed, removed, state)
     }
 
     /// The current fleet-merged result set for one named query.
-    pub async fn result_set_for(&self, query: QueryId) -> ResultSet {
+    pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {
-            QueryId::Convoys => self.result_set().await,
-            QueryId::Independents => self.independents_result_set().await,
+            QueryId::Convoys => Some(self.result_set().await),
+            QueryId::Independents => Some(self.independents_result_set().await),
+            QueryId::Issues { .. } => self.demand_backed.result_set(query),
         }
     }
 }
