@@ -86,7 +86,7 @@ async fn do_client_hello(session: &MessageSession) -> Result<(), String> {
 pub struct SocketDaemon {
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_tx: broadcast::WeakSender<DaemonEvent>,
     next_id: Arc<AtomicU64>,
     reader_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Local snapshot seq per repo, for gap detection.
@@ -120,6 +120,7 @@ impl SocketDaemon {
         let session = Arc::new(session);
 
         let (event_tx, _) = broadcast::channel(256);
+        let event_tx_weak = event_tx.downgrade();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(AtomicU64::new(1));
         let local_seqs: Arc<SeqMap> = Arc::new(std::sync::RwLock::new(HashMap::new()));
@@ -133,13 +134,14 @@ impl SocketDaemon {
             local_seqs: Arc::clone(&local_seqs),
             subscribed_queries: Arc::clone(&subscribed_queries),
             recovering,
-            event_tx: event_tx.clone(),
+            event_tx: event_tx_weak.clone(),
             session: Arc::clone(&session),
             pending: Arc::clone(&pending),
             next_id: Arc::clone(&next_id),
             initial_sync_complete: Arc::clone(&initial_sync_complete),
         };
         let reader_task = tokio::spawn(async move {
+            let _event_channel_guard = event_tx;
             loop {
                 match reader_session.read().await {
                     Ok(Some(msg)) => match msg {
@@ -166,7 +168,7 @@ impl SocketDaemon {
                     },
                     Ok(None) => {
                         // EOF — daemon closed connection
-                        error!("daemon connection closed (EOF)");
+                        tracing::info!("daemon connection closed; notifying subscribers");
                         let mut map = reader_context.pending.lock().await;
                         for (_, tx) in map.drain() {
                             let _ = tx.send(ResponseResult::Err { message: "daemon connection closed".into() });
@@ -174,7 +176,7 @@ impl SocketDaemon {
                         break;
                     }
                     Err(e) => {
-                        error!(err = %e, "error reading from daemon session");
+                        warn!(err = %e, "error reading from daemon session; notifying subscribers");
                         let mut map = reader_context.pending.lock().await;
                         for (_, tx) in map.drain() {
                             let _ = tx.send(ResponseResult::Err { message: format!("daemon read error: {e}") });
@@ -188,7 +190,7 @@ impl SocketDaemon {
         let daemon = Arc::new(Self {
             session,
             pending: Arc::clone(&pending),
-            event_tx: event_tx.clone(),
+            event_tx: event_tx_weak,
             next_id: Arc::clone(&next_id),
             reader_task: std::sync::Mutex::new(Some(reader_task)),
             local_seqs: Arc::clone(&local_seqs),
@@ -539,7 +541,7 @@ struct EventContext {
     local_seqs: Arc<SeqMap>,
     subscribed_queries: Arc<QuerySet>,
     recovering: Arc<std::sync::Mutex<HashMap<RepoIdentity, Vec<DaemonEvent>>>>,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_tx: broadcast::WeakSender<DaemonEvent>,
     session: Arc<MessageSession>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseResult>>>>,
     next_id: Arc<AtomicU64>,
@@ -551,6 +553,12 @@ fn repo_gap_log_level(local_seq: Option<u64>, initial_sync_complete: bool) -> tr
         tracing::Level::WARN
     } else {
         tracing::Level::DEBUG
+    }
+}
+
+fn send_event(event_tx: &broadcast::WeakSender<DaemonEvent>, event: DaemonEvent) {
+    if let Some(event_tx) = event_tx.upgrade() {
+        let _ = event_tx.send(event);
     }
 }
 
@@ -568,7 +576,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
             // Sync lock: update seq before dispatching event so a
             // quickly-following delta sees the correct local seq.
             local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Repo { identity: snap.repo_identity.clone() }, snap.seq);
-            let _ = event_tx.send(event);
+            send_event(event_tx, event);
         }
         DaemonEvent::RepoDelta(delta) => {
             let repo = delta.repo.clone();
@@ -586,7 +594,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
                     // Happy path: apply delta (sync lock, no spawn needed)
                     local_seqs.write().expect("sequence lock poisoned").insert(stream_key, seq);
                     debug!(repo_identity = %repo_identity, repo = ?repo, %prev_seq, %seq, "applied delta");
-                    let _ = event_tx.send(event);
+                    send_event(event_tx, event);
                 }
                 _ => {
                     // Seq gap or unknown repo — spawn recovery if not already in progress.
@@ -637,20 +645,20 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
         DaemonEvent::RepoUntracked { repo_identity, .. } => {
             // Sync lock: evict before dispatching
             local_seqs.write().expect("sequence lock poisoned").remove(&StreamKey::Repo { identity: repo_identity.clone() });
-            let _ = event_tx.send(event);
+            send_event(event_tx, event);
         }
         DaemonEvent::HostRemoved { environment_id, seq } => {
             local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Host { environment_id: environment_id.clone() }, *seq);
-            let _ = event_tx.send(event);
+            send_event(event_tx, event);
         }
         DaemonEvent::HostSnapshot(snap) => {
             let stream_key = StreamKey::Host { environment_id: snap.environment_id.clone() };
             local_seqs.write().expect("sequence lock poisoned").insert(stream_key, snap.seq);
-            let _ = event_tx.send(event);
+            send_event(event_tx, event);
         }
         DaemonEvent::ResultSet(result_set) => {
             local_seqs.write().expect("sequence lock poisoned").insert(StreamKey::Query { query: result_set.query() }, result_set.seq);
-            let _ = event_tx.send(event);
+            send_event(event_tx, event);
         }
         DaemonEvent::ResultDelta(delta) => {
             let query = delta.query();
@@ -662,7 +670,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
                 Some(ls) if seq == ls + 1 => {
                     local_seqs.write().expect("sequence lock poisoned").insert(stream_key, seq);
                     debug!(%query, %seq, "applied result delta");
-                    let _ = event_tx.send(event);
+                    send_event(event_tx, event);
                 }
                 Some(ls) if seq <= ls => {
                     // Already covered by the current result set — e.g. a live
@@ -689,7 +697,7 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
         | DaemonEvent::CommandFinished { .. }
         | DaemonEvent::CommandStepUpdate { .. }
         | DaemonEvent::PeerStatusChanged { .. } => {
-            let _ = event_tx.send(event);
+            send_event(event_tx, event);
         }
     }
 }
@@ -757,7 +765,7 @@ async fn recover_from_gap(ctx: &EventContext) {
                     }
                 }
                 for event in events {
-                    let _ = event_tx.send(event);
+                    send_event(event_tx, event);
                 }
             }
             Ok(other) => {
@@ -819,7 +827,7 @@ async fn recover_query_gap(ctx: &EventContext) {
                 debug!(event_count = events.len(), "query gap recovery: got result sets");
                 seed_query_seqs(local_seqs, &events);
                 for event in events {
-                    let _ = event_tx.send(event);
+                    send_event(event_tx, event);
                 }
             }
             Ok(other) => {
@@ -838,7 +846,14 @@ async fn recover_query_gap(ctx: &EventContext) {
 #[async_trait]
 impl DaemonHandle for SocketDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-        self.event_tx.subscribe()
+        match self.event_tx.upgrade() {
+            Some(event_tx) => event_tx.subscribe(),
+            None => {
+                let (event_tx, receiver) = broadcast::channel(1);
+                drop(event_tx);
+                receiver
+            }
+        }
     }
 
     async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {

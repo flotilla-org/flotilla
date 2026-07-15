@@ -633,8 +633,24 @@ fn print_bootstrap_events(events: &[DaemonEvent], replay_seqs: &mut HashMap<Stre
 }
 
 pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
-    let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
+    let mut backoff = crate::pm_connect::ReconnectBackoff::default();
+    loop {
+        match SocketDaemon::connect(socket_path).await {
+            Ok(daemon) => {
+                backoff.reset();
+                if let Err(error) = run_watch_connection(daemon, format).await {
+                    eprintln!("{error}; reconnecting...");
+                }
+            }
+            Err(error) if crate::pm_connect::is_incompatible_daemon_error(&error) => return Err(error),
+            Err(error) => eprintln!("cannot connect to daemon: {error}; retrying..."),
+        }
 
+        tokio::time::sleep(backoff.next_delay()).await;
+    }
+}
+
+async fn run_watch_connection(daemon: std::sync::Arc<dyn DaemonHandle>, format: OutputFormat) -> Result<(), String> {
     // Subscribe before replay so events emitted between replay and the loop
     // are buffered rather than silently dropped.
     let mut rx = daemon.subscribe();
@@ -683,14 +699,9 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("warning: skipped {n} events");
             }
-            Err(_) => {
-                eprintln!("daemon disconnected");
-                break;
-            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon disconnected".to_string()),
         }
     }
-
-    Ok(())
 }
 
 pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {

@@ -246,3 +246,50 @@ fn resolve_pm_prefers_explicit_socket_then_environment_detection() {
     let error = resolve_pm(&detect, &|_| None).map(|_| ()).expect_err("no PM detected");
     assert!(error.contains("no presentation manager detected"));
 }
+
+#[test]
+fn reconnect_backoff_doubles_and_caps_with_jitter() {
+    let mut backoff = ReconnectBackoff::default();
+    let delays: Vec<_> = (0..8).map(|_| backoff.next_delay_with_jitter(1.0)).collect();
+
+    assert_eq!(delays, vec![
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    ]);
+
+    backoff.reset();
+    assert_eq!(backoff.next_delay_with_jitter(0.0), Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn reconnect_loop_retries_unavailable_daemon_but_exits_for_incompatible_daemon() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_connect = Arc::clone(&attempts);
+
+    let result = run_reconnecting(
+        move || {
+            let attempt = attempts_for_connect.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                let message = if attempt < 3 {
+                    "daemon unavailable".to_string()
+                } else {
+                    "daemon protocol version mismatch: daemon has 8, client has 9".to_string()
+                };
+                Err::<Arc<dyn DaemonHandle>, _>(message)
+            }
+        },
+        |_| async { Ok(()) },
+        ReconnectBackoff { next_base: Duration::ZERO },
+    )
+    .await;
+
+    let error = result.expect_err("an incompatible daemon must terminate retries");
+    assert!(error.contains("protocol version mismatch"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 3, "ordinary connection failures must keep retrying");
+}

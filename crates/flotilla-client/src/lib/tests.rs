@@ -59,7 +59,7 @@ fn test_context(
         local_seqs: Arc::clone(local_seqs),
         subscribed_queries: Arc::clone(subscribed_queries),
         recovering: Arc::clone(recovering),
-        event_tx: event_tx.clone(),
+        event_tx: event_tx.downgrade(),
         session: Arc::clone(session),
         pending: Arc::clone(pending),
         next_id: Arc::clone(next_id),
@@ -402,6 +402,18 @@ async fn session_backed_daemon_streams_events_to_subscribers() {
         DaemonEvent::CommandStarted { command_id: 99, repo_identity: actual_identity, repo: actual_repo, ref description, .. }
             if actual_identity == repo_identity && actual_repo == Some(repo.clone()) && description == "from session"
     ));
+}
+
+#[tokio::test]
+async fn session_eof_closes_event_subscribers() {
+    let (client, server) = message_session_pair();
+    let daemon = SocketDaemon::from_session(client).expect("build session-backed daemon");
+    let mut events = daemon.subscribe();
+
+    drop(server);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), events.recv()).await.expect("subscriber should be notified of EOF");
+    assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
 }
 
 #[tokio::test]

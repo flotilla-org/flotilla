@@ -14,6 +14,7 @@ pub enum Event {
     Key(crossterm::event::KeyEvent),
     Mouse(crossterm::event::MouseEvent),
     Daemon(Box<DaemonEvent>),
+    DaemonDisconnected,
 }
 
 pub struct EventHandler {
@@ -80,7 +81,7 @@ impl EventHandler {
             let _ = task.await;
         }
         while let Ok(event) = self.rx.try_recv() {
-            if matches!(event, Event::Daemon(_)) {
+            if matches!(event, Event::Daemon(_) | Event::DaemonDisconnected) {
                 self.retained.push_back(event);
             }
         }
@@ -107,7 +108,10 @@ impl EventHandler {
                         tracing::warn!(skipped = n, "daemon event receiver lagged");
                         continue;
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let _ = tx.send(Event::DaemonDisconnected);
+                        break;
+                    }
                 }
             }
         });
@@ -131,5 +135,22 @@ impl Drop for EventHandler {
         if let Some(task) = self.terminal_task.take() {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_daemon_receiver_is_forwarded_to_event_loop() {
+        let mut handler = EventHandler::new(Duration::from_secs(60));
+        let (daemon_tx, daemon_rx) = broadcast::channel(4);
+        handler.attach_daemon(daemon_rx);
+
+        drop(daemon_tx);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), handler.next()).await.expect("disconnect event");
+        assert!(matches!(event, Some(Event::DaemonDisconnected)));
     }
 }
