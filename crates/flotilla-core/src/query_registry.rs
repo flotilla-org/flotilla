@@ -4,8 +4,11 @@ use std::{
 };
 
 use chrono::Utc;
-use flotilla_protocol::{DemandBackedMetadata, QueryCursor, QueryId, ResultSet, ResultSetCondition, ResultSetState, Rows};
-use tokio::sync::watch;
+use flotilla_protocol::{
+    DemandBackedMetadata, IssueRef, IssueRow, QueryChanges, QueryCursor, QueryId, ResultDelta, ResultSet, ResultSetCondition,
+    ResultSetState, Rows,
+};
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 /// Subscriber ownership and live state for demand-backed query
@@ -15,6 +18,7 @@ use uuid::Uuid;
 pub struct QueryRegistry {
     inner: Arc<Mutex<RegistryState>>,
     demand_tx: watch::Sender<HashSet<QueryId>>,
+    fetch_more_tx: broadcast::Sender<QueryId>,
 }
 
 #[derive(Default, Debug)]
@@ -26,7 +30,8 @@ struct RegistryState {
 impl Default for QueryRegistry {
     fn default() -> Self {
         let (demand_tx, _) = watch::channel(HashSet::new());
-        Self { inner: Arc::new(Mutex::new(RegistryState::default())), demand_tx }
+        let (fetch_more_tx, _) = broadcast::channel(32);
+        Self { inner: Arc::new(Mutex::new(RegistryState::default())), demand_tx, fetch_more_tx }
     }
 }
 
@@ -55,8 +60,63 @@ impl QueryRegistry {
         self.inner.lock().expect("query registry lock poisoned").demand_backed.get(query).cloned()
     }
 
+    /// Replace the current window of a live issue materialization. A fetch
+    /// that completes after the last subscriber left is discarded.
+    pub fn replace_issues(&self, query: &QueryId, rows: Vec<IssueRow>, result_state: ResultSetState) -> Option<ResultSet> {
+        let QueryId::Issues { scope } = query else { return None };
+        let mut state = self.inner.lock().expect("query registry lock poisoned");
+        let current = state.demand_backed.get_mut(query)?;
+        *current = ResultSet { seq: current.seq.saturating_add(1), rows: Rows::Issues { scope: scope.clone(), rows }, state: result_state };
+        Some(current.clone())
+    }
+
+    /// Apply an ordinary typed issue delta to a live materialization and keep
+    /// its replayable full window in sync.
+    pub fn apply_issue_changes(
+        &self,
+        query: &QueryId,
+        changed: Vec<IssueRow>,
+        removed: Vec<IssueRef>,
+        result_state: ResultSetState,
+    ) -> Option<ResultDelta> {
+        let QueryId::Issues { scope } = query else { return None };
+        let mut registry = self.inner.lock().expect("query registry lock poisoned");
+        let current = registry.demand_backed.get_mut(query)?;
+        let Rows::Issues { rows, .. } = &mut current.rows else { return None };
+        let mut by_reference = rows.drain(..).map(|row| (row.reference.clone(), row)).collect::<HashMap<_, _>>();
+        for reference in &removed {
+            by_reference.remove(reference);
+        }
+        for row in &changed {
+            by_reference.insert(row.reference.clone(), row.clone());
+        }
+        *rows = by_reference.into_values().collect();
+        rows.sort_by(|left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)));
+        current.seq = current.seq.saturating_add(1);
+        current.state = result_state.clone();
+        Some(ResultDelta {
+            seq: current.seq,
+            changes: QueryChanges::Issues { scope: scope.clone(), changed, removed },
+            state: Some(result_state),
+        })
+    }
+
     pub fn subscribe_demand(&self) -> watch::Receiver<HashSet<QueryId>> {
         self.demand_tx.subscribe()
+    }
+
+    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<QueryId> {
+        self.fetch_more_tx.subscribe()
+    }
+
+    pub fn request_fetch_more(&self, query: &QueryId) -> Result<(), String> {
+        let state = self.inner.lock().expect("query registry lock poisoned");
+        let result = state.demand_backed.get(query).ok_or_else(|| format!("query is not materialized: {query}"))?;
+        if !result.state.demand.as_ref().is_some_and(|metadata| metadata.has_more) {
+            return Err(format!("query has no more rows: {query}"));
+        }
+        drop(state);
+        self.fetch_more_tx.send(query.clone()).map(|_| ()).map_err(|_| "issue materializer is unavailable".to_string())
     }
 
     fn publish_demand(&self, state: &RegistryState) {
@@ -91,9 +151,6 @@ fn reconcile_demand(state: &mut RegistryState) -> HashSet<QueryId> {
     created
 }
 
-/// Until #747 supplies source resolution and the source-addressed provider
-/// seam, a live issue query is explicitly unavailable. It must never be
-/// represented as an ordinary empty issue window.
 fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
     let QueryId::Issues { scope } = query else { unreachable!("demand-backed registry only materializes issue queries") };
     ResultSet {
@@ -103,7 +160,7 @@ fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
             demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
             conditions: vec![ResultSetCondition::IssueSourceUnavailable {
                 source: None,
-                message: "issue source resolution is unavailable until #747 supplies the source-addressed fetch seam".to_string(),
+                message: "issue source materialization is pending".to_string(),
             }],
         },
     }
@@ -196,5 +253,21 @@ mod tests {
 
         let mut demand = registry.subscribe_demand();
         assert_eq!(*demand.borrow_and_update(), HashSet::from([query]));
+    }
+
+    #[test]
+    fn fetch_more_intent_is_available_only_for_a_live_window_with_more_rows() {
+        let registry = QueryRegistry::default();
+        let query = issues("paged");
+        registry.replace(Uuid::new_v4(), &[cursor(query.clone())]);
+        registry.replace_issues(&query, vec![], ResultSetState {
+            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
+            conditions: vec![],
+        });
+        let mut intents = registry.subscribe_fetch_more();
+
+        registry.request_fetch_more(&query).expect("live paged query accepts fetch-more");
+
+        assert_eq!(intents.try_recv().expect("fetch-more intent"), query);
     }
 }

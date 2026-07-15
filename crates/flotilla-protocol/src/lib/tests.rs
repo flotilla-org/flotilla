@@ -653,3 +653,11 @@ fn subscribe_queries_request_round_trips_cursors() {
     let decoded: Request = serde_json::from_str(&encoded).expect("deserialize subscribe request");
     assert_eq!(decoded, request);
 }
+
+#[test]
+fn fetch_more_request_round_trips_parameterized_query() {
+    let request = Request::FetchMore { query: QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_widget".into())) } };
+    let encoded = serde_json::to_string(&request).expect("serialize fetch-more request");
+    assert!(encoded.contains("\"fetch_more\""));
+    assert_eq!(serde_json::from_str::<Request>(&encoded).expect("deserialize fetch-more request"), request);
+}

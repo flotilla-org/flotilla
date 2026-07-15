@@ -13,7 +13,7 @@ pub mod ui_state;
 pub(crate) mod view_kind;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -379,6 +379,12 @@ pub struct App {
     pub repo_data: HashMap<RepoIdentity, Shared<RepoData>>,
     /// Per-repo issue paging state, driven by stateless queries.
     pub issue_views: HashMap<RepoIdentity, issue_view::IssueViewState>,
+    /// Demand-backed issue windows keyed by their fully parameterized query.
+    /// Default issue sections consume this; stateless paging remains for
+    /// ephemeral searches beyond the window.
+    pub materialized_issue_rows: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::IssueRow>>,
+    pub materialized_issue_states: HashMap<flotilla_protocol::QueryId, flotilla_protocol::ResultSetState>,
+    pub pending_fetch_more: HashSet<flotilla_protocol::QueryId>,
     /// Sender half for background issue query tasks. Cloned into spawned tasks.
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
     /// Receiver half, drained each event-loop iteration.
@@ -473,6 +479,9 @@ impl App {
             screen,
             repo_data: repo_data_map,
             issue_views: HashMap::new(),
+            materialized_issue_rows: HashMap::new(),
+            materialized_issue_states: HashMap::new(),
+            pending_fetch_more: HashSet::new(),
             issue_update_tx,
             issue_update_rx,
             session_id,
@@ -831,6 +840,9 @@ impl App {
 
     /// Fetch default issues for a repo if they haven't been fetched yet.
     fn maybe_fetch_default_issues(&mut self, repo_identity: &RepoIdentity) {
+        if self.model.repos.get(repo_identity).is_some_and(|repo| repo.repository_key.is_some()) {
+            return;
+        }
         if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
             return;
         }
@@ -881,6 +893,33 @@ impl App {
             handle.mutate(|d| {
                 d.issue_rows = issue_rows;
                 d.issue_section_label = label;
+            });
+        }
+    }
+
+    fn push_materialized_issue_items_to_repo_data(&self, query: &flotilla_protocol::QueryId) {
+        let flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::Repository(repository_key) } = query else {
+            return;
+        };
+        let Some((identity, repo)) = self.model.repos.iter().find(|(_, repo)| repo.repository_key.as_ref() == Some(repository_key)) else {
+            return;
+        };
+        if self.issue_views.get(identity).and_then(|view| view.search.as_ref()).is_some() {
+            return;
+        }
+        let rows = self.materialized_issue_rows.get(query).cloned().unwrap_or_default();
+        let issue_rows = rows
+            .into_iter()
+            .map(|row| crate::widgets::section_table::IssueRow {
+                id: format!("{}\0{}\0{}", row.reference.source.service, row.reference.source.scope, row.reference.id),
+                issue: row.issue,
+            })
+            .collect();
+        if let Some(handle) = self.repo_data.get(identity) {
+            let label = repo.labels.issues.section.clone();
+            handle.mutate(|data| {
+                data.issue_rows = issue_rows;
+                data.issue_section_label = label;
             });
         }
     }
@@ -1231,7 +1270,9 @@ impl App {
                 }
             }
             DaemonEvent::ResultSet(result_set) => {
-                self.query_seqs.insert(result_set.query(), result_set.seq);
+                let query = result_set.query();
+                self.pending_fetch_more.remove(&query);
+                self.query_seqs.insert(query.clone(), result_set.seq);
                 match &result_set.rows {
                     flotilla_protocol::Rows::Convoys(rows) => {
                         for namespace in self.namespaces.values_mut() {
@@ -1254,11 +1295,17 @@ impl App {
                             entry.independents.insert(row.resource.clone(), row.clone());
                         }
                     }
-                    flotilla_protocol::Rows::Issues { .. } => {}
+                    flotilla_protocol::Rows::Issues { rows, .. } => {
+                        self.materialized_issue_rows.insert(query.clone(), rows.clone());
+                        self.materialized_issue_states.insert(query.clone(), result_set.state.clone());
+                        self.push_materialized_issue_items_to_repo_data(&query);
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
-                self.query_seqs.insert(delta.query(), delta.seq);
+                let query = delta.query();
+                self.pending_fetch_more.remove(&query);
+                self.query_seqs.insert(query.clone(), delta.seq);
                 match &delta.changes {
                     flotilla_protocol::QueryChanges::Convoys { changed, removed } => {
                         for row in changed {
@@ -1286,7 +1333,24 @@ impl App {
                             }
                         }
                     }
-                    flotilla_protocol::QueryChanges::Issues { .. } => {}
+                    flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
+                        let rows = self.materialized_issue_rows.entry(query.clone()).or_default();
+                        rows.retain(|row| !removed.contains(&row.reference));
+                        for changed in changed {
+                            if let Some(existing) = rows.iter_mut().find(|row| row.reference == changed.reference) {
+                                *existing = changed.clone();
+                            } else {
+                                rows.push(changed.clone());
+                            }
+                        }
+                        rows.sort_by(|left, right| {
+                            right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference))
+                        });
+                        if let Some(state) = &delta.state {
+                            self.materialized_issue_states.insert(query.clone(), state.clone());
+                        }
+                        self.push_materialized_issue_items_to_repo_data(&query);
+                    }
                 }
             }
         }

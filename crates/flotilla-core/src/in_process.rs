@@ -27,14 +27,15 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
-    external_patches as convoy_external_patches, normalize_project_spec, terminal_session_attach_target, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus,
-    Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment,
-    InMemoryBackend, InputMeta, InputValue, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
-    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    external_patches as convoy_external_patches, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target,
+    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
+    Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, IssueSourceResolution, IssueSourceUnavailable,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec,
+    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
+    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WorkflowTemplate,
+    WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -1269,6 +1270,12 @@ impl InProcessDaemon {
     }
 
     pub async fn fetch_issue_by_ref(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
+        self.issue_provider_for_source(&reference.source).await?.fetch_by_id(reference).await
+    }
+
+    /// Resolve a portable issue source to a provider capability installed on
+    /// this host. Provider names and credentials remain local.
+    pub async fn issue_provider_for_source(&self, source: &flotilla_protocol::IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
         let host_bag = self
             .environment_manager
             .environment_bag(&self.local_environment_id)
@@ -1284,9 +1291,55 @@ impl InProcessDaemon {
             .discover_for_environment(&self.local_environment_id, &host_bag, &self.discovery.factories, &self.config, &probe_root, runner)
             .await;
         let provider = host_scoped
-            .issue_provider_for(&reference.source)
-            .ok_or_else(|| format!("no issue provider available for {} {}", reference.source.service, reference.source.scope))?;
-        provider.fetch_by_id(reference).await
+            .issue_provider_for(source)
+            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
+        Ok(provider)
+    }
+
+    /// Resolve a curated query scope to external issue sources. Repository
+    /// keys live in the daemon provisioning namespace; Project scopes carry
+    /// their namespace explicitly.
+    pub async fn resolve_issue_sources(
+        &self,
+        scope: &flotilla_protocol::QueryScope,
+    ) -> Result<Vec<flotilla_protocol::IssueSource>, String> {
+        match scope {
+            flotilla_protocol::QueryScope::Repository(key) => {
+                let namespace = self.provisioning_namespace().await;
+                let repository = self
+                    .resource_backend
+                    .clone()
+                    .using::<Repository>(&namespace)
+                    .get(&key.to_string())
+                    .await
+                    .map_err(|error| format!("repository {key}: {error}"))?;
+                repository
+                    .spec
+                    .forge()
+                    .map(|forge| {
+                        vec![flotilla_protocol::IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() }]
+                    })
+                    .ok_or_else(|| format!("repository {key} has no issue source"))
+            }
+            flotilla_protocol::QueryScope::Project { namespace, name } => {
+                let project = self
+                    .resource_backend
+                    .clone()
+                    .using::<Project>(namespace)
+                    .get(name)
+                    .await
+                    .map_err(|error| format!("project {namespace}/{name}: {error}"))?;
+                match resolve_project_issue_sources(&self.resource_backend.clone().using::<Repository>(namespace), &project.spec).await {
+                    IssueSourceResolution::Available { sources } => Ok(sources),
+                    IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
+                        Err(format!("repository {repository}: {message}"))
+                    }
+                    IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => {
+                        Err(format!("project {namespace}/{name} has no issue source"))
+                    }
+                }
+            }
+        }
     }
 
     pub fn command_runner_for_environment(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
@@ -4551,6 +4604,10 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn unsubscribe_queries(&self, subscriber_id: uuid::Uuid) {
         self.aggregator_projection_state().await.remove_subscriber(subscriber_id);
+    }
+
+    async fn fetch_more(&self, query: &flotilla_protocol::QueryId) -> Result<(), String> {
+        self.aggregator_projection_state().await.request_fetch_more(query)
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {

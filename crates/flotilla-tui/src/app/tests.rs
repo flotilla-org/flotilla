@@ -1752,6 +1752,58 @@ fn app_applies_independent_sets_and_removal_deltas_without_disturbing_convoys() 
     assert_eq!(app.namespaces["flotilla"].convoys.len(), 1);
 }
 
+#[test]
+fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
+    let mut app = stub_app();
+    let identity = app.model.repo_order[0].clone();
+    let repository_key = flotilla_protocol::RepositoryKey("repo_materialized".into());
+    app.model.repos.get_mut(&identity).expect("repo model").repository_key = Some(repository_key.clone());
+    let scope = flotilla_protocol::QueryScope::Repository(repository_key);
+    let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+    let mut first = TestIssue::new("First materialized issue").id("LINEAR-1").build();
+    first.reference.source = source.clone();
+    let first_ref = first.reference.clone();
+
+    app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq: 1,
+        rows: flotilla_protocol::Rows::Issues {
+            scope: scope.clone(),
+            rows: vec![flotilla_protocol::IssueRow { reference: first_ref.clone(), issue: first }],
+        },
+        state: flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-15T12:00:00Z".parse().expect("timestamp"),
+                has_more: true,
+            }),
+            conditions: vec![],
+        },
+    })));
+    assert_eq!(app.repo_data[&identity].read().issue_rows[0].issue.reference.id, "LINEAR-1");
+
+    let mut second = TestIssue::new("Second materialized issue").id("LINEAR-2").build();
+    second.reference.source = source;
+    let second_ref = second.reference.clone();
+    app.handle_daemon_event(DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
+        seq: 2,
+        changes: flotilla_protocol::QueryChanges::Issues {
+            scope,
+            changed: vec![flotilla_protocol::IssueRow { reference: second_ref, issue: second }],
+            removed: vec![first_ref],
+        },
+        state: Some(flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-15T12:01:00Z".parse().expect("timestamp"),
+                has_more: false,
+            }),
+            conditions: vec![],
+        }),
+    })));
+
+    let data = app.repo_data[&identity].read();
+    assert_eq!(data.issue_rows.len(), 1);
+    assert_eq!(data.issue_rows[0].issue.reference.id, "LINEAR-2");
+}
+
 // -- Convoys tab rendering --
 
 #[test]

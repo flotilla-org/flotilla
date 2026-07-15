@@ -118,7 +118,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -184,6 +184,11 @@ pub enum Request {
     SubscribeQueries {
         queries: Vec<QueryCursor>,
     },
+    /// Extend a live demand-backed result-set window. The appended rows are
+    /// delivered as ordinary `ResultDelta` events.
+    FetchMore {
+        query: QueryId,
+    },
     GetStatus,
     GetTopology,
     AgentHook {
@@ -211,6 +216,7 @@ pub enum Response {
     /// Replay events for the newly subscribed queries: a full [`ResultSet`]
     /// per query whose cursor was absent or stale.
     SubscribeQueries(Vec<DaemonEvent>),
+    FetchMore,
     GetStatus(StatusResponse),
     GetTopology(TopologyResponse),
     AgentHook,

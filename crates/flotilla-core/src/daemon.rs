@@ -86,6 +86,12 @@ pub trait DaemonHandle: Send + Sync {
     /// in-process consumers call it when their explicit session ends.
     async fn unsubscribe_queries(&self, _subscriber_id: Uuid) {}
 
+    /// Request the next page for a live demand-backed query. Consumers keep
+    /// one result set and observe the extension on the event stream.
+    async fn fetch_more(&self, _query: &flotilla_protocol::QueryId) -> Result<(), String> {
+        Err("fetch-more is unsupported by this daemon".to_string())
+    }
+
     /// Execute a query command synchronously. Returns the result directly
     /// without broadcasting. Only valid for commands where `action.is_query()`.
     /// The `session_id` ties cursor ownership to the calling client session.

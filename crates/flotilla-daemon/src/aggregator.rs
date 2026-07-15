@@ -6,13 +6,17 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
+use chrono::Utc;
+use flotilla_core::{
+    aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon, providers::issue_tracker::IssueProvider,
+};
 use flotilla_protocol::{
+    issue_query::IssueQuery,
     result_set::{
-        ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, ResultDelta, Rows, SessionPhase, VesselRow,
-        WorkPhase,
+        ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope,
+        ResultDelta, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
     },
-    DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
+    DaemonEvent, FleetReplicaSnapshot, HostName, IssueRef, IssueSource, ResourceRef,
 };
 use flotilla_resources::{
     api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation, Resource, ResourceError,
@@ -84,6 +88,36 @@ impl AttachCapabilityResolver for InProcessDaemon {
     }
 }
 
+#[async_trait]
+pub(crate) trait IssueMaterializationResolver: Send + Sync {
+    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String>;
+    async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String>;
+}
+
+#[async_trait]
+impl IssueMaterializationResolver for InProcessDaemon {
+    async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
+        self.resolve_issue_sources(scope).await
+    }
+
+    async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
+        self.issue_provider_for_source(source).await
+    }
+}
+
+struct IssueSourceWindow {
+    source: IssueSource,
+    provider: Arc<dyn IssueProvider>,
+    next_page: u32,
+    has_more: bool,
+    refresh_cursor: String,
+}
+
+struct IssueMaterialization {
+    sources: Vec<IssueSourceWindow>,
+    needs_full_reload: bool,
+}
+
 #[derive(bon::Builder)]
 pub struct Aggregator {
     state: AggregatorProjectionState,
@@ -100,6 +134,10 @@ pub struct Aggregator {
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
+    #[builder(skip)]
+    issue_resolver: Option<Arc<dyn IssueMaterializationResolver>>,
+    #[builder(skip)]
+    issue_materializations: HashMap<QueryId, IssueMaterialization>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
 
@@ -118,6 +156,8 @@ impl Aggregator {
             bootstrapping: false,
             emitted_queries: HashSet::new(),
             attach_resolver: None,
+            issue_resolver: None,
+            issue_materializations: HashMap::new(),
             event_tx,
         }
     }
@@ -128,6 +168,195 @@ impl Aggregator {
     {
         self.attach_resolver = Some(resolver);
         self
+    }
+
+    pub(crate) fn with_issue_resolver<R>(mut self, resolver: Arc<R>) -> Self
+    where
+        R: IssueMaterializationResolver + 'static,
+    {
+        self.issue_resolver = Some(resolver);
+        self
+    }
+
+    async fn reconcile_issue_demand(&mut self, demanded: HashSet<QueryId>) {
+        self.issue_materializations.retain(|query, _| demanded.contains(query));
+        let missing = demanded
+            .into_iter()
+            .filter(|query| matches!(query, QueryId::Issues { .. }) && !self.issue_materializations.contains_key(query))
+            .collect::<Vec<_>>();
+        for query in missing {
+            self.load_issue_materialization(query).await;
+        }
+    }
+
+    async fn load_issue_materialization(&mut self, query: QueryId) {
+        let QueryId::Issues { scope } = &query else { return };
+        let Some(resolver) = self.issue_resolver.clone() else { return };
+        let sources = match resolver.resolve_issue_sources(scope).await {
+            Ok(sources) if !sources.is_empty() => sources,
+            Ok(_) => {
+                self.issue_materializations.insert(query.clone(), IssueMaterialization { sources: Vec::new(), needs_full_reload: true });
+                self.publish_issue_window(&query, Vec::new(), false, vec![ResultSetCondition::IssueSourceUnavailable {
+                    source: None,
+                    message: "query scope has no issue source".into(),
+                }]);
+                return;
+            }
+            Err(message) => {
+                self.issue_materializations.insert(query.clone(), IssueMaterialization { sources: Vec::new(), needs_full_reload: true });
+                self.publish_issue_window(&query, Vec::new(), false, vec![ResultSetCondition::IssueSourceUnavailable {
+                    source: None,
+                    message,
+                }]);
+                return;
+            }
+        };
+
+        let mut rows = HashMap::<IssueRef, IssueRow>::new();
+        let mut windows = Vec::new();
+        let mut conditions = Vec::new();
+        for source in sources {
+            let provider = match resolver.issue_provider_for(&source).await {
+                Ok(provider) => provider,
+                Err(message) => {
+                    conditions.push(ResultSetCondition::IssueSourceUnavailable { source: Some(source), message });
+                    continue;
+                }
+            };
+            match provider.query(&source, &IssueQuery::default(), 1, 50).await {
+                Ok(page) => {
+                    for issue in page.items {
+                        let reference = issue.reference.clone();
+                        rows.insert(reference.clone(), IssueRow { reference, issue });
+                    }
+                    windows.push(IssueSourceWindow {
+                        source,
+                        provider,
+                        next_page: 2,
+                        has_more: page.has_more,
+                        refresh_cursor: Utc::now().to_rfc3339(),
+                    });
+                }
+                Err(message) => conditions.push(ResultSetCondition::IssueSourceUnavailable { source: Some(source), message }),
+            }
+        }
+        let has_more = windows.iter().any(|window| window.has_more);
+        let mut rows = rows.into_values().collect::<Vec<_>>();
+        rows.sort_by(|left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)));
+        self.issue_materializations
+            .insert(query.clone(), IssueMaterialization { sources: windows, needs_full_reload: !conditions.is_empty() });
+        self.publish_issue_window(&query, rows, has_more, conditions);
+    }
+
+    async fn fetch_more_issues(&mut self, query: &QueryId) {
+        let Some(mut materialization) = self.issue_materializations.remove(query) else { return };
+        let mut changed = Vec::new();
+        let mut conditions = Vec::new();
+        for window in &mut materialization.sources {
+            if !window.has_more {
+                continue;
+            }
+            match window.provider.query(&window.source, &IssueQuery::default(), window.next_page, 50).await {
+                Ok(page) => {
+                    changed.extend(page.items.into_iter().map(|issue| {
+                        let reference = issue.reference.clone();
+                        IssueRow { reference, issue }
+                    }));
+                    window.next_page = window.next_page.saturating_add(1);
+                    window.has_more = page.has_more;
+                }
+                Err(message) => {
+                    conditions.push(ResultSetCondition::IssueSourceUnavailable { source: Some(window.source.clone()), message });
+                    materialization.needs_full_reload = true;
+                }
+            }
+        }
+        let has_more = materialization.sources.iter().any(|window| window.has_more);
+        self.issue_materializations.insert(query.clone(), materialization);
+        if changed.is_empty() && conditions.is_empty() {
+            return;
+        }
+        changed.sort_by(|left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)));
+        let state = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions };
+        if let Some(delta) = self.state.apply_issue_changes(query, changed, Vec::new(), state) {
+            let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        }
+    }
+
+    async fn refresh_issue_materializations(&mut self) {
+        let queries = self.issue_materializations.keys().cloned().collect::<Vec<_>>();
+        for query in queries {
+            self.refresh_issue_query(&query).await;
+        }
+    }
+
+    async fn refresh_issue_query(&mut self, query: &QueryId) {
+        let Some(mut materialization) = self.issue_materializations.remove(query) else { return };
+        if materialization.sources.is_empty() || materialization.needs_full_reload {
+            self.load_issue_materialization(query.clone()).await;
+            return;
+        }
+        let mut changed_by_reference = HashMap::<IssueRef, IssueRow>::new();
+        let mut removed = HashSet::<IssueRef>::new();
+        let mut conditions = Vec::new();
+        let mut needs_full_reload = false;
+        for window in &mut materialization.sources {
+            match window.provider.list_changed_since(&window.source, &window.refresh_cursor, 50).await {
+                Ok(changes) if changes.has_more => {
+                    needs_full_reload = true;
+                }
+                Ok(changes) => {
+                    for issue in changes.updated {
+                        let reference = issue.reference.clone();
+                        if issue.state == flotilla_protocol::IssueState::Open {
+                            removed.remove(&reference);
+                            changed_by_reference.insert(reference.clone(), IssueRow { reference, issue });
+                        } else {
+                            changed_by_reference.remove(&reference);
+                            removed.insert(reference);
+                        }
+                    }
+                    for reference in changes.closed {
+                        changed_by_reference.remove(&reference);
+                        removed.insert(reference);
+                    }
+                    window.refresh_cursor = Utc::now().to_rfc3339();
+                }
+                Err(message) => {
+                    conditions.push(ResultSetCondition::IssueSourceUnavailable { source: Some(window.source.clone()), message });
+                    materialization.needs_full_reload = true;
+                }
+            }
+        }
+        self.issue_materializations.insert(query.clone(), materialization);
+        if needs_full_reload {
+            self.reload_issue_materialization(query).await;
+            return;
+        }
+        let mut changed = changed_by_reference.into_values().collect::<Vec<_>>();
+        changed.sort_by(|left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)));
+        let mut removed = removed.into_iter().collect::<Vec<_>>();
+        removed.sort();
+        let has_more = self
+            .issue_materializations
+            .get(query)
+            .is_some_and(|materialization| materialization.sources.iter().any(|window| window.has_more));
+        let state = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions };
+        if let Some(delta) = self.state.apply_issue_changes(query, changed, removed, state) {
+            let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        }
+    }
+
+    async fn reload_issue_materialization(&mut self, query: &QueryId) {
+        self.issue_materializations.remove(query);
+        self.load_issue_materialization(query.clone()).await;
+    }
+
+    fn publish_issue_window(&self, query: &QueryId, rows: Vec<IssueRow>, has_more: bool, conditions: Vec<ResultSetCondition>) {
+        let state = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions };
+        if let Some(result_set) = self.state.replace_issues(query, rows, state) {
+            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+        }
     }
 
     pub async fn run(
@@ -175,10 +404,11 @@ impl Aggregator {
         // for demand that predates Aggregator startup; #747's source-backed
         // reconciler plugs into this same initial/change path.
         let mut demand_rx = self.state.subscribe_demand();
+        let mut fetch_more_rx = self.state.subscribe_fetch_more();
+        let mut issue_refresh =
+            tokio::time::interval_at(tokio::time::Instant::now() + std::time::Duration::from_secs(30), std::time::Duration::from_secs(30));
         let initial_demand = demand_rx.borrow_and_update().clone();
-        if !initial_demand.is_empty() {
-            tracing::debug!(queries = ?initial_demand, "Aggregator started with demand-backed queries");
-        }
+        self.reconcile_issue_demand(initial_demand).await;
         self.bootstrapping = true;
         {
             let mut view = self.state.write().await;
@@ -212,8 +442,19 @@ impl Aggregator {
                     if demand.is_err() {
                         return Err(ResourceError::other("aggregator demand registry closed"));
                     }
-                    tracing::debug!(queries = ?*demand_rx.borrow_and_update(), "demand-backed query set changed");
+                    let demanded = demand_rx.borrow_and_update().clone();
+                    self.reconcile_issue_demand(demanded).await;
                 }
+                intent = fetch_more_rx.recv() => match intent {
+                    Ok(query) => self.fetch_more_issues(&query).await,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "aggregator lagged behind fetch-more intents");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err(ResourceError::other("aggregator fetch-more intent channel closed"));
+                    }
+                },
+                _ = issue_refresh.tick() => self.refresh_issue_materializations().await,
                 event = durable_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Durable, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -841,7 +1082,13 @@ mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::result_set::ResultSet;
+    use flotilla_core::providers::issue_tracker::IssueProvider;
+    use flotilla_protocol::{
+        issue_query::{IssueQuery, IssueResultPage},
+        result_set::ResultSet,
+        test_support::TestIssue,
+        Issue, IssueChangeset, IssueRef, IssueSource, QueryCursor, QueryScope, RepositoryKey,
+    };
     use flotilla_resources::{
         ConvoySpec, CrewSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase, PresentationSpec,
         PresentationStatus, ResourceBackend, Stance, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
@@ -887,12 +1134,222 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct FixedIssueProvider;
+
+    struct PagedIssueProvider;
+
+    struct ChangingIssueProvider;
+
+    #[async_trait]
+    impl IssueProvider for FixedIssueProvider {
+        fn supports(&self, _source: &IssueSource) -> bool {
+            true
+        }
+
+        async fn query(&self, source: &IssueSource, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
+            assert_eq!(page, 1);
+            let mut issue = TestIssue::new("Demand-backed issue").id("WIDGET-123").build();
+            issue.reference.source = source.clone();
+            Ok(IssueResultPage { items: vec![issue], total: Some(1), has_more: false })
+        }
+
+        async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+            unreachable!("not used by materialization")
+        }
+
+        async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+            Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+        }
+
+        async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+            unreachable!("not used by materialization")
+        }
+    }
+
+    #[async_trait]
+    impl IssueProvider for PagedIssueProvider {
+        fn supports(&self, _source: &IssueSource) -> bool {
+            true
+        }
+
+        async fn query(&self, source: &IssueSource, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
+            let (id, has_more) = match page {
+                1 => ("LINEAR-A", true),
+                2 => ("LINEAR-B", false),
+                other => panic!("unexpected page {other}"),
+            };
+            let mut issue = TestIssue::new(id).id(id).build();
+            issue.reference.source = source.clone();
+            Ok(IssueResultPage { items: vec![issue], total: Some(2), has_more })
+        }
+
+        async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+            unreachable!("not used by materialization")
+        }
+
+        async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+            Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+        }
+
+        async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+            unreachable!("not used by materialization")
+        }
+    }
+
+    #[async_trait]
+    impl IssueProvider for ChangingIssueProvider {
+        fn supports(&self, _source: &IssueSource) -> bool {
+            true
+        }
+
+        async fn query(&self, source: &IssueSource, _params: &IssueQuery, page: u32, _count: usize) -> Result<IssueResultPage, String> {
+            assert_eq!(page, 1);
+            let mut issue = TestIssue::new("Before refresh").id("OLD-9").build();
+            issue.reference.source = source.clone();
+            Ok(IssueResultPage { items: vec![issue], total: Some(1), has_more: false })
+        }
+
+        async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+            unreachable!("not used by materialization")
+        }
+
+        async fn list_changed_since(&self, source: &IssueSource, since: &str, _count: usize) -> Result<IssueChangeset, String> {
+            assert!(!since.is_empty());
+            let mut issue = TestIssue::new("After refresh").id("NEW-10").build();
+            issue.reference.source = source.clone();
+            Ok(IssueChangeset {
+                updated: vec![issue],
+                closed: vec![IssueRef { source: source.clone(), id: "OLD-9".into() }],
+                has_more: false,
+            })
+        }
+
+        async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+            unreachable!("not used by materialization")
+        }
+    }
+
+    struct FixedIssueResolver {
+        sources: Vec<IssueSource>,
+        provider: Arc<dyn IssueProvider>,
+    }
+
+    #[async_trait]
+    impl IssueMaterializationResolver for FixedIssueResolver {
+        async fn resolve_issue_sources(&self, _scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
+            Ok(self.sources.clone())
+        }
+
+        async fn issue_provider_for(&self, source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
+            assert!(self.sources.contains(source));
+            Ok(Arc::clone(&self.provider))
+        }
+    }
+
     #[async_trait]
     impl AttachCapabilityResolver for CountingAttachResolver {
         async fn resolvable_attach_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(references.iter().cloned().collect())
         }
+    }
+
+    #[tokio::test]
+    async fn repository_issue_demand_loads_the_first_provider_page() {
+        let state = AggregatorProjectionState::new();
+        let scope = QueryScope::Repository(RepositoryKey("repo_widget".into()));
+        let query = QueryId::Issues { scope: scope.clone() };
+        state.replace_subscriber(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+        let resolver = Arc::new(FixedIssueResolver { sources: vec![source.clone()], provider: Arc::new(FixedIssueProvider) });
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_issue_resolver(Arc::clone(&resolver));
+
+        aggregator.reconcile_issue_demand(HashSet::from([query.clone()])).await;
+
+        let result = state.result_set_for(&query).await.expect("live issue result set");
+        let rows = result.rows.as_issues().expect("issue rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference, IssueRef { source, id: "WIDGET-123".into() });
+        assert!(!result.state.demand.as_ref().expect("demand metadata").has_more);
+        assert!(result.state.conditions.is_empty());
+        assert!(matches!(event_rx.recv().await.expect("materialized event"), DaemonEvent::ResultSet(set) if set.query() == query));
+    }
+
+    #[tokio::test]
+    async fn project_issue_demand_unions_constituent_source_windows() {
+        let state = AggregatorProjectionState::new();
+        let scope = QueryScope::Project { namespace: "flotilla".into(), name: "platform".into() };
+        let query = QueryId::Issues { scope };
+        state.replace_subscriber(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        let source_a = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+        let source_b = IssueSource { service: "https://issues.example".into(), scope: "widgets/ui".into() };
+        let resolver =
+            Arc::new(FixedIssueResolver { sources: vec![source_a.clone(), source_b.clone()], provider: Arc::new(FixedIssueProvider) });
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_issue_resolver(resolver);
+
+        aggregator.reconcile_issue_demand(HashSet::from([query.clone()])).await;
+
+        let result = state.result_set_for(&query).await.expect("project issue result set");
+        let references = result.rows.as_issues().expect("issue rows").iter().map(|row| row.reference.clone()).collect::<HashSet<_>>();
+        assert_eq!(
+            references,
+            HashSet::from(
+                [IssueRef { source: source_a, id: "WIDGET-123".into() }, IssueRef { source: source_b, id: "WIDGET-123".into() },]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_more_appends_provider_pages_as_an_issue_delta() {
+        let state = AggregatorProjectionState::new();
+        let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_linear".into())) };
+        state.replace_subscriber(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        let source = IssueSource { service: "https://linear.example".into(), scope: "widgets".into() };
+        let resolver = Arc::new(FixedIssueResolver { sources: vec![source], provider: Arc::new(PagedIssueProvider) });
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_issue_resolver(resolver);
+        aggregator.reconcile_issue_demand(HashSet::from([query.clone()])).await;
+        let _ = event_rx.recv().await.expect("initial window event");
+
+        aggregator.fetch_more_issues(&query).await;
+
+        let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("fetch-more delta") else {
+            panic!("fetch-more must emit a delta");
+        };
+        assert_eq!(
+            delta.changes.as_issues().expect("issue changes").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>(),
+            vec!["LINEAR-B"]
+        );
+        assert!(!delta.state.as_ref().and_then(|state| state.demand.as_ref()).expect("demand metadata").has_more);
+        let result = state.result_set_for(&query).await.expect("extended window");
+        assert_eq!(result.rows.as_issues().expect("issue rows").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_refresh_updates_and_evicts_rows_in_the_live_window() {
+        let state = AggregatorProjectionState::new();
+        let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_refresh".into())) };
+        state.replace_subscriber(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        let source = IssueSource { service: "https://issues.example".into(), scope: "refresh/repo".into() };
+        let resolver = Arc::new(FixedIssueResolver { sources: vec![source.clone()], provider: Arc::new(ChangingIssueProvider) });
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_issue_resolver(resolver);
+        aggregator.reconcile_issue_demand(HashSet::from([query.clone()])).await;
+        let _ = event_rx.recv().await.expect("initial window event");
+
+        aggregator.refresh_issue_query(&query).await;
+
+        let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("refresh delta") else {
+            panic!("refresh must emit a delta");
+        };
+        assert_eq!(delta.changes.as_issues().expect("updated issues")[0].reference.id, "NEW-10");
+        assert_eq!(delta.changes.removed_issues().expect("closed issues"), &[IssueRef { source, id: "OLD-9".into() }]);
+        let result = state.result_set_for(&query).await.expect("refreshed window");
+        assert_eq!(result.rows.as_issues().expect("issue rows").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>(), vec![
+            "NEW-10"
+        ]);
     }
 
     fn pending_watch<T: Resource>() -> WatchStream<T> {

@@ -120,6 +120,18 @@ impl<'a> RequestDispatcher<'a> {
                 }
             }
 
+            Request::FetchMore { query } => {
+                let subscribed = self.query_subscriptions.read().expect("query subscriptions lock poisoned").contains(&query);
+                if !subscribed {
+                    Message::error_response(id, format!("query is not subscribed on this connection: {query}"))
+                } else {
+                    match self.daemon.fetch_more(&query).await {
+                        Ok(()) => Message::ok_response(id, Response::FetchMore),
+                        Err(e) => Message::error_response(id, e),
+                    }
+                }
+            }
+
             Request::GetStatus => match self.daemon.get_status().await {
                 Ok(status) => Message::ok_response(id, Response::GetStatus(status)),
                 Err(e) => Message::error_response(id, e),

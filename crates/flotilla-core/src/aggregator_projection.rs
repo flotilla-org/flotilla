@@ -11,10 +11,10 @@ use std::{
 };
 
 use flotilla_protocol::{
-    result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet, Rows},
-    HostName, QueryCursor, ResourceRef,
+    result_set::{ConvoyRow, IndependentRow, IssueRow, QueryId, ResultDelta, ResultSet, ResultSetState, Rows},
+    HostName, IssueRef, QueryCursor, ResourceRef,
 };
-use tokio::sync::{watch, RwLock, RwLockWriteGuard};
+use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
 use crate::query_registry::QueryRegistry;
@@ -178,6 +178,30 @@ impl AggregatorProjectionState {
     /// The Aggregator uses this to start and stop source materializers.
     pub fn subscribe_demand(&self) -> watch::Receiver<HashSet<QueryId>> {
         self.demand_backed.subscribe_demand()
+    }
+
+    pub fn subscribe_fetch_more(&self) -> broadcast::Receiver<QueryId> {
+        self.demand_backed.subscribe_fetch_more()
+    }
+
+    pub fn request_fetch_more(&self, query: &QueryId) -> Result<(), String> {
+        self.demand_backed.request_fetch_more(query)
+    }
+
+    /// Replace the fetched window for a live issue materialization. Results
+    /// racing with teardown are ignored by the registry.
+    pub fn replace_issues(&self, query: &QueryId, rows: Vec<IssueRow>, state: ResultSetState) -> Option<ResultSet> {
+        self.demand_backed.replace_issues(query, rows, state)
+    }
+
+    pub fn apply_issue_changes(
+        &self,
+        query: &QueryId,
+        changed: Vec<IssueRow>,
+        removed: Vec<IssueRef>,
+        state: ResultSetState,
+    ) -> Option<ResultDelta> {
+        self.demand_backed.apply_issue_changes(query, changed, removed, state)
     }
 
     /// The current fleet-merged result set for one named query.

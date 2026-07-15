@@ -933,6 +933,13 @@ impl DaemonHandle for SocketDaemon {
         // and tears it down when the connection closes.
     }
 
+    async fn fetch_more(&self, query: &QueryId) -> Result<(), String> {
+        match into_success_response(self.request(Request::FetchMore { query: query.clone() }).await?)? {
+            Response::FetchMore => Ok(()),
+            other => Err(format!("unexpected response for fetch-more: {other:?}")),
+        }
+    }
+
     async fn get_status(&self) -> Result<StatusResponse, String> {
         match into_success_response(self.request(Request::GetStatus).await?)? {
             Response::GetStatus(status) => Ok(status),
