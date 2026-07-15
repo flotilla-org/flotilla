@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
+pub use flotilla_protocol::IssueSource;
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, Repository, RepositoryKey, TypedResolver};
 
 define_resource!(Project, "projects", ProjectSpec, (), NoStatusPatch);
 
@@ -24,10 +27,44 @@ pub struct ProjectRepositorySpec {
     pub default_branch: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssueSource {
-    pub service: String,
-    pub scope: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueSourceUnavailable {
+    RepositoryUnavailable { repository: RepositoryKey, message: String },
+    NoIssueSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueSourceResolution {
+    Available { sources: Vec<IssueSource> },
+    Unavailable(IssueSourceUnavailable),
+}
+
+pub async fn resolve_project_issue_sources(repositories: &TypedResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
+    if let Some(source) = &project.issue_source {
+        return IssueSourceResolution::Available { sources: vec![source.clone()] };
+    }
+
+    let mut sources = BTreeSet::new();
+    for project_repository in &project.repositories {
+        let repository = match repositories.get(&project_repository.repo.to_string()).await {
+            Ok(repository) => repository,
+            Err(error) => {
+                return IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable {
+                    repository: project_repository.repo.clone(),
+                    message: error.to_string(),
+                });
+            }
+        };
+        if let Some(forge) = repository.spec.forge() {
+            sources.insert(IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() });
+        }
+    }
+
+    if sources.is_empty() {
+        IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource)
+    } else {
+        IssueSourceResolution::Available { sources: sources.into_iter().collect() }
+    }
 }
 
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {

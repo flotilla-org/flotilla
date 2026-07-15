@@ -1363,6 +1363,7 @@ dependencies = [
  "chrono",
  "flotilla-controllers",
  "flotilla-core",
+ "flotilla-protocol",
  "futures",
  "reqwest",
  "rstest",

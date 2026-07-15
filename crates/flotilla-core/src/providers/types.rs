@@ -4,7 +4,7 @@ use std::collections::HashMap;
 // These are the canonical definitions; core uses them via this re-export.
 pub use flotilla_protocol::{
     AheadBehind, AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, CorrelationKey, Issue,
-    IssueChangeset, IssuePage, SessionStatus, WorkingTreeStatus, Workspace,
+    IssueChangeset, SessionStatus, WorkingTreeStatus, Workspace,
 };
 
 use crate::path_context::ExecutionEnvironmentPath;

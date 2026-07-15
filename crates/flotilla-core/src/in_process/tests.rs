@@ -8,9 +8,10 @@ use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, IndependentRow, QueryId, ResultSet, Rows, SessionPhase},
+    test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent,
-    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, Issue, QueryCursor, RepoSelector, ResourceRef,
-    SystemInfo, ToolInventory, TopologyRoute,
+    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, QueryCursor, RepoSelector, ResourceRef, SystemInfo,
+    ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -2213,13 +2214,7 @@ fn snapshot_includes_linked_issues_when_populated() {
         provider_display_name: "GitHub".into(),
     });
     // Simulate fetch_missing_linked_issues having populated the issue
-    providers.issues.insert("42".into(), Issue {
-        title: "Something is broken".into(),
-        labels: vec!["bug".into()],
-        association_keys: vec![],
-        provider_name: "github".into(),
-        provider_display_name: "GitHub".into(),
-    });
+    providers.issues.insert("42".into(), TestIssue::new("Something is broken").with_labels(vec!["bug".into()]).build());
 
     let default_snap = RefreshSnapshot::default();
     let snapshot = build_repo_snapshot_with_peers(

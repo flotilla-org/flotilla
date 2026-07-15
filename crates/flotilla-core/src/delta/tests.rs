@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use flotilla_protocol::{
     delta::{Branch, BranchStatus},
-    test_support::qp,
+    test_support::{qp, TestIssue},
     AttachableId, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, Issue, ManagedTerminal, ProviderError,
     SessionStatus, TerminalStatus, Workspace,
 };
@@ -38,13 +38,7 @@ fn change_request(title: &str) -> ChangeRequest {
 }
 
 fn issue(title: &str) -> Issue {
-    Issue {
-        title: title.into(),
-        labels: vec![],
-        association_keys: vec![],
-        provider_name: String::new(),
-        provider_display_name: String::new(),
-    }
+    TestIssue::new(title).build()
 }
 
 fn session(title: &str) -> CloudAgentSession {

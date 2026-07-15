@@ -1,6 +1,6 @@
 use std::{collections::HashMap, path::Path};
 
-use flotilla_protocol::{provider_data::Issue, qualified_path::QualifiedPath, CommandValue, HostName};
+use flotilla_protocol::{provider_data::Issue, qualified_path::QualifiedPath, CommandValue, HostName, IssueSource};
 use tracing::{info, warn};
 
 use super::{known_local_checkout_key, WorkspaceOrchestrator};
@@ -16,7 +16,7 @@ use crate::{
 };
 
 pub(super) struct ReadOnlySessionActionService<'a> {
-    repo_root: &'a ExecutionEnvironmentPath,
+    issue_source: IssueSource,
     registry: &'a ProviderRegistry,
     providers_data: &'a ProviderData,
 }
@@ -37,8 +37,8 @@ pub(super) struct TeleportFlow<'a> {
 }
 
 impl<'a> ReadOnlySessionActionService<'a> {
-    pub(super) fn new(repo_root: &'a ExecutionEnvironmentPath, registry: &'a ProviderRegistry, providers_data: &'a ProviderData) -> Self {
-        Self { repo_root, registry, providers_data }
+    pub(super) fn new(issue_source: IssueSource, registry: &'a ProviderRegistry, providers_data: &'a ProviderData) -> Self {
+        Self { issue_source, registry, providers_data }
     }
 
     pub(super) async fn archive_session_result(&self, session_id: &str) -> CommandValue {
@@ -126,11 +126,11 @@ impl<'a> ReadOnlySessionActionService<'a> {
 
         let missing: Vec<String> = issue_keys.iter().filter(|key| !resolved.contains_key(key.as_str())).cloned().collect();
         if !missing.is_empty() {
-            if let Some(tracker) = self.registry.issue_trackers.preferred() {
-                match tracker.fetch_issues_by_id(self.repo_root.as_path(), &missing).await {
+            if let Some(tracker) = self.registry.issue_provider_for(&self.issue_source) {
+                match tracker.fetch_by_ids(&self.issue_source, &missing).await {
                     Ok(fetched) => {
-                        for (id, issue) in fetched {
-                            resolved.insert(id, issue);
+                        for issue in fetched {
+                            resolved.insert(issue.reference.id.clone(), issue);
                         }
                     }
                     Err(error) => {
@@ -168,6 +168,7 @@ impl<'a> TeleportSessionActionService<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         repo_root: &'a ExecutionEnvironmentPath,
+        issue_source: IssueSource,
         registry: &'a ProviderRegistry,
         providers_data: &'a ProviderData,
         config_base: &'a DaemonHostPath,
@@ -177,7 +178,7 @@ impl<'a> TeleportSessionActionService<'a> {
         terminal_manager: Option<&'a TerminalManager>,
     ) -> Self {
         Self {
-            read_only: ReadOnlySessionActionService::new(repo_root, registry, providers_data),
+            read_only: ReadOnlySessionActionService::new(issue_source, registry, providers_data),
             repo_root,
             config_base,
             attachable_store,
@@ -242,6 +243,7 @@ impl<'a> TeleportFlow<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         repo_root: &'a ExecutionEnvironmentPath,
+        issue_source: IssueSource,
         registry: &'a ProviderRegistry,
         providers_data: &'a ProviderData,
         config_base: &'a DaemonHostPath,
@@ -255,6 +257,7 @@ impl<'a> TeleportFlow<'a> {
         Self {
             service: TeleportSessionActionService::new(
                 repo_root,
+                issue_source,
                 registry,
                 providers_data,
                 config_base,

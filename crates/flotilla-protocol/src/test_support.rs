@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 use crate::{
-    provider_data::{ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, SessionStatus},
+    provider_data::{
+        ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CorrelationKey, Issue, IssueRef, IssueSource, IssueState,
+        SessionStatus,
+    },
     qualified_path::QualifiedPath,
     HostName, HostPath,
 };
@@ -156,13 +159,19 @@ impl TestSession {
 // ---------------------------------------------------------------------------
 
 pub struct TestIssue {
+    id: String,
     title: String,
     labels: Vec<String>,
 }
 
 impl TestIssue {
     pub fn new(title: &str) -> Self {
-        Self { title: title.to_string(), labels: Vec::new() }
+        Self { id: "test".into(), title: title.to_string(), labels: Vec::new() }
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     pub fn with_labels(mut self, labels: Vec<String>) -> Self {
@@ -172,8 +181,12 @@ impl TestIssue {
 
     pub fn build(self) -> Issue {
         Issue {
+            reference: IssueRef { source: IssueSource { service: "test".into(), scope: "owner/repo".into() }, id: self.id },
             title: self.title,
+            body: None,
+            state: IssueState::Open,
             labels: self.labels,
+            as_of: "2026-07-15T09:30:00Z".parse().expect("valid test issue timestamp"),
             association_keys: vec![],
             provider_name: String::new(),
             provider_display_name: String::new(),

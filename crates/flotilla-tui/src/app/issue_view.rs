@@ -44,7 +44,7 @@ pub enum IssueFetchFailure {
 /// State for a single paginated query — tracks accumulated items and next page.
 pub struct IssuePagingState {
     pub params: IssueQuery,
-    pub items: Vec<(String, Issue)>,
+    pub items: Vec<Issue>,
     pub next_page: u32,
     pub total: Option<u32>,
     pub has_more: bool,
@@ -158,7 +158,7 @@ impl IssuePagingState {
     /// Convert the paging state's issue items into native `IssueRow` values
     /// for the `SectionTable<IssueRow>` issue section.
     pub fn to_issue_rows(&self) -> Vec<IssueRow> {
-        self.items.iter().map(|(id, issue)| IssueRow { id: id.clone(), issue: issue.clone() }).collect()
+        self.items.iter().map(|issue| IssueRow { id: issue.reference.id.clone(), issue: issue.clone() }).collect()
     }
 }
 
@@ -260,18 +260,15 @@ pub enum IssueQueryUpdate {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{issue_query::IssueQuery, provider_data::Issue};
+    use flotilla_protocol::{issue_query::IssueQuery, test_support::TestIssue, Issue};
 
     use super::*;
 
-    fn test_issue(id: &str, title: &str) -> (String, Issue) {
-        (id.to_string(), Issue {
-            title: title.to_string(),
-            labels: vec![],
-            association_keys: vec![],
-            provider_name: "github".to_string(),
-            provider_display_name: "GitHub".to_string(),
-        })
+    fn test_issue(id: &str, title: &str) -> Issue {
+        let mut issue = TestIssue::new(title).id(id).build();
+        issue.provider_name = "github".into();
+        issue.provider_display_name = "GitHub".into();
+        issue
     }
 
     #[test]
@@ -318,7 +315,7 @@ mod tests {
         });
         let active = state.active().expect("should have active");
         assert!(active.params.search.is_some());
-        assert_eq!(active.items[0].0, "2");
+        assert_eq!(active.items[0].reference.id, "2");
     }
 
     #[test]

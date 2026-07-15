@@ -1,115 +1,121 @@
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use flotilla_protocol::{
+    issue_query::{IssueQuery, IssueResultPage},
+    AssociationKey, Issue, IssueChangeset, IssueRef, IssueSource, IssueState,
+};
 
 use crate::providers::{
     gh_api_get, gh_api_get_with_headers,
     github_api::{clamp_per_page, GhApi},
-    run,
-    types::*,
-    CommandRunner,
+    run, CommandRunner,
 };
 
-pub struct GitHubIssueTracker {
-    provider_name: String,
-    repo_slug: String,
+pub struct GitHubIssueProvider {
     api: Arc<dyn GhApi>,
     runner: Arc<dyn CommandRunner>,
+    host_root: Box<Path>,
 }
 
-impl GitHubIssueTracker {
-    pub fn new(provider_name: String, repo_slug: String, api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>) -> Self {
-        Self { provider_name, repo_slug, api, runner }
+impl GitHubIssueProvider {
+    pub fn new(api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>, host_root: impl Into<Box<Path>>) -> Self {
+        Self { api, runner, host_root: host_root.into() }
     }
 }
 
-pub(crate) fn parse_issue(provider_name: &str, v: &serde_json::Value) -> Option<(String, Issue)> {
+fn is_github_source(source: &IssueSource) -> bool {
+    // Bare service names are valid for explicit Project issue-source overrides;
+    // Forge-derived sources use the canonical URL form.
+    matches!(source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
+}
+
+fn parse_issue(source: &IssueSource, v: &serde_json::Value, as_of: DateTime<Utc>) -> Option<Issue> {
     let number = v["number"].as_i64()?;
     let title = v["title"].as_str()?.to_string();
+    let body = v["body"].as_str().map(str::to_string);
+    let state = match v["state"].as_str()? {
+        "open" => IssueState::Open,
+        "closed" => IssueState::Closed,
+        _ => return None,
+    };
     let labels: Vec<String> = v["labels"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let id = number.to_string();
-    let association_keys = vec![AssociationKey::IssueRef(provider_name.to_string(), id.clone())];
-    Some((id, Issue { title, labels, association_keys, provider_name: provider_name.to_string(), provider_display_name: "GitHub".into() }))
+    let reference = IssueRef { source: source.clone(), id: id.clone() };
+    let association_keys = vec![AssociationKey::IssueRef("github".to_string(), id)];
+    Some(
+        Issue::builder()
+            .reference(reference)
+            .title(title)
+            .maybe_body(body)
+            .state(state)
+            .labels(labels)
+            .as_of(as_of)
+            .association_keys(association_keys)
+            .provider_name("github".into())
+            .provider_display_name("GitHub".into())
+            .build(),
+    )
 }
 
 #[async_trait]
-impl super::IssueProvider for GitHubIssueTracker {
-    async fn list_issues(&self, repo_root: &Path, limit: usize) -> Result<Vec<(String, Issue)>, String> {
-        let page = self.list_issues_page(repo_root, 1, limit).await?;
-        Ok(page.issues)
+impl super::IssueProvider for GitHubIssueProvider {
+    fn supports(&self, source: &IssueSource) -> bool {
+        is_github_source(source)
     }
 
-    async fn list_issues_page(&self, repo_root: &Path, page: u32, per_page: usize) -> Result<IssuePage, String> {
-        let per_page = clamp_per_page(per_page);
-        let endpoint = format!("repos/{}/issues?state=open&per_page={}&page={}", self.repo_slug, per_page, page);
-        let response = gh_api_get_with_headers!(self.api, &endpoint, repo_root)?;
-        let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
-
-        let issues: Vec<(String, Issue)> = items
-            .into_iter()
-            .filter(|v| !v.as_object().map(|o| o.contains_key("pull_request")).unwrap_or(false))
-            .filter_map(|v| parse_issue(&self.provider_name, &v))
-            .collect();
-
-        Ok(IssuePage { issues, total_count: None, has_more: response.has_next_page })
-    }
-
-    async fn fetch_issues_by_id(&self, repo_root: &Path, ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
-        use futures::stream::{
-            StreamExt, {self},
-        };
-        let futs: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                let endpoint = format!("repos/{}/issues/{}", self.repo_slug, id);
-                let api = Arc::clone(&self.api);
-                let repo_root = repo_root.to_path_buf();
-                let provider_name = self.provider_name.clone();
-                let id = id.clone();
-                async move {
-                    let body = gh_api_get!(api, &endpoint, &repo_root)?;
-                    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-                    parse_issue(&provider_name, &v).ok_or_else(|| format!("failed to parse issue {}", id))
-                }
-            })
-            .collect();
-
-        let results: Vec<_> = stream::iter(futs).buffer_unordered(10).collect().await;
-        let mut issues = Vec::new();
-        for result in results {
-            match result {
-                Ok(issue) => issues.push(issue),
-                Err(e) => tracing::warn!(provider = "github", err = %e, "failed to fetch issue"),
+    async fn query(&self, source: &IssueSource, params: &IssueQuery, page: u32, count: usize) -> Result<IssueResultPage, String> {
+        let per_page = clamp_per_page(count);
+        let as_of = Utc::now();
+        let (items, has_more, total) = match &params.search {
+            None => {
+                let endpoint = format!("repos/{}/issues?state=open&per_page={}&page={}", source.scope, per_page, page);
+                let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
+                let raw_items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+                let issues = raw_items
+                    .into_iter()
+                    .filter(|value| !value.as_object().is_some_and(|object| object.contains_key("pull_request")))
+                    .filter_map(|value| parse_issue(source, &value, as_of))
+                    .collect();
+                (issues, response.has_next_page, None)
             }
-        }
-        Ok(issues)
+            Some(search_term) => {
+                let raw_query = format!("repo:{} is:issue is:open {}", source.scope, search_term);
+                let encoded_query = urlencoding::encode(&raw_query);
+                let endpoint = format!("search/issues?q={}&per_page={}&page={}", encoded_query, per_page, page);
+                let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
+                let parsed: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+                let total = parsed["total_count"].as_u64().and_then(|value| u32::try_from(value).ok());
+                let raw_items = parsed["items"].as_array().ok_or("no items array in search response")?;
+                let issues = raw_items.iter().filter_map(|value| parse_issue(source, value, as_of)).collect();
+                (issues, response.has_next_page, total)
+            }
+        };
+        Ok(IssueResultPage { items, total, has_more })
     }
 
-    async fn search_issues(&self, repo_root: &Path, query: &str, limit: usize) -> Result<Vec<(String, Issue)>, String> {
-        let per_page = clamp_per_page(limit);
-        let raw_query = format!("repo:{} is:issue is:open {}", self.repo_slug, query);
-        let encoded_query = urlencoding::encode(&raw_query);
-        let endpoint = format!("search/issues?q={}&per_page={}", encoded_query, per_page);
-        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
-        let response: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-
-        let items = response["items"].as_array().ok_or("no items array in search response")?;
-        Ok(items.iter().filter_map(|v| parse_issue(&self.provider_name, v)).collect())
+    async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+        let endpoint = format!("repos/{}/issues/{}", reference.source.scope, reference.id);
+        let body = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+        parse_issue(&reference.source, &value, Utc::now()).ok_or_else(|| format!("failed to parse issue {}", reference.id))
     }
 
-    async fn list_issues_changed_since(&self, repo_root: &Path, since: &str, per_page: usize) -> Result<IssueChangeset, String> {
-        let per_page = clamp_per_page(per_page);
+    async fn list_changed_since(&self, source: &IssueSource, since: &str, count: usize) -> Result<IssueChangeset, String> {
+        let per_page = clamp_per_page(count);
         let encoded_since = urlencoding::encode(since);
         let endpoint =
-            format!("repos/{}/issues?state=all&since={}&sort=updated&direction=desc&per_page={}", self.repo_slug, encoded_since, per_page);
-        let response = gh_api_get_with_headers!(self.api, &endpoint, repo_root)?;
+            format!("repos/{}/issues?state=all&since={}&sort=updated&direction=desc&per_page={}", source.scope, encoded_since, per_page);
+        let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+        let as_of = Utc::now();
 
         let mut updated = Vec::new();
-        let mut closed_ids = Vec::new();
+        let mut closed = Vec::new();
 
         for v in &items {
             if v.as_object().map(|o| o.contains_key("pull_request")).unwrap_or(false) {
@@ -117,11 +123,11 @@ impl super::IssueProvider for GitHubIssueTracker {
             }
             let state = v["state"].as_str().unwrap_or("open");
             if state == "open" {
-                if let Some(issue) = parse_issue(&self.provider_name, v) {
+                if let Some(issue) = parse_issue(source, v, as_of) {
                     updated.push(issue);
                 }
             } else if let Some(number) = v["number"].as_i64() {
-                closed_ids.push(number.to_string());
+                closed.push(IssueRef { source: source.clone(), id: number.to_string() });
             }
         }
 
@@ -129,36 +135,42 @@ impl super::IssueProvider for GitHubIssueTracker {
         // on this page — remaining pages likely contain more issues too.
         // When issue_count == 0 (all PRs), don't escalate: there are no
         // issue changes to miss.
-        let issue_count = updated.len() + closed_ids.len();
-        Ok(IssueChangeset { updated, closed_ids, has_more: response.has_next_page && issue_count > 0 })
+        let issue_count = updated.len() + closed.len();
+        Ok(IssueChangeset { updated, closed, has_more: response.has_next_page && issue_count > 0 })
     }
 
-    async fn open_in_browser(&self, repo_root: &Path, id: &str) -> Result<(), String> {
-        run!(self.runner, "gh", &["issue", "view", id, "--web"], repo_root)?;
+    async fn open_in_browser(&self, reference: &IssueRef) -> Result<(), String> {
+        run!(self.runner, "gh", &["issue", "view", &reference.id, "--repo", &reference.source.scope, "--web"], &self.host_root)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{collections::VecDeque, path::PathBuf, sync::Mutex};
 
     use super::*;
     use crate::providers::{
         github_api::{GhApi, GhApiResponse},
         github_test_support::{build_api_and_runner, repo_root_for_recording},
         issue_tracker::IssueProvider,
+        replay::{self, Masks},
         testing::MockRunner,
         ChannelLabel,
     };
 
     struct MockGhApi {
         responses: Mutex<VecDeque<Result<GhApiResponse, String>>>,
+        requests: Mutex<Vec<(String, PathBuf)>>,
     }
 
     impl MockGhApi {
         fn new(responses: Vec<Result<GhApiResponse, String>>) -> Self {
-            Self { responses: Mutex::new(responses.into()) }
+            Self { responses: Mutex::new(responses.into()), requests: Mutex::new(Vec::new()) }
+        }
+
+        fn requests(&self) -> Vec<(String, PathBuf)> {
+            self.requests.lock().expect("GitHub request lock poisoned").clone()
         }
     }
 
@@ -167,66 +179,113 @@ mod tests {
         async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
             self.get_with_headers(endpoint, repo_root, label).await.map(|r| r.body)
         }
-        async fn get_with_headers(&self, _endpoint: &str, _repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
-            self.responses.lock().unwrap().pop_front().expect("MockGhApi: no more responses")
+        async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
+            self.requests.lock().expect("GitHub request lock poisoned").push((endpoint.to_string(), repo_root.to_path_buf()));
+            self.responses.lock().expect("GitHub response lock poisoned").pop_front().expect("MockGhApi: no more responses")
         }
     }
 
-    fn mock_tracker(responses: Vec<Result<GhApiResponse, String>>) -> GitHubIssueTracker {
-        let api = Arc::new(MockGhApi::new(responses));
-        let runner = Arc::new(MockRunner::new(vec![]));
-        GitHubIssueTracker::new("github".into(), "owner/repo".into(), api, runner)
+    fn source() -> IssueSource {
+        IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() }
     }
 
-    use std::path::PathBuf;
+    fn ok_response(body: &str, has_next_page: bool) -> Result<GhApiResponse, String> {
+        Ok(GhApiResponse { status: 200, etag: None, body: body.to_string(), has_next_page, total_count: None })
+    }
 
-    use crate::providers::replay::{
-        Masks, {self},
-    };
+    fn mock_provider(responses: Vec<Result<GhApiResponse, String>>) -> GitHubIssueProvider {
+        let api = Arc::new(MockGhApi::new(responses));
+        let runner = Arc::new(MockRunner::new(vec![]));
+        GitHubIssueProvider::new(api, runner, Path::new("/neutral"))
+    }
 
     fn fixture(name: &str) -> String {
         crate::providers::testing::fixture_path("issue_tracker", name)
     }
 
     #[tokio::test]
-    async fn record_replay_list_issues() {
-        let repo_slug = "rjwittams/flotilla".to_string();
-
+    async fn record_replay_query_and_fetch_issue_by_id() {
         let session = replay::test_session(&fixture("github_issues.yaml"), Masks::new());
         let repo_root = if session.is_live() { repo_root_for_recording() } else { PathBuf::from("/test/repo") };
         let (api, runner) = build_api_and_runner(&session);
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let provider = GitHubIssueProvider::new(api, runner, repo_root);
 
-        let tracker = GitHubIssueTracker::new("github".into(), repo_slug, api, runner);
-        let issues = tracker.list_issues(&repo_root, 30).await.unwrap();
-
-        // The repo has open issues, so we expect a non-empty result
-        assert!(!issues.is_empty(), "expected at least one open issue in rjwittams/flotilla");
-        for (id, issue) in &issues {
-            assert!(!id.is_empty());
+        let page = provider.query(&source, &IssueQuery::default(), 1, 30).await.expect("replay query should succeed");
+        assert!(!page.items.is_empty(), "expected at least one open issue in flotilla-org/flotilla");
+        for issue in &page.items {
+            assert!(!issue.reference.id.is_empty());
             assert!(!issue.title.is_empty());
-            // Each issue should have an association key matching its id
-            assert!(
-                issue.association_keys.contains(&AssociationKey::IssueRef("github".into(), id.clone())),
-                "issue {} missing expected association key",
-                id
-            );
+            assert_eq!(issue.reference.source, source);
         }
+
+        let issue =
+            provider.fetch_by_id(&IssueRef { source: source.clone(), id: "747".into() }).await.expect("replay fetch-by-id should succeed");
+        assert_eq!(issue.reference, IssueRef { source, id: "747".into() });
+        assert!(!issue.title.is_empty());
+        assert!(issue.body.is_some());
 
         session.finish();
     }
 
-    #[test]
-    fn parse_rest_api_issues_filters_pull_requests() {
-        let json = r#"[
-            {"number": 1, "title": "Bug report", "labels": [{"name": "bug"}]},
-            {"number": 2, "title": "Feature PR", "labels": [], "pull_request": {"url": "..."}},
-            {"number": 3, "title": "Enhancement", "labels": [{"name": "enhancement"}]}
+    #[tokio::test]
+    async fn fetch_by_id_uses_source_identity_without_a_checkout() {
+        let before = Utc::now();
+        let api = Arc::new(MockGhApi::new(vec![ok_response(
+            r#"{"number":42,"title":"The answer","body":"Details","state":"closed","labels":[{"name":"bug"}]}"#,
+            false,
+        )]));
+        let provider = GitHubIssueProvider::new(api.clone(), Arc::new(MockRunner::new(vec![])), Path::new("/host-capability"));
+        let reference = IssueRef { source: source(), id: "42".into() };
+
+        let issue = provider.fetch_by_id(&reference).await.expect("fetch-by-id should succeed");
+
+        assert_eq!(issue.reference, reference);
+        assert_eq!(issue.body.as_deref(), Some("Details"));
+        assert_eq!(issue.state, IssueState::Closed);
+        assert!(issue.as_of >= before && issue.as_of <= Utc::now());
+        assert_eq!(api.requests(), vec![("repos/owner/repo/issues/42".into(), PathBuf::from("/host-capability"))]);
+    }
+
+    #[tokio::test]
+    async fn query_filters_pull_requests_and_preserves_source_refs() {
+        let body = r#"[
+            {"number":1,"title":"Real issue","state":"open","labels":[]},
+            {"number":2,"title":"A PR","state":"open","labels":[],"pull_request":{"url":"..."}},
+            {"number":3,"title":"Another issue","state":"open","labels":[]}
         ]"#;
-        let items: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
-        let filtered: Vec<&serde_json::Value> = items.iter().filter(|v| !v.as_object().unwrap().contains_key("pull_request")).collect();
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0]["number"], 1);
-        assert_eq!(filtered[1]["number"], 3);
+        let provider = mock_provider(vec![ok_response(body, false)]);
+
+        let page = provider.query(&source(), &IssueQuery::default(), 1, 10).await.expect("issue query should succeed");
+
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].reference, IssueRef { source: source(), id: "1".into() });
+        assert_eq!(page.items[1].reference.id, "3");
+    }
+
+    #[tokio::test]
+    async fn search_query_returns_total_and_pagination() {
+        let body = r#"{"total_count":5,"items":[{"number":1,"title":"Bug","state":"open","labels":[]}]}"#;
+        let provider = mock_provider(vec![ok_response(body, true)]);
+
+        let page = provider.query(&source(), &IssueQuery { search: Some("bug".into()) }, 2, 10).await.expect("issue search should succeed");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.total, Some(5));
+        assert!(page.has_more);
+    }
+
+    #[tokio::test]
+    async fn open_in_browser_passes_source_scope_explicitly() {
+        let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
+        let provider = GitHubIssueProvider::new(Arc::new(MockGhApi::new(vec![])), runner.clone(), Path::new("/neutral"));
+
+        provider.open_in_browser(&IssueRef { source: source(), id: "42".into() }).await.expect("open-in-browser should succeed");
+
+        assert_eq!(runner.calls(), vec![(
+            "gh".into(),
+            vec!["issue", "view", "42", "--repo", "owner/repo", "--web"].into_iter().map(str::to_string).collect()
+        )]);
     }
 
     #[tokio::test]
@@ -236,7 +295,7 @@ mod tests {
             {"number": 2, "title": "Closed issue", "state": "closed", "labels": []},
             {"number": 3, "title": "Another open", "state": "open", "labels": []}
         ]"#;
-        let tracker = mock_tracker(vec![Ok(GhApiResponse {
+        let provider = mock_provider(vec![Ok(GhApiResponse {
             status: 200,
             etag: None,
             body: body.to_string(),
@@ -244,12 +303,13 @@ mod tests {
             total_count: None,
         })]);
 
-        let changeset = tracker.list_issues_changed_since(Path::new("/tmp/repo"), "2026-03-09T00:00:00Z", 50).await.unwrap();
+        let changeset =
+            provider.list_changed_since(&source(), "2026-03-09T00:00:00Z", 50).await.expect("changed-since query should succeed");
 
         assert_eq!(changeset.updated.len(), 2);
-        assert_eq!(changeset.updated[0].0, "1");
-        assert_eq!(changeset.updated[1].0, "3");
-        assert_eq!(changeset.closed_ids, vec!["2"]);
+        assert_eq!(changeset.updated[0].reference.id, "1");
+        assert_eq!(changeset.updated[1].reference.id, "3");
+        assert_eq!(changeset.closed, vec![IssueRef { source: source(), id: "2".into() }]);
         assert!(!changeset.has_more);
     }
 
@@ -259,7 +319,7 @@ mod tests {
             {"number": 1, "title": "Issue", "state": "open", "labels": []},
             {"number": 2, "title": "PR", "state": "open", "labels": [], "pull_request": {"url": "..."}}
         ]"#;
-        let tracker = mock_tracker(vec![Ok(GhApiResponse {
+        let provider = mock_provider(vec![Ok(GhApiResponse {
             status: 200,
             etag: None,
             body: body.to_string(),
@@ -267,11 +327,12 @@ mod tests {
             total_count: None,
         })]);
 
-        let changeset = tracker.list_issues_changed_since(Path::new("/tmp/repo"), "2026-03-09T00:00:00Z", 50).await.unwrap();
+        let changeset =
+            provider.list_changed_since(&source(), "2026-03-09T00:00:00Z", 50).await.expect("changed-since query should succeed");
 
         assert_eq!(changeset.updated.len(), 1);
-        assert_eq!(changeset.updated[0].0, "1");
-        assert!(changeset.closed_ids.is_empty());
+        assert_eq!(changeset.updated[0].reference.id, "1");
+        assert!(changeset.closed.is_empty());
     }
 
     #[tokio::test]
@@ -282,7 +343,7 @@ mod tests {
             {"number": 10, "title": "PR A", "state": "open", "labels": [], "pull_request": {"url": "..."}},
             {"number": 11, "title": "PR B", "state": "open", "labels": [], "pull_request": {"url": "..."}}
         ]"#;
-        let tracker = mock_tracker(vec![Ok(GhApiResponse {
+        let provider = mock_provider(vec![Ok(GhApiResponse {
             status: 200,
             etag: None,
             body: body.to_string(),
@@ -290,10 +351,11 @@ mod tests {
             total_count: None,
         })]);
 
-        let changeset = tracker.list_issues_changed_since(Path::new("/tmp/repo"), "2026-03-09T00:00:00Z", 2).await.unwrap();
+        let changeset =
+            provider.list_changed_since(&source(), "2026-03-09T00:00:00Z", 2).await.expect("changed-since query should succeed");
 
         assert!(changeset.updated.is_empty());
-        assert!(changeset.closed_ids.is_empty());
+        assert!(changeset.closed.is_empty());
         assert!(!changeset.has_more, "should not escalate when all items are PRs");
     }
 
@@ -305,7 +367,7 @@ mod tests {
             {"number": 1, "title": "Issue", "state": "open", "labels": []},
             {"number": 2, "title": "PR", "state": "open", "labels": [], "pull_request": {"url": "..."}}
         ]"#;
-        let tracker = mock_tracker(vec![Ok(GhApiResponse {
+        let provider = mock_provider(vec![Ok(GhApiResponse {
             status: 200,
             etag: None,
             body: body.to_string(),
@@ -313,7 +375,8 @@ mod tests {
             total_count: None,
         })]);
 
-        let changeset = tracker.list_issues_changed_since(Path::new("/tmp/repo"), "2026-03-09T00:00:00Z", 2).await.unwrap();
+        let changeset =
+            provider.list_changed_since(&source(), "2026-03-09T00:00:00Z", 2).await.expect("changed-since query should succeed");
 
         assert_eq!(changeset.updated.len(), 1);
         assert!(changeset.has_more, "should escalate when page has issues and more pages exist");

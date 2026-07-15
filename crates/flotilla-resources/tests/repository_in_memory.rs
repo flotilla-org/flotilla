@@ -1,7 +1,85 @@
 use flotilla_resources::{
-    normalize_project_spec, DefaultBranchObservation, DefaultBranchProvenance, InMemoryBackend, InputMeta, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, SqliteBackend,
+    normalize_project_spec, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance, InMemoryBackend, InputMeta,
+    IssueSource, IssueSourceResolution, IssueSourceUnavailable, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryIdentity,
+    RepositoryKey, RepositorySpec, ResourceBackend, SqliteBackend,
 };
+
+#[tokio::test]
+async fn project_issue_source_override_resolves_without_a_checkout_or_repository_record() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.using::<Repository>("flotilla");
+    let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
+    let project = ProjectSpec {
+        display_name: "Widgets".into(),
+        default_workflow_ref: "single-agent-contained".into(),
+        issue_source: Some(override_source.clone()),
+        repositories: vec![ProjectRepositorySpec {
+            repo: RepositoryKey("repository-not-present-on-this-host".into()),
+            subpath: None,
+            default_branch: None,
+        }],
+    };
+
+    assert_eq!(resolve_project_issue_sources(&repositories, &project).await, IssueSourceResolution::Available {
+        sources: vec![override_source]
+    });
+}
+
+#[tokio::test]
+async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.using::<Repository>("flotilla");
+    let first = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("first repository");
+    let second = RepositorySpec::remote("https://gitlab.com/widgets/api.git").expect("second repository");
+    for spec in [&first, &second] {
+        repositories.create(&InputMeta::builder().name(spec.key().to_string()).build(), spec).await.expect("repository should create");
+    }
+    let project = ProjectSpec {
+        display_name: "Widgets".into(),
+        default_workflow_ref: "single-agent-contained".into(),
+        issue_source: None,
+        repositories: vec![
+            ProjectRepositorySpec { repo: first.key(), subpath: None, default_branch: None },
+            ProjectRepositorySpec { repo: second.key(), subpath: None, default_branch: None },
+            ProjectRepositorySpec { repo: first.key(), subpath: Some("duplicate-source".into()), default_branch: None },
+        ],
+    };
+
+    assert_eq!(resolve_project_issue_sources(&repositories, &project).await, IssueSourceResolution::Available {
+        sources: vec![IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, IssueSource {
+            service: "https://gitlab.com".into(),
+            scope: "widgets/api".into()
+        },]
+    });
+}
+
+#[tokio::test]
+async fn project_issue_source_resolution_reports_typed_unavailability() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.using::<Repository>("flotilla");
+    let local = RepositorySpec::local("host-01", "/srv/widgets/.git").expect("local repository");
+    repositories.create(&InputMeta::builder().name(local.key().to_string()).build(), &local).await.expect("repository should create");
+    let local_only = ProjectSpec {
+        display_name: "Widgets".into(),
+        default_workflow_ref: "single-agent-contained".into(),
+        issue_source: None,
+        repositories: vec![ProjectRepositorySpec { repo: local.key(), subpath: None, default_branch: None }],
+    };
+    assert_eq!(
+        resolve_project_issue_sources(&repositories, &local_only).await,
+        IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource)
+    );
+
+    let missing = RepositoryKey("missing".into());
+    let unresolved = ProjectSpec {
+        repositories: vec![ProjectRepositorySpec { repo: missing.clone(), subpath: None, default_branch: None }],
+        ..local_only
+    };
+    assert!(matches!(
+        resolve_project_issue_sources(&repositories, &unresolved).await,
+        IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, .. }) if repository == missing
+    ));
+}
 
 #[tokio::test]
 async fn repository_roundtrips_and_is_immutable_in_local_backends() {

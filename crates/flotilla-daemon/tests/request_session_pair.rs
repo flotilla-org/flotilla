@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use flotilla_core::{
@@ -7,11 +7,15 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     providers::{
         discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, init_git_repo_with_remote, FakeDiscoveryProviders},
-        issue_query::{IssueQuery, IssueQueryService, IssueResultPage},
+        issue_tracker::IssueProvider,
     },
 };
 use flotilla_daemon::server::test_support::{spawn_in_memory_request_topology, spawn_in_memory_request_topology_stateful};
-use flotilla_protocol::{provider_data::Issue, Command, CommandAction, CommandValue, HostName, RepoSelector};
+use flotilla_protocol::{
+    issue_query::{IssueQuery, IssueResultPage},
+    test_support::TestIssue,
+    Command, CommandAction, CommandValue, HostName, Issue, IssueChangeset, IssueRef, IssueSource, RepoSelector,
+};
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
@@ -26,32 +30,30 @@ async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
 }
 
 // ---------------------------------------------------------------------------
-// MockIssueQueryService — returns a fixed result for assertions
+// MockIssueProvider — returns a fixed result for assertions
 // ---------------------------------------------------------------------------
 
-struct MockIssueQueryService;
+struct MockIssueProvider;
 
 #[async_trait]
-impl IssueQueryService for MockIssueQueryService {
-    async fn query(&self, _repo: &Path, _params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
-        Ok(IssueResultPage {
-            items: vec![("1".into(), Issue {
-                title: "Test issue".into(),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: "github".into(),
-                provider_display_name: "GitHub".into(),
-            })],
-            total: Some(1),
-            has_more: false,
-        })
+impl IssueProvider for MockIssueProvider {
+    fn supports(&self, _source: &IssueSource) -> bool {
+        true
     }
 
-    async fn fetch_by_ids(&self, _repo: &Path, _ids: &[String]) -> Result<Vec<(String, Issue)>, String> {
-        Ok(vec![])
+    async fn query(&self, _source: &IssueSource, _params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
+        Ok(IssueResultPage { items: vec![TestIssue::new("Test issue").id("1").build()], total: Some(1), has_more: false })
     }
 
-    async fn open_in_browser(&self, _repo: &Path, _id: &str) -> Result<(), String> {
+    async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String> {
+        Err(format!("issue {} not found", reference.id))
+    }
+
+    async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+        Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+    }
+
+    async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
         Ok(())
     }
 }
@@ -94,14 +96,14 @@ async fn in_memory_request_client_routes_remote_command_result() {
 /// A stateless remote issue query should return results end-to-end.
 #[tokio::test]
 async fn remote_issue_query_returns_results() {
-    let mock_service = Arc::new(MockIssueQueryService);
+    let mock_service = Arc::new(MockIssueProvider);
 
     let follower_tmp = tempfile::tempdir().expect("tempdir");
     let follower_repo = follower_tmp.path().join("repo");
     init_git_repo_with_remote(&follower_repo, "git@github.com:owner/repo.git");
     let follower_config = test_config_store(follower_tmp.path().join("config"));
     let follower_discovery = fake_discovery_with_provider_set(
-        FakeDiscoveryProviders::new().with_issue_query_service(Arc::clone(&mock_service) as Arc<dyn IssueQueryService>),
+        FakeDiscoveryProviders::new().with_issue_tracker(Arc::clone(&mock_service) as Arc<dyn IssueProvider>),
     );
     let follower = InProcessDaemon::new(vec![follower_repo.clone()], follower_config, follower_discovery, HostName::new("follower")).await;
     follower.refresh(&RepoSelector::Path(follower_repo.clone())).await.expect("refresh follower repo");
@@ -133,7 +135,7 @@ async fn remote_issue_query_returns_results() {
     match result {
         CommandValue::IssuePage(page) => {
             assert_eq!(page.items.len(), 1);
-            assert_eq!(page.items[0].1.title, "Test issue");
+            assert_eq!(page.items[0].title, "Test issue");
         }
         other => panic!("expected IssuePage, got {other:?}"),
     }

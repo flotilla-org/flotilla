@@ -1047,7 +1047,7 @@ fn provider_table_widths() -> [Constraint; 3] {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{provider_data::Issue, HostPath, NodeId, WorkItemKind};
+    use flotilla_protocol::{test_support::TestIssue, HostPath, NodeId, WorkItemKind};
 
     use super::*;
 
@@ -1104,16 +1104,7 @@ mod tests {
     }
 
     fn native_issue_row(id: &str) -> IssueRow {
-        IssueRow {
-            id: id.to_string(),
-            issue: Issue {
-                title: format!("Issue {id}"),
-                labels: vec![],
-                association_keys: vec![],
-                provider_name: "github".to_string(),
-                provider_display_name: "GitHub".to_string(),
-            },
-        }
+        IssueRow { id: id.to_string(), issue: TestIssue::new(&format!("Issue {id}")).build() }
     }
 
     fn checkout_section(ids: &[&str]) -> SectionData {
