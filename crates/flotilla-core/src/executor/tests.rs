@@ -486,7 +486,7 @@ async fn create_workspace_for_checkout_not_found() {
 }
 
 #[tokio::test]
-async fn create_workspace_for_checkout_success_without_ws_manager() {
+async fn create_workspace_for_checkout_fails_without_ws_manager() {
     let registry = empty_registry();
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat").into(), TestCheckout::new("feat").build());
@@ -501,7 +501,7 @@ async fn create_workspace_for_checkout_success_without_ws_manager() {
     )
     .await;
 
-    assert_ok(result);
+    assert_error_contains(result, "no workspace manager is active");
 }
 
 #[tokio::test]
@@ -1083,7 +1083,7 @@ async fn select_workspace_no_manager() {
     let result =
         run_build_plan_to_completion(CommandAction::SelectWorkspace { ws_ref: "my-ws".to_string() }, registry, empty_data(), runner).await;
 
-    assert_ok(result);
+    assert_error_contains(result, "no workspace manager is active");
 }
 
 #[tokio::test]
@@ -1128,6 +1128,7 @@ async fn create_checkout_no_manager() {
 async fn create_checkout_success() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string())]);
 
     let result = run_build_plan_to_completion(fresh_checkout_action("feat-x"), registry, empty_data(), runner).await;
@@ -1139,6 +1140,7 @@ async fn create_checkout_success() {
 async fn create_checkout_with_issue_ids_writes_git_config() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+    registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
     // Two validation probes (branch absent locally/remotely), then the git config write.
     let runner = MockRunner::new(vec![Err("missing".to_string()), Err("missing".to_string()), Ok(String::new())]);
 
@@ -2178,7 +2180,7 @@ async fn build_plan_create_checkout_returns_steps() {
 }
 
 #[tokio::test]
-async fn checkout_command_fails_before_preparation_without_workspace_manager() {
+async fn checkout_command_fails_loudly_without_workspace_manager() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
 

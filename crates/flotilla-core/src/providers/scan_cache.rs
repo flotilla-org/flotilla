@@ -11,7 +11,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{
         presentation::PresentationManager,
-        terminal::{TerminalEnvVars, TerminalPool, TerminalSession},
+        terminal::{ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession},
         types::{Workspace, WorkspaceAttachRequest},
     },
 };
@@ -137,6 +137,10 @@ impl SharedTerminalPool {
 
 #[async_trait]
 impl TerminalPool for SharedTerminalPool {
+    fn managed_session_name(&self, metadata: &ManagedSessionMetadata) -> Option<String> {
+        self.inner.managed_session_name(metadata)
+    }
+
     fn tracks_session_liveness(&self) -> bool {
         self.inner.tracks_session_liveness()
     }

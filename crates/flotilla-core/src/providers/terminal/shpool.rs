@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, TerminalStatus};
 
-use super::{TerminalEnvVars, TerminalPool, TerminalSession};
+use super::{managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession, MANAGED_SESSION_PREFIX};
 use crate::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{run, run_output, CommandRunner},
@@ -78,13 +78,26 @@ impl ShpoolTerminalPool {
         let mut terminals = Vec::new();
         for session in sessions {
             let name = session["name"].as_str().ok_or("shpool session missing name")?;
+            let status_str = session["status"].as_str().unwrap_or("").to_ascii_lowercase();
+            let status = match status_str.as_str() {
+                "attached" => TerminalStatus::Running,
+                "disconnected" => TerminalStatus::Disconnected,
+                _ => TerminalStatus::Disconnected,
+            };
 
             // Only show flotilla-managed sessions (prefixed "flotilla/")
-            if !name.starts_with("flotilla/") {
+            if !name.starts_with("flotilla/") && !name.starts_with(MANAGED_SESSION_PREFIX) {
                 continue;
             }
 
-            // Validate the session name has the expected structure:
+            // V2 names carry discovery metadata and are decoded by the terminal
+            // manager. Legacy names retain their historical validation here.
+            if name.starts_with(MANAGED_SESSION_PREFIX) {
+                terminals.push(TerminalSession { session_name: name.to_string(), status, command: None, working_directory: None });
+                continue;
+            }
+
+            // Validate the session name has the expected legacy structure:
             // "flotilla/{checkout}/{role}/{index}"
             let rest = &name["flotilla/".len()..];
             let Some((before_index, index_str)) = rest.rsplit_once('/') else {
@@ -98,13 +111,6 @@ impl ShpoolTerminalPool {
                 tracing::warn!(session = name, index = index_str, "failed to parse managed terminal index, skipping");
                 continue;
             }
-
-            let status_str = session["status"].as_str().unwrap_or("").to_ascii_lowercase();
-            let status = match status_str.as_str() {
-                "attached" => TerminalStatus::Running,
-                "disconnected" => TerminalStatus::Disconnected,
-                _ => TerminalStatus::Disconnected,
-            };
 
             terminals.push(TerminalSession {
                 session_name: name.to_string(),
@@ -120,6 +126,10 @@ impl ShpoolTerminalPool {
 
 #[async_trait]
 impl TerminalPool for ShpoolTerminalPool {
+    fn managed_session_name(&self, metadata: &ManagedSessionMetadata) -> Option<String> {
+        Some(managed_session_name(metadata))
+    }
+
     async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
         let socket_path_str = self.socket_path.as_path().display().to_string();
         let config_path_str = self.config_path.as_path().display().to_string();

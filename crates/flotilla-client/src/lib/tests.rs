@@ -55,16 +55,16 @@ fn test_context(
     pending: &SharedPending,
     next_id: &Arc<AtomicU64>,
 ) -> EventContext {
-    EventContext {
-        local_seqs: Arc::clone(local_seqs),
-        subscribed_queries: Arc::clone(subscribed_queries),
-        recovering: Arc::clone(recovering),
-        event_tx: event_tx.downgrade(),
-        session: Arc::clone(session),
-        pending: Arc::clone(pending),
-        next_id: Arc::clone(next_id),
-        initial_sync_complete: Arc::new(AtomicBool::new(true)),
-    }
+    EventContext::builder()
+        .local_seqs(Arc::clone(local_seqs))
+        .subscribed_queries(Arc::clone(subscribed_queries))
+        .recovering(Arc::clone(recovering))
+        .event_tx(event_tx.downgrade())
+        .session(Arc::clone(session))
+        .pending(Arc::clone(pending))
+        .next_id(Arc::clone(next_id))
+        .initial_sync_complete(Arc::new(AtomicBool::new(true)))
+        .build()
 }
 
 fn no_subscriptions() -> Arc<QuerySet> {
@@ -1248,8 +1248,9 @@ fn into_success_response_returns_response_for_success() {
 }
 
 #[test]
-fn unknown_repo_delta_warns_only_after_initial_sync() {
-    assert_eq!(repo_gap_log_level(None, false), tracing::Level::DEBUG);
-    assert_eq!(repo_gap_log_level(None, true), tracing::Level::WARN);
-    assert_eq!(repo_gap_log_level(Some(4), false), tracing::Level::WARN, "a known-repo sequence gap is never startup noise");
+fn initial_sync_state_tracks_completion_flag() {
+    let flag = AtomicBool::new(false);
+    assert_eq!(InitialSyncState::load(&flag), InitialSyncState::Pending);
+    flag.store(true, Ordering::Release);
+    assert_eq!(InitialSyncState::load(&flag), InitialSyncState::Complete);
 }

@@ -77,6 +77,18 @@ fn parse_list_json_with_slashy_branch_names() {
 }
 
 #[test]
+fn parse_list_json_keeps_self_describing_managed_session() {
+    let session_name = "flotilla-v2:set-1:terminal-1:feat:shell:0:%2Frepo%2Fwt-feat";
+    let json = format!(r#"{{"sessions":[{{"name":"{session_name}","status":"Attached"}}]}}"#);
+
+    let sessions = ShpoolTerminalPool::parse_list_json(&json).expect("parse sessions");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_name, session_name);
+    assert_eq!(sessions[0].status, TerminalStatus::Running);
+}
+
+#[test]
 fn parse_list_json_empty_sessions() {
     let json = r#"{"sessions": []}"#;
     let sessions = ShpoolTerminalPool::parse_list_json(json).unwrap();

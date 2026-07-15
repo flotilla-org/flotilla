@@ -1083,34 +1083,22 @@ async fn refresh_correlates_discovered_attachable_set_from_member_working_direct
     let checkout_key: QualifiedPath = checkout.clone().into();
     let store = crate::attachable::shared_in_memory_attachable_store();
     let set_id = flotilla_protocol::AttachableSetId::new("discovered-set");
-    let attachable_id = flotilla_protocol::AttachableId::new("discovered-terminal");
-
-    {
-        let mut store = store.lock().expect("lock attachable store");
-        store.insert_set(flotilla_protocol::AttachableSet {
-            id: set_id.clone(),
-            host_affinity: Some(host),
-            checkout: None,
-            template_identity: None,
-            environment_id: None,
-            members: vec![attachable_id.clone()],
-        });
-        store.insert_attachable(crate::attachable::Attachable {
-            id: attachable_id,
-            set_id: set_id.clone(),
-            content: crate::attachable::AttachableContent::Terminal(crate::attachable::TerminalAttachable {
-                purpose: crate::attachable::TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
-                command: "bash".into(),
-                working_directory: ExecutionEnvironmentPath::new(&checkout_path),
-                status: flotilla_protocol::TerminalStatus::Running,
-            }),
-        });
-    }
+    let session_name = "flotilla-v2:discovered-set:discovered-terminal:feat:shell:0:%2Frepo%2Fwt-feat";
 
     let mut registry = ProviderRegistry::new();
     let mut checkout_data = TestCheckout::new("feat").build();
     checkout_data.correlation_keys = vec![flotilla_protocol::CorrelationKey::CheckoutPath(checkout_key)];
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::ok(vec![(checkout_path, checkout_data)])));
+    registry.terminal_pools.insert(
+        "shpool",
+        desc("shpool"),
+        Arc::new(MockTerminalPool::ok(vec![crate::providers::terminal::TerminalSession {
+            session_name: session_name.into(),
+            status: flotilla_protocol::TerminalStatus::Running,
+            command: None,
+            working_directory: None,
+        }])),
+    );
     let handle = RepoRefreshHandle::spawn(
         repo_root(),
         Arc::new(registry),

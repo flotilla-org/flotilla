@@ -7,7 +7,9 @@ use super::*;
 use crate::{
     attachable::{shared_in_memory_attachable_store, AttachableContent},
     path_context::ExecutionEnvironmentPath,
-    providers::terminal::{TerminalEnvVars, TerminalPool, TerminalSession},
+    providers::terminal::{
+        managed_session_name, parse_managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession,
+    },
 };
 
 fn ee(path: &str) -> ExecutionEnvironmentPath {
@@ -144,7 +146,7 @@ async fn ensure_running_delegates_to_pool() {
 }
 
 #[tokio::test]
-async fn ensure_running_uses_attachable_id_as_session_name() {
+async fn ensure_running_uses_provider_discovery_session_name() {
     let store = shared_in_memory_attachable_store();
     let mock = std::sync::Arc::new(MockTerminalPool::new());
 
@@ -160,6 +162,10 @@ async fn ensure_running_uses_attachable_id_as_session_name() {
 
     #[async_trait]
     impl TerminalPool for SharedMock {
+        fn managed_session_name(&self, metadata: &ManagedSessionMetadata) -> Option<String> {
+            Some(managed_session_name(metadata))
+        }
+
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             self.calls.lock().expect("lock").push(PoolCall::ListSessions);
             Ok(Vec::new())
@@ -212,7 +218,9 @@ async fn ensure_running_uses_attachable_id_as_session_name() {
     assert_eq!(recorded.len(), 1);
     match &recorded[0] {
         PoolCall::EnsureSession { session_name, command, cwd, env_vars } => {
-            assert_eq!(session_name, &att_id.to_string());
+            let metadata = parse_managed_session_name(session_name).expect("managed session metadata");
+            assert_eq!(metadata.attachable_id, att_id);
+            assert_eq!(metadata.working_directory, ee("/repo/wt-feat"));
             assert_eq!(command, "bash");
             assert_eq!(cwd, &ExecutionEnvironmentPath::new("/repo/wt-feat"));
             assert!(env_vars.iter().any(|(k, v)| k == "FLOTILLA_ATTACHABLE_ID" && v == att_id.as_str()));

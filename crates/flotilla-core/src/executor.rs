@@ -135,6 +135,14 @@ impl<'a> CheckoutFlow<'a> {
     }
 }
 
+fn no_workspace_manager_error_message() -> String {
+    "no workspace manager is active; run `flotilla status` to inspect unmet provider requirements".to_string()
+}
+
+fn no_workspace_manager_error() -> CommandValue {
+    CommandValue::Error { message: no_workspace_manager_error_message() }
+}
+
 /// Build a step plan for a command.
 ///
 /// Returns `Ok(StepPlan)` for all per-repo commands, or `Err(CommandValue)`
@@ -160,11 +168,6 @@ pub async fn build_plan(
 
     match action {
         CommandAction::Checkout { target, issue_ids, .. } => {
-            if registry.presentation_managers.preferred().is_none() {
-                return Err(CommandValue::Error {
-                    message: "no workspace manager is active; run `flotilla status` to inspect unmet provider requirements".to_string(),
-                });
-            }
             match provisioning_target {
                 Some(flotilla_protocol::ProvisioningTarget::NewEnvironment { provider, .. }) => {
                     return Ok(build_environment_checkout_plan(
@@ -892,6 +895,14 @@ impl StepResolver for ExecutorStepResolver {
                         _ => None,
                     })
                     .ok_or_else(|| "prepared workspace not produced by prior step".to_string())?;
+
+                // A checkout command may already have produced CheckoutCreated.
+                // Return an explicit command result here so the generic
+                // "preserve prior success" rule cannot hide this capability
+                // failure as a successful checkout.
+                if self.registry.presentation_managers.preferred().is_none() {
+                    return Ok(StepOutcome::CompletedWith(no_workspace_manager_error()));
+                }
 
                 // container_name flows through the PreparedWorkspace payload from
                 // the remote daemon — no local handle lookup needed.

@@ -6,6 +6,7 @@ use super::{ResolutionContext, ResolvedAction};
 use crate::{
     attachable::{AttachableContent, SharedAttachableStore},
     providers::terminal::{TerminalEnvVars, TerminalPool},
+    terminal_manager::session_name_for_attachable,
 };
 
 /// Resolves a `Hop::AttachTerminal` into a terminal-attach action on the context.
@@ -32,12 +33,13 @@ impl PoolTerminalHopResolver {
 
 impl TerminalHopResolver for PoolTerminalHopResolver {
     fn resolve(&self, attachable_id: &AttachableId, context: &mut ResolutionContext) -> Result<(), String> {
-        let (command, cwd) = {
+        let (session_name, command, cwd) = {
             let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let attachable =
                 store.registry().attachables.get(attachable_id).ok_or_else(|| format!("attachable not found: {attachable_id}"))?;
+            let session_name = session_name_for_attachable(&*store, attachable_id);
             match &attachable.content {
-                AttachableContent::Terminal(t) => (t.command.clone(), t.working_directory.clone()),
+                AttachableContent::Terminal(t) => (session_name, t.command.clone(), t.working_directory.clone()),
             }
         };
 
@@ -46,7 +48,6 @@ impl TerminalHopResolver for PoolTerminalHopResolver {
             env_vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.clone()));
         }
 
-        let session_name = attachable_id.to_string();
         let args = self.pool.attach_args(&session_name, &command, &cwd, &env_vars)?;
         context.actions.push(ResolvedAction::Command(args));
         Ok(())

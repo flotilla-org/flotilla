@@ -130,16 +130,16 @@ impl SocketDaemon {
 
         // Spawn background reader task
         let reader_session = Arc::clone(&session);
-        let reader_context = EventContext {
-            local_seqs: Arc::clone(&local_seqs),
-            subscribed_queries: Arc::clone(&subscribed_queries),
-            recovering,
-            event_tx: event_tx_weak.clone(),
-            session: Arc::clone(&session),
-            pending: Arc::clone(&pending),
-            next_id: Arc::clone(&next_id),
-            initial_sync_complete: Arc::clone(&initial_sync_complete),
-        };
+        let reader_context = EventContext::builder()
+            .local_seqs(Arc::clone(&local_seqs))
+            .subscribed_queries(Arc::clone(&subscribed_queries))
+            .recovering(recovering)
+            .event_tx(event_tx_weak.clone())
+            .session(Arc::clone(&session))
+            .pending(Arc::clone(&pending))
+            .next_id(Arc::clone(&next_id))
+            .initial_sync_complete(Arc::clone(&initial_sync_complete))
+            .build();
         let reader_task = tokio::spawn(async move {
             let _event_channel_guard = event_tx;
             loop {
@@ -536,7 +536,7 @@ fn into_success_response(result: ResponseResult) -> Result<Response, String> {
 /// Shared state the background reader threads through event handling and gap
 /// recovery: seq tracking, the query subscription set, in-flight recovery
 /// buffers, the subscriber fan-out, and the request plumbing recovery needs.
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
 struct EventContext {
     local_seqs: Arc<SeqMap>,
     subscribed_queries: Arc<QuerySet>,
@@ -548,11 +548,19 @@ struct EventContext {
     initial_sync_complete: Arc<AtomicBool>,
 }
 
-fn repo_gap_log_level(local_seq: Option<u64>, initial_sync_complete: bool) -> tracing::Level {
-    if local_seq.is_some() || initial_sync_complete {
-        tracing::Level::WARN
-    } else {
-        tracing::Level::DEBUG
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialSyncState {
+    Pending,
+    Complete,
+}
+
+impl InitialSyncState {
+    fn load(flag: &AtomicBool) -> Self {
+        if flag.load(Ordering::Acquire) {
+            Self::Complete
+        } else {
+            Self::Pending
+        }
     }
 }
 
@@ -612,10 +620,15 @@ fn handle_event(event: DaemonEvent, ctx: &EventContext) {
 
                     if let Some(ls) = local_seq {
                         warn!(repo_identity = %repo_identity, repo = ?repo, local_seq = ls, %prev_seq, "seq gap, requesting replay");
-                    } else if repo_gap_log_level(None, ctx.initial_sync_complete.load(Ordering::Acquire)) == tracing::Level::WARN {
-                        warn!(repo_identity = %repo_identity, repo = ?repo, "received delta for unknown repo, requesting replay");
                     } else {
-                        debug!(repo_identity = %repo_identity, repo = ?repo, "received startup delta before initial sync, requesting replay");
+                        match InitialSyncState::load(&ctx.initial_sync_complete) {
+                            InitialSyncState::Complete => {
+                                warn!(repo_identity = %repo_identity, repo = ?repo, "received delta for unknown repo, requesting replay");
+                            }
+                            InitialSyncState::Pending => {
+                                debug!(repo_identity = %repo_identity, repo = ?repo, "received startup delta before initial sync, requesting replay");
+                            }
+                        }
                     }
 
                     let ctx = ctx.clone();

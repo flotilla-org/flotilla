@@ -52,7 +52,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
         teleport_cmd: &str,
     ) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
-            return Ok(());
+            return Err(super::no_workspace_manager_error_message());
         };
 
         let attachable_set_id = self.ensure_attachable_set_for_checkout(self.local_host, checkout_path, checkout_key, None);
@@ -78,7 +78,7 @@ impl<'a> WorkspaceOrchestrator<'a> {
 
     pub(super) async fn attach_prepared_workspace(&self, prepared: &PreparedWorkspace, container_name: Option<&str>) -> Result<(), String> {
         let Some((provider_name, ws_mgr)) = self.preferred_workspace_manager() else {
-            return Ok(());
+            return Err(super::no_workspace_manager_error_message());
         };
 
         let scope_prefix = ws_mgr.binding_scope_prefix();
@@ -210,10 +210,8 @@ impl<'a> WorkspaceOrchestrator<'a> {
     }
 
     pub(super) async fn select_workspace(&self, ws_ref: &str) -> Result<(), String> {
-        if let Some(ws_mgr) = self.registry.presentation_managers.preferred() {
-            ws_mgr.select_workspace(ws_ref).await?;
-        }
-        Ok(())
+        let ws_mgr = self.registry.presentation_managers.preferred().ok_or_else(super::no_workspace_manager_error_message)?;
+        ws_mgr.select_workspace(ws_ref).await
     }
 
     fn preferred_workspace_manager(&self) -> Option<(&str, &Arc<dyn PresentationManager>)> {
