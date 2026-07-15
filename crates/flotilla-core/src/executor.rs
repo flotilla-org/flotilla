@@ -160,6 +160,11 @@ pub async fn build_plan(
 
     match action {
         CommandAction::Checkout { target, issue_ids, .. } => {
+            if registry.presentation_managers.preferred().is_none() {
+                return Err(CommandValue::Error {
+                    message: "no workspace manager is active; run `flotilla status` to inspect unmet provider requirements".to_string(),
+                });
+            }
             match provisioning_target {
                 Some(flotilla_protocol::ProvisioningTarget::NewEnvironment { provider, .. }) => {
                     return Ok(build_environment_checkout_plan(

@@ -42,7 +42,7 @@ mod status_human {
     use flotilla_protocol::{
         qualified_path::HostId, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostListEntry, HostListResponse,
         HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, ImageId, PeerConnectionState, RepoSummary,
-        StatusResponse, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+        StatusResponse, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
     };
 
     use super::*;
@@ -65,11 +65,17 @@ mod status_human {
                 provider_health: health(&[("vcs", "Git", true)]),
                 work_item_count: 3,
                 error_count: 0,
+                unmet_requirements: vec![UnmetRequirementInfo {
+                    factory: "ZellijPresentationManager".into(),
+                    kind: "missing_binary".into(),
+                    value: Some("zellij >= 0.44.1 required, found 0.44.0".into()),
+                }],
             }],
         };
         let output = format_status_response_human(&status);
         assert!(output.contains("my-repo"), "should contain repo name");
         assert!(output.contains("3"), "should show work item count");
+        assert!(output.contains("zellij >= 0.44.1 required, found 0.44.0"), "should expose why the provider was not activated");
     }
 
     fn sample_host_summary(name: &str) -> HostSummary {

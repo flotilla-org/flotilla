@@ -33,7 +33,7 @@ fn format_status_response_human(status: &StatusResponse) -> String {
     }
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Repo", "Path", "Work Items", "Errors", "Health"]);
+    table.set_header(vec!["Repo", "Path", "Work Items", "Errors", "Health", "Unavailable"]);
     for repo in &status.repos {
         let name = repo.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mut health: Vec<String> = repo
@@ -45,12 +45,22 @@ fn format_status_response_human(status: &StatusResponse) -> String {
             .collect();
         health.sort();
         let health_str = if health.is_empty() { "-".into() } else { health.join(", ") };
+        let unavailable = repo
+            .unmet_requirements
+            .iter()
+            .map(|requirement| match &requirement.value {
+                Some(value) => format!("{}: {value}", requirement.factory),
+                None => format!("{}: {}", requirement.factory, requirement.kind),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         table.add_row(vec![
             Cell::new(&name),
             Cell::new(repo.path.display()),
             Cell::new(repo.work_item_count),
             Cell::new(repo.error_count),
             Cell::new(&health_str),
+            Cell::new(if unavailable.is_empty() { "-" } else { &unavailable }),
         ]);
     }
     format!("{table}\n")

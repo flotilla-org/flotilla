@@ -2178,6 +2178,16 @@ async fn build_plan_create_checkout_returns_steps() {
 }
 
 #[tokio::test]
+async fn checkout_command_fails_before_preparation_without_workspace_manager() {
+    let mut registry = empty_registry();
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
+
+    let result = run_build_plan_to_completion(existing_branch_checkout_action("feat-x"), registry, empty_data(), runner_ok()).await;
+
+    assert_error_contains(result, "no workspace manager is active");
+}
+
+#[tokio::test]
 async fn build_plan_create_checkout_uses_command_host_for_checkout_steps() {
     let mut registry = empty_registry();
     registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
