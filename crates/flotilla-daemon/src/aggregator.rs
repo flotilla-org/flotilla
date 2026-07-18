@@ -743,7 +743,7 @@ impl Aggregator {
                 Some((checkout, spec))
             })
             .map(|(checkout, spec)| {
-                let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Managed);
+                let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Observed);
                 Ok(CheckoutRow::builder()
                     .resource(self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name))
                     .repo(spec.repo_ref.clone())
@@ -760,6 +760,9 @@ impl Aggregator {
     }
 
     fn emit_checkout_deltas(&self, deltas: Vec<ResultDelta>) {
+        if self.bootstrapping {
+            return;
+        }
         for delta in deltas {
             let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
         }
