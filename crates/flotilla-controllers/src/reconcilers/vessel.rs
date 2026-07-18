@@ -195,6 +195,7 @@ impl Reconciler for VesselReconciler {
             }
         };
         let checkout_slug = git_ref.as_deref().map(checkout_path_component);
+        let convoy_checkout_slug = checkout_path_component(&convoy.metadata.name);
         if repository_refs.len() > 1 && !obj.spec.adopted_checkout_refs.is_empty() {
             return Ok(VesselDeps::failed("adopted checkouts are not supported for multi-repository vessel workspaces".to_string()));
         }
@@ -282,8 +283,9 @@ impl Reconciler for VesselReconciler {
             match &strategy {
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                     format!(
-                        "{}/{}",
+                        "{}/{}/{}",
                         shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
+                        convoy_checkout_slug,
                         checkout_slug.as_deref().expect("repository workspace requires a branch")
                     )
                 }
@@ -371,6 +373,7 @@ impl Reconciler for VesselReconciler {
                     } else {
                         checkout_target_path(
                             shared_clone_root.as_deref().expect("shared-clone placement has a root"),
+                            &convoy_checkout_slug,
                             &repository.spec.catalog_slug(),
                             checkout_slug.as_deref().expect("repository checkout requires a branch"),
                         )
@@ -747,8 +750,8 @@ fn checkout_path_component(branch: &str) -> String {
     }
 }
 
-fn checkout_target_path(repo_default_dir: &str, repo_slug: &str, branch_slug: &str) -> String {
-    format!("{}/{}.{}", repo_default_dir.trim_end_matches('/'), repo_slug, branch_slug)
+fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {
+    format!("{}/{}/{}.{}", repo_default_dir.trim_end_matches('/'), convoy_slug, repo_slug, branch_slug)
 }
 
 fn append_convoy_work_context(content: &mut String, convoy: &ResourceObject<Convoy>, repository_refs: &[RepositoryKey]) {

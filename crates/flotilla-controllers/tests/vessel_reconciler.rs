@@ -243,6 +243,42 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
 }
 
 #[tokio::test]
+async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-one", "implement", REPO_URL, GIT_REF).await;
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-two", "implement", REPO_URL, GIT_REF).await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-shared-branch", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    let clone_name =
+        format!("clone-{}", clone_key(&canonicalize_repo_url(REPO_URL).expect("repo canonicalization"), &host_direct_env_name()));
+    create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
+    let first = create_workspace(&backend, NAMESPACE, "workspace-one", "convoy-one", "implement", "policy-shared-branch", REPO_URL).await;
+    let second = create_workspace(&backend, NAMESPACE, "workspace-two", "convoy-two", "implement", "policy-shared-branch", REPO_URL).await;
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let first_deps = reconciler.fetch_dependencies(&first).await.expect("first dependencies");
+    let second_deps = reconciler.fetch_dependencies(&second).await.expect("second dependencies");
+    let first_outcome = reconciler.reconcile(&first, &first_deps, Utc::now());
+    let second_outcome = reconciler.reconcile(&second, &second_deps, Utc::now());
+    let checkout_path = |outcome: &flotilla_resources::controller::ReconcileOutcome<_>| {
+        outcome
+            .actuations
+            .iter()
+            .find_map(|actuation| match actuation {
+                Actuation::CreateCheckout { spec, .. } => spec.target_path().map(str::to_string),
+                _ => None,
+            })
+            .expect("convoy should create a checkout")
+    };
+    let first_path = checkout_path(&first_outcome);
+    let second_path = checkout_path(&second_outcome);
+
+    assert_eq!(first_path, "/Users/alice/dev/flotilla-repos/convoy-one/github-com-flotilla-org-flotilla.feat-task-provisioning");
+    assert_eq!(second_path, "/Users/alice/dev/flotilla-repos/convoy-two/github-com-flotilla-org-flotilla.feat-task-provisioning");
+    assert_ne!(first_path, second_path);
+}
+
+#[tokio::test]
 async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_workspace_root() {
     let backend = ResourceBackend::InMemory(Default::default());
     let repository_specs = [
@@ -365,8 +401,8 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .collect::<Vec<_>>();
     assert_eq!(checkout_actuations.len(), 2);
     assert_eq!(checkout_actuations.iter().map(|(_, spec)| spec.target_path().expect("managed checkout path")).collect::<Vec<_>>(), [
-        "/Users/alice/dev/flotilla-repos/feature-multi/cleat",
-        "/Users/alice/dev/flotilla-repos/feature-multi/flotilla",
+        "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/cleat",
+        "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla",
     ]);
     for (meta, spec) in checkout_actuations {
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -389,10 +425,10 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         matches!(
             actuation,
             Actuation::CreateTerminalSession { spec, .. }
-                if spec.cwd == "/Users/alice/dev/flotilla-repos/feature-multi"
+                if spec.cwd == "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi"
                     && matches!(&spec.source, TerminalSessionSource::Agent { brief, .. }
                         if brief.path == ".flotilla/briefs/coder.md"
-                            && brief.copies == ["/Users/alice/dev/flotilla-repos/feature-multi/flotilla"]
+                            && brief.copies == ["/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla"]
                             && brief.content.contains("https://github.com` / `flotilla-org/flotilla` / `732")
                             && brief.content.contains("Snapshot as of `2026-07-18T09:30:00+00:00`")
                             && brief.content.contains("Persist this exact issue body.")
@@ -407,7 +443,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         &host_direct_env_name(),
         "coder",
         "cargo test",
-        "/Users/alice/dev/flotilla-repos/feature-multi",
+        "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi",
         "cleat",
     )
     .await;
@@ -546,7 +582,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
     });
     let mounts = mounts.expect("docker environment should be created");
     assert_eq!(mounts.len(), 1);
-    assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/feature-multi");
+    assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
 
     let mixed = backend
@@ -764,7 +800,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .expect("scoped checkout should be created");
     assert_eq!(checkout_name, "checkout-convoy-scoped-cleat");
     assert_eq!(checkout.repo_ref(), &cleat.key());
-    assert_eq!(checkout.target_path(), Some("/Users/alice/dev/flotilla-repos/feature-scoped/cleat"));
+    assert_eq!(checkout.target_path(), Some("/Users/alice/dev/flotilla-repos/convoy-scoped/feature-scoped/cleat"));
 
     let adopted_path = "/Users/alice/dev/cleat-existing";
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
