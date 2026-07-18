@@ -722,6 +722,7 @@ mod tests {
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
                 origin_node_id: NodeId::new("remote"),
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+                repository_key: None,
                 host_repo_root: Some(PathBuf::from("/home/remote/repo")),
                 clock: flotilla_protocol::VectorClock::default(),
                 kind: flotilla_protocol::PeerDataKind::Snapshot { data: Box::new(flotilla_protocol::ProviderData::default()), seq: 1 },

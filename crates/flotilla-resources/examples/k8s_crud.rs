@@ -48,10 +48,10 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         .into_iter()
         .collect(),
         placement_policy: Some("laptop-docker".to_string()),
-        repository: None,
+        repositories: Vec::new(),
         r#ref: None,
         project_ref: None,
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: Default::default(),
     }
 }
 

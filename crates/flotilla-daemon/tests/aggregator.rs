@@ -9,18 +9,21 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    providers::discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeTerminalPool},
+    providers::discovery::test_support::{
+        fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders, FakeIssueProvider, FakeTerminalPool,
+    },
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
     result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet},
-    DaemonEvent, HostName, QueryCursor,
+    test_support::TestIssue,
+    DaemonEvent, HostName, QueryCursor, QueryScope,
 };
 use flotilla_resources::{
     Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
-    InMemoryBackend, InputMeta, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_LABEL,
-    VESSEL_LABEL,
+    InMemoryBackend, InputMeta, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
+    CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -45,10 +48,10 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         workflow_ref: workflow_ref.to_string(),
         inputs: BTreeMap::new(),
         placement_policy: None,
-        repository: None,
+        repositories: Vec::new(),
         r#ref: None,
         project_ref: None,
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: BTreeMap::new(),
     }
 }
 
@@ -58,6 +61,83 @@ fn convoy_rows(result_set: &ResultSet) -> &[ConvoyRow] {
 
 fn independent_rows(result_set: &ResultSet) -> &[IndependentRow] {
     result_set.rows.as_independents().expect("independent rows")
+}
+
+#[tokio::test]
+async fn repository_issue_subscription_materializes_from_an_in_memory_provider() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository resource");
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider
+        .add_issues(
+            (0..51)
+                .map(|index| {
+                    let id = format!("WIDGET-{index:03}");
+                    (id.clone(), TestIssue::new(&format!("Materialized {id}")).build())
+                })
+                .collect(),
+        )
+        .await;
+    let discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new()
+            .with_issue_tracker(Arc::clone(&provider) as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+    );
+    let daemon = InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), discovery, HostName::new("local"), backend).await;
+    let options = RuntimeOptions {
+        namespace: "flotilla".into(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        ..RuntimeOptions::default()
+    };
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
+    let mut events = daemon.subscribe();
+    let query = QueryId::Issues { scope: QueryScope::Repository(repository_key) };
+
+    daemon
+        .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }])
+        .await
+        .expect("subscribe issue query");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::ResultSet(set) = events.recv().await.expect("daemon event") {
+                if set.query() == query && set.rows.as_issues().is_some_and(|rows| !rows.is_empty()) {
+                    return set;
+                }
+            }
+        }
+    })
+    .await
+    .expect("materialized issue window");
+    let rows = result.rows.as_issues().expect("issue rows");
+    assert_eq!(rows.len(), 50);
+    assert_eq!(rows[0].reference.id, "WIDGET-000");
+    assert!(result.state.demand.as_ref().expect("demand metadata").has_more);
+    assert!(result.state.conditions.is_empty());
+
+    daemon.fetch_more(&query).await.expect("request next page");
+    let delta = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::ResultDelta(delta) = events.recv().await.expect("daemon event") {
+                if delta.query() == query {
+                    return delta;
+                }
+            }
+        }
+    })
+    .await
+    .expect("fetch-more delta");
+    assert_eq!(delta.changes.as_issues().expect("appended issue rows")[0].reference.id, "WIDGET-050");
+    assert!(!delta.state.as_ref().and_then(|state| state.demand.as_ref()).expect("updated demand metadata").has_more);
 }
 
 #[tokio::test]
@@ -244,7 +324,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
                     }
                 }
                 Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
-                    let rows = delta.changed.as_independents().expect("independent rows");
+                    let rows = delta.changes.as_independents().expect("independent rows");
                     if !rows.is_empty() {
                         return rows.to_vec();
                     }
@@ -261,8 +341,10 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         rows.iter().all(|row| row.name != "terminal-convoy-coder"),
         "convoy-bound terminal sessions surface on vessel rows, never in independents",
     );
-    let convoy_replay =
-        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: None }]).await.expect("subscribe to convoys query");
+    let convoy_replay = daemon
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: None }])
+        .await
+        .expect("subscribe to convoys query");
     let convoy_rows = convoy_replay
         .iter()
         .find_map(|event| match event {
@@ -283,7 +365,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     assert!(daemon.resolve_attach_command_internal("terminal-yeoman").await.is_ok());
 
     let replay = daemon
-        .subscribe_queries(&[QueryCursor { query: QueryId::Independents, since: None }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Independents, since: None }])
         .await
         .expect("subscribe to independents query");
     let replayed = replay
@@ -312,7 +394,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
             match rx.recv().await {
                 Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
                     if let Some(row) = delta
-                        .changed
+                        .changes
                         .as_independents()
                         .expect("independent rows")
                         .iter()
@@ -339,7 +421,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
             match rx.recv().await {
                 Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
                     if let Some(row) = delta
-                        .changed
+                        .changes
                         .as_independents()
                         .expect("independent rows")
                         .iter()
@@ -375,7 +457,12 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let removed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents && !delta.removed.is_empty() => return delta,
+                Ok(DaemonEvent::ResultDelta(delta))
+                    if delta.query() == QueryId::Independents
+                        && delta.changes.removed_resources().is_some_and(|removed| !removed.is_empty()) =>
+                {
+                    return delta;
+                }
                 Ok(_) => continue,
                 Err(err) => panic!("broadcast receive error: {err}"),
             }
@@ -383,8 +470,9 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     })
     .await
     .expect("timed out waiting for adopted session removal");
-    assert_eq!(removed.removed.len(), 1);
-    assert_eq!(removed.removed[0].name, "terminal-yeoman");
+    let removed = removed.changes.removed_resources().expect("independent removals");
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].name, "terminal-yeoman");
 }
 
 /// Verifies the causal chain:
@@ -455,8 +543,10 @@ async fn subscribe_queries_replays_result_set_after_seq() {
     .expect("timed out waiting for ResultDelta after convoy-b");
 
     // Step 3: SubscribeQueries with the cursor from step 1.
-    let replay_events =
-        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: Some(cursor_seq) }]).await.expect("subscribe_queries");
+    let replay_events = daemon
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(cursor_seq) }])
+        .await
+        .expect("subscribe_queries");
 
     // The replay must include a ResultSet for the convoys query containing
     // convoy-b (the seq advanced past cursor_seq, so the full set is re-sent).

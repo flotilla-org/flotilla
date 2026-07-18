@@ -819,7 +819,7 @@ fn handle_repo_added_adds_new_repo() {
     // arrive asynchronously, e.g. registered by another session or the CLI)
     assert_eq!(app.views.active_index(), 2, "active tab unchanged");
     assert_eq!(app.model.active_repo, Some(app.model.repo_order[0].clone()));
-    assert!(app.views.find(&ViewAddress::Repo(app.model.repo_order[1].clone())).is_none(), "no tab opened for the new repo");
+    assert!(app.views.find(&ViewAddress::repo(app.model.repo_order[1].clone())).is_none(), "no tab opened for the new repo");
 }
 
 #[test]
@@ -829,6 +829,22 @@ fn handle_repo_added_duplicate_is_noop() {
     let info = repo_info(app.model.repos[&existing_path].path.clone(), "dup", RepoLabels::default());
     app.handle_repo_added(info);
     assert_eq!(app.model.repos.len(), 1);
+}
+
+#[test]
+fn handle_repo_added_enriches_an_existing_repo_with_its_query_key() {
+    let mut app = stub_app();
+    let identity = app.model.repo_order[0].clone();
+    let mut info = repo_info(app.model.repos[&identity].path.clone(), "resolved", RepoLabels::default());
+    let key = flotilla_protocol::RepositoryKey("repo_resolved".into());
+    info.repository_key = Some(key.clone());
+    app.subscriptions_dirty = false;
+
+    app.handle_repo_added(info);
+
+    assert_eq!(app.model.repos[&identity].repository_key, Some(key.clone()));
+    assert!(app.views.find(&ViewAddress::repo_with_key(identity, key)).is_some());
+    assert!(app.subscriptions_dirty);
 }
 
 #[test]
@@ -854,7 +870,7 @@ fn handle_repo_removed_last_repo_keeps_app_alive() {
     // tab stays open as a dangling error tab instead.
     assert!(!app.should_quit);
     assert!(app.model.repos.is_empty());
-    assert!(app.views.find(&ViewAddress::Repo(identity)).is_some(), "the removed repo's tab stays open as a dangling tab");
+    assert!(app.views.find(&ViewAddress::repo(identity)).is_some(), "the removed repo's tab stays open as a dangling tab");
 }
 
 #[test]
@@ -869,7 +885,7 @@ fn handle_repo_removed_keeps_tab_open_as_dangling() {
     // the repo's data is gone so the tab renders its dangling-repo error page.
     assert_eq!(app.views.active_index(), 4);
     assert_eq!(app.views.len(), 5);
-    assert!(app.views.find(&ViewAddress::Repo(last_identity.clone())).is_some());
+    assert!(app.views.find(&ViewAddress::repo(last_identity.clone())).is_some());
     assert!(!app.model.repos.contains_key(&last_identity));
     assert!(!app.screen.repo_pages.contains_key(&last_identity));
 }
@@ -1567,20 +1583,28 @@ fn result_set_event(snapshot: impl AsRef<crate::convoy_model::ConvoyFixtureSnaps
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(ResultSet {
         seq: snapshot.seq,
         rows: Rows::Convoys(snapshot.convoys.into_iter().map(wire_convoy_row).collect()),
+        state: Default::default(),
     }))
 }
 
 fn result_delta_event(delta: impl AsRef<crate::convoy_model::ConvoyFixtureDelta>) -> flotilla_protocol::DaemonEvent {
     use flotilla_protocol::{
-        result_set::{ResultDelta, Rows},
+        result_set::{QueryChanges, ResultDelta},
         ResourceRef,
     };
 
     let delta = delta.as_ref().clone();
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(ResultDelta {
         seq: delta.seq,
-        changed: Rows::Convoys(delta.changed.into_iter().map(wire_convoy_row).collect()),
-        removed: delta.removed.into_iter().map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name())).collect(),
+        changes: QueryChanges::Convoys {
+            changed: delta.changed.into_iter().map(wire_convoy_row).collect(),
+            removed: delta
+                .removed
+                .into_iter()
+                .map(|id| ResourceRef::new("flotilla.work/v1", "Convoy", id.namespace(), id.name()))
+                .collect(),
+        },
+        state: None,
     }))
 }
 
@@ -1599,6 +1623,7 @@ fn independent_result_set(seq: u64, rows: Vec<flotilla_protocol::IndependentRow>
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
         seq,
         rows: flotilla_protocol::Rows::Independents(rows),
+        state: Default::default(),
     }))
 }
 
@@ -1609,8 +1634,8 @@ fn independent_delta(
 ) -> flotilla_protocol::DaemonEvent {
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
         seq,
-        changed: flotilla_protocol::Rows::Independents(changed),
-        removed,
+        changes: flotilla_protocol::QueryChanges::Independents { changed, removed },
+        state: None,
     }))
 }
 
@@ -1727,6 +1752,95 @@ fn app_applies_independent_sets_and_removal_deltas_without_disturbing_convoys() 
     assert_eq!(app.namespaces["flotilla"].convoys.len(), 1);
 }
 
+#[test]
+fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
+    let mut app = stub_app();
+    let identity = app.model.repo_order[0].clone();
+    let repository_key = flotilla_protocol::RepositoryKey("repo_materialized".into());
+    app.model.repos.get_mut(&identity).expect("repo model").repository_key = Some(repository_key.clone());
+    let scope = flotilla_protocol::QueryScope::Repository(repository_key);
+    let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+    let mut first = TestIssue::new("First materialized issue").id("LINEAR-1").build();
+    first.reference.source = source.clone();
+    let first_ref = first.reference.clone();
+
+    app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq: 1,
+        rows: flotilla_protocol::Rows::Issues {
+            scope: scope.clone(),
+            rows: vec![flotilla_protocol::IssueRow { reference: first_ref.clone(), issue: first }],
+        },
+        state: flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-15T12:00:00Z".parse().expect("timestamp"),
+                has_more: true,
+            }),
+            conditions: vec![],
+        },
+    })));
+    assert_eq!(app.repo_data[&identity].read().issue_rows[0].issue.reference.id, "LINEAR-1");
+
+    let mut second = TestIssue::new("Second materialized issue").id("LINEAR-2").build();
+    second.reference.source = source;
+    let second_ref = second.reference.clone();
+    app.handle_daemon_event(DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
+        seq: 2,
+        changes: flotilla_protocol::QueryChanges::Issues {
+            scope,
+            changed: vec![flotilla_protocol::IssueRow { reference: second_ref, issue: second }],
+            removed: vec![first_ref],
+        },
+        state: Some(flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-15T12:01:00Z".parse().expect("timestamp"),
+                has_more: false,
+            }),
+            conditions: vec![],
+        }),
+    })));
+
+    let data = app.repo_data[&identity].read();
+    assert_eq!(data.issue_rows.len(), 1);
+    assert_eq!(data.issue_rows[0].issue.reference.id, "LINEAR-2");
+}
+
+#[tokio::test]
+async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
+    let mut app = stub_app();
+    let identity = app.model.repo_order[0].clone();
+    let repository_key = flotilla_protocol::RepositoryKey("repo_materialized".into());
+    app.model.repos.get_mut(&identity).expect("repo model").repository_key = Some(repository_key.clone());
+    let scope = flotilla_protocol::QueryScope::Repository(repository_key);
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone() };
+    let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+    let rows = (1..=50)
+        .map(|id| {
+            let mut issue = TestIssue::new(&format!("Materialized issue {id}")).id(id.to_string()).build();
+            issue.reference.source = source.clone();
+            flotilla_protocol::IssueRow { reference: issue.reference.clone(), issue }
+        })
+        .collect();
+
+    app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq: 1,
+        rows: flotilla_protocol::Rows::Issues { scope, rows },
+        state: flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-15T12:00:00Z".parse().expect("timestamp"),
+                has_more: true,
+            }),
+            conditions: vec![],
+        },
+    })));
+
+    let page = app.screen.repo_pages.get_mut(&identity).expect("repo page");
+    page.reconcile_if_changed();
+    page.table.select_flat_index(44);
+    app.handle_key(key(KeyCode::Char('j')));
+
+    assert!(app.pending_fetch_more.contains(&query));
+}
+
 // -- Convoys tab rendering --
 
 #[test]
@@ -1820,7 +1934,7 @@ fn selected_table_name(app: &App) -> Option<String> {
     let name_column = match address {
         ViewAddress::Convoys { .. } | ViewAddress::Independents | ViewAddress::Project { .. } => 0,
         ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
-        ViewAddress::Overview | ViewAddress::Repo(_) => return None,
+        ViewAddress::Overview | ViewAddress::Repo { .. } => return None,
     };
     let rows = crate::app::table_rows(&app.namespaces);
     let view = crate::table_view::project(address, &rows).ok()?;

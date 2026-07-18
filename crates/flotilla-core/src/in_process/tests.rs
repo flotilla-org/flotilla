@@ -10,17 +10,18 @@ use flotilla_protocol::{
     result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, IndependentRow, QueryId, ResultSet, Rows, SessionPhase},
     test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent,
-    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, QueryCursor, RepoSelector, ResourceRef, SystemInfo,
-    ToolInventory, TopologyRoute,
+    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, QueryCursor, QueryScope, RepoSelector,
+    RepositoryKey, ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
     CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Selector, TerminalBrief, TerminalCrewContext,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository,
+    RepositorySpec, RepositoryStatus, Selector, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
+    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
+    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
+    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
     CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
@@ -45,6 +46,17 @@ use crate::{
 };
 
 #[test]
+fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
+    let normalized = normalize_workspace_slug("My_repo...with spaces");
+    assert_eq!(normalized, "my-repo-with-spaces");
+    assert!(normalize_workspace_slug(&"a".repeat(100)).len() <= 48);
+
+    let left = disambiguate_workspace_slug("same-repo", &flotilla_resources::RepositoryKey("abcdefgh1111".to_string()));
+    let right = disambiguate_workspace_slug("same-repo", &flotilla_resources::RepositoryKey("ijklmnop2222".to_string()));
+    assert_ne!(left, right);
+}
+
+#[test]
 fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
     assert_eq!(project_target_syntax("/srv/repos/example"), ProjectTargetSyntax::ExplicitPath);
     assert_eq!(project_target_syntax("./org/repo"), ProjectTargetSyntax::ExplicitPath);
@@ -64,7 +76,7 @@ fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Opti
 }
 
 fn convoy_result_set(seq: u64, rows: Vec<ConvoyRow>) -> ResultSet {
-    ResultSet { seq, rows: Rows::Convoys(rows) }
+    ResultSet { seq, rows: Rows::Convoys(rows), state: Default::default() }
 }
 
 async fn set_local_convoy_rows(daemon: &InProcessDaemon, seq: u64, rows: Vec<ConvoyRow>) {
@@ -313,10 +325,10 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             workflow_ref: "coding-review".into(),
             inputs: BTreeMap::new(),
             placement_policy: None,
-            repository: None,
+            repositories: Vec::new(),
             r#ref: None,
             project_ref: None,
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("create convoy");
@@ -335,8 +347,20 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
                 vessels: vec![
-                    VesselRequirement { name: "prepare".into(), stance: Default::default(), depends_on: Vec::new(), crew: Vec::new() },
-                    VesselRequirement { name: "implement".into(), stance: Default::default(), depends_on: Vec::new(), crew: processes },
+                    VesselRequirement {
+                        name: "prepare".into(),
+                        stance: Default::default(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        crew: Vec::new(),
+                    },
+                    VesselRequirement {
+                        name: "implement".into(),
+                        stance: Default::default(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        crew: processes,
+                    },
                 ],
             }),
             work: BTreeMap::from([("implement".to_string(), WorkState {
@@ -371,7 +395,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                 convoy_ref: "demo".into(),
                 vessel_name: "implement".into(),
                 placement_policy_ref: "host-direct".into(),
-                adopted_checkout_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
             },
         )
         .await
@@ -1350,7 +1374,7 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
             .collect();
         daemon.fleet_replica_cache.write().await.insert(host_name, FleetReplicaCacheEntry {
             rows: fleet_rows,
-            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]) }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]), state: Default::default() }],
             last_sync: Some(Utc::now()),
             generation: Some(format!("gen-{host}")),
             last_error: None,
@@ -2329,10 +2353,10 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             workflow_ref: "review-and-fix".to_string(),
             inputs: BTreeMap::new(),
             placement_policy: Some("laptop-docker".to_string()),
-            repository: None,
+            repositories: Vec::new(),
             r#ref: None,
             project_ref: None,
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("convoy create should succeed");
@@ -2383,6 +2407,167 @@ async fn convoy_completion_command_updates_convoy_task_status() {
 }
 
 #[tokio::test]
+async fn convoy_admission_snapshots_every_project_repository() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
+    let cleat = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository");
+    for (spec, default_branch) in [(&flotilla, "main"), (&cleat, "trunk")] {
+        let created =
+            repositories.create(&empty_input_meta(&spec.key().to_string()), spec).await.expect("repository create should succeed");
+        repositories
+            .update_status(&created.metadata.name, &created.metadata.resource_version, &RepositoryStatus {
+                default_branch: Some(default_branch.to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("repository status should update");
+    }
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&empty_input_meta("flotilla-suite"), &ProjectSpec {
+            display_name: "Flotilla Suite".to_string(),
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_source: None,
+            repositories: vec![
+                ProjectRepositorySpec { repo: flotilla.key(), subpath: Some("crates/flotilla-core".to_string()), default_branch: None },
+                ProjectRepositorySpec { repo: flotilla.key(), subpath: Some("crates/flotilla-tui".to_string()), default_branch: None },
+                ProjectRepositorySpec { repo: cleat.key(), subpath: None, default_branch: Some("stable".to_string()) },
+            ],
+        })
+        .await
+        .expect("project create should succeed");
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&empty_input_meta("single-agent-contained"), &WorkflowTemplateSpec { inputs: Vec::new(), vessels: Vec::new() })
+        .await
+        .expect("workflow create should succeed");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "multi-repo".to_string(),
+                workflow_ref: "single-agent-contained".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: Some("feature/multi-repo".to_string()),
+                project_ref: Some("flotilla-suite".to_string()),
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "multi-repo".to_string() });
+    let convoy = backend.using::<Convoy>("flotilla").get("multi-repo").await.expect("convoy should exist");
+    assert_eq!(convoy.spec.repositories.len(), 2);
+    assert_eq!(convoy.spec.repositories[0].repo_ref, cleat.key());
+    assert_eq!(convoy.spec.repositories[0].base_ref, "stable");
+    assert_eq!(convoy.spec.repositories[0].workspace_slug, "cleat");
+    assert!(convoy.spec.repositories[0].subpaths.is_empty());
+    assert_eq!(convoy.spec.repositories[1].repo_ref, flotilla.key());
+    assert_eq!(convoy.spec.repositories[1].base_ref, "main");
+    assert_eq!(convoy.spec.repositories[1].workspace_slug, "flotilla");
+    assert_eq!(convoy.spec.repositories[1].subpaths, ["crates/flotilla-core", "crates/flotilla-tui"]);
+}
+
+#[tokio::test]
+async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let created =
+        repositories.create(&empty_input_meta(&repository.key().to_string()), &repository).await.expect("repository should create");
+    repositories
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &RepositoryStatus {
+            default_branch: Some("main".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("repository status should update");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "direct-repository".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: Some("https://github.com/flotilla-org/flotilla".to_string()),
+                r#ref: Some("feature/direct".to_string()),
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated {
+        name: "direct-repository".to_string()
+    });
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("direct-repository").await.expect("convoy");
+    assert_eq!(convoy.spec.repositories[0].base_ref, "main");
+}
+
+#[tokio::test]
+async fn direct_repository_admission_does_not_guess_a_default_branch() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "unresolved-direct-repository".to_string(),
+                workflow_ref: "scratch".to_string(),
+                inputs: Vec::new(),
+                repository_url: Some("https://github.com/example/main-repository".to_string()),
+                r#ref: Some("main".to_string()),
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    let result = wait_for_command_result(&mut events, command_id).await;
+    assert!(matches!(
+        result,
+        CommandValue::Error { message } if message.contains("has no resolved default branch")
+    ));
+}
+
+#[tokio::test]
 async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
@@ -2429,9 +2614,9 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
 
     assert_eq!(result, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("convoy-adopted").await.expect("convoy should exist");
-    assert_eq!(convoy.spec.repository.as_ref().map(|repo| repo.url.as_str()), Some(remote));
+    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some(remote));
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("main"));
-    assert_eq!(convoy.spec.adopted_checkout_ref.as_deref(), Some("adopted-checkout-convoy-adopted"));
+    assert_eq!(convoy.spec.adopted_checkout_refs.values().next().map(String::as_str), Some("adopted-checkout-convoy-adopted"));
 
     let checkout = daemon
         .resource_backend()
@@ -2546,10 +2731,10 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             workflow_ref: "review-and-fix".to_string(),
             inputs: BTreeMap::new(),
             placement_policy: Some("laptop-docker".to_string()),
-            repository: None,
+            repositories: Vec::new(),
             r#ref: None,
             project_ref: None,
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
         })
         .await
         .expect("convoy create should succeed");
@@ -2783,8 +2968,10 @@ async fn subscribe_queries_replays_result_set_from_aggregator_state() {
 
     set_local_convoy_rows(&daemon, 7, vec![convoy_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
 
-    let events =
-        daemon.subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: None }]).await.expect("subscribe_queries should succeed");
+    let events = daemon
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: None }])
+        .await
+        .expect("subscribe_queries should succeed");
     let result_set = events
         .iter()
         .find_map(|e| match e {
@@ -2810,7 +2997,7 @@ async fn subscribe_queries_skips_replay_when_cursor_matches_seq() {
     set_local_convoy_rows(&daemon, 7, vec![convoy_row("flotilla", "convoy-1", WireConvoyPhase::Active, None)]).await;
 
     let events = daemon
-        .subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: Some(7) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(7) }])
         .await
         .expect("subscribe_queries should succeed");
     assert!(!events.iter().any(|event| matches!(event, DaemonEvent::ResultSet(_))));
@@ -2834,7 +3021,7 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
 
     // Client's cursor is ahead of the daemon's seq — simulates daemon restart.
     let events = daemon
-        .subscribe_queries(&[QueryCursor { query: QueryId::Convoys, since: Some(99) }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys, since: Some(99) }])
         .await
         .expect("subscribe_queries should succeed");
     let result_set = events
@@ -2845,4 +3032,48 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
         })
         .expect("client ahead of daemon must still receive a result set");
     assert_eq!(result_set.seq, 2, "result set reflects the daemon's current seq, not the client's stale claim");
+}
+
+#[tokio::test]
+async fn issue_subscription_materializes_until_its_in_process_handle_drops() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let subscriber = uuid::Uuid::new_v4();
+    let subscription = daemon.query_subscription(subscriber);
+    let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_abc".into())) };
+
+    let events =
+        daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("subscribe to issue query");
+    let DaemonEvent::ResultSet(result) = events.into_iter().next().expect("issue result set") else {
+        panic!("expected issue result set");
+    };
+    assert_eq!(result.query(), query);
+    assert!(result.state.demand.is_some());
+    assert!(matches!(result.state.conditions.as_slice(), [ResultSetCondition::IssueSourceUnavailable { source: None, .. }]));
+    assert!(daemon.aggregator_projection_state().await.result_set_for(&query).await.is_some());
+
+    drop(subscription);
+    assert!(daemon.aggregator_projection_state().await.result_set_for(&query).await.is_none());
+}
+
+#[tokio::test]
+async fn recreated_issue_materialization_replays_even_when_cursor_matches_initial_seq() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let subscriber = uuid::Uuid::new_v4();
+    let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_recreated".into())) };
+
+    daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("initial subscription");
+    daemon.unsubscribe_queries(subscriber).await;
+
+    let events = daemon.subscribe_queries(subscriber, &[QueryCursor { query, since: Some(1) }]).await.expect("recreated subscription");
+    assert!(matches!(events.as_slice(), [DaemonEvent::ResultSet(_)]));
 }

@@ -440,6 +440,7 @@ trait DaemonTestCompat {
     async fn add_virtual_repo(
         &self,
         identity: RepoIdentity,
+        repository_key: Option<flotilla_protocol::RepositoryKey>,
         synthetic_path: PathBuf,
         peers: Vec<(HostName, ProviderData)>,
         overlay_version: u64,
@@ -487,6 +488,7 @@ impl DaemonTestCompat for Arc<InProcessDaemon> {
     async fn add_virtual_repo(
         &self,
         identity: RepoIdentity,
+        repository_key: Option<flotilla_protocol::RepositoryKey>,
         synthetic_path: PathBuf,
         peers: Vec<(HostName, ProviderData)>,
         overlay_version: u64,
@@ -494,6 +496,7 @@ impl DaemonTestCompat for Arc<InProcessDaemon> {
         InProcessDaemon::add_virtual_repo(
             self.as_ref(),
             identity,
+            repository_key,
             synthetic_path,
             peers.into_iter().map(|(host, data)| (test_node(host.as_str()), data)).collect(),
             overlay_version,
@@ -1933,7 +1936,7 @@ async fn removing_final_local_root_deletes_observed_checkouts_when_virtual_root_
     let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
     let identity = RepoIdentity { authority: "github.com".to_string(), path: "owner/repo".to_string() };
-    daemon.add_virtual_repo(identity.clone(), virtual_repo.clone(), vec![], 0).await.expect("add virtual root");
+    daemon.add_virtual_repo(identity.clone(), None, virtual_repo.clone(), vec![], 0).await.expect("add virtual root");
     daemon.add_repo(&repo).await.expect("add local root");
 
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
@@ -3231,9 +3234,11 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("new-repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
+    init_git_repo(&repo);
 
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("new-repo".to_string()))).await;
     let mut rx = daemon.subscribe();
 
     let add_id = daemon
@@ -3272,10 +3277,12 @@ async fn add_and_remove_repo_updates_state_and_emits_events() {
     assert_eq!(finished_identity, added.identity, "CommandFinished should use the tracked repo identity");
     assert_eq!(started_add, added.identity, "CommandStarted should use the tracked repo identity");
     assert_eq!(added.path.as_deref(), Some(repo.as_path()));
+    assert!(added.repository_key.is_some(), "RepoTracked should publish the queryable repository key");
 
     let repos = daemon.list_repos().await.expect("list_repos after add");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].path.as_deref(), Some(repo.as_path()));
+    assert_eq!(repos[0].repository_key, added.repository_key);
 
     let remove_id = daemon
         .execute(Command {
@@ -3400,7 +3407,10 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![], config, local_bare_remote_discovery(), HostName::local()).await;
 
-    daemon.add_virtual_repo(identity.clone(), PathBuf::from("/remote/desktop/owner/repo"), vec![], 0).await.expect("add virtual repo");
+    daemon
+        .add_virtual_repo(identity.clone(), None, PathBuf::from("/remote/desktop/owner/repo"), vec![], 0)
+        .await
+        .expect("add virtual repo");
     let (tracked_path, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
     // Path may be canonicalized (e.g. /var -> /private/var on macOS)
     let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
@@ -3999,6 +4009,7 @@ async fn follower_mode_skips_external_providers() {
     // list_repos gives us RepoInfo with provider_names populated from the registry
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1);
+    assert!(repos[0].repository_key.is_some(), "startup repo should expose its queryable repository key");
     let provider_names = &repos[0].provider_names;
 
     // VCS should be present (local provider, .git dir exists)
@@ -4043,7 +4054,11 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
         ..Default::default()
     })];
 
-    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), peers, 0).await.expect("add_virtual_repo should succeed");
+    let repository_key = RepositorySpec::remote("https://github.com/owner/remote-only").expect("repository spec").key();
+    daemon
+        .add_virtual_repo(identity.clone(), Some(repository_key.clone()), synthetic_path.clone(), peers, 0)
+        .await
+        .expect("add_virtual_repo should succeed");
 
     // Collect events: expect RepoTracked followed by a snapshot.
     let events = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4077,6 +4092,7 @@ async fn add_virtual_repo_emits_repo_tracked_then_snapshot_and_is_queryable() {
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].path.as_deref(), Some(synthetic_path.as_path()));
+    assert_eq!(repos[0].repository_key, Some(repository_key));
     assert!(!repos[0].loading);
 
     // get_state() should return the peer checkout data immediately.
@@ -4097,10 +4113,10 @@ async fn add_virtual_repo_is_idempotent() {
 
     let synthetic_path = PathBuf::from("<remote>/desktop/home/dev/repo");
     let identity = RepoIdentity { authority: "github.com".into(), path: "owner/remote-only".into() };
-    daemon.add_virtual_repo(identity.clone(), synthetic_path.clone(), vec![], 0).await.expect("first add should succeed");
+    daemon.add_virtual_repo(identity.clone(), None, synthetic_path.clone(), vec![], 0).await.expect("first add should succeed");
 
     // Second add with same path should be a no-op
-    daemon.add_virtual_repo(identity, synthetic_path.clone(), vec![], 0).await.expect("second add should succeed (idempotent)");
+    daemon.add_virtual_repo(identity, None, synthetic_path.clone(), vec![], 0).await.expect("second add should succeed (idempotent)");
 
     let repos = daemon.list_repos().await.expect("list_repos");
     assert_eq!(repos.len(), 1, "should still have exactly one repo");

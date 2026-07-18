@@ -100,13 +100,15 @@ fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
 }
 
 fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Option<&str>) -> flotilla_resources::ResourceObject<Vessel> {
+    let repository_key =
+        flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();
     flotilla_resources::ResourceObject {
         metadata: common::object_meta(&format!("{convoy_name}-{task}"), "flotilla", "17"),
         spec: VesselSpec {
             convoy_ref: convoy_name.to_string(),
             vessel_name: task.to_string(),
             placement_policy_ref: "laptop-docker".to_string(),
-            adopted_checkout_ref: None,
+            adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
             phase,
@@ -114,7 +116,7 @@ fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Opt
             observed_policy_ref: Some("laptop-docker".to_string()),
             observed_policy_version: Some("19".to_string()),
             environment_ref: Some(format!("env-{task}")),
-            checkout_ref: Some(format!("checkout-{task}")),
+            checkout_refs: BTreeMap::from([(repository_key, format!("checkout-{task}"))]),
             terminal_session_refs: vec![format!("terminal-{task}-coder")],
             started_at: Some(timestamp(16)),
             ready_at: (phase == VesselPhase::Ready).then(|| timestamp(18)),
@@ -176,6 +178,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
             .map(|task| flotilla_resources::VesselRequirement {
                 name: task.name.clone(),
                 stance: task.stance,
+                repository_refs: task.repository_refs.clone(),
                 depends_on: task.depends_on.clone(),
                 crew: task.crew.clone(),
             })
@@ -323,18 +326,21 @@ fn fan_out_advances_all_newly_ready_tasks() {
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
                 name: "b".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
                 name: "c".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
@@ -366,18 +372,21 @@ fn fan_in_waits_until_all_dependencies_complete() {
             flotilla_resources::VesselRequirement {
                 name: "implement".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
                 name: "verify".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
                 name: "review".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: vec!["implement".to_string(), "verify".to_string()],
                 crew: Vec::new(),
             },
@@ -509,18 +518,21 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
             flotilla_resources::VesselRequirement {
                 name: "a".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
                 name: "b".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
             flotilla_resources::VesselRequirement {
                 name: "c".to_string(),
                 stance: Default::default(),
+                repository_refs: None,
                 depends_on: Vec::new(),
                 crew: Vec::new(),
             },
@@ -763,11 +775,10 @@ async fn ready_task_emits_vessel_creation_actuation() {
         .expect("task workspace actuation should be present")
     {
         Actuation::CreateVessel { meta, spec } => {
-            let repository_key = convoy.spec.repository.as_ref().expect("repository association").repo_ref.to_string();
             assert_eq!(meta.name, "convoy-a-implement");
             assert_eq!(meta.labels.get("flotilla.work/convoy").map(String::as_str), Some("convoy-a"));
             assert_eq!(meta.labels.get("flotilla.work/vessel").map(String::as_str), Some("implement"));
-            assert_eq!(meta.labels.get("flotilla.work/repo-key").map(String::as_str), Some(repository_key.as_str()));
+            assert!(!meta.labels.contains_key("flotilla.work/repo-key"));
             assert_eq!(meta.owner_references.len(), 1);
             assert_eq!(meta.owner_references[0].kind, "Convoy");
             assert_eq!(meta.owner_references[0].name, "convoy-a");
@@ -795,6 +806,11 @@ async fn ready_task_with_ready_workspace_moves_to_launching() {
         timestamp(20),
     )
     .await;
+    let expected_checkout_refs = serde_json::to_value(BTreeMap::from([(
+        flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key(),
+        "checkout-implement".to_string(),
+    )]))
+    .expect("checkout refs should serialize");
 
     assert!(matches!(
         outcome.patch,
@@ -802,7 +818,7 @@ async fn ready_task_with_ready_workspace_moves_to_launching() {
             if work == "implement"
                 && started_at == timestamp(20)
                 && placement.fields.get("environment_ref") == Some(&serde_json::Value::String("env-implement".to_string()))
-                && placement.fields.get("checkout_ref") == Some(&serde_json::Value::String("checkout-implement".to_string()))
+                && placement.fields.get("checkout_refs") == Some(&expected_checkout_refs)
     ));
 }
 

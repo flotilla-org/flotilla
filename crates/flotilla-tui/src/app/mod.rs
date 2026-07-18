@@ -13,14 +13,14 @@ pub mod ui_state;
 pub(crate) mod view_kind;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use flotilla_core::{
     config::{ConfigStore, RepoViewLayoutConfig},
-    daemon::DaemonHandle,
+    daemon::{DaemonHandle, QuerySubscription},
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
@@ -115,6 +115,7 @@ impl CommandQueue {
 /// to render — no provider registry, no refresh handle.
 pub struct TuiRepoModel {
     pub identity: RepoIdentity,
+    pub repository_key: Option<flotilla_protocol::RepositoryKey>,
     pub path: PathBuf,
     pub providers: Arc<ProviderData>,
     pub labels: RepoLabels,
@@ -159,6 +160,7 @@ impl TuiModel {
             order.push(identity.clone());
             repos.insert(identity.clone(), TuiRepoModel {
                 identity,
+                repository_key: info.repository_key,
                 path,
                 providers: Arc::new(ProviderData::default()),
                 labels: info.labels,
@@ -377,12 +379,21 @@ pub struct App {
     pub repo_data: HashMap<RepoIdentity, Shared<RepoData>>,
     /// Per-repo issue paging state, driven by stateless queries.
     pub issue_views: HashMap<RepoIdentity, issue_view::IssueViewState>,
+    /// Demand-backed issue windows keyed by their fully parameterized query.
+    /// Default issue sections consume this; stateless paging remains for
+    /// ephemeral searches beyond the window.
+    pub materialized_issue_rows: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::IssueRow>>,
+    pub materialized_issue_states: HashMap<flotilla_protocol::QueryId, flotilla_protocol::ResultSetState>,
+    pub pending_fetch_more: HashSet<flotilla_protocol::QueryId>,
     /// Sender half for background issue query tasks. Cloned into spawned tasks.
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
     /// Receiver half, drained each event-loop iteration.
     pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
+    /// Drop guard that gives in-process subscribers the same teardown
+    /// semantics socket subscribers get from connection close.
+    _query_subscription: QuerySubscription,
     /// Per-namespace convoy state. Keyed by namespace string. Populated from
     /// `DaemonEvent::ResultSet` / `ResultDelta`.
     pub namespaces: HashMap<String, NamespaceModel>,
@@ -406,10 +417,18 @@ impl App {
         // pre-View tab bar (overview + convoys + one tab per tracked repo).
         // The seed isn't written back here — it is deterministic, and any
         // tab mutation persists the set (scoped mode must never write it).
-        let views = match config.load_open_views() {
+        let mut views = match config.load_open_views() {
             Some(entries) => OpenViews::from_entries(entries),
-            None => OpenViews::seed(model.repo_order.iter().cloned()),
+            None => OpenViews::seed_with_keys(
+                model
+                    .repo_order
+                    .iter()
+                    .filter_map(|identity| model.repos.get(identity).map(|repo| (identity.clone(), repo.repository_key.clone()))),
+            ),
         };
+        let repository_keys =
+            model.repos.iter().filter_map(|(identity, repo)| repo.repository_key.clone().map(|key| (identity.clone(), key))).collect();
+        views.bind_repository_keys(&repository_keys);
         model.active_repo = views.active_repo_identity().cloned();
         let mut ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
@@ -442,6 +461,8 @@ impl App {
         }
 
         let (issue_update_tx, issue_update_rx) = mpsc::unbounded_channel();
+        let session_id = uuid::Uuid::new_v4();
+        let query_subscription = daemon.query_subscription(session_id);
 
         Self {
             daemon,
@@ -458,9 +479,13 @@ impl App {
             screen,
             repo_data: repo_data_map,
             issue_views: HashMap::new(),
+            materialized_issue_rows: HashMap::new(),
+            materialized_issue_states: HashMap::new(),
+            pending_fetch_more: HashSet::new(),
             issue_update_tx,
             issue_update_rx,
-            session_id: uuid::Uuid::new_v4(),
+            session_id,
+            _query_subscription: query_subscription,
             namespaces: HashMap::new(),
             pending_repo_opens: Vec::new(),
             query_seqs: HashMap::new(),
@@ -491,12 +516,14 @@ impl App {
     pub fn query_cursors(&self) -> Vec<flotilla_protocol::QueryCursor> {
         let mut queries = Vec::new();
         for view in self.views.iter() {
-            let Some(query) = view.address().and_then(view_kind::query) else { continue };
-            if !queries.contains(&query) {
-                queries.push(query);
+            let Some(address) = view.address() else { continue };
+            for query in view_kind::queries(address) {
+                if !queries.contains(&query) {
+                    queries.push(query);
+                }
             }
         }
-        queries.into_iter().map(|query| flotilla_protocol::QueryCursor { query, since: self.query_seqs.get(&query).copied() }).collect()
+        queries.into_iter().map(|query| flotilla_protocol::QueryCursor { since: self.query_seqs.get(&query).copied(), query }).collect()
     }
 
     /// Returns true when the UI has in-progress work that should be animated.
@@ -813,6 +840,9 @@ impl App {
 
     /// Fetch default issues for a repo if they haven't been fetched yet.
     fn maybe_fetch_default_issues(&mut self, repo_identity: &RepoIdentity) {
+        if self.model.repos.get(repo_identity).is_some_and(|repo| repo.repository_key.is_some()) {
+            return;
+        }
         if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
             return;
         }
@@ -863,6 +893,33 @@ impl App {
             handle.mutate(|d| {
                 d.issue_rows = issue_rows;
                 d.issue_section_label = label;
+            });
+        }
+    }
+
+    fn push_materialized_issue_items_to_repo_data(&self, query: &flotilla_protocol::QueryId) {
+        let flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::Repository(repository_key) } = query else {
+            return;
+        };
+        let Some((identity, repo)) = self.model.repos.iter().find(|(_, repo)| repo.repository_key.as_ref() == Some(repository_key)) else {
+            return;
+        };
+        if self.issue_views.get(identity).and_then(|view| view.search.as_ref()).is_some() {
+            return;
+        }
+        let rows = self.materialized_issue_rows.get(query).cloned().unwrap_or_default();
+        let issue_rows = rows
+            .into_iter()
+            .map(|row| crate::widgets::section_table::IssueRow {
+                id: format!("{}\0{}\0{}", row.reference.source.service, row.reference.source.scope, row.reference.id),
+                issue: row.issue,
+            })
+            .collect();
+        if let Some(handle) = self.repo_data.get(identity) {
+            let label = repo.labels.issues.section.clone();
+            handle.mutate(|data| {
+                data.issue_rows = issue_rows;
+                data.issue_section_label = label;
             });
         }
     }
@@ -1063,8 +1120,11 @@ impl App {
                     self.move_tab(1);
                 }
                 AppAction::Refresh => {
-                    if let Some(query) = self.views.active_address().and_then(view_kind::query) {
-                        self.query_seqs.remove(&query);
+                    let queries = self.views.active_address().map(view_kind::queries).unwrap_or_default();
+                    if !queries.is_empty() {
+                        for query in queries {
+                            self.query_seqs.remove(&query);
+                        }
                         self.subscriptions_dirty = true;
                     } else if let Some(repo) = self.model.active_repo_root_opt().cloned() {
                         self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
@@ -1210,7 +1270,9 @@ impl App {
                 }
             }
             DaemonEvent::ResultSet(result_set) => {
-                self.query_seqs.insert(result_set.query(), result_set.seq);
+                let query = result_set.query();
+                self.pending_fetch_more.remove(&query);
+                self.query_seqs.insert(query.clone(), result_set.seq);
                 match &result_set.rows {
                     flotilla_protocol::Rows::Convoys(rows) => {
                         for namespace in self.namespaces.values_mut() {
@@ -1233,12 +1295,19 @@ impl App {
                             entry.independents.insert(row.resource.clone(), row.clone());
                         }
                     }
+                    flotilla_protocol::Rows::Issues { rows, .. } => {
+                        self.materialized_issue_rows.insert(query.clone(), rows.clone());
+                        self.materialized_issue_states.insert(query.clone(), result_set.state.clone());
+                        self.push_materialized_issue_items_to_repo_data(&query);
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
-                self.query_seqs.insert(delta.query(), delta.seq);
-                match &delta.changed {
-                    flotilla_protocol::Rows::Convoys(changed) => {
+                let query = delta.query();
+                self.pending_fetch_more.remove(&query);
+                self.query_seqs.insert(query.clone(), delta.seq);
+                match &delta.changes {
+                    flotilla_protocol::QueryChanges::Convoys { changed, removed } => {
                         for row in changed {
                             let convoy = ConvoySummary::from(row);
                             let namespace = convoy.namespace.clone();
@@ -1246,23 +1315,41 @@ impl App {
                             entry.convoys.insert(convoy.id.clone(), convoy);
                             entry.last_seq = delta.seq;
                         }
-                        for removed in &delta.removed {
+                        for removed in removed {
                             if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
                                 entry.convoys.shift_remove(&ConvoyId::for_resource(removed));
                                 entry.last_seq = delta.seq;
                             }
                         }
                     }
-                    flotilla_protocol::Rows::Independents(changed) => {
+                    flotilla_protocol::QueryChanges::Independents { changed, removed } => {
                         for row in changed {
                             let entry = self.namespaces.entry(row.resource.namespace.clone()).or_default();
                             entry.independents.insert(row.resource.clone(), row.clone());
                         }
-                        for removed in &delta.removed {
+                        for removed in removed {
                             if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
                                 entry.independents.shift_remove(removed);
                             }
                         }
+                    }
+                    flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
+                        let rows = self.materialized_issue_rows.entry(query.clone()).or_default();
+                        rows.retain(|row| !removed.contains(&row.reference));
+                        for changed in changed {
+                            if let Some(existing) = rows.iter_mut().find(|row| row.reference == changed.reference) {
+                                *existing = changed.clone();
+                            } else {
+                                rows.push(changed.clone());
+                            }
+                        }
+                        rows.sort_by(|left, right| {
+                            right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference))
+                        });
+                        if let Some(state) = &delta.state {
+                            self.materialized_issue_states.insert(query.clone(), state.clone());
+                        }
+                        self.push_materialized_issue_items_to_repo_data(&query);
                     }
                 }
             }
@@ -1417,7 +1504,14 @@ impl App {
 
     fn handle_repo_added(&mut self, info: RepoInfo) {
         let identity = info.identity.clone();
-        if self.model.repos.contains_key(&identity) {
+        if let Some(existing) = self.model.repos.get_mut(&identity) {
+            if existing.repository_key.is_none() {
+                if let Some(key) = info.repository_key {
+                    existing.repository_key = Some(key.clone());
+                    self.views.bind_repository_keys(&HashMap::from([(identity, key)]));
+                    self.subscriptions_dirty = true;
+                }
+            }
             return;
         }
         let path = TuiModel::display_path(&identity, info.path.clone());
@@ -1440,6 +1534,7 @@ impl App {
 
         self.model.repos.insert(identity.clone(), TuiRepoModel {
             identity: info.identity,
+            repository_key: info.repository_key.clone(),
             path: path.clone(),
             providers: Arc::new(ProviderData::default()),
             labels: info.labels,
@@ -1457,7 +1552,10 @@ impl App {
         if let Some(pos) = self.pending_repo_opens.iter().position(|pending| pending == &path) {
             self.pending_repo_opens.remove(pos);
             if !self.views.is_scoped() {
-                self.open_view(ViewAddress::Repo(identity));
+                self.open_view(match info.repository_key {
+                    Some(key) => ViewAddress::repo_with_key(identity, key),
+                    None => ViewAddress::repo(identity),
+                });
             }
         }
     }

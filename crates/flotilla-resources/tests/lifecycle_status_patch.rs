@@ -574,7 +574,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkReady {
                     environment_ref: Some("env-a".to_string()),
-                    checkout_ref: Some("checkout-a".to_string()),
+                    checkout_refs: Default::default(),
                     terminal_session_refs: Vec::new(),
                     requested_stance: Stance::WorkspaceWrite,
                     effective_stance: Stance::Contained,

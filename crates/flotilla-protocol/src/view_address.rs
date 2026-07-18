@@ -7,12 +7,12 @@
 //! order are frozen; evolution is additive only (new kinds, new optional
 //! `?key=value` parameters).
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::RepoIdentity;
+use crate::{RepoIdentity, RepositoryKey};
 
 /// Optional URI scheme prefix, accepted and stripped on parse.
 pub const SCHEME_PREFIX: &str = "flotilla://";
@@ -39,10 +39,22 @@ pub enum ViewAddress {
     /// A project dashboard: the work of one Project resource.
     Project { namespace: String, name: String },
     /// The per-repository view, identified by canonical remote identity.
-    Repo(RepoIdentity),
+    Repo {
+        identity: RepoIdentity,
+        /// Storage-safe Repository resource key used by scoped queries.
+        repository_key: Option<RepositoryKey>,
+    },
 }
 
 impl ViewAddress {
+    pub fn repo(identity: RepoIdentity) -> Self {
+        Self::Repo { identity, repository_key: None }
+    }
+
+    pub fn repo_with_key(identity: RepoIdentity, repository_key: RepositoryKey) -> Self {
+        Self::Repo { identity, repository_key: Some(repository_key) }
+    }
+
     /// The frozen kind token this address starts with.
     pub fn kind_name(&self) -> &'static str {
         match self {
@@ -52,7 +64,7 @@ impl ViewAddress {
             Self::Convoy { .. } => "convoy",
             Self::Vessel { .. } => "vessel",
             Self::Project { .. } => "project",
-            Self::Repo(_) => "repo",
+            Self::Repo { .. } => "repo",
         }
     }
 }
@@ -79,20 +91,23 @@ impl fmt::Display for ViewAddress {
                 write!(f, "vessel/{}/{}/{}", encode(namespace), encode(convoy), encode(vessel))
             }
             Self::Project { namespace, name } => write!(f, "project/{}/{}", encode(namespace), encode(name)),
-            Self::Repo(identity) => {
+            Self::Repo { identity, repository_key } => {
                 write!(f, "repo/{}", encode(&identity.authority))?;
                 if identity.path.split('/').any(|part| part.is_empty()) {
                     // Paths with empty components (e.g. the absolute-path
                     // fallback identity of a remote-less local repo) cannot
                     // render as pretty segments — encode the whole path as
                     // one segment so the address still round-trips.
-                    write!(f, "/{}", encode(&identity.path))
+                    write!(f, "/{}", encode(&identity.path))?;
                 } else {
                     for part in identity.path.split('/') {
                         write!(f, "/{}", encode(part))?;
                     }
-                    Ok(())
                 }
+                if let Some(key) = repository_key {
+                    write!(f, "?key={}", encode(&key.0))?;
+                }
+                Ok(())
             }
         }
     }
@@ -106,11 +121,16 @@ impl FromStr for ViewAddress {
         if s.is_empty() {
             return Err("empty view address".to_string());
         }
-        let segments: Vec<&str> = s.split('/').collect();
+        if s.contains('#') {
+            return Err(format!("view addresses do not support fragments: {s}"));
+        }
+        let (path, query) = s.split_once('?').map_or((s, None), |(path, query)| (path, Some(query)));
+        let mut parameters = parse_parameters(query)?;
+        let segments: Vec<&str> = path.split('/').collect();
         if segments.iter().any(|seg| seg.is_empty()) {
             return Err(format!("view address has an empty segment: {s}"));
         }
-        match segments[0] {
+        let address = match segments[0] {
             "overview" => match segments.len() {
                 1 => Ok(Self::Overview),
                 _ => Err(format!("overview takes no parameters: {s}")),
@@ -141,12 +161,35 @@ impl FromStr for ViewAddress {
                 [] | [_] => Err(format!("repo takes an authority and a path: {s}")),
                 [authority, path @ ..] => {
                     let path = path.iter().map(|seg| decode(seg)).collect::<Result<Vec<_>, _>>()?.join("/");
-                    Ok(Self::Repo(RepoIdentity { authority: decode(authority)?, path }))
+                    let repository_key = parameters.remove("key").map(|value| decode(value).map(RepositoryKey)).transpose()?;
+                    Ok(Self::Repo { identity: RepoIdentity { authority: decode(authority)?, path }, repository_key })
                 }
             },
             kind => Err(format!("unknown view kind: {kind}")),
+        }?;
+        if let Some((key, _)) = parameters.first_key_value() {
+            return Err(format!("unsupported parameter `{key}` for {} view", address.kind_name()));
+        }
+        Ok(address)
+    }
+}
+
+fn parse_parameters(query: Option<&str>) -> Result<BTreeMap<&str, &str>, String> {
+    let Some(query) = query else { return Ok(BTreeMap::new()) };
+    if query.is_empty() {
+        return Err("view address has an empty parameter list".to_string());
+    }
+    let mut parameters = BTreeMap::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').ok_or_else(|| format!("view parameter must be key=value: {pair}"))?;
+        if key.is_empty() || value.is_empty() {
+            return Err(format!("view parameter key and value must be non-empty: {pair}"));
+        }
+        if parameters.insert(key, value).is_some() {
+            return Err(format!("duplicate view parameter: {key}"));
         }
     }
+    Ok(parameters)
 }
 
 impl Serialize for ViewAddress {
@@ -167,7 +210,7 @@ mod tests {
     use super::*;
 
     fn repo(authority: &str, path: &str) -> ViewAddress {
-        ViewAddress::Repo(RepoIdentity { authority: authority.to_string(), path: path.to_string() })
+        ViewAddress::Repo { identity: RepoIdentity { authority: authority.to_string(), path: path.to_string() }, repository_key: None }
     }
 
     #[test]
@@ -194,6 +237,24 @@ mod tests {
         let addr = repo("github.com", "flotilla-org/flotilla");
         assert_eq!(addr.to_string(), "repo/github.com/flotilla-org/flotilla");
         assert_eq!(addr.to_string().parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn repo_scope_key_round_trips_through_optional_parameter_channel() {
+        let addr = ViewAddress::Repo {
+            identity: RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() },
+            repository_key: Some(RepositoryKey("repo/key with space".into())),
+        };
+        assert_eq!(addr.to_string(), "repo/github.com/flotilla-org/flotilla?key=repo%2Fkey%20with%20space");
+        assert_eq!(addr.to_string().parse::<ViewAddress>().expect("parse"), addr);
+    }
+
+    #[test]
+    fn optional_parameter_channel_rejects_unknown_duplicate_and_malformed_parameters() {
+        assert!("repo/github.com/o/r?host=feta".parse::<ViewAddress>().is_err());
+        assert!("repo/github.com/o/r?key=a&key=b".parse::<ViewAddress>().is_err());
+        assert!("repo/github.com/o/r?key".parse::<ViewAddress>().is_err());
+        assert!("project/ns/name?key=repo".parse::<ViewAddress>().is_err());
     }
 
     #[test]

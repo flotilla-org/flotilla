@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::NoStatusPatch};
+use crate::{resource::define_resource, status_patch::NoStatusPatch, RepositoryKey};
 
 define_resource!(WorkflowTemplate, "workflowtemplates", WorkflowTemplateSpec, (), NoStatusPatch);
 
@@ -30,6 +30,8 @@ pub struct VesselRequirement {
     #[builder(default)]
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_refs: Option<Vec<RepositoryKey>>,
     pub crew: Vec<CrewSpec>,
 }
 
@@ -97,6 +99,8 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     DuplicateVesselName { name: String },
+    EmptyRepositoryScope { vessel: String },
+    DuplicateRepositoryRef { vessel: String, repo_ref: RepositoryKey },
     DuplicateRoleInVessel { vessel: String, role: String },
     ReservedAddressMarkerInVesselName { name: String },
     ReservedAddressMarkerInCrewRole { vessel: String, role: String },
@@ -141,6 +145,10 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::DuplicateVesselName { name } => write!(f, "duplicate vessel name `{name}`"),
+            ValidationError::EmptyRepositoryScope { vessel } => write!(f, "vessel `{vessel}` has an empty repository scope"),
+            ValidationError::DuplicateRepositoryRef { vessel, repo_ref } => {
+                write!(f, "vessel `{vessel}` repository scope contains duplicate `{repo_ref}`")
+            }
             ValidationError::DuplicateRoleInVessel { vessel, role } => write!(f, "duplicate role `{role}` in vessel `{vessel}`"),
             ValidationError::ReservedAddressMarkerInVesselName { name } => {
                 write!(f, "vessel name `{name}` may not begin with the reserved `@` address marker")
@@ -222,6 +230,17 @@ fn validate_vessel(
     errors: &mut Vec<ValidationError>,
 ) {
     let mut roles = BTreeSet::new();
+    if let Some(repository_refs) = &vessel.repository_refs {
+        if repository_refs.is_empty() {
+            push_error(errors, ValidationError::EmptyRepositoryScope { vessel: vessel.name.clone() });
+        }
+        let mut seen = BTreeSet::new();
+        for repo_ref in repository_refs {
+            if !seen.insert(repo_ref.clone()) {
+                push_error(errors, ValidationError::DuplicateRepositoryRef { vessel: vessel.name.clone(), repo_ref: repo_ref.clone() });
+            }
+        }
+    }
     for dependency in &vessel.depends_on {
         if !vessels_by_name.contains_key(dependency) {
             push_error(errors, ValidationError::UnknownDependency { vessel: vessel.name.clone(), missing: dependency.clone() });

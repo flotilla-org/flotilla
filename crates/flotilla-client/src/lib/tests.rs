@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use flotilla_protocol::{
     qualified_path::HostId,
-    result_set::{QueryId, ResultDelta, ResultSet, Rows},
+    result_set::{QueryChanges, QueryId, ResultDelta, ResultSet, Rows},
     EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
 };
 use flotilla_transport::message::{message_session_pair, unix_message_session, MessageSession};
@@ -718,6 +718,7 @@ async fn handle_event_forwards_repo_added() {
 
     let repo_info = flotilla_protocol::RepoInfo {
         identity: repo_identity(),
+        repository_key: None,
         path: Some(PathBuf::from("/tmp/new-repo")),
         name: "new-repo".into(),
         labels: flotilla_protocol::RepoLabels::default(),
@@ -1118,11 +1119,11 @@ async fn recover_from_gap_handles_empty_replay() {
 // --- Query result stream gap detection ---
 
 fn make_result_set(seq: u64) -> ResultSet {
-    ResultSet { seq, rows: Rows::Convoys(vec![]) }
+    ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }
 }
 
 fn make_result_delta(seq: u64) -> ResultDelta {
-    ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }
+    ResultDelta { seq, changes: QueryChanges::Convoys { changed: vec![], removed: vec![] }, state: None }
 }
 
 #[tokio::test]

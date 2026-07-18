@@ -27,15 +27,15 @@ fn independent_row(name: &str, phase: SessionPhase) -> IndependentRow {
 }
 
 fn independents_set(seq: u64, rows: Vec<IndependentRow>) -> DaemonEvent {
-    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Independents(rows) }))
+    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Independents(rows), state: Default::default() }))
 }
 
 fn independents_delta(seq: u64, changed: Vec<IndependentRow>, removed: Vec<ResourceRef>) -> DaemonEvent {
-    DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Independents(changed), removed }))
+    DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes: QueryChanges::Independents { changed, removed }, state: None }))
 }
 
 fn convoys_set(seq: u64) -> DaemonEvent {
-    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]) }))
+    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }))
 }
 
 fn mint() -> AttachOnlyRecipes {
@@ -170,7 +170,7 @@ impl DaemonHandle for MockDaemon {
         Ok(vec![])
     }
 
-    async fn subscribe_queries(&self, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+    async fn subscribe_queries(&self, _subscriber_id: uuid::Uuid, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
         self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.bootstrap.lock().expect("bootstrap lock").clone())
     }

@@ -8,8 +8,8 @@ use std::{
 
 use flotilla_protocol::{
     Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostName, HostSummary, NodeId, NodeInfo,
-    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RoutedPeerMessage, Step, StepOutcome, StepStatus,
-    TopologyRoute, VectorClock,
+    PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepositoryKey, RoutedPeerMessage, Step, StepOutcome,
+    StepStatus, TopologyRoute, VectorClock,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -247,6 +247,7 @@ pub struct DisconnectPlan {
 /// Per-repo state received from a single peer host.
 pub struct PerRepoPeerState {
     pub provider_data: ProviderData,
+    pub repository_key: Option<RepositoryKey>,
     pub host_repo_root: Option<PathBuf>,
     pub seq: u64,
     pub via_peer: NodeId,
@@ -590,6 +591,7 @@ impl PeerManager {
     fn store_snapshot_from(&mut self, via_peer: &NodeId, via_generation: u64, msg: PeerDataMessage) -> HandleResult {
         let origin = msg.origin_node_id.clone();
         let repo = msg.repo_identity.clone();
+        let repository_key = msg.repository_key.clone();
         let host_repo_root = msg.host_repo_root.clone();
 
         let dedup_key = (origin.clone(), repo.clone());
@@ -611,6 +613,7 @@ impl PeerManager {
                 let repo_states = self.peer_data.entry(origin.clone()).or_default();
                 repo_states.insert(repo.clone(), PerRepoPeerState {
                     provider_data: *data,
+                    repository_key,
                     host_repo_root,
                     seq,
                     via_peer: via_peer.clone(),
@@ -733,6 +736,7 @@ impl PeerManager {
                 responder_node_id,
                 remaining_hops,
                 repo_identity,
+                repository_key,
                 host_repo_root,
                 clock,
                 seq,
@@ -753,6 +757,7 @@ impl PeerManager {
                     return self.store_snapshot_from(&connection_peer, connection_generation, PeerDataMessage {
                         origin_node_id: responder_node_id,
                         repo_identity,
+                        repository_key,
                         host_repo_root,
                         clock,
                         kind: PeerDataKind::Snapshot { data, seq },
@@ -777,6 +782,7 @@ impl PeerManager {
                     responder_node_id,
                     remaining_hops: remaining_hops.saturating_sub(1),
                     repo_identity,
+                    repository_key,
                     host_repo_root,
                     clock,
                     seq,

@@ -18,6 +18,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 name: "implement".to_string(),
                 stance: Default::default(),
                 depends_on: Vec::new(),
+                repository_refs: None,
                 crew: vec![
                     CrewSpec {
                         role: "coder".to_string(),
@@ -38,6 +39,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                 name: "review".to_string(),
                 stance: Default::default(),
                 depends_on: vec!["implement".to_string()],
+                repository_refs: None,
                 crew: vec![CrewSpec {
                     role: "reviewer".to_string(),
                     source: CrewSource::Agent {

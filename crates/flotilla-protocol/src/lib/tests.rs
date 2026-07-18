@@ -451,6 +451,7 @@ fn message_peer_data_roundtrip() {
     let msg = Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
         origin_node_id: NodeId::new("desktop"),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repository_key: Some(RepositoryKey("repo_peer".into())),
         host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         kind: PeerDataKind::Snapshot { data: Box::new(ProviderData::default()), seq: 7 },
@@ -481,6 +482,7 @@ fn message_peer_routed_resync_snapshot_roundtrip() {
         responder_node_id: NodeId::new("desktop"),
         remaining_hops: 4,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+        repository_key: Some(RepositoryKey("repo_peer".into())),
         host_repo_root: Some(PathBuf::from("/tmp/repo")),
         clock: VectorClock::default(),
         seq: 13,
@@ -591,7 +593,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![implement, review])
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]) }));
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]), state: Default::default() }));
 
     let encoded = serde_json::to_string(&event).expect("serialize result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize result set");
@@ -622,7 +624,7 @@ fn result_set_round_trips_independent_capabilities() {
         .attach("terminal-yeoman")
         .phase(SessionPhase::Running)
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 11, rows: Rows::Independents(vec![row]) }));
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 11, rows: Rows::Independents(vec![row]), state: Default::default() }));
 
     let encoded = serde_json::to_string(&event).expect("serialize independents result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize independents result set");
@@ -650,4 +652,12 @@ fn subscribe_queries_request_round_trips_cursors() {
     assert!(encoded.contains("\"independents\""));
     let decoded: Request = serde_json::from_str(&encoded).expect("deserialize subscribe request");
     assert_eq!(decoded, request);
+}
+
+#[test]
+fn fetch_more_request_round_trips_parameterized_query() {
+    let request = Request::FetchMore { query: QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_widget".into())) } };
+    let encoded = serde_json::to_string(&request).expect("serialize fetch-more request");
+    assert!(encoded.contains("\"fetch_more\""));
+    assert_eq!(serde_json::from_str::<Request>(&encoded).expect("deserialize fetch-more request"), request);
 }

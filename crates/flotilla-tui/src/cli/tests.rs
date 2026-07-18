@@ -288,6 +288,7 @@ mod watch_human {
     fn repo_tracked() {
         let event = DaemonEvent::RepoTracked(Box::new(flotilla_protocol::snapshot::RepoInfo {
             identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "/tmp/added-repo".into() },
+            repository_key: None,
             name: "added-repo".into(),
             path: Some(PathBuf::from("/tmp/added-repo")),
             labels: Default::default(),
@@ -977,7 +978,7 @@ mod query_event_formatting {
 
 mod result_set_event_formatting {
     use flotilla_protocol::{
-        result_set::{ResultDelta, ResultSet, Rows},
+        result_set::{QueryChanges, ResultDelta, ResultSet, Rows},
         DaemonEvent, ResourceRef,
     };
 
@@ -985,7 +986,7 @@ mod result_set_event_formatting {
 
     #[test]
     fn result_set_formatting() {
-        let result_set = ResultSet { seq: 7, rows: Rows::Convoys(vec![]) };
+        let result_set = ResultSet { seq: 7, rows: Rows::Convoys(vec![]), state: Default::default() };
         let event = DaemonEvent::ResultSet(Box::new(result_set));
         let line = format_event_human(&event);
         assert!(line.contains("[query]"), "should have query tag");
@@ -998,8 +999,11 @@ mod result_set_event_formatting {
     fn result_delta_formatting() {
         let delta = ResultDelta {
             seq: 12,
-            changed: Rows::Convoys(vec![]),
-            removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
+            changes: QueryChanges::Convoys {
+                changed: vec![],
+                removed: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "old-convoy")],
+            },
+            state: None,
         };
         let event = DaemonEvent::ResultDelta(Box::new(delta));
         let line = format_event_human(&event);
@@ -1015,18 +1019,22 @@ mod watch_dedupe_query {
     use std::collections::HashMap;
 
     use flotilla_protocol::{
-        result_set::{QueryId, ResultDelta, ResultSet, Rows},
+        result_set::{QueryChanges, QueryId, ResultDelta, ResultSet, Rows},
         DaemonEvent, StreamKey,
     };
 
     use crate::cli::event_stream_seq;
 
     fn result_set(seq: u64) -> DaemonEvent {
-        DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]) }))
+        DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }))
     }
 
     fn result_delta(seq: u64) -> DaemonEvent {
-        DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changed: Rows::Convoys(vec![]), removed: vec![] }))
+        DaemonEvent::ResultDelta(Box::new(ResultDelta {
+            seq,
+            changes: QueryChanges::Convoys { changed: vec![], removed: vec![] },
+            state: None,
+        }))
     }
 
     /// Simulate the run_watch dedup logic: build replay_seqs from a slice of

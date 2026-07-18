@@ -222,7 +222,7 @@ async fn controller_loop_advances_task_via_vessel_secondary_watch() {
             observed_policy_ref: Some("laptop-docker".to_string()),
             observed_policy_version: Some("17".to_string()),
             environment_ref: Some("env-implement".to_string()),
-            checkout_ref: Some("checkout-implement".to_string()),
+            checkout_refs: Default::default(),
             terminal_session_refs: vec!["terminal-implement-coder".to_string()],
             started_at: Some(timestamp(18)),
             ready_at: Some(timestamp(19)),
@@ -281,7 +281,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
                 convoy_ref: "convoy-delete".to_string(),
                 vessel_name: "implement".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
-                adopted_checkout_ref: None,
+                adopted_checkout_refs: Default::default(),
             },
         )
         .await
@@ -325,7 +325,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
                 convoy_ref: "convoy-delete".to_string(),
                 vessel_name: "adopted".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
-                adopted_checkout_ref: None,
+                adopted_checkout_refs: Default::default(),
             },
         )
         .await
@@ -345,7 +345,7 @@ async fn controller_loop_finalizer_deletes_presentations_and_vessels() {
                 convoy_ref: "convoy-delete".to_string(),
                 vessel_name: "observed".to_string(),
                 placement_policy_ref: "laptop-docker".to_string(),
-                adopted_checkout_ref: None,
+                adopted_checkout_refs: Default::default(),
             },
         )
         .await

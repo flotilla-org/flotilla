@@ -13,6 +13,7 @@ pub mod provider_data;
 mod provisioning_target;
 pub mod qualified_path;
 pub mod query;
+mod repository;
 pub mod resource_ref;
 pub mod result_set;
 pub mod snapshot;
@@ -32,6 +33,7 @@ pub use host_summary::{
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
+pub use repository::RepositoryKey;
 pub use step::{CheckoutIntent, Step, StepAction, StepExecutionContext, StepOutcome};
 pub use view_address::ViewAddress;
 
@@ -99,7 +101,8 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryId, ResultDelta, ResultSet, Rows, SessionPhase, VesselRow, WorkPhase,
+    ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope,
+    ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,7 +118,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -181,6 +184,11 @@ pub enum Request {
     SubscribeQueries {
         queries: Vec<QueryCursor>,
     },
+    /// Extend a live demand-backed result-set window. The appended rows are
+    /// delivered as ordinary `ResultDelta` events.
+    FetchMore {
+        query: QueryId,
+    },
     GetStatus,
     GetTopology,
     AgentHook {
@@ -208,6 +216,7 @@ pub enum Response {
     /// Replay events for the newly subscribed queries: a full [`ResultSet`]
     /// per query whose cursor was absent or stale.
     SubscribeQueries(Vec<DaemonEvent>),
+    FetchMore,
     GetStatus(StatusResponse),
     GetTopology(TopologyResponse),
     AgentHook,

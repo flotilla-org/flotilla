@@ -22,6 +22,7 @@ pub mod path_context;
 pub mod path_policy;
 pub mod provider_data;
 pub mod providers;
+pub mod query_registry;
 pub mod refresh;
 pub(crate) mod repo_state;
 pub mod repository_inspection;

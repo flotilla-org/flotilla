@@ -778,6 +778,7 @@ fn remote_only_app() -> App {
     let remote_identity = flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() };
     let model = TuiRepoModel {
         identity: remote_identity.clone(),
+        repository_key: old.repository_key,
         path: synthetic_path.clone(),
         providers: old.providers,
         labels: old.labels,
@@ -789,7 +790,7 @@ fn remote_only_app() -> App {
     app.model.repo_order[0] = remote_identity.clone();
     app.model.repos.insert(remote_identity.clone(), model);
     // Focus a tab on the swapped-in remote repo so it is the active repo view.
-    app.open_view(flotilla_protocol::ViewAddress::Repo(remote_identity));
+    app.open_view(flotilla_protocol::ViewAddress::repo(remote_identity));
     insert_local_host(&mut app.model, &HostName::local().to_string());
     app
 }

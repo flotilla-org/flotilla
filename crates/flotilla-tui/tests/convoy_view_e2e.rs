@@ -43,10 +43,10 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         workflow_ref: workflow_ref.to_string(),
         inputs: BTreeMap::new(),
         placement_policy: None,
-        repository: None,
+        repositories: Vec::new(),
         r#ref: None,
         project_ref: None,
-        adopted_checkout_ref: None,
+        adopted_checkout_refs: BTreeMap::new(),
     }
 }
 
@@ -179,7 +179,13 @@ async fn generated_table_action_completes_work() {
         placement: None,
     });
     let snapshot = WorkflowSnapshot {
-        vessels: vec![VesselRequirement { name: "implement".into(), stance: Default::default(), depends_on: vec![], crew: vec![] }],
+        vessels: vec![VesselRequirement {
+            name: "implement".into(),
+            stance: Default::default(),
+            depends_on: vec![],
+            repository_refs: None,
+            crew: vec![],
+        }],
     };
     apply_status_patch(
         &convoys,

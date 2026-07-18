@@ -155,7 +155,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
 
     VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
-        checkout_ref: Some("checkout-a".to_string()),
+        checkout_refs: Default::default(),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         requested_stance: Stance::WorkspaceWrite,
         effective_stance: Stance::Contained,
@@ -167,7 +167,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
 
     VesselStatusPatch::MarkReady {
         environment_ref: Some("env-a".to_string()),
-        checkout_ref: Some("checkout-a".to_string()),
+        checkout_refs: Default::default(),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         requested_stance: Stance::WorkspaceWrite,
         effective_stance: Stance::Contained,

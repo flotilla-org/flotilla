@@ -30,7 +30,7 @@ use flotilla_manifest::{
     wire::MetadataPatch,
 };
 use flotilla_protocol::{
-    result_set::{ConvoyRow, IndependentRow, ResultDelta, ResultSet, Rows},
+    result_set::{ConvoyRow, IndependentRow, QueryChanges, ResultDelta, ResultSet, Rows},
     DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -137,12 +137,24 @@ pub enum Applied {
 
 /// The connector's held state: fleet-merged rows per query, per-query
 /// cursors, and the catalog as last published.
-#[derive(Default)]
 pub struct ConnectorState {
     convoys: HashMap<ResourceRef, ConvoyRow>,
     independents: HashMap<ResourceRef, IndependentRow>,
     seqs: HashMap<QueryId, u64>,
     catalog: Catalog,
+    subscriber_id: uuid::Uuid,
+}
+
+impl Default for ConnectorState {
+    fn default() -> Self {
+        Self {
+            convoys: HashMap::new(),
+            independents: HashMap::new(),
+            seqs: HashMap::new(),
+            catalog: Catalog::default(),
+            subscriber_id: uuid::Uuid::new_v4(),
+        }
+    }
 }
 
 impl ConnectorState {
@@ -162,6 +174,7 @@ impl ConnectorState {
         match &set.rows {
             Rows::Convoys(rows) => self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
             Rows::Independents(rows) => self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
+            Rows::Issues { .. } => return Applied::Ignored,
         }
         self.seqs.insert(query, set.seq);
         Applied::Updated
@@ -178,26 +191,25 @@ impl ConnectorState {
         if delta.seq != seen + 1 {
             return Applied::Gap(query);
         }
-        match &delta.changed {
-            Rows::Convoys(rows) => {
+        match &delta.changes {
+            QueryChanges::Convoys { changed: rows, removed } => {
                 for row in rows {
                     self.convoys.insert(row.resource.clone(), row.clone());
                 }
+                for removed in removed {
+                    self.convoys.remove(removed);
+                }
             }
-            Rows::Independents(rows) => {
+            QueryChanges::Independents { changed: rows, removed } => {
                 for row in rows {
                     self.independents.insert(row.resource.clone(), row.clone());
                 }
-            }
-        }
-        for removed in &delta.removed {
-            match query {
-                QueryId::Convoys => {
-                    self.convoys.remove(removed);
-                }
-                QueryId::Independents => {
+                for removed in removed {
                     self.independents.remove(removed);
                 }
+            }
+            QueryChanges::Issues { .. } => {
+                return Applied::Gap(query);
             }
         }
         self.seqs.insert(query, delta.seq);
@@ -224,7 +236,7 @@ impl ConnectorState {
     /// stale by construction, so resubscribing with these gets it a full
     /// [`ResultSet`].
     pub fn cursors(&self) -> Vec<QueryCursor> {
-        QueryId::ALL.iter().map(|&query| QueryCursor { query, since: self.seqs.get(&query).copied() }).collect()
+        QueryId::ALWAYS_MATERIALIZED.iter().cloned().map(|query| QueryCursor { since: self.seqs.get(&query).copied(), query }).collect()
     }
 }
 
@@ -243,7 +255,7 @@ async fn resubscribe(
     mint: &dyn RecipeMint,
     sink: &dyn PatchSink,
 ) -> Result<(), String> {
-    let events = daemon.subscribe_queries(&state.cursors()).await?;
+    let events = daemon.subscribe_queries(state.subscriber_id, &state.cursors()).await?;
     let mut updated = false;
     for event in &events {
         updated |= state.apply_event(event) == Applied::Updated;
@@ -290,7 +302,10 @@ pub async fn run_connector(
                     warn!(skipped, "event stream lagged; resubscribing");
                     resubscribe(&*daemon, &mut state, &*mint, &*sink).await?;
                 }
-                Err(RecvError::Closed) => return Err("daemon event stream closed".to_owned()),
+                Err(RecvError::Closed) => {
+                    daemon.unsubscribe_queries(state.subscriber_id).await;
+                    return Err("daemon event stream closed".to_owned());
+                }
             }
         }
     }

@@ -55,6 +55,8 @@ pub struct RepoLabels {
 pub struct RepoInfo {
     pub identity: RepoIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<crate::RepositoryKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
     pub name: String,
     pub labels: RepoLabels,
@@ -239,6 +241,7 @@ mod tests {
 
         let info = RepoInfo {
             identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
+            repository_key: None,
             path: Some(PathBuf::from("/repos/test")),
             name: "test".into(),
             labels,
@@ -344,6 +347,7 @@ mod tests {
     fn repo_info_and_snapshot_omit_optional_path_metadata_when_absent() {
         let info = RepoInfo {
             identity: RepoIdentity { authority: "github.com".into(), path: "owner/test".into() },
+            repository_key: None,
             path: None,
             name: "test".into(),
             labels: RepoLabels::default(),

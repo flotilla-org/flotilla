@@ -155,8 +155,8 @@ fn prev_tab_cycles_with_no_repos() {
 fn move_tab_moves_active_tab_right_and_persists() {
     let mut app = stub_app_with_repos(3);
     // Active is repo-0 at tab index 2.
-    let repo0 = ViewAddress::Repo(app.model.repo_order[0].clone());
-    let repo1 = ViewAddress::Repo(app.model.repo_order[1].clone());
+    let repo0 = ViewAddress::repo(app.model.repo_order[0].clone());
+    let repo1 = ViewAddress::repo(app.model.repo_order[1].clone());
     let order_before = app.model.repo_order.clone();
 
     assert!(app.move_tab(1));
@@ -177,7 +177,7 @@ fn move_tab_moves_active_tab_right_and_persists() {
 fn move_tab_moves_active_tab_left() {
     let mut app = stub_app_with_repos(3);
     activate_repo_tab(&mut app, 1); // tab index 3
-    let repo1 = ViewAddress::Repo(app.model.repo_order[1].clone());
+    let repo1 = ViewAddress::repo(app.model.repo_order[1].clone());
 
     assert!(app.move_tab(-1));
 
