@@ -29,11 +29,11 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, descriptive_repo_slug, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
+    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource,
+    CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
-    TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError, ResourceObject,
+    Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -810,9 +810,12 @@ fn spawn_aggregator_task(
                             .durable_environments(durable.clone().using::<Environment>(&namespace))
                             .durable_presentations(durable.using::<Presentation>(&namespace))
                             .durable_sessions(durable.using::<flotilla_resources::TerminalSession>(&namespace))
+                            .durable_projects(durable.using::<Project>(&namespace))
+                            .durable_repositories(durable.using::<Repository>(&namespace))
                             .observed_convoys(observed.clone().using::<Convoy>(&namespace))
                             .observed_presentations(observed.using::<Presentation>(&namespace))
                             .observed_sessions(observed.using::<flotilla_resources::TerminalSession>(&namespace))
+                            .observed_checkouts(observed.using::<Checkout>(&namespace))
                             .build(),
                         daemon.subscribe_fleet_replicas(),
                     )

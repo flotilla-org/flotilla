@@ -13,7 +13,10 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{host::HostName, provider_data::Issue, resource_ref::ResourceRef, snapshot::RepoKey, IssueRef, IssueSource, RepositoryKey};
+use crate::{
+    host::HostName, provider_data::Issue, resource_ref::ResourceRef, snapshot::RepoKey, IssueRef, IssueSource, LifecycleAuthority,
+    RepositoryKey,
+};
 
 pub type Timestamp = DateTime<Utc>;
 
@@ -30,6 +33,8 @@ pub enum QueryId {
     /// Open issues in one Project or Repository scope. Rows are populated
     /// only while at least one client subscribes to this query.
     Issues { scope: QueryScope },
+    /// Concrete observed checkouts in one Project or Repository scope.
+    Checkouts { scope: QueryScope },
 }
 
 /// Scope parameters owned by a curated query family.
@@ -50,6 +55,7 @@ impl QueryId {
             Self::Convoys => "convoys",
             Self::Independents => "independents",
             Self::Issues { .. } => "issues",
+            Self::Checkouts { .. } => "checkouts",
         }
     }
 }
@@ -120,6 +126,12 @@ pub enum QueryChanges {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<IssueRef>,
     },
+    Checkouts {
+        scope: QueryScope,
+        changed: Vec<CheckoutRow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<ResourceRef>,
+    },
 }
 
 impl QueryChanges {
@@ -128,6 +140,7 @@ impl QueryChanges {
             Self::Convoys { .. } => QueryId::Convoys,
             Self::Independents { .. } => QueryId::Independents,
             Self::Issues { scope, .. } => QueryId::Issues { scope: scope.clone() },
+            Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
         }
     }
 
@@ -136,12 +149,13 @@ impl QueryChanges {
             Self::Convoys { changed, .. } => changed.len(),
             Self::Independents { changed, .. } => changed.len(),
             Self::Issues { changed, .. } => changed.len(),
+            Self::Checkouts { changed, .. } => changed.len(),
         }
     }
 
     pub fn removed_len(&self) -> usize {
         match self {
-            Self::Convoys { removed, .. } | Self::Independents { removed, .. } => removed.len(),
+            Self::Convoys { removed, .. } | Self::Independents { removed, .. } | Self::Checkouts { removed, .. } => removed.len(),
             Self::Issues { removed, .. } => removed.len(),
         }
     }
@@ -171,9 +185,16 @@ impl QueryChanges {
         }
     }
 
+    pub fn as_checkouts(&self) -> Option<&[CheckoutRow]> {
+        match self {
+            Self::Checkouts { changed, .. } => Some(changed),
+            _ => None,
+        }
+    }
+
     pub fn removed_resources(&self) -> Option<&[ResourceRef]> {
         match self {
-            Self::Convoys { removed, .. } | Self::Independents { removed, .. } => Some(removed),
+            Self::Convoys { removed, .. } | Self::Independents { removed, .. } | Self::Checkouts { removed, .. } => Some(removed),
             Self::Issues { .. } => None,
         }
     }
@@ -218,6 +239,10 @@ pub enum ResultSetCondition {
         source: Option<IssueSource>,
         message: String,
     },
+    QueryScopeUnavailable {
+        scope: QueryScope,
+        message: String,
+    },
 }
 
 /// Typed rows of a query result. The variant always matches the enclosing
@@ -228,6 +253,7 @@ pub enum Rows {
     Convoys(Vec<ConvoyRow>),
     Independents(Vec<IndependentRow>),
     Issues { scope: QueryScope, rows: Vec<IssueRow> },
+    Checkouts { scope: QueryScope, rows: Vec<CheckoutRow> },
 }
 
 impl Rows {
@@ -236,6 +262,7 @@ impl Rows {
             Self::Convoys(_) => QueryId::Convoys,
             Self::Independents(_) => QueryId::Independents,
             Self::Issues { scope, .. } => QueryId::Issues { scope: scope.clone() },
+            Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
         }
     }
 
@@ -244,6 +271,7 @@ impl Rows {
             Self::Convoys(rows) => rows.len(),
             Self::Independents(rows) => rows.len(),
             Self::Issues { rows, .. } => rows.len(),
+            Self::Checkouts { rows, .. } => rows.len(),
         }
     }
 
@@ -271,6 +299,13 @@ impl Rows {
             _ => None,
         }
     }
+
+    pub fn as_checkouts(&self) -> Option<&[CheckoutRow]> {
+        match self {
+            Self::Checkouts { rows, .. } => Some(rows),
+            _ => None,
+        }
+    }
 }
 
 /// One row in an `issues{scope}` result set.
@@ -278,6 +313,18 @@ impl Rows {
 pub struct IssueRow {
     pub reference: IssueRef,
     pub issue: Issue,
+}
+
+/// One concrete checkout observation in a scoped result set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct CheckoutRow {
+    pub resource: ResourceRef,
+    pub repo: RepositoryKey,
+    pub path: String,
+    pub branch: String,
+    pub host: HostName,
+    pub authority: LifecycleAuthority,
 }
 
 /// Lifecycle phase of an independent terminal session.
@@ -475,8 +522,69 @@ pub struct CrewMemberSummary {
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use super::{DemandBackedMetadata, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSetState};
-    use crate::{provider_data::Issue, IssueRef, IssueSource, IssueState, RepositoryKey};
+    use super::{
+        CheckoutRow, DemandBackedMetadata, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows,
+    };
+    use crate::{provider_data::Issue, HostName, IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey, ResourceRef};
+
+    #[test]
+    fn checkout_result_set_round_trip_preserves_scope_host_and_authority() {
+        let scope = QueryScope::Repository(RepositoryKey("repo_abc123".into()));
+        let set = ResultSet {
+            seq: 7,
+            rows: Rows::Checkouts {
+                scope: scope.clone(),
+                rows: vec![CheckoutRow::builder()
+                    .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-a").on_host(HostName::new("kiwi")))
+                    .repo(RepositoryKey("repo_abc123".into()))
+                    .path("/work/flotilla")
+                    .branch("feature/query")
+                    .host(HostName::new("kiwi"))
+                    .authority(LifecycleAuthority::Adopted)
+                    .build()],
+            },
+            state: ResultSetState::default(),
+        };
+
+        assert_eq!(set.query(), QueryId::Checkouts { scope });
+        let json = serde_json::to_string(&set).expect("serialize checkout set");
+        let decoded = serde_json::from_str::<ResultSet>(&json).expect("deserialize checkout set");
+        assert_eq!(decoded, set);
+    }
+
+    #[test]
+    fn checkout_delta_round_trip_preserves_scope_rows_and_removals() {
+        let scope = QueryScope::Project { namespace: "flotilla".into(), name: "dashboard".into() };
+        let removed = ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-old").on_host(HostName::new("kiwi"));
+        let delta = ResultDelta {
+            seq: 8,
+            changes: QueryChanges::Checkouts {
+                scope: scope.clone(),
+                changed: vec![CheckoutRow::builder()
+                    .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-new").on_host(HostName::new("mango")))
+                    .repo(RepositoryKey("repo_abc123".into()))
+                    .path("/work/flotilla")
+                    .branch("feature/query")
+                    .host(HostName::new("mango"))
+                    .authority(LifecycleAuthority::Observed)
+                    .build()],
+                removed: vec![removed.clone()],
+            },
+            state: Some(ResultSetState {
+                demand: None,
+                conditions: vec![super::ResultSetCondition::QueryScopeUnavailable {
+                    scope: scope.clone(),
+                    message: "repository definition is temporarily unavailable".into(),
+                }],
+            }),
+        };
+
+        assert_eq!(delta.query(), QueryId::Checkouts { scope });
+        let json = serde_json::to_string(&delta).expect("serialize checkout delta");
+        let decoded = serde_json::from_str::<ResultDelta>(&json).expect("deserialize checkout delta");
+        assert_eq!(decoded, delta);
+        assert_eq!(decoded.changes.removed_resources().expect("checkout removals"), &[removed]);
+    }
 
     #[test]
     fn issues_query_round_trips_with_owned_project_scope() {

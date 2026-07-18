@@ -2624,7 +2624,16 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
         .get("adopted-checkout-convoy-adopted")
         .await
         .expect("adopted checkout should exist");
+    let observed_checkout = daemon
+        .observed_resource_backend()
+        .using::<ResourceCheckout>("flotilla")
+        .get("adopted-checkout-convoy-adopted")
+        .await
+        .expect("adopted checkout should be published as an observed fact");
     assert_eq!(checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
+    assert_eq!(observed_checkout.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
+    assert_eq!(observed_checkout.spec, checkout.spec);
+    assert_eq!(observed_checkout.status, checkout.status);
     match checkout.spec {
         ResourceCheckoutSpec::Observed(spec) => {
             assert_eq!(spec.r#ref, "main");

@@ -6,6 +6,7 @@ pub mod framing;
 mod host;
 mod host_summary;
 pub mod issue_query;
+mod lifecycle;
 pub mod output;
 pub mod path_context;
 pub mod peer;
@@ -30,6 +31,7 @@ pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
     DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,
 };
+pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
 pub use peer::{CommandPeerEvent, GoodbyeReason, PeerDataKind, PeerDataMessage, PeerWireMessage, RoutedPeerMessage, VectorClock};
 pub use provisioning_target::ProvisioningTarget;
@@ -101,8 +103,8 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope,
-    ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
+    CheckoutRow, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId,
+    QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 

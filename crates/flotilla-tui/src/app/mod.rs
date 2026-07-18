@@ -1300,6 +1300,7 @@ impl App {
                         self.materialized_issue_states.insert(query.clone(), result_set.state.clone());
                         self.push_materialized_issue_items_to_repo_data(&query);
                     }
+                    flotilla_protocol::Rows::Checkouts { .. } => {}
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1351,6 +1352,7 @@ impl App {
                         }
                         self.push_materialized_issue_items_to_repo_data(&query);
                     }
+                    flotilla_protocol::QueryChanges::Checkouts { .. } => {}
                 }
             }
         }

@@ -9,15 +9,16 @@ use async_trait::async_trait;
 use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{
-        ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, ResultDelta, Rows, SessionPhase, VesselRow,
-        WorkPhase,
+        CheckoutRow, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope, ResultDelta, Rows,
+        SessionPhase, VesselRow, WorkPhase,
     },
-    DaemonEvent, FleetReplicaSnapshot, HostName, ResourceRef,
+    DaemonEvent, FleetReplicaSnapshot, HostName, LifecycleAuthority, RepositoryKey, ResourceRef,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation, Resource, ResourceError,
-    ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart,
-    WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation,
+    Project, Repository, Resource, ResourceError, ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver,
+    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL,
+    VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -33,9 +34,12 @@ pub struct AggregatorResolvers {
     durable_environments: TypedResolver<Environment>,
     durable_presentations: TypedResolver<Presentation>,
     durable_sessions: TypedResolver<TerminalSession>,
+    durable_projects: TypedResolver<Project>,
+    durable_repositories: TypedResolver<Repository>,
     observed_convoys: TypedResolver<Convoy>,
     observed_presentations: TypedResolver<Presentation>,
     observed_sessions: TypedResolver<TerminalSession>,
+    observed_checkouts: TypedResolver<Checkout>,
 }
 
 #[derive(bon::Builder)]
@@ -44,9 +48,12 @@ struct AggregatorSourceRefs<'a> {
     durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     durable_sessions: &'a dyn AggregatorWatchSource<TerminalSession>,
+    durable_projects: &'a dyn AggregatorWatchSource<Project>,
+    durable_repositories: &'a dyn AggregatorWatchSource<Repository>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
     observed_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     observed_sessions: &'a dyn AggregatorWatchSource<TerminalSession>,
+    observed_checkouts: &'a dyn AggregatorWatchSource<Checkout>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,6 +105,9 @@ pub struct Aggregator {
     sessions_by_source: HashMap<LocalSource, HashMap<SessionKey, ResourceObject<TerminalSession>>>,
     presentation_workspaces: HashMap<PresentationKey, String>,
     terminal_sessions: HashMap<SessionKey, ResourceObject<TerminalSession>>,
+    projects: HashMap<(String, String), ResourceObject<Project>>,
+    repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
+    observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
@@ -119,6 +129,9 @@ impl Aggregator {
             sessions_by_source: HashMap::new(),
             presentation_workspaces: HashMap::new(),
             terminal_sessions: HashMap::new(),
+            projects: HashMap::new(),
+            repositories: HashMap::new(),
+            observed_checkouts: HashMap::new(),
             bootstrapping: false,
             emitted_queries: HashSet::new(),
             attach_resolver: None,
@@ -153,18 +166,24 @@ impl Aggregator {
             durable_environments,
             durable_presentations,
             durable_sessions,
+            durable_projects,
+            durable_repositories,
             observed_convoys,
             observed_presentations,
             observed_sessions,
+            observed_checkouts,
         } = resolvers;
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
             .durable_environments(&durable_environments)
             .durable_presentations(&durable_presentations)
             .durable_sessions(&durable_sessions)
+            .durable_projects(&durable_projects)
+            .durable_repositories(&durable_repositories)
             .observed_convoys(&observed_convoys)
             .observed_presentations(&observed_presentations)
             .observed_sessions(&observed_sessions)
+            .observed_checkouts(&observed_checkouts)
             .build();
         self.run_with_sources(sources, replica_rx).await
     }
@@ -179,9 +198,12 @@ impl Aggregator {
             durable_environments,
             durable_presentations,
             durable_sessions,
+            durable_projects,
+            durable_repositories,
             observed_convoys,
             observed_presentations,
             observed_sessions,
+            observed_checkouts,
         } = sources;
         // Subscribe before any source bootstrap awaits so demand arriving
         // during recovery remains observable. Also consume the initial value
@@ -212,9 +234,12 @@ impl Aggregator {
         let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
         let mut durable_session_stream = self.recover_session_watch(LocalSource::Durable, durable_sessions).await?;
+        let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
+        let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
         let mut observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
         let mut observed_session_stream = self.recover_session_watch(LocalSource::Observed, observed_sessions).await?;
+        let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
         self.bootstrapping = false;
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
@@ -276,6 +301,22 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable terminal session watch ended")),
                 },
+                event = durable_project_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_project_event(event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_project_stream = self.recover_project_watch(durable_projects).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable project watch ended")),
+                },
+                event = durable_repository_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_repository_event(event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable repository watch ended")),
+                },
                 event = observed_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Observed, event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -299,6 +340,14 @@ impl Aggregator {
                     }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator observed terminal session watch ended")),
+                },
+                event = observed_checkout_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_checkout_event(event).await?,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator observed checkout watch ended")),
                 },
                 replica = replica_rx.recv() => match replica {
                     Ok(snapshots) => self.apply_replica_cache(snapshots).await,
@@ -364,6 +413,42 @@ impl Aggregator {
         }
     }
 
+    async fn recover_project_watch(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Project>,
+    ) -> Result<WatchStream<Project>, ResourceError> {
+        loop {
+            match self.list_and_watch_projects(resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
+    async fn recover_repository_watch(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Repository>,
+    ) -> Result<WatchStream<Repository>, ResourceError> {
+        loop {
+            match self.list_and_watch_repositories(resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
+    async fn recover_checkout_watch(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Checkout>,
+    ) -> Result<WatchStream<Checkout>, ResourceError> {
+        loop {
+            match self.list_and_watch_checkouts(resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
     async fn list_and_watch_convoys(
         &mut self,
         source: LocalSource,
@@ -414,6 +499,47 @@ impl Aggregator {
         let start = watch_start(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_session_source(source, listed.items).await;
+        Ok(watch)
+    }
+
+    async fn list_and_watch_projects(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Project>,
+    ) -> Result<WatchStream<Project>, ResourceError> {
+        let listed = resolver.list().await?;
+        let watch = resolver.watch(watch_start(&listed)).await?;
+        self.projects = listed
+            .items
+            .into_iter()
+            .map(|project| ((project.metadata.namespace.clone(), project.metadata.name.clone()), project))
+            .collect();
+        self.rebuild_checkout_catalog().await;
+        Ok(watch)
+    }
+
+    async fn list_and_watch_repositories(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Repository>,
+    ) -> Result<WatchStream<Repository>, ResourceError> {
+        let listed = resolver.list().await?;
+        let watch = resolver.watch(watch_start(&listed)).await?;
+        self.repositories = listed.items.into_iter().map(|repository| (repository.spec.key(), repository)).collect();
+        self.rebuild_checkout_catalog().await;
+        Ok(watch)
+    }
+
+    async fn list_and_watch_checkouts(
+        &mut self,
+        resolver: &dyn AggregatorWatchSource<Checkout>,
+    ) -> Result<WatchStream<Checkout>, ResourceError> {
+        let listed = resolver.list().await?;
+        let watch = resolver.watch(watch_start(&listed)).await?;
+        self.observed_checkouts = listed
+            .items
+            .into_iter()
+            .map(|checkout| (self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name), checkout))
+            .collect();
+        self.rebuild_checkout_rows().await?;
         Ok(watch)
     }
 
@@ -555,6 +681,90 @@ impl Aggregator {
         self.rebuild_independents_projection().await;
     }
 
+    async fn apply_project_event(&mut self, event: WatchEvent<Project>) {
+        match event {
+            WatchEvent::Added(project) | WatchEvent::Modified(project) => {
+                self.projects.insert((project.metadata.namespace.clone(), project.metadata.name.clone()), project);
+            }
+            WatchEvent::Deleted(project) => {
+                self.projects.remove(&(project.metadata.namespace, project.metadata.name));
+            }
+        }
+        self.rebuild_checkout_catalog().await;
+    }
+
+    async fn apply_repository_event(&mut self, event: WatchEvent<Repository>) {
+        match event {
+            WatchEvent::Added(repository) | WatchEvent::Modified(repository) => {
+                self.repositories.insert(repository.spec.key(), repository);
+            }
+            WatchEvent::Deleted(repository) => {
+                self.repositories.remove(&repository.spec.key());
+            }
+        }
+        self.rebuild_checkout_catalog().await;
+    }
+
+    async fn apply_checkout_event(&mut self, event: WatchEvent<Checkout>) -> Result<(), ResourceError> {
+        match event {
+            WatchEvent::Added(checkout) | WatchEvent::Modified(checkout) => {
+                let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
+                self.observed_checkouts.insert(reference, checkout);
+            }
+            WatchEvent::Deleted(checkout) => {
+                let reference = self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name);
+                self.observed_checkouts.remove(&reference);
+            }
+        }
+        self.rebuild_checkout_rows().await
+    }
+
+    async fn rebuild_checkout_catalog(&self) {
+        let repositories = self.repositories.keys().cloned().collect();
+        let projects = self
+            .projects
+            .values()
+            .map(|project| {
+                let scope = QueryScope::Project { namespace: project.metadata.namespace.clone(), name: project.metadata.name.clone() };
+                let repositories = project.spec.repositories.iter().map(|repository| repository.repo.clone()).collect();
+                (scope, repositories)
+            })
+            .collect();
+        let deltas = self.state.replace_checkout_catalog(repositories, projects).await;
+        self.emit_checkout_deltas(deltas);
+    }
+
+    async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
+        let rows = self
+            .observed_checkouts
+            .values()
+            .filter_map(|checkout| {
+                let CheckoutSpec::Observed(spec) = &checkout.spec else { return None };
+                Some((checkout, spec))
+            })
+            .map(|(checkout, spec)| {
+                let authority = checkout.metadata.lifecycle_authority()?.unwrap_or(LifecycleAuthority::Managed);
+                Ok(CheckoutRow::builder()
+                    .resource(self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name))
+                    .repo(spec.repo_ref.clone())
+                    .path(spec.path.clone())
+                    .branch(spec.r#ref.clone())
+                    .host(self.local_host.clone())
+                    .authority(authority)
+                    .build())
+            })
+            .collect::<Result<Vec<_>, ResourceError>>()?;
+        let deltas = self.state.replace_local_checkout_rows(rows).await;
+        self.emit_checkout_deltas(deltas);
+        Ok(())
+    }
+
+    fn emit_checkout_deltas(&self, deltas: Vec<ResultDelta>) {
+        for delta in deltas {
+            let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        }
+    }
+
     async fn rebuild_independents_projection(&mut self) {
         let mut effective_sessions = HashMap::new();
         for source in LOCAL_SOURCE_PRECEDENCE {
@@ -613,10 +823,12 @@ impl Aggregator {
     pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
         let mut convoy_replacements = HashMap::new();
         let mut independent_replacements = HashMap::new();
+        let mut checkout_replacements = HashMap::new();
         for snapshot in snapshots {
             let host = snapshot.host;
             let mut convoy_rows = HashMap::new();
             let mut independent_rows = HashMap::new();
+            let mut checkout_rows = Vec::new();
             for result_set in snapshot.result_sets {
                 match result_set.rows {
                     Rows::Convoys(convoys) => {
@@ -634,10 +846,20 @@ impl Aggregator {
                     Rows::Issues { .. } => {
                         tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
                     }
+                    Rows::Checkouts { scope: QueryScope::Repository(_), rows } => {
+                        for mut row in rows {
+                            set_checkout_row_host(&mut row, &host);
+                            checkout_rows.push(row);
+                        }
+                    }
+                    Rows::Checkouts { scope: QueryScope::Project { .. }, .. } => {
+                        tracing::warn!(host = %host, "ignoring derived project checkout set in fleet replica snapshot");
+                    }
                 }
             }
             convoy_replacements.insert(host.clone(), convoy_rows);
-            independent_replacements.insert(host, independent_rows);
+            independent_replacements.insert(host.clone(), independent_rows);
+            checkout_replacements.insert(host, checkout_rows);
         }
 
         let convoy_change = {
@@ -665,6 +887,9 @@ impl Aggregator {
                 let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set().await)));
             }
         }
+
+        let checkout_deltas = self.state.replace_checkout_replica_rows(checkout_replacements).await;
+        self.emit_checkout_deltas(checkout_deltas);
     }
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
@@ -691,6 +916,10 @@ impl Aggregator {
     fn session_ref(&self, namespace: &str, name: &str) -> ResourceRef {
         ResourceRef::new(api_version(TerminalSession::API_PATHS), TerminalSession::API_PATHS.kind, namespace, name)
             .on_host(self.local_host.clone())
+    }
+
+    fn checkout_ref(&self, namespace: &str, name: &str) -> ResourceRef {
+        ResourceRef::new(api_version(Checkout::API_PATHS), Checkout::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
     }
 
     fn summarize_independent(
@@ -829,6 +1058,11 @@ fn set_independent_row_host(row: &mut IndependentRow, host: &HostName) {
     row.host = host.clone();
 }
 
+fn set_checkout_row_host(row: &mut CheckoutRow, host: &HostName) {
+    row.resource.host = Some(host.clone());
+    row.host = host.clone();
+}
+
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
@@ -871,7 +1105,7 @@ mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::result_set::ResultSet;
+    use flotilla_protocol::result_set::{ResultSet, ResultSetState};
     use flotilla_resources::{
         ConvoySpec, CrewSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase, PresentationSpec,
         PresentationStatus, ResourceBackend, Stance, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
@@ -959,15 +1193,21 @@ mod tests {
     ) -> Result<(), ResourceError> {
         let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(durable_convoys)
             .durable_environments(&durable_environments)
             .durable_presentations(durable_presentations)
             .durable_sessions(&durable_sessions)
+            .durable_projects(&durable_projects)
+            .durable_repositories(&durable_repositories)
             .observed_convoys(observed_convoys)
             .observed_presentations(observed_presentations)
             .observed_sessions(&observed_sessions)
+            .observed_checkouts(&observed_checkouts)
             .build();
         aggregator.run_with_sources(sources, replica_rx).await
     }
@@ -1264,6 +1504,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replica_cache_merges_repository_checkout_rows_and_sets_origin_host() {
+        let state = AggregatorProjectionState::new();
+        let repo = RepositoryKey("repo-widgets".into());
+        state.replace_checkout_catalog(HashSet::from([repo.clone()]), HashMap::new()).await;
+        let scope = QueryScope::Repository(repo.clone());
+        let row = CheckoutRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "remote-checkout"))
+            .repo(repo)
+            .path("/srv/widgets")
+            .branch("main")
+            .host(HostName::new("incorrect-source-host"))
+            .authority(LifecycleAuthority::Observed)
+            .build();
+        let snapshot = FleetReplicaSnapshot {
+            host: HostName::new("kiwi"),
+            generation: None,
+            rows: vec![],
+            result_sets: vec![ResultSet {
+                seq: 4,
+                rows: Rows::Checkouts { scope: scope.clone(), rows: vec![row] },
+                state: ResultSetState::default(),
+            }],
+        };
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+
+        aggregator.apply_replica_cache(vec![snapshot]).await;
+
+        let set = state.result_set_for(&QueryId::Checkouts { scope }).await.expect("checkout result set");
+        let rows = set.rows.as_checkouts().expect("checkout rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host, HostName::new("kiwi"));
+        assert_eq!(rows[0].resource.host, Some(HostName::new("kiwi")));
+    }
+
+    #[tokio::test]
     async fn replica_cache_unions_independents_and_stamps_origin_host() {
         let state = AggregatorProjectionState::new();
         let (tx, mut rx) = broadcast::channel(8);
@@ -1324,9 +1600,12 @@ mod tests {
                     .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                     .durable_sessions(durable.using::<TerminalSession>("flotilla"))
+                    .durable_projects(durable.using::<Project>("flotilla"))
+                    .durable_repositories(durable.using::<Repository>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
                     .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
                     .observed_sessions(observed.using::<TerminalSession>("flotilla"))
+                    .observed_checkouts(observed.using::<Checkout>("flotilla"))
                     .build(),
                 replica_rx,
             )
@@ -1400,9 +1679,12 @@ mod tests {
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
             vec![Ok(expiring_watch()), Ok(pending_watch())],
         ));
+        let durable_projects = Arc::new(ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let observed_checkouts = Arc::new(ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let (_replica_tx, replica_rx) = broadcast::channel(1);
@@ -1415,9 +1697,12 @@ mod tests {
                 .durable_environments(durable_environments.as_ref())
                 .durable_presentations(durable_presentations.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
+                .durable_projects(durable_projects.as_ref())
+                .durable_repositories(durable_repositories.as_ref())
                 .observed_convoys(observed_convoys.as_ref())
                 .observed_presentations(observed_presentations.as_ref())
                 .observed_sessions(observed_sessions.as_ref())
+                .observed_checkouts(observed_checkouts.as_ref())
                 .build();
             Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources, replica_rx).await
         });
