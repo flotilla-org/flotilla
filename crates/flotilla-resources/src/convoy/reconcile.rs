@@ -11,6 +11,7 @@ use super::{
     WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
 };
 use crate::{
+    checkout::Checkout,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome as ControllerReconcileOutcome, Reconciler,
         SecondaryWatch,
@@ -52,6 +53,7 @@ pub struct ConvoyReconciler {
     templates: TypedResolver<WorkflowTemplate>,
     vessels: Option<TypedResolver<Vessel>>,
     presentations: Option<TypedResolver<Presentation>>,
+    checkouts: Option<TypedResolver<Checkout>>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,7 +65,7 @@ pub struct ConvoyDependencies {
 
 impl ConvoyReconciler {
     pub fn new(templates: TypedResolver<WorkflowTemplate>) -> Self {
-        Self { templates, vessels: None, presentations: None }
+        Self { templates, vessels: None, presentations: None, checkouts: None }
     }
 
     pub fn with_vessels(mut self, vessels: TypedResolver<Vessel>) -> Self {
@@ -76,10 +78,16 @@ impl ConvoyReconciler {
         self
     }
 
+    pub fn with_checkouts(mut self, checkouts: TypedResolver<Checkout>) -> Self {
+        self.checkouts = Some(checkouts);
+        self
+    }
+
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Convoy>>> {
         vec![
             Box::new(LabelMappedWatch::<Vessel, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<Checkout, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
         ]
     }
 }
@@ -143,6 +151,9 @@ impl Reconciler for ConvoyReconciler {
         }
         if let Some(vessels) = &self.vessels {
             delete_lifecycle_owned_matching(vessels, &selector).await?;
+        }
+        if let Some(checkouts) = &self.checkouts {
+            delete_lifecycle_owned_matching(checkouts, &selector).await?;
         }
         Ok(())
     }

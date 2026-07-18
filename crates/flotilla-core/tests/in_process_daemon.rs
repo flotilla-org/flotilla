@@ -679,7 +679,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
 #[tokio::test]
 async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snapshot() {
     let reference =
-        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "732".into() };
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/planning".into() }, id: "732".into() };
     let mut issue = TestIssue::new("Start convoy from an issue").id("732").with_labels(vec!["enhancement".into()]).build();
     issue.reference = reference.clone();
     issue.body = Some("Capture the issue at admission time.".into());
@@ -712,7 +712,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             display_name: "Flotilla".into(),
             default_workflow_ref: "single-agent-contained".into(),
-            issue_source: None,
+            issue_source: Some(reference.source.clone()),
             repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
         })
         .await
@@ -726,6 +726,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             context_repo: None,
             action: CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
                     project_ref: "flotilla".into(),
                     issue: Some(IssueSelector::Reference(reference.clone())),
                     name: Some("issue-732".into()),
@@ -775,6 +776,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             context_repo: None,
             action: CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
                     project_ref: "flotilla".into(),
                     issue: Some(IssueSelector::Reference(reference)),
                     name: None,
@@ -808,6 +810,130 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let fallback = backend.using::<ResourceConvoy>("flotilla").get("start-convoy-from-an-issue-732").await.expect("fallback convoy");
     assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
+            display_name: "Explicit workflow".into(),
+            default_workflow_ref: "missing-default".into(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project with unresolved default should persist");
+    let explicit_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: Some("flotilla".into()),
+                    project_ref: "explicit-workflow".into(),
+                    issue: None,
+                    name: Some("explicit-workflow".into()),
+                    branch: Some("fix/explicit-workflow".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("explicit workflow command accepted");
+    let explicit_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == explicit_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("explicit workflow should not consult the missing default");
+    assert_eq!(explicit_result, CommandValue::ConvoyStarted { name: "explicit-workflow".into(), attach_command: None, binding: None });
+
+    let wrong_namespace_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: Some("other".into()),
+                    project_ref: "flotilla".into(),
+                    issue: None,
+                    name: Some("wrong-namespace".into()),
+                    branch: Some("fix/wrong-namespace".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("namespace rejection command accepted");
+    let wrong_namespace_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == wrong_namespace_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("wrong namespace should fail visibly");
+    assert!(matches!(wrong_namespace_result, CommandValue::Error { message } if message.contains("not served by this daemon")));
+    assert!(matches!(
+        backend.using::<ResourceConvoy>("flotilla").get("wrong-namespace").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
+
+    let invalid_branch_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    issue: None,
+                    name: Some("invalid-branch".into()),
+                    branch: Some("bad branch".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("invalid branch command accepted");
+    let invalid_branch_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == invalid_branch_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("invalid branch should fail before persistence");
+    assert!(matches!(invalid_branch_result, CommandValue::Error { message } if message.contains("valid git branch")));
+    assert!(matches!(
+        backend.using::<ResourceConvoy>("flotilla").get("invalid-branch").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
 
     drop(temp);
 }
@@ -853,6 +979,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
             context_repo: None,
             action: CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
                     project_ref: "flotilla".into(),
                     issue: None,
                     name: None,

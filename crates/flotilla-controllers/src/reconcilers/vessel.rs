@@ -10,7 +10,7 @@ use flotilla_resources::{
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
     PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, Stance,
     TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
-    VesselStatusPatch, VESSEL_REF_LABEL,
+    VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -208,7 +208,7 @@ impl Reconciler for VesselReconciler {
             }
             convoy_repositories.push(repository);
         }
-        let multi_repository = convoy_repositories.len() > 1;
+        let multi_repository = convoy.spec.repositories.len() > 1;
         let workspace_slugs = convoy_repositories
             .iter()
             .map(|repository| (repository.repo_ref.clone(), repository.workspace_slug.clone()))
@@ -353,9 +353,14 @@ impl Reconciler for VesselReconciler {
             } else {
                 None
             };
-            let checkout_name = adopted_checkout_ref
-                .clone()
-                .unwrap_or_else(|| checkout_name(&obj.metadata.name, &convoy_repository.workspace_slug, multi_repository));
+            let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| match &strategy {
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                    checkout_name(&convoy.metadata.name, &convoy_repository.workspace_slug, multi_repository)
+                }
+                PlacementStrategy::DockerFreshCloneInContainer { .. } => {
+                    checkout_name(&obj.metadata.name, &convoy_repository.workspace_slug, multi_repository)
+                }
+            });
             let checkout_target_path = match &strategy {
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                     if multi_repository {
@@ -432,14 +437,14 @@ impl Reconciler for VesselReconciler {
                         }),
                     };
                     let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
-                    actuations.push(Actuation::CreateCheckout {
-                        meta: owned_child_meta(
-                            &checkout_name,
-                            obj,
-                            BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]),
-                        ),
-                        spec,
-                    });
+                    let labels = BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]);
+                    let meta = match &strategy {
+                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                            convoy_owned_child_meta(&checkout_name, &convoy, labels)
+                        }
+                        PlacementStrategy::DockerFreshCloneInContainer { .. } => owned_child_meta(&checkout_name, obj, labels),
+                    };
+                    actuations.push(Actuation::CreateCheckout { meta, spec });
                     waiting_for_checkouts = true;
                 }
                 Err(err) => return Err(err),
@@ -783,6 +788,20 @@ fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_la
             api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
             kind: Vessel::API_PATHS.kind.to_string(),
             name: workspace.metadata.name.clone(),
+            controller: true,
+        }])
+        .build()
+}
+
+fn convoy_owned_child_meta(name: &str, convoy: &ResourceObject<Convoy>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
+    extra_labels.insert(CONVOY_LABEL.to_string(), convoy.metadata.name.clone());
+    InputMeta::builder()
+        .name(name.to_string())
+        .labels(extra_labels)
+        .owner_references(vec![OwnerReference {
+            api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
+            kind: Convoy::API_PATHS.kind.to_string(),
+            name: convoy.metadata.name.clone(),
             controller: true,
         }])
         .build()

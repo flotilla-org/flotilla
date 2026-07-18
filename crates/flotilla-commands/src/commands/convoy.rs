@@ -175,6 +175,7 @@ impl ConvoyNoun {
                         context_repo: None,
                         action: CommandAction::ConvoyStart {
                             intent: Box::new(ConvoyStartIntent {
+                                namespace: None,
                                 project_ref: project,
                                 issue,
                                 name,
@@ -201,6 +202,7 @@ impl ConvoyNoun {
                             context_repo: None,
                             action: CommandAction::ConvoyStart {
                                 intent: Box::new(ConvoyStartIntent {
+                                    namespace: None,
                                     project_ref: project_ref.clone(),
                                     issue: None,
                                     name: Some(name),
@@ -427,6 +429,7 @@ mod tests {
                 context_repo: None,
                 action: CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
                         project_ref: "widgets".into(),
                         issue: Some(IssueSelector::Reference(IssueRef {
                             source: IssueSource { service: "https://linear.app".into(), scope: "WIDGET".into() },
@@ -530,6 +533,7 @@ mod tests {
         let Resolved::NeedsContext { command, .. } = resolved else { panic!("expected daemon command") };
         assert_eq!(command.action, CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
+                namespace: None,
                 project_ref: "widgets".into(),
                 issue: None,
                 name: Some("project-work".into()),

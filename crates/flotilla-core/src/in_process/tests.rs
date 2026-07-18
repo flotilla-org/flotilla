@@ -57,6 +57,24 @@ fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
 }
 
 #[test]
+fn convoy_fallback_names_are_dns_safe_bounded_and_deterministic() {
+    let title = "A very long issue title ".repeat(10);
+    let left = convoy_fallback_slug(&title, "LINEAR-732");
+    let right = convoy_fallback_slug(&title, "LINEAR-732");
+    assert_eq!(left, right);
+    assert!(left.len() <= 63);
+    validate_convoy_name(&left).expect("fallback should be a valid resource name");
+}
+
+#[test]
+fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
+    for branch in ["bad branch", "-invalid", "refs/heads/nested", "topic..nested", ".hidden/topic", "topic.lock"] {
+        assert!(validate_convoy_branch(branch).is_err(), "{branch} should be rejected");
+    }
+    validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
+}
+
+#[test]
 fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
     assert_eq!(project_target_syntax("/srv/repos/example"), ProjectTargetSyntax::ExplicitPath);
     assert_eq!(project_target_syntax("./org/repo"), ProjectTargetSyntax::ExplicitPath);

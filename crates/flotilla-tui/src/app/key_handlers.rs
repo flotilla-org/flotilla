@@ -414,9 +414,10 @@ impl App {
             TableIntent::ForceCompleteWork { convoy, vessel, host } => {
                 (self.command(CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }), host)
             }
-            TableIntent::StartConvoy { namespace: _, project, issue } => {
+            TableIntent::StartConvoy { namespace, project, issue } => {
                 self.proto_commands.push(self.command(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        namespace: Some(namespace),
                         project_ref: project,
                         issue: Some(IssueSelector::Reference(issue)),
                         name: None,

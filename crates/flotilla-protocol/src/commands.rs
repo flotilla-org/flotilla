@@ -103,6 +103,8 @@ pub enum IssueSelector {
 /// intent must never enter the resource store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyStartIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub project_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<IssueSelector>,

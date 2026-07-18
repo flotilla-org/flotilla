@@ -37,6 +37,7 @@ use flotilla_resources::{
     TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
     Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -2381,11 +2382,47 @@ fn convoy_fallback_slug(title: &str, id: &str) -> String {
             }
         })
         .0;
-    if slug.is_empty() {
-        "convoy".to_string()
-    } else {
-        slug
+    let slug = if slug.is_empty() { "convoy".to_string() } else { slug };
+    const MAX_CONVOY_NAME_LEN: usize = 63;
+    if slug.len() <= MAX_CONVOY_NAME_LEN {
+        return slug;
     }
+    let digest = format!("{:x}", Sha256::digest(slug.as_bytes()));
+    let suffix = &digest[..8];
+    let max_base_len = MAX_CONVOY_NAME_LEN - suffix.len() - 1;
+    let base = slug.chars().take(max_base_len).collect::<String>().trim_matches('-').to_string();
+    format!("{base}-{suffix}")
+}
+
+fn validate_convoy_name(name: &str) -> Result<(), String> {
+    if name.len() > 63
+        || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !name.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !name.bytes().last().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Err(format!("convoy name `{name}` must be a lowercase DNS label of at most 63 characters"));
+    }
+    Ok(())
+}
+
+fn validate_convoy_branch(branch: &str) -> Result<(), String> {
+    let invalid_character =
+        branch.bytes().any(|byte| byte <= b' ' || byte == 0x7f || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'));
+    let invalid_component =
+        branch.split('/').any(|component| component.is_empty() || component.starts_with('.') || component.ends_with(".lock"));
+    if branch.len() > 1024
+        || branch == "@"
+        || branch.starts_with('-')
+        || branch.starts_with("refs/")
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || invalid_character
+        || invalid_component
+    {
+        return Err(format!("branch `{branch}` is not a valid git branch name"));
+    }
+    Ok(())
 }
 
 impl InProcessDaemon {
@@ -2448,6 +2485,7 @@ impl InProcessDaemon {
         }
         let repository_ref = match matching_repositories.as_slice() {
             [repository] => Some(repository.clone()),
+            [] if project.spec.repositories.len() == 1 => Some(project.spec.repositories[0].repo.clone()),
             _ => None,
         };
 
@@ -2515,10 +2553,12 @@ impl InProcessDaemon {
             .map(|name| required_admission_value(name, "name").map(str::to_string))
             .transpose()?
             .unwrap_or_else(|| convoy_fallback_slug(&generated.name, "").trim_end_matches('-').to_string());
+        validate_convoy_name(&name)?;
         let branch = match intent.branch.as_deref() {
             Some(branch) => required_admission_value(branch, "branch")?.to_string(),
             None => required_admission_value(&generated.branch, "generated branch")?.to_string(),
         };
+        validate_convoy_branch(&branch)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         match convoys.get(&name).await {
             Ok(_) => return Err(format!("convoy {name} already exists")),
@@ -2602,10 +2642,6 @@ impl InProcessDaemon {
                 }
                 Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
             }
-        }
-        if let Err(error) = self.resource_backend.clone().using::<WorkflowTemplate>(namespace).get(&project.spec.default_workflow_ref).await
-        {
-            unresolved.push(format!("workflow template {}: {error}", project.spec.default_workflow_ref));
         }
         for (repo_ref, (_, _, _, base_ref, _)) in &snapshots {
             if base_ref.is_none() {
@@ -4170,29 +4206,38 @@ impl InProcessDaemon {
         if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;
-            let result = match self.admit_convoy_start(&namespace, intent).await {
-                Ok(name) if intent.auto_attach => {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-                    let resolved = loop {
-                        match self.resolve_attach_command_internal(&name).await {
-                            Ok(resolved) => break Ok(resolved),
-                            Err(message) if tokio::time::Instant::now() >= deadline => {
-                                break Err(format!("convoy {name} was created but no crew session became attachable: {message}"));
-                            }
-                            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                        }
-                    };
-                    match resolved {
-                        Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
-                            name,
-                            attach_command: Some(resolved.command),
-                            binding: resolved.binding,
-                        },
-                        Err(message) => flotilla_protocol::CommandValue::Error { message },
-                    }
+            let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
+            let result = if requested_namespace != namespace {
+                flotilla_protocol::CommandValue::Error {
+                    message: format!(
+                        "namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"
+                    ),
                 }
-                Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
-                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            } else {
+                match self.admit_convoy_start(&namespace, intent).await {
+                    Ok(name) if intent.auto_attach => {
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                        let resolved = loop {
+                            match self.resolve_attach_command_internal(&name).await {
+                                Ok(resolved) => break Ok(resolved),
+                                Err(message) if tokio::time::Instant::now() >= deadline => {
+                                    break Err(format!("convoy {name} was created but no crew session became attachable: {message}"));
+                                }
+                                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                            }
+                        };
+                        match resolved {
+                            Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
+                                name,
+                                attach_command: Some(resolved.command),
+                                binding: resolved.binding,
+                            },
+                            Err(message) => flotilla_protocol::CommandValue::Error { message },
+                        }
+                    }
+                    Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                }
             };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);

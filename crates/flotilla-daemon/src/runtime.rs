@@ -29,8 +29,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, descriptive_repo_slug, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
+    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource,
+    CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Repository, ResourceBackend, ResourceError, ResourceObject, Stance,
     TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
@@ -769,7 +769,8 @@ fn spawn_controller_loops(
                             secondaries: ConvoyReconciler::secondary_watches(),
                             reconciler: ConvoyReconciler::new(backend.clone().using::<WorkflowTemplate>(&namespace_string))
                                 .with_vessels(backend.clone().using::<Vessel>(&namespace_string))
-                                .with_presentations(backend.clone().using::<Presentation>(&namespace_string)),
+                                .with_presentations(backend.clone().using::<Presentation>(&namespace_string))
+                                .with_checkouts(backend.clone().using::<Checkout>(&namespace_string)),
                             resync_interval: controller_resync_interval,
                             backend,
                         }

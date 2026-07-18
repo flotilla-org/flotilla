@@ -226,7 +226,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let status = workspace.status.expect("workspace status should be present");
     assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.environment_ref.as_deref(), Some("host-direct-01HXYZ"));
-    assert_eq!(status.checkout_refs.values().next().map(String::as_str), Some("checkout-workspace-a"));
+    assert_eq!(status.checkout_refs.values().next().map(String::as_str), Some("checkout-convoy-a"));
     assert_eq!(status.terminal_session_refs, vec!["terminal-workspace-a-coder".to_string()]);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
