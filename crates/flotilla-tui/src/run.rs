@@ -12,11 +12,17 @@ use crate::{
     widgets::InteractiveWidget,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLoopExit {
+    Quit,
+    DaemonDisconnected,
+}
+
 /// Run the TUI event loop: replay initial state, then process events until quit.
 ///
 /// Takes ownership of a fully-constructed `App` (with daemon already connected)
 /// and the ratatui terminal.  On return the terminal is restored.
-pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App) -> Result<()> {
+pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App) -> Result<EventLoopExit> {
     // Subscribe before replay so events emitted between replay and the event
     // loop are buffered rather than silently dropped.
     let daemon_rx = app.daemon.subscribe();
@@ -90,6 +96,10 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 Event::Daemon(daemon_evt) => {
                     app.handle_daemon_event(*daemon_evt);
                 }
+                Event::DaemonDisconnected => {
+                    crate::terminal::restore_terminal();
+                    return Ok(EventLoopExit::DaemonDisconnected);
+                }
                 Event::Key(k) => {
                     // Ctrl-Z: suspend/resume (unix only)
                     #[cfg(unix)]
@@ -157,7 +167,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 
     app.daemon.unsubscribe_queries(app.session_id).await;
     crate::terminal::restore_terminal();
-    Ok(())
+    Ok(EventLoopExit::Quit)
 }
 
 /// Replace the daemon-side query subscription set with the union the open

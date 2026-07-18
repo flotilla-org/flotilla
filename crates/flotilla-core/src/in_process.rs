@@ -4766,6 +4766,11 @@ impl DaemonHandle for InProcessDaemon {
                 provider_health: snapshot.provider_health.clone(),
                 work_item_count: snapshot.work_items.len(),
                 error_count: snapshot.errors.len(),
+                unmet_requirements: state
+                    .unmet()
+                    .iter()
+                    .map(|(factory, requirement)| crate::convert::unmet_requirement_to_proto(factory, requirement))
+                    .collect(),
             });
         }
         Ok(StatusResponse { repos: summaries })

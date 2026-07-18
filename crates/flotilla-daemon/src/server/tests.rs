@@ -15,7 +15,7 @@ use flotilla_core::{
     in_process::InProcessDaemon,
     providers::discovery::test_support::{
         fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, FakeDiscoveryProviders,
-        FakePresentationManager,
+        FakePresentationManager, FakePresentationManagerFactory,
     },
 };
 use flotilla_protocol::{
@@ -107,6 +107,12 @@ fn test_config_store(config_dir: PathBuf) -> Arc<ConfigStore> {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     Arc::new(ConfigStore::with_base(config_dir))
+}
+
+fn git_process_discovery_with_workspace_manager() -> flotilla_core::providers::discovery::DiscoveryRuntime {
+    let mut discovery = git_process_discovery(false);
+    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(Arc::new(FakePresentationManager::new())))];
+    discovery
 }
 
 type RoutingState = (
@@ -1855,7 +1861,8 @@ async fn execute_forwarded_prepare_terminal_returns_terminal_prepared() {
     let repo = tmp.path().join("remote-root").join("repo");
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery_with_workspace_manager(), HostName::new("local")).await;
     daemon.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await.expect("refresh repo");
 
     let mut setup_rx = daemon.subscribe();
@@ -2021,7 +2028,9 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     init_git_repo_with_remote(&requester_repo, "git@github.com:owner/repo.git");
 
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    let daemon =
+        InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery_with_workspace_manager(), HostName::new("local"))
+            .await;
     daemon.refresh(&flotilla_protocol::RepoSelector::Path(remote_repo.clone())).await.expect("refresh repo");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));

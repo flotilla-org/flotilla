@@ -473,7 +473,7 @@ async fn refresh_fast_providers(
 
     collect_errors(&mut errors, "terminals", tp_errors);
 
-    project_attachable_data(pd, registry, attachable_store);
+    project_attachable_data(pd, registry, attachable_store, &local_host, host_id);
     project_agent_data(pd, agent_state_store);
 
     errors
@@ -531,7 +531,13 @@ async fn refresh_slow_providers(
     errors
 }
 
-fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, attachable_store: &SharedAttachableStore) {
+fn project_attachable_data(
+    pd: &mut ProviderData,
+    registry: &ProviderRegistry,
+    attachable_store: &SharedAttachableStore,
+    local_host: &HostName,
+    local_host_id: Option<&HostId>,
+) {
     let workspace_provider = registry.presentation_managers.preferred_with_desc().map(|(desc, _)| desc.implementation.clone());
     let Ok(mut store) = attachable_store.lock() else {
         tracing::warn!("attachable store lock poisoned while projecting provider data");
@@ -582,6 +588,56 @@ fn project_attachable_data(pd: &mut ProviderData, registry: &ProviderRegistry, a
                     tracing::warn!(err = %err, "failed to save after pruning stale workspace bindings");
                 }
             }
+        }
+    }
+
+    // A discovered set may predate the registry (or have been reconstructed
+    // without going through the executor), while its member terminals still
+    // carry the checkout directory as an observed fact. Adopt that fact when
+    // every member agrees and it identifies exactly one checkout in this repo.
+    let inferred_checkouts: Vec<_> = store
+        .registry()
+        .sets
+        .iter()
+        .filter(|(_, set)| set.checkout.is_none() && !set.members.is_empty())
+        .filter_map(|(set_id, set)| {
+            let working_directories: Option<Vec<&Path>> = set
+                .members
+                .iter()
+                .map(|member_id| {
+                    store.registry().attachables.get(member_id).map(|attachable| match &attachable.content {
+                        crate::attachable::AttachableContent::Terminal(terminal) => terminal.working_directory.as_path(),
+                    })
+                })
+                .collect();
+            let working_directories = working_directories?;
+            let shared_directory = working_directories.first()?;
+            if !working_directories.iter().all(|directory| directory == shared_directory) {
+                return None;
+            }
+            let mut matches = pd.checkouts.keys().filter(|checkout| {
+                if checkout.path != *shared_directory {
+                    return false;
+                }
+                match &checkout.qualifier {
+                    PathQualifier::Host(host_id) => set.host_affinity.as_ref() == Some(local_host) && local_host_id == Some(host_id),
+                    PathQualifier::HostName(host_name) => set.host_affinity.as_ref() == Some(host_name),
+                    PathQualifier::Environment(environment_id) => set.environment_id.as_ref() == Some(environment_id),
+                }
+            });
+            let checkout = matches.next()?.clone();
+            matches.next().is_none().then(|| (set_id.clone(), checkout))
+        })
+        .collect();
+    for (set_id, checkout) in &inferred_checkouts {
+        if let Some(mut set) = store.registry().sets.get(set_id).cloned() {
+            set.checkout = Some(checkout.clone());
+            store.insert_set(set);
+        }
+    }
+    if !inferred_checkouts.is_empty() {
+        if let Err(err) = store.save() {
+            tracing::warn!(err = %err, "failed to persist inferred attachable-set checkouts");
         }
     }
 

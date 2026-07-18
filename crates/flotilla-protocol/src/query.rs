@@ -61,6 +61,8 @@ pub struct RepoSummary {
     pub provider_health: ProviderHealthMap,
     pub work_item_count: usize,
     pub error_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_requirements: Vec<UnmetRequirementInfo>,
 }
 
 // --- repo detail ---

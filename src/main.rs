@@ -346,20 +346,31 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
     let startup_repo_roots = startup_repo_roots(&cli.repo_root).await;
     let cli_theme = cli.theme.clone();
+    let socket_path = cli.socket_path();
+    let config_dir_override = cli.config_dir.clone();
+    let socket_override = cli.socket.clone();
 
     // Spawn daemon init on a separate task so it runs concurrently with the splash
     // (show_splash uses blocking crossterm::event::poll calls).
     let daemon_log_path = paths.state_dir.as_path().join("daemon.log");
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
+    let initial_socket_path = socket_path.clone();
+    let initial_config_dir = resolved_config_dir.clone();
+    let initial_config_override = config_dir_override.clone();
+    let initial_socket_override = socket_override.clone();
     let daemon_task = tokio::spawn(async move {
-        let socket_path = cli.socket_path();
-        flotilla_tui::socket::connect_or_spawn(&socket_path, &resolved_config_dir, cli.config_dir.as_deref(), cli.socket.as_deref())
-            .await
-            .map(|d| d as Arc<dyn DaemonHandle>)
+        flotilla_tui::socket::connect_or_spawn(
+            &initial_socket_path,
+            &initial_config_dir,
+            initial_config_override.as_deref(),
+            initial_socket_override.as_deref(),
+        )
+        .await
+        .map(|d| d as Arc<dyn DaemonHandle>)
     });
 
     flotilla_tui::splash::show_splash(&mut terminal).await?;
-    let daemon = match daemon_task.await {
+    let mut daemon = match daemon_task.await {
         Ok(Ok(daemon)) => {
             info!(elapsed = ?startup.elapsed(), "daemon ready");
             daemon
@@ -398,13 +409,47 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         tracing::warn!(requested = %theme_name, using = %initial_theme.name, "unknown theme, falling back");
     }
 
-    let repos_info = daemon.list_repos().await.unwrap_or_default();
-    let app = match scoped_view {
-        Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme, address),
-        None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme),
-    };
+    loop {
+        let repos_info = daemon.list_repos().await.unwrap_or_default();
+        let app = match scoped_view.clone() {
+            Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
+            None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
+        };
 
-    flotilla_tui::run::run_event_loop(terminal, app).await
+        match flotilla_tui::run::run_event_loop(terminal, app).await? {
+            flotilla_tui::run::EventLoopExit::Quit => return Ok(()),
+            flotilla_tui::run::EventLoopExit::DaemonDisconnected => {
+                info!("daemon disconnected; reconnecting TUI");
+            }
+        }
+
+        let mut backoff = flotilla_tui::pm_connect::ReconnectBackoff::default();
+        loop {
+            match flotilla_tui::socket::connect_or_spawn(
+                &socket_path,
+                &resolved_config_dir,
+                config_dir_override.as_deref(),
+                socket_override.as_deref(),
+            )
+            .await
+            {
+                Ok(connected) => {
+                    info!("TUI reconnected to daemon");
+                    daemon = connected as Arc<dyn DaemonHandle>;
+                    terminal = ratatui::init();
+                    break;
+                }
+                Err(error) if flotilla_tui::pm_connect::is_incompatible_daemon_error(&error) => {
+                    return Err(color_eyre::eyre::eyre!(error));
+                }
+                Err(error) => {
+                    let delay = backoff.next_delay();
+                    info!(%error, ?delay, "daemon unavailable; retrying TUI connection");
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
 }
 
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {

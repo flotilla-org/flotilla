@@ -55,15 +55,16 @@ fn test_context(
     pending: &SharedPending,
     next_id: &Arc<AtomicU64>,
 ) -> EventContext {
-    EventContext {
-        local_seqs: Arc::clone(local_seqs),
-        subscribed_queries: Arc::clone(subscribed_queries),
-        recovering: Arc::clone(recovering),
-        event_tx: event_tx.clone(),
-        session: Arc::clone(session),
-        pending: Arc::clone(pending),
-        next_id: Arc::clone(next_id),
-    }
+    EventContext::builder()
+        .local_seqs(Arc::clone(local_seqs))
+        .subscribed_queries(Arc::clone(subscribed_queries))
+        .recovering(Arc::clone(recovering))
+        .event_tx(event_tx.downgrade())
+        .session(Arc::clone(session))
+        .pending(Arc::clone(pending))
+        .next_id(Arc::clone(next_id))
+        .initial_sync_complete(Arc::new(AtomicBool::new(true)))
+        .build()
 }
 
 fn no_subscriptions() -> Arc<QuerySet> {
@@ -401,6 +402,18 @@ async fn session_backed_daemon_streams_events_to_subscribers() {
         DaemonEvent::CommandStarted { command_id: 99, repo_identity: actual_identity, repo: actual_repo, ref description, .. }
             if actual_identity == repo_identity && actual_repo == Some(repo.clone()) && description == "from session"
     ));
+}
+
+#[tokio::test]
+async fn session_eof_closes_event_subscribers() {
+    let (client, server) = message_session_pair();
+    let daemon = SocketDaemon::from_session(client).expect("build session-backed daemon");
+    let mut events = daemon.subscribe();
+
+    drop(server);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), events.recv()).await.expect("subscriber should be notified of EOF");
+    assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
 }
 
 #[tokio::test]
@@ -1233,4 +1246,12 @@ fn into_success_response_returns_response_for_success() {
     })
     .expect("should succeed");
     assert!(matches!(response, Response::GetTopology(TopologyResponse { routes, .. }) if routes.is_empty()));
+}
+
+#[test]
+fn initial_sync_state_tracks_completion_flag() {
+    let flag = AtomicBool::new(false);
+    assert_eq!(InitialSyncState::load(&flag), InitialSyncState::Pending);
+    flag.store(true, Ordering::Release);
+    assert_eq!(InitialSyncState::load(&flag), InitialSyncState::Complete);
 }

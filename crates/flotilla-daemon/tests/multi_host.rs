@@ -13,7 +13,9 @@ use flotilla_core::{
     config::ConfigStore,
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
-    providers::discovery::test_support::{fake_discovery, git_process_discovery, init_git_repo},
+    providers::discovery::test_support::{
+        fake_discovery, git_process_discovery, init_git_repo, FakePresentationManager, FakePresentationManagerFactory,
+    },
 };
 use flotilla_daemon::peer::{
     channel_transport_pair,
@@ -60,6 +62,12 @@ fn node(name: &str) -> NodeId {
 
 fn node_info(name: &str) -> NodeInfo {
     NodeInfo::new(node(name), name)
+}
+
+fn git_process_discovery_with_workspace_manager() -> flotilla_core::providers::discovery::DiscoveryRuntime {
+    let mut discovery = git_process_discovery(false);
+    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(Arc::new(FakePresentationManager::new())))];
+    discovery
 }
 
 fn add_configured_transport(mgr: &mut PeerManager, label: &str, expected_host_name: &str, transport: MockTransport) {
@@ -280,7 +288,7 @@ async fn remote_checkout_replication_attributes_checkout_to_follower_host() {
     let follower = InProcessDaemon::new(
         vec![follower_repo.clone()],
         test_config_store(temp.path().join("follower-config")),
-        git_process_discovery(false),
+        git_process_discovery_with_workspace_manager(),
         HostName::new("follower"),
     )
     .await;

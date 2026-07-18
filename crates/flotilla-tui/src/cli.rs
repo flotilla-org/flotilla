@@ -33,7 +33,7 @@ fn format_status_response_human(status: &StatusResponse) -> String {
     }
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Repo", "Path", "Work Items", "Errors", "Health"]);
+    table.set_header(vec!["Repo", "Path", "Work Items", "Errors", "Health", "Unavailable"]);
     for repo in &status.repos {
         let name = repo.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let mut health: Vec<String> = repo
@@ -45,12 +45,22 @@ fn format_status_response_human(status: &StatusResponse) -> String {
             .collect();
         health.sort();
         let health_str = if health.is_empty() { "-".into() } else { health.join(", ") };
+        let unavailable = repo
+            .unmet_requirements
+            .iter()
+            .map(|requirement| match &requirement.value {
+                Some(value) => format!("{}: {value}", requirement.factory),
+                None => format!("{}: {}", requirement.factory, requirement.kind),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         table.add_row(vec![
             Cell::new(&name),
             Cell::new(repo.path.display()),
             Cell::new(repo.work_item_count),
             Cell::new(repo.error_count),
             Cell::new(&health_str),
+            Cell::new(if unavailable.is_empty() { "-" } else { &unavailable }),
         ]);
     }
     format!("{table}\n")
@@ -623,8 +633,24 @@ fn print_bootstrap_events(events: &[DaemonEvent], replay_seqs: &mut HashMap<Stre
 }
 
 pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
-    let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
+    let mut backoff = crate::pm_connect::ReconnectBackoff::default();
+    loop {
+        match SocketDaemon::connect(socket_path).await {
+            Ok(daemon) => {
+                backoff.reset();
+                if let Err(error) = run_watch_connection(daemon, format).await {
+                    eprintln!("{error}; reconnecting...");
+                }
+            }
+            Err(error) if crate::pm_connect::is_incompatible_daemon_error(&error) => return Err(error),
+            Err(error) => eprintln!("cannot connect to daemon: {error}; retrying..."),
+        }
 
+        tokio::time::sleep(backoff.next_delay()).await;
+    }
+}
+
+async fn run_watch_connection(daemon: std::sync::Arc<dyn DaemonHandle>, format: OutputFormat) -> Result<(), String> {
     // Subscribe before replay so events emitted between replay and the loop
     // are buffered rather than silently dropped.
     let mut rx = daemon.subscribe();
@@ -677,15 +703,9 @@ pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), S
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("warning: skipped {n} events");
             }
-            Err(_) => {
-                eprintln!("daemon disconnected");
-                break;
-            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon disconnected".to_string()),
         }
     }
-
-    daemon.unsubscribe_queries(subscriber_id).await;
-    Ok(())
 }
 
 pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {

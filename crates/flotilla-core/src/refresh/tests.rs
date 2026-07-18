@@ -809,7 +809,8 @@ fn project_attachable_data_populates_sets_and_ids() {
     );
     pd.workspaces.insert("ws-1".into(), make_workspace("dev"));
 
-    project_attachable_data(&mut pd, &registry, &attachable_store);
+    let local_host = flotilla_protocol::HostName::local();
+    project_attachable_data(&mut pd, &registry, &attachable_store, &local_host, None);
 
     assert_eq!(pd.attachable_sets.len(), 1);
     assert!(pd.attachable_sets.contains_key(&set_id));
@@ -817,7 +818,7 @@ fn project_attachable_data_populates_sets_and_ids() {
     assert_eq!(pd.workspaces.get("ws-1").and_then(|ws| ws.attachable_set_id.as_ref()), Some(&set_id));
 
     attachable_store.lock().expect("lock store").remove_set(&set_id);
-    project_attachable_data(&mut pd, &registry, &attachable_store);
+    project_attachable_data(&mut pd, &registry, &attachable_store, &local_host, None);
     assert!(pd.managed_terminals.is_empty(), "removed terminals must not survive the next projection");
 }
 
@@ -829,7 +830,7 @@ fn project_agent_data_removes_agents_missing_from_the_store() {
     let checkout = flotilla_protocol::HostPath::new(host.clone(), "/repo/wt-feat");
     let (set_id, attachable_id) = {
         let mut store = attachable_store.lock().expect("lock attachable store");
-        let set_id = store.ensure_terminal_set(Some(host), Some(checkout.clone().into()));
+        let set_id = store.ensure_terminal_set(Some(host.clone()), Some(checkout.clone().into()));
         let attachable_id = store.ensure_terminal_attachable(
             &set_id,
             "terminal_pool",
@@ -853,7 +854,7 @@ fn project_agent_data_removes_agents_missing_from_the_store() {
     let mut pd = ProviderData::default();
     pd.checkouts.insert(checkout.into(), TestCheckout::new("feat").build());
 
-    project_attachable_data(&mut pd, &ProviderRegistry::new(), &attachable_store);
+    project_attachable_data(&mut pd, &ProviderRegistry::new(), &attachable_store, &host, None);
     project_agent_data(&mut pd, &agent_store);
     assert!(pd.attachable_sets.contains_key(&set_id));
     assert!(pd.agents.contains_key(attachable_id.as_str()));
@@ -1037,7 +1038,7 @@ fn project_attachable_data_only_includes_sets_matching_repo_checkouts() {
     });
 
     let registry = ProviderRegistry::new();
-    project_attachable_data(&mut pd, &registry, &store);
+    project_attachable_data(&mut pd, &registry, &store, &host, None);
 
     assert_eq!(pd.attachable_sets.len(), 1);
     let set = pd.attachable_sets.values().next().expect("one set");
@@ -1070,7 +1071,86 @@ fn project_attachable_data_set_appears_without_terminal_scan() {
     });
 
     let registry = ProviderRegistry::new();
-    project_attachable_data(&mut pd, &registry, &store);
+    project_attachable_data(&mut pd, &registry, &store, &host, None);
 
     assert_eq!(pd.attachable_sets.len(), 1, "set should appear without terminal scan");
+}
+
+#[test]
+fn project_attachable_data_infers_checkout_only_in_the_attachable_set_namespace() {
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let local_host = flotilla_protocol::HostName::new("local");
+    let local_host_id = HostId::new("local-id");
+    let remote_host = flotilla_protocol::HostName::new("remote");
+    let checkout_path = PathBuf::from("/workspace");
+    let set_id = {
+        let mut store = store.lock().expect("lock");
+        let set_id = store.ensure_terminal_set(Some(local_host.clone()), None);
+        store.ensure_terminal_attachable(
+            &set_id,
+            "terminal_pool",
+            "shpool",
+            "discovered-session",
+            crate::attachable::TerminalPurpose { checkout: "feat".into(), role: "shell".into(), index: 0 },
+            "bash",
+            ExecutionEnvironmentPath::new(&checkout_path),
+            flotilla_protocol::TerminalStatus::Running,
+        );
+        set_id
+    };
+
+    let remote_checkout = QualifiedPath::from_host_name(&remote_host, &checkout_path);
+    let local_checkout = QualifiedPath::host(local_host_id.clone(), &checkout_path);
+    let mut pd = ProviderData::default();
+    pd.checkouts.insert(remote_checkout, TestCheckout::new("remote").build());
+
+    project_attachable_data(&mut pd, &ProviderRegistry::new(), &store, &local_host, Some(&local_host_id));
+    assert_eq!(store.lock().expect("lock").registry().sets[&set_id].checkout, None);
+
+    pd.checkouts.insert(local_checkout.clone(), TestCheckout::new("local").build());
+    project_attachable_data(&mut pd, &ProviderRegistry::new(), &store, &local_host, Some(&local_host_id));
+    assert_eq!(store.lock().expect("lock").registry().sets[&set_id].checkout.as_ref(), Some(&local_checkout));
+}
+
+#[tokio::test]
+async fn refresh_correlates_discovered_attachable_set_from_member_working_directories() {
+    let checkout_path = PathBuf::from("/repo/wt-feat");
+    let host = flotilla_protocol::HostName::local();
+    let checkout = flotilla_protocol::HostPath::new(host.clone(), checkout_path.clone());
+    let checkout_key: QualifiedPath = checkout.clone().into();
+    let store = crate::attachable::shared_in_memory_attachable_store();
+    let set_id = flotilla_protocol::AttachableSetId::new("discovered-set");
+    let session_name = "flotilla-v2:discovered-set:discovered-terminal:feat:shell:0:%2Frepo%2Fwt-feat";
+
+    let mut registry = ProviderRegistry::new();
+    let mut checkout_data = TestCheckout::new("feat").build();
+    checkout_data.correlation_keys = vec![flotilla_protocol::CorrelationKey::CheckoutPath(checkout_key)];
+    registry.checkout_managers.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::ok(vec![(checkout_path, checkout_data)])));
+    registry.terminal_pools.insert(
+        "shpool",
+        desc("shpool"),
+        Arc::new(MockTerminalPool::ok(vec![crate::providers::terminal::TerminalSession {
+            session_name: session_name.into(),
+            status: flotilla_protocol::TerminalStatus::Running,
+            command: None,
+            working_directory: None,
+        }])),
+    );
+    let handle = RepoRefreshHandle::spawn(
+        repo_root(),
+        Arc::new(registry),
+        criteria(),
+        None,
+        None,
+        store,
+        test_agent_state_store(),
+        Duration::from_secs(3600),
+    );
+
+    let mut snapshots = handle.snapshot_rx.clone();
+    let snapshot = wait_for_snapshot(&mut snapshots).await;
+
+    assert_eq!(snapshot.providers.attachable_sets.get(&set_id).and_then(|set| set.checkout.as_ref()), Some(&checkout.into()));
+    assert_eq!(snapshot.work_items.len(), 1, "checkout and discovered set should form one correlated work item");
+    assert_eq!(snapshot.work_items[0].attachable_set_id(), Some(&set_id));
 }

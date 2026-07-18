@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -34,6 +35,71 @@ use flotilla_protocol::{
 };
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
+
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+
+pub struct ReconnectBackoff {
+    next_base: Duration,
+}
+
+impl Default for ReconnectBackoff {
+    fn default() -> Self {
+        Self { next_base: RECONNECT_INITIAL_DELAY }
+    }
+}
+
+impl ReconnectBackoff {
+    pub fn reset(&mut self) {
+        self.next_base = RECONNECT_INITIAL_DELAY;
+    }
+
+    pub fn next_delay(&mut self) -> Duration {
+        let random = uuid::Uuid::new_v4().as_u128() as u64;
+        self.next_delay_with_jitter(random as f64 / u64::MAX as f64)
+    }
+
+    fn next_delay_with_jitter(&mut self, unit: f64) -> Duration {
+        let base = self.next_base;
+        self.next_base = std::cmp::min(base.saturating_mul(2), RECONNECT_MAX_DELAY);
+        let factor = 0.5 + 0.5 * unit.clamp(0.0, 1.0);
+        Duration::from_secs_f64(base.as_secs_f64() * factor)
+    }
+}
+
+pub fn is_incompatible_daemon_error(error: &str) -> bool {
+    error.contains("protocol version mismatch")
+}
+
+async fn run_reconnecting<Connect, ConnectFuture, Connected, ConnectedFuture>(
+    mut connect: Connect,
+    mut run_connected: Connected,
+    mut backoff: ReconnectBackoff,
+) -> Result<(), String>
+where
+    Connect: FnMut() -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<Arc<dyn DaemonHandle>, String>>,
+    Connected: FnMut(Arc<dyn DaemonHandle>) -> ConnectedFuture,
+    ConnectedFuture: Future<Output = Result<(), String>>,
+{
+    loop {
+        match connect().await {
+            Ok(daemon) => {
+                backoff.reset();
+                info!("connected to daemon");
+                if let Err(error) = run_connected(daemon).await {
+                    info!(%error, "daemon connection ended; reconnecting");
+                }
+            }
+            Err(error) if is_incompatible_daemon_error(&error) => return Err(error),
+            Err(error) => info!(%error, "daemon unavailable; retrying"),
+        }
+
+        let delay = backoff.next_delay();
+        debug!(?delay, "waiting before daemon reconnect");
+        tokio::time::sleep(delay).await;
+    }
+}
 
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -264,13 +330,16 @@ pub async fn run(
         .try_init();
     let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
     let mint: Arc<dyn RecipeMint> = Arc::new(AttachOnlyRecipes::new(options.flotilla_bin.clone()));
-    loop {
-        let daemon = crate::socket::connect_or_spawn(socket_path, config_dir, config_dir_override, socket_override).await?;
-        if let Err(error) = run_connector(daemon, sink.clone(), mint.clone(), Duration::from_millis(REASSERT_INTERVAL_MS)).await {
-            warn!(%error, "connector stopped; reconnecting");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    run_reconnecting(
+        || async {
+            crate::socket::connect_or_spawn(socket_path, config_dir, config_dir_override, socket_override)
+                .await
+                .map(|daemon| daemon as Arc<dyn DaemonHandle>)
+        },
+        |daemon| run_connector(daemon, sink.clone(), mint.clone(), Duration::from_millis(REASSERT_INTERVAL_MS)),
+        ReconnectBackoff::default(),
+    )
+    .await
 }
 
 #[cfg(test)]

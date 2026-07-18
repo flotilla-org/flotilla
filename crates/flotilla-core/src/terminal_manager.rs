@@ -4,7 +4,9 @@ use flotilla_protocol::{arg, qualified_path::QualifiedPath, AttachableId, Attach
 use tracing::warn;
 
 use crate::{
-    attachable::{Attachable, AttachableContent, SharedAttachableStore, TerminalAttachable, TerminalPurpose},
+    attachable::{
+        Attachable, AttachableContent, BindingObjectKind, ProviderBinding, SharedAttachableStore, TerminalAttachable, TerminalPurpose,
+    },
     hop_chain::{
         builder::HopPlanBuilder,
         environment::NoopEnvironmentHopResolver,
@@ -14,8 +16,24 @@ use crate::{
         ResolutionContext, ResolvedAction,
     },
     path_context::ExecutionEnvironmentPath,
-    providers::terminal::{TerminalEnvVars, TerminalPool},
+    providers::terminal::{parse_managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool},
 };
+
+const MANAGED_TERMINAL_PROVIDER: &str = "terminal-manager";
+
+pub(crate) fn session_name_for_attachable(store: &dyn crate::attachable::AttachableStoreApi, attachable_id: &AttachableId) -> String {
+    store
+        .registry()
+        .bindings
+        .iter()
+        .find(|binding| {
+            binding.provider_category == "terminal_pool"
+                && binding.object_kind == BindingObjectKind::Attachable
+                && binding.object_id == attachable_id.as_str()
+        })
+        .map(|binding| binding.external_ref.clone())
+        .unwrap_or_else(|| attachable_id.to_string())
+}
 
 /// Summary of a managed terminal for external consumers.
 #[derive(Debug, Clone)]
@@ -89,6 +107,14 @@ impl TerminalManager {
             }
         }
         let id = store.allocate_attachable_id();
+        let metadata = ManagedSessionMetadata::builder()
+            .set_id(set_id.clone())
+            .attachable_id(id.clone())
+            .checkout(target_purpose.checkout.clone())
+            .role(target_purpose.role.clone())
+            .index(target_purpose.index)
+            .working_directory(working_directory.clone())
+            .build();
         store.insert_attachable(Attachable {
             id: id.clone(),
             set_id: set_id.clone(),
@@ -105,25 +131,34 @@ impl TerminalManager {
             set.members.push(id.clone());
             store.insert_set(set);
         }
+        if let Some(external_ref) = self.pool.managed_session_name(&metadata) {
+            store.replace_binding(ProviderBinding {
+                provider_category: "terminal_pool".to_string(),
+                provider_name: MANAGED_TERMINAL_PROVIDER.to_string(),
+                object_kind: BindingObjectKind::Attachable,
+                object_id: id.to_string(),
+                external_ref,
+            });
+        }
         Ok(id)
     }
 
     /// Ensures the terminal session is running in the pool.
     /// Reads command and working directory from the stored attachable.
     pub async fn ensure_running(&self, attachable_id: &AttachableId, daemon_socket_path: Option<&str>) -> Result<(), String> {
-        let (command, cwd) = {
+        let (session_name, command, cwd) = {
             let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let attachable =
                 store.registry().attachables.get(attachable_id).ok_or_else(|| format!("attachable not found: {attachable_id}"))?;
+            let session_name = session_name_for_attachable(&*store, attachable_id);
             match &attachable.content {
-                AttachableContent::Terminal(t) => (t.command.clone(), t.working_directory.clone()),
+                AttachableContent::Terminal(t) => (session_name, t.command.clone(), t.working_directory.clone()),
             }
         };
         let mut env_vars: TerminalEnvVars = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), attachable_id.to_string())];
         if let Some(socket) = daemon_socket_path {
             env_vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.to_string()));
         }
-        let session_name = attachable_id.to_string();
         self.pool.ensure_session(&session_name, &command, &cwd, &env_vars).await
     }
 
@@ -183,26 +218,91 @@ impl TerminalManager {
         attachable_id: &AttachableId,
         daemon_socket_path: Option<&str>,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
-        let (command, cwd) = {
+        let (session_name, command, cwd) = {
             let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
             let attachable =
                 store.registry().attachables.get(attachable_id).ok_or_else(|| format!("attachable not found: {attachable_id}"))?;
+            let session_name = session_name_for_attachable(&*store, attachable_id);
             match &attachable.content {
-                AttachableContent::Terminal(t) => (t.command.clone(), t.working_directory.clone()),
+                AttachableContent::Terminal(t) => (session_name, t.command.clone(), t.working_directory.clone()),
             }
         };
         let mut env_vars: TerminalEnvVars = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), attachable_id.to_string())];
         if let Some(socket) = daemon_socket_path {
             env_vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.to_string()));
         }
-        let session_name = attachable_id.to_string();
         self.pool.attach_args(&session_name, &command, &cwd, &env_vars)
     }
 
     /// Kills a terminal session in the pool.
     pub async fn kill_terminal(&self, attachable_id: &AttachableId) -> Result<(), String> {
-        let session_name = attachable_id.to_string();
+        let session_name = {
+            let store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
+            session_name_for_attachable(&*store, attachable_id)
+        };
         self.pool.kill_session(&session_name).await
+    }
+
+    fn discover_sessions(
+        &self,
+        store: &mut dyn crate::attachable::AttachableStoreApi,
+        live_sessions: &[crate::providers::terminal::TerminalSession],
+    ) -> bool {
+        let mut changed = false;
+        for session in live_sessions {
+            let Some(metadata) = parse_managed_session_name(&session.session_name) else {
+                continue;
+            };
+
+            if !store.registry().sets.contains_key(&metadata.set_id) {
+                store.insert_set(AttachableSet {
+                    id: metadata.set_id.clone(),
+                    host_affinity: Some(self.local_host.clone()),
+                    checkout: None,
+                    template_identity: None,
+                    environment_id: None,
+                    members: Vec::new(),
+                });
+                changed = true;
+            }
+
+            let command = session.command.clone().or_else(|| {
+                store.registry().attachables.get(&metadata.attachable_id).map(|attachable| match &attachable.content {
+                    AttachableContent::Terminal(terminal) => terminal.command.clone(),
+                })
+            });
+            let discovered = Attachable {
+                id: metadata.attachable_id.clone(),
+                set_id: metadata.set_id.clone(),
+                content: AttachableContent::Terminal(TerminalAttachable {
+                    purpose: TerminalPurpose { checkout: metadata.checkout.clone(), role: metadata.role.clone(), index: metadata.index },
+                    command: command.unwrap_or_default(),
+                    working_directory: metadata.working_directory,
+                    status: session.status.clone(),
+                }),
+            };
+            if store.registry().attachables.get(&metadata.attachable_id) != Some(&discovered) {
+                store.insert_attachable(discovered);
+                changed = true;
+            }
+
+            if let Some(mut set) = store.registry().sets.get(&metadata.set_id).cloned() {
+                if !set.members.contains(&metadata.attachable_id) {
+                    set.members.push(metadata.attachable_id.clone());
+                    store.insert_set(set);
+                    changed = true;
+                }
+            }
+
+            changed |= store.replace_binding(ProviderBinding {
+                provider_category: "terminal_pool".to_string(),
+                provider_name: MANAGED_TERMINAL_PROVIDER.to_string(),
+                object_kind: BindingObjectKind::Attachable,
+                object_id: metadata.attachable_id.to_string(),
+                external_ref: session.session_name.clone(),
+            });
+        }
+        changed
     }
 
     /// Refreshes terminal state by querying the pool and reconciling with the store.
@@ -211,9 +311,14 @@ impl TerminalManager {
         let live_sessions = self.pool.list_sessions().await?;
         let live_names: std::collections::HashSet<String> = live_sessions.iter().map(|s| s.session_name.clone()).collect();
         let live_status: std::collections::HashMap<String, TerminalStatus> =
-            live_sessions.into_iter().map(|s| (s.session_name, s.status)).collect();
+            live_sessions.iter().map(|s| (s.session_name.clone(), s.status.clone())).collect();
 
         let mut store = self.store.lock().map_err(|e| format!("failed to lock store: {e}"))?;
+        if self.discover_sessions(&mut *store, &live_sessions) {
+            if let Err(error) = store.save() {
+                warn!(%error, "failed to persist discovered terminal sessions");
+            }
+        }
         let terminal_ids: Vec<AttachableId> = store
             .registry()
             .attachables
@@ -224,7 +329,7 @@ impl TerminalManager {
 
         let mut infos = Vec::new();
         for id in &terminal_ids {
-            let session_name = id.to_string();
+            let session_name = session_name_for_attachable(&*store, id);
             let new_status = if live_names.contains(&session_name) {
                 live_status.get(&session_name).cloned().unwrap_or(TerminalStatus::Running)
             } else {
