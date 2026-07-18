@@ -59,4 +59,13 @@ impl super::AiUtility for ClaudeCliAiUtility {
             Ok(branch)
         }
     }
+
+    async fn generate_convoy_names(&self, context: &str) -> Result<super::ConvoyNames, String> {
+        info!("ai: generating convoy and branch names via CLI");
+        let prompt = format!(
+            "Suggest a coherent short convoy resource name and git branch name for this context. \
+             Return ONLY JSON with string fields name and branch. Use lowercase kebab-case; the branch may contain one slash: {context}"
+        );
+        super::parse_convoy_names(&self.prompt(Model::Haiku, &prompt).await?)
+    }
 }

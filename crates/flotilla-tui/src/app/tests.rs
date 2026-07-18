@@ -1932,7 +1932,8 @@ fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::con
 fn selected_table_name(app: &App) -> Option<String> {
     let address = app.views.active_address()?;
     let name_column = match address {
-        ViewAddress::Convoys { .. } | ViewAddress::Independents | ViewAddress::Project { .. } => 0,
+        ViewAddress::Convoys { .. } | ViewAddress::Independents => 0,
+        ViewAddress::Project { .. } => 1,
         ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
         ViewAddress::Overview | ViewAddress::Repo { .. } => return None,
     };

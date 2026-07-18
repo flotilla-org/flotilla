@@ -54,7 +54,7 @@ pub enum HostVerb {
     Status,
     Providers,
     Refresh { repo: Option<String> },
-    Route(NounCommand),
+    Route(Box<NounCommand>),
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +80,7 @@ impl Refinable for HostNounPartial {
                 let cmd = <NounCommand as Subcommand>::augment_subcommands(cmd);
                 let matches = cmd.try_get_matches_from(&tokens).map_err(crate::subject::format_parse_error)?;
                 let noun = <NounCommand as clap::FromArgMatches>::from_arg_matches(&matches).map_err(crate::subject::format_parse_error)?;
-                HostVerb::Route(noun)
+                HostVerb::Route(Box::new(noun))
             }
             None => return Err("missing host command".into()),
         };

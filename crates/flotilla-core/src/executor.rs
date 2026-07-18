@@ -337,6 +337,7 @@ pub async fn build_plan(
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewHandoff { .. }
         | CommandAction::ConvoyCreate { .. }
+        | CommandAction::ConvoyStart { .. }
         | CommandAction::WorkflowTemplateApply { .. }
         | CommandAction::ProjectAdd { .. }
         | CommandAction::ProjectApply { .. }

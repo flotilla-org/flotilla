@@ -103,6 +103,10 @@ pub enum TerminalSessionSource {
 pub struct TerminalBrief {
     pub path: String,
     pub content: String,
+    /// Additional checkout roots that receive the same durable brief. The
+    /// session cwd still receives the canonical launch copy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copies: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

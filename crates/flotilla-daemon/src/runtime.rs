@@ -1087,6 +1087,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .get(&requirement.adapter)
                     .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
                 adapter.prepare(&cwd, brief).await?;
+                for copy_root in &brief.copies {
+                    let copy_root = ExecutionEnvironmentPath::new(copy_root);
+                    if copy_root != cwd {
+                        adapter.prepare(&copy_root, brief).await?;
+                    }
+                }
                 let plan = adapter.launch(&AgentLaunchRequest {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
@@ -1657,6 +1663,26 @@ mod tests {
         (daemon, pool)
     }
 
+    async fn crew_daemon_with_process_runner(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
+        let pool = Arc::new(FakeTerminalPool::new());
+        let mut discovery = fake_discovery_with_provider_set(
+            FakeDiscoveryProviders::new()
+                .with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
+        );
+        discovery.runner = Arc::new(ProcessCommandRunner);
+        let daemon = InProcessDaemon::new(Vec::new(), config, discovery, flotilla_protocol::HostName::new("dinghy")).await;
+        daemon
+            .replace_local_environment_bag_for_test(
+                EnvironmentBag::new()
+                    .with(EnvironmentAssertion::env_var("HOME", "/Users/tester"))
+                    .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
+                    .with(EnvironmentAssertion::binary("codex", "/tools/codex"))
+                    .with(EnvironmentAssertion::binary("claude", "/tools/claude")),
+            )
+            .expect("crew environment bag");
+        (daemon, pool)
+    }
+
     async fn run_stage4a_flow_reaches_running_and_completes_convoy(
         daemon: Arc<InProcessDaemon>,
         config: Arc<ConfigStore>,
@@ -1724,6 +1750,8 @@ mod tests {
                 r#ref: Some("main".to_string()),
                 project_ref: None,
                 adopted_checkout_refs: BTreeMap::new(),
+                issue: None,
+                instruction: None,
             })
             .await
             .expect("convoy create should succeed");
@@ -1984,7 +2012,7 @@ mod tests {
         std::fs::create_dir_all(&config_path).expect("config dir");
         std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_path));
-        let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
+        let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
         let state = Arc::new(ControllerRuntimeState::new(
@@ -2005,6 +2033,10 @@ mod tests {
         }])
         .await;
         let runtime = TerminalControllerRuntime { state };
+        let session_cwd = temp.path().join("session-cwd");
+        std::fs::create_dir_all(&session_cwd).expect("session cwd");
+        let durable_checkout = temp.path().join("durable-checkout");
+        std::fs::create_dir_all(&durable_checkout).expect("durable checkout dir");
         let spec = flotilla_resources::TerminalSessionSpec {
             env_ref: profile.host_direct_environment_name(),
             role: "coder".to_string(),
@@ -2013,6 +2045,7 @@ mod tests {
                 brief: flotilla_resources::TerminalBrief {
                     path: ".flotilla/briefs/coder.md".to_string(),
                     content: "Implement the issue.".to_string(),
+                    copies: vec![durable_checkout.display().to_string()],
                 },
                 context: flotilla_resources::TerminalCrewContext {
                     namespace: NAMESPACE.to_string(),
@@ -2021,7 +2054,7 @@ mod tests {
                 },
                 message: None,
             },
-            cwd: "/repo".to_string(),
+            cwd: session_cwd.display().to_string(),
             pool: "fake-terminals".to_string(),
         };
 
@@ -2030,6 +2063,10 @@ mod tests {
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
         assert_eq!(pool.ensured.lock().await.len(), 1, "the fresh agent command must actually be launched");
         assert!(launched.crew.is_some(), "the replacement gets a fresh crew identity");
+        assert_eq!(
+            std::fs::read_to_string(durable_checkout.join(".flotilla/briefs/coder.md")).expect("durable brief copy"),
+            "Implement the issue."
+        );
     }
 
     #[tokio::test]

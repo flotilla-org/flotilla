@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use flotilla_protocol::{IssueRef, IssueState};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, RepositoryKey};
@@ -30,6 +31,32 @@ pub struct ConvoySpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<ConvoyIssue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+}
+
+/// Durable source-qualified issue context captured when a convoy is admitted.
+/// The reference remains stable if the Project later changes its Issue Source;
+/// the snapshot records exactly what the crew was asked to act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoyIssue {
+    pub reference: IssueRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_ref: Option<RepositoryKey>,
+    pub snapshot: IssueSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueSnapshot {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    pub state: IssueState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    pub as_of: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

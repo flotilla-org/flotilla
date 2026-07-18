@@ -329,6 +329,8 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("create convoy");
@@ -427,7 +429,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                 role: "coder".into(),
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "coding".into() },
-                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into() },
+                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into(), copies: Vec::new() },
                     context: TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "demo".into(),
@@ -1158,7 +1160,7 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "coding".to_string() },
-                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into() },
+                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() },
                     context: TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "convoy-a".into(),
@@ -2357,6 +2359,8 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -2735,6 +2739,8 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy create should succeed");

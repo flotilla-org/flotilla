@@ -9,16 +9,18 @@ use common::{
     labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
 use flotilla_controllers::reconcilers::VesselReconciler;
+use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
-    ensure_repository, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyPhase, ConvoyReconciler,
-    ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
+    ensure_repository, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyIssue, ConvoyPhase,
+    ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
     DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec,
-    Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot,
-    WorkflowTemplate, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec,
+    PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
+    WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
+    VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -41,6 +43,8 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy should create");
@@ -204,6 +208,21 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
+            issue: Some(ConvoyIssue {
+                reference: IssueRef {
+                    source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                    id: "732".into(),
+                },
+                repository_ref: Some(repository_specs[0].key()),
+                snapshot: IssueSnapshot {
+                    title: "Start convoy from an issue".into(),
+                    body: Some("Persist this exact issue body.".into()),
+                    state: IssueState::Open,
+                    labels: vec!["enhancement".into()],
+                    as_of: "2026-07-18T09:30:00Z".parse().expect("timestamp"),
+                },
+            }),
+            instruction: Some("Keep the public seam stable.".into()),
         })
         .await
         .expect("convoy should create");
@@ -274,8 +293,8 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .collect::<Vec<_>>();
     assert_eq!(checkout_actuations.len(), 2);
     assert_eq!(checkout_actuations.iter().map(|(_, spec)| spec.target_path().expect("managed checkout path")).collect::<Vec<_>>(), [
-        "/Users/alice/dev/flotilla-repos/workspace-multi/cleat",
-        "/Users/alice/dev/flotilla-repos/workspace-multi/flotilla",
+        "/Users/alice/dev/flotilla-repos/feature-multi/cleat",
+        "/Users/alice/dev/flotilla-repos/feature-multi/flotilla",
     ]);
     for (meta, spec) in checkout_actuations {
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -298,9 +317,14 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         matches!(
             actuation,
             Actuation::CreateTerminalSession { spec, .. }
-                if spec.cwd == "/Users/alice/dev/flotilla-repos/workspace-multi"
+                if spec.cwd == "/Users/alice/dev/flotilla-repos/feature-multi"
                     && matches!(&spec.source, TerminalSessionSource::Agent { brief, .. }
-                        if brief.path == ".flotilla/briefs/coder.md")
+                        if brief.path == ".flotilla/briefs/coder.md"
+                            && brief.copies == ["/Users/alice/dev/flotilla-repos/feature-multi/flotilla"]
+                            && brief.content.contains("https://github.com` / `flotilla-org/flotilla` / `732")
+                            && brief.content.contains("Snapshot as of `2026-07-18T09:30:00+00:00`")
+                            && brief.content.contains("Persist this exact issue body.")
+                            && brief.content.contains("Keep the public seam stable."))
         )
     }));
 
@@ -311,7 +335,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         &host_direct_env_name(),
         "coder",
         "cargo test",
-        "/Users/alice/dev/flotilla-repos/workspace-multi",
+        "/Users/alice/dev/flotilla-repos/feature-multi",
         "cleat",
     )
     .await;
@@ -362,6 +386,8 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy should create");
@@ -448,7 +474,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
     });
     let mounts = mounts.expect("docker environment should be created");
     assert_eq!(mounts.len(), 1);
-    assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/workspace-multi-docker");
+    assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
 
     let mixed = backend
@@ -509,6 +535,8 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy should create");
@@ -614,6 +642,8 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             r#ref: Some("feature/scoped".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy should create");
@@ -661,7 +691,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         })
         .expect("scoped checkout should be created");
     assert_eq!(checkout.repo_ref(), &cleat.key());
-    assert_eq!(checkout.target_path(), Some("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-cleat.workspace-scoped"));
+    assert_eq!(checkout.target_path(), Some("/Users/alice/dev/flotilla-repos/github-com-flotilla-org-cleat.feature-scoped"));
 
     let adopted_path = "/Users/alice/dev/cleat-existing";
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -1125,7 +1155,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     assert!(brief.content.contains("- `reviewer`: latent"));
     assert!(brief.content.contains("flotilla crew reviewer handoff --message"));
     assert!(brief.content.contains("flotilla crew complete"));
-    assert!(brief.content.ends_with("Implement issue 668.\n"));
+    assert!(brief.content.contains("## Assignment\n\nImplement issue 668.\n"));
     assert_eq!(context.namespace, NAMESPACE);
     assert_eq!(context.vessel_ref, "workspace-crew");
     assert_eq!(message, &None);
@@ -1479,6 +1509,8 @@ async fn create_convoy_with_labeled_processes(
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy create should succeed");

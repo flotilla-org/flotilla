@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -14,7 +17,7 @@ use flotilla_core::{
     model::RepoModel,
     path_context::ExecutionEnvironmentPath,
     providers::{
-        ai_utility::AiUtility,
+        ai_utility::{AiUtility, ConvoyNames},
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::{
@@ -37,14 +40,16 @@ use flotilla_core::{
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     test_support::TestIssue,
-    AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, CorrelationKey, DaemonEvent,
-    EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath, HostProviderStatus, HostSummary, ImageId,
-    IssueRef, IssueSource, NodeId, NodeInfo, PeerConnectionState, ProviderData, RepoIdentity, RepoSelector, StreamKey, SystemInfo,
-    ToolInventory, TopologyRoute, WorkItemKind,
+    AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent,
+    CorrelationKey, DaemonEvent, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath,
+    HostProviderStatus, HostSummary, ImageId, IssueRef, IssueSelector, IssueSource, NodeId, NodeInfo, PeerConnectionState, ProviderData,
+    RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec,
-    RepositorySpec, TypedResolver, REPO_KEY_LABEL, REPO_LABEL,
+    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy,
+    PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkflowTemplate,
+    REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -320,6 +325,52 @@ fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     let mut runtime = fake_discovery(false);
     runtime.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility }));
     runtime
+}
+
+struct CountingConvoyAiUtility {
+    calls: AtomicUsize,
+    fail: AtomicBool,
+}
+
+#[async_trait]
+impl AiUtility for CountingConvoyAiUtility {
+    async fn generate_branch_name(&self, _: &str) -> Result<String, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok("unexpected-branch-only-call".into())
+    }
+
+    async fn generate_convoy_names(&self, _: &str) -> Result<ConvoyNames, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail.load(Ordering::SeqCst) {
+            Err("offline".into())
+        } else {
+            Ok(ConvoyNames { name: "generated-convoy".into(), branch: "fix/generated-convoy".into() })
+        }
+    }
+}
+
+struct CountingConvoyAiUtilityFactory {
+    utility: Arc<CountingConvoyAiUtility>,
+}
+
+#[async_trait]
+impl Factory for CountingConvoyAiUtilityFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn AiUtility;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named(ProviderCategory::AiUtility, "counting-ai")
+    }
+
+    async fn probe(
+        &self,
+        _: &EnvironmentBag,
+        _: &ConfigStore,
+        _: &ExecutionEnvironmentPath,
+        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
+    }
 }
 
 struct TestProvisionedEnvironment {
@@ -602,6 +653,237 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
     assert_eq!(fetched.reference, reference);
     assert_eq!(fetched.title, "Source-addressed issue fetch seam");
     assert!(daemon.list_repos().await.expect("list repos").is_empty());
+}
+
+async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend) {
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("docker-test".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    host_ref: "host-test".into(),
+                    image: "flotilla-test".into(),
+                    default_cwd: Some("/workspace".into()),
+                    env: Default::default(),
+                    checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
+                })
+                .build(),
+        )
+        .await
+        .expect("contained policy create");
+}
+
+#[tokio::test]
+async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snapshot() {
+    let reference =
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "732".into() };
+    let mut issue = TestIssue::new("Start convoy from an issue").id("732").with_labels(vec!["enhancement".into()]).build();
+    issue.reference = reference.clone();
+    issue.body = Some("Capture the issue at admission time.".into());
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider.add_issues(vec![(reference.id.clone(), issue.clone())]).await;
+    let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(false) });
+    let mut discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+    );
+    discovery.factories.ai_utilities.push(Box::new(CountingConvoyAiUtilityFactory { utility: Arc::clone(&utility) }));
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .await
+        .expect("workflow create");
+    create_test_contained_policy(&backend).await;
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".into(),
+            default_workflow_ref: "single-agent-contained".into(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    project_ref: "flotilla".into(),
+                    issue: Some(IssueSelector::Reference(reference.clone())),
+                    name: Some("issue-732".into()),
+                    branch: Some("fix/issue-732".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: vec![("review".into(), "required".into())],
+                    instruction: Some("Keep the snapshot durable.".into()),
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("start command accepted");
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("start command should finish");
+
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "issue-732".into(), attach_command: None, binding: None });
+    let persisted = backend.using::<ResourceConvoy>("flotilla").get("issue-732").await.expect("persisted convoy");
+    assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
+    assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
+    assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/issue-732"));
+    assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
+    assert_eq!(persisted.spec.repositories.len(), 1);
+    assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
+    let persisted_issue = persisted.spec.issue.expect("issue snapshot");
+    assert_eq!(persisted_issue.reference, reference);
+    assert_eq!(persisted_issue.repository_ref, Some(repository.key()));
+    assert_eq!(persisted_issue.snapshot.title, issue.title);
+    assert_eq!(persisted_issue.snapshot.body, issue.body);
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
+
+    utility.fail.store(true, Ordering::SeqCst);
+    let fallback_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    project_ref: "flotilla".into(),
+                    issue: Some(IssueSelector::Reference(reference)),
+                    name: None,
+                    branch: None,
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("offline fallback command accepted");
+    let fallback_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == fallback_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("offline fallback should finish");
+    assert_eq!(fallback_result, CommandValue::ConvoyStarted {
+        name: "start-convoy-from-an-issue-732".into(),
+        attach_command: None,
+        binding: None,
+    });
+    let fallback = backend.using::<ResourceConvoy>("flotilla").get("start-convoy-from-an-issue-732").await.expect("fallback convoy");
+    assert_eq!(fallback.spec.r#ref.as_deref(), Some("start-convoy-from-an-issue-732"));
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_start_completes_both_names_with_one_ai_call() {
+    let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(false) });
+    let mut discovery = fake_discovery(false);
+    discovery.factories.ai_utilities.push(Box::new(CountingConvoyAiUtilityFactory { utility: Arc::clone(&utility) }));
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .await
+        .expect("workflow create");
+    create_test_contained_policy(&backend).await;
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".into(),
+            default_workflow_ref: "single-agent-contained".into(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    project_ref: "flotilla".into(),
+                    issue: None,
+                    name: None,
+                    branch: None,
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: Some("Implement the admission snapshot.".into()),
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("start command accepted");
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("start command should finish");
+
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "generated-convoy".into(), attach_command: None, binding: None });
+    let persisted = backend.using::<ResourceConvoy>("flotilla").get("generated-convoy").await.expect("persisted convoy");
+    assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/generated-convoy"));
+    assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+    drop(temp);
 }
 
 fn static_ssh_test_discovery(runner: Arc<dyn CommandRunner>) -> DiscoveryRuntime {

@@ -29,13 +29,13 @@ use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
     external_patches as convoy_external_patches, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target,
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
-    Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, IssueSourceResolution, IssueSourceUnavailable,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec,
-    Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
-    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WorkflowTemplate,
-    WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
+    CrewSource, Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -58,6 +58,7 @@ use crate::{
     model::{provider_names_from_registry, repo_name, RepoModel},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
+        ai_utility::{AiUtility, ConvoyNames},
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
@@ -604,7 +605,7 @@ async fn create_adopted_checkout_resource(
     Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
 }
 
-async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str) -> Option<String> {
+async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str, contained: bool) -> Option<String> {
     let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
         Ok(list) => list.items,
         Err(err) => {
@@ -613,11 +614,12 @@ async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &
         }
     };
     policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-    let policy = policies
-        .iter()
-        .find(|policy| policy.metadata.name.starts_with("host-direct-"))
-        .or_else(|| policies.first())
-        .map(|policy| policy.metadata.name.clone());
+    let policy = if contained {
+        policies.iter().find(|policy| policy.spec.docker_per_vessel.is_some())
+    } else {
+        policies.iter().find(|policy| policy.metadata.name.starts_with("host-direct-")).or_else(|| policies.first())
+    }
+    .map(|policy| policy.metadata.name.clone());
     if policy.is_none() {
         warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
     }
@@ -1027,6 +1029,18 @@ const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl InProcessDaemon {
+    async fn admission_ai_utility(&self) -> Option<Arc<dyn AiUtility>> {
+        let environment = self.environment_manager.environment_bag(&self.local_environment_id)?;
+        let runner = self.environment_manager.environment_runner(&self.local_environment_id)?;
+        let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
+        for factory in &self.discovery.factories.ai_utilities {
+            if let Ok(utility) = factory.probe(&environment, &self.config, &probe_root, Arc::clone(&runner)).await {
+                return Some(utility);
+            }
+        }
+        None
+    }
+
     /// Create a new in-process daemon tracking the given repo paths.
     ///
     /// Returns `Arc<Self>` because a background poll task is spawned that
@@ -2343,7 +2357,213 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
     }
 }
 
+fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(format!("{field} cannot be empty"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn convoy_fallback_slug(title: &str, id: &str) -> String {
+    let slug = format!("{title}-{id}")
+        .chars()
+        .fold((String::new(), false), |(mut output, pending_separator), character| {
+            if character.is_ascii_alphanumeric() {
+                if pending_separator && !output.is_empty() {
+                    output.push('-');
+                }
+                output.push(character.to_ascii_lowercase());
+                (output, false)
+            } else {
+                (output, true)
+            }
+        })
+        .0;
+    if slug.is_empty() {
+        "convoy".to_string()
+    } else {
+        slug
+    }
+}
+
 impl InProcessDaemon {
+    async fn resolve_convoy_issue(
+        &self,
+        namespace: &str,
+        project: &ResourceObject<Project>,
+        selector: &flotilla_protocol::IssueSelector,
+    ) -> Result<ConvoyIssue, String> {
+        let sources =
+            match resolve_project_issue_sources(&self.resource_backend.clone().using::<Repository>(namespace), &project.spec).await {
+                IssueSourceResolution::Available { sources } => sources,
+                IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
+                    return Err(format!("repository {repository}: {message}"));
+                }
+                IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => {
+                    return Err(format!("project {} has no issue source", project.metadata.name));
+                }
+            };
+        let issue = match selector {
+            flotilla_protocol::IssueSelector::Reference(reference) => {
+                if !sources.contains(&reference.source) {
+                    return Err(format!(
+                        "issue source {} {} is not part of project {}",
+                        reference.source.service, reference.source.scope, project.metadata.name
+                    ));
+                }
+                self.fetch_issue_by_ref(reference).await?
+            }
+            flotilla_protocol::IssueSelector::Id(id) => {
+                let mut matches = Vec::new();
+                let mut failures = Vec::new();
+                for source in sources {
+                    let reference = flotilla_protocol::IssueRef { source, id: id.clone() };
+                    match self.fetch_issue_by_ref(&reference).await {
+                        Ok(issue) => matches.push(issue),
+                        Err(error) => failures.push(error),
+                    }
+                }
+                match matches.len() {
+                    1 => matches.remove(0),
+                    0 => return Err(format!("issue {id} was not found for project {}: {}", project.metadata.name, failures.join("; "))),
+                    count => return Err(format!("issue {id} is ambiguous across {count} project issue sources")),
+                }
+            }
+        };
+
+        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+        let mut matching_repositories = Vec::new();
+        for project_repository in &project.spec.repositories {
+            let repository = repositories
+                .get(&project_repository.repo.to_string())
+                .await
+                .map_err(|error| format!("repository {}: {error}", project_repository.repo))?;
+            if repository.spec.forge().is_some_and(|forge| {
+                forge.service_url == issue.reference.source.service && forge.repository == issue.reference.source.scope
+            }) {
+                matching_repositories.push(project_repository.repo.clone());
+            }
+        }
+        let repository_ref = match matching_repositories.as_slice() {
+            [repository] => Some(repository.clone()),
+            _ => None,
+        };
+
+        Ok(ConvoyIssue {
+            reference: issue.reference,
+            repository_ref,
+            snapshot: IssueSnapshot { title: issue.title, body: issue.body, state: issue.state, labels: issue.labels, as_of: issue.as_of },
+        })
+    }
+
+    async fn admit_convoy_start(&self, namespace: &str, intent: &flotilla_protocol::ConvoyStartIntent) -> Result<String, String> {
+        let project_ref = required_admission_value(&intent.project_ref, "project")?;
+        let project = self
+            .resource_backend
+            .clone()
+            .using::<Project>(namespace)
+            .get(project_ref)
+            .await
+            .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
+        let repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
+        let issue = match &intent.issue {
+            Some(selector) => Some(self.resolve_convoy_issue(namespace, &project, selector).await?),
+            None => None,
+        };
+        let workflow_ref = match intent.workflow_ref.as_deref() {
+            Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
+            None => project.spec.default_workflow_ref.clone(),
+        };
+        let workflow = self
+            .resource_backend
+            .clone()
+            .using::<WorkflowTemplate>(namespace)
+            .get(&workflow_ref)
+            .await
+            .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+
+        let fallback_slug = issue
+            .as_ref()
+            .map(|issue| convoy_fallback_slug(&issue.snapshot.title, &issue.reference.id))
+            .unwrap_or_else(|| convoy_fallback_slug(&project.spec.display_name, project_ref));
+        let generated = if intent.name.is_none() || intent.branch.is_none() {
+            let issue_context = issue.as_ref().map(|issue| {
+                format!("Issue {}: {}\n{}", issue.reference.id, issue.snapshot.title, issue.snapshot.body.as_deref().unwrap_or_default())
+            });
+            let context = [
+                Some(format!("Project: {}", project.spec.display_name)),
+                issue_context,
+                intent.instruction.as_ref().map(|instruction| format!("Instruction: {instruction}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            match self.admission_ai_utility().await {
+                Some(utility) => utility.generate_convoy_names(&context).await.ok(),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let generated = generated.unwrap_or_else(|| ConvoyNames { name: fallback_slug.clone(), branch: fallback_slug.clone() });
+        let name = intent
+            .name
+            .as_deref()
+            .map(|name| required_admission_value(name, "name").map(str::to_string))
+            .transpose()?
+            .unwrap_or_else(|| convoy_fallback_slug(&generated.name, "").trim_end_matches('-').to_string());
+        let branch = match intent.branch.as_deref() {
+            Some(branch) => required_admission_value(branch, "branch")?.to_string(),
+            None => required_admission_value(&generated.branch, "generated branch")?.to_string(),
+        };
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        match convoys.get(&name).await {
+            Ok(_) => return Err(format!("convoy {name} already exists")),
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let contained = workflow.spec.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
+        let placement_policy = match &intent.placement_policy {
+            Some(policy) => {
+                let policy = required_admission_value(policy, "placement policy")?;
+                let resolved = self
+                    .resource_backend
+                    .clone()
+                    .using::<PlacementPolicy>(namespace)
+                    .get(policy)
+                    .await
+                    .map_err(|error| format!("placement policy {policy}: {error}"))?;
+                if contained && resolved.spec.docker_per_vessel.is_none() {
+                    return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
+                }
+                Some(policy.to_string())
+            }
+            None => {
+                let policy = default_convoy_placement_policy(&self.resource_backend, namespace, contained).await;
+                if contained && policy.is_none() {
+                    return Err("contained workflow requires an available docker placement policy".to_string());
+                }
+                policy
+            }
+        };
+        let spec = ConvoySpec {
+            workflow_ref,
+            inputs: intent.inputs.iter().map(|(key, value)| (key.clone(), InputValue::String(value.clone()))).collect(),
+            placement_policy,
+            repositories,
+            r#ref: Some(branch),
+            project_ref: Some(project_ref.to_string()),
+            adopted_checkout_refs: BTreeMap::new(),
+            issue,
+            instruction: intent.instruction.clone(),
+        };
+        convoys.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
+        Ok(name)
+    }
+
     async fn snapshot_project_repositories(&self, namespace: &str, project_ref: &str) -> Result<Vec<ConvoyRepositorySpec>, String> {
         let project = self
             .resource_backend
@@ -3947,6 +4167,37 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = self.provisioning_namespace().await;
+            let result = match self.admit_convoy_start(&namespace, intent).await {
+                Ok(name) if intent.auto_attach => {
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                    let resolved = loop {
+                        match self.resolve_attach_command_internal(&name).await {
+                            Ok(resolved) => break Ok(resolved),
+                            Err(message) if tokio::time::Instant::now() >= deadline => {
+                                break Err(format!("convoy {name} was created but no crew session became attachable: {message}"));
+                            }
+                            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        }
+                    };
+                    match resolved {
+                        Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
+                            name,
+                            attach_command: Some(resolved.command),
+                            binding: resolved.binding,
+                        },
+                        Err(message) => flotilla_protocol::CommandValue::Error { message },
+                    }
+                }
+                Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
         if let flotilla_protocol::CommandAction::ConvoyCreate {
             name,
             workflow_ref,
@@ -4023,7 +4274,7 @@ impl InProcessDaemon {
             }
             let placement_policy = match placement_policy {
                 Some(policy) => Some(policy.clone()),
-                None => default_convoy_placement_policy(&self.resource_backend, &namespace).await,
+                None => default_convoy_placement_policy(&self.resource_backend, &namespace, false).await,
             };
             let mut direct_repository_url = repository_url.clone();
             let mut r#ref = r#ref.clone();
@@ -4145,6 +4396,8 @@ impl InProcessDaemon {
                 r#ref,
                 project_ref: project_ref.clone(),
                 adopted_checkout_refs,
+                issue: None,
+                instruction: None,
             };
             let meta = InputMeta::builder().name(name.clone()).build();
             let result = match convoys.create(&meta, &spec).await {

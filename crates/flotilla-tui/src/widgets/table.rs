@@ -152,8 +152,12 @@ impl InteractiveWidget for TableWidget {
                 Outcome::Consumed
             }
             Action::Confirm => {
-                if let Some(target) = ctx.views.active_table_state().selected_row(&view).and_then(|row| row.drill.clone()) {
-                    ctx.app_actions.push(AppAction::DrillView(target));
+                if let Some(row) = ctx.views.active_table_state().selected_row(&view) {
+                    if let Some(target) = row.drill.clone() {
+                        ctx.app_actions.push(AppAction::DrillView(target));
+                    } else if let [action] = row.actions.as_slice() {
+                        ctx.app_actions.push(AppAction::ExecuteTableIntent(action.intent.clone()));
+                    }
                 }
                 Outcome::Consumed
             }
@@ -335,8 +339,12 @@ mod tests {
             ),
         ];
         let rows = convoys.iter().collect::<Vec<_>>();
-        table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows { convoys: rows, independents: vec![] })
-            .expect("project snapshot table")
+        table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows {
+            convoys: rows,
+            independents: vec![],
+            project_issues: vec![],
+        })
+        .expect("project snapshot table")
     }
 
     #[test]

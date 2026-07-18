@@ -165,6 +165,13 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "convoy created");
             app.model.status_message = Some(format!("Convoy created: {name}"));
         }
+        CommandValue::ConvoyStarted { name, attach_command, .. } => {
+            info!(%name, "convoy started");
+            app.model.status_message = Some(format!("Convoy started: {name}"));
+            if let Some(command) = attach_command {
+                app.pending_attach_command = Some(command);
+            }
+        }
         CommandValue::WorkflowTemplateApplied { name } => {
             info!(%name, "workflow template applied");
             app.model.status_message = Some(format!("Workflow template applied: {name}"));
