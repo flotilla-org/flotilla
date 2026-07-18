@@ -753,7 +753,9 @@ fn full_controller_harness(backend: ResourceBackend) -> ControllerLoopHarness {
             primary: backend.clone().using::<Vessel>(NAMESPACE),
             secondaries: VesselReconciler::secondary_watches(),
             reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
-            resync_interval: Duration::from_millis(50),
+            // This must progress through Checkout Ready events rather than a
+            // periodic Vessel relist; production resync is also deliberately slow.
+            resync_interval: Duration::from_secs(60),
             backend,
         }
         .run(),

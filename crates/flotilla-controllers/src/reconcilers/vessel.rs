@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
 use flotilla_resources::{
     clone_key,
-    controller::{delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{
+        delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
+    },
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, CrewSource, DockerCheckoutStrategy,
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
@@ -47,6 +49,7 @@ impl VesselReconciler {
         vec![
             Box::new(LabelMappedWatch::<Environment, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Checkout, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
+            Box::new(LabelJoinWatch::<Checkout, Vessel> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
         ]
     }
