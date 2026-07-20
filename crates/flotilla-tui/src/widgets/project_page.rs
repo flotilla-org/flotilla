@@ -9,6 +9,7 @@ use super::{
     Outcome, RenderContext, WidgetContext,
 };
 use crate::{
+    app::{NamespaceMap, QueryTableCache},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::{self, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId},
@@ -56,20 +57,26 @@ impl ProjectPageWidget {
             .collect()
     }
 
+    fn project_panels(
+        address: &ViewAddress,
+        namespaces: &NamespaceMap,
+        query_tables: &QueryTableCache,
+        state: &ProjectTableState,
+    ) -> Result<Vec<ProjectPanel>, String> {
+        let rows = crate::app::table_rows(namespaces, query_tables, state.issue_source_search());
+        Self::filtered_panels(address, &rows, state)
+    }
+
     fn panels(ctx: &WidgetContext<'_>) -> Result<Vec<ProjectPanel>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let state = ctx.views.active_project_table_state();
-        let source_search = state.issue_source_search();
-        let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
-        Self::filtered_panels(address, &rows, state)
+        Self::project_panels(address, ctx.namespaces, ctx.query_tables, state)
     }
 
     fn render_panels(ctx: &RenderContext<'_>) -> Result<Vec<ProjectPanel>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let state = ctx.views.active_project_table_state();
-        let source_search = state.issue_source_search();
-        let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
-        Self::filtered_panels(address, &rows, state)
+        Self::project_panels(address, ctx.namespaces, ctx.query_tables, state)
     }
 
     fn layouts(panels: &[ProjectPanel]) -> Vec<PanelLayout<'_>> {
@@ -89,7 +96,7 @@ impl ProjectPageWidget {
     }
 
     fn line_area(&self, content_line: usize, state: &ProjectTableState) -> Option<Rect> {
-        let visible = content_line.checked_sub(state.scroll_offset)?;
+        let visible = content_line.checked_sub(state.scroll_offset())?;
         (visible < self.area.height as usize).then_some(Rect { y: self.area.y + visible as u16, height: 1, ..self.area })
     }
 
@@ -109,13 +116,13 @@ impl ProjectPageWidget {
         };
         let visible = self.area.height as usize;
         if visible == 0 {
-            state.scroll_offset = 0;
-        } else if line < state.scroll_offset {
-            state.scroll_offset = line;
-        } else if line >= state.scroll_offset.saturating_add(visible) {
-            state.scroll_offset = line + 1 - visible;
+            state.set_scroll_offset(0);
+        } else if line < state.scroll_offset() {
+            state.set_scroll_offset(line);
+        } else if line >= state.scroll_offset().saturating_add(visible) {
+            state.set_scroll_offset(line + 1 - visible);
         }
-        state.scroll_offset = state.scroll_offset.min(Self::content_height(layouts).saturating_sub(visible));
+        state.set_scroll_offset(state.scroll_offset().min(Self::content_height(layouts).saturating_sub(visible)));
     }
 
     fn select_delta(layouts: &[PanelLayout<'_>], state: &mut ProjectTableState, delta: isize) {
@@ -223,8 +230,8 @@ impl ProjectPageWidget {
             if let Some(columns_area) = self.line_area(layout.columns_line, state) {
                 super::table::TablePanel::render_header(frame, columns_area, theme, &layout.panel.table);
             }
-            let first = state.scroll_offset.saturating_sub(layout.rows_start);
-            let visible_end = state.scroll_offset.saturating_add(area.height as usize);
+            let first = state.scroll_offset().saturating_sub(layout.rows_start);
+            let visible_end = state.scroll_offset().saturating_add(area.height as usize);
             let end = layout.rows_end().min(visible_end);
             if first < layout.panel.table.rows.len() && end > layout.rows_start.saturating_add(first) {
                 let count = end - layout.rows_start - first;
@@ -337,7 +344,7 @@ impl InteractiveWidget for ProjectPageWidget {
         }
         let Ok(panels) = Self::panels(ctx) else { return Outcome::Ignored };
         let layouts = Self::layouts(&panels);
-        let line = ctx.views.active_project_table_state().scroll_offset + (mouse.row - self.area.y) as usize;
+        let line = ctx.views.active_project_table_state().scroll_offset() + (mouse.row - self.area.y) as usize;
         match mouse.kind {
             MouseEventKind::ScrollDown => return self.handle_action(Action::SelectNext, ctx),
             MouseEventKind::ScrollUp => return self.handle_action(Action::SelectPrev, ctx),

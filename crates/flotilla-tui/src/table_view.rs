@@ -109,14 +109,14 @@ pub struct ProjectTableState {
 
 impl Default for ProjectTableState {
     fn default() -> Self {
-        Self {
-            active: ProjectPanelKind::Convoys,
-            header_focused: false,
-            convoys: TableState::default(),
-            checkouts: TableState::default(),
-            issues: TableState::default(),
-            scroll_offset: 0,
-        }
+        Self::builder()
+            .active(ProjectPanelKind::Convoys)
+            .header_focused(false)
+            .convoys(TableState::default())
+            .checkouts(TableState::default())
+            .issues(TableState::default())
+            .scroll_offset(0)
+            .build()
     }
 }
 
@@ -139,6 +139,14 @@ impl ProjectTableState {
 
     pub fn focus_rows(&mut self) {
         self.header_focused = false;
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub fn set_scroll_offset(&mut self, offset: usize) {
+        self.scroll_offset = offset;
     }
 
     pub fn table(&self, kind: ProjectPanelKind) -> &TableState {
@@ -531,20 +539,21 @@ fn pending_project_table(address: &ViewAddress) -> TableView {
 }
 
 fn result_set_meta(state: &ResultSetState) -> TableMeta {
-    TableMeta {
-        as_of: state.demand.as_ref().map(|metadata| metadata.as_of),
-        has_more: state.demand.as_ref().is_some_and(|metadata| metadata.has_more),
-        conditions: state
-            .conditions
-            .iter()
-            .map(|condition| match condition {
-                ResultSetCondition::IssueSourceUnavailable { message, .. } | ResultSetCondition::QueryScopeUnavailable { message, .. } => {
-                    message.clone()
-                }
-            })
-            .collect(),
-        availability: TableAvailability::Ready,
-    }
+    TableMeta::builder()
+        .maybe_as_of(state.demand.as_ref().map(|metadata| metadata.as_of))
+        .has_more(state.demand.as_ref().is_some_and(|metadata| metadata.has_more))
+        .conditions(
+            state
+                .conditions
+                .iter()
+                .map(|condition| match condition {
+                    ResultSetCondition::IssueSourceUnavailable { message, .. }
+                    | ResultSetCondition::QueryScopeUnavailable { message, .. } => message.clone(),
+                })
+                .collect(),
+        )
+        .availability(TableAvailability::Ready)
+        .build()
 }
 
 fn find_convoy<'a>(convoys: &'a [&ConvoySummary], namespace: &str, name: &str) -> Result<&'a ConvoySummary, String> {
