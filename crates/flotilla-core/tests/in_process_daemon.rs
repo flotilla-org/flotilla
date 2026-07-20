@@ -46,10 +46,10 @@ use flotilla_protocol::{
     RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
-    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy as ResourceConvoy,
-    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy,
-    PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkflowTemplate,
-    REPO_KEY_LABEL, REPO_LABEL,
+    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, DockerCheckoutStrategy,
+    DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -2221,6 +2221,90 @@ async fn repo_refresh_reconciles_observed_checkouts() {
     let third = observed.list().await.expect("final observed checkout list should succeed");
     assert_eq!(third.items.len(), 1, "adopted checkout must not be deleted by observed reconciliation");
     assert_eq!(third.items[0].metadata.name, "adopted-checkout-feature");
+}
+
+#[tokio::test]
+async fn adopted_checkout_reconciliation_repairs_partial_durable_creation() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let spec = ResourceCheckoutSpec::Observed(
+        ObservedCheckoutSpec::builder()
+            .r#ref("feature/reconcile".to_string())
+            .path("/work/reconcile".to_string())
+            .repo_ref(flotilla_resources::RepositoryKey("widgets-api".to_string()))
+            .host_ref("host-01".to_string())
+            .is_main(false)
+            .build(),
+    );
+    durable
+        .create(
+            &InputMeta::builder()
+                .name("adopted-checkout-reconcile".to_string())
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &spec,
+        )
+        .await
+        .expect("durable checkout create should succeed");
+
+    daemon.reconcile_adopted_checkouts("flotilla").await.expect("adopted checkout reconciliation should succeed");
+
+    let durable_checkout = durable.get("adopted-checkout-reconcile").await.expect("durable checkout should remain");
+    assert_eq!(
+        durable_checkout.status,
+        Some(ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path("/work/reconcile".to_string()).build())
+    );
+    let observed_checkout = observed.get("adopted-checkout-reconcile").await.expect("observed checkout should be projected");
+    assert_eq!(observed_checkout.spec, durable_checkout.spec);
+    assert_eq!(observed_checkout.status, durable_checkout.status);
+    assert_eq!(observed_checkout.metadata.labels, durable_checkout.metadata.labels);
+}
+
+#[tokio::test]
+async fn adopted_checkout_reconciliation_isolates_an_observed_name_collision() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout_spec = |path: &str| {
+        ResourceCheckoutSpec::Observed(
+            ObservedCheckoutSpec::builder()
+                .r#ref("feature/reconcile".to_string())
+                .path(path.to_string())
+                .repo_ref(flotilla_resources::RepositoryKey("widgets-api".to_string()))
+                .host_ref("host-01".to_string())
+                .is_main(false)
+                .build(),
+        )
+    };
+    for (name, path) in [("a-collision", "/work/collision"), ("z-valid", "/work/valid")] {
+        durable
+            .create(
+                &InputMeta::builder().name(name.to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted),
+                &checkout_spec(path),
+            )
+            .await
+            .expect("durable checkout create should succeed");
+    }
+    observed
+        .create(
+            &InputMeta::builder().name("a-collision".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Observed),
+            &checkout_spec("/work/unrelated"),
+        )
+        .await
+        .expect("unrelated observed checkout should be created");
+
+    let error = daemon.reconcile_adopted_checkouts("flotilla").await.expect_err("the name collision should be reported");
+
+    assert!(error.contains("a-collision"), "{error}");
+    let collision = observed.get("a-collision").await.expect("colliding observation should remain");
+    assert_eq!(collision.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Observed));
+    let valid = observed.get("z-valid").await.expect("other durable adopted checkouts should still be projected");
+    assert_eq!(valid.metadata.lifecycle_authority().expect("authority should parse"), Some(LifecycleAuthority::Adopted));
 }
 
 #[tokio::test]

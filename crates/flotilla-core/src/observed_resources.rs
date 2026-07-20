@@ -2,10 +2,95 @@ use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{qualified_path::QualifiedPath, ProviderData};
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey,
-    ResourceBackend, ResourceError, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
+    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus, InputMeta, LifecycleAuthority,
+    ObservedCheckoutSpec, RepositoryKey, ResourceBackend, ResourceError, ResourceObject, AUTHORITY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
 };
 use sha2::{Digest, Sha256};
+
+/// Rebuild the query-facing adopted Checkout projection from the durable
+/// controller-facing resources.
+///
+/// Durable resources are authoritative. A missing durable status means the
+/// create was interrupted between its spec and status writes; an adopted
+/// observed Checkout requires no actuation, so its Ready status can be derived
+/// from the path already recorded in its spec.
+pub async fn reconcile_adopted_checkouts(
+    durable_backend: &ResourceBackend,
+    observed_backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<(), ResourceError> {
+    let selector = BTreeMap::from([(AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string())]);
+    let durable_checkouts = durable_backend.clone().using::<ResourceCheckout>(namespace);
+    let observed_checkouts = observed_backend.clone().using::<ResourceCheckout>(namespace);
+    let mut failures = Vec::new();
+
+    for checkout in durable_checkouts.list_matching_labels(&selector).await?.items {
+        let name = checkout.metadata.name.clone();
+        let result = async {
+            let checkout = ensure_adopted_checkout_status(&durable_checkouts, checkout).await?;
+            project_adopted_checkout_with(&observed_checkouts, &checkout).await
+        }
+        .await;
+        if let Err(error) = result {
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ResourceError::other(format!("failed to reconcile adopted checkouts: {}", failures.join("; "))))
+    }
+}
+
+/// Publish one durable adopted Checkout into the ephemeral observed store.
+pub async fn project_adopted_checkout(
+    observed_backend: &ResourceBackend,
+    namespace: &str,
+    durable: &ResourceObject<ResourceCheckout>,
+) -> Result<(), ResourceError> {
+    project_adopted_checkout_with(&observed_backend.clone().using::<ResourceCheckout>(namespace), durable).await
+}
+
+async fn ensure_adopted_checkout_status(
+    checkouts: &flotilla_resources::TypedResolver<ResourceCheckout>,
+    checkout: ResourceObject<ResourceCheckout>,
+) -> Result<ResourceObject<ResourceCheckout>, ResourceError> {
+    if checkout.status.is_some() {
+        return Ok(checkout);
+    }
+    let ResourceCheckoutSpec::Observed(spec) = &checkout.spec else {
+        return Err(ResourceError::invalid(format!("adopted checkout {} must use an observed checkout spec", checkout.metadata.name)));
+    };
+    let status = CheckoutStatus::builder().phase(CheckoutPhase::Ready).path(spec.path.clone()).build();
+    checkouts.update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &status).await
+}
+
+async fn project_adopted_checkout_with(
+    checkouts: &flotilla_resources::TypedResolver<ResourceCheckout>,
+    durable: &ResourceObject<ResourceCheckout>,
+) -> Result<(), ResourceError> {
+    let meta = InputMeta::from(&durable.metadata);
+    let projected = match checkouts.create(&meta, &durable.spec).await {
+        Ok(created) => created,
+        Err(ResourceError::Conflict { .. }) => {
+            let existing = checkouts.get(&durable.metadata.name).await?;
+            if existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
+                return Err(ResourceError::invalid(format!(
+                    "checkout {} already exists in the observed store but is not adopted",
+                    durable.metadata.name
+                )));
+            }
+            checkouts.update(&meta, &existing.metadata.resource_version, &durable.spec).await?
+        }
+        Err(error) => return Err(error),
+    };
+
+    if let Some(status) = &durable.status {
+        checkouts.update_status(&durable.metadata.name, &projected.metadata.resource_version, status).await?;
+    }
+    Ok(())
+}
 
 /// Publish the checkout facts discovered for one local repository into the
 /// daemon's ephemeral observed-resource store.
