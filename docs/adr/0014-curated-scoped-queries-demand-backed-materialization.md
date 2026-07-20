@@ -40,11 +40,12 @@ presuppose it.
 ## `QueryId` is a family plus owned scope parameters
 
 `QueryId` grows from a finite `Copy` enum to family + owned parameters, where
-the parameters are **scope**: a project reference or repo key. A project
-scope expands to its constituent repos inside the Aggregator — consumers
-never learn a project's composition. Scope rides the View address per ADR
-0013's `?key=value` channel. Global (unscoped) forms remain for fleet-wide
-tables. Subscription cost scales with what is on screen. For issue queries,
+the parameters are **scope**: a Project reference when visible to clients;
+Repository scope exists only while the Aggregator expands that Project into
+its constituent repositories. Consumers never learn a project's composition.
+Scope rides the View address per ADR 0013's `?key=value` channel. Global
+(unscoped) forms remain for fleet-wide tables where the curated family allows
+one. Subscription cost scales with what is on screen. For issue queries,
 a Project-level **Issue Source** override supplies one unified feed; without
 one, Project scope expands to each constituent Repository's Forge-backed issue
 source. The absence of a configured source is surfaced as unavailable, never

@@ -85,6 +85,15 @@ fn default_label(view: &OpenView, model: &TuiModel, level: usize) -> String {
             0 => format!("⛰ {name}"),
             _ => format!("⛰ {namespace}/{name}"),
         },
+        ViewTarget::View(ViewAddress::Issues { scope }) => match level {
+            0 => format!("◉ {} issues", scope.name),
+            _ => format!("◉ {}/{} issues", scope.namespace, scope.name),
+        },
+        ViewTarget::View(ViewAddress::Checkouts { scope: Some(scope) }) => match level {
+            0 => format!("⌂ {} checkouts", scope.name),
+            _ => format!("⌂ {}/{} checkouts", scope.namespace, scope.name),
+        },
+        ViewTarget::View(ViewAddress::Checkouts { scope: None }) => "⌂ checkouts".to_string(),
         ViewTarget::View(ViewAddress::Repo { identity, .. }) => repo_label(identity, model, level),
         ViewTarget::Broken { .. } => "⚠ invalid".to_string(),
     }

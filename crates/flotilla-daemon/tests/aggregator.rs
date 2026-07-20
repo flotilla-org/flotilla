@@ -107,14 +107,14 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
         ..RuntimeOptions::default()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
-    let repository_query = QueryId::Checkouts { scope: QueryScope::Repository(repository_key.clone()) };
-    let project_query = QueryId::Checkouts { scope: QueryScope::Project { namespace: "flotilla".into(), name: "widgets".into() } };
+    let fleet_query = QueryId::Checkouts { scope: None };
+    let project_query = QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "widgets")) };
     let subscriber = uuid::Uuid::new_v4();
 
     let initial_sequences = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let events = daemon
-                .subscribe_queries(subscriber, &[QueryCursor { query: repository_query.clone(), since: None }, QueryCursor {
+                .subscribe_queries(subscriber, &[QueryCursor { query: fleet_query.clone(), since: None }, QueryCursor {
                     query: project_query.clone(),
                     since: None,
                 }])
@@ -166,7 +166,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     })
     .await
     .expect("repository and project checkout additions");
-    for query in [&repository_query, &project_query] {
+    for query in [&fleet_query, &project_query] {
         let rows = additions.get(query).expect("scoped addition").changes.as_checkouts().expect("checkout changes");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "/work/widgets");
@@ -203,7 +203,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     })
     .await
     .expect("repository and project checkout modifications");
-    for query in [&repository_query, &project_query] {
+    for query in [&fleet_query, &project_query] {
         let rows = modifications.get(query).expect("scoped modification").changes.as_checkouts().expect("checkout changes");
         assert_eq!(rows[0].path, "/work/widgets-revised");
         assert_eq!(rows[0].branch, "feature/revised");
@@ -211,7 +211,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
 
     let stale_replay = daemon
         .subscribe_queries(subscriber, &[
-            QueryCursor { query: repository_query.clone(), since: initial_sequences.get(&repository_query).copied() },
+            QueryCursor { query: fleet_query.clone(), since: initial_sequences.get(&fleet_query).copied() },
             QueryCursor { query: project_query.clone(), since: initial_sequences.get(&project_query).copied() },
         ])
         .await
@@ -227,7 +227,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
 
     let current_replay = daemon
         .subscribe_queries(subscriber, &[
-            QueryCursor { query: repository_query.clone(), since: modifications.get(&repository_query).map(|delta| delta.seq) },
+            QueryCursor { query: fleet_query.clone(), since: modifications.get(&fleet_query).map(|delta| delta.seq) },
             QueryCursor { query: project_query.clone(), since: modifications.get(&project_query).map(|delta| delta.seq) },
         ])
         .await
@@ -247,7 +247,7 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     })
     .await
     .expect("repository and project checkout removals");
-    for query in [&repository_query, &project_query] {
+    for query in [&fleet_query, &project_query] {
         assert_eq!(removals.get(query).expect("scoped removal").changes.removed_resources().expect("checkout removals").len(), 1);
     }
 }
@@ -302,7 +302,7 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
         .start_controllers(false)
         .build();
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
-    let query = QueryId::Checkouts { scope: QueryScope::Repository(repository_key) };
+    let query = QueryId::Checkouts { scope: None };
 
     let result_set = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -334,7 +334,7 @@ async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootst
 }
 
 #[tokio::test]
-async fn repository_issue_subscription_materializes_from_an_in_memory_provider() {
+async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -346,6 +346,19 @@ async fn repository_issue_subscription_materializes_from_an_in_memory_provider()
         .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
         .await
         .expect("create repository resource");
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("widgets".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Widgets".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
+                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key).build()])
+                .build(),
+        )
+        .await
+        .expect("create project resource");
     let provider = Arc::new(FakeIssueProvider::new());
     provider
         .add_issues(
@@ -370,7 +383,8 @@ async fn repository_issue_subscription_materializes_from_an_in_memory_provider()
     };
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
     let mut events = daemon.subscribe();
-    let query = QueryId::Issues { scope: QueryScope::Repository(repository_key) };
+    let scope = QueryScope::new("flotilla", "widgets");
+    let query = QueryId::Issues { scope: scope.clone(), search: None };
 
     daemon
         .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }])
@@ -408,6 +422,24 @@ async fn repository_issue_subscription_materializes_from_an_in_memory_provider()
     .expect("fetch-more delta");
     assert_eq!(delta.changes.as_issues().expect("appended issue rows")[0].reference.id, "WIDGET-050");
     assert!(!delta.state.as_ref().and_then(|state| state.demand.as_ref()).expect("updated demand metadata").has_more);
+
+    let search = QueryId::Issues { scope, search: Some("WIDGET-050".into()) };
+    daemon
+        .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: search.clone(), since: None }])
+        .await
+        .expect("subscribe ephemeral search");
+    let search_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::ResultSet(set) = events.recv().await.expect("daemon event") {
+                if set.query() == search && set.rows.as_issues().is_some_and(|rows| !rows.is_empty()) {
+                    return set;
+                }
+            }
+        }
+    })
+    .await
+    .expect("materialized issue search");
+    assert!(matches!(search_result.rows.as_issues().expect("search rows"), [row] if row.reference.id == "WIDGET-050"));
 }
 
 #[tokio::test]

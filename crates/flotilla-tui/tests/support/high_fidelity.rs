@@ -367,6 +367,7 @@ impl HighFidelityHarness {
                     keymap: &self.app.keymap,
                     in_flight: &self.app.in_flight,
                     namespaces: &self.app.namespaces,
+                    query_tables: &self.app.query_tables,
                 };
                 self.app.screen.render(frame, area, &mut ctx);
             })

@@ -18,6 +18,7 @@ pub mod split_table;
 pub mod status_bar_widget;
 pub mod table;
 pub mod table_action_menu;
+pub mod table_search;
 pub mod tabs;
 
 use std::{any::Any, collections::HashMap};
@@ -81,6 +82,9 @@ pub enum AppAction {
     /// Pop the active tab's in-place navigation history.
     BackView,
     ExecuteTableIntent(crate::table_view::TableIntent),
+    SetTableFilter(String),
+    SetSourceSearch(Option<String>),
+    FetchMore(flotilla_protocol::QueryId),
     /// Return to the previously active tab (overview dismiss).
     SwitchToLastView,
     /// Close the open View at this tab index (pinned overview refuses).
@@ -137,6 +141,8 @@ pub struct WidgetContext<'a> {
     pub active_repo_is_remote_only: bool,
     /// Per-namespace convoy model — used by the command palette for convoy/work completions.
     pub namespaces: &'a crate::app::NamespaceMap,
+    /// Typed named-query rows consumed by reusable tables.
+    pub query_tables: &'a crate::app::QueryTableCache,
     pub app_actions: Vec<AppAction>,
 }
 
@@ -154,6 +160,8 @@ pub struct RenderContext<'a> {
     pub in_flight: &'a HashMap<u64, InFlightCommand>,
     /// Per-namespace convoy model, keyed by namespace string.
     pub namespaces: &'a crate::app::NamespaceMap,
+    /// Typed named-query rows consumed by reusable tables.
+    pub query_tables: &'a crate::app::QueryTableCache,
 }
 
 /// A self-contained interactive widget that handles events and renders itself.

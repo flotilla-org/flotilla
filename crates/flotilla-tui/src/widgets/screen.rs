@@ -122,7 +122,9 @@ impl Screen {
                 | ViewAddress::Independents
                 | ViewAddress::Project { .. }
                 | ViewAddress::Convoy { .. }
-                | ViewAddress::Vessel { .. },
+                | ViewAddress::Vessel { .. }
+                | ViewAddress::Issues { .. }
+                | ViewAddress::Checkouts { .. },
             ) => ActivePage::Table,
             ViewTarget::View(ViewAddress::Repo { identity, .. }) => {
                 if repos.contains_key(identity) {
@@ -370,7 +372,8 @@ impl InteractiveWidget for Screen {
             ActivePage::Table => {
                 let address = ctx.views.active_address().cloned().expect("table page has a parsed address");
                 let filter = ctx.views.active_table_state().filter.clone();
-                let rows = crate::app::table_rows(ctx.namespaces);
+                let source_search = ctx.views.active_table_state().source_search.as_deref();
+                let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
                 match crate::table_view::project(&address, &rows).map(|view| view.filtered(&filter)) {
                     Ok(view) => {
                         let breadcrumbs =

@@ -284,7 +284,21 @@ pub struct NamespaceModel {
     pub last_seq: u64,
 }
 
-pub fn table_rows(namespaces: &NamespaceMap) -> crate::table_view::TableRows<'_> {
+/// Client-side projections of typed query result sets. The query identity is
+/// retained so a scoped tab can select exactly the base or ephemeral-search
+/// window it subscribed to.
+#[derive(Default)]
+pub struct QueryTableCache {
+    pub issues: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::IssueRow>>,
+    pub checkouts: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::CheckoutRow>>,
+    pub states: HashMap<flotilla_protocol::QueryId, flotilla_protocol::ResultSetState>,
+}
+
+pub fn table_rows<'a>(
+    namespaces: &'a NamespaceMap,
+    queries: &'a QueryTableCache,
+    source_search: Option<&'a str>,
+) -> crate::table_view::TableRows<'a> {
     crate::table_view::TableRows {
         convoys: namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect(),
         independents: namespaces.values().flat_map(|namespace| namespace.independents.values()).collect(),
@@ -297,6 +311,17 @@ pub fn table_rows(namespaces: &NamespaceMap) -> crate::table_view::TableRows<'_>
                     .flat_map(move |(project, rows)| rows.iter().map(move |row| (namespace.as_str(), project.as_str(), row)))
             })
             .collect(),
+        issue_results: queries
+            .issues
+            .iter()
+            .filter_map(|(query, rows)| queries.states.get(query).map(|state| (query, rows.as_slice(), state)))
+            .collect(),
+        checkout_results: queries
+            .checkouts
+            .iter()
+            .filter_map(|(query, rows)| queries.states.get(query).map(|state| (query, rows.as_slice(), state)))
+            .collect(),
+        source_search,
     }
 }
 
@@ -392,8 +417,7 @@ pub struct App {
     /// Demand-backed issue windows keyed by their fully parameterized query.
     /// Default issue sections consume this; stateless paging remains for
     /// ephemeral searches beyond the window.
-    pub materialized_issue_rows: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::IssueRow>>,
-    pub materialized_issue_states: HashMap<flotilla_protocol::QueryId, flotilla_protocol::ResultSetState>,
+    pub query_tables: QueryTableCache,
     pub pending_fetch_more: HashSet<flotilla_protocol::QueryId>,
     /// Sender half for background issue query tasks. Cloned into spawned tasks.
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
@@ -489,8 +513,7 @@ impl App {
             screen,
             repo_data: repo_data_map,
             issue_views: HashMap::new(),
-            materialized_issue_rows: HashMap::new(),
-            materialized_issue_states: HashMap::new(),
+            query_tables: QueryTableCache::default(),
             pending_fetch_more: HashSet::new(),
             issue_update_tx,
             issue_update_rx,
@@ -527,7 +550,7 @@ impl App {
         let mut queries = Vec::new();
         for view in self.views.iter() {
             let Some(address) = view.address() else { continue };
-            for query in view_kind::queries(address) {
+            for query in view_kind::queries(address, view.table_state.source_search.as_deref()) {
                 if !queries.contains(&query) {
                     queries.push(query);
                 }
@@ -907,39 +930,12 @@ impl App {
         }
     }
 
-    fn push_materialized_issue_items_to_repo_data(&self, query: &flotilla_protocol::QueryId) {
-        let flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::Repository(repository_key) } = query else {
-            return;
-        };
-        let Some((identity, repo)) = self.model.repos.iter().find(|(_, repo)| repo.repository_key.as_ref() == Some(repository_key)) else {
-            return;
-        };
-        if self.issue_views.get(identity).and_then(|view| view.search.as_ref()).is_some() {
-            return;
-        }
-        let rows = self.materialized_issue_rows.get(query).cloned().unwrap_or_default();
-        let issue_rows = rows
-            .into_iter()
-            .map(|row| crate::widgets::section_table::IssueRow {
-                id: format!("{}\0{}\0{}", row.reference.source.service, row.reference.source.scope, row.reference.id),
-                issue: row.issue,
-            })
-            .collect();
-        if let Some(handle) = self.repo_data.get(identity) {
-            let label = repo.labels.issues.section.clone();
-            handle.mutate(|data| {
-                data.issue_rows = issue_rows;
-                data.issue_section_label = label;
-            });
-        }
-    }
-
     fn sync_project_issue_rows(&mut self, query: &flotilla_protocol::QueryId) {
-        let flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::Project { namespace, name } } = query else {
+        let flotilla_protocol::QueryId::Issues { scope, search: None } = query else {
             return;
         };
-        let rows = self.materialized_issue_rows.get(query).cloned().unwrap_or_default();
-        self.namespaces.entry(namespace.clone()).or_default().project_issues.insert(name.clone(), rows);
+        let rows = self.query_tables.issues.get(query).cloned().unwrap_or_default();
+        self.namespaces.entry(scope.namespace.clone()).or_default().project_issues.insert(scope.name.clone(), rows);
     }
 
     // ── Widget stack helpers ──
@@ -972,6 +968,7 @@ impl App {
             commands: &mut self.proto_commands,
             active_repo_is_remote_only,
             namespaces: &self.namespaces,
+            query_tables: &self.query_tables,
             app_actions: Vec::new(),
         }
     }
@@ -1107,6 +1104,25 @@ impl App {
                 AppAction::ExecuteTableIntent(intent) => {
                     self.execute_table_intent(intent);
                 }
+                AppAction::SetTableFilter(filter) => {
+                    self.views.active_table_state_mut().filter = filter;
+                }
+                AppAction::SetSourceSearch(search) => {
+                    if self.views.active_table_state().source_search != search {
+                        self.views.active_table_state_mut().source_search = search;
+                        self.subscriptions_dirty = true;
+                    }
+                }
+                AppAction::FetchMore(query) => {
+                    if self.pending_fetch_more.insert(query.clone()) {
+                        let daemon = Arc::clone(&self.daemon);
+                        tokio::spawn(async move {
+                            if let Err(error) = daemon.fetch_more(&query).await {
+                                tracing::warn!(%error, %query, "fetch-more intent failed");
+                            }
+                        });
+                    }
+                }
                 AppAction::SwitchToLastView => {
                     self.switch_to_last_view();
                 }
@@ -1138,7 +1154,11 @@ impl App {
                     self.move_tab(1);
                 }
                 AppAction::Refresh => {
-                    let queries = self.views.active_address().map(view_kind::queries).unwrap_or_default();
+                    let queries = self
+                        .views
+                        .active_address()
+                        .map(|address| view_kind::queries(address, self.views.active_table_state().source_search.as_deref()))
+                        .unwrap_or_default();
                     if !queries.is_empty() {
                         for query in queries {
                             self.query_seqs.remove(&query);
@@ -1314,12 +1334,14 @@ impl App {
                         }
                     }
                     flotilla_protocol::Rows::Issues { rows, .. } => {
-                        self.materialized_issue_rows.insert(query.clone(), rows.clone());
-                        self.materialized_issue_states.insert(query.clone(), result_set.state.clone());
-                        self.push_materialized_issue_items_to_repo_data(&query);
+                        self.query_tables.issues.insert(query.clone(), rows.clone());
+                        self.query_tables.states.insert(query.clone(), result_set.state.clone());
                         self.sync_project_issue_rows(&query);
                     }
-                    flotilla_protocol::Rows::Checkouts { .. } => {}
+                    flotilla_protocol::Rows::Checkouts { rows, .. } => {
+                        self.query_tables.checkouts.insert(query.clone(), rows.clone());
+                        self.query_tables.states.insert(query, result_set.state.clone());
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1354,7 +1376,7 @@ impl App {
                         }
                     }
                     flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
-                        let rows = self.materialized_issue_rows.entry(query.clone()).or_default();
+                        let rows = self.query_tables.issues.entry(query.clone()).or_default();
                         rows.retain(|row| !removed.contains(&row.reference));
                         for changed in changed {
                             if let Some(existing) = rows.iter_mut().find(|row| row.reference == changed.reference) {
@@ -1367,12 +1389,27 @@ impl App {
                             right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference))
                         });
                         if let Some(state) = &delta.state {
-                            self.materialized_issue_states.insert(query.clone(), state.clone());
+                            self.query_tables.states.insert(query.clone(), state.clone());
                         }
-                        self.push_materialized_issue_items_to_repo_data(&query);
                         self.sync_project_issue_rows(&query);
                     }
-                    flotilla_protocol::QueryChanges::Checkouts { .. } => {}
+                    flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
+                        let rows = self.query_tables.checkouts.entry(query.clone()).or_default();
+                        rows.retain(|row| !removed.contains(&row.resource));
+                        for changed in changed {
+                            if let Some(existing) = rows.iter_mut().find(|row| row.resource == changed.resource) {
+                                *existing = changed.clone();
+                            } else {
+                                rows.push(changed.clone());
+                            }
+                        }
+                        rows.sort_by(|left, right| {
+                            (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
+                        });
+                        if let Some(state) = &delta.state {
+                            self.query_tables.states.insert(query, state.clone());
+                        }
+                    }
                 }
             }
         }

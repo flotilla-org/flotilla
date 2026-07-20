@@ -30,25 +30,39 @@ pub enum QueryId {
     /// TerminalSessions with no Convoy association. Rows are
     /// [`IndependentRow`].
     Independents,
-    /// Open issues in one Project or Repository scope. Rows are populated
+    /// Open issues in one Project scope. Rows are populated
     /// only while at least one client subscribes to this query.
-    Issues { scope: QueryScope },
-    /// Concrete observed checkouts in one Project or Repository scope.
-    Checkouts { scope: QueryScope },
+    Issues {
+        scope: QueryScope,
+        /// An ephemeral source search. `None` is the maintained open-issues
+        /// window for the Project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<String>,
+    },
+    /// Concrete observed checkouts fleet-wide (`None`) or in one Project.
+    Checkouts { scope: Option<QueryScope> },
 }
 
-/// Scope parameters owned by a curated query family.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryScope {
-    Project { namespace: String, name: String },
-    Repository(RepositoryKey),
+/// The Project scope owned by a curated query family. Repository membership
+/// expansion is an Aggregator implementation detail and never crosses the
+/// client protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct QueryScope {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl QueryScope {
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { namespace: namespace.into(), name: name.into() }
+    }
 }
 
 impl QueryId {
     /// Finite query families that are always materialized. Parameterized
     /// demand-backed queries cannot appear in a static list.
-    pub const ALWAYS_MATERIALIZED: &'static [QueryId] = &[QueryId::Convoys, QueryId::Independents];
+    pub const ALWAYS_MATERIALIZED: &'static [QueryId] = &[QueryId::Convoys, QueryId::Independents, QueryId::Checkouts { scope: None }];
 
     pub fn family(&self) -> &'static str {
         match self {
@@ -122,12 +136,14 @@ pub enum QueryChanges {
     },
     Issues {
         scope: QueryScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<String>,
         changed: Vec<IssueRow>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<IssueRef>,
     },
     Checkouts {
-        scope: QueryScope,
+        scope: Option<QueryScope>,
         changed: Vec<CheckoutRow>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
@@ -139,7 +155,7 @@ impl QueryChanges {
         match self {
             Self::Convoys { .. } => QueryId::Convoys,
             Self::Independents { .. } => QueryId::Independents,
-            Self::Issues { scope, .. } => QueryId::Issues { scope: scope.clone() },
+            Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
         }
     }
@@ -252,8 +268,16 @@ pub enum ResultSetCondition {
 pub enum Rows {
     Convoys(Vec<ConvoyRow>),
     Independents(Vec<IndependentRow>),
-    Issues { scope: QueryScope, rows: Vec<IssueRow> },
-    Checkouts { scope: QueryScope, rows: Vec<CheckoutRow> },
+    Issues {
+        scope: QueryScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search: Option<String>,
+        rows: Vec<IssueRow>,
+    },
+    Checkouts {
+        scope: Option<QueryScope>,
+        rows: Vec<CheckoutRow>,
+    },
 }
 
 impl Rows {
@@ -261,7 +285,7 @@ impl Rows {
         match self {
             Self::Convoys(_) => QueryId::Convoys,
             Self::Independents(_) => QueryId::Independents,
-            Self::Issues { scope, .. } => QueryId::Issues { scope: scope.clone() },
+            Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
         }
     }
@@ -528,12 +552,11 @@ mod tests {
     use crate::{provider_data::Issue, HostName, IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey, ResourceRef};
 
     #[test]
-    fn checkout_result_set_round_trip_preserves_scope_host_and_authority() {
-        let scope = QueryScope::Repository(RepositoryKey("repo_abc123".into()));
+    fn fleet_checkout_result_set_round_trip_preserves_host_and_authority() {
         let set = ResultSet {
             seq: 7,
             rows: Rows::Checkouts {
-                scope: scope.clone(),
+                scope: None,
                 rows: vec![CheckoutRow::builder()
                     .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-a").on_host(HostName::new("kiwi")))
                     .repo(RepositoryKey("repo_abc123".into()))
@@ -546,7 +569,7 @@ mod tests {
             state: ResultSetState::default(),
         };
 
-        assert_eq!(set.query(), QueryId::Checkouts { scope });
+        assert_eq!(set.query(), QueryId::Checkouts { scope: None });
         let json = serde_json::to_string(&set).expect("serialize checkout set");
         let decoded = serde_json::from_str::<ResultSet>(&json).expect("deserialize checkout set");
         assert_eq!(decoded, set);
@@ -554,12 +577,12 @@ mod tests {
 
     #[test]
     fn checkout_delta_round_trip_preserves_scope_rows_and_removals() {
-        let scope = QueryScope::Project { namespace: "flotilla".into(), name: "dashboard".into() };
+        let scope = QueryScope::new("flotilla", "dashboard");
         let removed = ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-old").on_host(HostName::new("kiwi"));
         let delta = ResultDelta {
             seq: 8,
             changes: QueryChanges::Checkouts {
-                scope: scope.clone(),
+                scope: Some(scope.clone()),
                 changed: vec![CheckoutRow::builder()
                     .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-new").on_host(HostName::new("mango")))
                     .repo(RepositoryKey("repo_abc123".into()))
@@ -579,7 +602,7 @@ mod tests {
             }),
         };
 
-        assert_eq!(delta.query(), QueryId::Checkouts { scope });
+        assert_eq!(delta.query(), QueryId::Checkouts { scope: Some(scope) });
         let json = serde_json::to_string(&delta).expect("serialize checkout delta");
         let decoded = serde_json::from_str::<ResultDelta>(&json).expect("deserialize checkout delta");
         assert_eq!(decoded, delta);
@@ -588,31 +611,32 @@ mod tests {
 
     #[test]
     fn issues_query_round_trips_with_owned_project_scope() {
-        let query = QueryId::Issues { scope: QueryScope::Project { namespace: "flotilla".into(), name: "dashboard".into() } };
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: None };
 
         let json = serde_json::to_string(&query).expect("serialize scoped query");
-        assert_eq!(json, r#"{"issues":{"scope":{"project":{"namespace":"flotilla","name":"dashboard"}}}}"#);
+        assert_eq!(json, r#"{"issues":{"scope":{"namespace":"flotilla","name":"dashboard"}}}"#);
         assert_eq!(serde_json::from_str::<QueryId>(&json).expect("deserialize scoped query"), query);
     }
 
     #[test]
-    fn issues_query_round_trips_with_typed_repository_scope() {
-        let query = QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_abc123".into())) };
+    fn ephemeral_issue_search_is_part_of_query_identity() {
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: Some("is:open crash".into()) };
 
         let json = serde_json::to_string(&query).expect("serialize scoped query");
-        assert_eq!(json, r#"{"issues":{"scope":{"repository":"repo_abc123"}}}"#);
+        assert_eq!(json, r#"{"issues":{"scope":{"namespace":"flotilla","name":"dashboard"},"search":"is:open crash"}}"#);
         assert_eq!(serde_json::from_str::<QueryId>(&json).expect("deserialize scoped query"), query);
     }
 
     #[test]
     fn issue_delta_round_trip_keeps_source_qualified_opaque_keys() {
-        let scope = QueryScope::Project { namespace: "flotilla".into(), name: "dashboard".into() };
+        let scope = QueryScope::new("flotilla", "dashboard");
         let source = IssueSource { service: "https://linear.app".into(), scope: "WIDGET".into() };
         let reference = IssueRef { source: source.clone(), id: "WIDGET-123".into() };
         let delta = ResultDelta {
             seq: 4,
             changes: QueryChanges::Issues {
                 scope: scope.clone(),
+                search: None,
                 changed: vec![IssueRow {
                     reference: reference.clone(),
                     issue: Issue {
@@ -632,7 +656,7 @@ mod tests {
             state: None,
         };
 
-        assert_eq!(delta.query(), QueryId::Issues { scope });
+        assert_eq!(delta.query(), QueryId::Issues { scope, search: None });
         let json = serde_json::to_string(&delta).expect("serialize issue delta");
         let decoded = serde_json::from_str::<ResultDelta>(&json).expect("deserialize issue delta");
         assert_eq!(decoded, delta);
@@ -645,7 +669,7 @@ mod tests {
 
     #[test]
     fn delta_can_replace_demand_backed_set_metadata_without_row_changes() {
-        let scope = QueryScope::Repository(RepositoryKey("repo_abc123".into()));
+        let scope = QueryScope::new("flotilla", "dashboard");
         let state = ResultSetState {
             demand: Some(DemandBackedMetadata {
                 as_of: Utc.with_ymd_and_hms(2026, 7, 14, 19, 30, 0).single().expect("timestamp"),
@@ -653,8 +677,11 @@ mod tests {
             }),
             conditions: vec![],
         };
-        let delta =
-            ResultDelta { seq: 2, changes: QueryChanges::Issues { scope, changed: vec![], removed: vec![] }, state: Some(state.clone()) };
+        let delta = ResultDelta {
+            seq: 2,
+            changes: QueryChanges::Issues { scope, search: None, changed: vec![], removed: vec![] },
+            state: Some(state.clone()),
+        };
 
         let json = serde_json::to_string(&delta).expect("serialize metadata delta");
         let decoded = serde_json::from_str::<ResultDelta>(&json).expect("deserialize metadata delta");

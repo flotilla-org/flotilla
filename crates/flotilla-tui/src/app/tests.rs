@@ -1753,12 +1753,10 @@ fn app_applies_independent_sets_and_removal_deltas_without_disturbing_convoys() 
 }
 
 #[test]
-fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
+fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
     let mut app = stub_app();
-    let identity = app.model.repo_order[0].clone();
-    let repository_key = flotilla_protocol::RepositoryKey("repo_materialized".into());
-    app.model.repos.get_mut(&identity).expect("repo model").repository_key = Some(repository_key.clone());
-    let scope = flotilla_protocol::QueryScope::Repository(repository_key);
+    let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None };
     let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
     let mut first = TestIssue::new("First materialized issue").id("LINEAR-1").build();
     first.reference.source = source.clone();
@@ -1768,6 +1766,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
         seq: 1,
         rows: flotilla_protocol::Rows::Issues {
             scope: scope.clone(),
+            search: None,
             rows: vec![flotilla_protocol::IssueRow { reference: first_ref.clone(), issue: first }],
         },
         state: flotilla_protocol::ResultSetState {
@@ -1778,7 +1777,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
             conditions: vec![],
         },
     })));
-    assert_eq!(app.repo_data[&identity].read().issue_rows[0].issue.reference.id, "LINEAR-1");
+    assert_eq!(app.query_tables.issues[&query][0].issue.reference.id, "LINEAR-1");
 
     let mut second = TestIssue::new("Second materialized issue").id("LINEAR-2").build();
     second.reference.source = source;
@@ -1787,6 +1786,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
         seq: 2,
         changes: flotilla_protocol::QueryChanges::Issues {
             scope,
+            search: None,
             changed: vec![flotilla_protocol::IssueRow { reference: second_ref, issue: second }],
             removed: vec![first_ref],
         },
@@ -1799,19 +1799,43 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_repository_section() {
         }),
     })));
 
-    let data = app.repo_data[&identity].read();
-    assert_eq!(data.issue_rows.len(), 1);
-    assert_eq!(data.issue_rows[0].issue.reference.id, "LINEAR-2");
+    assert_eq!(app.query_tables.issues[&query].len(), 1);
+    assert_eq!(app.query_tables.issues[&query][0].issue.reference.id, "LINEAR-2");
+}
+
+#[test]
+fn app_applies_checkout_sets_and_removal_deltas_to_the_typed_query_cache() {
+    let mut app = stub_app();
+    let query = flotilla_protocol::QueryId::Checkouts { scope: None };
+    let row = flotilla_protocol::CheckoutRow::builder()
+        .resource(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "widgets"))
+        .repo(flotilla_protocol::RepositoryKey("repo_widgets".into()))
+        .path("/work/widgets")
+        .branch("main")
+        .host(HostName::new("kiwi"))
+        .authority(flotilla_protocol::LifecycleAuthority::Observed)
+        .build();
+    app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq: 1,
+        rows: flotilla_protocol::Rows::Checkouts { scope: None, rows: vec![row.clone()] },
+        state: Default::default(),
+    })));
+    assert_eq!(app.query_tables.checkouts[&query], vec![row.clone()]);
+
+    app.handle_daemon_event(DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
+        seq: 2,
+        changes: flotilla_protocol::QueryChanges::Checkouts { scope: None, changed: vec![], removed: vec![row.resource] },
+        state: None,
+    })));
+    assert!(app.query_tables.checkouts[&query].is_empty());
 }
 
 #[tokio::test]
 async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
     let mut app = stub_app();
-    let identity = app.model.repo_order[0].clone();
-    let repository_key = flotilla_protocol::RepositoryKey("repo_materialized".into());
-    app.model.repos.get_mut(&identity).expect("repo model").repository_key = Some(repository_key.clone());
-    let scope = flotilla_protocol::QueryScope::Repository(repository_key);
-    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone() };
+    let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None };
+    app.open_view("issues?project=flotilla%2Froadmap".parse().expect("address"));
     let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
     let rows = (1..=50)
         .map(|id| {
@@ -1823,7 +1847,7 @@ async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
 
     app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
         seq: 1,
-        rows: flotilla_protocol::Rows::Issues { scope, rows },
+        rows: flotilla_protocol::Rows::Issues { scope, search: None, rows },
         state: flotilla_protocol::ResultSetState {
             demand: Some(flotilla_protocol::DemandBackedMetadata {
                 as_of: "2026-07-15T12:00:00Z".parse().expect("timestamp"),
@@ -1833,12 +1857,47 @@ async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
         },
     })));
 
-    let page = app.screen.repo_pages.get_mut(&identity).expect("repo page");
-    page.reconcile_if_changed();
-    page.table.select_flat_index(44);
+    let rows = crate::app::table_rows(&app.namespaces, &app.query_tables, None);
+    let view = crate::table_view::project(app.views.active_address().expect("active address"), &rows).expect("table");
+    app.views.active_table_state_mut().reconcile(&view);
+    app.views.active_table_state_mut().select_index(&view, 44);
     app.handle_key(key(KeyCode::Char('j')));
 
     assert!(app.pending_fetch_more.contains(&query));
+}
+
+#[test]
+fn source_search_replaces_the_issue_subscription_without_changing_the_persisted_view() {
+    let mut app = stub_app();
+    app.open_view("issues?project=flotilla%2Froadmap".parse().expect("address"));
+    let base = flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None };
+    assert!(app.query_cursors().iter().any(|cursor| cursor.query == base));
+
+    app.process_app_actions(vec![crate::widgets::AppAction::SetSourceSearch(Some("widget".into()))]);
+    let search = flotilla_protocol::QueryId::Issues {
+        scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"),
+        search: Some("widget".into()),
+    };
+    let queries = app.query_cursors().into_iter().map(|cursor| cursor.query).collect::<Vec<_>>();
+    assert!(queries.contains(&search));
+    assert!(!queries.contains(&base), "source search replaces the base window while active");
+    assert_eq!(app.views.to_entries()[app.views.active_index()].address, "issues?project=flotilla%2Froadmap");
+
+    app.process_app_actions(vec![crate::widgets::AppAction::SetSourceSearch(None)]);
+    assert!(app.query_cursors().iter().any(|cursor| cursor.query == base));
+}
+
+#[test]
+fn escape_restores_the_base_issue_window_even_before_search_results_arrive() {
+    let mut app = stub_app();
+    app.open_view("issues?project=flotilla%2Froadmap".parse().expect("address"));
+    app.process_app_actions(vec![crate::widgets::AppAction::SetSourceSearch(Some("widget".into()))]);
+
+    app.handle_key(key(KeyCode::Esc));
+
+    assert_eq!(app.views.active_table_state().source_search, None);
+    assert!(app.query_cursors().iter().any(|cursor| cursor.query
+        == flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None }));
 }
 
 // -- Convoys tab rendering --
@@ -1879,6 +1938,7 @@ fn screen_renders_convoys_page_on_convoys_tab() {
                 keymap: &app.keymap,
                 in_flight: &app.in_flight,
                 namespaces: &app.namespaces,
+                query_tables: &app.query_tables,
             };
             app.screen.render(f, area, &mut ctx);
         })
@@ -1935,9 +1995,10 @@ fn selected_table_name(app: &App) -> Option<String> {
         ViewAddress::Convoys { .. } | ViewAddress::Independents => 0,
         ViewAddress::Project { .. } => 1,
         ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
+        ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => 0,
         ViewAddress::Overview | ViewAddress::Repo { .. } => return None,
     };
-    let rows = crate::app::table_rows(&app.namespaces);
+    let rows = crate::app::table_rows(&app.namespaces, &app.query_tables, app.views.active_table_state().source_search.as_deref());
     let view = crate::table_view::project(address, &rows).ok()?;
     app.views.active_table_state().selected_row(&view).map(|row| row.cells[name_column].text.clone())
 }
@@ -2090,6 +2151,7 @@ fn mouse_click_selects_and_double_click_drills() {
                 keymap: &app.keymap,
                 in_flight: &app.in_flight,
                 namespaces: &app.namespaces,
+                query_tables: &app.query_tables,
             };
             app.screen.render(frame, frame.area(), &mut ctx);
         })

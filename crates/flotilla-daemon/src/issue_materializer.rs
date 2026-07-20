@@ -203,7 +203,8 @@ async fn load_window(
     state: &AggregatorProjectionState,
     event_tx: &broadcast::Sender<DaemonEvent>,
 ) -> MaterializedWindow {
-    let QueryId::Issues { scope } = query else { unreachable!("issue materializer only accepts issue queries") };
+    let QueryId::Issues { scope, search } = query else { unreachable!("issue materializer only accepts issue queries") };
+    let params = IssueQuery { search: search.clone() };
     let sources = match resolver.resolve_issue_sources(scope).await {
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
@@ -224,22 +225,31 @@ async fn load_window(
         }
     };
 
-    let loaded = stream::iter(sources.into_iter().map(|source| async move {
-        let provider = resolver.issue_provider_for(&source).await.map_err(|message| unavailable(Some(source.clone()), message))?;
-        // Capture before the request. Re-reading changes is safe; skipping an
-        // update that arrived during the request is not.
-        let refresh_cursor = Utc::now().to_rfc3339();
-        let page = provider
-            .query(&source, &IssueQuery::default(), 1, PAGE_SIZE)
-            .await
-            .map_err(|message| unavailable(Some(source.clone()), message))?;
-        let rows = page.items.into_iter().map(issue_row).collect::<Vec<_>>();
-        let source_rows = rows.iter().cloned().map(|row| (row.reference.clone(), row)).collect::<HashMap<_, _>>();
-        let loaded_count = source_rows.len();
-        Ok::<_, ResultSetCondition>((
-            IssueSourceWindow { source, provider, next_page: 2, has_more: page.has_more, refresh_cursor, loaded_count, rows: source_rows },
-            rows,
-        ))
+    let loaded = stream::iter(sources.into_iter().map(|source| {
+        let params = params.clone();
+        async move {
+            let provider = resolver.issue_provider_for(&source).await.map_err(|message| unavailable(Some(source.clone()), message))?;
+            // Capture before the request. Re-reading changes is safe; skipping an
+            // update that arrived during the request is not.
+            let refresh_cursor = Utc::now().to_rfc3339();
+            let page =
+                provider.query(&source, &params, 1, PAGE_SIZE).await.map_err(|message| unavailable(Some(source.clone()), message))?;
+            let rows = page.items.into_iter().map(issue_row).collect::<Vec<_>>();
+            let source_rows = rows.iter().cloned().map(|row| (row.reference.clone(), row)).collect::<HashMap<_, _>>();
+            let loaded_count = source_rows.len();
+            Ok::<_, ResultSetCondition>((
+                IssueSourceWindow {
+                    source,
+                    provider,
+                    next_page: 2,
+                    has_more: page.has_more,
+                    refresh_cursor,
+                    loaded_count,
+                    rows: source_rows,
+                },
+                rows,
+            ))
+        }
     }))
     .buffer_unordered(MAX_CONCURRENT_SOURCES)
     .collect::<Vec<_>>()
@@ -277,7 +287,7 @@ async fn fetch_more(
         .iter()
         .enumerate()
         .filter(|(_, source)| source.has_more)
-        .map(|(index, source)| (index, Arc::clone(&source.provider), source.source.clone(), source.next_page))
+        .map(|(index, source)| (index, Arc::clone(&source.provider), source.source.clone(), issue_params(query), source.next_page))
         .collect::<Vec<_>>();
     let mut futures = Vec::<BoxFuture<'static, (usize, Result<IssueResultPage, String>)>>::with_capacity(requests.len());
     for request in requests {
@@ -323,6 +333,10 @@ async fn refresh_window(
     state: &AggregatorProjectionState,
     event_tx: &broadcast::Sender<DaemonEvent>,
 ) {
+    if matches!(query, QueryId::Issues { search: Some(_), .. }) {
+        *window = load_window(query, generation, resolver, state, event_tx).await;
+        return;
+    }
     if window.sources.is_empty() || window.needs_full_reload {
         *window = load_window(query, generation, resolver, state, event_tx).await;
         return;
@@ -445,9 +459,14 @@ fn sort_rows(rows: &mut [IssueRow]) {
 }
 
 async fn query_page(
-    (index, provider, source, page): (usize, Arc<dyn IssueProvider>, IssueSource, u32),
+    (index, provider, source, params, page): (usize, Arc<dyn IssueProvider>, IssueSource, IssueQuery, u32),
 ) -> (usize, Result<IssueResultPage, String>) {
-    (index, provider.query(&source, &IssueQuery::default(), page, PAGE_SIZE).await)
+    (index, provider.query(&source, &params, page, PAGE_SIZE).await)
+}
+
+fn issue_params(query: &QueryId) -> IssueQuery {
+    let QueryId::Issues { search, .. } = query else { unreachable!("issue params require an issue query") };
+    IssueQuery { search: search.clone() }
 }
 
 async fn changed_since(
@@ -461,7 +480,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use chrono::Duration as ChronoDuration;
-    use flotilla_protocol::{issue_query::IssueResultPage, test_support::TestIssue, Issue, IssueChangeset, QueryCursor, RepositoryKey};
+    use flotilla_protocol::{issue_query::IssueResultPage, test_support::TestIssue, Issue, IssueChangeset, QueryCursor};
     use tokio::sync::{Mutex, Notify};
     use uuid::Uuid;
 
@@ -528,8 +547,7 @@ mod tests {
     #[async_trait]
     impl IssueMaterializationResolver for ScopeResolver {
         async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
-            let QueryScope::Repository(RepositoryKey(name)) = scope else { unreachable!("repository scope") };
-            Ok(vec![IssueSource { service: "https://issues.example".into(), scope: name.clone() }])
+            Ok(vec![IssueSource { service: "https://issues.example".into(), scope: scope.name.clone() }])
         }
 
         async fn issue_provider_for(&self, _source: &IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
@@ -607,8 +625,8 @@ mod tests {
         IssueResultPage { items: ids.iter().map(|id| issue(id)).collect(), total: None, has_more }
     }
 
-    fn repository_query(name: &str) -> QueryId {
-        QueryId::Issues { scope: QueryScope::Repository(RepositoryKey(name.into())) }
+    fn project_query(name: &str) -> QueryId {
+        QueryId::Issues { scope: QueryScope::new("flotilla", name), search: None }
     }
 
     fn subscribe(state: &AggregatorProjectionState, query: &QueryId) -> u64 {
@@ -639,9 +657,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_demand_loads_a_source_qualified_first_page() {
+    async fn project_demand_loads_a_source_qualified_first_page() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_widget");
+        let query = project_query("repo_widget");
         let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["WIDGET-123"], false)], vec![]));
         let (_materializer, mut events) = manager(&state, &query, vec![source.clone()], provider);
@@ -656,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn project_demand_unions_constituent_source_windows() {
         let state = AggregatorProjectionState::new();
-        let query = QueryId::Issues { scope: QueryScope::Project { namespace: "flotilla".into(), name: "platform".into() } };
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "platform"), search: None };
         let source_a = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
         let source_b = IssueSource { service: "https://issues.example".into(), scope: "widgets/ui".into() };
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["WIDGET-123"], false), page(&["WIDGET-123"], false)], vec![]));
@@ -676,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_more_appends_rows_and_updates_metadata() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_linear");
+        let query = project_query("repo_linear");
         let source = IssueSource { service: "https://linear.example".into(), scope: "widgets".into() };
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["LINEAR-A"], true), page(&["LINEAR-B"], false)], vec![]));
         let (materializer, mut events) = manager(&state, &query, vec![source], provider);
@@ -700,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn empty_final_page_emits_metadata_only_delta_that_clears_has_more() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_empty_final");
+        let query = project_query("repo_empty_final");
         let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/empty".into() };
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["ONLY"], true), page(&[], false)], vec![]));
         let (materializer, mut events) = manager(&state, &query, vec![source], provider);
@@ -716,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_refresh_updates_and_evicts_rows() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_refresh");
+        let query = project_query("repo_refresh");
         let source = IssueSource { service: "https://issues.example".into(), scope: "refresh/repo".into() };
         let changes = IssueChangeset {
             updated: vec![issue("NEW-10")],
@@ -750,7 +768,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_refresh_preserves_the_loaded_page_boundary() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_boundary");
+        let query = project_query("repo_boundary");
         let source = IssueSource { service: "https://issues.example".into(), scope: "boundary/repo".into() };
         let base = Utc::now();
         let initial = (0..PAGE_SIZE)
@@ -782,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn boundary_removal_reloads_to_promote_the_next_unseen_row() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_boundary_removal");
+        let query = project_query("repo_boundary_removal");
         let source = IssueSource { service: "https://issues.example".into(), scope: "boundary/removal".into() };
         let initial = (0..PAGE_SIZE).map(|index| issue(&format!("ISSUE-{index:02}"))).collect::<Vec<_>>();
         let reloaded = (1..=PAGE_SIZE).map(|index| issue(&format!("ISSUE-{index:02}"))).collect::<Vec<_>>();
@@ -814,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn closed_only_refresh_advances_the_conservative_cursor() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("repo_closed_cursor");
+        let query = project_query("repo_closed_cursor");
         let source = IssueSource { service: "https://issues.example".into(), scope: "closed/repo".into() };
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["CLOSED"], false)], vec![
             IssueChangeset { updated: vec![], closed: vec![IssueRef { source: source.clone(), id: "CLOSED".into() }], has_more: false },
@@ -837,8 +855,8 @@ mod tests {
     #[tokio::test]
     async fn slow_provider_io_does_not_block_other_query_materializations() {
         let state = AggregatorProjectionState::new();
-        let slow = repository_query("slow");
-        let fast = repository_query("fast");
+        let slow = project_query("slow");
+        let fast = project_query("fast");
         let slow_generation = subscribe(&state, &slow);
         let fast_generation = subscribe(&state, &fast);
         let provider =
@@ -862,7 +880,7 @@ mod tests {
     #[tokio::test]
     async fn coalesced_generation_replacement_cancels_the_old_provider_request() {
         let state = AggregatorProjectionState::new();
-        let query = repository_query("slow");
+        let query = project_query("slow");
         let provider =
             Arc::new(BlockingProvider { slow_started: Notify::new(), release_slow: Notify::new(), slow_cancelled: Notify::new() });
         let resolver = Arc::new(ScopeResolver { provider: provider.clone() });
@@ -883,7 +901,7 @@ mod tests {
     async fn stale_fetch_more_intent_is_not_delivered_to_a_recreated_lifetime() {
         let state = AggregatorProjectionState::new();
         let subscriber = Uuid::new_v4();
-        let query = repository_query("recreated");
+        let query = project_query("recreated");
         let source = IssueSource { service: "https://issues.example".into(), scope: "recreated".into() };
         let provider = Arc::new(ScriptedProvider::new(
             vec![page(&["OLD-LIFETIME"], true), page(&["NEW-LIFETIME"], true), page(&["STALE-PAGE"], false)],

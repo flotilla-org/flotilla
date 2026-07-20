@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, fmt, str::FromStr};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{RepoIdentity, RepositoryKey};
+use crate::{QueryScope, RepoIdentity, RepositoryKey};
 
 /// Optional URI scheme prefix, accepted and stripped on parse.
 pub const SCHEME_PREFIX: &str = "flotilla://";
@@ -21,6 +21,9 @@ pub const SCHEME_PREFIX: &str = "flotilla://";
 /// separator, reserved address syntax, and characters a shell or renderer
 /// would misread.
 const SEGMENT: &AsciiSet = &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b' ');
+
+/// Reserved delimiters are encoded inside query-component values as well.
+const QUERY_COMPONENT: &AsciiSet = &SEGMENT.add(b'&').add(b'=');
 
 /// The address of a View: kind + typed parameters. Identity for
 /// open-or-focus semantics and the persisted form in `open-views.toml`.
@@ -38,6 +41,10 @@ pub enum ViewAddress {
     Vessel { namespace: String, convoy: String, vessel: String },
     /// A project dashboard: the work of one Project resource.
     Project { namespace: String, name: String },
+    /// The demand-backed issues window for one Project.
+    Issues { scope: QueryScope },
+    /// Concrete checkouts fleet-wide or narrowed to one Project.
+    Checkouts { scope: Option<QueryScope> },
     /// The per-repository view, identified by canonical remote identity.
     Repo {
         identity: RepoIdentity,
@@ -64,6 +71,8 @@ impl ViewAddress {
             Self::Convoy { .. } => "convoy",
             Self::Vessel { .. } => "vessel",
             Self::Project { .. } => "project",
+            Self::Issues { .. } => "issues",
+            Self::Checkouts { .. } => "checkouts",
             Self::Repo { .. } => "repo",
         }
     }
@@ -71,6 +80,10 @@ impl ViewAddress {
 
 fn encode(segment: &str) -> impl fmt::Display + '_ {
     utf8_percent_encode(segment, SEGMENT)
+}
+
+fn encode_query_component(value: &str) -> impl fmt::Display + '_ {
+    utf8_percent_encode(value, QUERY_COMPONENT)
 }
 
 fn decode(segment: &str) -> Result<String, String> {
@@ -91,6 +104,13 @@ impl fmt::Display for ViewAddress {
                 write!(f, "vessel/{}/{}/{}", encode(namespace), encode(convoy), encode(vessel))
             }
             Self::Project { namespace, name } => write!(f, "project/{}/{}", encode(namespace), encode(name)),
+            Self::Issues { scope } => {
+                write!(f, "issues?project={}", encode_query_component(&format!("{}/{}", scope.namespace, scope.name)))
+            }
+            Self::Checkouts { scope: Some(scope) } => {
+                write!(f, "checkouts?project={}", encode_query_component(&format!("{}/{}", scope.namespace, scope.name)))
+            }
+            Self::Checkouts { scope: None } => f.write_str("checkouts"),
             Self::Repo { identity, repository_key } => {
                 write!(f, "repo/{}", encode(&identity.authority))?;
                 if identity.path.split('/').any(|part| part.is_empty()) {
@@ -130,7 +150,8 @@ impl FromStr for ViewAddress {
         if segments.iter().any(|seg| seg.is_empty()) {
             return Err(format!("view address has an empty segment: {s}"));
         }
-        let address = match segments[0] {
+        let kind = segments[0].to_ascii_lowercase();
+        let address = match kind.as_str() {
             "overview" => match segments.len() {
                 1 => Ok(Self::Overview),
                 _ => Err(format!("overview takes no parameters: {s}")),
@@ -157,6 +178,20 @@ impl FromStr for ViewAddress {
                 [namespace, name] => Ok(Self::Project { namespace: decode(namespace)?, name: decode(name)? }),
                 _ => Err(format!("project takes exactly two parameters (namespace, name): {s}")),
             },
+            "issues" => match segments.len() {
+                1 => {
+                    let value = parameters.remove("project").ok_or_else(|| "issues requires a project parameter".to_string())?;
+                    Ok(Self::Issues { scope: parse_project_scope(value)? })
+                }
+                _ => Err(format!("issues takes no positional parameters: {s}")),
+            },
+            "checkouts" => match segments.len() {
+                1 => {
+                    let scope = parameters.remove("project").map(parse_project_scope).transpose()?;
+                    Ok(Self::Checkouts { scope })
+                }
+                _ => Err(format!("checkouts takes no positional parameters: {s}")),
+            },
             "repo" => match &segments[1..] {
                 [] | [_] => Err(format!("repo takes an authority and a path: {s}")),
                 [authority, path @ ..] => {
@@ -172,6 +207,17 @@ impl FromStr for ViewAddress {
         }
         Ok(address)
     }
+}
+
+fn parse_project_scope(value: &str) -> Result<QueryScope, String> {
+    let decoded = decode(value)?;
+    let Some((namespace, name)) = decoded.split_once('/') else {
+        return Err(format!("project scope must be <namespace>/<name>: {decoded}"));
+    };
+    if namespace.is_empty() || name.is_empty() || name.contains('/') {
+        return Err(format!("project scope must be <namespace>/<name>: {decoded}"));
+    }
+    Ok(QueryScope::new(namespace, name))
 }
 
 fn parse_parameters(query: Option<&str>) -> Result<BTreeMap<&str, &str>, String> {
@@ -230,6 +276,23 @@ mod tests {
     fn independents_round_trips() {
         assert_eq!("independents".parse::<ViewAddress>().expect("parse"), ViewAddress::Independents);
         assert_eq!(ViewAddress::Independents.to_string(), "independents");
+    }
+
+    #[test]
+    fn project_scoped_table_addresses_round_trip_canonically() {
+        let issues = "issues?project=flotilla%2froadmap".parse::<ViewAddress>().expect("parse issues address");
+        assert_eq!(issues.to_string(), "issues?project=flotilla%2Froadmap");
+
+        let checkouts = "CHECKOUTS?project=flotilla%2froadmap".parse::<ViewAddress>().expect("parse checkouts address");
+        assert_eq!(checkouts.to_string(), "checkouts?project=flotilla%2Froadmap");
+    }
+
+    #[test]
+    fn fleet_checkouts_is_valid_but_bare_issues_is_not() {
+        let checkouts = "checkouts".parse::<ViewAddress>().expect("parse fleet checkouts");
+        assert_eq!(checkouts.to_string(), "checkouts");
+
+        assert_eq!("issues".parse::<ViewAddress>().expect_err("bare issues must fail"), "issues requires a project parameter");
     }
 
     #[test]

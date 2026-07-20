@@ -166,6 +166,9 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
+    h(BindingModeId::Convoys, "/", Action::OpenTableFilter, "Filter"),
+    h(BindingModeId::Convoys, "s", Action::OpenSourceSearch, "Search source"),
+    h(BindingModeId::Convoys, "f", Action::FetchMore, "Fetch more"),
     // Legacy mode retained only so existing user keybinding files still parse
     // while the table slices land; no View selects it after #733.
     // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to

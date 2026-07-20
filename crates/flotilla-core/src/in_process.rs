@@ -1336,41 +1336,20 @@ impl InProcessDaemon {
         &self,
         scope: &flotilla_protocol::QueryScope,
     ) -> Result<Vec<flotilla_protocol::IssueSource>, String> {
-        match scope {
-            flotilla_protocol::QueryScope::Repository(key) => {
-                let namespace = self.provisioning_namespace().await;
-                let repository = self
-                    .resource_backend
-                    .clone()
-                    .using::<Repository>(&namespace)
-                    .get(&key.to_string())
-                    .await
-                    .map_err(|error| format!("repository {key}: {error}"))?;
-                repository
-                    .spec
-                    .forge()
-                    .map(|forge| {
-                        vec![flotilla_protocol::IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() }]
-                    })
-                    .ok_or_else(|| format!("repository {key} has no issue source"))
+        let project = self
+            .resource_backend
+            .clone()
+            .using::<Project>(&scope.namespace)
+            .get(&scope.name)
+            .await
+            .map_err(|error| format!("project {}/{}: {error}", scope.namespace, scope.name))?;
+        match resolve_project_issue_sources(&self.resource_backend.clone().using::<Repository>(&scope.namespace), &project.spec).await {
+            IssueSourceResolution::Available { sources } => Ok(sources),
+            IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
+                Err(format!("repository {repository}: {message}"))
             }
-            flotilla_protocol::QueryScope::Project { namespace, name } => {
-                let project = self
-                    .resource_backend
-                    .clone()
-                    .using::<Project>(namespace)
-                    .get(name)
-                    .await
-                    .map_err(|error| format!("project {namespace}/{name}: {error}"))?;
-                match resolve_project_issue_sources(&self.resource_backend.clone().using::<Repository>(namespace), &project.spec).await {
-                    IssueSourceResolution::Available { sources } => Ok(sources),
-                    IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable { repository, message }) => {
-                        Err(format!("repository {repository}: {message}"))
-                    }
-                    IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => {
-                        Err(format!("project {namespace}/{name} has no issue source"))
-                    }
-                }
+            IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => {
+                Err(format!("project {}/{} has no issue source", scope.namespace, scope.name))
             }
         }
     }

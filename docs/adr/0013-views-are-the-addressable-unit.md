@@ -108,3 +108,18 @@ concept (see CONTEXT.md: **View**).
 - Open Views drive the `SubscribeQueries` set (union across open Views,
   recomputed on open/close); Plane-A repo streams stay global and outside
   this lifecycle until they are deleted with Plane A.
+
+## Amendment: curated query-family Views (2026-07-20)
+
+Issues and checkouts are addressable as single-table Views. Their canonical
+grammar is `issues?project=<namespace%2Fname>`,
+`checkouts?project=<namespace%2Fname>`, and bare `checkouts` for the
+fleet-wide form. Bare `issues` is invalid. Family names and percent escapes
+render canonically in lowercase/uppercase respectively, and parsed addresses
+deduplicate by their typed identity. The earlier experimental `?repo=` form
+is not part of the contract.
+
+The client-visible query scope is Project-only: Repository membership is an
+Aggregator implementation detail. Source search is transient state of an
+open issues View, not part of its persisted address; leaving search restores
+the base materialized window.

@@ -499,6 +499,16 @@ mod tests {
     }
 
     #[test]
+    fn canonical_query_family_addresses_focus_the_existing_view() {
+        let mut views = three_tabs();
+        assert!(views.open_or_focus(addr("ISSUES?project=flotilla%2froadmap")));
+        let len = views.len();
+        assert!(!views.open_or_focus(addr("issues?project=flotilla%2Froadmap")));
+        assert_eq!(views.len(), len);
+        assert_eq!(views.active_address().map(ToString::to_string).as_deref(), Some("issues?project=flotilla%2Froadmap"));
+    }
+
+    #[test]
     fn open_or_focus_inserts_after_active_never_before_overview() {
         let mut views = three_tabs();
         assert!(views.open_or_focus(addr("repo/github.com/o/other")));
