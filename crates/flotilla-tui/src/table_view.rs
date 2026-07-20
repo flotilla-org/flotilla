@@ -104,7 +104,7 @@ pub struct ProjectTableState {
     convoys: TableState,
     checkouts: TableState,
     issues: TableState,
-    pub scroll_offset: usize,
+    scroll_offset: usize,
 }
 
 impl Default for ProjectTableState {
