@@ -254,21 +254,8 @@ impl InteractiveWidget for ProjectPageWidget {
         let layouts = Self::layouts(&panels);
         Self::reconcile(&layouts, ctx.views.active_project_table_state_mut());
         match action {
-            Action::OpenTableFilter => {
-                return Outcome::Push(Box::new(TableSearchWidget::local(&ctx.views.active_table_state().filter)));
-            }
-            Action::OpenSourceSearch => {
-                let state = ctx.views.active_project_table_state();
-                if state.active() != ProjectPanelKind::Issues {
-                    ctx.app_actions.push(AppAction::ShowStatus("Source search is only available for the Issues panel".into()));
-                    return Outcome::Consumed;
-                }
-                let Some(panel) = panels.iter().find(|panel| panel.kind == ProjectPanelKind::Issues) else { return Outcome::Consumed };
-                let ViewAddress::Issues { scope } = &panel.target else { return Outcome::Consumed };
-                return Outcome::Push(Box::new(TableSearchWidget::source(
-                    state.issue_source_search(),
-                    &format!("{}/{}", scope.namespace, scope.name),
-                )));
+            Action::OpenFind => {
+                return Outcome::Push(Box::new(TableSearchWidget::find(&ctx.views.active_table_state().filter)));
             }
             Action::Dismiss
                 if ctx.views.active_project_table_state().active() == ProjectPanelKind::Issues
