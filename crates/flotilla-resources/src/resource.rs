@@ -103,7 +103,10 @@ pub struct InputMeta {
 
 impl InputMeta {
     pub fn lifecycle_authority(&self) -> Result<Option<LifecycleAuthority>, ResourceError> {
-        self.labels.get(AUTHORITY_LABEL).map(|value| LifecycleAuthority::from_label_value(value)).transpose()
+        self.labels
+            .get(AUTHORITY_LABEL)
+            .map(|value| LifecycleAuthority::from_label_value(value).map_err(ResourceError::invalid))
+            .transpose()
     }
 
     pub fn set_lifecycle_authority(&mut self, authority: LifecycleAuthority) {
@@ -147,7 +150,10 @@ pub struct ObjectMeta {
 
 impl ObjectMeta {
     pub fn lifecycle_authority(&self) -> Result<Option<LifecycleAuthority>, ResourceError> {
-        self.labels.get(AUTHORITY_LABEL).map(|value| LifecycleAuthority::from_label_value(value)).transpose()
+        self.labels
+            .get(AUTHORITY_LABEL)
+            .map(|value| LifecycleAuthority::from_label_value(value).map_err(ResourceError::invalid))
+            .transpose()
     }
 
     pub fn is_pending_finalization(&self) -> bool {

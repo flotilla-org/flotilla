@@ -3,7 +3,11 @@
 //! Verifies that creating a Convoy resource causes a ResultSet event to
 //! reach subscribed clients through the daemon's broadcast event bus.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_core::{
     config::ConfigStore,
@@ -17,13 +21,14 @@ use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
 use flotilla_protocol::{
     result_set::{ConvoyRow, IndependentRow, QueryId, ResultSet},
     test_support::TestIssue,
-    DaemonEvent, HostName, QueryCursor, QueryScope,
+    DaemonEvent, HostName, LifecycleAuthority, QueryCursor, QueryScope,
 };
 use flotilla_resources::{
-    Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec, HostDirectEnvironmentSpec,
-    InMemoryBackend, InputMeta, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot,
-    CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
+    HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository,
+    RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_LABEL,
+    VESSEL_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -63,6 +68,188 @@ fn convoy_rows(result_set: &ResultSet) -> &[ConvoyRow] {
 
 fn independent_rows(result_set: &ResultSet) -> &[IndependentRow] {
     result_set.rows.as_independents().expect("independent rows")
+}
+
+#[tokio::test]
+async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository");
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("widgets".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Widgets".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
+                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key.clone()).build()])
+                .build(),
+        )
+        .await
+        .expect("create project");
+    let daemon =
+        InProcessDaemon::new_with_resource_backend(vec![], Arc::clone(&config), fake_discovery(false), HostName::new("local"), backend)
+            .await;
+    let observed = daemon.observed_resource_backend();
+    let options = RuntimeOptions {
+        namespace: "flotilla".into(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        ..RuntimeOptions::default()
+    };
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
+    let repository_query = QueryId::Checkouts { scope: QueryScope::Repository(repository_key.clone()) };
+    let project_query = QueryId::Checkouts { scope: QueryScope::Project { namespace: "flotilla".into(), name: "widgets".into() } };
+    let subscriber = uuid::Uuid::new_v4();
+
+    let initial_sequences = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = daemon
+                .subscribe_queries(subscriber, &[QueryCursor { query: repository_query.clone(), since: None }, QueryCursor {
+                    query: project_query.clone(),
+                    since: None,
+                }])
+                .await
+                .expect("subscribe checkout queries");
+            let result_sets = events
+                .iter()
+                .filter_map(|event| match event {
+                    DaemonEvent::ResultSet(set) if matches!(set.query(), QueryId::Checkouts { .. }) => Some(set),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if result_sets.len() == 2 && result_sets.iter().all(|set| set.state.conditions.is_empty()) {
+                break result_sets.iter().map(|set| (set.query(), set.seq)).collect::<HashMap<_, _>>();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checkout scopes become available");
+
+    let mut events = daemon.subscribe();
+    let checkouts = observed.using::<Checkout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder().name("checkout-widgets".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &CheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("feature/query".to_string())
+                    .path("/work/widgets".to_string())
+                    .repo_ref(repository_key.clone())
+                    .host_ref(daemon.local_host_id().expect("local host id").to_string())
+                    .is_main(false)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("create observed checkout");
+
+    let mut additions = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while additions.len() < 2 {
+            if let DaemonEvent::ResultDelta(delta) = events.recv().await.expect("checkout event") {
+                if matches!(delta.query(), QueryId::Checkouts { .. }) {
+                    additions.insert(delta.query(), delta);
+                }
+            }
+        }
+    })
+    .await
+    .expect("repository and project checkout additions");
+    for query in [&repository_query, &project_query] {
+        let rows = additions.get(query).expect("scoped addition").changes.as_checkouts().expect("checkout changes");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/work/widgets");
+        assert_eq!(rows[0].branch, "feature/query");
+        assert_eq!(rows[0].authority, LifecycleAuthority::Adopted);
+        assert_eq!(rows[0].host, HostName::new("local"));
+    }
+
+    let checkout = checkouts
+        .update(
+            &InputMeta::builder().name(checkout.metadata.name.clone()).build().with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &checkout.metadata.resource_version,
+            &CheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("feature/revised".to_string())
+                    .path("/work/widgets-revised".to_string())
+                    .repo_ref(repository_key)
+                    .host_ref(daemon.local_host_id().expect("local host id").to_string())
+                    .is_main(false)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("modify observed checkout");
+    let mut modifications = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while modifications.len() < 2 {
+            if let DaemonEvent::ResultDelta(delta) = events.recv().await.expect("checkout event") {
+                if matches!(delta.query(), QueryId::Checkouts { .. }) && delta.changes.as_checkouts().is_some_and(|rows| !rows.is_empty()) {
+                    modifications.insert(delta.query(), delta);
+                }
+            }
+        }
+    })
+    .await
+    .expect("repository and project checkout modifications");
+    for query in [&repository_query, &project_query] {
+        let rows = modifications.get(query).expect("scoped modification").changes.as_checkouts().expect("checkout changes");
+        assert_eq!(rows[0].path, "/work/widgets-revised");
+        assert_eq!(rows[0].branch, "feature/revised");
+    }
+
+    let stale_replay = daemon
+        .subscribe_queries(subscriber, &[
+            QueryCursor { query: repository_query.clone(), since: initial_sequences.get(&repository_query).copied() },
+            QueryCursor { query: project_query.clone(), since: initial_sequences.get(&project_query).copied() },
+        ])
+        .await
+        .expect("replay stale checkout cursors");
+    assert_eq!(stale_replay.iter().filter(|event| matches!(event, DaemonEvent::ResultSet(_))).count(), 2);
+    assert!(stale_replay
+        .iter()
+        .filter_map(|event| match event {
+            DaemonEvent::ResultSet(set) => set.rows.as_checkouts(),
+            _ => None,
+        })
+        .all(|rows| rows.len() == 1 && rows[0].branch == "feature/revised"));
+
+    let current_replay = daemon
+        .subscribe_queries(subscriber, &[
+            QueryCursor { query: repository_query.clone(), since: modifications.get(&repository_query).map(|delta| delta.seq) },
+            QueryCursor { query: project_query.clone(), since: modifications.get(&project_query).map(|delta| delta.seq) },
+        ])
+        .await
+        .expect("subscribe with current checkout cursors");
+    assert!(current_replay.is_empty());
+
+    checkouts.delete(&checkout.metadata.name).await.expect("delete observed checkout");
+    let mut removals = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while removals.len() < 2 {
+            if let DaemonEvent::ResultDelta(delta) = events.recv().await.expect("checkout event") {
+                if matches!(delta.query(), QueryId::Checkouts { .. }) && !delta.changes.removed_resources().unwrap_or_default().is_empty() {
+                    removals.insert(delta.query(), delta);
+                }
+            }
+        }
+    })
+    .await
+    .expect("repository and project checkout removals");
+    for query in [&repository_query, &project_query] {
+        assert_eq!(removals.get(query).expect("scoped removal").changes.removed_resources().expect("checkout removals").len(), 1);
+    }
 }
 
 #[tokio::test]

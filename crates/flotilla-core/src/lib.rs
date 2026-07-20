@@ -27,6 +27,7 @@ pub mod refresh;
 pub(crate) mod repo_state;
 pub mod repository_inspection;
 pub mod resolve;
+mod scoped_checkouts;
 pub mod step;
 pub mod template;
 pub mod terminal_manager;

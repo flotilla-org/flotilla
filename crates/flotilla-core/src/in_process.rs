@@ -553,7 +553,8 @@ struct AdoptedCheckoutRequest<'a> {
 }
 
 async fn create_adopted_checkout_resource(
-    backend: &ResourceBackend,
+    durable_backend: &ResourceBackend,
+    observed_backend: &ResourceBackend,
     request: AdoptedCheckoutRequest<'_>,
 ) -> Result<(String, String, String), String> {
     let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, repository_url, git_ref, host_ref } = request;
@@ -562,48 +563,56 @@ async fn create_adopted_checkout_resource(
     let path_str = path.to_string_lossy().to_string();
     let checkout_ref = adopted_checkout_name(convoy_name);
     let repository_key = repository_spec.key();
-    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
+    flotilla_resources::ensure_repository(&durable_backend.clone().using::<Repository>(namespace), &repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
-    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let meta = InputMeta::builder()
         .name(checkout_ref.clone())
         .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.to_string())]))
         .build()
         .with_lifecycle_authority(LifecycleAuthority::Adopted);
-    let spec = ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
-        r#ref: git_ref.to_string(),
-        path: path_str.clone(),
-        repo_ref: repository_key,
-        host_ref: host_ref.to_string(),
-        is_main: matches!(git_ref, "main" | "master" | "trunk"),
-    });
+    let spec = ResourceCheckoutSpec::Observed(
+        ResourceObservedCheckoutSpec::builder()
+            .r#ref(git_ref.to_string())
+            .path(path_str.clone())
+            .repo_ref(repository_key)
+            .host_ref(host_ref.to_string())
+            .is_main(matches!(git_ref, "main" | "master" | "trunk"))
+            .build(),
+    );
+    let status = ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path(path_str).build();
 
-    let checkout = match checkouts.create(&meta, &spec).await {
+    persist_adopted_checkout(durable_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
+    persist_adopted_checkout(observed_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
+
+    Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
+}
+
+async fn persist_adopted_checkout(
+    backend: &ResourceBackend,
+    namespace: &str,
+    checkout_ref: &str,
+    meta: &InputMeta,
+    spec: &ResourceCheckoutSpec,
+    status: &ResourceCheckoutStatus,
+) -> Result<(), String> {
+    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
+    let checkout = match checkouts.create(meta, spec).await {
         Ok(checkout) => checkout,
         Err(ResourceError::Conflict { .. }) => {
-            let existing = checkouts.get(&checkout_ref).await.map_err(|err| err.to_string())?;
+            let existing = checkouts.get(checkout_ref).await.map_err(|err| err.to_string())?;
             if existing.metadata.lifecycle_authority().map_err(|err| err.to_string())? != Some(LifecycleAuthority::Adopted) {
                 return Err(format!("checkout {checkout_ref} already exists but is not adopted"));
             }
-            if existing.spec != spec {
+            if &existing.spec != spec {
                 return Err(format!("checkout {checkout_ref} already exists with different adopted checkout details"));
             }
             existing
         }
         Err(err) => return Err(err.to_string()),
     };
-    checkouts
-        .update_status(&checkout_ref, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
-            phase: ResourceCheckoutPhase::Ready,
-            path: Some(path_str),
-            commit: None,
-            message: None,
-        })
-        .await
-        .map_err(|err| err.to_string())?;
-
-    Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
+    checkouts.update_status(checkout_ref, &checkout.metadata.resource_version, status).await.map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str, contained: bool) -> Option<String> {
@@ -4336,6 +4345,7 @@ impl InProcessDaemon {
                         let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
                         let (checkout_ref, inferred_repository_url, inferred_ref) = create_adopted_checkout_resource(
                             &self.resource_backend,
+                            &self.observed_resource_backend,
                             AdoptedCheckoutRequest::builder()
                                 .namespace(&namespace)
                                 .convoy_name(name)

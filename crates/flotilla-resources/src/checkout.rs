@@ -90,7 +90,7 @@ pub enum CheckoutPhase {
     Failed,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CheckoutStatus {
     pub phase: CheckoutPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]

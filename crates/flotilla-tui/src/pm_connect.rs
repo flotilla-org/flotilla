@@ -174,7 +174,7 @@ impl ConnectorState {
         match &set.rows {
             Rows::Convoys(rows) => self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
             Rows::Independents(rows) => self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
-            Rows::Issues { .. } => return Applied::Ignored,
+            Rows::Issues { .. } | Rows::Checkouts { .. } => return Applied::Ignored,
         }
         self.seqs.insert(query, set.seq);
         Applied::Updated
@@ -208,7 +208,7 @@ impl ConnectorState {
                     self.independents.remove(removed);
                 }
             }
-            QueryChanges::Issues { .. } => {
+            QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
                 return Applied::Gap(query);
             }
         }

@@ -11,13 +11,13 @@ use std::{
 };
 
 use flotilla_protocol::{
-    result_set::{ConvoyRow, IndependentRow, IssueRow, QueryId, ResultDelta, ResultSet, ResultSetState, Rows},
-    HostName, IssueRef, QueryCursor, ResourceRef,
+    result_set::{CheckoutRow, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows},
+    HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
 use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
-use crate::query_registry::QueryRegistry;
+use crate::{query_registry::QueryRegistry, scoped_checkouts::ScopedCheckoutProjection};
 
 /// A typed row of some named query's result set.
 pub trait QueryRow: Clone {
@@ -112,10 +112,11 @@ impl<R: QueryRow + PartialEq> QueryProjection<R> {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, bon::Builder)]
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
     independents: Arc<RwLock<QueryProjection<IndependentRow>>>,
+    checkouts: Arc<RwLock<ScopedCheckoutProjection>>,
     /// Subscriber ownership and demand-backed materializations belong to the
     /// Aggregator state, shared with the daemon's subscription transport.
     demand_backed: QueryRegistry,
@@ -161,7 +162,25 @@ impl AggregatorProjectionState {
     /// This host's local store-backed result sets. Demand-backed reference
     /// data is never included in fleet replica snapshots.
     pub async fn local_result_sets(&self) -> Vec<ResultSet> {
-        vec![self.local_result_set().await, self.local_independents_result_set().await]
+        let mut sets = vec![self.local_result_set().await, self.local_independents_result_set().await];
+        sets.extend(self.checkouts.read().await.local_result_sets());
+        sets
+    }
+
+    pub async fn replace_checkout_catalog(
+        &self,
+        repositories: HashSet<RepositoryKey>,
+        projects: HashMap<QueryScope, Vec<RepositoryKey>>,
+    ) -> Vec<ResultDelta> {
+        self.checkouts.write().await.replace_catalog(repositories, projects)
+    }
+
+    pub async fn replace_local_checkout_rows(&self, rows: Vec<CheckoutRow>) -> Vec<ResultDelta> {
+        self.checkouts.write().await.replace_local_rows(rows)
+    }
+
+    pub async fn replace_checkout_replica_rows(&self, replicas: HashMap<HostName, Vec<CheckoutRow>>) -> Vec<ResultDelta> {
+        self.checkouts.write().await.replace_replica_rows(replicas)
     }
 
     /// Replace one subscriber's complete demand and return queries whose
@@ -211,6 +230,7 @@ impl AggregatorProjectionState {
             QueryId::Convoys => Some(self.result_set().await),
             QueryId::Independents => Some(self.independents_result_set().await),
             QueryId::Issues { .. } => self.demand_backed.result_set(query),
+            QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
         }
     }
 }

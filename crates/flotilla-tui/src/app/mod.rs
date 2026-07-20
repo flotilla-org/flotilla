@@ -1319,6 +1319,7 @@ impl App {
                         self.push_materialized_issue_items_to_repo_data(&query);
                         self.sync_project_issue_rows(&query);
                     }
+                    flotilla_protocol::Rows::Checkouts { .. } => {}
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1371,6 +1372,7 @@ impl App {
                         self.push_materialized_issue_items_to_repo_data(&query);
                         self.sync_project_issue_rows(&query);
                     }
+                    flotilla_protocol::QueryChanges::Checkouts { .. } => {}
                 }
             }
         }
