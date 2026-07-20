@@ -105,13 +105,24 @@ impl CommandPaletteWidget {
         self.input.value()
     }
 
-    fn filtered(&self) -> Vec<&'static PaletteEntry> {
+    fn filtered(&self, interactions: crate::interaction::InteractionContext<'_>) -> Vec<&'static PaletteEntry> {
         palette::filter_entries(self.entries, self.input.value())
+            .into_iter()
+            .filter(|entry| interactions.is_available(entry.action))
+            .collect()
     }
 
     /// Compute position-aware completions using model context.
-    fn completions(&self, model: &TuiModel, namespaces: &crate::app::NamespaceMap, has_repo_context: bool) -> Vec<PaletteCompletion> {
-        palette::palette_completions(self.input.value(), model, namespaces, has_repo_context)
+    fn completions(
+        &self,
+        model: &TuiModel,
+        namespaces: &crate::app::NamespaceMap,
+        has_repo_context: bool,
+        interactions: crate::interaction::InteractionContext<'_>,
+    ) -> Vec<PaletteCompletion> {
+        palette::palette_completions_with_availability(self.input.value(), model, namespaces, has_repo_context, |action| {
+            interactions.is_available(action)
+        })
     }
 
     /// Fill the selected completion value into the input, appending to the
@@ -154,7 +165,12 @@ impl CommandPaletteWidget {
             Ok(PaletteParseResult::Resolved(resolved)) => self.dispatch_resolved(resolved, ctx),
             Err(err) => {
                 // If parse failed, fall back to the selected entry's action (fuzzy match)
-                let filtered = self.filtered();
+                let interactions = crate::interaction::InteractionContext::for_active_view(
+                    ctx.views.active_address(),
+                    ctx.views.active_table_state().selected(),
+                    ctx.model.active_repo_identity_opt().is_some(),
+                );
+                let filtered = self.filtered(interactions);
                 if let Some(entry) = filtered.get(self.selected) {
                     let action = entry.action;
                     return self.dispatch_palette_action(action, ctx);
@@ -187,31 +203,6 @@ impl CommandPaletteWidget {
                 }
                 Outcome::Finished
             }
-            PaletteLocalResult::Search(query) => {
-                let query = query.trim().to_string();
-                let Some(repo_identity) = ctx.model.active_repo_identity_opt().cloned() else {
-                    ctx.app_actions.push(AppAction::ShowStatus("No active repo".into()));
-                    return Outcome::Finished;
-                };
-                if query.is_empty() {
-                    ctx.app_actions.push(AppAction::ClearSearchQuery { repo: repo_identity });
-                } else {
-                    let cmd = Command {
-                        node_id: None,
-                        provisioning_target: None,
-                        context_repo: None,
-                        action: CommandAction::QueryIssues {
-                            repo: RepoSelector::Identity(repo_identity.clone()),
-                            params: flotilla_protocol::issue_query::IssueQuery { search: Some(query.clone()) },
-                            page: 1,
-                            count: 50,
-                        },
-                    };
-                    ctx.commands.push(cmd);
-                    ctx.app_actions.push(AppAction::SetSearchQuery { repo: repo_identity, query });
-                }
-                Outcome::Finished
-            }
         }
     }
 
@@ -240,6 +231,15 @@ impl CommandPaletteWidget {
     }
 
     fn dispatch_palette_action(&self, action: Action, ctx: &mut WidgetContext) -> Outcome {
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            ctx.views.active_address(),
+            ctx.views.active_table_state().selected(),
+            ctx.model.active_repo_identity_opt().is_some(),
+        );
+        if !interactions.is_available(action) {
+            ctx.app_actions.push(AppAction::ShowStatus("That action is not available in this view".into()));
+            return Outcome::Finished;
+        }
         match action {
             // Actions that open other widgets — use Swap to replace the palette
             Action::OpenBranchInput => {
@@ -250,14 +250,11 @@ impl CommandPaletteWidget {
                 let widget = super::branch_input::BranchInputWidget::new(crate::app::ui_state::BranchInputKind::Manual);
                 Outcome::Swap(Box::new(widget))
             }
-            Action::OpenIssueSearch => {
-                if ctx.model.active_repo_identity_opt().is_none() {
-                    ctx.app_actions.push(AppAction::ShowStatus("switch to a repo tab first".into()));
-                    Outcome::Finished
-                } else {
-                    Outcome::Swap(Box::new(super::issue_search::IssueSearchWidget::new()))
-                }
-            }
+            Action::OpenFind => match ctx.views.active_address() {
+                Some(flotilla_protocol::ViewAddress::Repo { .. }) => Outcome::Swap(Box::new(super::issue_search::IssueSearchWidget::new())),
+                Some(_) => Outcome::Swap(Box::new(super::table_search::TableSearchWidget::find(&ctx.views.active_table_state().filter))),
+                None => Outcome::Finished,
+            },
             Action::OpenFilePicker => {
                 let start_dir = ctx
                     .model
@@ -479,9 +476,14 @@ pub(crate) fn tui_dispatch(
 impl InteractiveWidget for CommandPaletteWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
         let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            ctx.views.active_address(),
+            ctx.views.active_table_state().selected(),
+            ctx.model.active_repo_identity_opt().is_some(),
+        );
         match action {
             Action::SelectNext => {
-                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context).len();
+                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions).len();
                 if count > 0 {
                     self.selected = (self.selected + 1) % count;
                     self.adjust_scroll();
@@ -489,7 +491,7 @@ impl InteractiveWidget for CommandPaletteWidget {
                 Outcome::Consumed
             }
             Action::SelectPrev => {
-                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context).len();
+                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions).len();
                 if count > 0 {
                     self.selected = if self.selected == 0 { count - 1 } else { self.selected - 1 };
                     self.adjust_scroll();
@@ -499,7 +501,7 @@ impl InteractiveWidget for CommandPaletteWidget {
             Action::Confirm => self.confirm(ctx),
             Action::Dismiss => Outcome::Finished,
             Action::FillSelected => {
-                let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
+                let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
                 if let Some(completion) = completions.get(self.selected) {
                     self.fill_completion(completion);
                 }
@@ -511,9 +513,14 @@ impl InteractiveWidget for CommandPaletteWidget {
 
     fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
         let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            ctx.views.active_address(),
+            ctx.views.active_table_state().selected(),
+            ctx.model.active_repo_identity_opt().is_some(),
+        );
         // Right arrow: fill selected completion into input (Tab goes through handle_action)
         if matches!(key.code, KeyCode::Right) {
-            let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
+            let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
             if let Some(completion) = completions.get(self.selected) {
                 self.fill_completion(completion);
             }
@@ -527,14 +534,6 @@ impl InteractiveWidget for CommandPaletteWidget {
 
         self.input.handle_event(&crossterm::event::Event::Key(key));
 
-        // Shortcut: typing / when input is empty fills "search "
-        if self.input.value() == "/" {
-            self.input = Input::from("search ");
-            self.selected = 0;
-            self.scroll_top = 0;
-            return Outcome::Consumed;
-        }
-
         self.selected = 0;
         self.scroll_top = 0;
         Outcome::Consumed
@@ -543,7 +542,12 @@ impl InteractiveWidget for CommandPaletteWidget {
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
         let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
-        let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context);
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            ctx.views.active_address(),
+            ctx.views.active_table_state().selected(),
+            ctx.model.active_repo_identity_opt().is_some(),
+        );
+        let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
         let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
         let area = overlay.body;
 
@@ -594,7 +598,7 @@ impl InteractiveWidget for CommandPaletteWidget {
     }
 
     fn status_fragment(&self) -> StatusFragment {
-        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "/".into(), text: self.input.value().to_string() }) }
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: ":".into(), text: self.input.value().to_string() }) }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -649,7 +653,12 @@ mod tests {
     fn select_next_wraps_around() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let total = widget.completions(&harness.model, &harness.namespaces, true).len();
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            harness.model.active_repo_identity_opt().is_some(),
+        );
+        let total = widget.completions(&harness.model, &harness.namespaces, true, interactions).len();
 
         // Advance to end
         for _ in 0..total - 1 {
@@ -668,7 +677,12 @@ mod tests {
     fn select_prev_wraps_around() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let total = widget.completions(&harness.model, &harness.namespaces, true).len();
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            harness.model.active_repo_identity_opt().is_some(),
+        );
+        let total = widget.completions(&harness.model, &harness.namespaces, true, interactions).len();
 
         // Prev from 0 wraps to end
         let mut ctx = harness.ctx();
@@ -682,7 +696,12 @@ mod tests {
         let mut harness = TestWidgetHarness::new();
 
         // Get the first completion value to verify fill works
-        let first_value = widget.completions(&harness.model, &harness.namespaces, true)[0].value.clone();
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            harness.views.active_address(),
+            harness.views.active_table_state().selected(),
+            harness.model.active_repo_identity_opt().is_some(),
+        );
+        let first_value = widget.completions(&harness.model, &harness.namespaces, true, interactions)[0].value.clone();
 
         let mut ctx = harness.ctx();
         let outcome = widget.handle_action(Action::FillSelected, &mut ctx);
@@ -702,49 +721,14 @@ mod tests {
     }
 
     #[test]
-    fn slash_fills_search_prefix() {
+    fn slash_is_literal_palette_input() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_raw_key(key(KeyCode::Char('/')), &mut ctx);
         assert!(matches!(outcome, Outcome::Consumed));
-        assert_eq!(widget.input.value(), "search ");
-    }
-
-    #[test]
-    fn confirm_search_pushes_search_command() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("search bug fix");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-
-        let (cmd, _) = harness.commands.take_next().expect("expected QueryIssues command");
-        match cmd {
-            Command { action: CommandAction::QueryIssues { params, .. }, .. } => {
-                assert_eq!(params.search.as_deref(), Some("bug fix"));
-            }
-            other => panic!("expected QueryIssues, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn confirm_search_empty_clears() {
-        let mut widget = CommandPaletteWidget::new();
-        widget.input = Input::from("search ");
-        let mut harness = TestWidgetHarness::new();
-        let mut ctx = harness.ctx();
-
-        let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        assert!(matches!(outcome, Outcome::Finished));
-
-        // Empty search no longer sends a command — only a ClearSearchQuery app action
-        assert!(ctx.app_actions.iter().any(|a| matches!(a, AppAction::ClearSearchQuery { .. })));
-        drop(ctx);
-        assert!(harness.commands.take_next().is_none());
+        assert_eq!(widget.input.value(), "/");
     }
 
     #[test]
@@ -772,17 +756,16 @@ mod tests {
     }
 
     #[test]
-    fn confirm_entry_search_returns_swap() {
+    fn confirm_entry_find_returns_swap() {
         let mut widget = CommandPaletteWidget::new();
-        // "search" as entry name (not "search <terms>")
-        widget.input = Input::from("search");
-        // Make sure selected is 0 so it picks "search" entry
+        widget.input = Input::from("find");
+        // Make sure selected is 0 so it picks the Find entry.
         widget.selected = 0;
         let mut harness = TestWidgetHarness::new();
         let mut ctx = harness.ctx();
 
         let outcome = widget.handle_action(Action::Confirm, &mut ctx);
-        // "search" entry has action OpenIssueSearch, which should Swap
+        // Find replaces the palette with the active View's Find input.
         assert!(matches!(outcome, Outcome::Swap(_)));
     }
 

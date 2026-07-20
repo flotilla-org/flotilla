@@ -623,28 +623,24 @@ fn normal_big_d_toggles_debug() {
 }
 
 #[test]
-fn normal_slash_opens_command_palette() {
+fn normal_slash_opens_find() {
     let mut app = stub_app();
     app.handle_key(key(KeyCode::Char('/')));
     assert_eq!(
         app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
-        KeyBindingMode::from(BindingModeId::CommandPalette)
+        KeyBindingMode::from(BindingModeId::FindInput)
     );
 }
 
 #[test]
-fn no_active_repo_command_palette_search_shows_status_message() {
+fn find_is_unavailable_on_a_dangling_repo_view() {
     let mut app = stub_app();
     app.model.repos.clear();
     app.model.repo_order.clear();
     app.screen.repo_pages.clear();
-    app.screen.modal_stack.push(Box::new(crate::widgets::command_palette::CommandPaletteWidget::new()));
-
     app.handle_key(key(KeyCode::Char('/')));
-    app.handle_key(key(KeyCode::Enter));
 
-    assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
-    assert_eq!(app.model.status_message.as_deref(), Some("No active repo"));
+    assert!(app.screen.modal_stack.is_empty());
 }
 
 #[test]
@@ -704,9 +700,9 @@ fn normal_dot_opens_action_menu() {
 }
 
 #[test]
-fn clicking_search_status_target_opens_command_palette() {
+fn clicking_command_palette_status_target_opens_command_palette() {
     let mut app = stub_app();
-    app.screen.status_bar.key_targets = vec![StatusBarTarget::new(Rect::new(10, 29, 12, 1), StatusBarAction::key(KeyCode::Char('/')))];
+    app.screen.status_bar.key_targets = vec![StatusBarTarget::new(Rect::new(10, 29, 12, 1), StatusBarAction::key(KeyCode::Char(':')))];
 
     app.handle_mouse(left_click(12, 29));
 
@@ -1624,15 +1620,9 @@ fn close_confirm_preserves_resolved_remote_command() {
 // ── command palette key handling ────────────────────────────────
 
 #[test]
-fn double_slash_fills_search() {
+fn colon_opens_command_palette() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
-    assert_eq!(
-        app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
-        KeyBindingMode::from(BindingModeId::CommandPalette)
-    );
-    // Typing '/' inside the palette fills "search "
-    app.handle_key(key(KeyCode::Char('/')));
+    app.handle_key(key(KeyCode::Char(':')));
     assert_eq!(
         app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
         KeyBindingMode::from(BindingModeId::CommandPalette)
@@ -1642,8 +1632,8 @@ fn double_slash_fills_search() {
 #[test]
 fn command_palette_tab_fills_command_name() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
-    // First entry is "search" — Tab should fill it
+    app.handle_key(key(KeyCode::Char(':')));
+    // First entry is Find — Tab should fill it.
     app.handle_key(key(KeyCode::Tab));
     // Widget should remain on stack
     assert_eq!(
@@ -1653,38 +1643,25 @@ fn command_palette_tab_fills_command_name() {
 }
 
 #[test]
-fn command_palette_search_with_args_applies_filter() {
+fn command_palette_find_opens_a_find_input() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
-    for c in "search auth".chars() {
+    app.handle_key(key(KeyCode::Char(':')));
+    for c in "find".chars() {
         app.handle_key(key(KeyCode::Char(c)));
     }
     app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
-    assert_eq!(active_search_query(&app), Some("auth"));
-}
-
-#[test]
-fn command_palette_search_empty_term_clears() {
-    let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
-    for c in "search ".chars() {
-        app.handle_key(key(KeyCode::Char(c)));
-    }
-    app.handle_key(key(KeyCode::Enter));
-    assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
-    assert_eq!(active_search_query(&app), None);
+    assert_eq!(app.screen.modal_stack.last().expect("Find input").binding_mode(), KeyBindingMode::from(BindingModeId::FindInput));
 }
 
 #[test]
 fn command_palette_enter_dispatches_action() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
-    // First entry is "search" which dispatches OpenIssueSearch → Swap
+    app.handle_key(key(KeyCode::Char(':')));
+    // First entry is Find, which replaces the palette with a Find input.
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
-        KeyBindingMode::from(BindingModeId::IssueSearch)
+        KeyBindingMode::from(BindingModeId::FindInput)
     );
 }
 
@@ -1813,7 +1790,7 @@ fn stale_search_results_discarded_by_drain() {
 #[test]
 fn command_palette_esc_dismisses() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
+    app.handle_key(key(KeyCode::Char(':')));
     assert_eq!(
         app.screen.modal_stack.last().expect("modal stack non-empty").binding_mode(),
         KeyBindingMode::from(BindingModeId::CommandPalette)
@@ -1825,7 +1802,7 @@ fn command_palette_esc_dismisses() {
 #[test]
 fn command_palette_arrow_navigation_wraps() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
+    app.handle_key(key(KeyCode::Char(':')));
     // Down from 0, Up from 0 — widget should remain on stack
     app.handle_key(key(KeyCode::Down));
     assert_eq!(
@@ -1848,7 +1825,7 @@ fn command_palette_arrow_navigation_wraps() {
 #[test]
 fn command_palette_typing_resets_selection() {
     let mut app = stub_app();
-    app.handle_key(key(KeyCode::Char('/')));
+    app.handle_key(key(KeyCode::Char(':')));
     app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Down));
     // Now type a char — widget should still be on stack; detailed selection reset tested in widget unit tests

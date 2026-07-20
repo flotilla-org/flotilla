@@ -31,4 +31,4 @@ expression: output
 
 
 
-/ for commands               <q> QUIT  <h> HELP  <?> CTX  <ENT> OPEN  <.> MENU  <n> NEW     □ zoom   @local
+: for commands               <q> QUIT  <h> HELP  <?> CTX  <:> COMMANDS  </> FIND              □ zoom   @local

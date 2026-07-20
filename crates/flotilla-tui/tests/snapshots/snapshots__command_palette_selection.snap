@@ -23,7 +23,7 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         │                                              │
-/                            <ENT> RUN  <ESC> CLOSE  <TAB> FILL                                   ◫ auto   @local
+:                            <ENT> RUN  <ESC> CLOSE  <TAB> FILL                                   ◫ auto   @local
   repo               Manage repositories
   environment        Manage environments
   env                Manage environments

@@ -82,11 +82,11 @@ impl InteractiveWidget for IssueSearchWidget {
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
-        BindingModeId::IssueSearch.into()
+        BindingModeId::FindInput.into()
     }
 
     fn status_fragment(&self) -> StatusFragment {
-        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "SEARCH ".into(), text: self.input.value().to_string() }) }
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "FIND ".into(), text: self.input.value().to_string() }) }
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn binding_mode_is_issue_search() {
         let widget = IssueSearchWidget::new();
-        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::IssueSearch));
+        assert_eq!(widget.binding_mode(), KeyBindingMode::from(BindingModeId::FindInput));
     }
 
     #[test]

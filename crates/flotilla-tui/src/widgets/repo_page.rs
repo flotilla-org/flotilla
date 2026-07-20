@@ -321,7 +321,7 @@ impl InteractiveWidget for RepoPage {
             Action::OpenBranchInput => {
                 Outcome::Push(Box::new(super::branch_input::BranchInputWidget::new(crate::app::ui_state::BranchInputKind::Manual)))
             }
-            Action::OpenIssueSearch => Outcome::Push(Box::new(super::issue_search::IssueSearchWidget::new())),
+            Action::OpenFind => Outcome::Push(Box::new(super::issue_search::IssueSearchWidget::new())),
             Action::OpenCommandPalette => Outcome::Push(Box::new(super::command_palette::CommandPaletteWidget::new())),
             Action::OpenContextualPalette => {
                 let widget = match self.table.selected_row() {
@@ -430,7 +430,7 @@ impl InteractiveWidget for RepoPage {
         let status = if self.show_providers {
             Some(StatusContent::Label("PROVIDERS".into()))
         } else if let Some(query) = &self.active_search_query {
-            Some(StatusContent::Label(format!("SEARCH \"{query}\"")))
+            Some(StatusContent::Label(format!("FIND \"{query}\"")))
         } else if self.show_archived {
             Some(StatusContent::Label("ARCHIVED".into()))
         } else if !self.multi_selected.is_empty() {
