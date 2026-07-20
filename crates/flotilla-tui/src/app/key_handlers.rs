@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, HostName, NodeId, RepoIdentity, RepoKey, WorkItem};
+use flotilla_protocol::{Command, CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
@@ -413,6 +413,23 @@ impl App {
             }
             TableIntent::ForceCompleteWork { convoy, vessel, host } => {
                 (self.command(CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }), host)
+            }
+            TableIntent::StartConvoy { namespace, project, issue } => {
+                self.proto_commands.push(self.command(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: Some(namespace),
+                        project_ref: project,
+                        issue: Some(IssueSelector::Reference(issue)),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        auto_attach: true,
+                    }),
+                }));
+                return;
             }
         };
         let node_id = match self.panel_target_node(&host) {

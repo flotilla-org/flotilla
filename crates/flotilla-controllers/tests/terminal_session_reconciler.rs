@@ -80,7 +80,11 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector { capability: "coding".to_string() },
-                brief: flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into() },
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "brief".into(),
+                    copies: Vec::new(),
+                },
                 context: flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),
@@ -143,7 +147,11 @@ async fn a_message_queued_during_startup_is_delivered_after_the_session_becomes_
             role: "reviewer".to_string(),
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector { capability: "review".to_string() },
-                brief: flotilla_resources::TerminalBrief { path: ".flotilla/briefs/reviewer.md".into(), content: "brief".into() },
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/reviewer.md".into(),
+                    content: "brief".into(),
+                    copies: Vec::new(),
+                },
                 context: flotilla_resources::TerminalCrewContext {
                     namespace: "flotilla".into(),
                     convoy: "demo".into(),

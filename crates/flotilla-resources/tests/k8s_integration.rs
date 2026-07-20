@@ -39,6 +39,8 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         r#ref: None,
         project_ref: None,
         adopted_checkout_refs: Default::default(),
+        issue: None,
+        instruction: None,
     }
 }
 

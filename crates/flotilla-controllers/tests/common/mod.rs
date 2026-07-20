@@ -90,6 +90,8 @@ pub async fn create_convoy_with_single_task(
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -124,8 +126,10 @@ pub async fn create_workspace(
     repo_url: &str,
 ) -> flotilla_resources::ResourceObject<Vessel> {
     let workspaces = backend.clone().using::<Vessel>(namespace);
+    let mut meta = vessel_meta(name, repo_url);
+    meta.labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy_ref.to_string());
     workspaces
-        .create(&vessel_meta(name, repo_url), &VesselSpec {
+        .create(&meta, &VesselSpec {
             convoy_ref: convoy_ref.to_string(),
             vessel_name: task.to_string(),
             placement_policy_ref: placement_policy_ref.to_string(),

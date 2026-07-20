@@ -4,10 +4,11 @@ use common::{
     bootstrapped_tool_only_convoy_status, convoy_meta, task_provisioning_convoy_spec, timestamp, tool_only_workflow_template_object,
     valid_convoy_spec, workflow_template_meta,
 };
+use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
-    apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyPhase, ConvoyReconciler, InMemoryBackend,
-    InputMeta, LifecycleAuthority, Presentation, PresentationSpec, ResourceBackend, ResourceError, Vessel, VesselPhase, VesselStatus,
-    WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    apply_status_patch, controller::ControllerLoop, external_patches, reconcile, Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler,
+    InMemoryBackend, InputMeta, IssueSnapshot, LifecycleAuthority, Presentation, PresentationSpec, RepositorySpec, ResourceBackend,
+    ResourceError, Vessel, VesselPhase, VesselStatus, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
 };
 use tokio::time::{timeout, Duration};
 
@@ -35,6 +36,35 @@ async fn reconcile_once(
     } else {
         None
     }
+}
+
+#[tokio::test]
+async fn convoy_persists_source_qualified_issue_snapshot_and_instruction() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.using::<Convoy>("flotilla");
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let mut spec = valid_convoy_spec();
+    spec.issue = Some(ConvoyIssue {
+        reference: IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "WIDGET-732".into(),
+        },
+        repository_ref: Some(repository.key()),
+        snapshot: IssueSnapshot {
+            title: "Start convoy from issue".into(),
+            body: Some("Build the admission path.".into()),
+            state: IssueState::Open,
+            labels: vec!["enhancement".into()],
+            as_of: timestamp(42),
+        },
+    });
+    spec.instruction = Some("Preserve the public API.".into());
+
+    convoys.create(&convoy_meta("issue-work"), &spec).await.expect("convoy create");
+    let persisted = convoys.get("issue-work").await.expect("convoy get");
+
+    assert_eq!(persisted.spec.issue, spec.issue);
+    assert_eq!(persisted.spec.instruction.as_deref(), Some("Preserve the public API."));
 }
 
 #[tokio::test]

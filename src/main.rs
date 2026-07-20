@@ -545,7 +545,14 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
 async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
-    flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    let result = flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))?;
+    if let CommandValue::ConvoyStarted { name, attach_command: Some(command), binding } = result {
+        if matches!(format, OutputFormat::Human) {
+            stamp_pane_identity(&name, binding.as_ref()).await;
+            return exec_attach_command(&command);
+        }
+    }
+    Ok(())
 }
 
 async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&str>, format: OutputFormat) -> Result<()> {

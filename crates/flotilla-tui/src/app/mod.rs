@@ -280,6 +280,7 @@ pub type NamespaceMap = HashMap<String, NamespaceModel>;
 pub struct NamespaceModel {
     pub convoys: IndexMap<crate::convoy_model::ConvoyId, crate::convoy_model::ConvoySummary>,
     pub independents: IndexMap<ResourceRef, flotilla_protocol::IndependentRow>,
+    pub project_issues: HashMap<String, Vec<flotilla_protocol::IssueRow>>,
     pub last_seq: u64,
 }
 
@@ -287,6 +288,15 @@ pub fn table_rows(namespaces: &NamespaceMap) -> crate::table_view::TableRows<'_>
     crate::table_view::TableRows {
         convoys: namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect(),
         independents: namespaces.values().flat_map(|namespace| namespace.independents.values()).collect(),
+        project_issues: namespaces
+            .iter()
+            .flat_map(|(namespace, model)| {
+                model
+                    .project_issues
+                    .iter()
+                    .flat_map(move |(project, rows)| rows.iter().map(move |row| (namespace.as_str(), project.as_str(), row)))
+            })
+            .collect(),
     }
 }
 
@@ -924,6 +934,14 @@ impl App {
         }
     }
 
+    fn sync_project_issue_rows(&mut self, query: &flotilla_protocol::QueryId) {
+        let flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::Project { namespace, name } } = query else {
+            return;
+        };
+        let rows = self.materialized_issue_rows.get(query).cloned().unwrap_or_default();
+        self.namespaces.entry(namespace.clone()).or_default().project_issues.insert(name.clone(), rows);
+    }
+
     // ── Widget stack helpers ──
 
     /// Pop all modal widgets from the stack.
@@ -1299,6 +1317,7 @@ impl App {
                         self.materialized_issue_rows.insert(query.clone(), rows.clone());
                         self.materialized_issue_states.insert(query.clone(), result_set.state.clone());
                         self.push_materialized_issue_items_to_repo_data(&query);
+                        self.sync_project_issue_rows(&query);
                     }
                 }
             }
@@ -1350,6 +1369,7 @@ impl App {
                             self.materialized_issue_states.insert(query.clone(), state.clone());
                         }
                         self.push_materialized_issue_items_to_repo_data(&query);
+                        self.sync_project_issue_rows(&query);
                     }
                 }
             }

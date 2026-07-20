@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flotilla_protocol::{HostName, IndependentRow, RepoKey, SessionPhase, ViewAddress};
+use flotilla_protocol::{HostName, IndependentRow, IssueRef, IssueRow, RepoKey, SessionPhase, ViewAddress};
 
 use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
 
@@ -194,6 +194,7 @@ pub enum TableIntent {
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
+    StartConvoy { namespace: String, project: String, issue: IssueRef },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -238,6 +239,12 @@ struct VesselProjection {
     vessel: VesselSummary,
 }
 
+#[derive(Clone)]
+enum ProjectProjection {
+    Convoy(ConvoySummary),
+    Issue { namespace: String, project: String, row: IssueRow },
+}
+
 /// Typed query rows currently available to the table registry. Surfaces build
 /// this once from their query caches; adding a query family grows this input
 /// without teaching the reusable widget about that family.
@@ -245,6 +252,7 @@ struct VesselProjection {
 pub struct TableRows<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
     pub independents: Vec<&'a IndependentRow>,
+    pub project_issues: Vec<(&'a str, &'a str, &'a IssueRow)>,
 }
 
 pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
@@ -265,13 +273,20 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             Ok(independent_spec().project("Independents".to_string(), rows.into_iter().cloned()))
         }
         ViewAddress::Project { namespace, name } => {
-            let rows = data
+            let mut rows = data
                 .convoys
                 .iter()
                 .copied()
                 .filter(|convoy| &convoy.namespace == namespace && convoy.project_ref.as_deref() == Some(name))
-                .cloned();
-            Ok(convoy_spec().project(format!("Project · {name}"), rows))
+                .cloned()
+                .map(ProjectProjection::Convoy)
+                .collect::<Vec<_>>();
+            rows.extend(
+                data.project_issues.iter().filter(|(row_namespace, project, _)| *row_namespace == namespace && *project == name).map(
+                    |(_, _, row)| ProjectProjection::Issue { namespace: namespace.clone(), project: name.clone(), row: (*row).clone() },
+                ),
+            );
+            Ok(project_spec().project(format!("Project · {name}"), rows))
         }
         ViewAddress::Convoy { namespace, name } => {
             let convoy = find_convoy(&data.convoys, namespace, name)?;
@@ -340,6 +355,14 @@ fn convoy_spec() -> TableSpec<ConvoySummary> {
     TableSpec { columns: &CONVOY_COLUMNS, actions: &[], row: RowSpec { id: convoy_id, drill: convoy_drill, describe: convoy_description } }
 }
 
+fn project_spec() -> TableSpec<ProjectProjection> {
+    TableSpec {
+        columns: &PROJECT_COLUMNS,
+        actions: &PROJECT_ACTIONS,
+        row: RowSpec { id: project_row_id, drill: project_row_drill, describe: project_row_description },
+    }
+}
+
 fn vessel_spec() -> TableSpec<VesselProjection> {
     TableSpec {
         columns: &VESSEL_COLUMNS,
@@ -388,6 +411,61 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 6] = [
         extract: |row| CellValue::plain(row.message.as_deref().unwrap_or_default()),
     },
 ];
+
+static PROJECT_COLUMNS: [ColumnSpec<ProjectProjection>; 4] = [
+    ColumnSpec {
+        id: "kind",
+        label: "KIND",
+        width: WidthHint::Fixed(8),
+        alignment: Alignment::Left,
+        extract: |row| {
+            CellValue::toned(
+                match row {
+                    ProjectProjection::Convoy(_) => "convoy",
+                    ProjectProjection::Issue { .. } => "issue",
+                },
+                CellTone::Muted,
+            )
+        },
+    },
+    ColumnSpec {
+        id: "name",
+        label: "WORK",
+        width: WidthHint::Flexible { minimum: 18, weight: 2 },
+        alignment: Alignment::Left,
+        extract: |row| {
+            CellValue::plain(match row {
+                ProjectProjection::Convoy(convoy) => convoy.name.clone(),
+                ProjectProjection::Issue { row, .. } => format!("{} · {}", row.reference.id, row.issue.title),
+            })
+        },
+    },
+    ColumnSpec {
+        id: "state",
+        label: "STATE",
+        width: WidthHint::Fixed(12),
+        alignment: Alignment::Left,
+        extract: |row| match row {
+            ProjectProjection::Convoy(convoy) => convoy_phase(convoy),
+            ProjectProjection::Issue { row, .. } => CellValue::plain(format!("{:?}", row.issue.state).to_lowercase()),
+        },
+    },
+    ColumnSpec {
+        id: "detail",
+        label: "DETAIL",
+        width: WidthHint::Flexible { minimum: 18, weight: 2 },
+        alignment: Alignment::Left,
+        extract: |row| {
+            CellValue::plain(match row {
+                ProjectProjection::Convoy(convoy) => convoy.message.clone().unwrap_or_default(),
+                ProjectProjection::Issue { row, .. } => row.issue.labels.join(", "),
+            })
+        },
+    },
+];
+
+static PROJECT_ACTIONS: [ActionSpec<ProjectProjection>; 1] =
+    [ActionSpec { id: "start", label: "Start convoy", key: 's', resolve: start_project_issue }];
 
 static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     ColumnSpec {
@@ -479,6 +557,46 @@ static INDEPENDENT_ACTIONS: [ActionSpec<IndependentRow>; 1] =
 
 fn convoy_id(row: &ConvoySummary) -> RowId {
     RowId::new(row.id.as_str())
+}
+
+fn project_row_id(row: &ProjectProjection) -> RowId {
+    match row {
+        ProjectProjection::Convoy(convoy) => RowId::new(format!("convoy:{}", convoy.id.as_str())),
+        ProjectProjection::Issue { namespace, project, row } => RowId::new(format!(
+            "issue:{namespace}:{project}:{}:{}:{}",
+            row.reference.source.service, row.reference.source.scope, row.reference.id
+        )),
+    }
+}
+
+fn project_row_drill(row: &ProjectProjection) -> Option<ViewAddress> {
+    match row {
+        ProjectProjection::Convoy(convoy) => convoy_drill(convoy),
+        ProjectProjection::Issue { .. } => None,
+    }
+}
+
+fn project_row_description(row: &ProjectProjection) -> Vec<DetailField> {
+    match row {
+        ProjectProjection::Convoy(convoy) => convoy_description(convoy),
+        ProjectProjection::Issue { namespace, project, row } => vec![
+            DetailField { label: "Namespace", value: namespace.clone() },
+            DetailField { label: "Project", value: project.clone() },
+            DetailField { label: "Issue", value: row.reference.id.clone() },
+            DetailField { label: "Title", value: row.issue.title.clone() },
+            DetailField { label: "Source", value: format!("{} / {}", row.reference.source.service, row.reference.source.scope) },
+            DetailField { label: "As of", value: row.issue.as_of.to_rfc3339() },
+        ],
+    }
+}
+
+fn start_project_issue(row: &ProjectProjection) -> Option<TableIntent> {
+    match row {
+        ProjectProjection::Issue { namespace, project, row } => {
+            Some(TableIntent::StartConvoy { namespace: namespace.clone(), project: project.clone(), issue: row.reference.clone() })
+        }
+        ProjectProjection::Convoy(_) => None,
+    }
 }
 
 fn convoy_drill(row: &ConvoySummary) -> Option<ViewAddress> {
@@ -602,13 +720,17 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::ResourceRef;
+    use flotilla_protocol::{test_support::TestIssue, ResourceRef};
 
     use super::*;
     use crate::convoy_model::{ConvoyId, ProcessSummary, WorkCompletionTarget};
 
     fn project_convoys(address: &str, convoys: &[&ConvoySummary]) -> Result<TableView, String> {
-        project(&address.parse().expect("valid address"), &TableRows { convoys: convoys.to_vec(), independents: vec![] })
+        project(&address.parse().expect("valid address"), &TableRows {
+            convoys: convoys.to_vec(),
+            independents: vec![],
+            project_issues: vec![],
+        })
     }
 
     fn vessel(name: &str, depends_on: &[&str], phase: WorkPhase) -> VesselSummary {
@@ -696,7 +818,7 @@ mod tests {
         elsewhere.project_ref = Some("other".into());
 
         let project_view = project_convoys("project/dev/flotilla", &[&in_project, &elsewhere]).expect("project table");
-        assert_eq!(project_view.rows.iter().map(|row| row.cells[0].text.as_str()).collect::<Vec<_>>(), vec!["tables"]);
+        assert_eq!(project_view.rows.iter().map(|row| row.cells[1].text.as_str()).collect::<Vec<_>>(), vec!["tables"]);
 
         let vessel = project_convoys("vessel/dev/tables/review", &[&in_project, &elsewhere]).expect("vessel table");
         assert_eq!(vessel.rows.len(), 1);
@@ -720,8 +842,12 @@ mod tests {
     fn independent_projection_has_typed_columns_and_truthful_attach_action() {
         let available = independent("scratch", "kiwi", Some("terminal-scratch"));
         let unavailable = independent("wedged", "feta", None);
-        let view = project(&ViewAddress::Independents, &TableRows { convoys: vec![], independents: vec![&unavailable, &available] })
-            .expect("independents table");
+        let view = project(&ViewAddress::Independents, &TableRows {
+            convoys: vec![],
+            independents: vec![&unavailable, &available],
+            project_issues: vec![],
+        })
+        .expect("independents table");
 
         assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec!["name", "repo", "host", "phase", "attach"]);
         assert_eq!(view.rows.iter().map(|row| row.cells[0].text.as_str()).collect::<Vec<_>>(), vec!["scratch", "wedged"]);
@@ -735,19 +861,40 @@ mod tests {
     }
 
     #[test]
+    fn project_issue_row_exposes_one_start_convoy_action_with_the_qualified_reference() {
+        let issue = TestIssue::new("Start convoy from issue").id("ENG-ab12").build();
+        let row = IssueRow { reference: issue.reference.clone(), issue };
+        let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+
+        let view =
+            project(&address, &TableRows { convoys: vec![], independents: vec![], project_issues: vec![("flotilla", "roadmap", &row)] })
+                .expect("project issue table");
+
+        assert_eq!(view.rows.len(), 1);
+        assert_eq!(view.rows[0].actions, vec![AvailableAction {
+            id: "start",
+            label: "Start convoy",
+            key: 's',
+            intent: TableIntent::StartConvoy { namespace: "flotilla".into(), project: "roadmap".into(), issue: row.reference },
+        }]);
+    }
+
+    #[test]
     fn table_state_preserves_identity_and_clamps_when_rows_disappear() {
         let first = convoy(vec![]);
         let mut second = convoy(vec![]);
         second.id = ConvoyId::new("dev", "other");
         second.name = "other".into();
         let address = "convoys/dev".parse().expect("valid address");
-        let view = project(&address, &TableRows { convoys: vec![&first, &second], independents: vec![] }).expect("project table");
+        let view = project(&address, &TableRows { convoys: vec![&first, &second], independents: vec![], project_issues: vec![] })
+            .expect("project table");
         let mut state = TableState::default();
         state.reconcile(&view);
         state.select_delta(&view, 1);
         assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other"));
 
-        let changed = project(&address, &TableRows { convoys: vec![&first], independents: vec![] }).expect("project table");
+        let changed =
+            project(&address, &TableRows { convoys: vec![&first], independents: vec![], project_issues: vec![] }).expect("project table");
         state.reconcile(&changed);
         assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables"));
     }

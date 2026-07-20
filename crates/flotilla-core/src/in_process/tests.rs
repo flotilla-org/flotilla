@@ -57,6 +57,24 @@ fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
 }
 
 #[test]
+fn convoy_fallback_names_are_dns_safe_bounded_and_deterministic() {
+    let title = "A very long issue title ".repeat(10);
+    let left = convoy_fallback_slug(&title, "LINEAR-732");
+    let right = convoy_fallback_slug(&title, "LINEAR-732");
+    assert_eq!(left, right);
+    assert!(left.len() <= 63);
+    validate_convoy_name(&left).expect("fallback should be a valid resource name");
+}
+
+#[test]
+fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
+    for branch in ["bad branch", "-invalid", "refs/heads/nested", "topic..nested", ".hidden/topic", "topic.lock"] {
+        assert!(validate_convoy_branch(branch).is_err(), "{branch} should be rejected");
+    }
+    validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
+}
+
+#[test]
 fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
     assert_eq!(project_target_syntax("/srv/repos/example"), ProjectTargetSyntax::ExplicitPath);
     assert_eq!(project_target_syntax("./org/repo"), ProjectTargetSyntax::ExplicitPath);
@@ -329,6 +347,8 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("create convoy");
@@ -427,7 +447,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
                 role: "coder".into(),
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "coding".into() },
-                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into() },
+                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "coder brief".into(), copies: Vec::new() },
                     context: TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "demo".into(),
@@ -1158,7 +1178,7 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Agent {
                     selector: Selector { capability: "coding".to_string() },
-                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into() },
+                    brief: TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() },
                     context: TerminalCrewContext {
                         namespace: "flotilla".into(),
                         convoy: "convoy-a".into(),
@@ -2357,6 +2377,8 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy create should succeed");
@@ -2735,6 +2757,8 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
+            issue: None,
+            instruction: None,
         })
         .await
         .expect("convoy create should succeed");

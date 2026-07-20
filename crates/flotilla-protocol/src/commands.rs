@@ -10,7 +10,7 @@ use crate::{
         CrewCommandContext, CrewListResponse, FleetListResponse, FleetReplicaSnapshot, HostListResponse, HostProvidersResponse,
         HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
     },
-    AttachableSetId, RepoIdentity,
+    AttachableSetId, IssueRef, RepoIdentity,
 };
 #[cfg(test)]
 use crate::{qualified_path::HostId, EnvironmentId};
@@ -84,6 +84,46 @@ pub struct Command {
     pub context_repo: Option<RepoSelector>,
     #[serde(flatten)]
     pub action: CommandAction,
+}
+
+/// An issue supplied to convoy admission either as a fully source-qualified
+/// reference or as an opaque ID whose source must be resolved through the
+/// Project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IssueSelector {
+    Id(String),
+    Reference(IssueRef),
+}
+
+/// Partial intent accepted by the convoy start verb. Admission completes any
+/// omitted fields before persisting a `ConvoySpec`.
+///
+/// This type lives in protocol rather than resources because incomplete
+/// intent must never enter the resource store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ConvoyStartIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub project_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<IssueSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_ref: Option<String>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_policy: Option<String>,
+    #[builder(default)]
+    #[serde(default)]
+    pub auto_attach: bool,
 }
 
 /// Commands the client can send to the daemon.
@@ -191,6 +231,9 @@ pub enum CommandAction {
         placement_policy: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adopted_checkout: Option<Box<PathBuf>>,
+    },
+    ConvoyStart {
+        intent: Box<ConvoyStartIntent>,
     },
     WorkflowTemplateApply {
         name: String,
@@ -310,6 +353,7 @@ impl Command {
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
+            CommandAction::ConvoyStart { .. } => "Starting convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectAdd { .. } => "Adding project...",
             CommandAction::ProjectApply { .. } => "Applying project...",
@@ -432,6 +476,13 @@ pub enum CommandValue {
     },
     ConvoyCreated {
         name: String,
+    },
+    ConvoyStarted {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<AttachBinding>,
     },
     WorkflowTemplateApplied {
         name: String,

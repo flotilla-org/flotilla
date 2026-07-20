@@ -5,8 +5,8 @@ use flotilla_controllers::reconcilers::{
 };
 use flotilla_core::{path_context::DaemonHostPath, providers::registry::ProviderRegistry, HostName};
 use flotilla_resources::{
-    controller::ControllerLoop, ensure_crd, ensure_namespace, Convoy, ConvoyReconciler, HttpBackend, Presentation, ResourceBackend, Vessel,
-    WorkflowTemplate,
+    controller::ControllerLoop, ensure_crd, ensure_namespace, Checkout, Convoy, ConvoyReconciler, HttpBackend, Presentation,
+    ResourceBackend, Vessel, WorkflowTemplate,
 };
 use tracing::info;
 
@@ -93,7 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 secondaries: ConvoyReconciler::secondary_watches(),
                 reconciler: ConvoyReconciler::new(templates)
                     .with_vessels(convoy_backend.clone().using::<Vessel>(&namespace))
-                    .with_presentations(convoy_backend.clone().using::<Presentation>(&namespace)),
+                    .with_presentations(convoy_backend.clone().using::<Presentation>(&namespace))
+                    .with_checkouts(convoy_backend.clone().using::<Checkout>(&namespace)),
                 resync_interval: Duration::from_secs(60),
                 backend: convoy_backend,
             }

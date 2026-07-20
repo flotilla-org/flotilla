@@ -44,6 +44,22 @@ fn setup_native_issue_rows(app: &mut App, issue_ids: &[&str]) {
     }
 }
 
+#[test]
+fn project_issue_start_preserves_the_selected_namespace() {
+    let mut app = stub_app();
+    let issue = flotilla_protocol::IssueRef {
+        source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+        id: "732".into(),
+    };
+    app.execute_table_intent(TableIntent::StartConvoy { namespace: "other-team".into(), project: "roadmap".into(), issue: issue.clone() });
+
+    let (command, _) = app.proto_commands.take_next().expect("start command");
+    let flotilla_protocol::CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
+    assert_eq!(intent.namespace.as_deref(), Some("other-team"));
+    assert_eq!(intent.project_ref, "roadmap");
+    assert_eq!(intent.issue, Some(flotilla_protocol::IssueSelector::Reference(issue)));
+}
+
 /// Read the active RepoPage's selected flat index.
 fn active_selection(app: &App) -> Option<usize> {
     let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");

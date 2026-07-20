@@ -48,7 +48,7 @@ pub fn build_crew_brief(
         "Complete your assignment with `flotilla crew complete --message '...'`. If it cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
         prompt.unwrap_or("No additional assignment was provided.")
     ));
-    flotilla_resources::TerminalBrief { path: crew_brief_path(role), content }
+    flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +222,7 @@ mod tests {
         let brief = flotilla_resources::TerminalBrief {
             path: ".flotilla/briefs/coder.md".into(),
             content: "protocol preamble\n\nImplement the issue.".into(),
+            copies: Vec::new(),
         };
 
         let codex = registry.get("codex").expect("codex adapter");

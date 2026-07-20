@@ -395,6 +395,9 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::IssuePage(page) => format!("issue page: {} items, has_more={}", page.items.len(), page.has_more),
         CommandValue::IssuesByIds { items } => format!("issues by ids: {} items", items.len()),
         CommandValue::ConvoyCreated { name } => format!("convoy created: {name}"),
+        CommandValue::ConvoyStarted { name, attach_command, .. } => {
+            format!("convoy started: {name}{}", if attach_command.is_some() { " (crew ready)" } else { "" })
+        }
         CommandValue::WorkflowTemplateApplied { name } => format!("workflow template applied: {name}"),
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
         CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
@@ -708,7 +711,7 @@ async fn run_watch_connection(daemon: std::sync::Arc<dyn DaemonHandle>, format: 
     }
 }
 
-pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
+pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<CommandValue, String> {
     if command.action.is_query() {
         return run_query_command(daemon, command, format).await;
     }
@@ -741,7 +744,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                 return match result {
                     CommandValue::Error { message } => Err(message),
                     CommandValue::Cancelled => Err("command cancelled".into()),
-                    _ => Ok(()),
+                    result => Ok(result),
                 };
             }
             Ok(_) => {}
@@ -757,7 +760,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
     }
 }
 
-async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<(), String> {
+async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: OutputFormat) -> Result<CommandValue, String> {
     let result = daemon.execute_query(command, uuid::Uuid::new_v4()).await?;
     match format {
         OutputFormat::Human => {
@@ -770,7 +773,7 @@ async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: 
     match result {
         CommandValue::Error { message } => Err(message),
         CommandValue::Cancelled => Err("command cancelled".into()),
-        _ => Ok(()),
+        result => Ok(result),
     }
 }
 

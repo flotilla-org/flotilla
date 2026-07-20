@@ -4,13 +4,15 @@ use chrono::{DateTime, Utc};
 use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
 use flotilla_resources::{
     clone_key,
-    controller::{delete_lifecycle_owned_matching, Actuation, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
+    controller::{
+        delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
+    },
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, CrewSource, DockerCheckoutStrategy,
     DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
     PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, Stance,
     TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
-    VesselStatusPatch, VESSEL_REF_LABEL,
+    VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -47,6 +49,7 @@ impl VesselReconciler {
         vec![
             Box::new(LabelMappedWatch::<Environment, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Checkout, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
+            Box::new(LabelJoinWatch::<Checkout, Vessel> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<TerminalSession, Vessel> { label_key: VESSEL_REF_LABEL, _marker: PhantomData }),
         ]
     }
@@ -191,6 +194,8 @@ impl Reconciler for VesselReconciler {
                 None => return Ok(VesselDeps::failed("convoy ref is missing".to_string())),
             }
         };
+        let checkout_slug = git_ref.as_deref().map(checkout_path_component);
+        let convoy_checkout_slug = checkout_path_component(&convoy.metadata.name);
         if repository_refs.len() > 1 && !obj.spec.adopted_checkout_refs.is_empty() {
             return Ok(VesselDeps::failed("adopted checkouts are not supported for multi-repository vessel workspaces".to_string()));
         }
@@ -207,7 +212,11 @@ impl Reconciler for VesselReconciler {
             }
             convoy_repositories.push(repository);
         }
-        let multi_repository = convoy_repositories.len() > 1;
+        let multi_repository = convoy.spec.repositories.len() > 1;
+        let workspace_slugs = convoy_repositories
+            .iter()
+            .map(|repository| (repository.repo_ref.clone(), repository.workspace_slug.clone()))
+            .collect::<BTreeMap<_, _>>();
 
         let clone_env_ref = host_direct_environment_name(strategy.host_ref());
         let mut actuations = Vec::new();
@@ -274,9 +283,10 @@ impl Reconciler for VesselReconciler {
             match &strategy {
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                     format!(
-                        "{}/{}",
+                        "{}/{}/{}",
                         shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
-                        obj.metadata.name
+                        convoy_checkout_slug,
+                        checkout_slug.as_deref().expect("repository workspace requires a branch")
                     )
                 }
                 PlacementStrategy::DockerFreshCloneInContainer { clone_path, .. } => clone_path.clone(),
@@ -348,9 +358,14 @@ impl Reconciler for VesselReconciler {
             } else {
                 None
             };
-            let checkout_name = adopted_checkout_ref
-                .clone()
-                .unwrap_or_else(|| checkout_name(&obj.metadata.name, &convoy_repository.workspace_slug, multi_repository));
+            let checkout_name = adopted_checkout_ref.clone().unwrap_or_else(|| match &strategy {
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                    checkout_name(&convoy.metadata.name, &convoy_repository.workspace_slug, multi_repository)
+                }
+                PlacementStrategy::DockerFreshCloneInContainer { .. } => {
+                    checkout_name(&obj.metadata.name, &convoy_repository.workspace_slug, multi_repository)
+                }
+            });
             let checkout_target_path = match &strategy {
                 PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
                     if multi_repository {
@@ -358,8 +373,9 @@ impl Reconciler for VesselReconciler {
                     } else {
                         checkout_target_path(
                             shared_clone_root.as_deref().expect("shared-clone placement has a root"),
+                            &convoy_checkout_slug,
                             &repository.spec.catalog_slug(),
-                            &obj.metadata.name,
+                            checkout_slug.as_deref().expect("repository checkout requires a branch"),
                         )
                     }
                 }
@@ -427,14 +443,14 @@ impl Reconciler for VesselReconciler {
                         }),
                     };
                     let env_ref = spec.env_ref().expect("managed checkout should have an env_ref").to_string();
-                    actuations.push(Actuation::CreateCheckout {
-                        meta: owned_child_meta(
-                            &checkout_name,
-                            obj,
-                            BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]),
-                        ),
-                        spec,
-                    });
+                    let labels = BTreeMap::from([(ENV_LABEL.to_string(), env_ref), (REPO_KEY_LABEL.to_string(), repo_key)]);
+                    let meta = match &strategy {
+                        PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerWorktreeOnHostAndMount { .. } => {
+                            convoy_owned_child_meta(&checkout_name, &convoy, labels)
+                        }
+                        PlacementStrategy::DockerFreshCloneInContainer { .. } => owned_child_meta(&checkout_name, obj, labels),
+                    };
+                    actuations.push(Actuation::CreateCheckout { meta, spec });
                     waiting_for_checkouts = true;
                 }
                 Err(err) => return Err(err),
@@ -516,6 +532,23 @@ impl Reconciler for VesselReconciler {
                 precreated_environment_ref.expect("fresh-clone strategy should resolve environment first")
             }
         };
+        let terminal_cwd = strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories);
+        let brief_copies = checkout_paths
+            .iter()
+            .filter(|(repo_ref, _)| {
+                convoy.spec.issue.as_ref().and_then(|issue| issue.repository_ref.as_ref()).is_none_or(|relevant| relevant == *repo_ref)
+            })
+            .map(|(repo_ref, path)| match &strategy {
+                PlacementStrategy::DockerWorktreeOnHostAndMount { mount_path, .. } => {
+                    if multi_repository {
+                        format!("{}/{}", mount_path.trim_end_matches('/'), workspace_slugs[repo_ref])
+                    } else {
+                        mount_path.clone()
+                    }
+                }
+                PlacementStrategy::HostDirect { .. } | PlacementStrategy::DockerFreshCloneInContainer { .. } => path.clone(),
+            })
+            .collect::<Vec<_>>();
 
         let first_agent_index = requirement.crew.iter().position(|process| matches!(process.source, CrewSource::Agent { .. }));
         let mut terminal_refs = Vec::new();
@@ -579,12 +612,10 @@ impl Reconciler for VesselReconciler {
                                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
                                 })
                                 .collect::<Vec<_>>();
-                            flotilla_resources::TerminalSessionSource::Agent {
-                                selector: selector.clone(),
-                                brief: build_crew_brief(&context, &obj.spec.vessel_name, &process.role, prompt.as_deref(), &members),
-                                context,
-                                message: None,
-                            }
+                            let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, prompt.as_deref(), &members);
+                            append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
+                            brief.copies = brief_copies.clone();
+                            flotilla_resources::TerminalSessionSource::Agent { selector: selector.clone(), brief, context, message: None }
                         }
                     };
                     actuations.push(Actuation::CreateTerminalSession {
@@ -593,7 +624,7 @@ impl Reconciler for VesselReconciler {
                             env_ref: resolved_environment_ref.clone(),
                             role: process.role.clone(),
                             source,
-                            cwd: strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories),
+                            cwd: terminal_cwd.clone(),
                             pool: strategy.pool().to_string(),
                         },
                     });
@@ -706,8 +737,52 @@ fn checkout_name(vessel_name: &str, workspace_slug: &str, multi_repository: bool
     }
 }
 
-fn checkout_target_path(repo_default_dir: &str, repo_slug: &str, vessel_name: &str) -> String {
-    format!("{}/{}.{}", repo_default_dir.trim_end_matches('/'), repo_slug, vessel_name)
+fn checkout_path_component(branch: &str) -> String {
+    let normalized = branch
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') { character } else { '-' })
+        .collect::<String>();
+    let normalized = normalized.trim_matches(['-', '.']).to_string();
+    if normalized.is_empty() {
+        "work".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {
+    format!("{}/{}/{}.{}", repo_default_dir.trim_end_matches('/'), convoy_slug, repo_slug, branch_slug)
+}
+
+fn append_convoy_work_context(content: &mut String, convoy: &ResourceObject<Convoy>, repository_refs: &[RepositoryKey]) {
+    content.push_str("\n\n## Work context\n\n");
+    if let Some(branch) = &convoy.spec.r#ref {
+        content.push_str(&format!("- Branch: `{branch}`\n"));
+    }
+    content.push_str("- Repositories:\n");
+    for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
+        content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
+    }
+    if let Some(issue) = &convoy.spec.issue {
+        content.push_str("\n## Issue snapshot\n\n");
+        content.push_str(&format!(
+            "Source-qualified reference: `{}` / `{}` / `{}`\n\n",
+            issue.reference.source.service, issue.reference.source.scope, issue.reference.id
+        ));
+        content.push_str(&format!("Snapshot as of `{}`.\n\n", issue.snapshot.as_of.to_rfc3339()));
+        content.push_str(&format!("### {}\n\n", issue.snapshot.title));
+        content.push_str(&format!("State: `{:?}`\n\n", issue.snapshot.state).to_lowercase());
+        content.push_str(&format!("Labels: {}\n\n", issue.snapshot.labels.join(", ")));
+        if let Some(body) = &issue.snapshot.body {
+            content.push_str(body);
+            content.push('\n');
+        }
+    }
+    if let Some(instruction) = &convoy.spec.instruction {
+        content.push_str("\n## Human instruction\n\n");
+        content.push_str(instruction);
+        content.push('\n');
+    }
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
@@ -719,6 +794,20 @@ fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_la
             api_version: format!("{}/{}", Vessel::API_PATHS.group, Vessel::API_PATHS.version),
             kind: Vessel::API_PATHS.kind.to_string(),
             name: workspace.metadata.name.clone(),
+            controller: true,
+        }])
+        .build()
+}
+
+fn convoy_owned_child_meta(name: &str, convoy: &ResourceObject<Convoy>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {
+    extra_labels.insert(CONVOY_LABEL.to_string(), convoy.metadata.name.clone());
+    InputMeta::builder()
+        .name(name.to_string())
+        .labels(extra_labels)
+        .owner_references(vec![OwnerReference {
+            api_version: format!("{}/{}", Convoy::API_PATHS.group, Convoy::API_PATHS.version),
+            kind: Convoy::API_PATHS.kind.to_string(),
+            name: convoy.metadata.name.clone(),
             controller: true,
         }])
         .build()

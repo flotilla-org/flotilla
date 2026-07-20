@@ -82,6 +82,51 @@ spec:
                   additionalProperties:
                     type: string
                     minLength: 1
+                issue:
+                  type: object
+                  required: [reference, snapshot]
+                  properties:
+                    reference:
+                      type: object
+                      required: [source, id]
+                      properties:
+                        source:
+                          type: object
+                          required: [service, scope]
+                          properties:
+                            service:
+                              type: string
+                              minLength: 1
+                            scope:
+                              type: string
+                              minLength: 1
+                        id:
+                          type: string
+                          minLength: 1
+                    repository_ref:
+                      type: string
+                      minLength: 1
+                    snapshot:
+                      type: object
+                      required: [title, state, labels, as_of]
+                      properties:
+                        title:
+                          type: string
+                          minLength: 1
+                        body:
+                          type: string
+                        state:
+                          type: string
+                          enum: [open, closed]
+                        labels:
+                          type: array
+                          items:
+                            type: string
+                        as_of:
+                          type: string
+                          format: date-time
+                instruction:
+                  type: string
             status:
               type: object
               properties:
