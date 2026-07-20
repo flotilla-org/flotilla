@@ -2589,54 +2589,62 @@ async fn direct_repository_admission_does_not_guess_a_default_branch() {
     ));
 }
 
+const ADOPTED_CHECKOUT_REMOTE: &str = "git@github.com:flotilla-org/flotilla.git";
+
+struct AdoptedConvoyFixture {
+    _temp: tempfile::TempDir,
+    daemon: Arc<InProcessDaemon>,
+    checkout_path: PathBuf,
+}
+
+impl AdoptedConvoyFixture {
+    async fn new() -> Self {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let config_base = temp.path().join("config");
+        std::fs::create_dir_all(&config_base).expect("create config dir");
+        std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+        let checkout_path = temp.path().join("repo");
+        init_git_repo_with_remote(&checkout_path, ADOPTED_CHECKOUT_REMOTE);
+        let daemon =
+            InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local())
+                .await;
+        Self { _temp: temp, daemon, checkout_path }
+    }
+
+    async fn create_convoy(&self) -> CommandValue {
+        let mut events = self.daemon.subscribe();
+        let command_id = self
+            .daemon
+            .execute(Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyCreate {
+                    name: "convoy-adopted".to_string(),
+                    workflow_ref: "scratch".to_string(),
+                    inputs: Vec::new(),
+                    repository_url: None,
+                    r#ref: None,
+                    project_ref: None,
+                    placement_policy: None,
+                    adopted_checkout: Some(Box::new(self.checkout_path.clone())),
+                },
+            })
+            .await
+            .expect("execute should return a command id");
+        wait_for_command_result(&mut events, command_id).await
+    }
+}
+
 #[tokio::test]
 async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource() {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let config_base = temp.path().join("config");
-    std::fs::create_dir_all(&config_base).expect("create config dir");
-    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    let checkout_path = temp.path().join("repo");
-    let remote = "git@github.com:flotilla-org/flotilla.git";
-    init_git_repo_with_remote(&checkout_path, remote);
+    let fixture = AdoptedConvoyFixture::new().await;
+    let daemon = &fixture.daemon;
+    let checkout_path = &fixture.checkout_path;
 
-    let daemon =
-        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local()).await;
-
-    let mut events = daemon.subscribe();
-    let command_id = daemon
-        .execute(Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: None,
-            action: CommandAction::ConvoyCreate {
-                name: "convoy-adopted".to_string(),
-                workflow_ref: "scratch".to_string(),
-                inputs: Vec::new(),
-                repository_url: None,
-                r#ref: None,
-                project_ref: None,
-                placement_policy: None,
-                adopted_checkout: Some(Box::new(checkout_path.clone())),
-            },
-        })
-        .await
-        .expect("execute should return a command id");
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            match events.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
-                Ok(_) => {}
-                Err(err) => panic!("unexpected event error: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("timeout waiting for command result");
-
-    assert_eq!(result, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+    assert_eq!(fixture.create_convoy().await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("convoy-adopted").await.expect("convoy should exist");
-    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some(remote));
+    assert_eq!(convoy.spec.repositories.first().map(|repo| repo.url.as_str()), Some(ADOPTED_CHECKOUT_REMOTE));
     assert_eq!(convoy.spec.r#ref.as_deref(), Some("main"));
     assert_eq!(convoy.spec.adopted_checkout_refs.values().next().map(String::as_str), Some("adopted-checkout-convoy-adopted"));
 
@@ -2659,7 +2667,7 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
     match checkout.spec {
         ResourceCheckoutSpec::Observed(spec) => {
             assert_eq!(spec.r#ref, "main");
-            assert_eq!(spec.path, std::fs::canonicalize(&checkout_path).expect("canonical path").display().to_string());
+            assert_eq!(spec.path, std::fs::canonicalize(checkout_path).expect("canonical path").display().to_string());
             assert_eq!(
                 spec.repo_ref,
                 flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec").key()
@@ -2669,7 +2677,54 @@ async fn convoy_create_with_adopted_checkout_creates_adopted_checkout_resource()
     }
     let status = checkout.status.expect("adopted checkout should be ready");
     assert_eq!(status.phase, ResourceCheckoutPhase::Ready);
-    assert_eq!(status.path.as_deref(), Some(std::fs::canonicalize(&checkout_path).expect("canonical path").to_string_lossy().as_ref()));
+    assert_eq!(status.path.as_deref(), Some(std::fs::canonicalize(checkout_path).expect("canonical path").to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
+async fn convoy_create_preserves_status_of_a_matching_preexisting_adopted_checkout() {
+    let fixture = AdoptedConvoyFixture::new().await;
+    let daemon = &fixture.daemon;
+    let canonical_path = std::fs::canonicalize(&fixture.checkout_path).expect("canonical checkout path").to_string_lossy().into_owned();
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let created = checkouts
+        .create(
+            &InputMeta::builder()
+                .name("adopted-checkout-convoy-adopted".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-adopted".to_string())]))
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &ResourceCheckoutSpec::Observed(
+                ResourceObservedCheckoutSpec::builder()
+                    .r#ref("main".to_string())
+                    .path(canonical_path.clone())
+                    .repo_ref(RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec").key())
+                    .host_ref(daemon.local_host_id().expect("local host id").to_string())
+                    .is_main(true)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("preexisting adopted checkout should be created");
+    let failed_status = ResourceCheckoutStatus::builder()
+        .phase(ResourceCheckoutPhase::Failed)
+        .path(canonical_path)
+        .message("earlier adoption failure".to_string())
+        .build();
+    checkouts
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &failed_status)
+        .await
+        .expect("preexisting status should be stored");
+
+    assert_eq!(fixture.create_convoy().await, CommandValue::ConvoyCreated { name: "convoy-adopted".to_string() });
+    let durable = checkouts.get("adopted-checkout-convoy-adopted").await.expect("durable adopted checkout should remain");
+    assert_eq!(durable.status, Some(failed_status.clone()));
+    let observed = daemon
+        .observed_resource_backend()
+        .using::<ResourceCheckout>("flotilla")
+        .get("adopted-checkout-convoy-adopted")
+        .await
+        .expect("observed adopted checkout should be published");
+    assert_eq!(observed.status, Some(failed_status));
 }
 
 #[tokio::test]

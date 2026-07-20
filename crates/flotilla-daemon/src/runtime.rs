@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -47,7 +48,7 @@ use crate::{
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_REPO_DIR_SUFFIX: &str = "dev/flotilla-repos";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct RuntimeOptions {
     pub namespace: String,
     pub heartbeat_interval: Duration,
@@ -97,10 +98,14 @@ impl DaemonRuntime {
         let profile = build_local_profile(&daemon, &local_registry)?;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
+        if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
+            warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
+        }
 
         let mut tasks = vec![
             spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
+            spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
             spawn_aggregator_task(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -474,11 +479,11 @@ fn spawn_heartbeat_task(
     profile: LocalProvisioningProfile,
     interval: Duration,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        let profile = profile.clone();
+        async move {
             if let Err(err) = apply_host_heartbeat(&daemon, &namespace, &profile).await {
                 warn!(%err, "failed to publish host heartbeat");
             }
@@ -487,14 +492,49 @@ fn spawn_heartbeat_task(
 }
 
 fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
+    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
+        let daemon = Arc::clone(&daemon);
+        async move {
             if let Err(err) = daemon.refresh_fleet_replicas_once().await {
                 warn!(%err, "failed to refresh fleet replicas");
             }
+        }
+    })
+}
+
+fn spawn_adopted_checkout_reconciliation_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    spawn_periodic_task(interval, PeriodicTaskStart::AfterInterval, move || {
+        let daemon = Arc::clone(&daemon);
+        let namespace = namespace.clone();
+        async move {
+            if let Err(error) = daemon.reconcile_adopted_checkouts(&namespace).await {
+                warn!(%error, "failed to reconcile adopted checkout observations");
+            }
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PeriodicTaskStart {
+    Immediate,
+    AfterInterval,
+}
+
+fn spawn_periodic_task<Operation, OperationFuture>(interval: Duration, start: PeriodicTaskStart, mut operation: Operation) -> JoinHandle<()>
+where
+    Operation: FnMut() -> OperationFuture + Send + 'static,
+    OperationFuture: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let start = match start {
+            PeriodicTaskStart::Immediate => tokio::time::Instant::now(),
+            PeriodicTaskStart::AfterInterval => tokio::time::Instant::now() + interval,
+        };
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            operation().await;
         }
     })
 }
@@ -1259,9 +1299,10 @@ mod tests {
     };
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
     use flotilla_resources::{
-        Checkout as ResourceCheckout, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
-        PlacementPolicy, RepositorySpec, Selector, SqliteBackend, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement,
-        WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+        Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+        CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
+        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend, TerminalSession,
+        TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -1905,6 +1946,54 @@ mod tests {
 
         heartbeat.abort();
         let _ = heartbeat.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adopted_checkout_reconciliation_task_runs_after_interval() {
+        let temp = TempDir::new().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), config).await;
+        let durable = daemon.resource_backend().using::<ResourceCheckout>(NAMESPACE);
+        let created = durable
+            .create(
+                &InputMeta::builder()
+                    .name("adopted-checkout-periodic".to_string())
+                    .build()
+                    .with_lifecycle_authority(LifecycleAuthority::Adopted),
+                &ResourceCheckoutSpec::Observed(
+                    ResourceObservedCheckoutSpec::builder()
+                        .r#ref("feature/periodic".to_string())
+                        .path("/work/periodic".to_string())
+                        .repo_ref(flotilla_resources::RepositoryKey("widgets-api".to_string()))
+                        .host_ref("host-01".to_string())
+                        .is_main(false)
+                        .build(),
+                ),
+            )
+            .await
+            .expect("durable adopted checkout should be created");
+        durable
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path("/work/periodic".to_string()).build(),
+            )
+            .await
+            .expect("durable checkout status should be stored");
+        let interval = Duration::from_secs(60);
+        let reconciliation = spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), NAMESPACE.to_string(), interval);
+        tokio::task::yield_now().await;
+        let observed = daemon.observed_resource_backend().using::<ResourceCheckout>(NAMESPACE);
+        assert!(
+            matches!(observed.get("adopted-checkout-periodic").await, Err(ResourceError::NotFound { .. })),
+            "the periodic task should wait for its first interval"
+        );
+
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+
+        observed.get("adopted-checkout-periodic").await.expect("periodic reconciliation should restore the observed checkout");
+        reconciliation.abort();
     }
 
     #[tokio::test]

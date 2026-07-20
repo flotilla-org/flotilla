@@ -582,8 +582,14 @@ async fn create_adopted_checkout_resource(
     );
     let status = ResourceCheckoutStatus::builder().phase(ResourceCheckoutPhase::Ready).path(path_str).build();
 
-    persist_adopted_checkout(durable_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
-    persist_adopted_checkout(observed_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
+    let durable = persist_adopted_checkout(durable_backend, namespace, &checkout_ref, &meta, &spec, &status).await?;
+    match crate::observed_resources::project_adopted_checkout(observed_backend, namespace, &durable).await {
+        Ok(()) => {}
+        Err(ResourceError::Invalid { message }) => return Err(message),
+        Err(error) => {
+            warn!(checkout = %checkout_ref, %error, "adopted checkout committed durably but observed publication failed; reconciliation will retry");
+        }
+    }
 
     Ok((checkout_ref, repository_url.to_string(), git_ref.to_string()))
 }
@@ -595,7 +601,7 @@ async fn persist_adopted_checkout(
     meta: &InputMeta,
     spec: &ResourceCheckoutSpec,
     status: &ResourceCheckoutStatus,
-) -> Result<(), String> {
+) -> Result<ResourceObject<ResourceCheckout>, String> {
     let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
     let checkout = match checkouts.create(meta, spec).await {
         Ok(checkout) => checkout,
@@ -611,8 +617,11 @@ async fn persist_adopted_checkout(
         }
         Err(err) => return Err(err.to_string()),
     };
-    checkouts.update_status(checkout_ref, &checkout.metadata.resource_version, status).await.map_err(|err| err.to_string())?;
-    Ok(())
+    if checkout.status.is_some() {
+        Ok(checkout)
+    } else {
+        checkouts.update_status(checkout_ref, &checkout.metadata.resource_version, status).await.map_err(|err| err.to_string())
+    }
 }
 
 async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str, contained: bool) -> Option<String> {
@@ -1489,6 +1498,15 @@ impl InProcessDaemon {
 
     pub fn observed_resource_backend(&self) -> ResourceBackend {
         self.observed_resource_backend.clone()
+    }
+
+    /// Restore the ephemeral adopted Checkout projection from durable
+    /// controller-facing Checkout resources.
+    pub async fn reconcile_adopted_checkouts(&self, namespace: &str) -> Result<(), String> {
+        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+        crate::observed_resources::reconcile_adopted_checkouts(&self.resource_backend, &self.observed_resource_backend, namespace)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -4343,6 +4361,7 @@ impl InProcessDaemon {
                             .as_deref()
                             .ok_or_else(|| "an adopted checkout requires a repository transport URL".to_string())?;
                         let git_ref = r#ref.as_deref().unwrap_or(&inspection.checkout.git_ref);
+                        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                         let (checkout_ref, inferred_repository_url, inferred_ref) = create_adopted_checkout_resource(
                             &self.resource_backend,
                             &self.observed_resource_backend,

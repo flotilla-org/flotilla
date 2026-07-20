@@ -24,11 +24,11 @@ use flotilla_protocol::{
     DaemonEvent, HostName, LifecycleAuthority, QueryCursor, QueryScope,
 };
 use flotilla_resources::{
-    Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, Environment, EnvironmentSpec,
-    HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository,
-    RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, CONVOY_LABEL, REPO_LABEL,
-    VESSEL_LABEL,
+    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus,
+    Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState,
+    WorkflowSnapshot, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -250,6 +250,87 @@ async fn scoped_checkout_queries_emit_observed_rows_and_removal_deltas() {
     for query in [&repository_query, &project_query] {
         assert_eq!(removals.get(query).expect("scoped removal").changes.removed_resources().expect("checkout removals").len(), 1);
     }
+}
+
+#[tokio::test]
+async fn runtime_start_republishes_durable_adopted_checkouts_before_query_bootstrap() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/widgets/api.git").expect("remote repository");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository");
+    backend
+        .clone()
+        .using::<Checkout>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("adopted-checkout-restart".to_string())
+                .build()
+                .with_lifecycle_authority(LifecycleAuthority::Adopted),
+            &CheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("feature/restart".to_string())
+                    .path("/work/widgets".to_string())
+                    .repo_ref(repository_key.clone())
+                    .host_ref("host-before-restart".to_string())
+                    .is_main(false)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("persist durable adopted checkout without status");
+
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let options = RuntimeOptions::builder()
+        .namespace("flotilla".to_string())
+        .heartbeat_interval(Duration::from_secs(300))
+        .controller_resync_interval(Duration::from_secs(300))
+        .controller_supervision(Default::default())
+        .start_controllers(false)
+        .build();
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
+    let query = QueryId::Checkouts { scope: QueryScope::Repository(repository_key) };
+
+    let result_set = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = daemon
+                .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }])
+                .await
+                .expect("subscribe checkout query");
+            if let Some(result_set) = events.into_iter().find_map(|event| match event {
+                DaemonEvent::ResultSet(result_set)
+                    if result_set.query() == query && result_set.rows.as_checkouts().is_some_and(|rows| !rows.is_empty()) =>
+                {
+                    Some(result_set)
+                }
+                _ => None,
+            }) {
+                break result_set;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("adopted checkout should be present in the bootstrapped query");
+
+    let rows = result_set.rows.as_checkouts().expect("checkout rows");
+    assert!(matches!(rows, [row] if row.authority == LifecycleAuthority::Adopted && row.branch == "feature/restart"));
+    let durable =
+        backend.using::<Checkout>("flotilla").get("adopted-checkout-restart").await.expect("durable adopted checkout should remain");
+    assert_eq!(durable.status, Some(CheckoutStatus::builder().phase(CheckoutPhase::Ready).path("/work/widgets".to_string()).build()));
 }
 
 #[tokio::test]
