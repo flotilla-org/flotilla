@@ -218,7 +218,9 @@ impl MetadataPatch {
     /// The compact payload written to the apply-patch pipe — the
     /// patch wrapped in andamento's externally-visible message envelope.
     pub fn to_pipe_payload(&self) -> String {
-        serde_json::to_string(&WireMessage::MetadataPatch(self.clone())).expect("metadata patch serializes")
+        let payload = serde_json::to_string(&WireMessage::MetadataPatch(self.clone())).expect("metadata patch serializes");
+        assert!(!payload.bytes().any(|byte| byte == b'\n' || byte == b'\r'), "metadata patch pipe payload must be a single line");
+        payload
     }
 }
 

@@ -10,7 +10,7 @@ bon = { workspace = true }
 flotilla-protocol = { path = "../flotilla-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["process", "net", "io-util"] }
+tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
