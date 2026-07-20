@@ -280,7 +280,6 @@ pub type NamespaceMap = HashMap<String, NamespaceModel>;
 pub struct NamespaceModel {
     pub convoys: IndexMap<crate::convoy_model::ConvoyId, crate::convoy_model::ConvoySummary>,
     pub independents: IndexMap<ResourceRef, flotilla_protocol::IndependentRow>,
-    pub project_issues: HashMap<String, Vec<flotilla_protocol::IssueRow>>,
     pub last_seq: u64,
 }
 
@@ -337,15 +336,6 @@ pub fn table_rows<'a>(
     crate::table_view::TableRows {
         convoys: namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect(),
         independents: namespaces.values().flat_map(|namespace| namespace.independents.values()).collect(),
-        project_issues: namespaces
-            .iter()
-            .flat_map(|(namespace, model)| {
-                model
-                    .project_issues
-                    .iter()
-                    .flat_map(move |(project, rows)| rows.iter().map(move |row| (namespace.as_str(), project.as_str(), row)))
-            })
-            .collect(),
         issue_results: queries
             .issues
             .iter()
@@ -585,7 +575,7 @@ impl App {
         let mut queries = Vec::new();
         for view in self.views.iter() {
             let Some(address) = view.address() else { continue };
-            for query in view_kind::queries(address, view.table_state.source_search.as_deref()) {
+            for query in view_kind::queries(address, view.source_search()) {
                 if !queries.contains(&query) {
                     queries.push(query);
                 }
@@ -965,14 +955,6 @@ impl App {
         }
     }
 
-    fn sync_project_issue_rows(&mut self, query: &flotilla_protocol::QueryId) {
-        let flotilla_protocol::QueryId::Issues { scope, search: None } = query else {
-            return;
-        };
-        let rows = self.query_tables.issues.get(query).map(|result| result.rows.clone()).unwrap_or_default();
-        self.namespaces.entry(scope.namespace.clone()).or_default().project_issues.insert(scope.name.clone(), rows);
-    }
-
     // ── Widget stack helpers ──
 
     /// Pop all modal widgets from the stack.
@@ -1192,7 +1174,7 @@ impl App {
                     let queries = self
                         .views
                         .active_address()
-                        .map(|address| view_kind::queries(address, self.views.active_table_state().source_search.as_deref()))
+                        .map(|address| view_kind::queries(address, self.views.active_source_search()))
                         .unwrap_or_default();
                     if !queries.is_empty() {
                         for query in queries {
@@ -1372,7 +1354,6 @@ impl App {
                         self.query_tables
                             .issues
                             .insert(query.clone(), QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
-                        self.sync_project_issue_rows(&query);
                     }
                     flotilla_protocol::Rows::Checkouts { rows, .. } => {
                         self.query_tables.checkouts.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
@@ -1419,7 +1400,6 @@ impl App {
                             |row| row.reference.clone(),
                             |left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)),
                         );
-                        self.sync_project_issue_rows(&query);
                     }
                     flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
                         let result = self.query_tables.checkouts.entry(query).or_default();
