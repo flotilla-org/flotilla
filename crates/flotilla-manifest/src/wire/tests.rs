@@ -92,13 +92,18 @@ fn observed_identities_parse_merges_concatenated_responses() {
 
 #[test]
 fn pipe_payload_is_the_tagged_compact_envelope() {
-    let patch =
-        MetadataPatch { target: MetadataTarget::Root, source_id: "flotilla-connector".to_owned(), set: BTreeMap::new(), unset: vec![] };
+    let patch = MetadataPatch {
+        target: MetadataTarget::Root,
+        source_id: "flotilla\nconnector\rstream".to_owned(),
+        set: BTreeMap::new(),
+        unset: vec![],
+    };
     let payload = patch.to_pipe_payload();
     assert!(!payload.contains('\n'));
+    assert!(!payload.contains('\r'));
     let value: Value = serde_json::from_str(&payload).expect("payload is JSON");
     assert_eq!(value["type"], "metadata-patch");
-    assert_eq!(value["source_id"], "flotilla-connector");
+    assert_eq!(value["source_id"], "flotilla\nconnector\rstream");
 }
 
 #[test]
