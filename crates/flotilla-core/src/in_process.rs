@@ -2311,6 +2311,14 @@ async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, names
 }
 
 fn normalize_project_name(name: &str) -> Result<String, String> {
+    let normalized = normalized_project_name(name)?;
+    if normalized != name {
+        return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
+    }
+    Ok(normalized)
+}
+
+fn normalized_project_name(name: &str) -> Result<String, String> {
     let normalized = name
         .trim()
         .chars()
@@ -2322,9 +2330,6 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
         .join("-");
     if normalized.is_empty() {
         return Err("project name must contain an alphanumeric character".to_string());
-    }
-    if normalized != name {
-        return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
     }
     Ok(normalized)
 }
@@ -2806,6 +2811,78 @@ impl InProcessDaemon {
         Ok(project_name)
     }
 
+    async fn ensure_degenerate_project(&self, repository_spec: &RepositorySpec) -> Result<String, String> {
+        let namespace = self.provisioning_namespace().await;
+        let repository_key = repository_spec.key();
+        flotilla_resources::ensure_repository(
+            &self.resource_backend.clone().using::<Repository>(&namespace),
+            &repository_key,
+            repository_spec,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        ensure_single_agent_contained_workflow(&self.resource_backend, &namespace).await?;
+
+        let projects = self.resource_backend.clone().using::<Project>(&namespace);
+        if let Some(existing) = projects
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|project| project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()))
+        {
+            return Ok(existing.metadata.name);
+        }
+
+        let display_name = normalized_project_name(&repository_spec.leaf_slug())?;
+        let catalog_name = normalized_project_name(&repository_spec.catalog_slug())?;
+        let key_suffix = repository_key.0.chars().take(8).collect::<String>();
+        let disambiguated_name = format!("{catalog_name}-{key_suffix}");
+        let mut candidates = Vec::new();
+        for candidate in [display_name.clone(), catalog_name, disambiguated_name] {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+
+        let spec = normalize_project_spec(ProjectSpec {
+            display_name,
+            default_workflow_ref: "single-agent-contained".to_string(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository_key.clone(), subpath: None, default_branch: None }],
+        })?;
+        for project_name in candidates {
+            match projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await {
+                Ok(_) => return Ok(project_name),
+                Err(ResourceError::Conflict { .. }) => {
+                    let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
+                    if existing.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()) {
+                        return Ok(project_name);
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!("could not allocate a deterministic Project name for repository {repository_key}"))
+    }
+
+    pub async fn materialize_tracked_repo_projects(&self) -> Result<(), String> {
+        for repo_path in self.tracked_repo_paths().await {
+            let inspection = match self.inspect_repository_path(&repo_path, None).await {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    warn!(repo = %repo_path.display(), %error, "skipping degenerate Project because repository identity resolution failed");
+                    continue;
+                }
+            };
+            self.ensure_degenerate_project(&inspection.spec)
+                .await
+                .map_err(|error| format!("materialize degenerate Project for {}: {error}", repo_path.display()))?;
+        }
+        Ok(())
+    }
+
     async fn ensure_project_checkout(
         &self,
         namespace: &str,
@@ -2945,13 +3022,17 @@ impl InProcessDaemon {
         // surface can subscribe to issues{repository} immediately. The
         // background refresh still ensures the Repository resource and
         // reconciles observed Checkouts.
-        let repository_key = match self.inspect_repository_path(&path, None).await {
-            Ok(inspection) => Some(inspection.key()),
+        let repository_inspection = match self.inspect_repository_path(&path, None).await {
+            Ok(inspection) => Some(inspection),
             Err(error) => {
                 warn!(repo = %path.display(), %error, "repository key is unavailable while tracking repo");
                 None
             }
         };
+        let repository_key = repository_inspection.as_ref().map(RepositoryInspection::key);
+        if let Some(inspection) = repository_inspection.as_ref() {
+            self.ensure_degenerate_project(&inspection.spec).await?;
+        }
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
             if tracked_identity == identity {
                 let key_became_available = {

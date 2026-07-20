@@ -110,6 +110,141 @@ async fn execute_project_add(
 }
 
 #[tokio::test]
+async fn tracking_repo_materializes_whole_repo_project() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let checkout_path = tmp.path().join("tracked");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+
+    daemon.add_repo(&checkout_path).await.expect("track repo");
+
+    let project = backend.using::<Project>("flotilla").get("tracked").await.expect("degenerate project should exist");
+    assert_eq!(project.spec.display_name, "tracked");
+    assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
+    assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
+        repo: repository_key,
+        subpath: None,
+        default_branch: None,
+    }]);
+}
+
+#[tokio::test]
+async fn daemon_start_backfills_project_idempotently_and_preserves_edits() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let checkout_path = tmp.path().join("backfilled");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![checkout_path],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let repository_spec = RepositorySpec::remote("https://github.com/org/backfilled.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let options = RuntimeOptions {
+        namespace: "flotilla".to_string(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        start_controllers: false,
+        ..RuntimeOptions::default()
+    };
+
+    let runtime =
+        DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options.clone()).await.expect("runtime start");
+
+    let projects = backend.clone().using::<Project>("flotilla");
+    let project = projects.get("backfilled").await.expect("backfilled project should exist");
+    assert_eq!(project.spec.repositories[0].repo, repository_key);
+    let mut evolved = project.spec;
+    evolved.display_name = "Backfilled product".to_string();
+    evolved.default_workflow_ref = "custom-workflow".to_string();
+    evolved.issue_source = Some(IssueSource { service: "linear".to_string(), scope: "BACK".to_string() });
+    evolved.repositories.push(flotilla_resources::ProjectRepositorySpec {
+        repo: RepositoryKey("second-repository".to_string()),
+        subpath: None,
+        default_branch: None,
+    });
+    projects
+        .update(&InputMeta::builder().name("backfilled".to_string()).build(), &project.metadata.resource_version, &evolved)
+        .await
+        .expect("evolve project");
+    drop(runtime);
+
+    let _restarted = DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime restart");
+
+    assert_eq!(projects.get("backfilled").await.expect("evolved project").spec, evolved);
+    assert_eq!(projects.list().await.expect("project list").items.len(), 1);
+}
+
+#[tokio::test]
+async fn tracking_repo_widens_project_name_without_overwriting_custom_project() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let projects = backend.clone().using::<Project>("flotilla");
+    let custom_spec = flotilla_resources::ProjectSpec {
+        display_name: "Shared product".to_string(),
+        default_workflow_ref: "custom-workflow".to_string(),
+        issue_source: None,
+        repositories: vec![flotilla_resources::ProjectRepositorySpec {
+            repo: RepositoryKey("other-repository".to_string()),
+            subpath: None,
+            default_branch: None,
+        }],
+    };
+    projects.create(&InputMeta::builder().name("shared".to_string()).build(), &custom_spec).await.expect("custom project create");
+    let repository_spec = RepositorySpec::remote("https://github.com/org-b/shared.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let checkout_path = tmp.path().join("shared");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+
+    daemon.add_repo(&checkout_path).await.expect("track repo");
+
+    assert_eq!(projects.get("shared").await.expect("custom project").spec, custom_spec);
+    let generated = projects.get("github-com-org-b-shared").await.expect("collision-aware project should exist");
+    assert_eq!(generated.spec.repositories[0].repo, repository_key);
+}
+
+#[tokio::test]
+async fn tracking_repo_uses_repository_key_when_slug_candidates_collide() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let projects = backend.clone().using::<Project>("flotilla");
+    for (name, repo_ref) in [("shared", "first-repository"), ("github-com-org-b-shared", "second-repository")] {
+        projects
+            .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
+                display_name: name.to_string(),
+                default_workflow_ref: "custom-workflow".to_string(),
+                issue_source: None,
+                repositories: vec![flotilla_resources::ProjectRepositorySpec {
+                    repo: RepositoryKey(repo_ref.to_string()),
+                    subpath: None,
+                    default_branch: None,
+                }],
+            })
+            .await
+            .expect("occupied project create");
+    }
+    let repository_spec = RepositorySpec::remote("https://github.com/org-b/shared.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let checkout_path = tmp.path().join("shared");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+
+    daemon.add_repo(&checkout_path).await.expect("track repo");
+
+    let key_prefix = repository_key.0.chars().take(8).collect::<String>();
+    let generated_name = format!("github-com-org-b-shared-{key_prefix}");
+    let generated = projects.get(&generated_name).await.expect("key-disambiguated project should exist");
+    assert_eq!(generated.spec.repositories[0].repo, repository_key);
+}
+
+#[tokio::test]
 async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let repository_spec = RepositorySpec::remote("https://github.com/org/repo.git").expect("repository spec");
