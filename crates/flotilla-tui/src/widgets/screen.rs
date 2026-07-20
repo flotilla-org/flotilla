@@ -444,14 +444,29 @@ impl InteractiveWidget for Screen {
 
         // 3b. Resolve key chips from binding mode via compiled binding table.
         //     Progress fragments suppress key chips (user can't interact during progress).
+        let interactions = crate::interaction::InteractionContext::for_active_view(
+            ctx.views.active_address(),
+            ctx.views.active_table_state().selected(),
+            ctx.model.active_repo_identity_opt().is_some(),
+        );
         let key_chips = if matches!(fragment.status, Some(crate::binding_table::StatusContent::Progress { .. })) {
             vec![]
         } else {
-            ctx.keymap.hints_for(&binding_mode)
+            ctx.keymap
+                .hints_for(&binding_mode)
+                .into_iter()
+                .filter(|chip| match chip.action {
+                    StatusBarAction::KeyPress { code, modifiers } => ctx
+                        .keymap
+                        .resolve(&binding_mode, crokey::KeyCombination::from(KeyEvent::new(code, modifiers)))
+                        .is_none_or(|action| interactions.is_available(action)),
+                    StatusBarAction::ClearError(_) | StatusBarAction::None => true,
+                })
+                .collect()
         };
 
         // 3c. Resolve status section from fragment (with fallback)
-        let fallback_label = "/ for commands";
+        let fallback_label = ": for commands";
         let status = status_bar_widget::resolve_status_section(&fragment, fallback_label);
 
         // 3d. Task spinner — fragment progress takes priority over in-flight commands.

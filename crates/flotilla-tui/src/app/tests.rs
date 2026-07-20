@@ -2183,6 +2183,19 @@ fn table_page_keeps_shell_palette_tab_and_quit_bindings() {
 }
 
 #[test]
+fn escape_clears_a_table_find_before_navigating_back() {
+    let mut app = stub_app_with_repos(1);
+    app.switch_tab(1);
+    let address = app.views.active_address().cloned().expect("active table view");
+    app.process_app_actions(vec![crate::widgets::AppAction::SetTableFilter("stalled".into())]);
+
+    app.handle_key(key(KeyCode::Esc));
+
+    assert!(app.views.active_table_state().filter.is_empty());
+    assert_eq!(app.views.active_address(), Some(&address), "clearing Find does not navigate the View");
+}
+
+#[test]
 fn table_refresh_requests_a_fresh_named_query_snapshot() {
     let mut app = stub_app();
     app.switch_tab(1);

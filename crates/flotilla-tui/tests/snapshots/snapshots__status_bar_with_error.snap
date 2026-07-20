@@ -31,4 +31,4 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         └──────────────────────────────────────────────┘
-ERROR GitHub API rate limit exceeded × <q> QUIT  <h> HELP  <?> CTX  <ENT> OPEN  <.> MENU      ◫ auto   @local
+ERROR GitHub API rate limit exceeded × <q> QUIT  <h> HELP  <?> CTX  <:> COMMANDS  </> FIND    ◫ auto   @local

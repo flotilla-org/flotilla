@@ -31,4 +31,4 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         └──────────────────────────────────────────────┘
-SEARCH auth timeout          <ENT> APPLY  <ESC> CANCEL 
+FIND auth timeout            <ENT> APPLY  <ESC> CANCEL 

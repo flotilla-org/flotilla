@@ -10,25 +10,13 @@ use crate::{
     keymap::Action,
 };
 
-#[derive(Debug, Clone, Copy)]
-pub enum TableSearchKind {
-    Local,
-    Source,
-}
-
 pub struct TableSearchWidget {
-    kind: TableSearchKind,
     input: Input,
-    prefix: String,
 }
 
 impl TableSearchWidget {
-    pub fn local(current: &str) -> Self {
-        Self { kind: TableSearchKind::Local, input: Input::from(current), prefix: "FILTER ".into() }
-    }
-
-    pub fn source(current: Option<&str>, source: &str) -> Self {
-        Self { kind: TableSearchKind::Source, input: Input::from(current.unwrap_or_default()), prefix: format!("SEARCH {source} ") }
+    pub fn find(current: &str) -> Self {
+        Self { input: Input::from(current) }
     }
 }
 
@@ -37,12 +25,7 @@ impl InteractiveWidget for TableSearchWidget {
         match action {
             Action::Confirm => {
                 let value = self.input.value().trim().to_string();
-                match self.kind {
-                    TableSearchKind::Local => ctx.app_actions.push(AppAction::SetTableFilter(value)),
-                    TableSearchKind::Source => {
-                        ctx.app_actions.push(AppAction::SetSourceSearch((!value.is_empty()).then_some(value)));
-                    }
-                }
+                ctx.app_actions.push(AppAction::SetTableFilter(value));
                 Outcome::Finished
             }
             Action::Dismiss => Outcome::Finished,
@@ -58,11 +41,11 @@ impl InteractiveWidget for TableSearchWidget {
     fn render(&mut self, _frame: &mut Frame, _area: Rect, _ctx: &mut RenderContext) {}
 
     fn binding_mode(&self) -> KeyBindingMode {
-        BindingModeId::IssueSearch.into()
+        BindingModeId::FindInput.into()
     }
 
     fn status_fragment(&self) -> StatusFragment {
-        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: self.prefix.clone(), text: self.input.value().to_string() }) }
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: "FIND ".into(), text: self.input.value().to_string() }) }
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -83,13 +66,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_search_status_identifies_the_source() {
-        let widget = TableSearchWidget::source(Some("needs triage"), "flotilla/roadmap");
+    fn find_status_identifies_the_interaction() {
+        let widget = TableSearchWidget::find("needs triage");
 
         let Some(StatusContent::ActiveInput { prefix, text }) = widget.status_fragment().status else {
             panic!("source search should display an active input status");
         };
-        assert_eq!(prefix, "SEARCH flotilla/roadmap ");
+        assert_eq!(prefix, "FIND ");
         assert_eq!(text, "needs triage");
     }
 }

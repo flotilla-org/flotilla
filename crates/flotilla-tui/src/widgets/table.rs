@@ -138,6 +138,9 @@ impl TableWidget {
     ) {
         state.reconcile(view);
         let mut title = view.title.clone();
+        if !state.filter.is_empty() {
+            title.push_str(&format!(" · find \"{}\"", state.filter));
+        }
         if let Some(as_of) = view.meta.as_of {
             title.push_str(&format!(" · as of {}", as_of.format("%Y-%m-%d %H:%M")));
         }
@@ -222,18 +225,12 @@ impl InteractiveWidget for TableWidget {
             ctx.app_actions.push(AppAction::SetSourceSearch(None));
             return Outcome::Consumed;
         }
-        if action == Action::OpenTableFilter {
-            return Outcome::Push(Box::new(super::table_search::TableSearchWidget::local(&ctx.views.active_table_state().filter)));
-        }
-        if action == Action::OpenSourceSearch {
-            if let Some(flotilla_protocol::ViewAddress::Issues { scope }) = ctx.views.active_address() {
-                return Outcome::Push(Box::new(super::table_search::TableSearchWidget::source(
-                    ctx.views.active_table_state().source_search.as_deref(),
-                    &format!("{}/{}", scope.namespace, scope.name),
-                )));
-            }
-            ctx.app_actions.push(AppAction::ShowStatus("Source search is only available for issue tables".into()));
+        if action == Action::Dismiss && !ctx.views.active_table_state().filter.is_empty() {
+            ctx.app_actions.push(AppAction::SetTableFilter(String::new()));
             return Outcome::Consumed;
+        }
+        if action == Action::OpenFind {
+            return Outcome::Push(Box::new(super::table_search::TableSearchWidget::find(&ctx.views.active_table_state().filter)));
         }
         let Ok(view) = Self::projected(ctx) else { return Outcome::Ignored };
         ctx.views.active_table_state_mut().reconcile(&view);

@@ -34,7 +34,7 @@ fn round_trip_non_dispatch_actions() {
         Action::CycleTheme,
         Action::OpenActionMenu,
         Action::OpenBranchInput,
-        Action::OpenIssueSearch,
+        Action::OpenFind,
         Action::OpenFilePicker,
         Action::OpenCommandPalette,
         Action::OpenContextualPalette,
@@ -104,7 +104,7 @@ fn all_actions_have_descriptions() {
         Action::CycleTheme,
         Action::OpenActionMenu,
         Action::OpenBranchInput,
-        Action::OpenIssueSearch,
+        Action::OpenFind,
         Action::OpenFilePicker,
         Action::OpenCommandPalette,
         Action::OpenContextualPalette,
@@ -173,7 +173,8 @@ fn normal_mode_specific_bindings() {
     assert_eq!(km.resolve(&normal_composed, crokey::key!(q)), Some(Action::Quit));
     assert_eq!(km.resolve(&normal_composed, crokey::key!(h)), Some(Action::ToggleHelp));
     assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('T'), KeyModifiers::SHIFT)), Some(Action::CycleTheme));
-    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::OpenCommandPalette));
+    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char(':'), KeyModifiers::NONE)), Some(Action::OpenCommandPalette));
+    assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('/'), KeyModifiers::NONE)), Some(Action::OpenFind));
     assert_eq!(km.resolve(&normal_composed, kc(KeyCode::Char('D'), KeyModifiers::SHIFT)), Some(Action::ToggleDebug));
     // Keys from Normal (repo-tab specific):
     assert_eq!(km.resolve(&normal_composed, crokey::key!(r)), Some(Action::Refresh));

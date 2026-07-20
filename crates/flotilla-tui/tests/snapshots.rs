@@ -152,6 +152,7 @@ fn config_screen() {
         .with_provider_status("my-project", "cloud_agent", "Claude", ProviderStatus::Ok);
     let output = harness.render_to_string();
     assert!(output.contains(""));
+    assert!(!output.contains("</> FIND"));
     insta::assert_snapshot!(output);
 }
 
@@ -198,7 +199,7 @@ fn status_bar_ribbons_include_space_before_key_token() {
     let mut harness = TestHarness::single_repo("my-project");
     let output = harness.render_to_string();
 
-    assert!(output.contains(" <ENT> OPEN"));
+    assert!(output.contains(" <:> COMMANDS"));
 }
 
 #[test]

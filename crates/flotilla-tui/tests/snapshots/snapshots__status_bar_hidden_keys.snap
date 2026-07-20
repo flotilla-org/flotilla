@@ -31,4 +31,4 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         └──────────────────────────────────────────────┘
-/ for commands                                                                                          ◫ auto   @local
+: for commands                                                                                          ◫ auto   @local

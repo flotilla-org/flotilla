@@ -591,12 +591,12 @@ fn open_branch_input_pushes_widget() {
 }
 
 #[test]
-fn open_issue_search_pushes_widget() {
+fn open_find_pushes_widget() {
     let mut page = page_with_items(vec![]);
     let mut harness = TestWidgetHarness::new();
     let mut ctx = harness.ctx();
 
-    let outcome = page.handle_action(Action::OpenIssueSearch, &mut ctx);
+    let outcome = page.handle_action(Action::OpenFind, &mut ctx);
     assert!(matches!(outcome, Outcome::Push(_)));
 }
 
@@ -672,12 +672,12 @@ fn status_fragment_shows_selected_count() {
 }
 
 #[test]
-fn status_fragment_shows_search_query() {
+fn status_fragment_shows_find_query() {
     let mut page = page_with_items(vec![]);
     page.active_search_query = Some("auth".into());
     let fragment = page.status_fragment();
     match fragment.status {
-        Some(StatusContent::Label(s)) => assert!(s.contains("auth")),
+        Some(StatusContent::Label(s)) => assert!(s.contains("FIND \"auth\"")),
         other => panic!("expected Label with query, got {:?}", other),
     }
 }

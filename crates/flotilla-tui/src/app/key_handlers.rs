@@ -19,7 +19,14 @@ impl App {
     /// Called when the base layer widget (Normal mode_id) is on top.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
         let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.views.is_scoped());
-        self.keymap.resolve(&mode, crokey::KeyCombination::from(key))
+        self.keymap.resolve(&mode, crokey::KeyCombination::from(key)).filter(|action| {
+            crate::interaction::InteractionContext::for_active_view(
+                self.views.active_address(),
+                self.views.active_table_state().selected(),
+                self.model.active_repo_identity_opt().is_some(),
+            )
+            .is_available(*action)
+        })
     }
 
     /// Handle actions that the widget stack returned `Ignored` for.

@@ -23,7 +23,7 @@ expression: output
                         │                                                                      │                       │
                         │Actions                                                               │                       │
                         │Enter             Confirm / execute                                   │                       │
-                        │/                 Open command palette                                │                       │
+                        │:                 Open command palette                                │                       │
                         │?                 Open contextual palette (pre-filled)                │                       │
                         │.                 Open action menu                                    │                       │
                         │n                 New branch input                                    │                       │

@@ -42,7 +42,7 @@ pub enum BindingModeId {
     DeleteConfirm,
     CloseConfirm,
     BranchInput,
-    IssueSearch,
+    FindInput,
     CommandPalette,
     FilePicker,
     SearchActive,
@@ -138,7 +138,8 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::TabPage, "?", Action::OpenContextualPalette, "Ctx"),
     b(BindingModeId::TabPage, "S-T", Action::CycleTheme),
     b(BindingModeId::TabPage, "S-D", Action::ToggleDebug),
-    b(BindingModeId::TabPage, "/", Action::OpenCommandPalette),
+    h(BindingModeId::TabPage, ":", Action::OpenCommandPalette, "Commands"),
+    h(BindingModeId::TabPage, "/", Action::OpenFind, "Find"),
     // ── TabShell — tab-management keys, only where the tab bar exists ──
     b(BindingModeId::TabShell, "[", Action::PrevTab),
     b(BindingModeId::TabShell, "]", Action::NextTab),
@@ -168,8 +169,6 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
-    h(BindingModeId::Convoys, "/", Action::OpenTableFilter, "Filter"),
-    h(BindingModeId::DemandTable, "s", Action::OpenSourceSearch, "Search source"),
     h(BindingModeId::DemandTable, "f", Action::FetchMore, "Fetch more"),
     // Legacy mode retained only so existing user keybinding files still parse
     // while the table slices land; no View selects it after #733.
@@ -210,9 +209,9 @@ pub static BINDINGS: &[Binding] = &[
     // ── BranchInput ──
     hk(BindingModeId::BranchInput, "enter", "ENT", Action::Confirm, "Create"),
     hk(BindingModeId::BranchInput, "esc", "ESC", Action::Dismiss, "Cancel"),
-    // ── IssueSearch ──
-    hk(BindingModeId::IssueSearch, "enter", "ENT", Action::Confirm, "Apply"),
-    hk(BindingModeId::IssueSearch, "esc", "ESC", Action::Dismiss, "Cancel"),
+    // ── Find input ──
+    hk(BindingModeId::FindInput, "enter", "ENT", Action::Confirm, "Apply"),
+    hk(BindingModeId::FindInput, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── CommandPalette ──
     // No shared fallback: typing keys must reach handle_raw_key for text input.
     b(BindingModeId::CommandPalette, "up", Action::SelectPrev),

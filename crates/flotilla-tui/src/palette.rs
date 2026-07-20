@@ -20,7 +20,7 @@ pub fn all_entries() -> &'static [PaletteEntry] {
     static ENTRIES: OnceLock<Vec<PaletteEntry>> = OnceLock::new();
     ENTRIES.get_or_init(|| {
         vec![
-            PaletteEntry { name: "search", description: "filter items in view", key_hint: Some("/"), action: Action::OpenIssueSearch },
+            PaletteEntry { name: "find", description: "find work in the current view", key_hint: Some("/"), action: Action::OpenFind },
             PaletteEntry { name: "refresh", description: "refresh active repo", key_hint: Some("r"), action: Action::Refresh },
             PaletteEntry { name: "branch", description: "create a new branch", key_hint: Some("n"), action: Action::OpenBranchInput },
             PaletteEntry { name: "help", description: "show key bindings", key_hint: Some("h"), action: Action::ToggleHelp },
@@ -53,7 +53,6 @@ pub enum PaletteLocalResult<'a> {
     SetLayout(&'a str),
     SetTheme(&'a str),
     SetTarget(&'a str),
-    Search(&'a str),
     /// Open (or focus) the View at this address (ADR 0013).
     OpenView(&'a str),
 }
@@ -67,8 +66,6 @@ pub fn parse_palette_local(input: &str) -> Option<PaletteLocalResult<'_>> {
         "theme" if !arg.is_empty() => Some(PaletteLocalResult::SetTheme(arg)),
         "target" if !arg.is_empty() => Some(PaletteLocalResult::SetTarget(arg)),
         "open" if !arg.is_empty() => Some(PaletteLocalResult::OpenView(arg)),
-        // "search" with trailing content → search command; bare "search" falls through to no-arg lookup
-        "search" if input.starts_with("search ") => Some(PaletteLocalResult::Search(arg)),
         _ => {
             // Check no-arg palette entries
             let entries = all_entries();
@@ -245,13 +242,26 @@ pub fn palette_completions(
     namespaces: &crate::app::NamespaceMap,
     has_repo_context: bool,
 ) -> Vec<PaletteCompletion> {
+    palette_completions_with_availability(input, model, namespaces, has_repo_context, |_| true)
+}
+
+/// Compute palette completions, suppressing local entries unavailable in the
+/// caller's interaction context. Noun and verb completion stays global; only
+/// palette-local actions are contextual.
+pub fn palette_completions_with_availability(
+    input: &str,
+    model: &TuiModel,
+    namespaces: &crate::app::NamespaceMap,
+    has_repo_context: bool,
+    is_available: impl Fn(Action) -> bool,
+) -> Vec<PaletteCompletion> {
     let trailing_space = input.ends_with(' ');
     let tokens: Vec<&str> = input.split_whitespace().collect();
 
     // Empty input or partial first token: show nouns + palette-local entries.
     if tokens.is_empty() || (tokens.len() == 1 && !trailing_space) {
         let partial = tokens.first().copied().unwrap_or("");
-        return root_completions(partial, has_repo_context);
+        return root_completions(partial, has_repo_context, &is_available);
     }
 
     let first = tokens[0];
@@ -338,7 +348,7 @@ fn convoy_vessel_completions(convoy_id: &str, partial: &str, namespaces: &crate:
 }
 
 /// Completions at the root level: noun names, aliases, and palette-local entries.
-fn root_completions(partial: &str, has_repo_context: bool) -> Vec<PaletteCompletion> {
+fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl Fn(Action) -> bool) -> Vec<PaletteCompletion> {
     let lower = partial.to_lowercase();
     let mut completions = Vec::new();
 
@@ -378,7 +388,7 @@ fn root_completions(partial: &str, has_repo_context: bool) -> Vec<PaletteComplet
     // Palette-local entries.
     let entries = all_entries();
     for entry in entries {
-        if lower.is_empty() || entry.name.to_lowercase().starts_with(&lower) {
+        if is_available(entry.action) && (lower.is_empty() || entry.name.to_lowercase().starts_with(&lower)) {
             completions.push(PaletteCompletion {
                 value: entry.name.to_string(),
                 description: entry.description.to_string(),
@@ -394,8 +404,8 @@ fn root_completions(partial: &str, has_repo_context: bool) -> Vec<PaletteComplet
 fn is_palette_local_command(token: &str) -> bool {
     let entries = all_entries();
     let is_entry = entries.iter().any(|e| e.name == token);
-    // "layout", "theme", "target", "search" are local commands with args.
-    is_entry || matches!(token, "layout" | "theme" | "target" | "search")
+    // "layout", "theme", and "target" are local commands with args.
+    is_entry || matches!(token, "layout" | "theme" | "target")
 }
 
 /// Resolve a token to its canonical noun name via the clap tree.
@@ -692,16 +702,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_search_with_query() {
-        let result = parse_palette_local("search bug fix");
-        assert_eq!(result, Some(PaletteLocalResult::Search("bug fix")));
-    }
-
-    #[test]
     fn parse_bare_search_falls_through_to_entry() {
-        let result = parse_palette_local("search");
-        // "search" without trailing space returns the no-arg entry action
-        assert!(matches!(result, Some(PaletteLocalResult::Action(Action::OpenIssueSearch))));
+        let result = parse_palette_local("find");
+        // Find without trailing input returns the no-arg entry action.
+        assert!(matches!(result, Some(PaletteLocalResult::Action(Action::OpenFind))));
     }
 
     #[test]
@@ -726,7 +730,7 @@ mod tests {
     fn all_entries_returns_expected_count() {
         let entries = all_entries();
         assert_eq!(entries.len(), 14);
-        assert_eq!(entries[0].name, "search");
+        assert_eq!(entries[0].name, "find");
         assert_eq!(entries[entries.len() - 1].name, "keys");
     }
 
@@ -790,14 +794,7 @@ mod tests {
         assert!(parse_palette_input("bogus command").is_err());
     }
 
-    #[test]
-    fn parse_palette_input_search_with_query() {
-        let result = parse_palette_input("search bug fix").expect("should parse");
-        assert!(matches!(result, PaletteParseResult::Local(PaletteLocalResult::Search("bug fix"))));
-    }
-
     // --- palette_completions tests ---
-
     use std::sync::Arc;
 
     use flotilla_protocol::{
@@ -929,6 +926,22 @@ mod tests {
         assert!(values.contains(&"host"), "expected 'host' in {values:?}");
         assert!(values.contains(&"layout"), "expected 'layout' in {values:?}");
         assert!(values.contains(&"quit"), "expected 'quit' in {values:?}");
+    }
+
+    #[test]
+    fn contextual_completions_only_offer_find_when_the_active_view_supports_it() {
+        let model = empty_model();
+        let overview = flotilla_protocol::ViewAddress::Overview;
+        let overview_context = crate::interaction::InteractionContext::for_active_view(Some(&overview), None, false);
+        let overview_values =
+            palette_completions_with_availability("", &model, &Default::default(), false, |action| overview_context.is_available(action));
+        assert!(!overview_values.iter().any(|completion| completion.value == "find"));
+
+        let table: flotilla_protocol::ViewAddress = "convoys/flotilla".parse().expect("table address");
+        let table_context = crate::interaction::InteractionContext::for_active_view(Some(&table), None, false);
+        let table_values =
+            palette_completions_with_availability("", &model, &Default::default(), false, |action| table_context.is_available(action));
+        assert!(table_values.iter().any(|completion| completion.value == "find"));
     }
 
     #[test]

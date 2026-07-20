@@ -31,4 +31,4 @@ expression: output
                                                                         │                                              │
                                                                         │                                              │
                                                                         └──────────────────────────────────────────────┘
-/ for commands               <q> QUIT  <h> HELP  <?> CTX           ◫ auto   @local - Refreshing repository... (+1)
+: for commands               <q> QUIT  <h> HELP  <?> CTX           ◫ auto   @local - Refreshing repository... (+1)
