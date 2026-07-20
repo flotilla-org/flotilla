@@ -141,7 +141,10 @@ impl RepositoryInspector for GitRepositoryInspector {
         let top_level = PathBuf::from(self.git(&path, &["rev-parse", "--show-toplevel"]).await?);
         let top_level = std::fs::canonicalize(&top_level)
             .map_err(|error| format!("repository root {} cannot be resolved: {error}", top_level.display()))?;
-        let branch = self.git(&top_level, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+        let branch = match self.git(&top_level, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
+            Ok(branch) => branch,
+            Err(_) => self.git(&top_level, &["symbolic-ref", "--short", "HEAD"]).await?,
+        };
         let git_ref = if branch == "HEAD" { self.git(&top_level, &["rev-parse", "HEAD"]).await? } else { branch.clone() };
         let selected_remote = self.selected_remote(&top_level, &branch, remote).await?;
         let (spec, transport_url) = match selected_remote {
@@ -285,6 +288,25 @@ mod tests {
         let second = inspector.inspect_path(&second, None).await.expect("second inspection");
 
         assert_eq!(first.key(), second.key());
+    }
+
+    #[tokio::test]
+    async fn unborn_head_uses_the_symbolic_branch_name() {
+        let (_temp, root) = git_repo();
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("git", &["rev-parse", "--show-toplevel"], Ok(root.to_string_lossy().into_owned()))
+            .on_run("git", &["rev-parse", "--abbrev-ref", "HEAD"], Err("unborn HEAD".to_string()))
+            .on_run("git", &["symbolic-ref", "--short", "HEAD"], Ok("main\n".to_string()))
+            .on_run("git", &["remote"], Ok(String::new()))
+            .on_run("git", &["rev-parse", "--git-common-dir"], Ok(".git\n".to_string()))
+            .build();
+        let inspector = GitRepositoryInspector::new(Arc::new(runner), "host-01");
+
+        let inspected = inspector.inspect_path(&root, None).await.expect("unborn repository should be inspected");
+
+        assert!(matches!(inspected.spec.identity(), RepositoryIdentity::Local { host_ref, .. } if host_ref == "host-01"));
+        assert_eq!(inspected.checkout.git_ref, "main");
+        assert!(inspected.checkout.is_main);
     }
 
     #[tokio::test]

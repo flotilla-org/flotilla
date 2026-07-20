@@ -257,9 +257,11 @@ async fn dispatch_request_handles_error_response_for_untracked_repo() {
 
 #[tokio::test]
 async fn dispatch_add_list_remove_repo_round_trip() {
-    let (tmp, daemon) = empty_daemon().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let daemon = InProcessDaemon::new(vec![], config, git_process_discovery(false), HostName::local()).await;
     let repo_path = tmp.path().join("repo-a");
-    std::fs::create_dir_all(&repo_path).expect("create repo directory");
+    init_git_repo_with_remote(&repo_path, "git@github.com:owner/repo-a.git");
 
     let add = dispatch_request_test(&daemon, 10, Request::AddRepo { path: repo_path.clone() }).await;
     assert!(matches!(ok_response(add, 10), Response::AddRepo));

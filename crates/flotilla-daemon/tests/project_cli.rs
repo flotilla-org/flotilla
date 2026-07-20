@@ -72,6 +72,26 @@ impl RepositoryInspector for FixedInspector {
     }
 }
 
+#[derive(Clone)]
+struct FailingInspector;
+
+#[async_trait]
+impl RepositoryInspector for FailingInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Err(format!("cannot inspect {}", path.display()))
+    }
+}
+
+async fn track_repository(daemon: &Arc<InProcessDaemon>, tmp: &tempfile::TempDir, directory_name: &str, remote: &str) -> RepositoryKey {
+    let repository_spec = RepositorySpec::remote(remote).expect("repository spec");
+    let repository_key = repository_spec.key();
+    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
+    let checkout_path = tmp.path().join(directory_name);
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    daemon.add_repo(&checkout_path).await.expect("track repo");
+    repository_key
+}
+
 async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -112,15 +132,9 @@ async fn execute_project_add(
 #[tokio::test]
 async fn tracking_repo_materializes_whole_repo_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
-    let repository_spec = RepositorySpec::remote("https://github.com/org/tracked.git").expect("repository spec");
-    let repository_key = repository_spec.key();
-    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
-    let checkout_path = tmp.path().join("tracked");
-    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let repository_key = track_repository(&daemon, &tmp, "tracked", "https://github.com/org/tracked.git").await;
 
-    daemon.add_repo(&checkout_path).await.expect("track repo");
-
-    let project = backend.using::<Project>("flotilla").get("tracked").await.expect("degenerate project should exist");
+    let project = backend.using::<Project>("flotilla").get("tracked").await.expect("whole-repository project should exist");
     assert_eq!(project.spec.display_name, "tracked");
     assert_eq!(project.spec.default_workflow_ref, "single-agent-contained");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
@@ -128,6 +142,20 @@ async fn tracking_repo_materializes_whole_repo_project() {
         subpath: None,
         default_branch: None,
     }]);
+}
+
+#[tokio::test]
+async fn tracking_repo_fails_when_its_project_cannot_be_materialized() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
+    let checkout_path = tmp.path().join("uninspectable");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+
+    let error = daemon.add_repo(&checkout_path).await.expect_err("tracking should fail");
+
+    assert!(error.contains("cannot inspect"));
+    assert!(!daemon.tracked_repo_paths().await.contains(&checkout_path));
+    assert!(backend.using::<Project>("flotilla").list().await.expect("project list").items.is_empty());
 }
 
 #[tokio::test]
@@ -184,6 +212,36 @@ async fn daemon_start_backfills_project_idempotently_and_preserves_edits() {
 }
 
 #[tokio::test]
+async fn daemon_start_fails_when_a_tracked_repo_cannot_be_backfilled() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let checkout_path = tmp.path().join("uninspectable");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![checkout_path],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend,
+    )
+    .await;
+    daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
+
+    let error = match DaemonRuntime::start_with_options(daemon, config, None, RuntimeOptions {
+        start_controllers: false,
+        ..RuntimeOptions::default()
+    })
+    .await
+    {
+        Ok(_) => panic!("runtime start should fail"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("cannot inspect"));
+}
+
+#[tokio::test]
 async fn tracking_repo_widens_project_name_without_overwriting_custom_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let projects = backend.clone().using::<Project>("flotilla");
@@ -198,13 +256,7 @@ async fn tracking_repo_widens_project_name_without_overwriting_custom_project() 
         }],
     };
     projects.create(&InputMeta::builder().name("shared".to_string()).build(), &custom_spec).await.expect("custom project create");
-    let repository_spec = RepositorySpec::remote("https://github.com/org-b/shared.git").expect("repository spec");
-    let repository_key = repository_spec.key();
-    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
-    let checkout_path = tmp.path().join("shared");
-    std::fs::create_dir(&checkout_path).expect("checkout dir");
-
-    daemon.add_repo(&checkout_path).await.expect("track repo");
+    let repository_key = track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
 
     assert_eq!(projects.get("shared").await.expect("custom project").spec, custom_spec);
     let generated = projects.get("github-com-org-b-shared").await.expect("collision-aware project should exist");
@@ -230,13 +282,7 @@ async fn tracking_repo_uses_repository_key_when_slug_candidates_collide() {
             .await
             .expect("occupied project create");
     }
-    let repository_spec = RepositorySpec::remote("https://github.com/org-b/shared.git").expect("repository spec");
-    let repository_key = repository_spec.key();
-    daemon.set_repository_inspector(Arc::new(FixedInspector { spec: repository_spec, host_ref: "host-01".to_string() })).await;
-    let checkout_path = tmp.path().join("shared");
-    std::fs::create_dir(&checkout_path).expect("checkout dir");
-
-    daemon.add_repo(&checkout_path).await.expect("track repo");
+    let repository_key = track_repository(&daemon, &tmp, "shared", "https://github.com/org-b/shared.git").await;
 
     let key_prefix = repository_key.0.chars().take(8).collect::<String>();
     let generated_name = format!("github-com-org-b-shared-{key_prefix}");
