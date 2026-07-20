@@ -198,6 +198,7 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
             keymap: &app.keymap,
             in_flight: &app.in_flight,
             namespaces: &app.namespaces,
+            query_tables: &app.query_tables,
         };
         app.screen.render(f, area, &mut ctx);
     })?;

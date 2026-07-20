@@ -21,6 +21,12 @@ use crate::{
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchTrigger {
+    NearBottom,
+    Explicit,
+}
+
 #[derive(Default)]
 pub struct TableWidget {
     rows_area: Rect,
@@ -31,7 +37,8 @@ impl TableWidget {
     fn projected(ctx: &WidgetContext<'_>) -> Result<TableView, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let filter = ctx.views.active_table_state().filter.clone();
-        let rows = crate::app::table_rows(ctx.namespaces);
+        let source_search = ctx.views.active_table_state().source_search.as_deref();
+        let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
         table_view::project(address, &rows).map(|view| view.filtered(&filter))
     }
 
@@ -50,6 +57,24 @@ impl TableWidget {
             || mouse.row >= self.rows_area.y.saturating_add(self.rows_area.height))
     }
 
+    fn demand_query(ctx: &WidgetContext<'_>) -> Option<flotilla_protocol::QueryId> {
+        let address = ctx.views.active_address()?;
+        table_view::query_for(address, ctx.views.active_table_state().source_search.as_deref())
+    }
+
+    fn request_more_if_needed(view: &TableView, ctx: &mut WidgetContext<'_>, trigger: FetchTrigger) {
+        if !view.meta.has_more {
+            return;
+        }
+        let selected = ctx.views.active_table_state().selected_index(view).unwrap_or(0);
+        let near_bottom = view.rows.len().saturating_sub(selected + 1) <= 5;
+        if trigger == FetchTrigger::Explicit || near_bottom {
+            if let Some(query) = Self::demand_query(ctx) {
+                ctx.app_actions.push(AppAction::FetchMore(query));
+            }
+        }
+    }
+
     pub fn render_table(
         &mut self,
         frame: &mut Frame,
@@ -60,7 +85,17 @@ impl TableWidget {
         breadcrumbs: &[String],
     ) {
         state.reconcile(view);
-        let block = Block::bordered().style(theme.block_style()).title(format!(" {} ", view.title));
+        let mut title = view.title.clone();
+        if let Some(as_of) = view.meta.as_of {
+            title.push_str(&format!(" · as of {}", as_of.format("%Y-%m-%d %H:%M")));
+        }
+        if view.meta.has_more {
+            title.push_str(" · more available");
+        }
+        if !view.meta.conditions.is_empty() {
+            title.push_str(&format!(" · ⚠ {}", view.meta.conditions.join("; ")));
+        }
+        let block = Block::bordered().style(theme.block_style()).title(format!(" {title} "));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -140,11 +175,29 @@ fn cell_style(tone: CellTone, theme: &Theme) -> Style {
 
 impl InteractiveWidget for TableWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
+        if action == Action::Dismiss && ctx.views.active_table_state().source_search.is_some() {
+            ctx.app_actions.push(AppAction::SetSourceSearch(None));
+            return Outcome::Consumed;
+        }
+        if action == Action::OpenTableFilter {
+            return Outcome::Push(Box::new(super::table_search::TableSearchWidget::local(&ctx.views.active_table_state().filter)));
+        }
+        if action == Action::OpenSourceSearch {
+            if let Some(flotilla_protocol::ViewAddress::Issues { scope }) = ctx.views.active_address() {
+                return Outcome::Push(Box::new(super::table_search::TableSearchWidget::source(
+                    ctx.views.active_table_state().source_search.as_deref(),
+                    &format!("{}/{}", scope.namespace, scope.name),
+                )));
+            }
+            ctx.app_actions.push(AppAction::ShowStatus("Source search is only available for issue tables".into()));
+            return Outcome::Consumed;
+        }
         let Ok(view) = Self::projected(ctx) else { return Outcome::Ignored };
         ctx.views.active_table_state_mut().reconcile(&view);
         match action {
             Action::SelectNext => {
                 ctx.views.active_table_state_mut().select_delta(&view, 1);
+                Self::request_more_if_needed(&view, ctx, FetchTrigger::NearBottom);
                 Outcome::Consumed
             }
             Action::SelectPrev => {
@@ -163,6 +216,10 @@ impl InteractiveWidget for TableWidget {
             }
             Action::Dismiss => {
                 ctx.app_actions.push(AppAction::BackView);
+                Outcome::Consumed
+            }
+            Action::FetchMore => {
+                Self::request_more_if_needed(&view, ctx, FetchTrigger::Explicit);
                 Outcome::Consumed
             }
             Action::Describe => match ctx.views.active_table_state().selected_row(&view) {
@@ -192,6 +249,7 @@ impl InteractiveWidget for TableWidget {
                     return Outcome::Ignored;
                 }
                 ctx.views.active_table_state_mut().select_delta(&view, 1);
+                Self::request_more_if_needed(&view, ctx, FetchTrigger::NearBottom);
                 return Outcome::Consumed;
             }
             MouseEventKind::ScrollUp => {
@@ -210,6 +268,7 @@ impl InteractiveWidget for TableWidget {
         };
         let index = ctx.views.active_table_state().scroll_offset + visible_index;
         ctx.views.active_table_state_mut().select_index(&view, index);
+        Self::request_more_if_needed(&view, ctx, FetchTrigger::NearBottom);
         let row = &view.rows[index];
         if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
             return if row.actions.is_empty() {
@@ -241,7 +300,8 @@ impl InteractiveWidget for TableWidget {
         // the shared widget contract for direct embedding and test harnesses.
         let Some(address) = ctx.views.active_address().cloned() else { return };
         let filter = ctx.views.active_table_state().filter.clone();
-        let rows = crate::app::table_rows(ctx.namespaces);
+        let source_search = ctx.views.active_table_state().source_search.as_deref();
+        let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
         let Ok(view) = table_view::project(&address, &rows).map(|view| view.filtered(&filter)) else { return };
         let breadcrumbs = ctx.views.active().breadcrumb_addresses().into_iter().map(ToString::to_string).collect::<Vec<_>>();
         self.render_table(frame, area, ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
@@ -286,6 +346,7 @@ mod tests {
                 describe: vec![],
                 actions: vec![],
             }],
+            meta: Default::default(),
         }
     }
 
@@ -343,6 +404,7 @@ mod tests {
             convoys: rows,
             independents: vec![],
             project_issues: vec![],
+            ..table_view::TableRows::default()
         })
         .expect("project snapshot table")
     }
@@ -387,6 +449,41 @@ mod tests {
                 widget.render_table(frame, frame.area(), &Theme::classic(), &snapshot_view(), &mut state, &["convoys/dev".into()]);
             })
             .expect("draw");
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn scoped_issue_metadata_and_condition_snapshot() {
+        let issue = flotilla_protocol::test_support::TestIssue::new("Fix pagination").id("ENG-42").build();
+        let row = flotilla_protocol::IssueRow { reference: issue.reference.clone(), issue };
+        let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+        let query = flotilla_protocol::QueryId::Issues { scope, search: None };
+        let state = flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-20T12:00:00Z".parse().expect("timestamp"),
+                has_more: true,
+            }),
+            conditions: vec![flotilla_protocol::ResultSetCondition::IssueSourceUnavailable {
+                source: None,
+                message: "one source unavailable".into(),
+            }],
+        };
+        let view = table_view::project(&"issues?project=flotilla%2Froadmap".parse().expect("address"), &table_view::TableRows {
+            issue_results: vec![table_view::QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
+            ..table_view::TableRows::default()
+        })
+        .expect("issue table");
+        let mut terminal = Terminal::new(TestBackend::new(110, 7)).expect("terminal");
+        let mut widget = TableWidget::default();
+        let mut table_state = TableState::default();
+        terminal
+            .draw(|frame| {
+                widget.render_table(frame, frame.area(), &Theme::classic(), &view, &mut table_state, &[
+                    "issues?project=flotilla%2Froadmap".into(),
+                ]);
+            })
+            .expect("draw");
+
         insta::assert_snapshot!(terminal.backend());
     }
 }

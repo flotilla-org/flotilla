@@ -241,6 +241,7 @@ pub(crate) struct TestWidgetHarness {
     pub my_node_id: Option<NodeId>,
     pub active_repo_is_remote_only: bool,
     pub namespaces: crate::app::NamespaceMap,
+    pub query_tables: crate::app::QueryTableCache,
 }
 
 impl TestWidgetHarness {
@@ -258,6 +259,7 @@ impl TestWidgetHarness {
             my_node_id: None,
             active_repo_is_remote_only: false,
             namespaces: Default::default(),
+            query_tables: Default::default(),
         }
     }
 
@@ -280,6 +282,7 @@ impl TestWidgetHarness {
             commands: &mut self.commands,
             active_repo_is_remote_only: self.active_repo_is_remote_only,
             namespaces: &self.namespaces,
+            query_tables: &self.query_tables,
             app_actions: Vec::new(),
         }
     }

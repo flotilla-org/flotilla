@@ -31,6 +31,8 @@ pub enum BindingModeId {
     /// shell and therefore no tab bindings (ADR 0013).
     TabShell,
     Convoys,
+    /// Capabilities present only on demand-backed table families.
+    DemandTable,
     /// Inner focus on the Convoys tab — the vessel tree on the right pane.
     /// Composed with `TabPage`. `j/k` navigate vessels; `esc` returns to the
     /// convoy list; `x` opens the palette pre-filled to complete the work.
@@ -166,6 +168,9 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Convoys, "right", Action::Confirm),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
+    h(BindingModeId::Convoys, "/", Action::OpenTableFilter, "Filter"),
+    h(BindingModeId::DemandTable, "s", Action::OpenSourceSearch, "Search source"),
+    h(BindingModeId::DemandTable, "f", Action::FetchMore, "Fetch more"),
     // Legacy mode retained only so existing user keybinding files still parse
     // while the table slices land; no View selects it after #733.
     // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to

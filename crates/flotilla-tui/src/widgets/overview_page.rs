@@ -138,6 +138,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let empty_namespaces = crate::app::NamespaceMap::new();
+                let empty_queries = crate::app::QueryTableCache::default();
                 let mut ctx = RenderContext {
                     model: &harness.model,
                     views: &mut harness.views,
@@ -146,6 +147,7 @@ mod tests {
                     keymap: &keymap,
                     in_flight: &in_flight,
                     namespaces: &empty_namespaces,
+                    query_tables: &empty_queries,
                 };
                 page.render(frame, frame.area(), &mut ctx);
             })

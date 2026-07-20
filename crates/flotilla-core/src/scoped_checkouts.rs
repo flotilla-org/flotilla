@@ -26,7 +26,7 @@ impl MaterializedSet {
         }
     }
 
-    fn result_set(&self, scope: &QueryScope) -> ResultSet {
+    fn result_set(&self, scope: &Option<QueryScope>) -> ResultSet {
         let mut rows = self.rows.values().cloned().collect::<Vec<_>>();
         rows.sort_by(|left, right| {
             (&left.host, &left.path, &left.resource.namespace, &left.resource.name).cmp(&(
@@ -48,7 +48,7 @@ pub struct ScopedCheckoutProjection {
     projects: HashMap<QueryScope, Vec<RepositoryKey>>,
     local_by_repo: HashMap<RepositoryKey, HashMap<ResourceRef, CheckoutRow>>,
     replicas_by_repo: HashMap<RepositoryKey, HashMap<HostName, HashMap<ResourceRef, CheckoutRow>>>,
-    sets: HashMap<QueryScope, MaterializedSet>,
+    sets: HashMap<Option<QueryScope>, MaterializedSet>,
 }
 
 impl ScopedCheckoutProjection {
@@ -77,7 +77,7 @@ impl ScopedCheckoutProjection {
         self.recompute_all()
     }
 
-    pub fn result_set(&mut self, scope: &QueryScope) -> ResultSet {
+    pub fn result_set(&mut self, scope: &Option<QueryScope>) -> ResultSet {
         if !self.sets.contains_key(scope) {
             let materialized = self.materialize(scope);
             self.sets.insert(scope.clone(), materialized);
@@ -85,38 +85,31 @@ impl ScopedCheckoutProjection {
         self.sets.get(scope).expect("checkout scope inserted").result_set(scope)
     }
 
-    /// Local Repository-scoped facts are the federation unit. Project views
-    /// are derived after the receiver has merged every Repository scope.
+    /// Local checkout facts are the federation unit. Project views are
+    /// derived after the receiver groups fleet rows by their Repository key.
     pub fn local_result_sets(&self) -> Vec<ResultSet> {
-        let mut scopes = self.known_repositories.iter().cloned().collect::<Vec<_>>();
-        scopes.sort();
-        scopes
-            .into_iter()
-            .map(|repo| {
-                let rows = self.local_by_repo.get(&repo).cloned().unwrap_or_default();
-                let scope = QueryScope::Repository(repo);
-                let seq = self.sets.get(&scope).map_or(0, |set| set.seq);
-                let materialized = MaterializedSet { seq, rows, state: ResultSetState::default() };
-                materialized.result_set(&scope)
-            })
-            .collect()
+        let rows = self.local_by_repo.values().flat_map(|rows| rows.iter()).map(|(key, row)| (key.clone(), row.clone())).collect();
+        let scope = None;
+        let seq = self.sets.get(&scope).map_or(0, |set| set.seq);
+        vec![MaterializedSet { seq, rows, state: ResultSetState::default() }.result_set(&scope)]
     }
 
     fn recompute_all(&mut self) -> Vec<ResultDelta> {
         let mut scopes = self.sets.keys().cloned().collect::<HashSet<_>>();
-        scopes.extend(self.known_repositories.iter().cloned().map(QueryScope::Repository));
-        scopes.extend(self.projects.keys().cloned());
-        scopes.extend(self.local_by_repo.keys().cloned().map(QueryScope::Repository));
-        scopes.extend(self.replicas_by_repo.keys().cloned().map(QueryScope::Repository));
+        scopes.insert(None);
+        scopes.extend(self.projects.keys().cloned().map(Some));
 
         let mut scopes = scopes.into_iter().collect::<Vec<_>>();
         scopes.sort_by_key(scope_sort_key);
         scopes.into_iter().filter_map(|scope| self.recompute_scope(scope)).collect()
     }
 
-    fn recompute_scope(&mut self, scope: QueryScope) -> Option<ResultDelta> {
+    fn recompute_scope(&mut self, scope: Option<QueryScope>) -> Option<ResultDelta> {
         let replacement = self.materialize(&scope);
-        let previous = self.sets.remove(&scope).unwrap_or_else(|| MaterializedSet::unavailable(&scope, unavailable_message(&scope)));
+        let previous = self.sets.remove(&scope).unwrap_or_else(|| match &scope {
+            Some(scope) => MaterializedSet::unavailable(scope, unavailable_message(scope)),
+            None => MaterializedSet { seq: 0, rows: HashMap::new(), state: ResultSetState::default() },
+        });
         let changed = replacement
             .rows
             .iter()
@@ -136,24 +129,29 @@ impl ScopedCheckoutProjection {
         Some(ResultDelta { seq, changes: QueryChanges::Checkouts { scope, changed, removed }, state })
     }
 
-    fn materialize(&self, scope: &QueryScope) -> MaterializedSet {
+    fn materialize(&self, scope: &Option<QueryScope>) -> MaterializedSet {
         match scope {
-            QueryScope::Repository(repo) => {
-                if !self.known_repositories.contains(repo) {
-                    return MaterializedSet::unavailable(scope, unavailable_message(scope));
-                }
-                MaterializedSet { seq: 0, rows: self.rows_for_repo(repo), state: ResultSetState::default() }
+            None => {
+                let repositories = self
+                    .known_repositories
+                    .iter()
+                    .chain(self.local_by_repo.keys())
+                    .chain(self.replicas_by_repo.keys())
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let rows = repositories.iter().flat_map(|repo| self.rows_for_repo(repo)).collect();
+                MaterializedSet { seq: 0, rows, state: ResultSetState::default() }
             }
-            QueryScope::Project { namespace, name } => {
-                let Some(repositories) = self.projects.get(scope) else {
-                    return MaterializedSet::unavailable(scope, unavailable_message(scope));
+            Some(project) => {
+                let Some(repositories) = self.projects.get(project) else {
+                    return MaterializedSet::unavailable(project, unavailable_message(project));
                 };
                 let missing = repositories.iter().filter(|repo| !self.known_repositories.contains(*repo)).collect::<Vec<_>>();
                 if !missing.is_empty() {
                     let missing = missing.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
                     return MaterializedSet::unavailable(
-                        scope,
-                        format!("project {namespace}/{name} references unavailable repositories: {missing}"),
+                        project,
+                        format!("project {}/{} references unavailable repositories: {missing}", project.namespace, project.name),
                     );
                 }
                 let rows = repositories.iter().flat_map(|repo| self.rows_for_repo(repo)).collect();
@@ -180,16 +178,13 @@ fn group_rows(rows: Vec<CheckoutRow>) -> HashMap<RepositoryKey, HashMap<Resource
 }
 
 fn unavailable_message(scope: &QueryScope) -> String {
-    match scope {
-        QueryScope::Repository(repo) => format!("repository {repo} is unavailable"),
-        QueryScope::Project { namespace, name } => format!("project {namespace}/{name} is unavailable"),
-    }
+    format!("project {}/{} is unavailable", scope.namespace, scope.name)
 }
 
-fn scope_sort_key(scope: &QueryScope) -> String {
+fn scope_sort_key(scope: &Option<QueryScope>) -> String {
     match scope {
-        QueryScope::Repository(repo) => format!("repository/{repo}"),
-        QueryScope::Project { namespace, name } => format!("project/{namespace}/{name}"),
+        None => String::new(),
+        Some(scope) => format!("project/{}/{}", scope.namespace, scope.name),
     }
 }
 
@@ -215,17 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn repository_scope_distinguishes_unavailable_from_valid_empty() {
+    fn fleet_scope_is_available_when_empty() {
         let mut projection = ScopedCheckoutProjection::default();
-        let scope = QueryScope::Repository(repo("repo-a"));
-        let missing = projection.result_set(&scope);
-        assert!(matches!(missing.state.conditions.as_slice(), [ResultSetCondition::QueryScopeUnavailable { .. }]));
-
-        let deltas = projection.replace_catalog(HashSet::from([repo("repo-a")]), HashMap::new());
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].query(), QueryId::Checkouts { scope: scope.clone() });
-        assert!(deltas[0].state.as_ref().expect("condition clear").conditions.is_empty());
-        let available = projection.result_set(&scope);
+        let available = projection.result_set(&None);
         assert!(available.rows.is_empty());
         assert!(available.state.conditions.is_empty());
     }
@@ -233,7 +220,7 @@ mod tests {
     #[test]
     fn project_scope_unions_local_and_replica_repository_rows() {
         let mut projection = ScopedCheckoutProjection::default();
-        let project = QueryScope::Project { namespace: "flotilla".into(), name: "suite".into() };
+        let project = QueryScope::new("flotilla", "suite");
         projection.replace_catalog(
             HashSet::from([repo("repo-a"), repo("repo-b")]),
             HashMap::from([(project.clone(), vec![repo("repo-a"), repo("repo-b")])]),
@@ -241,7 +228,7 @@ mod tests {
         projection.replace_local_rows(vec![row("repo-a", "local", "laptop")]);
         projection.replace_replica_rows(HashMap::from([(HostName::new("kiwi"), vec![row("repo-b", "remote", "kiwi")])]));
 
-        let result = projection.result_set(&project);
+        let result = projection.result_set(&Some(project));
         let rows = result.rows.as_checkouts().expect("checkout rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|row| row.host == HostName::new("laptop")));
@@ -249,16 +236,16 @@ mod tests {
     }
 
     #[test]
-    fn fleet_export_includes_empty_repository_scopes_and_excludes_projects() {
+    fn fleet_export_is_one_unscoped_local_result_set() {
         let mut projection = ScopedCheckoutProjection::default();
         let repository = repo("repo-a");
-        let project = QueryScope::Project { namespace: "flotilla".into(), name: "suite".into() };
+        let project = QueryScope::new("flotilla", "suite");
         projection.replace_catalog(HashSet::from([repository.clone()]), HashMap::from([(project, vec![repository.clone()])]));
 
         let sets = projection.local_result_sets();
 
         assert_eq!(sets.len(), 1);
-        assert_eq!(sets[0].query(), QueryId::Checkouts { scope: QueryScope::Repository(repository) });
+        assert_eq!(sets[0].query(), QueryId::Checkouts { scope: None });
         assert!(sets[0].rows.is_empty());
         assert!(sets[0].state.conditions.is_empty());
     }
@@ -266,14 +253,15 @@ mod tests {
     #[test]
     fn project_membership_change_emits_typed_addition_and_removal() {
         let mut projection = ScopedCheckoutProjection::default();
-        let project = QueryScope::Project { namespace: "flotilla".into(), name: "suite".into() };
+        let project = QueryScope::new("flotilla", "suite");
         projection
             .replace_catalog(HashSet::from([repo("repo-a"), repo("repo-b")]), HashMap::from([(project.clone(), vec![repo("repo-a")])]));
         projection.replace_local_rows(vec![row("repo-a", "a", "local"), row("repo-b", "b", "local")]);
 
         let deltas = projection
             .replace_catalog(HashSet::from([repo("repo-a"), repo("repo-b")]), HashMap::from([(project.clone(), vec![repo("repo-b")])]));
-        let delta = deltas.into_iter().find(|delta| delta.query() == QueryId::Checkouts { scope: project.clone() }).expect("project delta");
+        let delta =
+            deltas.into_iter().find(|delta| delta.query() == QueryId::Checkouts { scope: Some(project.clone()) }).expect("project delta");
         assert_eq!(delta.changes.as_checkouts().expect("changed checkout")[0].resource.name, "b");
         assert_eq!(delta.changes.removed_resources().expect("removed checkout")[0].name, "a");
     }

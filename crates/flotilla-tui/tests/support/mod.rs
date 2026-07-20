@@ -181,6 +181,7 @@ impl TestHarness {
         let theme = self.theme.clone().unwrap_or_else(Theme::classic);
         let keymap = Keymap::defaults();
         let empty_namespaces = flotilla_tui::app::NamespaceMap::new();
+        let empty_queries = flotilla_tui::app::QueryTableCache::default();
         terminal
             .draw(|frame| {
                 let area = frame.area();
@@ -192,6 +193,7 @@ impl TestHarness {
                     keymap: &keymap,
                     in_flight: &self.in_flight,
                     namespaces: &empty_namespaces,
+                    query_tables: &empty_queries,
                 };
                 self.screen.render(frame, area, &mut ctx);
             })

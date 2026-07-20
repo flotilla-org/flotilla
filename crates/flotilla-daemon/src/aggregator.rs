@@ -725,7 +725,7 @@ impl Aggregator {
             .projects
             .values()
             .map(|project| {
-                let scope = QueryScope::Project { namespace: project.metadata.namespace.clone(), name: project.metadata.name.clone() };
+                let scope = QueryScope::new(project.metadata.namespace.clone(), project.metadata.name.clone());
                 let repositories = project.spec.repositories.iter().map(|repository| repository.repo.clone()).collect();
                 (scope, repositories)
             })
@@ -849,13 +849,13 @@ impl Aggregator {
                     Rows::Issues { .. } => {
                         tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
                     }
-                    Rows::Checkouts { scope: QueryScope::Repository(_), rows } => {
+                    Rows::Checkouts { scope: None, rows } => {
                         for mut row in rows {
                             set_checkout_row_host(&mut row, &host);
                             checkout_rows.push(row);
                         }
                     }
-                    Rows::Checkouts { scope: QueryScope::Project { .. }, .. } => {
+                    Rows::Checkouts { scope: Some(_), .. } => {
                         tracing::warn!(host = %host, "ignoring derived project checkout set in fleet replica snapshot");
                     }
                 }
@@ -1511,7 +1511,7 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let repo = RepositoryKey("repo-widgets".into());
         state.replace_checkout_catalog(HashSet::from([repo.clone()]), HashMap::new()).await;
-        let scope = QueryScope::Repository(repo.clone());
+        let scope = None;
         let row = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "remote-checkout"))
             .repo(repo)

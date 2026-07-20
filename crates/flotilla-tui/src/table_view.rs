@@ -6,7 +6,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flotilla_protocol::{HostName, IndependentRow, IssueRef, IssueRow, RepoKey, SessionPhase, ViewAddress};
+use flotilla_protocol::{
+    result_set::Timestamp, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, ResultSetCondition,
+    ResultSetState, SessionPhase, ViewAddress,
+};
 
 use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
 
@@ -19,10 +22,13 @@ impl RowId {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct TableState {
     selected: Option<RowId>,
     pub filter: String,
+    /// Ephemeral provider-side search for demand-backed issue tables. This is
+    /// deliberately View state rather than part of the persisted address.
+    pub source_search: Option<String>,
     pub scroll_offset: usize,
 }
 
@@ -171,7 +177,7 @@ impl<R: 'static> TableSpec<R> {
                     .collect(),
             })
             .collect();
-        TableView { title, columns, rows }
+        TableView { title, columns, rows, meta: TableMeta::default() }
     }
 }
 
@@ -214,21 +220,43 @@ pub struct ProjectedRow {
     pub actions: Vec<AvailableAction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TableView {
     pub title: String,
     pub columns: Vec<ProjectedColumn>,
     pub rows: Vec<ProjectedRow>,
+    pub meta: TableMeta,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableMeta {
+    pub as_of: Option<Timestamp>,
+    pub has_more: bool,
+    pub conditions: Vec<String>,
 }
 
 impl TableView {
     pub fn filtered(mut self, filter: &str) -> Self {
         let filter = filter.trim().to_lowercase();
         if !filter.is_empty() {
-            self.rows.retain(|row| row.cells.iter().any(|cell| cell.text.to_lowercase().contains(&filter)));
+            self.rows.retain(|row| row.cells.iter().any(|cell| fuzzy_matches(&cell.text, &filter)));
         }
         self
     }
+}
+
+fn fuzzy_matches(value: &str, pattern: &str) -> bool {
+    let mut pattern = pattern.chars();
+    let mut next = pattern.next();
+    for candidate in value.chars().flat_map(char::to_lowercase) {
+        if next == Some(candidate) {
+            next = pattern.next();
+            if next.is_none() {
+                return true;
+            }
+        }
+    }
+    next.is_none()
 }
 
 #[derive(Clone)]
@@ -240,6 +268,12 @@ struct VesselProjection {
 }
 
 #[derive(Clone)]
+struct ScopedIssueProjection {
+    scope: QueryScope,
+    row: IssueRow,
+}
+
+#[derive(Clone)]
 enum ProjectProjection {
     Convoy(ConvoySummary),
     Issue { namespace: String, project: String, row: IssueRow },
@@ -248,11 +282,33 @@ enum ProjectProjection {
 /// Typed query rows currently available to the table registry. Surfaces build
 /// this once from their query caches; adding a query family grows this input
 /// without teaching the reusable widget about that family.
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
 pub struct TableRows<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
     pub independents: Vec<&'a IndependentRow>,
     pub project_issues: Vec<(&'a str, &'a str, &'a IssueRow)>,
+    pub issue_results: Vec<QueryRows<'a, IssueRow>>,
+    pub checkout_results: Vec<QueryRows<'a, CheckoutRow>>,
+    pub source_search: Option<&'a str>,
+}
+
+pub struct QueryRows<'a, R> {
+    pub query: &'a QueryId,
+    pub rows: &'a [R],
+    pub state: &'a ResultSetState,
+}
+
+/// Query identity owned by a single-family table address. Composite Views
+/// add their other queries in `app::view_kind`, but use this same mapping for
+/// curated table families to prevent subscription/projection drift.
+pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<QueryId> {
+    match address {
+        ViewAddress::Issues { scope } => {
+            Some(QueryId::Issues { scope: scope.clone(), search: source_search.filter(|search| !search.is_empty()).map(str::to_owned) })
+        }
+        ViewAddress::Checkouts { scope } => Some(QueryId::Checkouts { scope: scope.clone() }),
+        _ => None,
+    }
 }
 
 pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
@@ -312,7 +368,51 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 vessel: vessel_row.clone(),
             }]))
         }
+        ViewAddress::Issues { scope } => {
+            let query = query_for(address, data.source_search).expect("issues address has a query");
+            let result = data
+                .issue_results
+                .iter()
+                .find(|result| *result.query == query)
+                .ok_or_else(|| format!("result set not available: {query}"))?;
+            let mut view = issue_spec().project(
+                format!("Issues · {}/{}", scope.namespace, scope.name),
+                result.rows.iter().cloned().map(|row| ScopedIssueProjection { scope: scope.clone(), row }),
+            );
+            view.meta = result_set_meta(result.state);
+            Ok(view)
+        }
+        ViewAddress::Checkouts { scope } => {
+            let query = query_for(address, data.source_search).expect("checkouts address has a query");
+            let result = data
+                .checkout_results
+                .iter()
+                .find(|result| *result.query == query)
+                .ok_or_else(|| format!("result set not available: {query}"))?;
+            let title = scope
+                .as_ref()
+                .map_or_else(|| "Checkouts · fleet".to_string(), |scope| format!("Checkouts · {}/{}", scope.namespace, scope.name));
+            let mut view = checkout_spec().project(title, result.rows.iter().cloned());
+            view.meta = result_set_meta(result.state);
+            Ok(view)
+        }
         ViewAddress::Overview | ViewAddress::Repo { .. } => Err(format!("view is not table-backed: {address}")),
+    }
+}
+
+fn result_set_meta(state: &ResultSetState) -> TableMeta {
+    TableMeta {
+        as_of: state.demand.as_ref().map(|metadata| metadata.as_of),
+        has_more: state.demand.as_ref().is_some_and(|metadata| metadata.has_more),
+        conditions: state
+            .conditions
+            .iter()
+            .map(|condition| match condition {
+                ResultSetCondition::IssueSourceUnavailable { message, .. } | ResultSetCondition::QueryScopeUnavailable { message, .. } => {
+                    message.clone()
+                }
+            })
+            .collect(),
     }
 }
 
@@ -376,6 +476,22 @@ fn independent_spec() -> TableSpec<IndependentRow> {
         columns: &INDEPENDENT_COLUMNS,
         actions: &INDEPENDENT_ACTIONS,
         row: RowSpec { id: independent_id, drill: |_| None, describe: independent_description },
+    }
+}
+
+fn issue_spec() -> TableSpec<ScopedIssueProjection> {
+    TableSpec {
+        columns: &ISSUE_COLUMNS,
+        actions: &ISSUE_ACTIONS,
+        row: RowSpec { id: scoped_issue_id, drill: |_| None, describe: scoped_issue_description },
+    }
+}
+
+fn checkout_spec() -> TableSpec<CheckoutRow> {
+    TableSpec {
+        columns: &CHECKOUT_COLUMNS,
+        actions: &[],
+        row: RowSpec { id: checkout_id, drill: |_| None, describe: checkout_description },
     }
 }
 
@@ -555,6 +671,78 @@ static INDEPENDENT_COLUMNS: [ColumnSpec<IndependentRow>; 5] = [
 static INDEPENDENT_ACTIONS: [ActionSpec<IndependentRow>; 1] =
     [ActionSpec { id: "attach", label: "Attach temporarily", key: 'a', resolve: attach_independent }];
 
+static ISSUE_COLUMNS: [ColumnSpec<ScopedIssueProjection>; 4] = [
+    ColumnSpec {
+        id: "issue",
+        label: "ISSUE",
+        width: WidthHint::Fixed(14),
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(&row.row.reference.id),
+    },
+    ColumnSpec {
+        id: "title",
+        label: "TITLE",
+        width: WidthHint::Flexible { minimum: 24, weight: 3 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(&row.row.issue.title),
+    },
+    ColumnSpec {
+        id: "source",
+        label: "SOURCE",
+        width: WidthHint::Flexible { minimum: 16, weight: 1 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(format!("{} / {}", row.row.reference.source.service, row.row.reference.source.scope)),
+    },
+    ColumnSpec {
+        id: "updated",
+        label: "UPDATED",
+        width: WidthHint::Fixed(20),
+        alignment: Alignment::Left,
+        extract: |row| CellValue::toned(row.row.issue.as_of.format("%Y-%m-%d %H:%M").to_string(), CellTone::Muted),
+    },
+];
+
+static ISSUE_ACTIONS: [ActionSpec<ScopedIssueProjection>; 1] =
+    [ActionSpec { id: "start", label: "Start convoy", key: 'c', resolve: start_scoped_issue }];
+
+static CHECKOUT_COLUMNS: [ColumnSpec<CheckoutRow>; 5] = [
+    ColumnSpec {
+        id: "host",
+        label: "HOST",
+        width: WidthHint::Flexible { minimum: 10, weight: 1 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(row.host.to_string()),
+    },
+    ColumnSpec {
+        id: "path",
+        label: "PATH",
+        width: WidthHint::Flexible { minimum: 22, weight: 3 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(&row.path),
+    },
+    ColumnSpec {
+        id: "branch",
+        label: "BRANCH",
+        width: WidthHint::Flexible { minimum: 14, weight: 2 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(&row.branch),
+    },
+    ColumnSpec {
+        id: "repository",
+        label: "REPOSITORY",
+        width: WidthHint::Flexible { minimum: 14, weight: 2 },
+        alignment: Alignment::Left,
+        extract: |row| CellValue::plain(row.repo.to_string()),
+    },
+    ColumnSpec {
+        id: "authority",
+        label: "AUTHORITY",
+        width: WidthHint::Fixed(10),
+        alignment: Alignment::Left,
+        extract: |row| CellValue::toned(row.authority.as_label_value(), CellTone::Muted),
+    },
+];
+
 fn convoy_id(row: &ConvoySummary) -> RowId {
     RowId::new(row.id.as_str())
 }
@@ -634,6 +822,46 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
         DetailField { label: "Phase", value: convoy_phase(row).text },
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
+    ]
+}
+
+fn scoped_issue_id(row: &ScopedIssueProjection) -> RowId {
+    RowId::new(format!(
+        "issue:{}:{}:{}:{}:{}",
+        row.scope.namespace, row.scope.name, row.row.reference.source.service, row.row.reference.source.scope, row.row.reference.id
+    ))
+}
+
+fn scoped_issue_description(row: &ScopedIssueProjection) -> Vec<DetailField> {
+    vec![
+        DetailField { label: "Namespace", value: row.scope.namespace.clone() },
+        DetailField { label: "Project", value: row.scope.name.clone() },
+        DetailField { label: "Issue", value: row.row.reference.id.clone() },
+        DetailField { label: "Title", value: row.row.issue.title.clone() },
+        DetailField { label: "Source", value: format!("{} / {}", row.row.reference.source.service, row.row.reference.source.scope) },
+        DetailField { label: "As of", value: row.row.issue.as_of.to_rfc3339() },
+    ]
+}
+
+fn start_scoped_issue(row: &ScopedIssueProjection) -> Option<TableIntent> {
+    Some(TableIntent::StartConvoy {
+        namespace: row.scope.namespace.clone(),
+        project: row.scope.name.clone(),
+        issue: row.row.reference.clone(),
+    })
+}
+
+fn checkout_id(row: &CheckoutRow) -> RowId {
+    RowId::new(format!("checkout:{}/{}/{}/{}@{}", row.resource.api_version, row.resource.namespace, row.resource.name, row.path, row.host))
+}
+
+fn checkout_description(row: &CheckoutRow) -> Vec<DetailField> {
+    vec![
+        DetailField { label: "Host", value: row.host.to_string() },
+        DetailField { label: "Path", value: row.path.clone() },
+        DetailField { label: "Branch", value: row.branch.clone() },
+        DetailField { label: "Repository", value: row.repo.to_string() },
+        DetailField { label: "Authority", value: row.authority.as_label_value().to_string() },
     ]
 }
 
@@ -720,7 +948,10 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{test_support::TestIssue, ResourceRef};
+    use flotilla_protocol::{
+        test_support::TestIssue, DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef,
+        ResultSetCondition, ResultSetState,
+    };
 
     use super::*;
     use crate::convoy_model::{ConvoyId, ProcessSummary, WorkCompletionTarget};
@@ -730,6 +961,7 @@ mod tests {
             convoys: convoys.to_vec(),
             independents: vec![],
             project_issues: vec![],
+            ..TableRows::default()
         })
     }
 
@@ -846,6 +1078,7 @@ mod tests {
             convoys: vec![],
             independents: vec![&unavailable, &available],
             project_issues: vec![],
+            ..TableRows::default()
         })
         .expect("independents table");
 
@@ -866,9 +1099,13 @@ mod tests {
         let row = IssueRow { reference: issue.reference.clone(), issue };
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
 
-        let view =
-            project(&address, &TableRows { convoys: vec![], independents: vec![], project_issues: vec![("flotilla", "roadmap", &row)] })
-                .expect("project issue table");
+        let view = project(&address, &TableRows {
+            convoys: vec![],
+            independents: vec![],
+            project_issues: vec![("flotilla", "roadmap", &row)],
+            ..TableRows::default()
+        })
+        .expect("project issue table");
 
         assert_eq!(view.rows.len(), 1);
         assert_eq!(view.rows[0].actions, vec![AvailableAction {
@@ -880,21 +1117,95 @@ mod tests {
     }
 
     #[test]
+    fn scoped_issue_table_projects_rows_freshness_conditions_and_actions() {
+        let issue = TestIssue::new("Start convoy from scoped issue").id("ENG-42").build();
+        let row = IssueRow { reference: issue.reference.clone(), issue };
+        let scope = QueryScope::new("flotilla", "roadmap");
+        let query = QueryId::Issues { scope: scope.clone(), search: None };
+        let state = ResultSetState {
+            demand: Some(DemandBackedMetadata { as_of: "2026-07-20T12:00:00Z".parse().expect("timestamp"), has_more: true }),
+            conditions: vec![ResultSetCondition::IssueSourceUnavailable { source: None, message: "one source is unavailable".into() }],
+        };
+        let address: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("issues address");
+
+        let view = project(&address, &TableRows {
+            convoys: vec![],
+            independents: vec![],
+            project_issues: vec![],
+            issue_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
+            ..TableRows::default()
+        })
+        .expect("scoped issue table");
+
+        assert_eq!(view.rows.len(), 1);
+        assert_eq!(view.rows[0].cells[0].text, "ENG-42");
+        assert_eq!(view.rows[0].actions[0].intent, TableIntent::StartConvoy {
+            namespace: "flotilla".into(),
+            project: "roadmap".into(),
+            issue: row.reference,
+        });
+        assert_eq!(view.meta.as_of, state.demand.as_ref().map(|metadata| metadata.as_of));
+        assert!(view.meta.has_more);
+        assert_eq!(view.meta.conditions, vec!["one source is unavailable"]);
+    }
+
+    #[test]
+    fn fleet_checkout_table_projects_typed_rows() {
+        let row = CheckoutRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "widgets-api"))
+            .repo(RepositoryKey("repo_widgets".into()))
+            .path("/work/widgets-api")
+            .branch("feature/scoped-tabs")
+            .host(HostName::new("kiwi"))
+            .authority(LifecycleAuthority::Observed)
+            .build();
+        let query = QueryId::Checkouts { scope: None };
+        let state = ResultSetState::default();
+        let view = project(&ViewAddress::Checkouts { scope: None }, &TableRows {
+            checkout_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
+            ..TableRows::default()
+        })
+        .expect("checkout table");
+
+        assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec![
+            "host",
+            "path",
+            "branch",
+            "repository",
+            "authority",
+        ]);
+        assert_eq!(view.rows[0].cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(), vec![
+            "kiwi",
+            "/work/widgets-api",
+            "feature/scoped-tabs",
+            "repo_widgets",
+            "observed",
+        ]);
+        assert!(view.rows[0].actions.is_empty());
+    }
+
+    #[test]
     fn table_state_preserves_identity_and_clamps_when_rows_disappear() {
         let first = convoy(vec![]);
         let mut second = convoy(vec![]);
         second.id = ConvoyId::new("dev", "other");
         second.name = "other".into();
         let address = "convoys/dev".parse().expect("valid address");
-        let view = project(&address, &TableRows { convoys: vec![&first, &second], independents: vec![], project_issues: vec![] })
-            .expect("project table");
+        let view = project(&address, &TableRows {
+            convoys: vec![&first, &second],
+            independents: vec![],
+            project_issues: vec![],
+            ..TableRows::default()
+        })
+        .expect("project table");
         let mut state = TableState::default();
         state.reconcile(&view);
         state.select_delta(&view, 1);
         assert_eq!(state.selected_row(&view).map(|row| row.cells[0].text.as_str()), Some("other"));
 
         let changed =
-            project(&address, &TableRows { convoys: vec![&first], independents: vec![], project_issues: vec![] }).expect("project table");
+            project(&address, &TableRows { convoys: vec![&first], independents: vec![], project_issues: vec![], ..TableRows::default() })
+                .expect("project table");
         state.reconcile(&changed);
         assert_eq!(state.selected_row(&changed).map(|row| row.cells[0].text.as_str()), Some("tables"));
     }
@@ -929,7 +1240,7 @@ mod tests {
         let mut active = convoy(vec![]);
         active.id = ConvoyId::new("dev", "other");
         active.name = "other".into();
-        let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DISK");
+        let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DSK F");
 
         assert_eq!(view.rows.len(), 1);
         assert_eq!(view.rows[0].cells[0].text, "tables");

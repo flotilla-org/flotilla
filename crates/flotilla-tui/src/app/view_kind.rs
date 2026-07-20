@@ -12,17 +12,17 @@ use crate::binding_table::{BindingModeId, KeyBindingMode};
 
 /// The named query a view kind consumes — the tab set IS the subscription
 /// set. Repo views ride the Plane-A repo streams and return None.
-pub(crate) fn queries(address: &ViewAddress) -> Vec<QueryId> {
+pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec<QueryId> {
     match address {
         ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys],
         ViewAddress::Project { namespace, name } => {
-            vec![QueryId::Convoys, QueryId::Issues { scope: QueryScope::Project { namespace: namespace.clone(), name: name.clone() } }]
+            vec![QueryId::Convoys, QueryId::Issues { scope: QueryScope::new(namespace, name), search: None }]
         }
         ViewAddress::Independents => vec![QueryId::Independents],
-        ViewAddress::Repo { repository_key: Some(repository_key), .. } => {
-            vec![QueryId::Issues { scope: QueryScope::Repository(repository_key.clone()) }]
+        ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => {
+            vec![crate::table_view::query_for(address, source_search).expect("single-family table address has a query")]
         }
-        ViewAddress::Overview | ViewAddress::Repo { repository_key: None, .. } => vec![],
+        ViewAddress::Overview | ViewAddress::Repo { .. } => vec![],
     }
 }
 
@@ -56,10 +56,12 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
             | ViewAddress::Independents
             | ViewAddress::Project { .. }
             | ViewAddress::Convoy { .. }
-            | ViewAddress::Vessel { .. },
+            | ViewAddress::Vessel { .. }
+            | ViewAddress::Checkouts { .. },
         ) => {
             vec![BindingModeId::Convoys]
         }
+        Some(ViewAddress::Issues { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable],
         Some(ViewAddress::Repo { .. }) => vec![BindingModeId::Normal],
         None => vec![],
     }
@@ -72,24 +74,32 @@ pub(crate) fn binding_mode(address: Option<&ViewAddress>, scoped: bool) -> KeyBi
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{RepoIdentity, RepositoryKey};
-
     use super::*;
 
     #[test]
     fn project_view_composes_store_and_demand_backed_queries() {
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
-        assert_eq!(queries(&address), vec![QueryId::Convoys, QueryId::Issues {
-            scope: QueryScope::Project { namespace: "flotilla".into(), name: "roadmap".into() }
+        assert_eq!(queries(&address, None), vec![QueryId::Convoys, QueryId::Issues {
+            scope: QueryScope::new("flotilla", "roadmap"),
+            search: None,
         },]);
     }
 
     #[test]
-    fn repo_view_owns_its_typed_query_scope_in_the_address() {
-        let address = ViewAddress::repo_with_key(
-            RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() },
-            RepositoryKey("repo_abc".into()),
-        );
-        assert_eq!(queries(&address), vec![QueryId::Issues { scope: QueryScope::Repository(RepositoryKey("repo_abc".into())) }]);
+    fn scoped_issue_view_subscribes_to_its_ephemeral_search_window() {
+        let address: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("address");
+        assert_eq!(queries(&address, Some("widget")), vec![QueryId::Issues {
+            scope: QueryScope::new("flotilla", "roadmap"),
+            search: Some("widget".into()),
+        }]);
+    }
+
+    #[test]
+    fn only_demand_backed_issue_tables_expose_source_search_and_fetch_more() {
+        let issues: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("issues address");
+        let checkouts: ViewAddress = "checkouts".parse().expect("checkouts address");
+
+        assert_eq!(kind_modes(Some(&issues)), vec![BindingModeId::Convoys, BindingModeId::DemandTable]);
+        assert_eq!(kind_modes(Some(&checkouts)), vec![BindingModeId::Convoys]);
     }
 }

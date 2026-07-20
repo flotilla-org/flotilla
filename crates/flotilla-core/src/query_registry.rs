@@ -65,13 +65,17 @@ impl QueryRegistry {
     /// Replace the current window of a live issue materialization. A fetch
     /// that completes after the last subscriber left is discarded.
     pub fn replace_issues(&self, query: &QueryId, generation: u64, rows: Vec<IssueRow>, result_state: ResultSetState) -> Option<ResultSet> {
-        let QueryId::Issues { scope } = query else { return None };
+        let QueryId::Issues { scope, search } = query else { return None };
         let mut state = self.inner.lock().expect("query registry lock poisoned");
         if state.generations.get(query) != Some(&generation) {
             return None;
         }
         let current = state.demand_backed.get_mut(query)?;
-        *current = ResultSet { seq: current.seq.saturating_add(1), rows: Rows::Issues { scope: scope.clone(), rows }, state: result_state };
+        *current = ResultSet {
+            seq: current.seq.saturating_add(1),
+            rows: Rows::Issues { scope: scope.clone(), search: search.clone(), rows },
+            state: result_state,
+        };
         Some(current.clone())
     }
 
@@ -85,7 +89,7 @@ impl QueryRegistry {
         removed: Vec<IssueRef>,
         result_state: ResultSetState,
     ) -> Option<ResultDelta> {
-        let QueryId::Issues { scope } = query else { return None };
+        let QueryId::Issues { scope, search } = query else { return None };
         let mut registry = self.inner.lock().expect("query registry lock poisoned");
         if registry.generations.get(query) != Some(&generation) {
             return None;
@@ -105,7 +109,7 @@ impl QueryRegistry {
         current.state = result_state.clone();
         Some(ResultDelta {
             seq: current.seq,
-            changes: QueryChanges::Issues { scope: scope.clone(), changed, removed },
+            changes: QueryChanges::Issues { scope: scope.clone(), search: search.clone(), changed, removed },
             state: Some(result_state),
         })
     }
@@ -171,10 +175,10 @@ fn reconcile_demand(state: &mut RegistryState) -> HashSet<QueryId> {
 }
 
 fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
-    let QueryId::Issues { scope } = query else { unreachable!("demand-backed registry only materializes issue queries") };
+    let QueryId::Issues { scope, search } = query else { unreachable!("demand-backed registry only materializes issue queries") };
     ResultSet {
         seq: 1,
-        rows: Rows::Issues { scope, rows: vec![] },
+        rows: Rows::Issues { scope, search, rows: vec![] },
         state: ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
             conditions: vec![ResultSetCondition::IssueSourceUnavailable {
@@ -187,12 +191,12 @@ fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::{QueryScope, RepositoryKey};
+    use flotilla_protocol::QueryScope;
 
     use super::*;
 
     fn issues(name: &str) -> QueryId {
-        QueryId::Issues { scope: QueryScope::Repository(RepositoryKey(name.into())) }
+        QueryId::Issues { scope: QueryScope::new("flotilla", name), search: None }
     }
 
     fn cursor(query: QueryId) -> QueryCursor {
