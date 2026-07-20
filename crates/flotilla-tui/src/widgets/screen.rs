@@ -11,6 +11,7 @@ use ratatui::{
 
 use super::{
     overview_page::OverviewPage,
+    project_page::ProjectPageWidget,
     repo_page::RepoPage,
     status_bar_widget::{self, StatusBarWidget},
     table::TableWidget,
@@ -30,6 +31,7 @@ use crate::{
 enum ActivePage {
     Overview,
     Table,
+    Project,
     Repo(RepoIdentity),
     /// A repo view whose repo is no longer tracked, or an address that
     /// failed to parse: renders its own error, handles only shell actions.
@@ -57,6 +59,7 @@ pub struct Screen {
     pub repo_pages: HashMap<RepoIdentity, RepoPage>,
     pub overview_page: OverviewPage,
     pub table: TableWidget,
+    pub project_page: ProjectPageWidget,
 }
 
 impl Default for Screen {
@@ -74,6 +77,7 @@ impl Screen {
             repo_pages: HashMap::new(),
             overview_page: OverviewPage::new(),
             table: TableWidget::default(),
+            project_page: ProjectPageWidget::default(),
         }
     }
 
@@ -120,12 +124,12 @@ impl Screen {
             ViewTarget::View(
                 ViewAddress::Convoys { .. }
                 | ViewAddress::Independents
-                | ViewAddress::Project { .. }
                 | ViewAddress::Convoy { .. }
                 | ViewAddress::Vessel { .. }
                 | ViewAddress::Issues { .. }
                 | ViewAddress::Checkouts { .. },
             ) => ActivePage::Table,
+            ViewTarget::View(ViewAddress::Project { .. }) => ActivePage::Project,
             ViewTarget::View(ViewAddress::Repo { identity, .. }) => {
                 if repos.contains_key(identity) {
                     ActivePage::Repo(identity.clone())
@@ -240,6 +244,14 @@ impl InteractiveWidget for Screen {
                     outcome
                 }
             }
+            ActivePage::Project => {
+                let outcome = self.project_page.handle_action(action, ctx);
+                if matches!(outcome, Outcome::Ignored) {
+                    Self::fallback_page_action(action, ctx)
+                } else {
+                    outcome
+                }
+            }
             ActivePage::Error { .. } => Self::fallback_page_action(action, ctx),
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_action(action, ctx),
@@ -267,7 +279,7 @@ impl InteractiveWidget for Screen {
         // No modal — dispatch to the active View's page
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_raw_key(key, ctx),
-            ActivePage::Table | ActivePage::Error { .. } => Outcome::Ignored,
+            ActivePage::Table | ActivePage::Project | ActivePage::Error { .. } => Outcome::Ignored,
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_raw_key(key, ctx),
                 None => Outcome::Ignored,
@@ -339,6 +351,7 @@ impl InteractiveWidget for Screen {
         let outcome = match self.active_page(ctx.views.active(), &ctx.model.repos) {
             ActivePage::Overview => self.overview_page.handle_mouse(mouse, ctx),
             ActivePage::Table => self.table.handle_mouse(mouse, ctx),
+            ActivePage::Project => self.project_page.handle_mouse(mouse, ctx),
             ActivePage::Error { .. } => Outcome::Ignored,
             ActivePage::Repo(identity) => match self.repo_pages.get_mut(&identity) {
                 Some(page) => page.handle_mouse(mouse, ctx),
@@ -383,6 +396,7 @@ impl InteractiveWidget for Screen {
                     Err(detail) => Self::render_error_page(frame, chunks[1], ctx.theme, "table view unavailable", &detail),
                 }
             }
+            ActivePage::Project => self.project_page.render(frame, chunks[1], ctx),
             ActivePage::Overview => self.overview_page.render(frame, chunks[1], ctx),
             ActivePage::Repo(identity) => {
                 let identity = identity.clone();
@@ -421,7 +435,7 @@ impl InteractiveWidget for Screen {
                     Some(page) => (view_kind::compose_with_shell(scoped, page.binding_mode().modes()), page.status_fragment()),
                     None => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
                 },
-                ActivePage::Table => (view_kind::binding_mode(address, scoped), StatusFragment::default()),
+                ActivePage::Table | ActivePage::Project => (view_kind::binding_mode(address, scoped), StatusFragment::default()),
                 ActivePage::Error { .. } => (view_kind::compose_with_shell(scoped, []), StatusFragment::default()),
             }
         };

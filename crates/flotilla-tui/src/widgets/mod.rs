@@ -11,6 +11,7 @@ pub mod help;
 pub mod issue_search;
 pub mod overview_page;
 pub mod preview_panel;
+pub mod project_page;
 pub mod repo_page;
 pub mod screen;
 pub mod section_table;

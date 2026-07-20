@@ -16,7 +16,10 @@ pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec
     match address {
         ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys],
         ViewAddress::Project { namespace, name } => {
-            vec![QueryId::Convoys, QueryId::Issues { scope: QueryScope::new(namespace, name), search: None }]
+            vec![QueryId::Convoys, QueryId::Checkouts { scope: Some(QueryScope::new(namespace, name)) }, QueryId::Issues {
+                scope: QueryScope::new(namespace, name),
+                search: source_search.filter(|search| !search.is_empty()).map(str::to_owned),
+            }]
         }
         ViewAddress::Independents => vec![QueryId::Independents],
         ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => {
@@ -54,13 +57,13 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
         Some(
             ViewAddress::Convoys { .. }
             | ViewAddress::Independents
-            | ViewAddress::Project { .. }
             | ViewAddress::Convoy { .. }
             | ViewAddress::Vessel { .. }
             | ViewAddress::Checkouts { .. },
         ) => {
             vec![BindingModeId::Convoys]
         }
+        Some(ViewAddress::Project { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable],
         Some(ViewAddress::Issues { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable],
         Some(ViewAddress::Repo { .. }) => vec![BindingModeId::Normal],
         None => vec![],
@@ -79,10 +82,11 @@ mod tests {
     #[test]
     fn project_view_composes_store_and_demand_backed_queries() {
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
-        assert_eq!(queries(&address, None), vec![QueryId::Convoys, QueryId::Issues {
-            scope: QueryScope::new("flotilla", "roadmap"),
-            search: None,
-        },]);
+        assert_eq!(queries(&address, None), vec![
+            QueryId::Convoys,
+            QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
+            QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None },
+        ]);
     }
 
     #[test]
