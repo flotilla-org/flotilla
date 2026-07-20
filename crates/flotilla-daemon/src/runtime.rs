@@ -282,6 +282,7 @@ async fn register_startup_resources(
     discover_local_clones(daemon, &backend, namespace, profile).await?;
     ensure_default_policies(&backend, namespace, profile).await?;
     ensure_default_workflow_templates(&backend, namespace).await?;
+    daemon.materialize_tracked_repo_projects().await?;
     Ok(())
 }
 

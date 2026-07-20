@@ -3899,6 +3899,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
     let identity = test_repo_identity();
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![], config, local_bare_remote_discovery(), HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
 
     daemon
         .add_virtual_repo(identity.clone(), None, PathBuf::from("/remote/desktop/owner/repo"), vec![], 0)
@@ -4710,6 +4711,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
     let config = test_config_store(temp.path().join("config"));
     let daemon =
         InProcessDaemon::new(vec![], config, fake_discovery_with_provider_set(FakeDiscoveryProviders::new()), HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("manager-backed-repo".to_string()))).await;
 
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::remote_host(
@@ -4743,6 +4745,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
         .terminal_pools
         .push(Box::new(EnvGatedTerminalPoolFactory { required_env_var: "ENABLE_MANAGER_TERMINALS", pool: terminal_pool }));
     let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("provider-discovery".to_string()))).await;
 
     daemon
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::env_var("ENABLE_MANAGER_TERMINALS", "1")))

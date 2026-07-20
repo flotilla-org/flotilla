@@ -22,7 +22,10 @@ _Avoid_: using "Island" as a code/identifier name — it is the metaphor, not th
 **Project**:
 The definition resource that structurally groups work (convoys) belonging to
 one codebase, which may span one or more **Repositories** or repository slices.
-The concrete form of the **Island** metaphor.
+Tracking a Repository materialises an ordinary whole-repository Project as the
+human-intent-backed default; that Project remains user-editable and may grow to
+cover more Repositories or select a different Issue Source. The concrete form
+of the **Island** metaphor.
 _Avoid_: Repo (a Project may span more than the bare git remote), Workspace.
 
 **Repository**:

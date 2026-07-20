@@ -2328,6 +2328,14 @@ async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, names
     }
 }
 
+fn validate_project_name(name: &str) -> Result<(), String> {
+    let normalized = normalize_project_name(name)?;
+    if normalized != name {
+        return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
+    }
+    Ok(())
+}
+
 fn normalize_project_name(name: &str) -> Result<String, String> {
     let normalized = name
         .trim()
@@ -2341,10 +2349,28 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
     if normalized.is_empty() {
         return Err("project name must contain an alphanumeric character".to_string());
     }
-    if normalized != name {
-        return Err(format!("project name `{name}` is invalid; use `{normalized}`"));
-    }
     Ok(normalized)
+}
+
+async fn ensure_repository_and_default_project_workflow(
+    backend: &ResourceBackend,
+    namespace: &str,
+    repository_key: &RepositoryKey,
+    repository_spec: &RepositorySpec,
+) -> Result<(), String> {
+    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
+        .await
+        .map_err(|error| error.to_string())?;
+    ensure_single_agent_contained_workflow(backend, namespace).await
+}
+
+fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
+    normalize_project_spec(ProjectSpec {
+        display_name,
+        default_workflow_ref: "single-agent-contained".to_string(),
+        issue_source: None,
+        repositories: vec![ProjectRepositorySpec { repo: repository_key, subpath: None, default_branch: None }],
+    })
 }
 
 fn normalize_workspace_slug(candidate: &str) -> String {
@@ -2783,15 +2809,14 @@ impl InProcessDaemon {
             (None, None) => return Err(format!("`{target}` is neither a repository path nor a repository catalog slug")),
         };
 
-        flotilla_resources::ensure_repository(&repositories, &key, &repository_spec).await.map_err(|error| error.to_string())?;
+        ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &key, &repository_spec).await?;
         if let Some(checkout) = checkout {
             self.ensure_project_checkout(&namespace, &key, &repository_spec, checkout).await?;
         }
-        ensure_single_agent_contained_workflow(&self.resource_backend, &namespace).await?;
 
         let default_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let project_name = explicit_name.map(str::to_string).unwrap_or(default_name.clone());
-        normalize_project_name(&project_name)?;
+        validate_project_name(&project_name)?;
         let projects = self.resource_backend.clone().using::<Project>(&namespace);
         match projects.get(&project_name).await {
             Ok(existing) => {
@@ -2814,14 +2839,69 @@ impl InProcessDaemon {
             Err(error) => return Err(error.to_string()),
         }
 
-        let spec = normalize_project_spec(ProjectSpec {
-            display_name: explicit_display_name.map(str::to_string).unwrap_or(default_name),
-            default_workflow_ref: "single-agent-contained".to_string(),
-            issue_source: None,
-            repositories: vec![ProjectRepositorySpec { repo: key, subpath: None, default_branch: None }],
-        })?;
+        let spec = whole_repository_project_spec(key, explicit_display_name.map(str::to_string).unwrap_or(default_name))?;
         projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
         Ok(project_name)
+    }
+
+    async fn ensure_whole_repository_project(&self, repository_spec: &RepositorySpec) -> Result<String, String> {
+        let namespace = self.provisioning_namespace().await;
+        let repository_key = repository_spec.key();
+        ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &repository_key, repository_spec).await?;
+
+        let projects = self.resource_backend.clone().using::<Project>(&namespace);
+        if let Some(existing) = projects
+            .list()
+            .await
+            .map_err(|error| error.to_string())?
+            .items
+            .into_iter()
+            .find(|project| project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()))
+        {
+            return Ok(existing.metadata.name);
+        }
+
+        let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
+        let catalog_name = normalize_project_name(&repository_spec.catalog_slug())?;
+        let key_suffix = repository_key.0.chars().take(8).collect::<String>();
+        let disambiguated_name = format!("{catalog_name}-{key_suffix}");
+        let mut candidates = Vec::new();
+        for candidate in [display_name.clone(), catalog_name, disambiguated_name] {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+
+        let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
+        for project_name in candidates {
+            match projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await {
+                Ok(_) => return Ok(project_name),
+                Err(ResourceError::Conflict { .. }) => {
+                    let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
+                    if existing.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()) {
+                        return Ok(project_name);
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(format!("could not allocate a deterministic Project name for repository {repository_key}"))
+    }
+
+    pub async fn materialize_tracked_repo_projects(&self) -> Result<(), String> {
+        for repo_path in self.tracked_repo_paths().await {
+            let inspection = match self.inspect_repository_path(&repo_path, None).await {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    warn!(repo = %repo_path.display(), %error, "skipping Project backfill because repository identity resolution failed");
+                    continue;
+                }
+            };
+            self.ensure_whole_repository_project(&inspection.spec)
+                .await
+                .map_err(|error| format!("materialize whole-repository Project for {}: {error}", repo_path.display()))?;
+        }
+        Ok(())
     }
 
     async fn ensure_project_checkout(
@@ -2961,15 +3041,14 @@ impl InProcessDaemon {
         let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
         // Resolve the storage identity before publishing RepoTracked so a
         // surface can subscribe to issues{repository} immediately. The
-        // background refresh still ensures the Repository resource and
-        // reconciles observed Checkouts.
-        let repository_key = match self.inspect_repository_path(&path, None).await {
-            Ok(inspection) => Some(inspection.key()),
-            Err(error) => {
-                warn!(repo = %path.display(), %error, "repository key is unavailable while tracking repo");
-                None
-            }
-        };
+        // background refresh also reconciles the Repository resource and
+        // observed Checkouts.
+        let repository_inspection = self
+            .inspect_repository_path(&path, None)
+            .await
+            .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
+        let repository_key = Some(repository_inspection.key());
+        self.ensure_whole_repository_project(&repository_inspection.spec).await?;
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
             if tracked_identity == identity {
                 let key_became_available = {
@@ -4558,7 +4637,7 @@ impl InProcessDaemon {
             });
             let namespace = self.provisioning_namespace().await;
             let projects = self.resource_backend.clone().using::<Project>(&namespace);
-            let result = match normalize_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
+            let result = match validate_project_name(name).and_then(|_| parse_project_yaml(spec_yaml)) {
                 Ok(spec) => match normalize_project_spec(spec) {
                     Ok(spec) => {
                         let meta = InputMeta::builder().name(name.clone()).build();
