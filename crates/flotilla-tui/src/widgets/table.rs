@@ -22,9 +22,63 @@ use crate::{
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FetchTrigger {
+pub(crate) enum FetchTrigger {
     NearBottom,
     Explicit,
+}
+
+/// Reusable presentation and interaction policy for a curated table embedded
+/// in any surface. `TableWidget` adds its border and breadcrumbs; the Project
+/// page composes several panels into its one scrolling document.
+pub(crate) struct TablePanel;
+
+impl TablePanel {
+    pub(crate) fn row_action(row: &table_view::ProjectedRow) -> Option<AppAction> {
+        if let Some(target) = row.drill.clone() {
+            Some(AppAction::DrillView(target))
+        } else if let [action] = row.actions.as_slice() {
+            Some(AppAction::ExecuteTableIntent(action.intent.clone()))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn should_fetch_more(view: &TableView, state: &table_view::TableState, trigger: FetchTrigger) -> bool {
+        view.meta.has_more
+            && (trigger == FetchTrigger::Explicit || view.rows.len().saturating_sub(state.selected_index(view).unwrap_or(0) + 1) <= 5)
+    }
+
+    pub(crate) fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, view: &TableView) {
+        let header =
+            Row::new(view.columns.iter().map(|column| Cell::from(Line::from(column.label).alignment(ratatui_alignment(column.alignment)))))
+                .style(theme.header_style());
+        let widths = width_constraints(&view.columns, area.width);
+        frame.render_widget(Table::new(Vec::<Row>::new(), widths).header(header).column_spacing(1), area);
+    }
+
+    pub(crate) fn render_rows(
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        view: &TableView,
+        state: &table_view::TableState,
+        first: usize,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let rows = view.rows.iter().skip(first).take(count).map(|row| {
+            let selected = state.selected() == Some(&row.id);
+            let cells = row.cells.iter().zip(&view.columns).map(|(cell, column)| {
+                Cell::from(Line::from(cell.text.clone()).alignment(ratatui_alignment(column.alignment))).style(cell_style(cell.tone, theme))
+            });
+            let style = if selected { Style::default().bg(theme.row_highlight).add_modifier(Modifier::BOLD) } else { Style::default() };
+            Row::new(cells).style(style)
+        });
+        let widths = width_constraints(&view.columns, area.width);
+        frame.render_widget(Table::new(rows, widths).column_spacing(1), area);
+    }
 }
 
 #[derive(Default)]
@@ -66,9 +120,7 @@ impl TableWidget {
         if !view.meta.has_more {
             return;
         }
-        let selected = ctx.views.active_table_state().selected_index(view).unwrap_or(0);
-        let near_bottom = view.rows.len().saturating_sub(selected + 1) <= 5;
-        if trigger == FetchTrigger::Explicit || near_bottom {
+        if TablePanel::should_fetch_more(view, ctx.views.active_table_state(), trigger) {
             if let Some(query) = Self::demand_query(ctx) {
                 ctx.app_actions.push(AppAction::FetchMore(query));
             }
@@ -92,6 +144,9 @@ impl TableWidget {
         if view.meta.has_more {
             title.push_str(" · more available");
         }
+        if view.meta.availability == table_view::TableAvailability::Loading {
+            title.push_str(" · loading");
+        }
         if !view.meta.conditions.is_empty() {
             title.push_str(&format!(" · ⚠ {}", view.meta.conditions.join("; ")));
         }
@@ -109,31 +164,19 @@ impl TableWidget {
         self.rows_area = Rect { y: table_area.y.saturating_add(1), height: table_area.height.saturating_sub(1), ..table_area };
         state.ensure_selected_visible(view, self.rows_area.height as usize);
 
-        let header =
-            Row::new(view.columns.iter().map(|column| Cell::from(Line::from(column.label).alignment(ratatui_alignment(column.alignment)))))
-                .style(theme.header_style())
-                .height(1);
-        let rows = view.rows.iter().skip(state.scroll_offset).take(self.rows_area.height as usize).map(|row| {
-            let selected = state.selected() == Some(&row.id);
-            let cells = row.cells.iter().zip(&view.columns).map(|(cell, column)| {
-                Cell::from(Line::from(cell.text.clone()).alignment(ratatui_alignment(column.alignment))).style(cell_style(cell.tone, theme))
-            });
-            let style = if selected { Style::default().bg(theme.row_highlight).add_modifier(Modifier::BOLD) } else { Style::default() };
-            Row::new(cells).style(style)
-        });
-        let widths = width_constraints(&view.columns, table_area.width);
-        frame.render_widget(Table::new(rows, widths).header(header).column_spacing(1), table_area);
+        TablePanel::render_header(frame, Rect { height: 1, ..table_area }, theme, view);
+        TablePanel::render_rows(frame, self.rows_area, theme, view, state, state.scroll_offset, self.rows_area.height as usize);
     }
 }
 
-fn ratatui_alignment(alignment: Alignment) -> RatatuiAlignment {
+pub(crate) fn ratatui_alignment(alignment: Alignment) -> RatatuiAlignment {
     match alignment {
         Alignment::Left => RatatuiAlignment::Left,
         Alignment::Right => RatatuiAlignment::Right,
     }
 }
 
-fn width_constraints(columns: &[ProjectedColumn], available_width: u16) -> Vec<Constraint> {
+pub(crate) fn width_constraints(columns: &[ProjectedColumn], available_width: u16) -> Vec<Constraint> {
     let spacing = columns.len().saturating_sub(1) as u16;
     let minimum_width = columns.iter().fold(spacing, |total, column| {
         total.saturating_add(match column.width {
@@ -162,7 +205,7 @@ fn width_constraints(columns: &[ProjectedColumn], available_width: u16) -> Vec<C
         .collect()
 }
 
-fn cell_style(tone: CellTone, theme: &Theme) -> Style {
+pub(crate) fn cell_style(tone: CellTone, theme: &Theme) -> Style {
     let color: Color = match tone {
         CellTone::Plain => theme.text,
         CellTone::Muted => theme.muted,
@@ -205,12 +248,8 @@ impl InteractiveWidget for TableWidget {
                 Outcome::Consumed
             }
             Action::Confirm => {
-                if let Some(row) = ctx.views.active_table_state().selected_row(&view) {
-                    if let Some(target) = row.drill.clone() {
-                        ctx.app_actions.push(AppAction::DrillView(target));
-                    } else if let [action] = row.actions.as_slice() {
-                        ctx.app_actions.push(AppAction::ExecuteTableIntent(action.intent.clone()));
-                    }
+                if let Some(action) = ctx.views.active_table_state().selected_row(&view).and_then(TablePanel::row_action) {
+                    ctx.app_actions.push(action);
                 }
                 Outcome::Consumed
             }
@@ -287,8 +326,8 @@ impl InteractiveWidget for TableWidget {
         self.last_click = Some((row.id.clone(), now));
         if double_click {
             self.last_click = None;
-            if let Some(target) = &row.drill {
-                ctx.app_actions.push(AppAction::DrillView(target.clone()));
+            if let Some(action) = TablePanel::row_action(row) {
+                ctx.app_actions.push(action);
             }
         }
         Outcome::Consumed
@@ -403,7 +442,6 @@ mod tests {
         table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows {
             convoys: rows,
             independents: vec![],
-            project_issues: vec![],
             ..table_view::TableRows::default()
         })
         .expect("project snapshot table")

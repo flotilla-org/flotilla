@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use flotilla_core::config::OpenViewEntry;
 use flotilla_protocol::{RepoIdentity, RepositoryKey, ViewAddress};
 
-use crate::table_view::TableState;
+use crate::table_view::{ProjectTableState, TableState};
 
 /// What an open tab points at: a parsed View address, or the raw entry that
 /// failed to parse. A broken entry renders an error view in place — it never
@@ -27,6 +27,7 @@ pub struct OpenView {
     /// User-set label. Display-only; never part of view identity.
     pub label_override: Option<String>,
     pub table_state: TableState,
+    pub project_table_state: ProjectTableState,
     /// Addresses left behind by in-place drill navigation in this tab.
     /// History is ephemeral and deliberately not persisted.
     pub(crate) history: Vec<NavigationFrame>,
@@ -36,6 +37,7 @@ pub struct OpenView {
 pub(crate) struct NavigationFrame {
     target: ViewTarget,
     table_state: TableState,
+    project_table_state: ProjectTableState,
 }
 
 impl OpenView {
@@ -44,17 +46,52 @@ impl OpenView {
             Ok(address) => ViewTarget::View(address),
             Err(error) => ViewTarget::Broken { raw: entry.address, error },
         };
-        Self { target, label_override: entry.label, table_state: TableState::default(), history: Vec::new() }
+        Self {
+            target,
+            label_override: entry.label,
+            table_state: TableState::default(),
+            project_table_state: ProjectTableState::default(),
+            history: Vec::new(),
+        }
     }
 
     fn of(address: ViewAddress) -> Self {
-        Self { target: ViewTarget::View(address), label_override: None, table_state: TableState::default(), history: Vec::new() }
+        Self {
+            target: ViewTarget::View(address),
+            label_override: None,
+            table_state: TableState::default(),
+            project_table_state: ProjectTableState::default(),
+            history: Vec::new(),
+        }
     }
 
     pub fn address(&self) -> Option<&ViewAddress> {
         match &self.target {
             ViewTarget::View(address) => Some(address),
             ViewTarget::Broken { .. } => None,
+        }
+    }
+
+    pub fn source_search(&self) -> Option<&str> {
+        match self.address() {
+            Some(ViewAddress::Project { .. }) => self.project_table_state.issue_source_search(),
+            _ => self.table_state.source_search.as_deref(),
+        }
+    }
+
+    fn focused_table_state(&self) -> &TableState {
+        match self.address() {
+            Some(ViewAddress::Project { .. }) => self.project_table_state.active_table(),
+            _ => &self.table_state,
+        }
+    }
+
+    fn focused_table_state_mut(&mut self) -> &mut TableState {
+        let is_project = matches!(self.address(), Some(ViewAddress::Project { .. }));
+        if is_project {
+            self.project_table_state.active_table_mut()
+        } else {
+            &mut self.table_state
         }
     }
 
@@ -234,6 +271,7 @@ impl OpenViews {
         let Some(frame) = view.history.pop() else { return false };
         view.target = frame.target;
         view.table_state = frame.table_state;
+        view.project_table_state = frame.project_table_state;
         true
     }
 
@@ -250,6 +288,7 @@ impl OpenViews {
         let previous = NavigationFrame {
             target: std::mem::replace(&mut view.target, ViewTarget::View(address)),
             table_state: std::mem::take(&mut view.table_state),
+            project_table_state: std::mem::take(&mut view.project_table_state),
         };
         view.history.push(previous);
         true
@@ -292,11 +331,23 @@ impl OpenViews {
     }
 
     pub fn active_table_state(&self) -> &TableState {
-        &self.active().table_state
+        self.active().focused_table_state()
     }
 
     pub fn active_table_state_mut(&mut self) -> &mut TableState {
-        &mut self.active_mut().table_state
+        self.active_mut().focused_table_state_mut()
+    }
+
+    pub fn active_project_table_state(&self) -> &ProjectTableState {
+        &self.active().project_table_state
+    }
+
+    pub fn active_project_table_state_mut(&mut self) -> &mut ProjectTableState {
+        &mut self.active_mut().project_table_state
+    }
+
+    pub fn active_source_search(&self) -> Option<&str> {
+        self.active().source_search()
     }
 
     /// The active View's address, if the active tab isn't broken.
