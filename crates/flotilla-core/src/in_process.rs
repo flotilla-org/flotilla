@@ -2872,10 +2872,13 @@ impl InProcessDaemon {
 
     pub async fn materialize_tracked_repo_projects(&self) -> Result<(), String> {
         for repo_path in self.tracked_repo_paths().await {
-            let inspection = self
-                .inspect_repository_path(&repo_path, None)
-                .await
-                .map_err(|error| format!("inspect tracked repository {} for Project materialization: {error}", repo_path.display()))?;
+            let inspection = match self.inspect_repository_path(&repo_path, None).await {
+                Ok(inspection) => inspection,
+                Err(error) => {
+                    warn!(repo = %repo_path.display(), %error, "skipping Project backfill because repository identity resolution failed");
+                    continue;
+                }
+            };
             self.ensure_whole_repository_project(&inspection.spec)
                 .await
                 .map_err(|error| format!("materialize whole-repository Project for {}: {error}", repo_path.display()))?;
@@ -3025,7 +3028,7 @@ impl InProcessDaemon {
         let repository_inspection = self
             .inspect_repository_path(&path, None)
             .await
-            .map_err(|error| format!("inspect repository {} for Project materialization: {error}", path.display()))?;
+            .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
         let repository_key = Some(repository_inspection.key());
         self.ensure_whole_repository_project(&repository_inspection.spec).await?;
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {

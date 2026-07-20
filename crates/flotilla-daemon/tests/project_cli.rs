@@ -212,7 +212,7 @@ async fn daemon_start_backfills_project_idempotently_and_preserves_edits() {
 }
 
 #[tokio::test]
-async fn daemon_start_fails_when_a_tracked_repo_cannot_be_backfilled() {
+async fn daemon_start_skips_a_tracked_repo_that_cannot_be_backfilled() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let checkout_path = tmp.path().join("uninspectable");
@@ -223,22 +223,17 @@ async fn daemon_start_fails_when_a_tracked_repo_cannot_be_backfilled() {
         Arc::clone(&config),
         fake_discovery(false),
         HostName::new("local"),
-        backend,
+        backend.clone(),
     )
     .await;
     daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
 
-    let error = match DaemonRuntime::start_with_options(daemon, config, None, RuntimeOptions {
-        start_controllers: false,
-        ..RuntimeOptions::default()
-    })
-    .await
-    {
-        Ok(_) => panic!("runtime start should fail"),
-        Err(error) => error,
-    };
+    let _runtime =
+        DaemonRuntime::start_with_options(daemon, config, None, RuntimeOptions { start_controllers: false, ..RuntimeOptions::default() })
+            .await
+            .expect("runtime should skip the uninspectable repository");
 
-    assert!(error.contains("cannot inspect"));
+    assert!(backend.using::<Project>("flotilla").list().await.expect("project list").items.is_empty());
 }
 
 #[tokio::test]

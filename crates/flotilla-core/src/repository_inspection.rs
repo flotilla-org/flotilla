@@ -141,6 +141,8 @@ impl RepositoryInspector for GitRepositoryInspector {
         let top_level = PathBuf::from(self.git(&path, &["rev-parse", "--show-toplevel"]).await?);
         let top_level = std::fs::canonicalize(&top_level)
             .map_err(|error| format!("repository root {} cannot be resolved: {error}", top_level.display()))?;
+        // `rev-parse HEAD` can fail before the first commit, while the symbolic
+        // ref still exposes the initial branch name.
         let branch = match self.git(&top_level, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
             Ok(branch) => branch,
             Err(_) => self.git(&top_level, &["symbolic-ref", "--short", "HEAD"]).await?,
