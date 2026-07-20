@@ -22,7 +22,7 @@ impl RowId {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct TableState {
     selected: Option<RowId>,
     pub filter: String,
@@ -287,9 +287,15 @@ pub struct TableRows<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
     pub independents: Vec<&'a IndependentRow>,
     pub project_issues: Vec<(&'a str, &'a str, &'a IssueRow)>,
-    pub issue_results: Vec<(&'a QueryId, &'a [IssueRow], &'a ResultSetState)>,
-    pub checkout_results: Vec<(&'a QueryId, &'a [CheckoutRow], &'a ResultSetState)>,
+    pub issue_results: Vec<QueryRows<'a, IssueRow>>,
+    pub checkout_results: Vec<QueryRows<'a, CheckoutRow>>,
     pub source_search: Option<&'a str>,
+}
+
+pub struct QueryRows<'a, R> {
+    pub query: &'a QueryId,
+    pub rows: &'a [R],
+    pub state: &'a ResultSetState,
 }
 
 /// Query identity owned by a single-family table address. Composite Views
@@ -364,30 +370,30 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
         }
         ViewAddress::Issues { scope } => {
             let query = query_for(address, data.source_search).expect("issues address has a query");
-            let (_, rows, state) = data
+            let result = data
                 .issue_results
                 .iter()
-                .find(|(candidate, _, _)| **candidate == query)
+                .find(|result| *result.query == query)
                 .ok_or_else(|| format!("result set not available: {query}"))?;
             let mut view = issue_spec().project(
                 format!("Issues · {}/{}", scope.namespace, scope.name),
-                rows.iter().cloned().map(|row| ScopedIssueProjection { scope: scope.clone(), row }),
+                result.rows.iter().cloned().map(|row| ScopedIssueProjection { scope: scope.clone(), row }),
             );
-            view.meta = result_set_meta(state);
+            view.meta = result_set_meta(result.state);
             Ok(view)
         }
         ViewAddress::Checkouts { scope } => {
             let query = query_for(address, data.source_search).expect("checkouts address has a query");
-            let (_, rows, state) = data
+            let result = data
                 .checkout_results
                 .iter()
-                .find(|(candidate, _, _)| **candidate == query)
+                .find(|result| *result.query == query)
                 .ok_or_else(|| format!("result set not available: {query}"))?;
             let title = scope
                 .as_ref()
                 .map_or_else(|| "Checkouts · fleet".to_string(), |scope| format!("Checkouts · {}/{}", scope.namespace, scope.name));
-            let mut view = checkout_spec().project(title, rows.iter().cloned());
-            view.meta = result_set_meta(state);
+            let mut view = checkout_spec().project(title, result.rows.iter().cloned());
+            view.meta = result_set_meta(result.state);
             Ok(view)
         }
         ViewAddress::Overview | ViewAddress::Repo { .. } => Err(format!("view is not table-backed: {address}")),
@@ -1126,7 +1132,7 @@ mod tests {
             convoys: vec![],
             independents: vec![],
             project_issues: vec![],
-            issue_results: vec![(&query, std::slice::from_ref(&row), &state)],
+            issue_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
             ..TableRows::default()
         })
         .expect("scoped issue table");
@@ -1156,7 +1162,7 @@ mod tests {
         let query = QueryId::Checkouts { scope: None };
         let state = ResultSetState::default();
         let view = project(&ViewAddress::Checkouts { scope: None }, &TableRows {
-            checkout_results: vec![(&query, std::slice::from_ref(&row), &state)],
+            checkout_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
             ..TableRows::default()
         })
         .expect("checkout table");

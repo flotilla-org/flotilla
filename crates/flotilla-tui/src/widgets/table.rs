@@ -21,6 +21,12 @@ use crate::{
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchTrigger {
+    NearBottom,
+    Explicit,
+}
+
 #[derive(Default)]
 pub struct TableWidget {
     rows_area: Rect,
@@ -56,13 +62,13 @@ impl TableWidget {
         table_view::query_for(address, ctx.views.active_table_state().source_search.as_deref())
     }
 
-    fn request_more_if_needed(view: &TableView, ctx: &mut WidgetContext<'_>, force: bool) {
+    fn request_more_if_needed(view: &TableView, ctx: &mut WidgetContext<'_>, trigger: FetchTrigger) {
         if !view.meta.has_more {
             return;
         }
         let selected = ctx.views.active_table_state().selected_index(view).unwrap_or(0);
         let near_bottom = view.rows.len().saturating_sub(selected + 1) <= 5;
-        if force || near_bottom {
+        if trigger == FetchTrigger::Explicit || near_bottom {
             if let Some(query) = Self::demand_query(ctx) {
                 ctx.app_actions.push(AppAction::FetchMore(query));
             }
@@ -191,7 +197,7 @@ impl InteractiveWidget for TableWidget {
         match action {
             Action::SelectNext => {
                 ctx.views.active_table_state_mut().select_delta(&view, 1);
-                Self::request_more_if_needed(&view, ctx, false);
+                Self::request_more_if_needed(&view, ctx, FetchTrigger::NearBottom);
                 Outcome::Consumed
             }
             Action::SelectPrev => {
@@ -213,7 +219,7 @@ impl InteractiveWidget for TableWidget {
                 Outcome::Consumed
             }
             Action::FetchMore => {
-                Self::request_more_if_needed(&view, ctx, true);
+                Self::request_more_if_needed(&view, ctx, FetchTrigger::Explicit);
                 Outcome::Consumed
             }
             Action::Describe => match ctx.views.active_table_state().selected_row(&view) {
@@ -243,7 +249,7 @@ impl InteractiveWidget for TableWidget {
                     return Outcome::Ignored;
                 }
                 ctx.views.active_table_state_mut().select_delta(&view, 1);
-                Self::request_more_if_needed(&view, ctx, false);
+                Self::request_more_if_needed(&view, ctx, FetchTrigger::NearBottom);
                 return Outcome::Consumed;
             }
             MouseEventKind::ScrollUp => {
@@ -262,7 +268,7 @@ impl InteractiveWidget for TableWidget {
         };
         let index = ctx.views.active_table_state().scroll_offset + visible_index;
         ctx.views.active_table_state_mut().select_index(&view, index);
-        Self::request_more_if_needed(&view, ctx, false);
+        Self::request_more_if_needed(&view, ctx, FetchTrigger::NearBottom);
         let row = &view.rows[index];
         if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
             return if row.actions.is_empty() {
@@ -463,7 +469,7 @@ mod tests {
             }],
         };
         let view = table_view::project(&"issues?project=flotilla%2Froadmap".parse().expect("address"), &table_view::TableRows {
-            issue_results: vec![(&query, std::slice::from_ref(&row), &state)],
+            issue_results: vec![table_view::QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
             ..table_view::TableRows::default()
         })
         .expect("issue table");

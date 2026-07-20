@@ -304,6 +304,31 @@ impl<R> Default for QueryTableResult<R> {
     }
 }
 
+impl<R: Clone> QueryTableResult<R> {
+    fn apply_delta<K: Eq>(
+        &mut self,
+        changed: &[R],
+        removed: &[K],
+        state: Option<&flotilla_protocol::ResultSetState>,
+        key: impl Fn(&R) -> K,
+        compare: impl FnMut(&R, &R) -> std::cmp::Ordering,
+    ) {
+        self.rows.retain(|row| !removed.contains(&key(row)));
+        for changed_row in changed {
+            let changed_key = key(changed_row);
+            if let Some(existing) = self.rows.iter_mut().find(|row| key(row) == changed_key) {
+                *existing = changed_row.clone();
+            } else {
+                self.rows.push(changed_row.clone());
+            }
+        }
+        self.rows.sort_by(compare);
+        if let Some(state) = state {
+            self.state = state.clone();
+        }
+    }
+}
+
 pub fn table_rows<'a>(
     namespaces: &'a NamespaceMap,
     queries: &'a QueryTableCache,
@@ -321,8 +346,16 @@ pub fn table_rows<'a>(
                     .flat_map(move |(project, rows)| rows.iter().map(move |row| (namespace.as_str(), project.as_str(), row)))
             })
             .collect(),
-        issue_results: queries.issues.iter().map(|(query, result)| (query, result.rows.as_slice(), &result.state)).collect(),
-        checkout_results: queries.checkouts.iter().map(|(query, result)| (query, result.rows.as_slice(), &result.state)).collect(),
+        issue_results: queries
+            .issues
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
+        checkout_results: queries
+            .checkouts
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
         source_search,
     }
 }
@@ -1379,40 +1412,26 @@ impl App {
                     }
                     flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
                         let result = self.query_tables.issues.entry(query.clone()).or_default();
-                        let rows = &mut result.rows;
-                        rows.retain(|row| !removed.contains(&row.reference));
-                        for changed in changed {
-                            if let Some(existing) = rows.iter_mut().find(|row| row.reference == changed.reference) {
-                                *existing = changed.clone();
-                            } else {
-                                rows.push(changed.clone());
-                            }
-                        }
-                        rows.sort_by(|left, right| {
-                            right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference))
-                        });
-                        if let Some(state) = &delta.state {
-                            result.state = state.clone();
-                        }
+                        result.apply_delta(
+                            changed,
+                            removed,
+                            delta.state.as_ref(),
+                            |row| row.reference.clone(),
+                            |left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)),
+                        );
                         self.sync_project_issue_rows(&query);
                     }
                     flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
                         let result = self.query_tables.checkouts.entry(query).or_default();
-                        let rows = &mut result.rows;
-                        rows.retain(|row| !removed.contains(&row.resource));
-                        for changed in changed {
-                            if let Some(existing) = rows.iter_mut().find(|row| row.resource == changed.resource) {
-                                *existing = changed.clone();
-                            } else {
-                                rows.push(changed.clone());
-                            }
-                        }
-                        rows.sort_by(|left, right| {
-                            (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
-                        });
-                        if let Some(state) = &delta.state {
-                            result.state = state.clone();
-                        }
+                        result.apply_delta(
+                            changed,
+                            removed,
+                            delta.state.as_ref(),
+                            |row| row.resource.clone(),
+                            |left, right| {
+                                (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
+                            },
+                        );
                     }
                 }
             }
