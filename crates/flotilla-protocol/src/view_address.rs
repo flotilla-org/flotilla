@@ -150,8 +150,8 @@ impl FromStr for ViewAddress {
         if segments.iter().any(|seg| seg.is_empty()) {
             return Err(format!("view address has an empty segment: {s}"));
         }
-        let kind = segments[0].to_ascii_lowercase();
-        let address = match kind.as_str() {
+        let kind = segments[0];
+        let address = match kind {
             "overview" => match segments.len() {
                 1 => Ok(Self::Overview),
                 _ => Err(format!("overview takes no parameters: {s}")),
@@ -178,14 +178,14 @@ impl FromStr for ViewAddress {
                 [namespace, name] => Ok(Self::Project { namespace: decode(namespace)?, name: decode(name)? }),
                 _ => Err(format!("project takes exactly two parameters (namespace, name): {s}")),
             },
-            "issues" => match segments.len() {
+            kind if kind.eq_ignore_ascii_case("issues") => match segments.len() {
                 1 => {
                     let value = parameters.remove("project").ok_or_else(|| "issues requires a project parameter".to_string())?;
                     Ok(Self::Issues { scope: parse_project_scope(value)? })
                 }
                 _ => Err(format!("issues takes no positional parameters: {s}")),
             },
-            "checkouts" => match segments.len() {
+            kind if kind.eq_ignore_ascii_case("checkouts") => match segments.len() {
                 1 => {
                     let scope = parameters.remove("project").map(parse_project_scope).transpose()?;
                     Ok(Self::Checkouts { scope })
@@ -211,6 +211,8 @@ impl FromStr for ViewAddress {
 
 fn parse_project_scope(value: &str) -> Result<QueryScope, String> {
     let decoded = decode(value)?;
+    // Project resource namespace/name components cannot contain `/`, so the
+    // single decoded separator is unambiguous.
     let Some((namespace, name)) = decoded.split_once('/') else {
         return Err(format!("project scope must be <namespace>/<name>: {decoded}"));
     };
@@ -289,6 +291,16 @@ mod tests {
         let reserved = ViewAddress::Issues { scope: QueryScope::new("flotilla+platform", "road map") };
         assert_eq!(reserved.to_string(), "issues?project=flotilla%2Bplatform%2Froad%20map");
         assert_eq!(reserved.to_string().parse::<ViewAddress>().expect("parse reserved characters"), reserved);
+    }
+
+    #[test]
+    fn case_insensitive_family_parsing_is_limited_to_the_new_query_families() {
+        assert_eq!(
+            "ISSUES?project=flotilla%2Froadmap".parse::<ViewAddress>().expect("parse issues").to_string(),
+            "issues?project=flotilla%2Froadmap"
+        );
+        assert!("OVERVIEW".parse::<ViewAddress>().is_err());
+        assert!("REPO/github.com/flotilla-org/flotilla".parse::<ViewAddress>().is_err());
     }
 
     #[test]

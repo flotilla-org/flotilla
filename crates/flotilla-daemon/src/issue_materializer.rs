@@ -421,6 +421,7 @@ async fn refresh_window(
     sort_rows(&mut changed);
     let mut removed = removed.into_iter().collect::<Vec<_>>();
     removed.sort();
+    window.conditions = conditions.clone();
     let result_state = demand_state(window.sources.iter().any(|source| source.has_more), conditions);
     if let Some(delta) = state.apply_issue_changes(query, generation, changed, removed, result_state) {
         let _ = event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
@@ -547,6 +548,10 @@ mod tests {
         pages: Mutex<VecDeque<IssueResultPage>>,
     }
 
+    struct RefreshUnavailableProvider {
+        pages: Mutex<VecDeque<IssueResultPage>>,
+    }
+
     #[async_trait]
     impl IssueProvider for PartiallyUnavailableProvider {
         fn supports(&self, _source: &IssueSource) -> bool {
@@ -570,6 +575,33 @@ mod tests {
 
         async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
             Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+        }
+
+        async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+            unreachable!("not used by materialization")
+        }
+    }
+
+    #[async_trait]
+    impl IssueProvider for RefreshUnavailableProvider {
+        fn supports(&self, _source: &IssueSource) -> bool {
+            true
+        }
+
+        async fn query(&self, source: &IssueSource, _params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
+            let mut page = self.pages.lock().await.pop_front().expect("scripted page");
+            for issue in &mut page.items {
+                issue.reference.source = source.clone();
+            }
+            Ok(page)
+        }
+
+        async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+            unreachable!("not used by materialization")
+        }
+
+        async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+            Err("source unavailable during refresh".into())
         }
 
         async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
@@ -766,6 +798,31 @@ mod tests {
         assert!(delta.state.expect("state replacement").conditions.iter().any(|condition| matches!(
             condition,
             ResultSetCondition::IssueSourceUnavailable { source: Some(source), .. } if source == &unavailable_source
+        )));
+    }
+
+    #[tokio::test]
+    async fn fetch_more_preserves_a_condition_discovered_by_incremental_refresh() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("refresh-unavailable");
+        let source = IssueSource { service: "https://issues.example".into(), scope: "refresh-unavailable".into() };
+        let provider =
+            Arc::new(RefreshUnavailableProvider { pages: Mutex::new(VecDeque::from([page(&["FIRST"], true), page(&["SECOND"], false)])) });
+        let (materializer, mut events) = manager(&state, &query, vec![source.clone()], provider);
+        let _ = next_event(&mut events).await;
+
+        materializer.refresh(&query);
+        let DaemonEvent::ResultDelta(refresh_delta) = next_event(&mut events).await else { panic!("refresh must emit a delta") };
+        assert!(refresh_delta.state.expect("state replacement").conditions.iter().any(|condition| matches!(
+            condition,
+            ResultSetCondition::IssueSourceUnavailable { source: Some(condition_source), .. } if condition_source == &source
+        )));
+
+        materializer.fetch_more(&query, generation(&state, &query));
+        let DaemonEvent::ResultDelta(fetch_delta) = next_event(&mut events).await else { panic!("fetch-more must emit a delta") };
+        assert!(fetch_delta.state.expect("state replacement").conditions.iter().any(|condition| matches!(
+            condition,
+            ResultSetCondition::IssueSourceUnavailable { source: Some(condition_source), .. } if condition_source == &source
         )));
     }
 

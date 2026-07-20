@@ -46,8 +46,7 @@ pub enum QueryId {
 /// The Project scope owned by a curated query family. Repository membership
 /// expansion is an Aggregator implementation detail and never crosses the
 /// client protocol.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, bon::Builder)]
-#[builder(on(String, into))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryScope {
     pub namespace: String,
     pub name: String,
