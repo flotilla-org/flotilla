@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::{ProviderError, WorkItem},
-    EnvironmentInfo, HostName, HostSummary, NodeInfo, PeerConnectionState,
+    EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress,
 };
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
@@ -116,6 +116,76 @@ pub struct RepoWorkResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
     pub work_items: Vec<WorkItem>,
+}
+
+// --- project list ---
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectListResponse {
+    pub projects: Vec<ProjectListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ProjectListEntry {
+    pub namespace: String,
+    pub name: String,
+    pub display_name: String,
+    pub address: ViewAddress,
+    pub repository_count: usize,
+    pub repositories: Vec<ProjectListRepository>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_source: Option<IssueSource>,
+    pub default_workflow_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectListRepository {
+    pub key: RepositoryKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+}
+
+#[cfg(test)]
+mod project_list_tests {
+    use serde_json::json;
+
+    use super::{ProjectListEntry, ProjectListRepository, ProjectListResponse};
+    use crate::{IssueSource, RepositoryKey, ViewAddress};
+
+    #[test]
+    fn project_list_json_is_stable_and_typed() {
+        let response = ProjectListResponse {
+            projects: vec![ProjectListEntry::builder()
+                .namespace("flotilla".to_string())
+                .name("platform".to_string())
+                .display_name("Platform".to_string())
+                .address(ViewAddress::Project { namespace: "flotilla".into(), name: "platform".into() })
+                .repository_count(1)
+                .repositories(vec![ProjectListRepository {
+                    key: RepositoryKey("repo-key".into()),
+                    slug: Some("flotilla-org/flotilla".into()),
+                }])
+                .maybe_issue_source(Some(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }))
+                .default_workflow_ref("single-agent-contained".to_string())
+                .build()],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize"),
+            json!({
+                "projects": [{
+                    "namespace": "flotilla",
+                    "name": "platform",
+                    "display_name": "Platform",
+                    "address": "project/flotilla/platform",
+                    "repository_count": 1,
+                    "repositories": [{"key": "repo-key", "slug": "flotilla-org/flotilla"}],
+                    "issue_source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"},
+                    "default_workflow_ref": "single-agent-contained"
+                }]
+            })
+        );
+    }
 }
 
 // --- fleet listing / replicas ---

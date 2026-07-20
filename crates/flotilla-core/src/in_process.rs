@@ -21,9 +21,10 @@ use flotilla_protocol::{
     result_set::{ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
     FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProviderData, ProviderInfo, QueryCursor,
-    RepoDelta, RepoDetailResponse, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand,
-    StatusResponse, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProjectListEntry, ProjectListRepository,
+    ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoInfo, RepoProvidersResponse,
+    RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse, StreamKey, SystemInfo, ToolInventory,
+    TopologyResponse, TopologyRoute, ViewAddress,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
@@ -3300,6 +3301,43 @@ impl InProcessDaemon {
         Ok(self.host_registry.list_hosts(&counts).await)
     }
 
+    pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
+        let namespace = self.provisioning_namespace().await;
+        let projects = self.resource_backend.clone().using::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let repository_slugs = repositories
+            .items
+            .into_iter()
+            .map(|repository| (RepositoryKey(repository.metadata.name), repository.spec.catalog_slug()))
+            .collect::<HashMap<_, _>>();
+
+        let mut entries = projects
+            .items
+            .into_iter()
+            .map(|project| {
+                let mut repository_keys = project.spec.repositories.into_iter().map(|repository| repository.repo).collect::<Vec<_>>();
+                repository_keys.sort();
+                repository_keys.dedup();
+                let repositories = repository_keys
+                    .into_iter()
+                    .map(|key| ProjectListRepository { slug: repository_slugs.get(&key).cloned(), key })
+                    .collect::<Vec<_>>();
+                ProjectListEntry::builder()
+                    .namespace(project.metadata.namespace.clone())
+                    .name(project.metadata.name.clone())
+                    .display_name(project.spec.display_name)
+                    .address(ViewAddress::Project { namespace: project.metadata.namespace, name: project.metadata.name })
+                    .repository_count(repositories.len())
+                    .repositories(repositories)
+                    .maybe_issue_source(project.spec.issue_source)
+                    .default_workflow_ref(project.spec.default_workflow_ref)
+                    .build()
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+        Ok(ProjectListResponse { projects: entries })
+    }
+
     pub async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String> {
         let local_summary = self.refresh_local_host_summary().await;
         let mut counts = self.local_host_counts().await;
@@ -4991,6 +5029,10 @@ impl DaemonHandle for InProcessDaemon {
             },
             CommandAction::QueryHostList {} => match self.list_hosts_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::HostList(Box::new(v))),
+                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryProjectList {} => match self.list_projects_internal().await {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::ProjectList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryHostStatus { target_environment_id } => match self.get_host_status_internal(target_environment_id).await {

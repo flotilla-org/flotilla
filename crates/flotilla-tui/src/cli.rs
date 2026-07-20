@@ -4,8 +4,8 @@ use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     output::OutputFormat, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, FleetListResponse,
-    FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo, PeerConnectionState, RepoDetailResponse, RepoProvidersResponse,
-    RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
+    FleetStaleness, HostProvidersResponse, HostStatusResponse, NodeInfo, PeerConnectionState, ProjectListResponse, RepoDetailResponse,
+    RepoProvidersResponse, RepoWorkResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -145,6 +145,42 @@ fn format_host_list_human(response: &flotilla_protocol::HostListResponse) -> Str
             Cell::new(if host.has_summary { "yes" } else { "no" }),
             Cell::new(host.repo_count),
             Cell::new(host.work_item_count),
+        ]);
+    }
+    format!("{table}\n")
+}
+
+fn format_project_list_human(response: &ProjectListResponse) -> String {
+    if response.projects.is_empty() {
+        return "No projects known.\n".into();
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Project", "Display Name", "Repositories", "Issue Source", "Workflow", "Address"]);
+    for project in &response.projects {
+        let repositories = if project.repository_count <= 3 {
+            project
+                .repositories
+                .iter()
+                .map(|repository| repository.slug.as_deref().unwrap_or(&repository.key.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!("{} repositories", project.repository_count)
+        };
+        let issue_source = project
+            .issue_source
+            .as_ref()
+            .map(|source| format!("{}/{}", source.service.trim_end_matches('/'), source.scope))
+            .unwrap_or_else(|| "-".to_string());
+        table.add_row(vec![
+            Cell::new(format!("{}/{}", project.namespace, project.name)),
+            Cell::new(&project.display_name),
+            Cell::new(repositories),
+            Cell::new(issue_source),
+            Cell::new(&project.default_workflow_ref),
+            Cell::new(project.address.to_string()),
         ]);
     }
     format!("{table}\n")
@@ -384,6 +420,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
         CommandValue::RepoWork(work) => format_repo_work_human(work),
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
+        CommandValue::ProjectList(projects) => format_project_list_human(projects),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),

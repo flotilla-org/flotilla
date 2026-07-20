@@ -82,6 +82,73 @@ fn project_target_syntax_disambiguates_paths_and_qualified_slugs() {
     assert_eq!(project_target_syntax("repo"), ProjectTargetSyntax::Ambiguous);
 }
 
+#[tokio::test]
+async fn project_list_query_returns_all_projects_with_addresses_and_repository_slugs() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
+    let cleat = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository");
+    for repository in [&flotilla, &cleat] {
+        repositories.create(&empty_input_meta(&repository.key().to_string()), repository).await.expect("repository create should succeed");
+    }
+
+    let projects = backend.using::<Project>("flotilla");
+    projects
+        .create(
+            &empty_input_meta("suite"),
+            &ProjectSpec::builder()
+                .display_name("Flotilla Suite".to_string())
+                .default_workflow_ref("review-and-fix".to_string())
+                .maybe_issue_source(Some(flotilla_protocol::IssueSource { service: "https://linear.app".into(), scope: "FLOT".into() }))
+                .repositories(vec![
+                    ProjectRepositorySpec::builder().repo(flotilla.key()).maybe_subpath(Some("crates/flotilla-core".to_string())).build(),
+                    ProjectRepositorySpec::builder().repo(cleat.key()).build(),
+                    ProjectRepositorySpec::builder().repo(flotilla.key()).maybe_subpath(Some("crates/flotilla-tui".to_string())).build(),
+                ])
+                .build(),
+        )
+        .await
+        .expect("suite project create should succeed");
+    projects
+        .create(
+            &empty_input_meta("cleat"),
+            &ProjectSpec::builder()
+                .display_name("cleat".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
+                .repositories(vec![ProjectRepositorySpec::builder().repo(cleat.key()).build()])
+                .build(),
+        )
+        .await
+        .expect("whole-repository project create should succeed");
+
+    let result = daemon
+        .execute_query(
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("project list query should succeed");
+    let CommandValue::ProjectList(response) = result else { panic!("expected project list response") };
+
+    assert_eq!(response.projects.iter().map(|project| project.name.as_str()).collect::<Vec<_>>(), vec!["cleat", "suite"]);
+    assert_eq!(response.projects[0].address.to_string(), "project/flotilla/cleat");
+    assert_eq!(response.projects[0].repository_count, 1);
+    assert_eq!(response.projects[0].repositories[0].slug.as_deref(), Some("github-com-flotilla-org-cleat"));
+    assert_eq!(response.projects[1].repository_count, 2, "repository slices should count as one repository");
+    assert_eq!(response.projects[1].repositories.iter().filter_map(|repository| repository.slug.as_deref()).collect::<Vec<_>>(), vec![
+        "github-com-flotilla-org-cleat",
+        "github-com-flotilla-org-flotilla"
+    ]);
+    assert_eq!(response.projects[1].issue_source.as_ref().map(|source| source.scope.as_str()), Some("FLOT"));
+    assert_eq!(response.projects[1].default_workflow_ref, "review-and-fix");
+}
+
 fn convoy_row(namespace: &str, name: &str, phase: WireConvoyPhase, message: Option<&str>) -> ConvoyRow {
     ConvoyRow::builder()
         .resource(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name))

@@ -214,6 +214,54 @@ mod status_human {
     }
 }
 
+mod project_list_human {
+    use flotilla_protocol::{IssueSource, ProjectListEntry, ProjectListRepository, ProjectListResponse, RepositoryKey, ViewAddress};
+
+    use crate::cli::format_project_list_human;
+
+    fn repository(name: &str) -> ProjectListRepository {
+        ProjectListRepository { key: RepositoryKey(format!("key-{name}")), slug: Some(name.to_string()) }
+    }
+
+    #[test]
+    fn empty_project_list_has_a_clear_message() {
+        assert_eq!(format_project_list_human(&ProjectListResponse { projects: vec![] }), "No projects known.\n");
+    }
+
+    #[test]
+    fn project_list_shows_addresses_slugs_and_configuration() {
+        let few = ProjectListEntry::builder()
+            .namespace("flotilla".to_string())
+            .name("suite".to_string())
+            .display_name("Flotilla Suite".to_string())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: "suite".into() })
+            .repository_count(2)
+            .repositories(vec![repository("flotilla-org/cleat"), repository("flotilla-org/flotilla")])
+            .maybe_issue_source(Some(IssueSource { service: "https://linear.app".into(), scope: "FLOT".into() }))
+            .default_workflow_ref("review-and-fix".to_string())
+            .build();
+        let many = ProjectListEntry::builder()
+            .namespace("flotilla".to_string())
+            .name("portfolio".to_string())
+            .display_name("Portfolio".to_string())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: "portfolio".into() })
+            .repository_count(4)
+            .repositories(vec![repository("one"), repository("two"), repository("three"), repository("four")])
+            .maybe_issue_source(None)
+            .default_workflow_ref("single-agent-contained".to_string())
+            .build();
+
+        let output = format_project_list_human(&ProjectListResponse { projects: vec![few, many] });
+        assert!(output.contains("flotilla/suite"));
+        assert!(output.contains("project/flotilla/suite"));
+        assert!(output.contains("flotilla-org/cleat, flotilla-org/flotilla"));
+        assert!(output.contains("https://linear.app/FLOT"));
+        assert!(output.contains("review-and-fix"));
+        assert!(output.contains("4 repositories"));
+        assert!(!output.contains("one, two, three, four"));
+    }
+}
+
 mod watch_human {
     use std::path::PathBuf;
 
