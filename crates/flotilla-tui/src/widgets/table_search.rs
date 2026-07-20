@@ -19,15 +19,16 @@ pub enum TableSearchKind {
 pub struct TableSearchWidget {
     kind: TableSearchKind,
     input: Input,
+    prefix: String,
 }
 
 impl TableSearchWidget {
     pub fn local(current: &str) -> Self {
-        Self { kind: TableSearchKind::Local, input: Input::from(current) }
+        Self { kind: TableSearchKind::Local, input: Input::from(current), prefix: "FILTER ".into() }
     }
 
-    pub fn source(current: Option<&str>) -> Self {
-        Self { kind: TableSearchKind::Source, input: Input::from(current.unwrap_or_default()) }
+    pub fn source(current: Option<&str>, source: &str) -> Self {
+        Self { kind: TableSearchKind::Source, input: Input::from(current.unwrap_or_default()), prefix: format!("SEARCH {source} ") }
     }
 }
 
@@ -61,11 +62,7 @@ impl InteractiveWidget for TableSearchWidget {
     }
 
     fn status_fragment(&self) -> StatusFragment {
-        let prefix = match self.kind {
-            TableSearchKind::Local => "FILTER ",
-            TableSearchKind::Source => "SEARCH SOURCE ",
-        };
-        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: prefix.into(), text: self.input.value().to_string() }) }
+        StatusFragment { status: Some(StatusContent::ActiveInput { prefix: self.prefix.clone(), text: self.input.value().to_string() }) }
     }
 
     fn captures_raw_keys(&self) -> bool {
@@ -78,5 +75,21 @@ impl InteractiveWidget for TableSearchWidget {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_search_status_identifies_the_source() {
+        let widget = TableSearchWidget::source(Some("needs triage"), "flotilla/roadmap");
+
+        let Some(StatusContent::ActiveInput { prefix, text }) = widget.status_fragment().status else {
+            panic!("source search should display an active input status");
+        };
+        assert_eq!(prefix, "SEARCH flotilla/roadmap ");
+        assert_eq!(text, "needs triage");
     }
 }

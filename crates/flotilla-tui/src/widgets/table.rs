@@ -53,9 +53,7 @@ impl TableWidget {
 
     fn demand_query(ctx: &WidgetContext<'_>) -> Option<flotilla_protocol::QueryId> {
         let address = ctx.views.active_address()?;
-        crate::app::view_kind::queries(address, ctx.views.active_table_state().source_search.as_deref())
-            .into_iter()
-            .find(|query| matches!(query, flotilla_protocol::QueryId::Issues { .. } | flotilla_protocol::QueryId::Checkouts { .. }))
+        table_view::query_for(address, ctx.views.active_table_state().source_search.as_deref())
     }
 
     fn request_more_if_needed(view: &TableView, ctx: &mut WidgetContext<'_>, force: bool) {
@@ -179,9 +177,10 @@ impl InteractiveWidget for TableWidget {
             return Outcome::Push(Box::new(super::table_search::TableSearchWidget::local(&ctx.views.active_table_state().filter)));
         }
         if action == Action::OpenSourceSearch {
-            if matches!(ctx.views.active_address(), Some(flotilla_protocol::ViewAddress::Issues { .. })) {
+            if let Some(flotilla_protocol::ViewAddress::Issues { scope }) = ctx.views.active_address() {
                 return Outcome::Push(Box::new(super::table_search::TableSearchWidget::source(
                     ctx.views.active_table_state().source_search.as_deref(),
+                    &format!("{}/{}", scope.namespace, scope.name),
                 )));
             }
             ctx.app_actions.push(AppAction::ShowStatus("Source search is only available for issue tables".into()));
@@ -444,6 +443,41 @@ mod tests {
                 widget.render_table(frame, frame.area(), &Theme::classic(), &snapshot_view(), &mut state, &["convoys/dev".into()]);
             })
             .expect("draw");
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn scoped_issue_metadata_and_condition_snapshot() {
+        let issue = flotilla_protocol::test_support::TestIssue::new("Fix pagination").id("ENG-42").build();
+        let row = flotilla_protocol::IssueRow { reference: issue.reference.clone(), issue };
+        let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+        let query = flotilla_protocol::QueryId::Issues { scope, search: None };
+        let state = flotilla_protocol::ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata {
+                as_of: "2026-07-20T12:00:00Z".parse().expect("timestamp"),
+                has_more: true,
+            }),
+            conditions: vec![flotilla_protocol::ResultSetCondition::IssueSourceUnavailable {
+                source: None,
+                message: "one source unavailable".into(),
+            }],
+        };
+        let view = table_view::project(&"issues?project=flotilla%2Froadmap".parse().expect("address"), &table_view::TableRows {
+            issue_results: vec![(&query, std::slice::from_ref(&row), &state)],
+            ..table_view::TableRows::default()
+        })
+        .expect("issue table");
+        let mut terminal = Terminal::new(TestBackend::new(110, 7)).expect("terminal");
+        let mut widget = TableWidget::default();
+        let mut table_state = TableState::default();
+        terminal
+            .draw(|frame| {
+                widget.render_table(frame, frame.area(), &Theme::classic(), &view, &mut table_state, &[
+                    "issues?project=flotilla%2Froadmap".into(),
+                ]);
+            })
+            .expect("draw");
+
         insta::assert_snapshot!(terminal.backend());
     }
 }

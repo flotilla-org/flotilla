@@ -1,0 +1,11 @@
+---
+source: crates/flotilla-tui/src/widgets/table.rs
+expression: terminal.backend()
+---
+"┌ Issues · flotilla/roadmap · as of 2026-07-20 12:00 · more available · ⚠ one source unavailable ────────────┐"
+"│issues?project=flotilla%2Froadmap                                                                           │"
+"│ISSUE          TITLE                                           SOURCE                  UPDATED              │"
+"│ENG-42         Fix pagination                                  test / owner/repo       2026-07-15 09:30     │"
+"│                                                                                                            │"
+"│                                                                                                            │"
+"└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"

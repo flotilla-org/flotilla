@@ -132,13 +132,14 @@ impl ScopedCheckoutProjection {
     fn materialize(&self, scope: &Option<QueryScope>) -> MaterializedSet {
         match scope {
             None => {
-                let rows = self
+                let repositories = self
                     .known_repositories
                     .iter()
                     .chain(self.local_by_repo.keys())
                     .chain(self.replicas_by_repo.keys())
-                    .flat_map(|repo| self.rows_for_repo(repo))
-                    .collect();
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                let rows = repositories.iter().flat_map(|repo| self.rows_for_repo(repo)).collect();
                 MaterializedSet { seq: 0, rows, state: ResultSetState::default() }
             }
             Some(project) => {

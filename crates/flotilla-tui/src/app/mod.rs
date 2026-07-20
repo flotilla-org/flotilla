@@ -289,9 +289,19 @@ pub struct NamespaceModel {
 /// window it subscribed to.
 #[derive(Default)]
 pub struct QueryTableCache {
-    pub issues: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::IssueRow>>,
-    pub checkouts: HashMap<flotilla_protocol::QueryId, Vec<flotilla_protocol::CheckoutRow>>,
-    pub states: HashMap<flotilla_protocol::QueryId, flotilla_protocol::ResultSetState>,
+    pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
+    pub checkouts: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::CheckoutRow>>,
+}
+
+pub struct QueryTableResult<R> {
+    pub rows: Vec<R>,
+    pub state: flotilla_protocol::ResultSetState,
+}
+
+impl<R> Default for QueryTableResult<R> {
+    fn default() -> Self {
+        Self { rows: Vec::new(), state: flotilla_protocol::ResultSetState::default() }
+    }
 }
 
 pub fn table_rows<'a>(
@@ -311,16 +321,8 @@ pub fn table_rows<'a>(
                     .flat_map(move |(project, rows)| rows.iter().map(move |row| (namespace.as_str(), project.as_str(), row)))
             })
             .collect(),
-        issue_results: queries
-            .issues
-            .iter()
-            .filter_map(|(query, rows)| queries.states.get(query).map(|state| (query, rows.as_slice(), state)))
-            .collect(),
-        checkout_results: queries
-            .checkouts
-            .iter()
-            .filter_map(|(query, rows)| queries.states.get(query).map(|state| (query, rows.as_slice(), state)))
-            .collect(),
+        issue_results: queries.issues.iter().map(|(query, result)| (query, result.rows.as_slice(), &result.state)).collect(),
+        checkout_results: queries.checkouts.iter().map(|(query, result)| (query, result.rows.as_slice(), &result.state)).collect(),
         source_search,
     }
 }
@@ -934,7 +936,7 @@ impl App {
         let flotilla_protocol::QueryId::Issues { scope, search: None } = query else {
             return;
         };
-        let rows = self.query_tables.issues.get(query).cloned().unwrap_or_default();
+        let rows = self.query_tables.issues.get(query).map(|result| result.rows.clone()).unwrap_or_default();
         self.namespaces.entry(scope.namespace.clone()).or_default().project_issues.insert(scope.name.clone(), rows);
     }
 
@@ -1334,13 +1336,13 @@ impl App {
                         }
                     }
                     flotilla_protocol::Rows::Issues { rows, .. } => {
-                        self.query_tables.issues.insert(query.clone(), rows.clone());
-                        self.query_tables.states.insert(query.clone(), result_set.state.clone());
+                        self.query_tables
+                            .issues
+                            .insert(query.clone(), QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                         self.sync_project_issue_rows(&query);
                     }
                     flotilla_protocol::Rows::Checkouts { rows, .. } => {
-                        self.query_tables.checkouts.insert(query.clone(), rows.clone());
-                        self.query_tables.states.insert(query, result_set.state.clone());
+                        self.query_tables.checkouts.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
                 }
             }
@@ -1376,7 +1378,8 @@ impl App {
                         }
                     }
                     flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
-                        let rows = self.query_tables.issues.entry(query.clone()).or_default();
+                        let result = self.query_tables.issues.entry(query.clone()).or_default();
+                        let rows = &mut result.rows;
                         rows.retain(|row| !removed.contains(&row.reference));
                         for changed in changed {
                             if let Some(existing) = rows.iter_mut().find(|row| row.reference == changed.reference) {
@@ -1389,12 +1392,13 @@ impl App {
                             right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference))
                         });
                         if let Some(state) = &delta.state {
-                            self.query_tables.states.insert(query.clone(), state.clone());
+                            result.state = state.clone();
                         }
                         self.sync_project_issue_rows(&query);
                     }
                     flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
-                        let rows = self.query_tables.checkouts.entry(query.clone()).or_default();
+                        let result = self.query_tables.checkouts.entry(query).or_default();
+                        let rows = &mut result.rows;
                         rows.retain(|row| !removed.contains(&row.resource));
                         for changed in changed {
                             if let Some(existing) = rows.iter_mut().find(|row| row.resource == changed.resource) {
@@ -1407,7 +1411,7 @@ impl App {
                             (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
                         });
                         if let Some(state) = &delta.state {
-                            self.query_tables.states.insert(query, state.clone());
+                            result.state = state.clone();
                         }
                     }
                 }

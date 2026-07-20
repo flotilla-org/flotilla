@@ -151,6 +151,7 @@ struct IssueSourceWindow {
 struct MaterializedWindow {
     sources: Vec<IssueSourceWindow>,
     needs_full_reload: bool,
+    conditions: Vec<ResultSetCondition>,
 }
 
 async fn run_materialization(
@@ -208,20 +209,14 @@ async fn load_window(
     let sources = match resolver.resolve_issue_sources(scope).await {
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
-            publish_window(
-                query,
-                generation,
-                Vec::new(),
-                false,
-                vec![unavailable(None, "query scope has no issue source")],
-                state,
-                event_tx,
-            );
-            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true };
+            let conditions = vec![unavailable(None, "query scope has no issue source")];
+            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx);
+            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions };
         }
         Err(message) => {
-            publish_window(query, generation, Vec::new(), false, vec![unavailable(None, message)], state, event_tx);
-            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true };
+            let conditions = vec![unavailable(None, message)];
+            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx);
+            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions };
         }
     };
 
@@ -271,8 +266,8 @@ async fn load_window(
     let mut rows = rows.into_values().collect::<Vec<_>>();
     sort_rows(&mut rows);
     let needs_full_reload = !conditions.is_empty();
-    publish_window(query, generation, rows, has_more, conditions, state, event_tx);
-    MaterializedWindow { sources: windows, needs_full_reload }
+    publish_window(query, generation, rows, has_more, conditions.clone(), state, event_tx);
+    MaterializedWindow { sources: windows, needs_full_reload, conditions }
 }
 
 async fn fetch_more(
@@ -296,7 +291,7 @@ async fn fetch_more(
     let results = stream::iter(futures).buffer_unordered(MAX_CONCURRENT_SOURCES).collect::<Vec<_>>().await;
 
     let mut changed = Vec::new();
-    let mut conditions = Vec::new();
+    let mut conditions = window.conditions.clone();
     for (index, result) in results {
         let source = &mut window.sources[index];
         match result {
@@ -311,11 +306,15 @@ async fn fetch_more(
                 source.has_more = page.has_more;
             }
             Err(message) => {
-                conditions.push(unavailable(Some(source.source.clone()), message));
+                let condition = unavailable(Some(source.source.clone()), message);
+                if !conditions.contains(&condition) {
+                    conditions.push(condition);
+                }
                 window.needs_full_reload = true;
             }
         }
     }
+    window.conditions = conditions.clone();
     sort_rows(&mut changed);
     let result_state = demand_state(window.sources.iter().any(|source| source.has_more), conditions);
     // Metadata-only deltas are significant: an empty final page must still
@@ -544,6 +543,40 @@ mod tests {
         provider: Arc<dyn IssueProvider>,
     }
 
+    struct PartiallyUnavailableProvider {
+        pages: Mutex<VecDeque<IssueResultPage>>,
+    }
+
+    #[async_trait]
+    impl IssueProvider for PartiallyUnavailableProvider {
+        fn supports(&self, _source: &IssueSource) -> bool {
+            true
+        }
+
+        async fn query(&self, source: &IssueSource, _params: &IssueQuery, _page: u32, _count: usize) -> Result<IssueResultPage, String> {
+            if source.scope == "unavailable" {
+                return Err("source offline".into());
+            }
+            let mut page = self.pages.lock().await.pop_front().expect("scripted available page");
+            for issue in &mut page.items {
+                issue.reference.source = source.clone();
+            }
+            Ok(page)
+        }
+
+        async fn fetch_by_id(&self, _reference: &IssueRef) -> Result<Issue, String> {
+            unreachable!("not used by materialization")
+        }
+
+        async fn list_changed_since(&self, _source: &IssueSource, _since: &str, _count: usize) -> Result<IssueChangeset, String> {
+            Ok(IssueChangeset { updated: vec![], closed: vec![], has_more: false })
+        }
+
+        async fn open_in_browser(&self, _reference: &IssueRef) -> Result<(), String> {
+            unreachable!("not used by materialization")
+        }
+    }
+
     #[async_trait]
     impl IssueMaterializationResolver for ScopeResolver {
         async fn resolve_issue_sources(&self, scope: &QueryScope) -> Result<Vec<IssueSource>, String> {
@@ -713,6 +746,27 @@ mod tests {
         assert_eq!(delta.changes.as_issues().expect("issue changes")[0].reference.id, "LINEAR-B");
         assert!(!delta.state.and_then(|state| state.demand).expect("demand metadata").has_more);
         assert_eq!(state.result_set_for(&query).await.expect("extended window").rows.as_issues().expect("issue rows").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_more_preserves_an_unavailable_source_condition() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("partially-available");
+        let available = IssueSource { service: "https://issues.example".into(), scope: "available".into() };
+        let unavailable_source = IssueSource { service: "https://issues.example".into(), scope: "unavailable".into() };
+        let provider = Arc::new(PartiallyUnavailableProvider {
+            pages: Mutex::new(VecDeque::from([page(&["FIRST"], true), page(&["SECOND"], false)])),
+        });
+        let (materializer, mut events) = manager(&state, &query, vec![available, unavailable_source.clone()], provider);
+        let _ = next_event(&mut events).await;
+
+        materializer.fetch_more(&query, generation(&state, &query));
+
+        let DaemonEvent::ResultDelta(delta) = next_event(&mut events).await else { panic!("fetch-more must emit a delta") };
+        assert!(delta.state.expect("state replacement").conditions.iter().any(|condition| matches!(
+            condition,
+            ResultSetCondition::IssueSourceUnavailable { source: Some(source), .. } if source == &unavailable_source
+        )));
     }
 
     #[tokio::test]

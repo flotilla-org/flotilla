@@ -220,7 +220,7 @@ pub struct ProjectedRow {
     pub actions: Vec<AvailableAction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TableView {
     pub title: String,
     pub columns: Vec<ProjectedColumn>,
@@ -232,7 +232,6 @@ pub struct TableView {
 pub struct TableMeta {
     pub as_of: Option<Timestamp>,
     pub has_more: bool,
-    pub supports_source_search: bool,
     pub conditions: Vec<String>,
 }
 
@@ -240,10 +239,24 @@ impl TableView {
     pub fn filtered(mut self, filter: &str) -> Self {
         let filter = filter.trim().to_lowercase();
         if !filter.is_empty() {
-            self.rows.retain(|row| row.cells.iter().any(|cell| cell.text.to_lowercase().contains(&filter)));
+            self.rows.retain(|row| row.cells.iter().any(|cell| fuzzy_matches(&cell.text, &filter)));
         }
         self
     }
+}
+
+fn fuzzy_matches(value: &str, pattern: &str) -> bool {
+    let mut pattern = pattern.chars();
+    let mut next = pattern.next();
+    for candidate in value.chars().flat_map(char::to_lowercase) {
+        if next == Some(candidate) {
+            next = pattern.next();
+            if next.is_none() {
+                return true;
+            }
+        }
+    }
+    next.is_none()
 }
 
 #[derive(Clone)]
@@ -269,7 +282,7 @@ enum ProjectProjection {
 /// Typed query rows currently available to the table registry. Surfaces build
 /// this once from their query caches; adding a query family grows this input
 /// without teaching the reusable widget about that family.
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
 pub struct TableRows<'a> {
     pub convoys: Vec<&'a ConvoySummary>,
     pub independents: Vec<&'a IndependentRow>,
@@ -277,6 +290,19 @@ pub struct TableRows<'a> {
     pub issue_results: Vec<(&'a QueryId, &'a [IssueRow], &'a ResultSetState)>,
     pub checkout_results: Vec<(&'a QueryId, &'a [CheckoutRow], &'a ResultSetState)>,
     pub source_search: Option<&'a str>,
+}
+
+/// Query identity owned by a single-family table address. Composite Views
+/// add their other queries in `app::view_kind`, but use this same mapping for
+/// curated table families to prevent subscription/projection drift.
+pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<QueryId> {
+    match address {
+        ViewAddress::Issues { scope } => {
+            Some(QueryId::Issues { scope: scope.clone(), search: source_search.filter(|search| !search.is_empty()).map(str::to_owned) })
+        }
+        ViewAddress::Checkouts { scope } => Some(QueryId::Checkouts { scope: scope.clone() }),
+        _ => None,
+    }
 }
 
 pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView, String> {
@@ -337,8 +363,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             }]))
         }
         ViewAddress::Issues { scope } => {
-            let search = data.source_search.map(str::to_owned);
-            let query = QueryId::Issues { scope: scope.clone(), search };
+            let query = query_for(address, data.source_search).expect("issues address has a query");
             let (_, rows, state) = data
                 .issue_results
                 .iter()
@@ -348,11 +373,11 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 format!("Issues · {}/{}", scope.namespace, scope.name),
                 rows.iter().cloned().map(|row| ScopedIssueProjection { scope: scope.clone(), row }),
             );
-            view.meta = result_set_meta(state, true);
+            view.meta = result_set_meta(state);
             Ok(view)
         }
         ViewAddress::Checkouts { scope } => {
-            let query = QueryId::Checkouts { scope: scope.clone() };
+            let query = query_for(address, data.source_search).expect("checkouts address has a query");
             let (_, rows, state) = data
                 .checkout_results
                 .iter()
@@ -362,18 +387,17 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 .as_ref()
                 .map_or_else(|| "Checkouts · fleet".to_string(), |scope| format!("Checkouts · {}/{}", scope.namespace, scope.name));
             let mut view = checkout_spec().project(title, rows.iter().cloned());
-            view.meta = result_set_meta(state, false);
+            view.meta = result_set_meta(state);
             Ok(view)
         }
         ViewAddress::Overview | ViewAddress::Repo { .. } => Err(format!("view is not table-backed: {address}")),
     }
 }
 
-fn result_set_meta(state: &ResultSetState, supports_source_search: bool) -> TableMeta {
+fn result_set_meta(state: &ResultSetState) -> TableMeta {
     TableMeta {
         as_of: state.demand.as_ref().map(|metadata| metadata.as_of),
         has_more: state.demand.as_ref().is_some_and(|metadata| metadata.has_more),
-        supports_source_search,
         conditions: state
             .conditions
             .iter()
@@ -1116,7 +1140,6 @@ mod tests {
         });
         assert_eq!(view.meta.as_of, state.demand.as_ref().map(|metadata| metadata.as_of));
         assert!(view.meta.has_more);
-        assert!(view.meta.supports_source_search);
         assert_eq!(view.meta.conditions, vec!["one source is unavailable"]);
     }
 
@@ -1211,7 +1234,7 @@ mod tests {
         let mut active = convoy(vec![]);
         active.id = ConvoyId::new("dev", "other");
         active.name = "other".into();
-        let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DISK");
+        let view = project_convoys("convoys/dev", &[&failed, &active]).expect("project table").filtered("DSK F");
 
         assert_eq!(view.rows.len(), 1);
         assert_eq!(view.rows[0].cells[0].text, "tables");

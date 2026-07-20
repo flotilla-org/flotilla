@@ -1777,7 +1777,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
             conditions: vec![],
         },
     })));
-    assert_eq!(app.query_tables.issues[&query][0].issue.reference.id, "LINEAR-1");
+    assert_eq!(app.query_tables.issues[&query].rows[0].issue.reference.id, "LINEAR-1");
 
     let mut second = TestIssue::new("Second materialized issue").id("LINEAR-2").build();
     second.reference.source = source;
@@ -1799,8 +1799,8 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
         }),
     })));
 
-    assert_eq!(app.query_tables.issues[&query].len(), 1);
-    assert_eq!(app.query_tables.issues[&query][0].issue.reference.id, "LINEAR-2");
+    assert_eq!(app.query_tables.issues[&query].rows.len(), 1);
+    assert_eq!(app.query_tables.issues[&query].rows[0].issue.reference.id, "LINEAR-2");
 }
 
 #[test]
@@ -1820,14 +1820,14 @@ fn app_applies_checkout_sets_and_removal_deltas_to_the_typed_query_cache() {
         rows: flotilla_protocol::Rows::Checkouts { scope: None, rows: vec![row.clone()] },
         state: Default::default(),
     })));
-    assert_eq!(app.query_tables.checkouts[&query], vec![row.clone()]);
+    assert_eq!(app.query_tables.checkouts[&query].rows, vec![row.clone()]);
 
     app.handle_daemon_event(DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
         seq: 2,
         changes: flotilla_protocol::QueryChanges::Checkouts { scope: None, changed: vec![], removed: vec![row.resource] },
         state: None,
     })));
-    assert!(app.query_tables.checkouts[&query].is_empty());
+    assert!(app.query_tables.checkouts[&query].rows.is_empty());
 }
 
 #[tokio::test]

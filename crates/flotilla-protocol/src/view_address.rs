@@ -9,7 +9,7 @@
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
-use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{QueryScope, RepoIdentity, RepositoryKey};
@@ -22,8 +22,8 @@ pub const SCHEME_PREFIX: &str = "flotilla://";
 /// would misread.
 const SEGMENT: &AsciiSet = &CONTROLS.add(b'/').add(b'?').add(b'#').add(b'%').add(b' ');
 
-/// Reserved delimiters are encoded inside query-component values as well.
-const QUERY_COMPONENT: &AsciiSet = &SEGMENT.add(b'&').add(b'=');
+/// RFC 3986 query-component values: preserve exactly the unreserved set.
+const QUERY_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
 
 /// The address of a View: kind + typed parameters. Identity for
 /// open-or-focus semantics and the persisted form in `open-views.toml`.
@@ -285,6 +285,10 @@ mod tests {
 
         let checkouts = "CHECKOUTS?project=flotilla%2froadmap".parse::<ViewAddress>().expect("parse checkouts address");
         assert_eq!(checkouts.to_string(), "checkouts?project=flotilla%2Froadmap");
+
+        let reserved = ViewAddress::Issues { scope: QueryScope::new("flotilla+platform", "road map") };
+        assert_eq!(reserved.to_string(), "issues?project=flotilla%2Bplatform%2Froad%20map");
+        assert_eq!(reserved.to_string().parse::<ViewAddress>().expect("parse reserved characters"), reserved);
     }
 
     #[test]
