@@ -1343,49 +1343,16 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
         node_id: None,
         provisioning_target: None,
         context_repo: None,
-        action: CommandAction::ConvoyStart {
-            intent: Box::new(ConvoyStartIntent {
-                namespace: None,
-                project_ref: "flotilla".into(),
-                issue: None,
-                name: None,
-                branch: None,
-                workflow_ref: None,
-                inputs: Vec::new(),
-                instruction: None,
-                placement_policy: None,
-                auto_attach: false,
-            }),
-        },
+        action: CommandAction::ConvoyStart { intent: Box::new(ConvoyStartIntent::builder().project_ref("flotilla".to_string()).build()) },
     };
     let mut events = daemon.subscribe();
 
     let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
-    let first_result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == first_id => break result,
-                Ok(_) => {}
-                Err(error) => panic!("command event receive failed: {error:?}"),
-            }
-        }
-    })
-    .await
-    .expect("panicked convoy start should finish");
+    let first_result = recv_command_finished(&mut events, first_id).await;
     assert!(matches!(first_result, CommandValue::Error { message } if message.contains("worker panicked")));
 
     let retry_id = daemon.execute(command).await.expect("matching convoy start retry should be accepted");
-    let retry_result = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == retry_id => break result,
-                Ok(_) => {}
-                Err(error) => panic!("command event receive failed: {error:?}"),
-            }
-        }
-    })
-    .await
-    .expect("matching convoy start retry should finish");
+    let retry_result = recv_command_finished(&mut events, retry_id).await;
     assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy".into(), attach_command: None, binding: None });
 
     drop(temp);
@@ -3154,6 +3121,15 @@ async fn provisioned_repo_refresh_stamps_discovered_checkout_environment_id() {
 
 async fn recv_event(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>) -> DaemonEvent {
     tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.expect("timeout waiting for event").expect("recv error")
+}
+
+async fn recv_command_finished(rx: &mut tokio::sync::broadcast::Receiver<DaemonEvent>, command_id: u64) -> CommandValue {
+    loop {
+        match recv_event(rx).await {
+            DaemonEvent::CommandFinished { command_id: finished_id, result, .. } if finished_id == command_id => return result,
+            _ => {}
+        }
+    }
 }
 
 async fn trigger_refresh_and_recv(
