@@ -16,13 +16,15 @@ use flotilla_protocol::{
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, HostDirectEnvironmentSpec, InputMeta,
-    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, Project, ProjectRepositorySpec, ProjectSpec, Repository,
-    RepositorySpec, RepositoryStatus, Selector, TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec,
-    TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
-    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
+    LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, RepositoryStatus, Selector, Stance, TerminalBrief, TerminalCrewContext,
+    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
+    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
+    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
+    VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -72,6 +74,45 @@ fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
         assert!(validate_convoy_branch(branch).is_err(), "{branch} should be rejected");
     }
     validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
+}
+
+#[tokio::test]
+async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_required_adapter() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec {}).await.expect("host create");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"]))].into_iter().collect(),
+            heartbeat_at: None,
+            ready: true,
+            resource_store: None,
+        })
+        .await
+        .expect("host status update");
+    let placement = backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("host-direct-test".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host.metadata.name,
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("placement create");
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+
+    let error = validate_workflow_agent_adapters(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("host without codex must be rejected");
+
+    assert_eq!(error, "workflow requires agent adapter `codex`, which is not available in placement `host-direct-test` (host `host-test`)");
 }
 
 #[test]
@@ -2573,6 +2614,15 @@ async fn convoy_admission_snapshots_every_project_repository() {
     assert_eq!(convoy.spec.repositories[1].subpaths, ["crates/flotilla-core", "crates/flotilla-tui"]);
 }
 
+async fn create_empty_workflow(backend: &ResourceBackend, name: &str) {
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&empty_input_meta(name), &WorkflowTemplateSpec { inputs: Vec::new(), vessels: Vec::new() })
+        .await
+        .expect("workflow create should succeed");
+}
+
 #[tokio::test]
 async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
     let temp = tempfile::tempdir().expect("create tempdir");
@@ -2581,6 +2631,7 @@ async fn direct_repository_admission_snapshots_its_resolved_default_branch() {
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    create_empty_workflow(&daemon.resource_backend(), "scratch").await;
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let created =
@@ -2628,6 +2679,7 @@ async fn direct_repository_admission_does_not_guess_a_default_branch() {
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    create_empty_workflow(&daemon.resource_backend(), "scratch").await;
 
     let mut events = daemon.subscribe();
     let command_id = daemon
@@ -2675,6 +2727,7 @@ impl AdoptedConvoyFixture {
         let daemon =
             InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local())
                 .await;
+        create_empty_workflow(&daemon.resource_backend(), "scratch").await;
         Self { _temp: temp, daemon, checkout_path }
     }
 
@@ -2808,6 +2861,7 @@ async fn duplicate_adopted_convoy_create_does_not_repoint_existing_checkout() {
 
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), git_process_discovery(false), HostName::local()).await;
+    create_empty_workflow(&daemon.resource_backend(), "scratch").await;
     let mut events = daemon.subscribe();
 
     let first_id = daemon

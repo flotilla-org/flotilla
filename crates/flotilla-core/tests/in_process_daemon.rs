@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -657,7 +657,7 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
     assert!(daemon.list_repos().await.expect("list repos").is_empty());
 }
 
-async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend) {
+async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
     backend
         .clone()
         .using::<PlacementPolicy>("flotilla")
@@ -667,7 +667,8 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
                 .pool("passthrough".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                     host_ref: "host-test".into(),
-                    image: "flotilla-test".into(),
+                    image: image.into(),
+                    agent_adapters,
                     default_cwd: Some("/workspace".into()),
                     env: Default::default(),
                     checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
@@ -692,7 +693,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
         .await
         .expect("workflow create");
-    create_test_contained_policy(backend).await;
+    create_test_contained_policy(backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -704,6 +705,122 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         })
         .await
         .expect("project create");
+}
+
+#[tokio::test]
+async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config_store(temp.path().join("config"));
+    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .await
+        .expect("workflow create");
+    create_test_contained_policy(&backend, "ubuntu:24.04", BTreeSet::new()).await;
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".into(),
+            default_workflow_ref: "single-agent-contained".into(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    issue: None,
+                    name: Some("missing-adapter".into()),
+                    branch: Some("fix/missing-adapter".into()),
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: Some("docker-test".into()),
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("start command accepted");
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("start command should finish");
+
+    assert_eq!(result, CommandValue::Error {
+        message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
+            .to_string()
+    });
+    assert!(matches!(
+        backend.using::<ResourceConvoy>("flotilla").get("missing-adapter").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
+
+    let legacy_command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "missing-adapter-legacy".into(),
+                workflow_ref: "single-agent-contained".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: Some("fix/missing-adapter-legacy".into()),
+                project_ref: Some("flotilla".into()),
+                placement_policy: Some("docker-test".into()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("legacy create command accepted");
+    let legacy_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == legacy_command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("legacy create command should finish");
+
+    assert_eq!(legacy_result, CommandValue::Error {
+        message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
+            .to_string()
+    });
+    assert!(matches!(
+        backend.using::<ResourceConvoy>("flotilla").get("missing-adapter-legacy").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
 }
 
 #[tokio::test]
@@ -735,7 +852,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
         .await
         .expect("workflow create");
-    create_test_contained_policy(&backend).await;
+    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")
@@ -988,7 +1105,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
         .await
         .expect("workflow create");
-    create_test_contained_policy(&backend).await;
+    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string()])).await;
     backend
         .clone()
         .using::<Project>("flotilla")

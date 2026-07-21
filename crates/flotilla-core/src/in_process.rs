@@ -31,10 +31,10 @@ use flotilla_resources::{
     external_patches as convoy_external_patches, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target,
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
-    CrewSource, Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    CrewSource, Environment as ResourceEnvironment, Host as ResourceHost, InMemoryBackend, InputMeta, InputValue, IssueSnapshot,
+    IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend,
+    ResourceError, ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
     TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
     Vessel, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL,
     REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
+    agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
@@ -2471,6 +2472,55 @@ fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, 
     }
 }
 
+async fn validate_workflow_agent_adapters(
+    backend: &ResourceBackend,
+    namespace: &str,
+    workflow: &WorkflowTemplateSpec,
+    placement: Option<&ResourceObject<PlacementPolicy>>,
+) -> Result<(), String> {
+    let capabilities = CapabilityTable::seeded();
+    let mut required_adapters = BTreeSet::new();
+    for crew in workflow.vessels.iter().flat_map(|vessel| &vessel.crew) {
+        if let CrewSource::Agent { selector, .. } = &crew.source {
+            required_adapters.insert(capabilities.resolve(&selector.capability)?.adapter.clone());
+        }
+    }
+
+    for adapter in required_adapters {
+        let Some(placement) = placement else {
+            return Err(format!("workflow requires agent adapter `{adapter}`, but no placement is available"));
+        };
+        let (available_adapters, detail) = if let Some(docker) = &placement.spec.docker_per_vessel {
+            (docker.agent_adapters.clone(), format!("image `{}`", docker.image))
+        } else if let Some(host_direct) = &placement.spec.host_direct {
+            let host = backend.clone().using::<ResourceHost>(namespace).get(&host_direct.host_ref).await.map_err(|error| {
+                format!("placement `{}` host `{}` is not ready: {error}", placement.metadata.name, host_direct.host_ref)
+            })?;
+            let status = host
+                .status
+                .ok_or_else(|| format!("placement `{}` host `{}` has no observed status", placement.metadata.name, host_direct.host_ref))?;
+            let available_adapters = status.agent_adapters().map_err(|error| {
+                format!(
+                    "placement `{}` host `{}` has invalid agent adapter capabilities: {error}",
+                    placement.metadata.name, host_direct.host_ref
+                )
+            })?;
+            (available_adapters, format!("host `{}`", host_direct.host_ref))
+        } else {
+            (BTreeSet::new(), "unknown target environment".to_string())
+        };
+        if available_adapters.contains(&adapter) {
+            continue;
+        }
+        return Err(format!(
+            "workflow requires agent adapter `{adapter}`, which is not available in placement `{}` ({detail})",
+            placement.metadata.name
+        ));
+    }
+
+    Ok(())
+}
+
 fn convoy_fallback_slug(title: &str, id: &str) -> String {
     let slug = format!("{title}-{id}")
         .chars()
@@ -2669,30 +2719,8 @@ impl InProcessDaemon {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let contained = workflow.spec.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
-        let placement_policy = match &intent.placement_policy {
-            Some(policy) => {
-                let policy = required_admission_value(policy, "placement policy")?;
-                let resolved = self
-                    .resource_backend
-                    .clone()
-                    .using::<PlacementPolicy>(namespace)
-                    .get(policy)
-                    .await
-                    .map_err(|error| format!("placement policy {policy}: {error}"))?;
-                if contained && resolved.spec.docker_per_vessel.is_none() {
-                    return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
-                }
-                Some(policy.to_string())
-            }
-            None => {
-                let policy = default_convoy_placement_policy(&self.resource_backend, namespace, contained).await;
-                if contained && policy.is_none() {
-                    return Err("contained workflow requires an available docker placement policy".to_string());
-                }
-                policy
-            }
-        };
+        let placement = self.resolve_and_validate_convoy_placement(namespace, &workflow.spec, intent.placement_policy.as_deref()).await?;
+        let placement_policy = placement.map(|placement| placement.metadata.name);
         let spec = ConvoySpec {
             workflow_ref,
             inputs: intent.inputs.iter().map(|(key, value)| (key.clone(), InputValue::String(value.clone()))).collect(),
@@ -2706,6 +2734,50 @@ impl InProcessDaemon {
         };
         convoys.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
         Ok(name)
+    }
+
+    async fn resolve_and_validate_convoy_placement(
+        &self,
+        namespace: &str,
+        workflow: &WorkflowTemplateSpec,
+        placement_policy: Option<&str>,
+    ) -> Result<Option<ResourceObject<PlacementPolicy>>, String> {
+        let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
+        let placement = match placement_policy {
+            Some(policy) => {
+                let policy = required_admission_value(policy, "placement policy")?;
+                let resolved = self
+                    .resource_backend
+                    .clone()
+                    .using::<PlacementPolicy>(namespace)
+                    .get(policy)
+                    .await
+                    .map_err(|error| format!("placement policy {policy}: {error}"))?;
+                if contained && resolved.spec.docker_per_vessel.is_none() {
+                    return Err(format!("contained workflow requires a docker placement policy, but {policy} is not contained"));
+                }
+                Some(resolved)
+            }
+            None => {
+                let policy = default_convoy_placement_policy(&self.resource_backend, namespace, contained).await;
+                if contained && policy.is_none() {
+                    return Err("contained workflow requires an available docker placement policy".to_string());
+                }
+                match policy {
+                    Some(policy) => Some(
+                        self.resource_backend
+                            .clone()
+                            .using::<PlacementPolicy>(namespace)
+                            .get(&policy)
+                            .await
+                            .map_err(|error| format!("placement policy {policy}: {error}"))?,
+                    ),
+                    None => None,
+                }
+            }
+        };
+        validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.as_ref()).await?;
+        Ok(placement)
     }
 
     async fn run_convoy_start(&self, task: ConvoyStartTask) {
@@ -4552,6 +4624,40 @@ impl InProcessDaemon {
                     return Ok(id);
                 }
             }
+            let workflow = match self
+                .resource_backend
+                .clone()
+                .using::<WorkflowTemplate>(&namespace)
+                .get(workflow_ref)
+                .await
+                .map_err(|error| format!("workflow template {workflow_ref}: {error}"))
+            {
+                Ok(workflow) => workflow,
+                Err(message) => {
+                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        command_id: id,
+                        node_id: self.node_id.clone(),
+                        repo_identity: empty_identity,
+                        repo: None,
+                        result: flotilla_protocol::CommandValue::Error { message },
+                    });
+                    return Ok(id);
+                }
+            };
+            let placement_policy =
+                match self.resolve_and_validate_convoy_placement(&namespace, &workflow.spec, placement_policy.as_deref()).await {
+                    Ok(placement) => placement.map(|placement| placement.metadata.name),
+                    Err(message) => {
+                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                            command_id: id,
+                            node_id: self.node_id.clone(),
+                            repo_identity: empty_identity,
+                            repo: None,
+                            result: flotilla_protocol::CommandValue::Error { message },
+                        });
+                        return Ok(id);
+                    }
+                };
             let project_repositories = if let Some(project_ref) = project_ref {
                 match self.snapshot_project_repositories(&namespace, project_ref).await {
                     Ok(repositories) => Some(repositories),
@@ -4580,10 +4686,6 @@ impl InProcessDaemon {
                 });
                 return Ok(id);
             }
-            let placement_policy = match placement_policy {
-                Some(policy) => Some(policy.clone()),
-                None => default_convoy_placement_policy(&self.resource_backend, &namespace, false).await,
-            };
             let mut direct_repository_url = repository_url.clone();
             let mut r#ref = r#ref.clone();
             let adopted_checkout = match adopted_checkout {
