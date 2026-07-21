@@ -18,6 +18,8 @@ pub struct ProjectNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ProjectVerb {
+    /// List projects and their view addresses
+    List,
     /// Add a whole-repository project from a local path or repository catalog slug
     Add {
         /// Local checkout path or repository catalog slug
@@ -45,6 +47,7 @@ pub enum ProjectVerb {
 impl ProjectNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         let action = match self.verb {
+            ProjectVerb::List => CommandAction::QueryProjectList {},
             ProjectVerb::Add { target, name, display_name, remote } => CommandAction::ProjectAdd { target, name, display_name, remote },
             ProjectVerb::Apply { name, file } => {
                 let spec_yaml = std::fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
@@ -63,6 +66,7 @@ impl std::fmt::Display for ProjectNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "project")?;
         match &self.verb {
+            ProjectVerb::List => write!(f, " list")?,
             ProjectVerb::Add { target, name, display_name, remote } => {
                 write!(f, " add {}", quote_value(target))?;
                 if let Some(name) = name {
@@ -135,6 +139,16 @@ mod tests {
     }
 
     #[test]
+    fn project_list_resolves_to_a_local_query() {
+        let resolved = parse(&["project", "list"]).resolve().expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
     fn project_apply_reads_file() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), "display_name: Scratch\n").expect("write");
@@ -164,6 +178,7 @@ mod tests {
             "upstream",
         ]);
         assert_round_trip::<ProjectNoun>(&["project", "apply", "core", "--file", "/tmp/project.yaml"]);
+        assert_round_trip::<ProjectNoun>(&["project", "list"]);
     }
 
     #[test]

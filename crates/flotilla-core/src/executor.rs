@@ -348,6 +348,7 @@ pub async fn build_plan(
         | CommandAction::QueryRepoProviders { .. }
         | CommandAction::QueryRepoWork { .. }
         | CommandAction::QueryHostList {}
+        | CommandAction::QueryProjectList {}
         | CommandAction::QueryFleetList {}
         | CommandAction::QueryCrewList { .. }
         | CommandAction::QueryFleetReplicaSnapshot {}

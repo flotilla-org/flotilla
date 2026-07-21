@@ -8,7 +8,7 @@ use crate::{
     qualified_path::QualifiedPath,
     query::{
         CrewCommandContext, CrewListResponse, FleetListResponse, FleetReplicaSnapshot, HostListResponse, HostProvidersResponse,
-        HostStatusResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
+        HostStatusResponse, ProjectListResponse, RepoDetailResponse, RepoProvidersResponse, RepoWorkResponse,
     },
     AttachableSetId, IssueRef, RepoIdentity,
 };
@@ -291,6 +291,7 @@ pub enum CommandAction {
         repo: RepoSelector,
     },
     QueryHostList {},
+    QueryProjectList {},
     QueryHostStatus {
         target_environment_id: crate::EnvironmentId,
     },
@@ -313,6 +314,7 @@ impl CommandAction {
                 | CommandAction::QueryRepoProviders { .. }
                 | CommandAction::QueryRepoWork { .. }
                 | CommandAction::QueryHostList {}
+                | CommandAction::QueryProjectList {}
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
                 | CommandAction::QueryFleetList {}
@@ -368,6 +370,7 @@ impl Command {
             CommandAction::QueryRepoProviders { .. } => "query repo providers",
             CommandAction::QueryRepoWork { .. } => "query repo work",
             CommandAction::QueryHostList {} => "query host list",
+            CommandAction::QueryProjectList {} => "query project list",
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
             CommandAction::QueryFleetList {} => "query fleet list",
@@ -456,6 +459,7 @@ pub enum CommandValue {
     RepoProviders(Box<RepoProvidersResponse>),
     RepoWork(Box<RepoWorkResponse>),
     HostList(Box<HostListResponse>),
+    ProjectList(Box<ProjectListResponse>),
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
     FleetList(Box<FleetListResponse>),
@@ -769,6 +773,7 @@ mod tests {
                 action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/repo")) },
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetList {} },
             Command {
                 node_id: None,
@@ -915,6 +920,7 @@ mod tests {
                     work_item_count: 3,
                 }],
             })),
+            CommandValue::ProjectList(Box::new(crate::ProjectListResponse { projects: vec![] })),
             CommandValue::HostStatus(Box::new(HostStatusResponse {
                 environment_id: EnvironmentId::host(HostId::new("desktop-host")),
                 host_name: crate::HostName::new("desktop"),
@@ -1229,6 +1235,7 @@ mod tests {
                 action: CommandAction::QueryRepoWork { repo: RepoSelector::Path(PathBuf::from("/tmp")) },
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
             Command {
                 node_id: None,
                 provisioning_target: None,
