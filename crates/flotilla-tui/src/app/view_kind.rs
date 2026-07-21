@@ -16,13 +16,17 @@ pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec
     match address {
         ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys],
         ViewAddress::Project { namespace, name } => {
-            vec![QueryId::Convoys, QueryId::Checkouts { scope: Some(QueryScope::new(namespace, name)) }, QueryId::Issues {
-                scope: QueryScope::new(namespace, name),
-                search: source_search.filter(|search| !search.is_empty()).map(str::to_owned),
-            }]
+            vec![
+                QueryId::Convoys,
+                QueryId::Checkouts { scope: Some(QueryScope::new(namespace, name)) },
+                QueryId::Issues {
+                    scope: QueryScope::new(namespace, name),
+                    search: source_search.filter(|search| !search.is_empty()).map(str::to_owned),
+                },
+                QueryId::Independents { scope: Some(QueryScope::new(namespace, name)) },
+            ]
         }
-        ViewAddress::Independents => vec![QueryId::Independents],
-        ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => {
+        ViewAddress::Independents { .. } | ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => {
             vec![crate::table_view::query_for(address, source_search).expect("single-family table address has a query")]
         }
         ViewAddress::Overview | ViewAddress::Repo { .. } => vec![],
@@ -56,7 +60,7 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
         Some(ViewAddress::Overview) => vec![BindingModeId::Overview],
         Some(
             ViewAddress::Convoys { .. }
-            | ViewAddress::Independents
+            | ViewAddress::Independents { .. }
             | ViewAddress::Convoy { .. }
             | ViewAddress::Vessel { .. }
             | ViewAddress::Checkouts { .. },
@@ -86,6 +90,7 @@ mod tests {
             QueryId::Convoys,
             QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
             QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None },
+            QueryId::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) },
         ]);
     }
 

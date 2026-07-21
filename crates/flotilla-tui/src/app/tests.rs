@@ -1622,7 +1622,19 @@ fn independent_row(name: &str, attach: Option<&str>) -> flotilla_protocol::Indep
 fn independent_result_set(seq: u64, rows: Vec<flotilla_protocol::IndependentRow>) -> flotilla_protocol::DaemonEvent {
     flotilla_protocol::DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
         seq,
-        rows: flotilla_protocol::Rows::Independents(rows),
+        rows: flotilla_protocol::Rows::Independents { scope: None, rows },
+        state: Default::default(),
+    }))
+}
+
+fn scoped_independent_result_set(
+    seq: u64,
+    scope: flotilla_protocol::QueryScope,
+    rows: Vec<flotilla_protocol::IndependentRow>,
+) -> flotilla_protocol::DaemonEvent {
+    flotilla_protocol::DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq,
+        rows: flotilla_protocol::Rows::Independents { scope: Some(scope), rows },
         state: Default::default(),
     }))
 }
@@ -1634,7 +1646,7 @@ fn independent_delta(
 ) -> flotilla_protocol::DaemonEvent {
     flotilla_protocol::DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
         seq,
-        changes: flotilla_protocol::QueryChanges::Independents { changed, removed },
+        changes: flotilla_protocol::QueryChanges::Independents { scope: None, changed, removed },
         state: None,
     }))
 }
@@ -1745,11 +1757,26 @@ fn app_applies_independent_sets_and_removal_deltas_without_disturbing_convoys() 
 
     app.handle_daemon_event(independent_result_set(4, vec![independent]));
 
-    assert_eq!(app.namespaces["flotilla"].independents.len(), 1);
+    let query = flotilla_protocol::QueryId::Independents { scope: None };
+    assert_eq!(app.query_tables.independents[&query].rows.len(), 1);
     assert_eq!(app.namespaces["flotilla"].convoys.len(), 1, "query snapshots replace only their own family");
     app.handle_daemon_event(independent_delta(5, vec![], vec![reference]));
-    assert!(app.namespaces["flotilla"].independents.is_empty());
+    assert!(app.query_tables.independents[&query].rows.is_empty());
     assert_eq!(app.namespaces["flotilla"].convoys.len(), 1);
+}
+
+#[test]
+fn app_keeps_fleet_and_project_independent_results_separate() {
+    let mut app = stub_app();
+    let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+    let fleet_query = flotilla_protocol::QueryId::Independents { scope: None };
+    let project_query = flotilla_protocol::QueryId::Independents { scope: Some(scope.clone()) };
+
+    app.handle_daemon_event(independent_result_set(4, vec![independent_row("fleet-only", None)]));
+    app.handle_daemon_event(scoped_independent_result_set(2, scope, vec![independent_row("governor", Some("governor"))]));
+
+    assert_eq!(app.query_tables.independents[&fleet_query].rows[0].name, "fleet-only");
+    assert_eq!(app.query_tables.independents[&project_query].rows[0].name, "governor");
 }
 
 #[test]
@@ -1992,7 +2019,7 @@ fn snapshot_with(convoys: Vec<crate::convoy_model::ConvoySummary>) -> crate::con
 fn selected_table_name(app: &App) -> Option<String> {
     let address = app.views.active_address()?;
     let name_column = match address {
-        ViewAddress::Convoys { .. } | ViewAddress::Independents => 0,
+        ViewAddress::Convoys { .. } | ViewAddress::Independents { .. } => 0,
         ViewAddress::Project { .. } => 1,
         ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => 1,
         ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => 0,
@@ -2071,10 +2098,13 @@ fn generated_vessel_actions_execute_attach_and_force_complete() {
 #[test]
 fn independent_view_subscribes_and_generates_a_pane_attach_query() {
     let mut app = stub_app();
-    app.open_view(ViewAddress::Independents);
+    app.open_view(ViewAddress::Independents { scope: None });
     app.handle_daemon_event(independent_result_set(7, vec![independent_row("terminal-scratch", Some("terminal-scratch"))]));
 
-    assert!(app.query_cursors().iter().any(|cursor| cursor.query == flotilla_protocol::QueryId::Independents && cursor.since == Some(7)));
+    assert!(app
+        .query_cursors()
+        .iter()
+        .any(|cursor| cursor.query == (flotilla_protocol::QueryId::Independents { scope: None }) && cursor.since == Some(7)));
 
     app.handle_key(key(KeyCode::Char('.')));
     assert_eq!(selected_table_name(&app).as_deref(), Some("terminal-scratch"));

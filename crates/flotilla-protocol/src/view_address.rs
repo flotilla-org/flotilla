@@ -34,7 +34,7 @@ pub enum ViewAddress {
     /// All convoys in one namespace.
     Convoys { namespace: String },
     /// All terminal sessions that are not associated with a Convoy.
-    Independents,
+    Independents { scope: Option<QueryScope> },
     /// One convoy: its vessel DAG, phases, and intents.
     Convoy { namespace: String, name: String },
     /// One vessel: crew, work state, attach.
@@ -67,7 +67,7 @@ impl ViewAddress {
         match self {
             Self::Overview => "overview",
             Self::Convoys { .. } => "convoys",
-            Self::Independents => "independents",
+            Self::Independents { .. } => "independents",
             Self::Convoy { .. } => "convoy",
             Self::Vessel { .. } => "vessel",
             Self::Project { .. } => "project",
@@ -98,7 +98,10 @@ impl fmt::Display for ViewAddress {
         match self {
             Self::Overview => f.write_str("overview"),
             Self::Convoys { namespace } => write!(f, "convoys/{}", encode(namespace)),
-            Self::Independents => f.write_str("independents"),
+            Self::Independents { scope: Some(scope) } => {
+                write!(f, "independents?project={}", encode_query_component(&format!("{}/{}", scope.namespace, scope.name)))
+            }
+            Self::Independents { scope: None } => f.write_str("independents"),
             Self::Convoy { namespace, name } => write!(f, "convoy/{}/{}", encode(namespace), encode(name)),
             Self::Vessel { namespace, convoy, vessel } => {
                 write!(f, "vessel/{}/{}/{}", encode(namespace), encode(convoy), encode(vessel))
@@ -161,7 +164,10 @@ impl FromStr for ViewAddress {
                 _ => Err(format!("convoys takes exactly one parameter (namespace): {s}")),
             },
             "independents" => match segments.len() {
-                1 => Ok(Self::Independents),
+                1 => {
+                    let scope = parameters.remove("project").map(parse_project_scope).transpose()?;
+                    Ok(Self::Independents { scope })
+                }
                 _ => Err(format!("independents takes no parameters: {s}")),
             },
             "convoy" => match segments[1..] {
@@ -276,8 +282,13 @@ mod tests {
 
     #[test]
     fn independents_round_trips() {
-        assert_eq!("independents".parse::<ViewAddress>().expect("parse"), ViewAddress::Independents);
-        assert_eq!(ViewAddress::Independents.to_string(), "independents");
+        let fleet = ViewAddress::Independents { scope: None };
+        assert_eq!("independents".parse::<ViewAddress>().expect("parse fleet independents"), fleet);
+        assert_eq!(fleet.to_string(), "independents");
+
+        let project = ViewAddress::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) };
+        assert_eq!("independents?project=flotilla%2froadmap".parse::<ViewAddress>().expect("parse project independents"), project);
+        assert_eq!(project.to_string(), "independents?project=flotilla%2Froadmap");
     }
 
     #[test]

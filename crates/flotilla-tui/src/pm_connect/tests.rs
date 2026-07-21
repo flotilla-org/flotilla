@@ -27,11 +27,15 @@ fn independent_row(name: &str, phase: SessionPhase) -> IndependentRow {
 }
 
 fn independents_set(seq: u64, rows: Vec<IndependentRow>) -> DaemonEvent {
-    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Independents(rows), state: Default::default() }))
+    DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Independents { scope: None, rows }, state: Default::default() }))
 }
 
 fn independents_delta(seq: u64, changed: Vec<IndependentRow>, removed: Vec<ResourceRef>) -> DaemonEvent {
-    DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes: QueryChanges::Independents { changed, removed }, state: None }))
+    DaemonEvent::ResultDelta(Box::new(ResultDelta {
+        seq,
+        changes: QueryChanges::Independents { scope: None, changed, removed },
+        state: None,
+    }))
 }
 
 fn convoys_set(seq: u64) -> DaemonEvent {
@@ -72,14 +76,14 @@ fn state_applies_full_set_then_contiguous_deltas() {
 fn gaps_and_unseeded_deltas_request_resubscription() {
     let mut state = ConnectorState::default();
     // A delta before any full set is a gap: there is nothing to apply onto.
-    assert_eq!(state.apply_event(&independents_delta(1, vec![], vec![])), Applied::Gap(QueryId::Independents));
+    assert_eq!(state.apply_event(&independents_delta(1, vec![], vec![])), Applied::Gap(QueryId::Independents { scope: None }));
 
     assert_eq!(state.apply_event(&independents_set(1, vec![])), Applied::Updated);
-    assert_eq!(state.apply_event(&independents_delta(3, vec![], vec![])), Applied::Gap(QueryId::Independents));
+    assert_eq!(state.apply_event(&independents_delta(3, vec![], vec![])), Applied::Gap(QueryId::Independents { scope: None }));
 
     // Cursors resume from what was actually applied.
     let cursors = state.cursors();
-    let independents = cursors.iter().find(|cursor| cursor.query == QueryId::Independents).expect("independents cursor");
+    let independents = cursors.iter().find(|cursor| cursor.query == (QueryId::Independents { scope: None })).expect("independents cursor");
     assert_eq!(independents.since, Some(1));
     let convoys = cursors.iter().find(|cursor| cursor.query == QueryId::Convoys).expect("convoys cursor");
     assert_eq!(convoys.since, None, "never-seen queries subscribe from scratch");

@@ -1394,7 +1394,7 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
             .collect();
         daemon.fleet_replica_cache.write().await.insert(host_name, FleetReplicaCacheEntry {
             rows: fleet_rows,
-            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]), state: Default::default() }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents { scope: None, rows: vec![row] }, state: Default::default() }],
             last_sync: Some(Utc::now()),
             generation: Some(format!("gen-{host}")),
             last_error: None,

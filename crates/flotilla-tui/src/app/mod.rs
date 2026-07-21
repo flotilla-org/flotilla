@@ -24,8 +24,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus,
-    ViewAddress, WorkItem, WorkItemIdentity,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, ViewAddress,
+    WorkItem, WorkItemIdentity,
 };
 use indexmap::IndexMap;
 pub use intent::Intent;
@@ -279,7 +279,6 @@ pub type NamespaceMap = HashMap<String, NamespaceModel>;
 #[derive(Default)]
 pub struct NamespaceModel {
     pub convoys: IndexMap<crate::convoy_model::ConvoyId, crate::convoy_model::ConvoySummary>,
-    pub independents: IndexMap<ResourceRef, flotilla_protocol::IndependentRow>,
     pub last_seq: u64,
 }
 
@@ -288,6 +287,7 @@ pub struct NamespaceModel {
 /// window it subscribed to.
 #[derive(Default)]
 pub struct QueryTableCache {
+    pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
     pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
     pub checkouts: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::CheckoutRow>>,
 }
@@ -335,7 +335,11 @@ pub fn table_rows<'a>(
 ) -> crate::table_view::TableRows<'a> {
     crate::table_view::TableRows {
         convoys: namespaces.values().flat_map(|namespace| namespace.convoys.values()).collect(),
-        independents: namespaces.values().flat_map(|namespace| namespace.independents.values()).collect(),
+        independent_results: queries
+            .independents
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
         issue_results: queries
             .issues
             .iter()
@@ -1341,14 +1345,10 @@ impl App {
                             entry.last_seq = result_set.seq;
                         }
                     }
-                    flotilla_protocol::Rows::Independents(rows) => {
-                        for namespace in self.namespaces.values_mut() {
-                            namespace.independents.clear();
-                        }
-                        for row in rows {
-                            let entry = self.namespaces.entry(row.resource.namespace.clone()).or_default();
-                            entry.independents.insert(row.resource.clone(), row.clone());
-                        }
+                    flotilla_protocol::Rows::Independents { rows, .. } => {
+                        self.query_tables
+                            .independents
+                            .insert(query.clone(), QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
                     flotilla_protocol::Rows::Issues { rows, .. } => {
                         self.query_tables
@@ -1380,16 +1380,22 @@ impl App {
                             }
                         }
                     }
-                    flotilla_protocol::QueryChanges::Independents { changed, removed } => {
-                        for row in changed {
-                            let entry = self.namespaces.entry(row.resource.namespace.clone()).or_default();
-                            entry.independents.insert(row.resource.clone(), row.clone());
-                        }
-                        for removed in removed {
-                            if let Some(entry) = self.namespaces.get_mut(&removed.namespace) {
-                                entry.independents.shift_remove(removed);
-                            }
-                        }
+                    flotilla_protocol::QueryChanges::Independents { changed, removed, .. } => {
+                        let result = self.query_tables.independents.entry(query).or_default();
+                        result.apply_delta(
+                            changed,
+                            removed,
+                            delta.state.as_ref(),
+                            |row| row.resource.clone(),
+                            |left, right| {
+                                (&left.name, &left.host, &left.resource.namespace, &left.resource.name).cmp(&(
+                                    &right.name,
+                                    &right.host,
+                                    &right.resource.namespace,
+                                    &right.resource.name,
+                                ))
+                            },
+                        );
                     }
                     flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
                         let result = self.query_tables.issues.entry(query.clone()).or_default();

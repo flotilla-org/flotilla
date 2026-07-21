@@ -173,7 +173,10 @@ impl ConnectorState {
         }
         match &set.rows {
             Rows::Convoys(rows) => self.convoys = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
-            Rows::Independents(rows) => self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect(),
+            Rows::Independents { scope: None, rows } => {
+                self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
+            }
+            Rows::Independents { scope: Some(_), .. } => return Applied::Ignored,
             Rows::Issues { .. } | Rows::Checkouts { .. } => return Applied::Ignored,
         }
         self.seqs.insert(query, set.seq);
@@ -200,7 +203,7 @@ impl ConnectorState {
                     self.convoys.remove(removed);
                 }
             }
-            QueryChanges::Independents { changed: rows, removed } => {
+            QueryChanges::Independents { scope: None, changed: rows, removed } => {
                 for row in rows {
                     self.independents.insert(row.resource.clone(), row.clone());
                 }
@@ -208,6 +211,7 @@ impl ConnectorState {
                     self.independents.remove(removed);
                 }
             }
+            QueryChanges::Independents { scope: Some(_), .. } => return Applied::Ignored,
             QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
                 return Applied::Gap(query);
             }

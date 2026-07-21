@@ -30,7 +30,7 @@ impl<'a> InteractionSelection<'a> {
         let selected_row = selected_row?;
         match active_view? {
             ViewAddress::Convoys { .. } => Some(Self::Convoy(selected_row)),
-            ViewAddress::Independents => Some(Self::Independent(selected_row)),
+            ViewAddress::Independents { .. } => Some(Self::Independent(selected_row)),
             // Project tables currently contain both Convoys and Issues. The
             // view family is retained until their row projection exposes a
             // more specific resource kind.
@@ -61,7 +61,7 @@ impl<'a> InteractionContext<'a> {
                 Some(ViewAddress::Repo { .. }) => self.has_repo_context,
                 Some(
                     ViewAddress::Convoys { .. }
-                    | ViewAddress::Independents
+                    | ViewAddress::Independents { .. }
                     | ViewAddress::Project { .. }
                     | ViewAddress::Convoy { .. }
                     | ViewAddress::Vessel { .. }

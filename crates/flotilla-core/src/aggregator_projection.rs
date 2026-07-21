@@ -1,9 +1,8 @@
 //! Shared Aggregator state used for replay and fleet-replica export.
 //!
-//! [`QueryProjection`] is the query-agnostic core: rows keyed by
-//! [`ResourceRef`] (local plus per-replica-host), one contiguous sequence
-//! counter per query. Each named query instantiates it with that query's
-//! typed row.
+//! [`QueryProjection`] maintains the unscoped Convoys family. Store-backed
+//! families with Project views share the scoped projection in
+//! `scoped_store`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -17,7 +16,10 @@ use flotilla_protocol::{
 use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
-use crate::{query_registry::QueryRegistry, scoped_checkouts::ScopedCheckoutProjection};
+use crate::{
+    query_registry::QueryRegistry,
+    scoped_store::{ScopedCheckoutProjection, ScopedIndependentProjection},
+};
 
 /// A typed row of some named query's result set.
 pub trait QueryRow: Clone {
@@ -32,16 +34,6 @@ impl QueryRow for ConvoyRow {
 
     fn into_rows(rows: Vec<Self>) -> Rows {
         Rows::Convoys(rows)
-    }
-}
-
-impl QueryRow for IndependentRow {
-    fn resource(&self) -> &ResourceRef {
-        &self.resource
-    }
-
-    fn into_rows(rows: Vec<Self>) -> Rows {
-        Rows::Independents(rows)
     }
 }
 
@@ -115,7 +107,9 @@ impl<R: QueryRow + PartialEq> QueryProjection<R> {
 #[derive(Debug, Default, Clone, bon::Builder)]
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
-    independents: Arc<RwLock<QueryProjection<IndependentRow>>>,
+    #[builder(skip)]
+    independents: Arc<RwLock<ScopedIndependentProjection>>,
+    #[builder(skip)]
     checkouts: Arc<RwLock<ScopedCheckoutProjection>>,
     /// Subscriber ownership and demand-backed materializations belong to the
     /// Aggregator state, shared with the daemon's subscription transport.
@@ -143,36 +137,35 @@ impl AggregatorProjectionState {
         self.convoys.read().await.local_result_set()
     }
 
-    pub async fn write_independents(&self) -> RwLockWriteGuard<'_, QueryProjection<IndependentRow>> {
-        self.independents.write().await
-    }
-
-    pub async fn independents_result_set(&self) -> ResultSet {
-        self.independents.read().await.result_set()
-    }
-
-    pub async fn independents_seq(&self) -> u64 {
-        self.independents.read().await.seq
-    }
-
-    pub async fn local_independents_result_set(&self) -> ResultSet {
-        self.independents.read().await.local_result_set()
+    pub async fn independents_result_set(&self, scope: &Option<QueryScope>) -> ResultSet {
+        self.independents.write().await.result_set(scope)
     }
 
     /// This host's local store-backed result sets. Demand-backed reference
     /// data is never included in fleet replica snapshots.
     pub async fn local_result_sets(&self) -> Vec<ResultSet> {
-        let mut sets = vec![self.local_result_set().await, self.local_independents_result_set().await];
+        let mut sets = vec![self.local_result_set().await];
+        sets.extend(self.independents.read().await.local_result_sets());
         sets.extend(self.checkouts.read().await.local_result_sets());
         sets
     }
 
-    pub async fn replace_checkout_catalog(
+    pub async fn replace_store_catalog(
         &self,
         repositories: HashSet<RepositoryKey>,
         projects: HashMap<QueryScope, Vec<RepositoryKey>>,
     ) -> Vec<ResultDelta> {
-        self.checkouts.write().await.replace_catalog(repositories, projects)
+        let mut deltas = self.independents.write().await.replace_catalog(repositories.clone(), projects.clone());
+        deltas.extend(self.checkouts.write().await.replace_catalog(repositories, projects));
+        deltas
+    }
+
+    pub async fn replace_local_independent_rows(&self, rows: Vec<IndependentRow>) -> Vec<ResultDelta> {
+        self.independents.write().await.replace_local_rows(rows)
+    }
+
+    pub async fn replace_independent_replica_rows(&self, replicas: HashMap<HostName, Vec<IndependentRow>>) -> Vec<ResultDelta> {
+        self.independents.write().await.replace_replica_rows(replicas)
     }
 
     pub async fn replace_local_checkout_rows(&self, rows: Vec<CheckoutRow>) -> Vec<ResultDelta> {
@@ -228,7 +221,7 @@ impl AggregatorProjectionState {
     pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {
             QueryId::Convoys => Some(self.result_set().await),
-            QueryId::Independents => Some(self.independents_result_set().await),
+            QueryId::Independents { scope } => Some(self.independents_result_set(scope).await),
             QueryId::Issues { .. } => self.demand_backed.result_set(query),
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
         }

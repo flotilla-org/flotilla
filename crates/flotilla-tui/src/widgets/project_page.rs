@@ -432,13 +432,14 @@ mod tests {
     }
 
     #[test]
-    fn composite_renders_the_three_panels_as_one_stacked_page() {
+    fn composite_renders_the_four_panels_as_one_stacked_page() {
         let panels = vec![
             panel(ProjectPanelKind::Convoys, "Convoys", "convoys/flotilla", "convoy-a"),
             panel(ProjectPanelKind::Checkouts, "Checkouts", "checkouts?project=flotilla%2Froadmap", "checkout-a"),
             panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "issue-a"),
+            panel(ProjectPanelKind::Independents, "Independents", "independents?project=flotilla%2Froadmap", "governor"),
         ];
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
         let mut widget = ProjectPageWidget::default();
         let mut state = ProjectTableState::default();
         terminal.draw(|frame| widget.render_composite(frame, frame.area(), &Theme::classic(), &panels, &mut state)).expect("render");
@@ -447,10 +448,12 @@ mod tests {
         let convoy = rendered.find("Convoys").expect("convoys header");
         let checkout = rendered.find("Checkouts").expect("checkouts header");
         let issue = rendered.find("Issues").expect("issues header");
-        assert!(convoy < checkout && checkout < issue, "panels should retain the fixed v1 order");
+        let independents = rendered.find("Independents").expect("independents header");
+        assert!(convoy < checkout && checkout < issue && issue < independents, "panels should retain the fixed v1 order");
         assert!(rendered.contains("convoy-a"));
         assert!(rendered.contains("checkout-a"));
         assert!(rendered.contains("issue-a"));
+        assert!(rendered.contains("governor"));
     }
 
     #[test]
