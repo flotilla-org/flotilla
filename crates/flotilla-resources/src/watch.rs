@@ -51,6 +51,21 @@ pub enum WatchStart {
     FromVersionInGeneration { generation: String, resource_version: String },
 }
 
+impl WatchStart {
+    /// Resume a watch from where a list left off, carrying the list's store
+    /// generation when it has one. Generational stores reject a plain
+    /// `FromVersion` resume, so every list-then-watch caller must go through
+    /// this instead of constructing `FromVersion` directly.
+    pub fn resuming_from<T: Resource>(listed: &ResourceList<T>) -> Self {
+        match &listed.generation {
+            Some(generation) => {
+                Self::FromVersionInGeneration { generation: generation.clone(), resource_version: listed.resource_version.clone() }
+            }
+            None => Self::FromVersion(listed.resource_version.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "T::Spec: Serialize, T::Status: Serialize",
