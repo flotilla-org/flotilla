@@ -730,6 +730,17 @@ fn create_vessel_outcome(convoy: &ResourceObject<Convoy>, vessel: &str, _now: Da
 }
 
 fn create_presentation_actuation(convoy: &ResourceObject<Convoy>, vessel: &str) -> Actuation {
+    let presentation_name = if convoy
+        .status
+        .as_ref()
+        .and_then(|status| status.workflow_snapshot.as_ref())
+        .is_some_and(|snapshot| snapshot.vessels.len() == 1)
+    {
+        convoy.metadata.name.clone()
+    } else {
+        format!("{}:{vessel}", convoy.metadata.name)
+    };
+
     Actuation::CreatePresentation {
         meta: InputMeta::builder()
             .name(vessel_resource_name(&convoy.metadata.name, vessel))
@@ -749,7 +760,7 @@ fn create_presentation_actuation(convoy: &ResourceObject<Convoy>, vessel: &str) 
             // Stage 4a always uses the built-in default policy. Threading a policy ref through
             // ConvoySpec remains follow-up work once convoys can choose among multiple layouts.
             presentation_policy_ref: "default".to_string(),
-            name: vessel.to_string(),
+            name: presentation_name,
             process_selector: BTreeMap::from([
                 (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
                 (VESSEL_LABEL.to_string(), vessel.to_string()),
