@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Weak,
     },
     time::Duration,
 };
@@ -36,8 +36,10 @@ use flotilla_resources::{
     ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
     TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    Vessel, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    Vessel, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL,
+    REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -981,6 +983,71 @@ async fn queue_pending_crew_message(
         .map_err(|err| err.to_string())
 }
 
+struct ConvoyStartTask {
+    command_id: u64,
+    intent: flotilla_protocol::ConvoyStartIntent,
+    key: ConvoyStartKey,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ConvoyStartKey {
+    namespace: String,
+    project_ref: String,
+    subject: ConvoyStartSubject,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ConvoyStartSubject {
+    IssueId(String),
+    IssueReference(flotilla_protocol::IssueRef),
+    Name(String),
+    Anonymous {
+        branch: Option<String>,
+        workflow_ref: Option<String>,
+        inputs: Vec<(String, String)>,
+        instruction: Option<String>,
+        placement_policy: Option<String>,
+    },
+}
+
+impl ConvoyStartKey {
+    fn new(namespace: String, intent: &flotilla_protocol::ConvoyStartIntent) -> Self {
+        let subject = match &intent.issue {
+            Some(flotilla_protocol::IssueSelector::Id(id)) => ConvoyStartSubject::IssueId(id.clone()),
+            Some(flotilla_protocol::IssueSelector::Reference(reference)) => ConvoyStartSubject::IssueReference(reference.clone()),
+            None => match &intent.name {
+                Some(name) => ConvoyStartSubject::Name(name.clone()),
+                None => ConvoyStartSubject::Anonymous {
+                    branch: intent.branch.clone(),
+                    workflow_ref: intent.workflow_ref.clone(),
+                    inputs: intent.inputs.clone(),
+                    instruction: intent.instruction.clone(),
+                    placement_policy: intent.placement_policy.clone(),
+                },
+            },
+        };
+        Self { namespace, project_ref: intent.project_ref.clone(), subject }
+    }
+}
+
+fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<String> {
+    let status = convoy.status.as_ref()?;
+    if let Some((work, state)) = status.work.iter().find(|(_, state)| state.phase == ResourceWorkPhase::Failed) {
+        let detail = state.message.as_deref().filter(|message| !message.trim().is_empty()).unwrap_or("work failed without a message");
+        return Some(format!("convoy {} failed while starting work {work}: {detail}", convoy.metadata.name));
+    }
+    match status.phase {
+        flotilla_resources::ConvoyPhase::Failed => Some(match status.message.as_deref().filter(|message| !message.trim().is_empty()) {
+            Some(message) => format!("convoy {} failed while starting: {message}", convoy.metadata.name),
+            None => format!("convoy {} failed while starting", convoy.metadata.name),
+        }),
+        flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {} was cancelled while starting", convoy.metadata.name)),
+        flotilla_resources::ConvoyPhase::Pending | flotilla_resources::ConvoyPhase::Active | flotilla_resources::ConvoyPhase::Completed => {
+            None
+        }
+    }
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1019,6 +1086,8 @@ pub struct InProcessDaemon {
     discovery: DiscoveryRuntime,
     /// Running commands, keyed by command ID, for cancellation.
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    self_weak: Weak<InProcessDaemon>,
+    pending_convoy_starts: Mutex<HashSet<ConvoyStartKey>>,
     /// Unique identity for this daemon instance, generated at startup.
     /// Used in peer Hello handshake to detect remote daemon restarts.
     session_id: uuid::Uuid,
@@ -1167,7 +1236,7 @@ impl InProcessDaemon {
         .await;
 
         let (fleet_replica_tx, _) = broadcast::channel(32);
-        let daemon = Arc::new(Self {
+        let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: RwLock::new(repos),
             repo_order: RwLock::new(order),
             event_tx,
@@ -1188,6 +1257,8 @@ impl InProcessDaemon {
             environment_manager,
             discovery,
             active_commands: Arc::new(Mutex::new(HashMap::new())),
+            self_weak: self_weak.clone(),
+            pending_convoy_starts: Mutex::new(HashSet::new()),
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
@@ -2635,6 +2706,77 @@ impl InProcessDaemon {
         };
         convoys.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.map_err(|error| error.to_string())?;
         Ok(name)
+    }
+
+    async fn run_convoy_start(&self, task: ConvoyStartTask) {
+        let ConvoyStartTask { command_id, intent, key } = task;
+        let namespace = self.provisioning_namespace().await;
+        let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
+        let result = if requested_namespace != namespace {
+            flotilla_protocol::CommandValue::Error {
+                message: format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"),
+            }
+        } else {
+            match self.admit_convoy_start(&namespace, &intent).await {
+                Ok(name) if intent.auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
+                    Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
+                        name,
+                        attach_command: Some(resolved.command),
+                        binding: resolved.binding,
+                    },
+                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+                },
+                Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            }
+        };
+        self.finish_context_free_command(command_id, empty_repo_identity(), result);
+        self.pending_convoy_starts.lock().await.remove(&key);
+    }
+
+    async fn wait_for_convoy_attach(&self, namespace: &str, name: &str) -> Result<ResolvedAttach, String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let listed = convoys.list().await.map_err(|error| format!("watch convoy {name} while waiting to attach: {error}"))?;
+        if let Some(message) = listed.items.iter().find(|convoy| convoy.metadata.name == name).and_then(convoy_start_failure) {
+            return Err(message);
+        }
+        let mut watch = convoys
+            .watch(WatchStart::resuming_from(&listed))
+            .await
+            .map_err(|error| format!("watch convoy {name} while waiting to attach: {error}"))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut retry = tokio::time::interval(Duration::from_millis(100));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_attach_error = "attach target is not available yet".to_string();
+
+        loop {
+            tokio::select! {
+                _ = retry.tick() => {
+                    match self.resolve_attach_command_internal(name).await {
+                        Ok(resolved) => return Ok(resolved),
+                        Err(message) => last_attach_error = message,
+                    }
+                }
+                event = watch.next() => {
+                    match event {
+                        Some(Ok(WatchEvent::Added(convoy) | WatchEvent::Modified(convoy))) if convoy.metadata.name == name => {
+                            if let Some(message) = convoy_start_failure(&convoy) {
+                                return Err(message);
+                            }
+                        }
+                        Some(Ok(WatchEvent::Deleted(convoy))) if convoy.metadata.name == name => {
+                            return Err(format!("convoy {name} was deleted while waiting for a crew session"));
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => return Err(format!("watch convoy {name} while waiting to attach: {error}")),
+                        None => return Err(format!("convoy {name} status watch ended while waiting to attach")),
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(format!("convoy {name} was created but no crew session became attachable: {last_attach_error}"));
+                }
+            }
+        }
     }
 
     async fn snapshot_project_repositories(&self, namespace: &str, project_ref: &str) -> Result<Vec<ConvoyRepositorySpec>, String> {
@@ -4327,41 +4469,25 @@ impl InProcessDaemon {
 
         if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let namespace = self.provisioning_namespace().await;
-            let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
-            let result = if requested_namespace != namespace {
-                flotilla_protocol::CommandValue::Error {
-                    message: format!(
-                        "namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"
-                    ),
-                }
+            let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let key = ConvoyStartKey::new(namespace, intent);
+            if !self.pending_convoy_starts.lock().await.insert(key.clone()) {
+                self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {
+                    message: format!("convoy start for project {} is already in progress", intent.project_ref),
+                });
+                return Ok(id);
+            }
+            let task = ConvoyStartTask { command_id: id, intent: intent.as_ref().clone(), key: key.clone() };
+            if let Some(daemon) = self.self_weak.upgrade() {
+                tokio::spawn(async move {
+                    daemon.run_convoy_start(task).await;
+                });
             } else {
-                match self.admit_convoy_start(&namespace, intent).await {
-                    Ok(name) if intent.auto_attach => {
-                        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-                        let resolved = loop {
-                            match self.resolve_attach_command_internal(&name).await {
-                                Ok(resolved) => break Ok(resolved),
-                                Err(message) if tokio::time::Instant::now() >= deadline => {
-                                    break Err(format!("convoy {name} was created but no crew session became attachable: {message}"));
-                                }
-                                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-                            }
-                        };
-                        match resolved {
-                            Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
-                                name,
-                                attach_command: Some(resolved.command),
-                                binding: resolved.binding,
-                            },
-                            Err(message) => flotilla_protocol::CommandValue::Error { message },
-                        }
-                    }
-                    Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
-                }
-            };
-            self.finish_context_free_command(id, empty_identity, result);
+                self.pending_convoy_starts.lock().await.remove(&key);
+                self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {
+                    message: "convoy start worker is unavailable".to_string(),
+                });
+            }
             return Ok(id);
         }
 

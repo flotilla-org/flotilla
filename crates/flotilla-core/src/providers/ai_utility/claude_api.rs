@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -12,6 +12,7 @@ static REQUEST_FACTORY: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLo
 const API_BASE: &str = "https://api.anthropic.com";
 const API_VERSION: &str = "2023-06-01";
 const SYSTEM_PROMPT: &str = "You are a concise assistant. Output only what is asked, with no explanation or formatting.";
+const ANTHROPIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct ClaudeApiAiUtility {
     api_key: String,
@@ -41,7 +42,9 @@ impl ClaudeApiAiUtility {
             .build()
             .map_err(|e| e.to_string())?;
 
-        let resp = http_execute!(self.http, request)?;
+        let resp = tokio::time::timeout(ANTHROPIC_REQUEST_TIMEOUT, async { http_execute!(self.http, request) })
+            .await
+            .map_err(|_| format!("Anthropic API request timed out after {}s", ANTHROPIC_REQUEST_TIMEOUT.as_secs()))??;
         let status = resp.status().as_u16();
         let body_bytes = resp.into_body();
         let body_str = std::str::from_utf8(&body_bytes).map_err(|e| e.to_string())?;
@@ -99,5 +102,35 @@ impl super::AiUtility for ClaudeApiAiUtility {
              Return ONLY JSON with string fields name and branch. Use lowercase kebab-case; the branch may contain one slash: {context}"
         );
         super::parse_convoy_names(&self.prompt(Model::Haiku, &prompt).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future, sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+
+    use super::ClaudeApiAiUtility;
+    use crate::providers::{ai_utility::AiUtility, ChannelLabel, HttpClient};
+
+    struct HangingHttpClient;
+
+    #[async_trait]
+    impl HttpClient for HangingHttpClient {
+        async fn execute(&self, _: reqwest::Request, _: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn convoy_name_generation_times_out_when_anthropic_does_not_respond() {
+        let utility = ClaudeApiAiUtility::new("test-key".into(), Arc::new(HangingHttpClient));
+
+        let result = tokio::time::timeout(Duration::from_secs(16), utility.generate_convoy_names("Issue 782"))
+            .await
+            .expect("Anthropic request should enforce its own shorter deadline");
+
+        assert!(matches!(result, Err(message) if message.contains("timed out after 15s")));
     }
 }

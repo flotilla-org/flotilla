@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -46,10 +46,12 @@ use flotilla_protocol::{
     RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
-    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
-    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, DockerCheckoutStrategy,
+    apply_status_patch, controller_patches as convoy_controller_patches, single_agent_contained_workflow_spec,
+    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
+    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -676,6 +678,34 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
         .expect("contained policy create");
 }
 
+async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBackend, issue_source: Option<IssueSource>) {
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-contained".to_string()).build(), &single_agent_contained_workflow_spec())
+        .await
+        .expect("workflow create");
+    create_test_contained_policy(backend).await;
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".into(),
+            default_workflow_ref: "single-agent-contained".into(),
+            issue_source,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+}
+
 #[tokio::test]
 async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snapshot() {
     let reference =
@@ -1010,6 +1040,225 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
     let persisted = backend.using::<ResourceConvoy>("flotilla").get("generated-convoy").await.expect("persisted convoy");
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/generated-convoy"));
     assert_eq!(utility.calls.load(Ordering::SeqCst), 1);
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_start_acknowledges_while_admission_is_in_flight() {
+    let utility = Arc::new(SlowAiUtility::new());
+    let discovery = slow_ai_discovery(Arc::clone(&utility));
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+
+    let mut execution = tokio::spawn({
+        let daemon = Arc::clone(&daemon);
+        async move {
+            daemon
+                .execute(Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ConvoyStart {
+                        intent: Box::new(ConvoyStartIntent {
+                            namespace: None,
+                            project_ref: "flotilla".into(),
+                            issue: None,
+                            name: None,
+                            branch: None,
+                            workflow_ref: None,
+                            inputs: Vec::new(),
+                            instruction: None,
+                            placement_policy: None,
+                            auto_attach: false,
+                        }),
+                    },
+                })
+                .await
+        }
+    });
+    utility.wait_for_generation_start().await;
+
+    let command_id = tokio::time::timeout(Duration::from_millis(100), &mut execution)
+        .await
+        .expect("convoy start should acknowledge while admission is still in flight")
+        .expect("execute task should not panic")
+        .expect("convoy start should be accepted");
+
+    let mut events = daemon.subscribe();
+    utility.release_generation();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("convoy start should finish after admission is released");
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }));
+
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_flight() {
+    let reference =
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "782".into() };
+    let mut issue = TestIssue::new("Convoy start freezes the TUI").id("782").build();
+    issue.reference = reference.clone();
+    let provider = Arc::new(FakeIssueProvider::new());
+    provider.add_issues(vec![(reference.id.clone(), issue)]).await;
+    let utility = Arc::new(SlowAiUtility::new());
+    let mut discovery = fake_discovery_with_provider_set(
+        FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
+    );
+    discovery.factories.ai_utilities.push(Box::new(SlowAiUtilityFactory { utility: Arc::clone(&utility) }));
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, Some(reference.source.clone())).await;
+    let command = Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::ConvoyStart {
+            intent: Box::new(ConvoyStartIntent {
+                namespace: None,
+                project_ref: "flotilla".into(),
+                issue: Some(IssueSelector::Reference(reference)),
+                name: None,
+                branch: None,
+                workflow_ref: None,
+                inputs: Vec::new(),
+                instruction: Some("Implement issue 782".into()),
+                placement_policy: None,
+                auto_attach: false,
+            }),
+        },
+    };
+    let mut events = daemon.subscribe();
+
+    let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
+    utility.wait_for_generation_start().await;
+    let duplicate_id = daemon.execute(command).await.expect("duplicate command should receive an asynchronous result");
+    let duplicate_result = tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == duplicate_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("duplicate convoy start should finish without waiting for admission");
+    assert!(matches!(duplicate_result, CommandValue::Error { message } if message.contains("already in progress")));
+
+    utility.release_generation();
+    let first_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == first_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("first convoy start should finish after admission is released");
+    assert!(matches!(first_result, CommandValue::ConvoyStarted { .. }));
+
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeout() {
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    issue: None,
+                    name: Some("bootstrap-failure".into()),
+                    branch: Some("fix/bootstrap-failure".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: true,
+                }),
+            },
+        })
+        .await
+        .expect("convoy start should be accepted");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if convoys.get("bootstrap-failure").await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("convoy should be persisted");
+
+    let workflow = single_agent_contained_workflow_spec();
+    apply_status_patch(
+        &convoys,
+        "bootstrap-failure",
+        &convoy_controller_patches::bootstrap(
+            WorkflowSnapshot { vessels: workflow.vessels },
+            "single-agent-contained".into(),
+            BTreeMap::new(),
+            BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Pending).build())]),
+            BTreeMap::new(),
+            ConvoyPhase::Pending,
+            None,
+        ),
+    )
+    .await
+    .expect("convoy bootstrap patch");
+
+    let work_message = "agent adapter claude cannot realize contained stance";
+    apply_status_patch(
+        &convoys,
+        "bootstrap-failure",
+        &convoy_controller_patches::roll_up_work("work".into(), WorkPhase::Failed, chrono::Utc::now(), Some(work_message.into())),
+    )
+    .await
+    .expect("work failure patch");
+    apply_status_patch(
+        &convoys,
+        "bootstrap-failure",
+        &convoy_controller_patches::fail_convoy(BTreeMap::new(), chrono::Utc::now(), Some("convoy bootstrap failed".into())),
+    )
+    .await
+    .expect("convoy failure patch");
+
+    let result = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("failed convoy should stop auto-attach promptly");
+    assert!(matches!(result, CommandValue::Error { message } if message.contains(work_message)));
+
     drop(temp);
 }
 
