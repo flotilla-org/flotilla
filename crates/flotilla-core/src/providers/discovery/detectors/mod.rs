@@ -14,6 +14,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),
         Box::new(codex::CodexAuthDetector),
+        Box::new(CommandDetector::new("codex", &["--version"], parse_first_dotted_version)),
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
         Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
         Box::new(CommandDetector::new("agent", &["--version"], parse_first_dotted_version)),
@@ -86,6 +87,7 @@ mod tests {
             ("cleat", "cleat", &["--version"], "cleat 0.1.0\n", Some("0.1.0")),
             ("shpool", "shpool", &["version"], "shpool 0.9.0\n", Some("0.9.0")),
             ("gemini", "gemini", &["--version"], "gemini 1.0.0\n", Some("1.0.0")),
+            ("codex", "codex", &["--version"], "codex-cli 0.5.0\n", Some("0.5.0")),
         ];
 
         for (_detector_name, command, args, output, version) in cases {
@@ -99,5 +101,26 @@ mod tests {
                 if name == command && found_version.as_deref() == version
             ));
         }
+    }
+
+    /// The default detector list must surface the binaries agent-adapter
+    /// discovery keys on. The codex adapter was unregistrable on every real
+    /// host because no default detector probed the `codex` binary — only its
+    /// auth file (flotilla-org/flotilla#796 dogfood, 2026-07-21).
+    #[tokio::test]
+    async fn default_detectors_surface_agent_adapter_binaries() {
+        use std::sync::Arc;
+
+        use crate::providers::discovery::run_host_detectors;
+
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))
+            .on_run("claude", &["--version"], Ok("1.0.0 (Claude Code)\n".into()))
+            .build();
+        let bag = run_host_detectors(&default_host_detectors(), &runner, &TestEnvVars::default()).await;
+
+        assert!(bag.find_binary("codex").is_some(), "codex binary must be detected for its agent adapter to register");
+        let adapters = crate::agent_adapter::AgentAdapterRegistry::discover(&bag, Arc::new(runner));
+        assert!(adapters.get("codex").is_some(), "codex agent adapter should register when the binary is present");
     }
 }
