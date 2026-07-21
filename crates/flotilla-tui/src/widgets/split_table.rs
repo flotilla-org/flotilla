@@ -647,7 +647,13 @@ impl SplitTable {
             if flat_row >= self.scroll_offset && flat_row < self.scroll_offset + viewport_height {
                 let y = area.y + (flat_row - self.scroll_offset) as u16;
                 let row_rect = Rect::new(area.x, y, area.width, 1);
-                render_divider(frame, section.header_label(), theme, row_rect);
+                ui_helpers::render_section_divider(
+                    frame,
+                    section.header_label(),
+                    theme,
+                    row_rect,
+                    Style::default().fg(theme.section_header),
+                );
             }
             flat_row += 1;
 
@@ -784,20 +790,6 @@ impl SplitTable {
 }
 
 // ── Row rendering helpers ──────────────────────────────────────────────────
-
-/// Render a section divider: "── Label ──"
-fn render_divider(frame: &mut Frame, label: &str, theme: &Theme, area: Rect) {
-    let dashes_left = 2;
-    let left = "\u{2500}".repeat(dashes_left);
-    let right_width = area.width.saturating_sub(dashes_left as u16 + label.chars().count() as u16 + 4);
-    let right = "\u{2500}".repeat(right_width as usize);
-    let header_line = Line::from(vec![
-        Span::styled(format!("{left} "), Style::default().fg(theme.muted)),
-        Span::styled(label.to_string(), Style::default().fg(theme.section_header)),
-        Span::styled(format!(" {right}"), Style::default().fg(theme.muted)),
-    ]);
-    frame.render_widget(header_line, area);
-}
 
 /// Render column headers for a section.
 fn render_column_headers(

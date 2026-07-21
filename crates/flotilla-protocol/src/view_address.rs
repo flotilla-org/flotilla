@@ -76,6 +76,35 @@ impl ViewAddress {
             Self::Repo { .. } => "repo",
         }
     }
+
+    /// A decoded address-shaped label for human-facing surfaces.
+    ///
+    /// Unlike [`fmt::Display`], this form is not a persistence or parsing
+    /// contract: reserved characters remain readable instead of being
+    /// percent-encoded.
+    pub fn human_label(&self) -> String {
+        match self {
+            Self::Overview => "overview".to_string(),
+            Self::Convoys { namespace } => format!("convoys/{namespace}"),
+            Self::Independents { scope: Some(scope) } => {
+                format!("independents?project={}/{}", scope.namespace, scope.name)
+            }
+            Self::Independents { scope: None } => "independents".to_string(),
+            Self::Convoy { namespace, name } => format!("convoy/{namespace}/{name}"),
+            Self::Vessel { namespace, convoy, vessel } => format!("vessel/{namespace}/{convoy}/{vessel}"),
+            Self::Project { namespace, name } => format!("project/{namespace}/{name}"),
+            Self::Issues { scope } => format!("issues?project={}/{}", scope.namespace, scope.name),
+            Self::Checkouts { scope: Some(scope) } => format!("checkouts?project={}/{}", scope.namespace, scope.name),
+            Self::Checkouts { scope: None } => "checkouts".to_string(),
+            Self::Repo { identity, repository_key } => {
+                let mut label = format!("repo/{}/{}", identity.authority, identity.path);
+                if let Some(key) = repository_key {
+                    label.push_str(&format!("?key={}", key.0));
+                }
+                label
+            }
+        }
+    }
 }
 
 fn encode(segment: &str) -> impl fmt::Display + '_ {
@@ -302,6 +331,21 @@ mod tests {
         let reserved = ViewAddress::Issues { scope: QueryScope::new("flotilla+platform", "road map") };
         assert_eq!(reserved.to_string(), "issues?project=flotilla%2Bplatform%2Froad%20map");
         assert_eq!(reserved.to_string().parse::<ViewAddress>().expect("parse reserved characters"), reserved);
+    }
+
+    #[test]
+    fn human_labels_show_decoded_address_components_without_changing_the_canonical_form() {
+        let address = ViewAddress::Issues { scope: QueryScope::new("flotilla+platform", "road map") };
+
+        assert_eq!(address.human_label(), "issues?project=flotilla+platform/road map");
+        assert_eq!(address.to_string(), "issues?project=flotilla%2Bplatform%2Froad%20map");
+
+        let repo = ViewAddress::Repo {
+            identity: RepoIdentity { authority: "local".into(), path: "/tmp/repo 0".into() },
+            repository_key: Some(RepositoryKey("repo/key with space".into())),
+        };
+        assert_eq!(repo.human_label(), "repo/local//tmp/repo 0?key=repo/key with space");
+        assert_eq!(repo.to_string(), "repo/local/%2Ftmp%2Frepo%200?key=repo%2Fkey%20with%20space");
     }
 
     #[test]

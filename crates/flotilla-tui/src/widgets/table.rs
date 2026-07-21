@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use flotilla_protocol::ViewAddress;
 use ratatui::{
     layout::{Alignment as RatatuiAlignment, Constraint, Rect},
     style::{Color, Modifier, Style},
@@ -134,7 +135,7 @@ impl TableWidget {
         theme: &Theme,
         view: &TableView,
         state: &mut table_view::TableState,
-        breadcrumbs: &[String],
+        breadcrumbs: &[ViewAddress],
     ) {
         state.reconcile(view);
         let mut title = view.title.clone();
@@ -160,7 +161,8 @@ impl TableWidget {
         let breadcrumb_height = u16::from(!breadcrumbs.is_empty());
         if breadcrumb_height == 1 {
             let breadcrumb_area = Rect { height: 1, ..inner };
-            frame.render_widget(Line::styled(breadcrumbs.join("  ›  "), Style::default().fg(theme.muted)), breadcrumb_area);
+            let labels = breadcrumbs.iter().map(ViewAddress::human_label).collect::<Vec<_>>();
+            frame.render_widget(Line::styled(labels.join("  ›  "), Style::default().fg(theme.muted)), breadcrumb_area);
         }
         let table_area =
             Rect { y: inner.y.saturating_add(breadcrumb_height), height: inner.height.saturating_sub(breadcrumb_height), ..inner };
@@ -339,7 +341,7 @@ impl InteractiveWidget for TableWidget {
         let source_search = ctx.views.active_table_state().source_search.as_deref();
         let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
         let Ok(view) = table_view::project(&address, &rows).map(|view| view.filtered(&filter)) else { return };
-        let breadcrumbs = ctx.views.active().breadcrumb_addresses().into_iter().map(ToString::to_string).collect::<Vec<_>>();
+        let breadcrumbs = ctx.views.active().breadcrumb_addresses();
         self.render_table(frame, area, ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
     }
 
@@ -448,9 +450,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).expect("terminal");
         let mut widget = TableWidget::default();
         let mut state = TableState::default();
+        let address: ViewAddress = "convoys/dev".parse().expect("address");
         terminal
             .draw(|frame| {
-                widget.render_table(frame, frame.area(), &Theme::classic(), &view(), &mut state, &["convoys/dev".into()]);
+                widget.render_table(frame, frame.area(), &Theme::classic(), &view(), &mut state, &[address]);
             })
             .expect("draw");
         let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
@@ -478,9 +481,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
         let mut widget = TableWidget::default();
         let mut state = TableState::default();
+        let address: ViewAddress = "convoys/dev".parse().expect("address");
         terminal
             .draw(|frame| {
-                widget.render_table(frame, frame.area(), &Theme::classic(), &snapshot_view(), &mut state, &["convoys/dev".into()]);
+                widget.render_table(frame, frame.area(), &Theme::classic(), &snapshot_view(), &mut state, &[address]);
             })
             .expect("draw");
         insta::assert_snapshot!(terminal.backend());
@@ -510,14 +514,16 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(110, 7)).expect("terminal");
         let mut widget = TableWidget::default();
         let mut table_state = TableState::default();
+        let address: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("address");
         terminal
             .draw(|frame| {
-                widget.render_table(frame, frame.area(), &Theme::classic(), &view, &mut table_state, &[
-                    "issues?project=flotilla%2Froadmap".into(),
-                ]);
+                widget.render_table(frame, frame.area(), &Theme::classic(), &view, &mut table_state, &[address]);
             })
             .expect("draw");
 
+        let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("issues?project=flotilla/roadmap"));
+        assert!(!rendered.contains("%2F"));
         insta::assert_snapshot!(terminal.backend());
     }
 }
