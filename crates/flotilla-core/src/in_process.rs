@@ -5,6 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -39,7 +40,7 @@ use flotilla_resources::{
     Vessel, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL,
     REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -2780,30 +2781,39 @@ impl InProcessDaemon {
         Ok(placement)
     }
 
-    async fn run_convoy_start(&self, task: ConvoyStartTask) {
-        let ConvoyStartTask { command_id, intent, key } = task;
+    async fn run_convoy_start(&self, intent: flotilla_protocol::ConvoyStartIntent) -> flotilla_protocol::CommandValue {
         let namespace = self.provisioning_namespace().await;
         let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
-        let result = if requested_namespace != namespace {
-            flotilla_protocol::CommandValue::Error {
+        if requested_namespace != namespace {
+            return flotilla_protocol::CommandValue::Error {
                 message: format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"),
-            }
-        } else {
-            match self.admit_convoy_start(&namespace, &intent).await {
-                Ok(name) if intent.auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
-                    Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
-                        name,
-                        attach_command: Some(resolved.command),
-                        binding: resolved.binding,
-                    },
-                    Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+        }
+        match self.admit_convoy_start(&namespace, &intent).await {
+            Ok(name) if intent.auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
+                Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
+                    name,
+                    attach_command: Some(resolved.command),
+                    binding: resolved.binding,
                 },
-                Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
+            },
+            Ok(name) => flotilla_protocol::CommandValue::ConvoyStarted { name, attach_command: None, binding: None },
+            Err(message) => flotilla_protocol::CommandValue::Error { message },
+        }
+    }
+
+    async fn supervise_convoy_start(&self, task: ConvoyStartTask) {
+        let ConvoyStartTask { command_id, intent, key } = task;
+        let result = match AssertUnwindSafe(self.run_convoy_start(intent)).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(command_id, "convoy start worker panicked");
+                flotilla_protocol::CommandValue::Error { message: "convoy start worker panicked".to_string() }
             }
         };
-        self.finish_context_free_command(command_id, empty_repo_identity(), result);
         self.pending_convoy_starts.lock().await.remove(&key);
+        self.finish_context_free_command(command_id, empty_repo_identity(), result);
     }
 
     async fn wait_for_convoy_attach(&self, namespace: &str, name: &str) -> Result<ResolvedAttach, String> {
@@ -4567,7 +4577,7 @@ impl InProcessDaemon {
             let task = ConvoyStartTask { command_id: id, intent: intent.as_ref().clone(), key: key.clone() };
             if let Some(daemon) = self.self_weak.upgrade() {
                 tokio::spawn(async move {
-                    daemon.run_convoy_start(task).await;
+                    daemon.supervise_convoy_start(task).await;
                 });
             } else {
                 self.pending_convoy_starts.lock().await.remove(&key);
