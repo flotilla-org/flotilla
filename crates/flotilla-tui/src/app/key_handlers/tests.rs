@@ -1690,8 +1690,9 @@ fn query_issues_command_intercepted_by_executor_dispatch() {
     // a task that will fail (stub daemon). We just need to verify the
     // interception path runs without error.
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     rt.block_on(async {
-        crate::app::executor::dispatch(cmd, &mut app, None).await;
+        crate::app::executor::dispatch(cmd, &mut app, None, event_tx);
     });
 
     // Key assertion: no in-flight command was recorded. If the command had

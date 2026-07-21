@@ -47,6 +47,8 @@ use crate::{
     },
 };
 
+const RECENT_COMMAND_FINISH_LIMIT: usize = 64;
+
 /// Owned version of `SelectedRow` for use when the borrow can't be held.
 pub(super) enum OwnedSelectedRow {
     WorkItem(Box<WorkItem>),
@@ -435,6 +437,13 @@ pub struct App {
     pub keymap: Keymap,
     pub proto_commands: CommandQueue,
     pub in_flight: HashMap<u64, InFlightCommand>,
+    /// Command IDs whose execute acknowledgement has arrived but whose
+    /// CommandFinished event has not yet been handled.
+    pub acknowledged_dispatches: HashSet<u64>,
+    /// Recently finished commands whose execute acknowledgement was not seen
+    /// first. This bounded cache reconciles independent event/response stream
+    /// ordering without retaining commands initiated by other clients.
+    pub recent_command_finishes: VecDeque<(u64, Option<String>)>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
     pub screen: crate::widgets::screen::Screen,
@@ -537,6 +546,8 @@ impl App {
             keymap,
             proto_commands: Default::default(),
             in_flight: HashMap::new(),
+            acknowledged_dispatches: HashSet::new(),
+            recent_command_finishes: VecDeque::new(),
             pending_cancel: None,
             should_quit: false,
             screen,
@@ -593,7 +604,9 @@ impl App {
         if !self.in_flight.is_empty() {
             return true;
         }
-        if self.screen.repo_pages.values().any(|page| page.pending_actions.values().any(|a| matches!(a.status, PendingStatus::InFlight))) {
+        if self.screen.repo_pages.values().any(|page| {
+            page.pending_actions.values().any(|a| matches!(a.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+        }) {
             return true;
         }
         // Check modal stack for loading states
@@ -1250,7 +1263,7 @@ impl App {
                         self.screen.repo_pages.iter().find_map(|(repo_identity, page)| {
                             page.pending_actions
                                 .iter()
-                                .find(|(_, a)| a.command_id == command_id)
+                                .find(|(_, a)| matches!(a.status, PendingStatus::InFlight { command_id: id } if id == command_id))
                                 .map(|(id, _)| (repo_identity.clone(), id.clone()))
                         });
 
@@ -1263,6 +1276,13 @@ impl App {
                             }
                         } else if let Some(page) = self.screen.repo_pages.get_mut(&repo_identity) {
                             page.pending_actions.remove(&identity);
+                        }
+                    }
+
+                    if !self.acknowledged_dispatches.remove(&command_id) {
+                        self.recent_command_finishes.push_back((command_id, error_message));
+                        if self.recent_command_finishes.len() > RECENT_COMMAND_FINISH_LIMIT {
+                            self.recent_command_finishes.pop_front();
                         }
                     }
                 }

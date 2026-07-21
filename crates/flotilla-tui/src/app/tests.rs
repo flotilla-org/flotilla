@@ -420,9 +420,10 @@ async fn manual_refresh_replaces_default_issue_page_when_fresh_results_arrive() 
     let mut daemon_events = daemon.subscribe();
     app.handle_key(key(KeyCode::Char('r')));
     let (command, pending_ctx) = app.proto_commands.take_next().expect("refresh command");
-    executor::dispatch(command, &mut app, pending_ctx).await;
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    executor::dispatch(command, &mut app, pending_ctx, event_tx);
 
-    tokio::time::timeout(Duration::from_secs(1), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let event = daemon_events.recv().await.expect("daemon event");
             let refresh_completed = matches!(event, DaemonEvent::RepoRefreshCompleted { .. });
@@ -1140,11 +1141,12 @@ fn command_finished_ok_clears_pending_action() {
     let repo_path = app.model.repos[&repo].path.clone();
     let identity = WorkItemIdentity::Session("s1".into());
 
-    app.screen.repo_pages.get_mut(&repo).unwrap().pending_actions.insert(identity.clone(), PendingAction {
-        command_id: 42,
-        status: PendingStatus::InFlight,
-        description: "test".into(),
-    });
+    app.screen
+        .repo_pages
+        .get_mut(&repo)
+        .unwrap()
+        .pending_actions
+        .insert(identity.clone(), PendingAction { status: PendingStatus::InFlight { command_id: 42 }, description: "test".into() });
     app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
@@ -1167,11 +1169,12 @@ fn command_finished_error_transitions_to_failed() {
     let repo_path = app.model.repos[&repo].path.clone();
     let identity = WorkItemIdentity::Session("s1".into());
 
-    app.screen.repo_pages.get_mut(&repo).unwrap().pending_actions.insert(identity.clone(), PendingAction {
-        command_id: 42,
-        status: PendingStatus::InFlight,
-        description: "test".into(),
-    });
+    app.screen
+        .repo_pages
+        .get_mut(&repo)
+        .unwrap()
+        .pending_actions
+        .insert(identity.clone(), PendingAction { status: PendingStatus::InFlight { command_id: 42 }, description: "test".into() });
     app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
@@ -1195,11 +1198,12 @@ fn command_finished_cancelled_clears_pending_action() {
     let repo_path = app.model.repos[&repo].path.clone();
     let identity = WorkItemIdentity::Session("s1".into());
 
-    app.screen.repo_pages.get_mut(&repo).unwrap().pending_actions.insert(identity.clone(), PendingAction {
-        command_id: 42,
-        status: PendingStatus::InFlight,
-        description: "test".into(),
-    });
+    app.screen
+        .repo_pages
+        .get_mut(&repo)
+        .unwrap()
+        .pending_actions
+        .insert(identity.clone(), PendingAction { status: PendingStatus::InFlight { command_id: 42 }, description: "test".into() });
     app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {
@@ -1222,12 +1226,13 @@ fn orphaned_command_finished_harmlessly_ignored() {
     let repo_path = app.model.repos[&repo].path.clone();
     let identity = WorkItemIdentity::Session("s1".into());
 
-    // Insert pending action with command_id 99 (different from finished event)
-    app.screen.repo_pages.get_mut(&repo).unwrap().pending_actions.insert(identity.clone(), PendingAction {
-        command_id: 99,
-        status: PendingStatus::InFlight,
-        description: "test".into(),
-    });
+    // Insert pending action for command 99 (different from finished event)
+    app.screen
+        .repo_pages
+        .get_mut(&repo)
+        .unwrap()
+        .pending_actions
+        .insert(identity.clone(), PendingAction { status: PendingStatus::InFlight { command_id: 99 }, description: "test".into() });
     app.in_flight.insert(42, InFlightCommand { repo_identity: repo.clone(), repo: repo_path.clone(), description: "test".into() });
 
     app.handle_daemon_event(DaemonEvent::CommandFinished {

@@ -100,6 +100,12 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                     crate::terminal::restore_terminal();
                     return Ok(EventLoopExit::DaemonDisconnected);
                 }
+                Event::CommandDispatchCompleted { result, pending_ctx } => {
+                    app::executor::handle_dispatch_completion(result, pending_ctx, &mut app);
+                }
+                Event::AttachDispatchCompleted(result) => {
+                    app::executor::handle_attach_dispatch_completion(result, &mut app);
+                }
                 Event::Key(k) => {
                     // Ctrl-Z: suspend/resume (unix only)
                     #[cfg(unix)]
@@ -138,7 +144,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
 
         // ── Process queued commands ──
         while let Some((cmd, pending_ctx)) = app.proto_commands.take_next() {
-            app::executor::dispatch(cmd, &mut app, pending_ctx).await;
+            app::executor::dispatch(cmd, &mut app, pending_ctx, events.sender());
         }
         if let Some(command) = app.pending_attach_command.take() {
             events.pause_terminal_input().await;

@@ -243,8 +243,9 @@ async fn generated_table_action_completes_work() {
 
     // Dispatch the queued command through the daemon.
     let mut took_one = false;
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     while let Some((cmd, pending_ctx)) = app.proto_commands.take_next() {
-        flotilla_tui::app::executor::dispatch(cmd, &mut app, pending_ctx).await;
+        flotilla_tui::app::executor::dispatch(cmd, &mut app, pending_ctx, event_tx.clone());
         took_one = true;
     }
     assert!(took_one, "expected at least one command to be dispatched after Enter");
