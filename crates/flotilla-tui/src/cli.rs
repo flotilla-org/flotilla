@@ -172,7 +172,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
         let issue_source = project
             .issue_source
             .as_ref()
-            .map(|source| format!("{}/{}", source.service.trim_end_matches('/'), source.scope))
+            .map(|source| format!("{} / {}", source.service.trim_end_matches('/'), source.scope))
             .unwrap_or_else(|| "-".to_string());
         table.add_row(vec![
             Cell::new(format!("{}/{}", project.namespace, project.name)),

@@ -255,7 +255,7 @@ mod project_list_human {
         assert!(output.contains("flotilla/suite"));
         assert!(output.contains("project/flotilla/suite"));
         assert!(output.contains("flotilla-org/cleat, flotilla-org/flotilla"));
-        assert!(output.contains("https://linear.app/FLOT"));
+        assert!(output.contains("https://linear.app / FLOT"));
         assert!(output.contains("review-and-fix"));
         assert!(output.contains("4 repositories"));
         assert!(!output.contains("one, two, three, four"));
