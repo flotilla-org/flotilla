@@ -267,7 +267,7 @@ impl App {
         let my_node_id = self.model.my_node_id().cloned();
         if !intent.is_allowed_for_host(item, &my_node_id) {
             tracing::warn!(?intent, node_id = %item.node_id, "blocked intent on remote item");
-            self.model.status_message = Some("Cannot perform this action on a remote item".to_string());
+            self.set_status_message(Some("Cannot perform this action on a remote item".to_string()));
             return;
         }
 
@@ -323,7 +323,7 @@ impl App {
                             return;
                         }
                         Err(e) => {
-                            self.model.status_message = Some(e);
+                            self.set_status_message(Some(e));
                             return;
                         }
                     }

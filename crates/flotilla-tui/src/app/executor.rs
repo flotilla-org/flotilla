@@ -21,7 +21,7 @@ use crate::{
 /// request starts so the renderer can show an indicator while the daemon
 /// acknowledgement is outstanding.
 pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>, event_tx: mpsc::UnboundedSender<Event>) {
-    app.model.status_message = None;
+    app.set_status_message(None);
 
     // Pane attach is a query that resolves a command for the TUI process to
     // run temporarily outside raw mode. It must not go through the ordinary
@@ -41,7 +41,7 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
         let repo_identity = match repo {
             flotilla_protocol::RepoSelector::Identity(id) => id,
             _ => {
-                app.model.status_message = Some("issue query requires RepoSelector::Identity".into());
+                app.set_status_message(Some("issue query requires RepoSelector::Identity".into()));
                 return;
             }
         };
@@ -60,7 +60,7 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
                 .get(&ctx.identity)
                 .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
             {
-                app.model.status_message = Some("An action is already in progress for this item".into());
+                app.set_status_message(Some("An action is already in progress for this item".into()));
                 return;
             }
             page.pending_actions.insert(ctx.identity.clone(), action);
@@ -101,7 +101,7 @@ pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Opti
                 remove_pending_action(app, &ctx);
             }
             reset_loading_mode(app);
-            app.model.status_message = Some(message);
+            app.set_status_message(Some(message));
         }
     }
 
@@ -116,10 +116,10 @@ pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, a
             app.pending_attach_command = Some(command);
         }
         Ok(CommandValue::Error { message }) | Err(message) => {
-            app.model.status_message = Some(message);
+            app.set_status_message(Some(message));
         }
         Ok(other) => {
-            app.model.status_message = Some(format!("unexpected attach response: {other:?}"));
+            app.set_status_message(Some(format!("unexpected attach response: {other:?}")));
         }
     }
 }
@@ -200,11 +200,11 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         }
         CommandValue::Error { message } => {
             reset_loading_mode(app);
-            app.model.status_message = Some(message);
+            app.set_status_message(Some(message));
         }
         CommandValue::Cancelled => {
             reset_loading_mode(app);
-            app.model.status_message = Some("Command cancelled".into());
+            app.set_status_message(Some("Command cancelled".into()));
         }
         CommandValue::TerminalPrepared { .. }
         | CommandValue::PreparedWorkspace(_)
@@ -230,26 +230,26 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::IssuePage(_) | CommandValue::IssuesByIds { .. } => {}
         CommandValue::ConvoyCreated { name } => {
             info!(%name, "convoy created");
-            app.model.status_message = Some(format!("Convoy created: {name}"));
+            app.set_status_message(Some(format!("Convoy created: {name}")));
         }
         CommandValue::ConvoyStarted { name, attach_command, .. } => {
             info!(%name, "convoy started");
-            app.model.status_message = Some(format!("Convoy started: {name}"));
+            app.set_status_message(Some(format!("Convoy started: {name}")));
             if let Some(command) = attach_command {
                 app.pending_attach_command = Some(command);
             }
         }
         CommandValue::WorkflowTemplateApplied { name } => {
             info!(%name, "workflow template applied");
-            app.model.status_message = Some(format!("Workflow template applied: {name}"));
+            app.set_status_message(Some(format!("Workflow template applied: {name}")));
         }
         CommandValue::ProjectAdded { name } => {
             info!(%name, "project created");
-            app.model.status_message = Some(format!("Project created: {name}"));
+            app.set_status_message(Some(format!("Project created: {name}")));
         }
         CommandValue::ProjectApplied { name } => {
             info!(%name, "project applied");
-            app.model.status_message = Some(format!("Project applied: {name}"));
+            app.set_status_message(Some(format!("Project applied: {name}")));
         }
     }
 }

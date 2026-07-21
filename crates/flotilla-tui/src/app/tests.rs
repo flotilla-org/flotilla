@@ -617,6 +617,21 @@ fn new_status_message_reappears_after_dismissing_old_one() {
 }
 
 #[test]
+fn command_error_is_visible_after_a_prior_dismissal() {
+    // Regression: command errors used to write `model.status_message`
+    // directly, bypassing `set_status_message`'s un-dismiss — so one
+    // dismissed error chip muted every later error for the session.
+    let mut app = stub_app();
+    app.set_status_message(Some("provider noise".into()));
+    app.dismiss_status_item(0);
+    assert!(app.visible_status_items().is_empty());
+
+    executor::handle_result(CommandValue::Error { message: "admission rejected".into() }, &mut app);
+
+    assert_eq!(app.visible_status_items(), vec![VisibleStatusItem { id: 0, text: "ERROR admission rejected".into() }]);
+}
+
+#[test]
 fn visible_status_items_use_shared_error_and_peer_labels() {
     let mut app = stub_app();
     app.set_status_message(Some("boom".into()));
