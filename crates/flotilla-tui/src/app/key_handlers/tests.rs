@@ -60,6 +60,30 @@ fn project_issue_start_preserves_the_selected_namespace() {
     assert_eq!(intent.issue, Some(flotilla_protocol::IssueSelector::Reference(issue)));
 }
 
+#[test]
+fn convoy_delete_table_intent_confirms_then_routes_to_origin_host() {
+    let mut app = stub_app();
+    insert_peer_host(&mut app.model, "remote-host");
+
+    app.execute_table_intent(TableIntent::DeleteConvoy {
+        namespace: "other-team".into(),
+        name: "failed-convoy".into(),
+        host: Some(HostName::new("remote-host")),
+    });
+
+    assert_eq!(
+        app.screen.modal_stack.last().expect("delete confirmation modal").binding_mode(),
+        KeyBindingMode::from(BindingModeId::DeleteConfirm)
+    );
+    assert!(app.proto_commands.take_next().is_none(), "delete must wait for confirmation");
+
+    app.handle_key(key(KeyCode::Enter));
+
+    let (command, _) = app.proto_commands.take_next().expect("confirmed delete command");
+    assert_eq!(command.node_id, Some(NodeId::new("remote-host")));
+    assert_eq!(command.action, CommandAction::ConvoyDelete { namespace: Some("other-team".into()), name: "failed-convoy".into() });
+}
+
 /// Read the active RepoPage's selected flat index.
 fn active_selection(app: &App) -> Option<usize> {
     let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");

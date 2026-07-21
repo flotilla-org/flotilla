@@ -202,6 +202,11 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    ConvoyDelete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+    },
     CrewHandoff {
         context: CrewCommandContext,
         target: String,
@@ -351,6 +356,7 @@ impl Command {
             CommandAction::ArchiveSession { .. } => "Archiving session...",
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
+            CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
@@ -677,6 +683,12 @@ mod tests {
                     work: "implement".into(),
                     message: Some("done".into()),
                 },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into() },
             },
             Command {
                 node_id: None,
@@ -1196,6 +1208,12 @@ mod tests {
                 provisioning_target: None,
                 context_repo: Some(RepoSelector::Path(PathBuf::from("/tmp"))),
                 action: CommandAction::GenerateBranchName { issue_keys: vec![] },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into() },
             },
             Command {
                 node_id: None,

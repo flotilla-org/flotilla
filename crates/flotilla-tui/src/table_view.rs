@@ -291,6 +291,7 @@ pub struct DetailField {
 pub enum TableIntent {
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
+    DeleteConvoy { namespace: String, name: String, host: Option<HostName> },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
     StartConvoy { namespace: String, project: String, issue: IssueRef },
 }
@@ -619,7 +620,11 @@ fn stable_topological_vessels(vessels: &[VesselSummary]) -> Vec<&VesselSummary> 
 }
 
 fn convoy_spec() -> TableSpec<ConvoySummary> {
-    TableSpec { columns: &CONVOY_COLUMNS, actions: &[], row: RowSpec { id: convoy_id, drill: convoy_drill, describe: convoy_description } }
+    TableSpec {
+        columns: &CONVOY_COLUMNS,
+        actions: &CONVOY_ACTIONS,
+        row: RowSpec { id: convoy_id, drill: convoy_drill, describe: convoy_description },
+    }
 }
 
 fn vessel_spec() -> TableSpec<VesselProjection> {
@@ -686,6 +691,9 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 6] = [
         extract: |row| CellValue::plain(row.message.as_deref().unwrap_or_default()),
     },
 ];
+
+static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 1] =
+    [ActionSpec { id: "delete", label: "Delete convoy", key: 'd', resolve: delete_convoy }];
 
 static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     ColumnSpec {
@@ -889,6 +897,10 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
     ]
 }
 
+fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
+    Some(TableIntent::DeleteConvoy { namespace: row.namespace.clone(), name: row.name.clone(), host: row.origin_host.clone() })
+}
+
 fn scoped_issue_id(row: &ScopedIssueProjection) -> RowId {
     RowId::new(format!(
         "issue:{}:{}:{}:{}:{}",
@@ -1046,6 +1058,7 @@ mod tests {
             id: ConvoyId::new("dev", "tables"),
             namespace: "dev".into(),
             name: "tables".into(),
+            origin_host: None,
             workflow_ref: "implement-review".into(),
             phase: ConvoyPhase::Active,
             message: None,
@@ -1083,6 +1096,20 @@ mod tests {
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
         assert_eq!(view.rows[0].cells[5].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
+    }
+
+    #[test]
+    fn convoy_projection_exposes_host_routed_delete_action() {
+        let mut row = convoy(vec![]);
+        row.origin_host = Some(HostName::new("kiwi"));
+        let view = project_convoys("convoys/dev", &[&row]).expect("project table");
+
+        assert_eq!(view.rows[0].actions, vec![AvailableAction {
+            id: "delete",
+            label: "Delete convoy",
+            key: 'd',
+            intent: TableIntent::DeleteConvoy { namespace: "dev".into(), name: "tables".into(), host: Some(HostName::new("kiwi")) },
+        }]);
     }
 
     #[test]

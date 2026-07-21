@@ -23,6 +23,11 @@ pub struct ConvoyNoun {
 pub enum ConvoyVerb {
     /// Manage the work aboard a convoy's vessels
     Work(ConvoyWorkNoun),
+    /// Delete a convoy and tear down its managed resources
+    Delete {
+        /// Convoy resource name
+        name: String,
+    },
     /// Start a convoy through Project-scoped admission completion
     Start {
         /// Project whose definitions and repository set admission snapshots
@@ -139,6 +144,21 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
+            ConvoyVerb::Delete { name } => {
+                if self.subject.is_some() {
+                    return Err("convoy delete takes its name after `delete`".to_string());
+                }
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: None,
+                        context_repo: None,
+                        action: CommandAction::ConvoyDelete { namespace: None, name },
+                    },
+                    repo: RepoContext::None,
+                    host: HostResolution::Local,
+                })
+            }
             ConvoyVerb::Start {
                 project,
                 issue,
@@ -263,6 +283,9 @@ impl std::fmt::Display for ConvoyNoun {
                         }
                     }
                 }
+            }
+            ConvoyVerb::Delete { name } => {
+                write!(f, " delete {}", quote_value(name))?;
             }
             ConvoyVerb::Start {
                 project,
@@ -394,6 +417,26 @@ mod tests {
     #[test]
     fn round_trip_complete() {
         assert_round_trip::<ConvoyNoun>(&["convoy", "convoy-a", "work", "implement", "complete"]);
+    }
+
+    #[test]
+    fn convoy_delete_resolves() {
+        let resolved = parse(&["convoy", "delete", "failed-convoy"]).resolve().expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".into() },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
+    fn round_trip_delete() {
+        assert_round_trip::<ConvoyNoun>(&["convoy", "delete", "failed-convoy"]);
     }
 
     #[test]

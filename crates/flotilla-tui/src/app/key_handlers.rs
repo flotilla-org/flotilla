@@ -6,7 +6,7 @@ use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::TableIntent,
-    widgets::InteractiveWidget,
+    widgets::{convoy_delete_confirm::ConvoyDeleteConfirmWidget, InteractiveWidget},
 };
 
 impl App {
@@ -385,6 +385,22 @@ impl App {
             }
             TableIntent::AttachPane { reference, host } => {
                 self.proto_commands.push(self.command(CommandAction::AttachTransient { reference, host: Some(host) }));
+                return;
+            }
+            TableIntent::DeleteConvoy { namespace, name, host } => {
+                let node_id = match host.as_ref() {
+                    Some(host) => match self.panel_target_node(host) {
+                        Ok(node_id) => node_id,
+                        Err(message) => {
+                            self.set_status_message(Some(message));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                let mut command = self.command(CommandAction::ConvoyDelete { namespace: Some(namespace.clone()), name: name.clone() });
+                command.node_id = node_id;
+                self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command)));
                 return;
             }
             TableIntent::ForceCompleteWork { convoy, vessel, host } => {
