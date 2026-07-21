@@ -3,18 +3,26 @@
 //! compare:
 //!
 //! ```sh
-//! cargo run -p flotilla-tui --example splash_probe [query_timeout_ms]
+//! cargo run -p flotilla-tui --example splash_probe [query_timeout_ms] [--uncapped]
 //! ```
+//!
+//! By default the draw applies the same native-resolution cap as the real
+//! splash (`flotilla_tui::splash::splash_scale`). Pass `--uncapped` to
+//! transmit at the full fit-to-area size instead — useful for stressing a
+//! multiplexer's ingest throughput with a deliberately large payload.
 
 use std::time::{Duration, Instant};
 
+use flotilla_tui::splash::splash_scale;
 use ratatui_image::{
     picker::{cap_parser::QueryStdioOptions, Picker},
     StatefulImage,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let timeout_ms = std::env::args().nth(1).and_then(|raw| raw.parse::<u64>().ok()).unwrap_or(2000);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let uncapped = args.iter().any(|arg| arg == "--uncapped");
+    let timeout_ms = args.iter().find_map(|raw| raw.parse::<u64>().ok()).unwrap_or(2000);
 
     let img_bytes = include_bytes!("../../../assets/splash.webp");
     let t = Instant::now();
@@ -46,12 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal: &mut ratatui::DefaultTerminal,
         protocol: &mut ratatui_image::protocol::StatefulProtocol,
         (img_w, img_h): (f64, f64),
+        pixel_font_size: Option<(u16, u16)>,
         rendered: &mut (u16, u16),
     ) -> std::io::Result<()> {
         terminal.draw(|f| {
             use ratatui::layout::{Constraint, Flex, Layout};
             let area = f.area();
-            let scale = (area.width as f64 / img_w).min(area.height as f64 * 2.0 / img_h);
+            let scale = splash_scale(img_w, img_h, area.width, area.height, pixel_font_size);
             let rw = (img_w * scale) as u16;
             let rh = (img_h * scale / 2.0) as u16;
             *rendered = (rw.min(area.width), rh.min(area.height));
@@ -62,18 +71,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
+    // Mirror the real splash: pixel protocols are capped at native resolution
+    // unless --uncapped asks for the full fit-to-area payload.
+    let pixel_font_size = (!uncapped && !matches!(protocol_type, ratatui_image::picker::ProtocolType::Halfblocks)).then_some(font_size);
+
     let mut rendered = (0u16, 0u16);
 
     // First draw: resize + encode + transmit image data.
     let t = Instant::now();
-    draw(&mut terminal, &mut protocol, (img_w, img_h), &mut rendered)?;
+    draw(&mut terminal, &mut protocol, (img_w, img_h), pixel_font_size, &mut rendered)?;
     let first_draw = t.elapsed();
 
     std::thread::sleep(Duration::from_millis(400));
 
     // Second draw: protocol already encoded; measures placement/redraw only.
     let t = Instant::now();
-    draw(&mut terminal, &mut protocol, (img_w, img_h), &mut rendered)?;
+    draw(&mut terminal, &mut protocol, (img_w, img_h), pixel_font_size, &mut rendered)?;
     let second_draw = t.elapsed();
 
     std::thread::sleep(Duration::from_millis(400));
@@ -96,6 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("  protocol picked:    {protocol_type:?}");
     println!("  font size:          {font_size:?}");
+    println!("  native-res cap:     {}", if pixel_font_size.is_some() { "applied (as in production splash)" } else { "off" });
     println!(
         "  render area:        {}x{} cells = {}x{} px (~{} KiB raw rgba, ~{} KiB base64)",
         cells.0,
