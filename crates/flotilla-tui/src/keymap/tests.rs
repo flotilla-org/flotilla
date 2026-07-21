@@ -15,6 +15,8 @@ fn round_trip_non_dispatch_actions() {
     let actions = [
         Action::SelectNext,
         Action::SelectPrev,
+        Action::NextPanel,
+        Action::PrevPanel,
         Action::Confirm,
         Action::Dismiss,
         Action::Quit,
@@ -85,6 +87,8 @@ fn all_actions_have_descriptions() {
     let all_actions: Vec<Action> = vec![
         Action::SelectNext,
         Action::SelectPrev,
+        Action::NextPanel,
+        Action::PrevPanel,
         Action::Confirm,
         Action::Dismiss,
         Action::Quit,
@@ -144,6 +148,17 @@ fn defaults_resolve_shared_navigation() {
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(up)), Some(Action::SelectPrev));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(enter)), Some(Action::Confirm));
     assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Normal), crokey::key!(esc)), Some(Action::Dismiss));
+}
+
+#[test]
+fn defaults_resolve_project_panel_navigation() {
+    let km = Keymap::defaults();
+    let mode = KeyBindingMode::from(BindingModeId::Project);
+
+    assert_eq!(km.resolve(&mode, kc(KeyCode::Tab, KeyModifiers::NONE)), Some(Action::NextPanel));
+    assert_eq!(km.resolve(&mode, kc(KeyCode::Tab, KeyModifiers::SHIFT)), Some(Action::PrevPanel));
+    assert_eq!(km.resolve(&mode, kc(KeyCode::BackTab, KeyModifiers::NONE)), Some(Action::PrevPanel));
+    assert_eq!(km.resolve(&mode, kc(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(Action::PrevPanel));
 }
 
 #[test]

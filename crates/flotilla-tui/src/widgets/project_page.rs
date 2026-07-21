@@ -163,6 +163,22 @@ impl ProjectPageWidget {
         }
     }
 
+    fn select_panel_delta(layouts: &[PanelLayout<'_>], state: &mut ProjectTableState, delta: isize) {
+        let Some(index) = layouts.iter().position(|layout| layout.panel.kind == state.active()) else { return };
+        let candidate = if delta > 0 {
+            index.checked_add(1).filter(|candidate| *candidate < layouts.len())
+        } else if delta < 0 {
+            index.checked_sub(1)
+        } else {
+            None
+        };
+        let Some(candidate) = candidate else { return };
+        let next = &layouts[candidate];
+        state.set_active(next.panel.kind);
+        state.table_mut(next.panel.kind).reconcile(&next.panel.table);
+        state.focus_header();
+    }
+
     fn fetch_more_query(layouts: &[PanelLayout<'_>], state: &ProjectTableState, trigger: super::table::FetchTrigger) -> Option<QueryId> {
         let layout = layouts.iter().find(|layout| layout.panel.kind == state.active())?;
         if layout.panel.kind != ProjectPanelKind::Issues
@@ -286,6 +302,18 @@ impl InteractiveWidget for ProjectPageWidget {
                 self.ensure_active_visible(&layouts, state);
                 Outcome::Consumed
             }
+            Action::NextPanel => {
+                let state = ctx.views.active_project_table_state_mut();
+                Self::select_panel_delta(&layouts, state, 1);
+                self.ensure_active_visible(&layouts, state);
+                Outcome::Consumed
+            }
+            Action::PrevPanel => {
+                let state = ctx.views.active_project_table_state_mut();
+                Self::select_panel_delta(&layouts, state, -1);
+                self.ensure_active_visible(&layouts, state);
+                Outcome::Consumed
+            }
             Action::Confirm => {
                 let action = Self::active_action(&layouts, ctx.views.active_project_table_state());
                 if let Some(action) = action {
@@ -388,7 +416,7 @@ impl InteractiveWidget for ProjectPageWidget {
     }
 
     fn binding_mode(&self) -> KeyBindingMode {
-        BindingModeId::Convoys.into()
+        BindingModeId::Project.into()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -491,6 +519,42 @@ mod tests {
 
         assert!(state.header_focused());
         assert!(matches!(ProjectPageWidget::active_action(&layouts, &state), Some(AppAction::DrillView(ViewAddress::Convoys { .. }))));
+    }
+
+    #[test]
+    fn panel_navigation_crosses_a_growing_issue_window_without_disabling_fetch_on_scroll() {
+        let mut panels = vec![
+            panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "issue-0"),
+            panel(ProjectPanelKind::Independents, "Independents", "independents?project=flotilla%2Froadmap", "governor"),
+        ];
+        for index in 1..8 {
+            let mut row = panels[0].table.rows[0].clone();
+            row.id = RowId::new(format!("issue-{index}"));
+            panels[0].table.rows.push(row);
+        }
+        panels[0].table.meta.has_more = true;
+
+        let mut state = ProjectTableState::default();
+        state.set_active(ProjectPanelKind::Issues);
+        state.focus_rows();
+        state.table_mut(ProjectPanelKind::Issues).select_index(&panels[0].table, 0);
+
+        for keypress in 0..20 {
+            let layouts = ProjectPageWidget::layouts(&panels);
+            ProjectPageWidget::select_delta(&layouts, &mut state, 1);
+            if ProjectPageWidget::fetch_more_query(&layouts, &state, crate::widgets::table::FetchTrigger::NearBottom).is_some() {
+                let mut row = panels[0].table.rows[0].clone();
+                row.id = RowId::new(format!("fetched-{keypress}"));
+                panels[0].table.rows.push(row);
+            }
+            ProjectPageWidget::reconcile(&ProjectPageWidget::layouts(&panels), &mut state);
+        }
+
+        assert!(panels[0].table.rows.len() > 8, "near-bottom row navigation should still fetch more issues");
+        assert_eq!(state.active(), ProjectPanelKind::Issues, "the growing issue window should reproduce the row-navigation trap");
+        ProjectPageWidget::select_panel_delta(&ProjectPageWidget::layouts(&panels), &mut state, 1);
+        assert_eq!(state.active(), ProjectPanelKind::Independents);
+        assert!(state.header_focused());
     }
 
     #[test]

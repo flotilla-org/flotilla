@@ -31,6 +31,8 @@ pub enum BindingModeId {
     /// shell and therefore no tab bindings (ADR 0013).
     TabShell,
     Convoys,
+    /// Navigation between panels on the composite Project page.
+    Project,
     /// Capabilities present only on demand-backed table families.
     DemandTable,
     /// Inner focus on the Convoys tab — the vessel tree on the right pane.
@@ -170,6 +172,10 @@ pub static BINDINGS: &[Binding] = &[
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
     h(BindingModeId::DemandTable, "f", Action::FetchMore, "Fetch more"),
+    h(BindingModeId::Project, "tab", Action::NextPanel, "Next panel"),
+    b(BindingModeId::Project, "S-tab", Action::PrevPanel),
+    b(BindingModeId::Project, "backtab", Action::PrevPanel),
+    b(BindingModeId::Project, "S-backtab", Action::PrevPanel),
     // Legacy mode retained only so existing user keybinding files still parse
     // while the table slices land; no View selects it after #733.
     // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to
@@ -468,6 +474,7 @@ fn parse_key_string(s: &str) -> KeyCombination {
         "esc" => KeyCode::Esc,
         "space" => KeyCode::Char(' '),
         "tab" => KeyCode::Tab,
+        "backtab" => KeyCode::BackTab,
         "up" => KeyCode::Up,
         "down" => KeyCode::Down,
         "left" => KeyCode::Left,
@@ -501,6 +508,7 @@ fn display_for_combo(combo: &KeyCombination) -> (String, KeyCode, KeyModifiers) 
         KeyCode::Enter => "ENT".into(),
         KeyCode::Esc => "ESC".into(),
         KeyCode::Tab => "TAB".into(),
+        KeyCode::BackTab => "BACKTAB".into(),
         KeyCode::Up => "UP".into(),
         KeyCode::Down => "DOWN".into(),
         KeyCode::Left => "LEFT".into(),
