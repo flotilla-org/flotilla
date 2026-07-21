@@ -249,8 +249,13 @@ impl InteractiveWidget for StatusBarWidget {
 
 /// Resolve the active in-flight task description for the current repo.
 pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<TaskSection> {
-    let active_repo = model.active_repo.as_ref()?;
-    let repo_cmds: Vec<(&u64, &InFlightCommand)> = in_flight.iter().filter(|(_, cmd)| &cmd.repo_identity == active_repo).collect();
+    let repo_cmds: Vec<(&u64, &InFlightCommand)> = in_flight
+        .iter()
+        .filter(|(_, cmd)| match model.active_repo.as_ref() {
+            Some(active_repo) => &cmd.repo_identity == active_repo,
+            None => cmd.repo_identity.authority.is_empty() && cmd.repo_identity.path.is_empty(),
+        })
+        .collect();
 
     // Highest command ID = most recently started (IDs are monotonically increasing AtomicU64).
     let (_, most_recent) = repo_cmds.iter().max_by_key(|(id, _)| *id)?;
@@ -313,7 +318,7 @@ pub(crate) fn resolve_task_from_fragment(fragment: &StatusFragment) -> Option<Ta
 mod tests {
     use std::path::PathBuf;
 
-    use flotilla_protocol::RepoLabels;
+    use flotilla_protocol::{RepoIdentity, RepoLabels};
     use ratatui::layout::Rect;
 
     use super::*;
@@ -387,6 +392,23 @@ mod tests {
 
         let task = active_task(&model, &in_flight).expect("should have an active task");
         assert_eq!(task.description, "only command");
+    }
+
+    #[test]
+    fn active_task_shows_context_free_command_on_project_view() {
+        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
+        let mut model = TuiModel::from_repo_info(vec![ri]);
+        model.active_repo = None;
+        let mut in_flight = HashMap::new();
+        in_flight.insert(42, InFlightCommand {
+            repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
+            repo: PathBuf::new(),
+            description: "Starting convoy...".into(),
+        });
+
+        let task = active_task(&model, &in_flight).expect("project view should show context-free command progress");
+
+        assert_eq!(task.description, "Starting convoy...");
     }
 
     #[test]
