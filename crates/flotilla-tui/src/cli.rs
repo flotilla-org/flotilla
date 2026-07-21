@@ -159,7 +159,8 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_header(vec!["Project", "Display Name", "Repositories", "Issue Source", "Workflow", "Address"]);
     for project in &response.projects {
-        let repositories = if project.repository_count <= 3 {
+        let repository_count = project.repositories.len();
+        let repositories = if repository_count <= 3 {
             project
                 .repositories
                 .iter()
@@ -167,7 +168,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            format!("{} repositories", project.repository_count)
+            format!("{repository_count} repositories")
         };
         let issue_source = project
             .issue_source

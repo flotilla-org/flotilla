@@ -131,7 +131,6 @@ pub struct ProjectListEntry {
     pub name: String,
     pub display_name: String,
     pub address: ViewAddress,
-    pub repository_count: usize,
     pub repositories: Vec<ProjectListRepository>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_source: Option<IssueSource>,
@@ -160,7 +159,6 @@ mod project_list_tests {
                 .name("platform".to_string())
                 .display_name("Platform".to_string())
                 .address(ViewAddress::Project { namespace: "flotilla".into(), name: "platform".into() })
-                .repository_count(1)
                 .repositories(vec![ProjectListRepository {
                     key: RepositoryKey("repo-key".into()),
                     slug: Some("flotilla-org/flotilla".into()),
@@ -178,7 +176,6 @@ mod project_list_tests {
                     "name": "platform",
                     "display_name": "Platform",
                     "address": "project/flotilla/platform",
-                    "repository_count": 1,
                     "repositories": [{"key": "repo-key", "slug": "flotilla-org/flotilla"}],
                     "issue_source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"},
                     "default_workflow_ref": "single-agent-contained"

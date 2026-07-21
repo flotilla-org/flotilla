@@ -3327,7 +3327,6 @@ impl InProcessDaemon {
                     .name(project.metadata.name.clone())
                     .display_name(project.spec.display_name)
                     .address(ViewAddress::Project { namespace: project.metadata.namespace, name: project.metadata.name })
-                    .repository_count(repositories.len())
                     .repositories(repositories)
                     .maybe_issue_source(project.spec.issue_source)
                     .default_workflow_ref(project.spec.default_workflow_ref)
