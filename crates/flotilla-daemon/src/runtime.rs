@@ -2605,21 +2605,10 @@ mod tests {
             })
             .await
             .expect("create unknown convoy");
-        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::ConvoyCreated { name: "unknown-convoy".to_string() });
-        wait_until(|| {
-            let convoys = convoys.clone();
-            async move {
-                convoys
-                    .get("unknown-convoy")
-                    .await
-                    .ok()
-                    .and_then(|convoy| convoy.status)
-                    .is_some_and(|status| status.phase == ConvoyPhase::Failed)
-            }
-        })
-        .await;
-        let failed = convoys.get("unknown-convoy").await.expect("unknown convoy").status.expect("unknown status");
-        assert_eq!(failed.work.get("implement").and_then(|task| task.message.as_deref()), Some("unknown agent capability `architect`"));
+        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::Error {
+            message: "unknown agent capability `architect`".to_string()
+        });
+        assert!(convoys.get("unknown-convoy").await.is_err(), "rejected convoy should not be persisted");
 
         for handle in controller_handles {
             handle.abort();
