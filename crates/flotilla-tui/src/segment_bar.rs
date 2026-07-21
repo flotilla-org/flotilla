@@ -29,6 +29,12 @@ impl RenderedItem {
         Self { spans, width }
     }
 
+    /// Return the display-cell offset of the last `needle` in the rendered text.
+    pub(crate) fn last_cell_offset_of(&self, needle: &str) -> Option<usize> {
+        let text: String = self.spans.iter().map(|span| span.content.as_ref()).collect();
+        text.rfind(needle).map(|byte_offset| text[..byte_offset].width())
+    }
+
     pub fn empty() -> Self {
         Self { spans: vec![], width: 0 }
     }

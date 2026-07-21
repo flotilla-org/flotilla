@@ -201,17 +201,23 @@ impl Tabs {
             BarKind::Pipe => Box::new(ThemedTabBarStyle { theme, site: &theme.tab_bar }),
             BarKind::Chevron => Box::new(ThemedRibbonStyle { theme, site: &theme.tab_bar }),
         };
+        let close_offset = (active_idx != 0)
+            .then(|| tab_style.render_item(&items[active_idx]).last_cell_offset_of(CLOSE_AFFORDANCE))
+            .flatten()
+            .and_then(|offset| u16::try_from(offset).ok());
         let hits = segment_bar::render(&items, tab_style.as_ref(), area, frame.buffer_mut());
 
-        // Map hit regions to tab areas; carve the close affordance out of
-        // the active tab's segment (the trailing "× " cell pair).
+        // Map hit regions to tab areas; carve the close affordance's exact
+        // rendered cell out of the active tab's segment.
         self.tab_areas.clear();
         self.close_area = None;
         for hit in hits {
             if let Some(tab_id) = tab_ids.get(hit.index) {
-                if *tab_id == TabId::View(active_idx) && active_idx != 0 && hit.area.width >= 3 {
-                    let close = Rect::new(hit.area.x + hit.area.width - 3, hit.area.y, 3, hit.area.height);
-                    self.close_area = Some((active_idx, close));
+                if *tab_id == TabId::View(active_idx) {
+                    if let Some(offset) = close_offset.filter(|&offset| offset < hit.area.width) {
+                        let close = Rect::new(hit.area.x + offset, hit.area.y, 1, hit.area.height);
+                        self.close_area = Some((active_idx, close));
+                    }
                 }
                 self.tab_areas.insert(*tab_id, hit.area);
             }
@@ -326,7 +332,7 @@ impl Tabs {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::layout::Rect;
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
 
     use super::*;
     use crate::app::test_support::stub_app_with_repos;
@@ -362,6 +368,35 @@ mod tests {
         tabs.close_area = Some((2, Rect::new(17, 0, 3, 1)));
         assert_eq!(tabs.handle_click(12, 0), TabBarAction::SwitchTo(2));
         assert_eq!(tabs.handle_click(18, 0), TabBarAction::Close(2));
+    }
+
+    #[test]
+    fn rendered_close_affordance_is_the_only_close_hotspot_for_every_bar_style() {
+        for theme in [Theme::classic(), Theme::catppuccin_mocha()] {
+            let mut app = stub_app_with_repos(2);
+            let active_idx = app.views.active_index();
+            app.views.get_mut(active_idx).expect("active view").label_override = Some("custom × label".to_string());
+            let mut tabs = Tabs::new();
+            let mut terminal = Terminal::new(TestBackend::new(80, 1)).expect("terminal");
+
+            terminal.draw(|frame| tabs.render(&app.views, &app.model, &mut app.ui, &theme, frame, frame.area())).expect("render tabs");
+
+            let active_area = *tabs.tab_areas().get(&TabId::View(active_idx)).expect("active tab area");
+            let close_x = (active_area.x..active_area.right())
+                .rev()
+                .find(|&x| terminal.backend().buffer()[(x, active_area.y)].symbol() == CLOSE_AFFORDANCE)
+                .expect("rendered close affordance");
+
+            for (tab_id, area) in tabs.tab_areas() {
+                let TabId::View(idx) = *tab_id else {
+                    continue;
+                };
+                for x in area.x..area.right() {
+                    let expected = if idx == active_idx && x == close_x { TabBarAction::Close(idx) } else { TabBarAction::SwitchTo(idx) };
+                    assert_eq!(tabs.handle_click(x, area.y), expected, "unexpected hit at x={x} for {:?}", theme.tab_bar.kind);
+                }
+            }
+        }
     }
 
     // ── Drag ──
