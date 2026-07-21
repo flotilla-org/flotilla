@@ -2958,6 +2958,50 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
 }
 
 #[tokio::test]
+async fn convoy_delete_command_targets_requested_namespace_or_configured_default() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    daemon.set_provisioning_namespace("custom-ns".to_string()).await;
+    let convoy_spec = ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build();
+    let convoys = daemon.resource_backend().using::<Convoy>("custom-ns");
+    convoys.create(&empty_input_meta("failed-convoy"), &convoy_spec).await.expect("convoy create should succeed");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".to_string() },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert!(matches!(convoys.get("failed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+
+    let explicit_convoys = daemon.resource_backend().using::<Convoy>("explicit-ns");
+    explicit_convoys.create(&empty_input_meta("completed-convoy"), &convoy_spec).await.expect("convoy create should succeed");
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: Some("explicit-ns".to_string()), name: "completed-convoy".to_string() },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert!(matches!(explicit_convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
 async fn normalize_local_provider_hosts_uses_mount_metadata_for_provisioned_checkouts() {
     struct TestProvisionedEnvironment {
         id: EnvironmentId,

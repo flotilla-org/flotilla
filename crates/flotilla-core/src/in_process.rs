@@ -4438,6 +4438,21 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = match namespace {
+                Some(namespace) => namespace.clone(),
+                None => self.provisioning_namespace().await,
+            };
+            let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
+            let result = match convoys.delete(name).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
         if let flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, work, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = self.provisioning_namespace().await;

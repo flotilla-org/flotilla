@@ -3,6 +3,7 @@ pub mod branch_input;
 pub mod close_confirm;
 pub mod columns;
 pub mod command_palette;
+pub mod convoy_delete_confirm;
 pub mod delete_confirm;
 pub mod describe;
 pub mod event_log;

@@ -143,6 +143,7 @@ pub struct ConvoySummary {
     pub id: ConvoyId,
     pub namespace: String,
     pub name: String,
+    pub origin_host: Option<HostName>,
     pub workflow_ref: String,
     pub phase: ConvoyPhase,
     pub message: Option<String>,
@@ -162,6 +163,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             id: ConvoyId::for_resource(&row.resource),
             namespace: row.resource.namespace.clone(),
             name: row.name.clone(),
+            origin_host: row.resource.host.clone(),
             workflow_ref: row.workflow_ref.clone(),
             phase: row.phase.into(),
             message: row.message.clone(),
@@ -218,4 +220,23 @@ pub struct ConvoyFixtureDelta {
     pub namespace: String,
     pub changed: Vec<ConvoySummary>,
     pub removed: Vec<ConvoyId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn convoy_summary_preserves_origin_host_for_action_routing() {
+        let row = wire::ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "remote-convoy").on_host(HostName::new("feta")))
+            .name("remote-convoy")
+            .workflow_ref("review-and-fix")
+            .phase(wire::ConvoyPhase::Failed)
+            .build();
+
+        let summary = ConvoySummary::from(&row);
+
+        assert_eq!(summary.origin_host, Some(HostName::new("feta")));
+    }
 }

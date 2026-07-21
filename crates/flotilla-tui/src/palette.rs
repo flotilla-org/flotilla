@@ -809,6 +809,7 @@ mod tests {
             id: ConvoyId::new("flotilla", name),
             namespace: "flotilla".into(),
             name: name.into(),
+            origin_host: None,
             workflow_ref: "wf".into(),
             phase: ConvoyPhase::Active,
             message: None,

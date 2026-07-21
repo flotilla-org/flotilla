@@ -25,7 +25,10 @@ use test_support::*;
 use tokio::sync::{watch, Mutex as TokioMutex, Semaphore};
 
 use super::*;
-use crate::widgets::InteractiveWidget;
+use crate::{
+    binding_table::{BindingModeId, KeyBindingMode},
+    widgets::{table_action_menu::TableActionMenuWidget, InteractiveWidget},
+};
 
 fn insert_host(
     model: &mut TuiModel,
@@ -1554,7 +1557,10 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
         HostName, ResourceRef,
     };
 
-    let resource = ResourceRef::new("flotilla.work/v1", "Convoy", &convoy.namespace, &convoy.name);
+    let mut resource = ResourceRef::new("flotilla.work/v1", "Convoy", &convoy.namespace, &convoy.name);
+    if let Some(host) = convoy.origin_host {
+        resource = resource.on_host(host);
+    }
     let vessels = convoy
         .vessels
         .into_iter()
@@ -1686,6 +1692,7 @@ fn test_convoy(
         id: crate::convoy_model::ConvoyId::new(namespace, name),
         namespace: namespace.into(),
         name: name.into(),
+        origin_host: None,
         workflow_ref: "wf".into(),
         phase,
         message: None,
@@ -2085,14 +2092,20 @@ fn describe_opens_for_the_selected_table_row() {
 }
 
 #[test]
-fn action_menu_reports_when_the_selected_table_row_has_no_actions() {
+fn convoy_delete_action_menu_opens_confirmation() {
     let mut app = stub_app();
     app.handle_daemon_event(result_set_event(Box::new(make_convoy_fixture_snapshot(&["alpha"]))));
     app.switch_tab(1);
 
     app.handle_key(key(KeyCode::Char('.')));
+    assert!(app.screen.modal_stack.last().is_some_and(|widget| widget.as_any().is::<TableActionMenuWidget>()));
 
-    assert_eq!(app.model.status_message.as_deref(), Some("No actions available for the selected row"));
+    app.handle_key(key(KeyCode::Char('d')));
+
+    assert_eq!(
+        app.screen.modal_stack.last().expect("delete confirmation modal").binding_mode(),
+        KeyBindingMode::from(BindingModeId::DeleteConfirm)
+    );
 }
 
 #[test]
