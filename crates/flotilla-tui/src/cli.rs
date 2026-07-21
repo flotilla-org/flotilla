@@ -439,6 +439,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::WorkflowTemplateApplied { name } => format!("workflow template applied: {name}"),
         CommandValue::ProjectAdded { name } => format!("project added: {name}"),
         CommandValue::ProjectApplied { name } => format!("project applied: {name}"),
+        CommandValue::PlacementPolicyApplied { name } => format!("placement policy applied: {name}"),
     }
 }
 

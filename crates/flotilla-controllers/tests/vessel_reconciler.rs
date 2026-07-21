@@ -677,6 +677,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
                 default_cwd: None,
                 env: Default::default(),
                 checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace/".to_string() },
+                agent_adapters: Vec::new(),
             })
             .build(),
     )
@@ -875,6 +876,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
                 default_cwd: None,
                 env: Default::default(),
                 checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+                agent_adapters: Vec::new(),
             })
             .build(),
     )
@@ -1065,6 +1067,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
             default_cwd: None,
             env: Default::default(),
             checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+            agent_adapters: Vec::new(),
         })
         .build(),
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree",
@@ -1090,6 +1093,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
             default_cwd: Some("/app".to_string()),
             env: Default::default(),
             checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+            agent_adapters: Vec::new(),
         })
         .build(),
     "/workspace",

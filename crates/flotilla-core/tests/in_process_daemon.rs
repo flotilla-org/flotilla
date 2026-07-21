@@ -671,6 +671,7 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
                     default_cwd: Some("/workspace".into()),
                     env: Default::default(),
                     checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".into() },
+                    agent_adapters: Vec::new(),
                 })
                 .build(),
         )

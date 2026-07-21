@@ -32,8 +32,8 @@ use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
     CrewSource, Environment as ResourceEnvironment, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
-    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
     ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
     TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
     Vessel, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL,
@@ -538,6 +538,13 @@ fn parse_and_validate_workflow_template_yaml(yaml: &str) -> Result<WorkflowTempl
 
 fn parse_project_yaml(yaml: &str) -> Result<ProjectSpec, String> {
     serde_yml::from_str(yaml).map_err(|err| format!("invalid project YAML: {err}"))
+}
+
+fn parse_and_validate_placement_policy_yaml(yaml: &str) -> Result<PlacementPolicySpec, String> {
+    let spec: PlacementPolicySpec = serde_yml::from_str(yaml).map_err(|err| format!("invalid placement policy YAML: {err}"))?;
+    flotilla_resources::validate_placement_policy(&spec)
+        .map_err(|errors| format!("placement policy validation failed: {}", errors.join("; ")))?;
+    Ok(spec)
 }
 
 fn adopted_checkout_name(convoy_name: &str) -> String {
@@ -4810,6 +4817,42 @@ impl InProcessDaemon {
                     }
                     Err(message) => flotilla_protocol::CommandValue::Error { message },
                 },
+                Err(err) => flotilla_protocol::CommandValue::Error { message: err },
+            };
+            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity,
+                repo: None,
+                result,
+            });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::PlacementPolicyApply { name, spec_yaml } = &command.action {
+            let empty_identity = empty_repo_identity();
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: self.node_id.clone(),
+                repo_identity: empty_identity.clone(),
+                repo: None,
+                description: command.description().to_string(),
+            });
+            let namespace = self.provisioning_namespace().await;
+            let policies = self.resource_backend.clone().using::<PlacementPolicy>(&namespace);
+            let result = match parse_and_validate_placement_policy_yaml(spec_yaml) {
+                Ok(spec) => {
+                    let meta = InputMeta::builder().name(name.clone()).build();
+                    let outcome = match policies.get(name).await {
+                        Ok(existing) => policies.update(&meta, &existing.metadata.resource_version, &spec).await.map(|_| ()),
+                        Err(ResourceError::NotFound { .. }) => policies.create(&meta, &spec).await.map(|_| ()),
+                        Err(err) => Err(err),
+                    };
+                    match outcome {
+                        Ok(()) => flotilla_protocol::CommandValue::PlacementPolicyApplied { name: name.clone() },
+                        Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                    }
+                }
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {

@@ -182,6 +182,7 @@ pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace:
                 default_cwd: fixture.default_cwd,
                 env: Default::default(),
                 checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: fixture.mount_path },
+                agent_adapters: Vec::new(),
             })
             .build(),
     )

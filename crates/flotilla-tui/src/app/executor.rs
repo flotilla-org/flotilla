@@ -251,6 +251,10 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
             info!(%name, "project applied");
             app.model.status_message = Some(format!("Project applied: {name}"));
         }
+        CommandValue::PlacementPolicyApplied { name } => {
+            info!(%name, "placement policy applied");
+            app.model.status_message = Some(format!("Placement policy applied: {name}"));
+        }
     }
 }
 

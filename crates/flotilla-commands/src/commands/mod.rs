@@ -6,6 +6,7 @@ pub mod crew;
 pub mod environment;
 pub mod host;
 pub mod issue;
+pub mod placement_policy;
 pub mod project;
 pub mod repo;
 pub mod workflow_template;

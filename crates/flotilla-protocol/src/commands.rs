@@ -257,6 +257,10 @@ pub enum CommandAction {
         name: String,
         spec_yaml: String,
     },
+    PlacementPolicyApply {
+        name: String,
+        spec_yaml: String,
+    },
     TeleportSession {
         session_id: String,
         branch: Option<String>,
@@ -365,6 +369,7 @@ impl Command {
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectAdd { .. } => "Adding project...",
             CommandAction::ProjectApply { .. } => "Applying project...",
+            CommandAction::PlacementPolicyApply { .. } => "Applying placement policy...",
             CommandAction::TeleportSession { .. } => "Teleporting session...",
             CommandAction::TrackRepoPath { .. } => "Tracking repository...",
             CommandAction::UntrackRepo { .. } => "Untracking repository...",
@@ -501,6 +506,9 @@ pub enum CommandValue {
         name: String,
     },
     ProjectApplied {
+        name: String,
+    },
+    PlacementPolicyApplied {
         name: String,
     },
 }
@@ -755,6 +763,12 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ProjectApply { name: "my-project".into(), spec_yaml: "repositories: []\n".into() },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::PlacementPolicyApply { name: "docker-worktree".into(), spec_yaml: "pool: docker\n".into() },
             },
             Command {
                 node_id: Some(NodeId::new("feta")),
@@ -1043,6 +1057,7 @@ mod tests {
             CommandValue::WorkflowTemplateApplied { name: "scratch".into() },
             CommandValue::ProjectAdded { name: "my-project".into() },
             CommandValue::ProjectApplied { name: "my-project".into() },
+            CommandValue::PlacementPolicyApplied { name: "docker-worktree".into() },
         ];
 
         for result in cases {

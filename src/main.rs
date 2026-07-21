@@ -135,6 +135,8 @@ enum SubCommand {
     WorkflowTemplate(flotilla_commands::commands::workflow_template::WorkflowTemplateNoun),
     /// Manage projects
     Project(flotilla_commands::commands::project::ProjectNoun),
+    /// Manage placement policies
+    PlacementPolicy(flotilla_commands::commands::placement_policy::PlacementPolicyNoun),
 
     /// Generate completions (hidden, called by shell scripts)
     #[command(hide = true)]
@@ -273,6 +275,7 @@ async fn main() -> Result<()> {
         }
         Some(SubCommand::WorkflowTemplate(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
         Some(SubCommand::Project(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
+        Some(SubCommand::PlacementPolicy(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
 
         Some(SubCommand::Complete { line, cursor_pos }) => {
             run_complete(&line, cursor_pos);

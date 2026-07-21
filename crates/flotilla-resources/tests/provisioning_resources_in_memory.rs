@@ -171,6 +171,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
             default_cwd: Some("/workspace".to_string()),
             env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
             checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
+            agent_adapters: Vec::new(),
         })
         .build();
 

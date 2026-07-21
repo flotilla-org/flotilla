@@ -463,6 +463,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
                             default_cwd: Some("/workspace".to_string()),
                             env: BTreeMap::new(),
                             checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
+                            agent_adapters: Vec::new(),
                         })
                         .build(),
                 )
