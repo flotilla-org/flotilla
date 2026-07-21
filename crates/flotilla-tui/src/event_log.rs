@@ -196,10 +196,11 @@ impl<S: tracing::Subscriber> Layer<S> for TuiLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         let level = *event.metadata().level();
 
-        let mut visitor = MessageVisitor { message: String::new(), provider: None };
+        let mut visitor = MessageVisitor { message: String::new(), provider: None, fields: Vec::new() };
         event.record(&mut visitor);
 
-        let display = format_log_message(&visitor.message, visitor.provider.as_deref());
+        let provider = visitor.provider.clone();
+        let display = format_log_message(&visitor.into_line(), provider.as_deref());
         EVENT_LOG.lock().unwrap().push(level, display);
     }
 }
@@ -215,12 +216,28 @@ fn format_log_message(message: &str, provider: Option<&str>) -> String {
 struct MessageVisitor {
     message: String,
     provider: Option<String>,
+    /// Non-message structured fields, rendered as ` key=value` suffixes so
+    /// the log viewer shows the substance of an event (e.g. the `error` field
+    /// of a "command failed" warning), not just its bare message.
+    fields: Vec<(String, String)>,
+}
+
+impl MessageVisitor {
+    fn into_line(self) -> String {
+        let mut line = self.message;
+        for (key, value) in &self.fields {
+            line.push_str(&format!(" {key}={value}"));
+        }
+        line
+    }
 }
 
 impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{:?}", value);
+        } else {
+            self.fields.push((field.name().to_string(), format!("{:?}", value)));
         }
     }
 
@@ -228,7 +245,7 @@ impl tracing::field::Visit for MessageVisitor {
         match field.name() {
             "message" => self.message = value.to_string(),
             "provider" => self.provider = Some(value.to_string()),
-            _ => {}
+            _ => self.fields.push((field.name().to_string(), value.to_string())),
         }
     }
 }

@@ -799,7 +799,12 @@ impl App {
         self.ui.status_bar.dismissed_status_ids.insert(id);
     }
 
-    fn set_status_message(&mut self, status_message: Option<String>) {
+    /// The only sanctioned way to write `model.status_message`. A dismissed
+    /// error chip stays hidden only while the message is unchanged; any new
+    /// message un-dismisses so it becomes visible. Writing the field directly
+    /// bypasses that and leaves new errors invisible after one dismissal —
+    /// which is how convoy admission errors vanished during the #796 dogfood.
+    pub(crate) fn set_status_message(&mut self, status_message: Option<String>) {
         if self.model.status_message != status_message {
             self.ui.status_bar.dismissed_status_ids.remove(&0);
         }

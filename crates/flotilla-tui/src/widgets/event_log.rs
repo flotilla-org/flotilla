@@ -91,7 +91,8 @@ impl EventLogWidget {
                     .title(" Event Log ")
                     .title_top(Line::from(Span::styled(filter_label, Style::default().fg(theme.muted))).right_aligned()),
             )
-            .highlight_style(Style::default().bg(theme.multi_select_bg));
+            .highlight_style(Style::default().bg(theme.row_highlight).bold())
+            .highlight_symbol("\u{25b8} ");
 
         let mut state = ListState::default();
         state.select(self.selected);
