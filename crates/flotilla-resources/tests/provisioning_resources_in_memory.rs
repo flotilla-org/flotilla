@@ -168,6 +168,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
+            agent_adapters: Default::default(),
             default_cwd: Some("/workspace".to_string()),
             env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
             checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },

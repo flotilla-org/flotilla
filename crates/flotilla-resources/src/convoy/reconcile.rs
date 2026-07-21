@@ -439,10 +439,12 @@ fn input_value_string(value: &InputValue) -> String {
 }
 
 fn fail_fast_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option<InternalReconcileOutcome> {
-    let any_failed = status.work.values().any(|state| state.phase == WorkPhase::Failed);
-    if !any_failed {
-        return None;
-    }
+    let failure_message = status
+        .work
+        .values()
+        .filter(|state| state.phase == WorkPhase::Failed)
+        .find_map(|state| state.message.clone())
+        .or_else(|| status.work.values().any(|state| state.phase == WorkPhase::Failed).then(|| "work failure detected".to_string()))?;
 
     let cancelled_work = status
         .work
@@ -464,7 +466,7 @@ fn fail_fast_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option
     }
 
     Some(InternalReconcileOutcome {
-        patch: Some(controller_patches::fail_convoy(cancelled_work, now, Some("work failure detected".to_string()))),
+        patch: Some(controller_patches::fail_convoy(cancelled_work, now, Some(failure_message))),
         actuations: Vec::new(),
         events,
     })

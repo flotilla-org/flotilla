@@ -674,6 +674,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),
+                agent_adapters: Default::default(),
                 default_cwd: None,
                 env: Default::default(),
                 checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace/".to_string() },
@@ -872,6 +873,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),
+                agent_adapters: Default::default(),
                 default_cwd: None,
                 env: Default::default(),
                 checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },
@@ -1062,6 +1064,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
+            agent_adapters: Default::default(),
             default_cwd: None,
             env: Default::default(),
             checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
@@ -1087,6 +1090,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
+            agent_adapters: Default::default(),
             default_cwd: Some("/app".to_string()),
             env: Default::default(),
             checkout: DockerCheckoutStrategy::FreshCloneInContainer { clone_path: "/workspace".to_string() },

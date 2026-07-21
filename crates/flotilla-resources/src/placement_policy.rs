@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,9 @@ pub enum HostDirectPlacementPolicyCheckout {
 pub struct DockerPerVesselPlacementPolicySpec {
     pub host_ref: String,
     pub image: String,
+    /// Agent adapters the image recipe promises will be available after provisioning.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agent_adapters: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_cwd: Option<String>,
     #[serde(default)]

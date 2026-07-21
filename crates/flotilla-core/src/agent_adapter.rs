@@ -176,6 +176,10 @@ impl AgentAdapterRegistry {
     pub fn get(&self, id: &str) -> Option<&Arc<dyn AgentAdapter>> {
         self.adapters.get(id)
     }
+
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.adapters.keys().map(String::as_str)
+    }
 }
 
 #[cfg(test)]

@@ -427,6 +427,7 @@ fn failed_task_triggers_fail_fast() {
     status.phase = ConvoyPhase::Active;
     status.work.get_mut("implement").expect("implement").phase = WorkPhase::Failed;
     status.work.get_mut("implement").expect("implement").finished_at = Some(timestamp(12));
+    status.work.get_mut("implement").expect("implement").message = Some("agent adapter codex unavailable".to_string());
     status.work.get_mut("review").expect("review").phase = WorkPhase::Running;
     status.work.get_mut("review").expect("review").started_at = Some(timestamp(11));
     let convoy = convoy_object("convoy-a", valid_convoy_spec(), Some(status));
@@ -438,7 +439,7 @@ fn failed_task_triggers_fail_fast() {
         Some(controller_patches::fail_convoy(
             [("review".to_string(), timestamp(30))].into_iter().collect(),
             timestamp(30),
-            Some("work failure detected".to_string())
+            Some("agent adapter codex unavailable".to_string())
         ))
     );
 }

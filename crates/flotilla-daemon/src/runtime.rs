@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,7 +34,7 @@ use flotilla_resources::{
     CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
     InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError, ResourceObject,
-    Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -152,6 +152,7 @@ struct LocalProvisioningProfile {
     host_direct_pool: String,
     docker_pool: String,
     available_pools: Vec<String>,
+    available_agent_adapters: BTreeSet<String>,
     docker_available: bool,
 }
 
@@ -260,6 +261,7 @@ fn build_local_profile(daemon: &Arc<InProcessDaemon>, local_registry: &ProviderR
     let host_direct_pool = local_registry.terminal_pools.preferred_name().unwrap_or("passthrough").to_string();
     let docker_pool =
         if local_registry.terminal_pools.contains_key("passthrough") { "passthrough".to_string() } else { host_direct_pool.clone() };
+    let available_agent_adapters = local_registry.agent_adapters.ids().map(ToString::to_string).collect();
 
     Ok(LocalProvisioningProfile {
         host_id,
@@ -267,6 +269,7 @@ fn build_local_profile(daemon: &Arc<InProcessDaemon>, local_registry: &ProviderR
         host_direct_pool,
         docker_pool,
         available_pools,
+        available_agent_adapters,
         docker_available: local_registry.environment_providers.contains_key("docker"),
     })
 }
@@ -460,6 +463,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
                         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
                             host_ref: profile.host_id.clone(),
                             image: DEFAULT_DOCKER_IMAGE.to_string(),
+                            agent_adapters: BTreeSet::new(),
                             default_cwd: Some("/workspace".to_string()),
                             env: BTreeMap::new(),
                             checkout: DockerCheckoutStrategy::WorktreeOnHostAndMount { mount_path: "/workspace".to_string() },
@@ -564,6 +568,7 @@ async fn apply_host_heartbeat(daemon: &Arc<InProcessDaemon>, namespace: &str, pr
 
 fn host_capabilities(_summary: &HostSummary, profile: &LocalProvisioningProfile) -> BTreeMap<String, serde_json::Value> {
     BTreeMap::from([
+        (AGENT_ADAPTERS_CAPABILITY.to_string(), json!(profile.available_agent_adapters)),
         ("docker".to_string(), json!(profile.docker_available)),
         ("terminal_pools".to_string(), json!(profile.available_pools)),
     ])
@@ -1657,6 +1662,7 @@ mod tests {
             host_direct_pool: "passthrough".to_string(),
             docker_pool: "passthrough".to_string(),
             available_pools: vec!["passthrough".to_string()],
+            available_agent_adapters: BTreeSet::new(),
             docker_available,
         }
     }
@@ -1938,6 +1944,7 @@ mod tests {
 
         let status = wait_for_host_status(&hosts, &host_id).await;
         assert!(status.ready, "heartbeat should mark host ready");
+        assert_eq!(status.agent_adapters().expect("valid agent adapter capability"), BTreeSet::new());
         assert_eq!(status.capabilities.get("docker"), Some(&json!(false)));
         assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
         assert!(
