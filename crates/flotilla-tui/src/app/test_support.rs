@@ -14,7 +14,7 @@ use flotilla_protocol::{
     ProviderData, ProviderError, ProvisioningTarget, RepoDelta, RepoInfo, RepoLabels, RepoSnapshot, StatusResponse, StreamKey,
     TopologyResponse, WorkItem,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 use tui_input::Input;
 
 // Re-export shared builders so unit tests can use `test_support::checkout_item` etc.
@@ -22,9 +22,15 @@ pub(crate) use super::test_builders::*;
 use super::{App, CommandQueue, DirEntry, InFlightCommand, OpenViews, TuiHostState, TuiModel};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
+#[derive(bon::Builder)]
 pub(crate) struct StubDaemon {
+    #[builder(default = broadcast::channel(1).0)]
     tx: broadcast::Sender<DaemonEvent>,
+    #[builder(default = Mutex::new(None), with = |result: Result<CommandValue, String>| Mutex::new(Some(result)))]
     query_result: Mutex<Option<Result<CommandValue, String>>>,
+    execute_gate: Option<Arc<Semaphore>>,
+    #[builder(default = Ok(1))]
+    execute_result: Result<u64, String>,
 }
 
 static STUB_APP_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -55,14 +61,7 @@ fn insert_stub_local_host(model: &mut TuiModel) {
 
 impl StubDaemon {
     pub(crate) fn new() -> Self {
-        let (tx, _) = broadcast::channel(1);
-        Self { tx, query_result: Mutex::new(None) }
-    }
-
-    pub(crate) fn with_query_result(result: Result<CommandValue, String>) -> Self {
-        let daemon = Self::new();
-        *daemon.query_result.lock().expect("query result lock") = Some(result);
-        daemon
+        Self::builder().build()
     }
 }
 
@@ -81,7 +80,10 @@ impl DaemonHandle for StubDaemon {
     }
 
     async fn execute(&self, _command: Command) -> Result<u64, String> {
-        Ok(1)
+        if let Some(gate) = &self.execute_gate {
+            gate.acquire().await.expect("execute gate should remain open").forget();
+        }
+        self.execute_result.clone()
     }
 
     async fn execute_query(&self, _command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
@@ -212,10 +214,10 @@ fn stub_app_with_repo_infos(repos_info: Vec<RepoInfo>) -> App {
 }
 
 pub(crate) fn stub_app_with_query_result(result: Result<CommandValue, String>) -> App {
-    stub_app_with_daemon(Arc::new(StubDaemon::with_query_result(result)), vec![default_repo_info()])
+    stub_app_with_daemon(Arc::new(StubDaemon::builder().query_result(result).build()), vec![default_repo_info()])
 }
 
-fn stub_app_with_daemon(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>) -> App {
+pub(crate) fn stub_app_with_daemon(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>) -> App {
     let config_id = STUB_APP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
     let config_base = std::env::temp_dir().join(format!("flotilla-test-{config_id}"));
     let _ = std::fs::remove_dir_all(&config_base);

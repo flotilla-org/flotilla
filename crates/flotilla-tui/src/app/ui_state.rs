@@ -33,13 +33,13 @@ pub enum RepoViewLayout {
 
 #[derive(Clone, Debug)]
 pub enum PendingStatus {
-    InFlight,
+    Submitting,
+    InFlight { command_id: u64 },
     Failed(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct PendingAction {
-    pub command_id: u64,
     pub status: PendingStatus,
     pub description: String,
 }

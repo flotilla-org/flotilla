@@ -688,22 +688,24 @@ fn command_palette_selection() {
 
 // ── Regression tests ─────────────────────────────────────────────────────
 
-/// In-flight pending action replaces the normal icon with a spinner character
+/// Submitting pending action replaces the normal icon with a spinner character
 /// and preserves the rest of the row content.
 #[test]
-fn pending_action_in_flight_shows_spinner() {
+fn pending_action_submitting_shows_spinner() {
     let items = vec![make_work_item_checkout("feat-login", "/test/my-project/feat-login")];
     let providers = ProviderData::default();
     let mut harness = TestHarness::single_repo("my-project").with_provider_data(providers, items);
 
-    // Insert an in-flight pending action for the checkout item.
+    // Insert a pre-ack pending action for the checkout item.
     let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-login")).into());
     let repo = harness.model.repo_order[0].clone();
-    harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
-        command_id: 1,
-        status: PendingStatus::InFlight,
-        description: "Deleting checkout...".into(),
-    });
+    harness
+        .screen
+        .repo_pages
+        .get_mut(&repo)
+        .expect("repo page exists")
+        .pending_actions
+        .insert(identity, PendingAction { status: PendingStatus::Submitting, description: "Deleting checkout...".into() });
 
     let buffer = harness.render_to_buffer();
 
@@ -726,7 +728,7 @@ fn pending_action_in_flight_shows_spinner() {
             break;
         }
     }
-    assert!(found_spinner, "expected a braille spinner character in the rendered buffer for an in-flight pending action");
+    assert!(found_spinner, "expected a braille spinner character in the rendered buffer for a submitting pending action");
 
     // Verify the row still contains the branch text and description.
     let output = support::buffer_to_string_for_test(&buffer);
@@ -744,7 +746,6 @@ fn pending_action_failed_shows_error_icon() {
     let identity = WorkItemIdentity::Checkout(HostPath::new(HostName::local(), PathBuf::from("/test/my-project/feat-broken")).into());
     let repo = harness.model.repo_order[0].clone();
     harness.screen.repo_pages.get_mut(&repo).expect("repo page exists").pending_actions.insert(identity, PendingAction {
-        command_id: 2,
         status: PendingStatus::Failed("network error".into()),
         description: "Deleting checkout...".into(),
     });

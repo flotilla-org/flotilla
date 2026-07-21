@@ -28,6 +28,7 @@ use flotilla_daemon::server::test_support::{spawn_in_memory_request_topology, In
 use flotilla_protocol::{test_support::TestCheckout, DaemonEvent, HostName, RepoIdentity, RepoSelector, WorkItemKind};
 use flotilla_tui::{
     app::{self, App},
+    event::Event,
     theme::Theme,
     widgets::{delete_confirm::DeleteConfirmWidget, InteractiveWidget},
 };
@@ -52,6 +53,8 @@ pub struct HighFidelityHarness {
     daemon_rx: tokio::sync::broadcast::Receiver<DaemonEvent>,
     leader_daemon_rx: tokio::sync::broadcast::Receiver<DaemonEvent>,
     follower_daemon_rx: tokio::sync::broadcast::Receiver<DaemonEvent>,
+    command_event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    command_event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     recent_events: Vec<String>,
     recent_leader_events: Vec<String>,
     recent_follower_events: Vec<String>,
@@ -130,6 +133,7 @@ impl HighFidelityHarness {
         for event in daemon.replay_since(&HashMap::new()).await? {
             app.handle_daemon_event(event);
         }
+        let (command_event_tx, command_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut harness = Self {
             _tempdir: tempdir,
@@ -140,6 +144,8 @@ impl HighFidelityHarness {
             daemon_rx,
             leader_daemon_rx,
             follower_daemon_rx,
+            command_event_tx,
+            command_event_rx,
             recent_events: Vec::new(),
             recent_leader_events: Vec::new(),
             recent_follower_events: Vec::new(),
@@ -203,7 +209,7 @@ impl HighFidelityHarness {
         while let Some((command, pending_ctx)) = self.app.proto_commands.take_next() {
             dispatched += 1;
             self.last_dispatched_command = Some(format!("{command:?}"));
-            app::executor::dispatch(command, &mut self.app, pending_ctx).await;
+            app::executor::dispatch(command, &mut self.app, pending_ctx, self.command_event_tx.clone());
             self.drain_events()?;
         }
         self.drain_events()?;
@@ -274,7 +280,7 @@ impl HighFidelityHarness {
         self.drain_events()?;
         while let Some((command, pending_ctx)) = self.app.proto_commands.take_next() {
             self.last_dispatched_command = Some(format!("{command:?}"));
-            app::executor::dispatch(command, &mut self.app, pending_ctx).await;
+            app::executor::dispatch(command, &mut self.app, pending_ctx, self.command_event_tx.clone());
             self.drain_events()?;
         }
         self.drain_events()?;
@@ -284,6 +290,21 @@ impl HighFidelityHarness {
     fn drain_events(&mut self) -> Result<(), String> {
         drain_daemon_events(&mut self.leader_daemon_rx, &mut self.recent_leader_events, "leader", |_| {})?;
         drain_daemon_events(&mut self.follower_daemon_rx, &mut self.recent_follower_events, "follower", |_| {})?;
+        loop {
+            match self.command_event_rx.try_recv() {
+                Ok(Event::CommandDispatchCompleted { result, pending_ctx }) => {
+                    app::executor::handle_dispatch_completion(result, pending_ctx, &mut self.app);
+                }
+                Ok(Event::AttachDispatchCompleted(result)) => {
+                    app::executor::handle_attach_dispatch_completion(result, &mut self.app);
+                }
+                Ok(other) => return Err(format!("unexpected command event: {other:?}")),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err("command event stream closed".into());
+                }
+            }
+        }
         loop {
             match self.daemon_rx.try_recv() {
                 Ok(event) => {

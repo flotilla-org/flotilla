@@ -147,13 +147,11 @@ fn reconcile_prunes_stale_pending_actions() {
     page.reconcile_if_changed();
 
     page.pending_actions.insert(WorkItemIdentity::Issue("1".into()), PendingAction {
-        command_id: 1,
-        status: crate::app::ui_state::PendingStatus::InFlight,
+        status: crate::app::ui_state::PendingStatus::InFlight { command_id: 1 },
         description: "test".into(),
     });
     page.pending_actions.insert(WorkItemIdentity::Issue("2".into()), PendingAction {
-        command_id: 2,
-        status: crate::app::ui_state::PendingStatus::InFlight,
+        status: crate::app::ui_state::PendingStatus::InFlight { command_id: 2 },
         description: "test".into(),
     });
 

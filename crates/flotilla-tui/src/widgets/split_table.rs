@@ -838,7 +838,7 @@ fn render_data_row(
     area_width: u16,
     theme: &Theme,
 ) {
-    let is_in_flight = pending.is_some_and(|p| matches!(p.status, PendingStatus::InFlight));
+    let is_in_flight = pending.is_some_and(|p| matches!(p.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }));
     let is_failed = pending.is_some_and(|p| matches!(p.status, PendingStatus::Failed(_)));
 
     // ── In-flight shimmer rendering ────────────────────────────────────

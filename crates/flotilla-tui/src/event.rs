@@ -1,12 +1,14 @@
 use std::{collections::VecDeque, time::Duration};
 
 use crossterm::event::{EventStream, KeyEventKind};
-use flotilla_protocol::DaemonEvent;
+use flotilla_protocol::{CommandValue, DaemonEvent};
 use futures::{FutureExt, StreamExt};
 use tokio::{
     sync::{broadcast, mpsc},
     task::JoinHandle,
 };
+
+use crate::app::ui_state::PendingActionContext;
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -15,6 +17,8 @@ pub enum Event {
     Mouse(crossterm::event::MouseEvent),
     Daemon(Box<DaemonEvent>),
     DaemonDisconnected,
+    CommandDispatchCompleted { result: Result<u64, String>, pending_ctx: Option<PendingActionContext> },
+    AttachDispatchCompleted(Result<CommandValue, String>),
 }
 
 pub struct EventHandler {
@@ -74,14 +78,18 @@ impl EventHandler {
     }
 
     /// Stop polling the controlling terminal while a foreground child owns
-    /// it. Daemon events remain queued; stale terminal input and ticks do not.
+    /// it. Daemon and command completion events remain queued; stale terminal
+    /// input and ticks do not.
     pub async fn pause_terminal_input(&mut self) {
         if let Some(task) = self.terminal_task.take() {
             task.abort();
             let _ = task.await;
         }
         while let Ok(event) = self.rx.try_recv() {
-            if matches!(event, Event::Daemon(_) | Event::DaemonDisconnected) {
+            if matches!(
+                event,
+                Event::Daemon(_) | Event::DaemonDisconnected | Event::CommandDispatchCompleted { .. } | Event::AttachDispatchCompleted(_)
+            ) {
                 self.retained.push_back(event);
             }
         }
@@ -115,6 +123,10 @@ impl EventHandler {
                 }
             }
         });
+    }
+
+    pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
+        self.tx.clone()
     }
 
     pub async fn next(&mut self) -> Option<Event> {
@@ -152,5 +164,21 @@ mod tests {
 
         let event = tokio::time::timeout(Duration::from_secs(1), handler.next()).await.expect("disconnect event");
         assert!(matches!(event, Some(Event::DaemonDisconnected)));
+    }
+
+    #[tokio::test]
+    async fn pause_retains_command_completions_but_discards_terminal_events() {
+        let mut handler = EventHandler::new(Duration::from_secs(60));
+        handler.pause_terminal_input().await;
+        let sender = handler.sender();
+        sender.send(Event::Tick).expect("event handler should remain open");
+        sender.send(Event::CommandDispatchCompleted { result: Ok(42), pending_ctx: None }).expect("event handler should remain open");
+        sender.send(Event::AttachDispatchCompleted(Err("attach failed".into()))).expect("event handler should remain open");
+
+        handler.pause_terminal_input().await;
+
+        assert!(matches!(handler.try_next(), Some(Event::CommandDispatchCompleted { result: Ok(42), pending_ctx: None })));
+        assert!(matches!(handler.try_next(), Some(Event::AttachDispatchCompleted(Err(message))) if message == "attach failed"));
+        assert!(handler.try_next().is_none(), "ticks should not survive a terminal pause");
     }
 }

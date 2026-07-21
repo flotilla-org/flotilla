@@ -1,11 +1,15 @@
 use flotilla_protocol::{Command, CommandAction, CommandValue};
+use tokio::sync::mpsc;
 use tracing::info;
 
 use super::{
     ui_state::{PendingAction, PendingActionContext, PendingStatus},
     App,
 };
-use crate::widgets::{branch_input::BranchInputWidget, delete_confirm::DeleteConfirmWidget};
+use crate::{
+    event::Event,
+    widgets::{branch_input::BranchInputWidget, delete_confirm::DeleteConfirmWidget},
+};
 
 /// Dispatch a single protocol command through the daemon.
 ///
@@ -13,27 +17,22 @@ use crate::widgets::{branch_input::BranchInputWidget, delete_confirm::DeleteConf
 /// results arrive via the background `issue_update_tx` channel.  Non-query
 /// commands use the regular `execute` path.
 ///
-/// When `pending_ctx` is provided the successful command ID is recorded as a
-/// [`PendingAction`] on the active repo's UI state so the renderer can show
-/// an in-flight indicator on the affected work item row.
-pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>) {
+/// When `pending_ctx` is provided a [`PendingAction`] is recorded before the
+/// request starts so the renderer can show an indicator while the daemon
+/// acknowledgement is outstanding.
+pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>, event_tx: mpsc::UnboundedSender<Event>) {
     app.model.status_message = None;
 
-    // Pane attach is a synchronous query that resolves a command for the TUI
-    // process to run temporarily outside raw mode. It must not go through the
-    // ordinary command lifecycle (`execute` rejects query commands).
+    // Pane attach is a query that resolves a command for the TUI process to
+    // run temporarily outside raw mode. It must not go through the ordinary
+    // command lifecycle (`execute` rejects query commands).
     if matches!(&cmd.action, CommandAction::Attach { .. } | CommandAction::AttachTransient { .. }) {
-        match app.daemon.execute_query(cmd, app.session_id).await {
-            Ok(CommandValue::AttachCommandResolved { command, .. }) => {
-                app.pending_attach_command = Some(command);
-            }
-            Ok(CommandValue::Error { message }) | Err(message) => {
-                app.model.status_message = Some(message);
-            }
-            Ok(other) => {
-                app.model.status_message = Some(format!("unexpected attach response: {other:?}"));
-            }
-        }
+        let daemon = app.daemon.clone();
+        let session_id = app.session_id;
+        tokio::spawn(async move {
+            let result = daemon.execute_query(cmd, session_id).await;
+            let _ = event_tx.send(Event::AttachDispatchCompleted(result));
+        });
         return;
     }
 
@@ -53,27 +52,94 @@ pub async fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingAc
         return;
     }
 
-    match app.daemon.execute(cmd).await {
+    if let Some(ctx) = &pending_ctx {
+        let action = PendingAction { status: PendingStatus::Submitting, description: ctx.description.clone() };
+        if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
+            if page
+                .pending_actions
+                .get(&ctx.identity)
+                .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+            {
+                app.model.status_message = Some("An action is already in progress for this item".into());
+                return;
+            }
+            page.pending_actions.insert(ctx.identity.clone(), action);
+        }
+        app.pending_dispatch_acks += 1;
+    }
+
+    let daemon = app.daemon.clone();
+    tokio::spawn(async move {
+        let result = daemon.execute(cmd).await;
+        let _ = event_tx.send(Event::CommandDispatchCompleted { result, pending_ctx });
+    });
+}
+
+pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Option<PendingActionContext>, app: &mut App) {
+    if pending_ctx.is_some() {
+        debug_assert!(app.pending_dispatch_acks > 0, "pending-action acknowledgement without a tracked dispatch");
+        app.pending_dispatch_acks = app.pending_dispatch_acks.saturating_sub(1);
+    }
+
+    match result {
         Ok(command_id) => {
-            if let Some(ctx) = pending_ctx {
-                let action = PendingAction { command_id, status: PendingStatus::InFlight, description: ctx.description };
-                if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
-                    page.pending_actions.insert(ctx.identity, action);
+            let finished_error = app.recent_command_finishes.remove(&command_id);
+            if let Some(finished_error) = finished_error {
+                if let Some(ctx) = pending_ctx {
+                    match finished_error {
+                        Some(message) => set_pending_status(app, &ctx, PendingStatus::Failed(message)),
+                        None => remove_pending_action(app, &ctx),
+                    }
                 }
+            } else if let Some(ctx) = pending_ctx {
+                app.acknowledged_dispatches.insert(command_id);
+                set_pending_status(app, &ctx, PendingStatus::InFlight { command_id });
             }
         }
-        Err(e) => {
-            // Reset loading modes so the error message is visible.
+        Err(message) => {
+            if let Some(ctx) = pending_ctx {
+                remove_pending_action(app, &ctx);
+            }
             reset_loading_mode(app);
-            app.model.status_message = Some(e);
+            app.model.status_message = Some(message);
         }
+    }
+
+    if app.pending_dispatch_acks == 0 {
+        app.recent_command_finishes.clear();
+    }
+}
+
+pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, app: &mut App) {
+    match result {
+        Ok(CommandValue::AttachCommandResolved { command, .. }) => {
+            app.pending_attach_command = Some(command);
+        }
+        Ok(CommandValue::Error { message }) | Err(message) => {
+            app.model.status_message = Some(message);
+        }
+        Ok(other) => {
+            app.model.status_message = Some(format!("unexpected attach response: {other:?}"));
+        }
+    }
+}
+
+fn set_pending_status(app: &mut App, ctx: &PendingActionContext, status: PendingStatus) {
+    if let Some(action) = app.screen.repo_pages.get_mut(&ctx.repo_identity).and_then(|page| page.pending_actions.get_mut(&ctx.identity)) {
+        action.status = status;
+    }
+}
+
+fn remove_pending_action(app: &mut App, ctx: &PendingActionContext) {
+    if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
+        page.pending_actions.remove(&ctx.identity);
     }
 }
 
 /// Reset UI modes that are waiting for a command result.
 ///
-/// When a command fails (either synchronously from `dispatch` or
-/// asynchronously via `CommandValue::Error`), loading modes like
+/// When a command fails (either in its dispatch acknowledgement or later via
+/// `CommandValue::Error`), loading modes like
 /// `DeleteConfirm { loading: true }` must be cleared so the user
 /// can see the error message and isn't stuck in a loading state.
 fn reset_loading_mode(app: &mut App) {
@@ -190,19 +256,132 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
+    use crossterm::event::KeyCode;
     use flotilla_protocol::{
         arg::Arg,
         qualified_path::{HostId, QualifiedPath},
-        CheckoutStatus, NodeId, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity,
+        CheckoutStatus, HostName, NodeId, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity,
     };
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::{mpsc, Semaphore};
 
     use super::*;
-    use crate::app::{
-        test_support::{stub_app, stub_app_with_query_result},
-        ui_state::BranchInputKind,
+    use crate::{
+        app::{
+            test_support::{
+                activate_repo_tab, key, repo_info, session_item, setup_selectable_table, stub_app, stub_app_with_daemon,
+                stub_app_with_query_result, StubDaemon,
+            },
+            ui_state::BranchInputKind,
+        },
+        event::EventHandler,
+        widgets::{InteractiveWidget, RenderContext},
     };
+
+    #[tokio::test]
+    async fn dispatch_returns_while_daemon_ack_is_outstanding() {
+        let execute_gate = Arc::new(Semaphore::new(0));
+        let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let command = app.command(CommandAction::Refresh { repo: None });
+        let repo_identity = app.model.repo_order[0].clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        activate_repo_tab(&mut app, 0);
+        setup_selectable_table(&mut app, vec![session_item("session-1")]);
+        let pending_ctx =
+            PendingActionContext { identity: identity.clone(), description: "Refresh".into(), repo_identity: repo_identity.clone() };
+        let mut events = EventHandler::new(Duration::from_secs(60));
+        events.pause_terminal_input().await;
+
+        dispatch(command, &mut app, Some(pending_ctx), events.sender());
+
+        assert!(matches!(app.screen.repo_pages[&repo_identity].pending_actions[&identity].status, PendingStatus::Submitting));
+        assert!(app.needs_animation(), "submitting actions should render their pending indicator");
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let mut ctx = RenderContext {
+                    model: &app.model,
+                    views: &mut app.views,
+                    ui: &mut app.ui,
+                    theme: &app.theme,
+                    keymap: &app.keymap,
+                    in_flight: &app.in_flight,
+                    namespaces: &app.namespaces,
+                    query_tables: &app.query_tables,
+                };
+                app.screen.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("pending frame should render");
+        let rendered: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            rendered.chars().any(|ch| matches!(
+                ch,
+                '\u{280b}' | '\u{2819}' | '\u{2839}' | '\u{2838}' | '\u{283c}' | '\u{2834}' | '\u{2826}' | '\u{2827}'
+            )),
+            "submitting pending action should render a spinner"
+        );
+
+        events.sender().send(Event::Key(key(KeyCode::Char('q')))).expect("event loop should remain open");
+        match events.next().await.expect("queued key event") {
+            Event::Key(key) => app.handle_key(key),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(app.should_quit, "the app should continue handling keys while the acknowledgement is outstanding");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.next()).await.is_err(),
+            "daemon acknowledgement should still be outstanding"
+        );
+
+        execute_gate.add_permits(1);
+        let event = events.next().await.expect("dispatch completion event");
+        match event {
+            Event::CommandDispatchCompleted { result, pending_ctx } => {
+                handle_dispatch_completion(result, pending_ctx, &mut app);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(matches!(app.screen.repo_pages[&repo_identity].pending_actions[&identity].status, PendingStatus::InFlight {
+            command_id: 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_second_pending_action_for_the_same_identity() {
+        let execute_gate = Arc::new(Semaphore::new(0));
+        let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let repo_identity = app.model.repo_order[0].clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx =
+            PendingActionContext { identity: identity.clone(), description: "Refresh".into(), repo_identity: repo_identity.clone() };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx.clone()), event_tx.clone());
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
+
+        assert_eq!(app.pending_dispatch_acks, 1);
+        assert_eq!(app.model.status_message.as_deref(), Some("An action is already in progress for this item"));
+
+        execute_gate.add_permits(2);
+        let event = event_rx.recv().await.expect("first dispatch completion event");
+        match event {
+            Event::CommandDispatchCompleted { result, pending_ctx } => {
+                handle_dispatch_completion(result, pending_ctx, &mut app);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let duplicate_event = tokio::time::timeout(Duration::from_millis(20), event_rx.recv()).await;
+        assert!(!matches!(duplicate_event, Ok(Some(_))), "the duplicate dispatch should not reach the daemon");
+        assert!(matches!(app.screen.repo_pages[&repo_identity].pending_actions[&identity].status, PendingStatus::InFlight {
+            command_id: 1
+        }));
+    }
 
     #[tokio::test]
     async fn pane_attach_query_hands_the_resolved_command_to_the_event_loop() {
@@ -214,11 +393,217 @@ mod tests {
             reference: "terminal-scratch".to_string(),
             host: Some(flotilla_protocol::HostName::new("kiwi")),
         });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-        dispatch(command, &mut app, None).await;
+        dispatch(command, &mut app, None, event_tx);
+        let event = event_rx.recv().await.expect("attach completion event");
+        match event {
+            Event::AttachDispatchCompleted(result) => handle_attach_dispatch_completion(result, &mut app),
+            other => panic!("unexpected event: {other:?}"),
+        }
 
         assert_eq!(app.pending_attach_command.as_deref(), Some("cleat attach terminal-scratch"));
         assert!(app.model.status_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_error_clears_pending_state_and_resets_loading_modal() {
+        let daemon = Arc::new(StubDaemon::builder().execute_result(Err("request timed out after 30s".into())).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let repo_identity = app.model.repo_order[0].clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx =
+            PendingActionContext { identity: identity.clone(), description: "Delete session".into(), repo_identity: repo_identity.clone() };
+        app.screen.modal_stack.push(Box::new(DeleteConfirmWidget::new(identity.clone(), None, None)));
+        let command = app.command(CommandAction::Refresh { repo: None });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        dispatch(command, &mut app, Some(pending_ctx), event_tx);
+        let event = event_rx.recv().await.expect("dispatch completion event");
+        match event {
+            Event::CommandDispatchCompleted { result, pending_ctx } => {
+                handle_dispatch_completion(result, pending_ctx, &mut app);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert!(!app.screen.repo_pages[&repo_identity].pending_actions.contains_key(&identity));
+        assert!(app.screen.modal_stack.is_empty(), "loading modal should be reset after dispatch error");
+        assert_eq!(app.model.status_message.as_deref(), Some("request timed out after 30s"));
+    }
+
+    #[test]
+    fn command_finish_before_ack_reconciles_pending_action() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let repo = app.model.repos[&repo_identity].path.clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Archive session".into(),
+            repo_identity: repo_identity.clone(),
+        };
+        app.screen
+            .repo_pages
+            .get_mut(&repo_identity)
+            .expect("repo page")
+            .pending_actions
+            .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
+
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo.clone()),
+            description: pending_ctx.description.clone(),
+        });
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo),
+            result: CommandValue::Ok,
+        });
+
+        handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
+
+        assert!(!app.screen.repo_pages[&repo_identity].pending_actions.contains_key(&identity));
+        assert!(app.recent_command_finishes.is_empty());
+        assert!(app.acknowledged_dispatches.is_empty());
+    }
+
+    #[test]
+    fn unrelated_finishes_cannot_evict_a_finish_awaiting_its_ack() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let repo = app.model.repos[&repo_identity].path.clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Archive session".into(),
+            repo_identity: repo_identity.clone(),
+        };
+        app.screen
+            .repo_pages
+            .get_mut(&repo_identity)
+            .expect("repo page")
+            .pending_actions
+            .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
+
+        for command_id in std::iter::once(42).chain(100..166) {
+            app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+                command_id,
+                node_id: NodeId::new(HostName::local().as_str()),
+                repo_identity: repo_identity.clone(),
+                repo: Some(repo.clone()),
+                description: format!("command {command_id}"),
+            });
+            app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+                command_id,
+                node_id: NodeId::new(HostName::local().as_str()),
+                repo_identity: repo_identity.clone(),
+                repo: Some(repo.clone()),
+                result: CommandValue::Ok,
+            });
+        }
+
+        assert!(app.recent_command_finishes.contains_key(&42));
+        assert_eq!(app.recent_command_finishes.len(), 67);
+
+        handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
+
+        assert!(!app.screen.repo_pages[&repo_identity].pending_actions.contains_key(&identity));
+        assert_eq!(app.pending_dispatch_acks, 0);
+        assert!(app.recent_command_finishes.is_empty());
+        assert!(app.acknowledged_dispatches.is_empty());
+    }
+
+    #[test]
+    fn command_error_before_ack_marks_pending_action_failed() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let repo = app.model.repos[&repo_identity].path.clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Archive session".into(),
+            repo_identity: repo_identity.clone(),
+        };
+        app.screen
+            .repo_pages
+            .get_mut(&repo_identity)
+            .expect("repo page")
+            .pending_actions
+            .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
+
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo.clone()),
+            description: pending_ctx.description.clone(),
+        });
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo),
+            result: CommandValue::Error { message: "archive failed".into() },
+        });
+
+        handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
+
+        assert!(matches!(
+            app.screen.repo_pages[&repo_identity].pending_actions[&identity].status,
+            PendingStatus::Failed(ref message) if message == "archive failed"
+        ));
+        assert_eq!(app.model.status_message.as_deref(), Some("archive failed"));
+        assert!(app.recent_command_finishes.is_empty());
+        assert!(app.acknowledged_dispatches.is_empty());
+    }
+
+    #[test]
+    fn command_ack_before_finish_reconciles_pending_action() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let repo = app.model.repos[&repo_identity].path.clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Archive session".into(),
+            repo_identity: repo_identity.clone(),
+        };
+        app.screen
+            .repo_pages
+            .get_mut(&repo_identity)
+            .expect("repo page")
+            .pending_actions
+            .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
+
+        handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo.clone()),
+            description: "Archive session".into(),
+        });
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo),
+            result: CommandValue::Ok,
+        });
+
+        assert!(!app.screen.repo_pages[&repo_identity].pending_actions.contains_key(&identity));
+        assert!(app.recent_command_finishes.is_empty());
+        assert!(app.acknowledged_dispatches.is_empty());
     }
 
     #[test]
