@@ -329,6 +329,48 @@ fn slow_ai_discovery(utility: Arc<SlowAiUtility>) -> DiscoveryRuntime {
     runtime
 }
 
+struct PanicOnceAiUtility {
+    panicked: AtomicBool,
+}
+
+#[async_trait]
+impl AiUtility for PanicOnceAiUtility {
+    async fn generate_branch_name(&self, _: &str) -> Result<String, String> {
+        Ok("fix/retried-convoy".into())
+    }
+
+    async fn generate_convoy_names(&self, _: &str) -> Result<ConvoyNames, String> {
+        if !self.panicked.swap(true, Ordering::SeqCst) {
+            panic!("injected convoy start worker panic");
+        }
+        Ok(ConvoyNames { name: "retried-convoy".into(), branch: "fix/retried-convoy".into() })
+    }
+}
+
+struct PanicOnceAiUtilityFactory {
+    utility: Arc<PanicOnceAiUtility>,
+}
+
+#[async_trait]
+impl Factory for PanicOnceAiUtilityFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn AiUtility;
+
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named(ProviderCategory::AiUtility, "panic-once-ai")
+    }
+
+    async fn probe(
+        &self,
+        _: &EnvironmentBag,
+        _: &ConfigStore,
+        _: &ExecutionEnvironmentPath,
+        _: Arc<dyn flotilla_core::providers::CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        Ok(Arc::clone(&self.utility) as Arc<dyn AiUtility>)
+    }
+}
+
 struct CountingConvoyAiUtility {
     calls: AtomicUsize,
     fail: AtomicBool,
@@ -1286,6 +1328,65 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     .await
     .expect("first convoy start should finish after admission is released");
     assert!(matches!(first_result, CommandValue::ConvoyStarted { .. }));
+
+    drop(temp);
+}
+
+#[tokio::test]
+async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
+    let utility = Arc::new(PanicOnceAiUtility { panicked: AtomicBool::new(false) });
+    let mut discovery = fake_discovery(false);
+    discovery.factories.ai_utilities.push(Box::new(PanicOnceAiUtilityFactory { utility }));
+    let (temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    create_test_convoy_project(&daemon.resource_backend(), None).await;
+    let command = Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::ConvoyStart {
+            intent: Box::new(ConvoyStartIntent {
+                namespace: None,
+                project_ref: "flotilla".into(),
+                issue: None,
+                name: None,
+                branch: None,
+                workflow_ref: None,
+                inputs: Vec::new(),
+                instruction: None,
+                placement_policy: None,
+                auto_attach: false,
+            }),
+        },
+    };
+    let mut events = daemon.subscribe();
+
+    let first_id = daemon.execute(command.clone()).await.expect("first convoy start should be accepted");
+    let first_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == first_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("panicked convoy start should finish");
+    assert!(matches!(first_result, CommandValue::Error { message } if message.contains("worker panicked")));
+
+    let retry_id = daemon.execute(command).await.expect("matching convoy start retry should be accepted");
+    let retry_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == retry_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("matching convoy start retry should finish");
+    assert_eq!(retry_result, CommandValue::ConvoyStarted { name: "retried-convoy".into(), attach_command: None, binding: None });
 
     drop(temp);
 }
