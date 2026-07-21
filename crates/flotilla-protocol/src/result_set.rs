@@ -29,7 +29,7 @@ pub enum QueryId {
     Convoys,
     /// TerminalSessions with no Convoy association. Rows are
     /// [`IndependentRow`].
-    Independents,
+    Independents { scope: Option<QueryScope> },
     /// Open issues in one Project scope. Rows are populated
     /// only while at least one client subscribes to this query.
     Issues {
@@ -61,12 +61,13 @@ impl QueryScope {
 impl QueryId {
     /// Finite query families that are always materialized. Parameterized
     /// demand-backed queries cannot appear in a static list.
-    pub const ALWAYS_MATERIALIZED: &'static [QueryId] = &[QueryId::Convoys, QueryId::Independents, QueryId::Checkouts { scope: None }];
+    pub const ALWAYS_MATERIALIZED: &'static [QueryId] =
+        &[QueryId::Convoys, QueryId::Independents { scope: None }, QueryId::Checkouts { scope: None }];
 
     pub fn family(&self) -> &'static str {
         match self {
             Self::Convoys => "convoys",
-            Self::Independents => "independents",
+            Self::Independents { .. } => "independents",
             Self::Issues { .. } => "issues",
             Self::Checkouts { .. } => "checkouts",
         }
@@ -129,6 +130,7 @@ pub enum QueryChanges {
         removed: Vec<ResourceRef>,
     },
     Independents {
+        scope: Option<QueryScope>,
         changed: Vec<IndependentRow>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
@@ -153,7 +155,7 @@ impl QueryChanges {
     pub fn query(&self) -> QueryId {
         match self {
             Self::Convoys { .. } => QueryId::Convoys,
-            Self::Independents { .. } => QueryId::Independents,
+            Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
             Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
         }
@@ -266,7 +268,10 @@ pub enum ResultSetCondition {
 #[serde(tag = "kind", content = "rows", rename_all = "snake_case")]
 pub enum Rows {
     Convoys(Vec<ConvoyRow>),
-    Independents(Vec<IndependentRow>),
+    Independents {
+        scope: Option<QueryScope>,
+        rows: Vec<IndependentRow>,
+    },
     Issues {
         scope: QueryScope,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,7 +288,7 @@ impl Rows {
     pub fn query(&self) -> QueryId {
         match self {
             Self::Convoys(_) => QueryId::Convoys,
-            Self::Independents(_) => QueryId::Independents,
+            Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
             Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
         }
@@ -292,7 +297,7 @@ impl Rows {
     pub fn len(&self) -> usize {
         match self {
             Self::Convoys(rows) => rows.len(),
-            Self::Independents(rows) => rows.len(),
+            Self::Independents { rows, .. } => rows.len(),
             Self::Issues { rows, .. } => rows.len(),
             Self::Checkouts { rows, .. } => rows.len(),
         }
@@ -311,7 +316,7 @@ impl Rows {
 
     pub fn as_independents(&self) -> Option<&[IndependentRow]> {
         match self {
-            Self::Independents(rows) => Some(rows),
+            Self::Independents { rows, .. } => Some(rows),
             _ => None,
         }
     }
@@ -387,6 +392,10 @@ pub struct IndependentRow {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoKey>,
+    /// Canonical Repository membership fact used by the Aggregator to derive
+    /// Project-scoped result sets. This is data on the row, not a query scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<RepositoryKey>,
     /// Host whose daemon can act on this session.
     pub host: HostName,
     /// Session reference accepted by `flotilla attach`. `Some` is a
@@ -546,7 +555,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        CheckoutRow, DemandBackedMetadata, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows,
+        CheckoutRow, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet,
+        ResultSetState, Rows, SessionPhase,
     };
     use crate::{provider_data::Issue, HostName, IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey, ResourceRef};
 
@@ -572,6 +582,32 @@ mod tests {
         let json = serde_json::to_string(&set).expect("serialize checkout set");
         let decoded = serde_json::from_str::<ResultSet>(&json).expect("deserialize checkout set");
         assert_eq!(decoded, set);
+    }
+
+    #[test]
+    fn project_independents_result_set_round_trip_preserves_scope_and_repository_membership() {
+        let scope = QueryScope::new("flotilla", "roadmap");
+        let row = IndependentRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "governor"))
+            .name("governor")
+            .maybe_repo(Some(crate::RepoKey("flotilla".into())))
+            .maybe_repository_key(Some(RepositoryKey("repository-flotilla".into())))
+            .host(HostName::new("feta"))
+            .maybe_attach(Some("governor".to_string()))
+            .phase(SessionPhase::Running)
+            .build();
+        let set = ResultSet {
+            seq: 7,
+            rows: Rows::Independents { scope: Some(scope.clone()), rows: vec![row.clone()] },
+            state: ResultSetState::default(),
+        };
+
+        let encoded = serde_json::to_string(&set).expect("serialize scoped independents");
+        let decoded: ResultSet = serde_json::from_str(&encoded).expect("deserialize scoped independents");
+
+        assert_eq!(decoded, set);
+        assert_eq!(decoded.query(), QueryId::Independents { scope: Some(scope) });
+        assert_eq!(decoded.rows.as_independents(), Some([row].as_slice()));
     }
 
     #[test]

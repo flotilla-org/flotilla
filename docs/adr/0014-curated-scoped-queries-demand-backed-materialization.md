@@ -40,16 +40,21 @@ presuppose it.
 ## `QueryId` is a family plus owned scope parameters
 
 `QueryId` grows from a finite `Copy` enum to family + owned parameters, where
-the parameters are **scope**: a Project reference when visible to clients;
-Repository scope exists only while the Aggregator expands that Project into
-its constituent repositories. Consumers never learn a project's composition.
-Scope rides the View address per ADR 0013's `?key=value` channel. Global
-(unscoped) forms remain for fleet-wide tables where the curated family allows
-one. Subscription cost scales with what is on screen. For issue queries,
+the parameters are **scope**: a Project reference, or its absence for the
+Fleet-wide form where the curated family allows one. The Aggregator expands a
+Project into its constituent Repository membership facts; consumers never
+learn a project's composition. Scope rides the View address per ADR 0013's
+`?key=value` channel. Subscription cost scales with what is on screen. For issue queries,
 a Project-level **Issue Source** override supplies one unified feed; without
 one, Project scope expands to each constituent Repository's Forge-backed issue
 source. The absence of a configured source is surfaced as unavailable, never
 as an ordinary empty issue set.
+
+Scope is the span of stewardship, and v1 has exactly the two stewardship
+levels the system knows: Project for a governor and Fleet for a yeoman.
+Repository is therefore an identity and membership fact on rows, never a
+scope; any future third scope must represent another stewardship level (for
+example namespace), not Repository.
 
 ## Two materialization classes, one wire contract
 

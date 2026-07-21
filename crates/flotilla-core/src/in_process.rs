@@ -3946,7 +3946,7 @@ impl InProcessDaemon {
                     });
                 }
                 for result_set in &entry.result_sets {
-                    let Rows::Independents(rows) = &result_set.rows else { continue };
+                    let Rows::Independents { scope: None, rows } = &result_set.rows else { continue };
                     for row in rows {
                         let Some(reference) = &row.attach else { continue };
                         if row.phase != flotilla_protocol::SessionPhase::Running || !indexed_sessions.insert(reference.clone()) {

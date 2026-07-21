@@ -624,13 +624,17 @@ fn result_set_round_trips_independent_capabilities() {
         .attach("terminal-yeoman")
         .phase(SessionPhase::Running)
         .build();
-    let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 11, rows: Rows::Independents(vec![row]), state: Default::default() }));
+    let event = DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 11,
+        rows: Rows::Independents { scope: None, rows: vec![row] },
+        state: Default::default(),
+    }));
 
     let encoded = serde_json::to_string(&event).expect("serialize independents result set");
     let decoded: DaemonEvent = serde_json::from_str(&encoded).expect("deserialize independents result set");
     let DaemonEvent::ResultSet(result_set) = decoded else { panic!("expected ResultSet") };
     assert_eq!(result_set.seq, 11);
-    assert_eq!(result_set.query(), QueryId::Independents);
+    assert_eq!(result_set.query(), QueryId::Independents { scope: None });
     let rows = result_set.rows.as_independents().expect("independent rows");
     assert_eq!(rows[0].name, "terminal-yeoman");
     assert_eq!(rows[0].repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
@@ -644,7 +648,10 @@ fn subscribe_queries_request_round_trips_cursors() {
     use crate::result_set::QueryId;
 
     let request = Request::SubscribeQueries {
-        queries: vec![QueryCursor { query: QueryId::Convoys, since: Some(41) }, QueryCursor { query: QueryId::Independents, since: None }],
+        queries: vec![QueryCursor { query: QueryId::Convoys, since: Some(41) }, QueryCursor {
+            query: QueryId::Independents { scope: None },
+            since: None,
+        }],
     };
     let encoded = serde_json::to_string(&request).expect("serialize subscribe request");
     assert!(encoded.contains("\"subscribe_queries\""));

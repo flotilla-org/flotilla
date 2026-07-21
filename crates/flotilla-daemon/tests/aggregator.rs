@@ -28,7 +28,7 @@ use flotilla_resources::{
     Environment, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObservedCheckoutSpec, Project,
     ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, ResourceBackend, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkPhase as ResourceWorkPhase, WorkState,
-    WorkflowSnapshot, CONVOY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    WorkflowSnapshot, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -503,6 +503,27 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("repository spec");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository_key.to_string()).build(), &repository_spec)
+        .await
+        .expect("create repository");
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("Flotilla".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
+                .repositories(vec![ProjectRepositorySpec::builder().repo(repository_key.clone()).build()])
+                .build(),
+        )
+        .await
+        .expect("create project");
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
@@ -595,7 +616,10 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .create(
             &InputMeta::builder()
                 .name("terminal-yeoman".to_string())
-                .labels(BTreeMap::from([(REPO_LABEL.to_string(), "flotilla-org/flotilla".to_string())]))
+                .labels(BTreeMap::from([
+                    (REPO_KEY_LABEL.to_string(), repository_key.to_string()),
+                    (REPO_LABEL.to_string(), "flotilla-org/flotilla".to_string()),
+                ]))
                 .build(),
             &TerminalSessionSpec {
                 env_ref: environment_name.clone(),
@@ -619,13 +643,13 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let rows = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == QueryId::Independents => {
+                Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == (QueryId::Independents { scope: None }) => {
                     let rows = independent_rows(&result_set);
                     if !rows.is_empty() {
                         return rows.to_vec();
                     }
                 }
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => {
                     let rows = delta.changes.as_independents().expect("independent rows");
                     if !rows.is_empty() {
                         return rows.to_vec();
@@ -659,6 +683,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
 
     let row = rows.iter().find(|row| row.name == "terminal-yeoman").expect("attachable session row");
     assert_eq!(row.repo.as_ref().map(|repo| repo.0.as_str()), Some("flotilla-org/flotilla"));
+    assert_eq!(row.repository_key.as_ref(), Some(&repository_key));
     assert_eq!(row.host, HostName::new("local"));
     assert_eq!(row.attach.as_deref(), Some("terminal-yeoman"));
     assert_eq!(row.phase, flotilla_protocol::SessionPhase::Running);
@@ -667,13 +692,15 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     assert!(daemon.resolve_attach_command_internal("terminal-yeoman").await.is_ok());
 
     let replay = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Independents, since: None }])
+        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Independents { scope: None }, since: None }])
         .await
         .expect("subscribe to independents query");
     let replayed = replay
         .iter()
         .find_map(|event| match event {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Independents => Some(independent_rows(result_set)),
+            DaemonEvent::ResultSet(result_set) if result_set.query() == (QueryId::Independents { scope: None }) => {
+                Some(independent_rows(result_set))
+            }
             _ => None,
         })
         .expect("independents replay result set");
@@ -681,11 +708,30 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let unresolvable = replayed.iter().find(|row| row.name == "terminal-unresolvable").expect("unresolvable session row");
     assert_eq!(unresolvable.attach, None);
 
+    let scope = QueryScope::new("flotilla", "flotilla");
+    let scoped = daemon
+        .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor {
+            query: QueryId::Independents { scope: Some(scope.clone()) },
+            since: None,
+        }])
+        .await
+        .expect("subscribe to project independents query");
+    let scoped_rows = scoped
+        .iter()
+        .find_map(|event| match event {
+            DaemonEvent::ResultSet(result_set) if result_set.query() == (QueryId::Independents { scope: Some(scope.clone()) }) => {
+                Some(independent_rows(result_set))
+            }
+            _ => None,
+        })
+        .expect("project independents replay result set");
+    assert!(matches!(scoped_rows, [row] if row.name == "terminal-yeoman"));
+
     let replica = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot");
     let local_independents = replica
         .result_sets
         .iter()
-        .find(|result_set| result_set.query() == QueryId::Independents)
+        .find(|result_set| result_set.query() == (QueryId::Independents { scope: None }))
         .map(independent_rows)
         .expect("local independents result set");
     assert_eq!(local_independents.len(), 2);
@@ -694,7 +740,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let unavailable = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => {
                     if let Some(row) = delta
                         .changes
                         .as_independents()
@@ -721,7 +767,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
     let available = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == QueryId::Independents => {
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => {
                     if let Some(row) = delta
                         .changes
                         .as_independents()
@@ -760,7 +806,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         loop {
             match rx.recv().await {
                 Ok(DaemonEvent::ResultDelta(delta))
-                    if delta.query() == QueryId::Independents
+                    if delta.query() == (QueryId::Independents { scope: None })
                         && delta.changes.removed_resources().is_some_and(|removed| !removed.is_empty()) =>
                 {
                     return delta;

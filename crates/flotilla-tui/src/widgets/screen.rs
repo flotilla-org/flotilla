@@ -123,7 +123,7 @@ impl Screen {
             ViewTarget::View(ViewAddress::Overview) => ActivePage::Overview,
             ViewTarget::View(
                 ViewAddress::Convoys { .. }
-                | ViewAddress::Independents
+                | ViewAddress::Independents { .. }
                 | ViewAddress::Convoy { .. }
                 | ViewAddress::Vessel { .. }
                 | ViewAddress::Issues { .. }

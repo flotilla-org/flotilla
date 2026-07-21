@@ -17,8 +17,8 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation,
     Project, Repository, Resource, ResourceError, ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver,
-    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_LABEL,
-    VESSEL_LABEL,
+    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
+    REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -223,13 +223,7 @@ impl Aggregator {
                 view.seq = view.seq.saturating_add(1);
             }
         }
-        {
-            let mut view = self.state.write_independents().await;
-            if !view.local_rows.is_empty() {
-                view.local_rows.clear();
-                view.seq = view.seq.saturating_add(1);
-            }
-        }
+        self.state.replace_local_independent_rows(Vec::new()).await;
         let mut durable_convoy_stream = self.recover_convoy_watch(LocalSource::Durable, durable_convoys).await?;
         let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
@@ -243,7 +237,7 @@ impl Aggregator {
         self.bootstrapping = false;
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
-        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set().await)));
+        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
 
         loop {
             tokio::select! {
@@ -513,7 +507,7 @@ impl Aggregator {
             .into_iter()
             .map(|project| ((project.metadata.namespace.clone(), project.metadata.name.clone()), project))
             .collect();
-        self.rebuild_checkout_catalog().await;
+        self.rebuild_store_catalog().await;
         Ok(watch)
     }
 
@@ -524,7 +518,7 @@ impl Aggregator {
         let listed = resolver.list().await?;
         let watch = resolver.watch(watch_start(&listed)).await?;
         self.repositories = listed.items.into_iter().map(|repository| (repository.spec.key(), repository)).collect();
-        self.rebuild_checkout_catalog().await;
+        self.rebuild_store_catalog().await;
         Ok(watch)
     }
 
@@ -690,7 +684,7 @@ impl Aggregator {
                 self.projects.remove(&(project.metadata.namespace, project.metadata.name));
             }
         }
-        self.rebuild_checkout_catalog().await;
+        self.rebuild_store_catalog().await;
     }
 
     async fn apply_repository_event(&mut self, event: WatchEvent<Repository>) {
@@ -702,7 +696,7 @@ impl Aggregator {
                 self.repositories.remove(&repository.spec.key());
             }
         }
-        self.rebuild_checkout_catalog().await;
+        self.rebuild_store_catalog().await;
     }
 
     async fn apply_checkout_event(&mut self, event: WatchEvent<Checkout>) -> Result<(), ResourceError> {
@@ -719,7 +713,7 @@ impl Aggregator {
         self.rebuild_checkout_rows().await
     }
 
-    async fn rebuild_checkout_catalog(&self) {
+    async fn rebuild_store_catalog(&self) {
         let repositories = self.repositories.keys().cloned().collect();
         let projects = self
             .projects
@@ -730,8 +724,8 @@ impl Aggregator {
                 (scope, repositories)
             })
             .collect();
-        let deltas = self.state.replace_checkout_catalog(repositories, projects).await;
-        self.emit_checkout_deltas(deltas);
+        let deltas = self.state.replace_store_catalog(repositories, projects).await;
+        self.emit_store_deltas(deltas);
     }
 
     async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
@@ -755,11 +749,11 @@ impl Aggregator {
             })
             .collect::<Result<Vec<_>, ResourceError>>()?;
         let deltas = self.state.replace_local_checkout_rows(rows).await;
-        self.emit_checkout_deltas(deltas);
+        self.emit_store_deltas(deltas);
         Ok(())
     }
 
-    fn emit_checkout_deltas(&self, deltas: Vec<ResultDelta>) {
+    fn emit_store_deltas(&self, deltas: Vec<ResultDelta>) {
         if self.bootstrapping {
             return;
         }
@@ -789,38 +783,10 @@ impl Aggregator {
             None => HashSet::new(),
         };
 
-        let mut replacement = HashMap::new();
-        for session in self.terminal_sessions.values() {
-            if let Some(row) = self.summarize_independent(session, &attachable_references) {
-                replacement.insert(row.resource.clone(), row);
-            }
-        }
-
-        let (changed, removed, result_set) = {
-            let mut view = self.state.write_independents().await;
-            let changed = replacement
-                .iter()
-                .filter(|(reference, row)| view.local_rows.get(*reference) != Some(*row))
-                .map(|(_, row)| row.clone())
-                .collect::<Vec<_>>();
-            let removed = view.local_rows.keys().filter(|reference| !replacement.contains_key(*reference)).cloned().collect::<Vec<_>>();
-            if changed.is_empty() && removed.is_empty() {
-                return;
-            }
-            view.local_rows = replacement;
-            view.seq = view.seq.saturating_add(1);
-            (changed, removed, view.result_set())
-        };
-
-        if self.bootstrapping {
-            return;
-        }
-        if self.emitted_queries.contains(&QueryId::Independents) {
-            self.emit_independent_delta(changed, removed).await;
-        } else {
-            self.emitted_queries.insert(QueryId::Independents);
-            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
-        }
+        let replacement =
+            self.terminal_sessions.values().filter_map(|session| self.summarize_independent(session, &attachable_references)).collect();
+        let deltas = self.state.replace_local_independent_rows(replacement).await;
+        self.emit_store_deltas(deltas);
     }
 
     pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
@@ -830,7 +796,7 @@ impl Aggregator {
         for snapshot in snapshots {
             let host = snapshot.host;
             let mut convoy_rows = HashMap::new();
-            let mut independent_rows = HashMap::new();
+            let mut independent_rows = Vec::new();
             let mut checkout_rows = Vec::new();
             for result_set in snapshot.result_sets {
                 match result_set.rows {
@@ -840,11 +806,14 @@ impl Aggregator {
                             convoy_rows.insert(row.resource.clone(), row);
                         }
                     }
-                    Rows::Independents(independents) => {
+                    Rows::Independents { scope: None, rows: independents } => {
                         for mut row in independents {
                             set_independent_row_host(&mut row, &host);
-                            independent_rows.insert(row.resource.clone(), row);
+                            independent_rows.push(row);
                         }
+                    }
+                    Rows::Independents { scope: Some(_), .. } => {
+                        tracing::warn!(host = %host, "ignoring derived project independents set in fleet replica snapshot");
                     }
                     Rows::Issues { .. } => {
                         tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
@@ -878,32 +847,16 @@ impl Aggregator {
             }
         }
 
-        let independent_change = {
-            let mut view = self.state.write_independents().await;
-            view.replace_replica_rows(independent_replacements)
-        };
-        if let Some((changed, removed)) = independent_change {
-            if self.emitted_queries.contains(&QueryId::Independents) {
-                self.emit_independent_delta(changed, removed).await;
-            } else {
-                self.emitted_queries.insert(QueryId::Independents);
-                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set().await)));
-            }
-        }
+        let independent_deltas = self.state.replace_independent_replica_rows(independent_replacements).await;
+        self.emit_store_deltas(independent_deltas);
 
         let checkout_deltas = self.state.replace_checkout_replica_rows(checkout_replacements).await;
-        self.emit_checkout_deltas(checkout_deltas);
+        self.emit_store_deltas(checkout_deltas);
     }
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
         let changes = QueryChanges::Convoys { changed, removed };
-        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
-    }
-
-    async fn emit_independent_delta(&self, changed: Vec<IndependentRow>, removed: Vec<ResourceRef>) {
-        let seq = self.state.independents_seq().await;
-        let changes = QueryChanges::Independents { changed, removed };
         let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
     }
 
@@ -940,6 +893,7 @@ impl Aggregator {
                 .resource(self.session_ref(&session.metadata.namespace, name))
                 .name(name)
                 .maybe_repo(session.metadata.labels.get(REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
+                .maybe_repository_key(session.metadata.labels.get(REPO_KEY_LABEL).cloned().map(RepositoryKey))
                 .host(self.local_host.clone())
                 .maybe_attach(attach)
                 .phase(SessionPhase::Running)
@@ -1316,7 +1270,7 @@ mod tests {
             .await;
 
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-        let result_set = state.independents_result_set().await;
+        let result_set = state.independents_result_set(&None).await;
         let rows = result_set.rows.as_independents().expect("session rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.attach.as_deref() == Some(row.name.as_str())));
@@ -1340,12 +1294,18 @@ mod tests {
         }
     }
 
-    fn remote_independent_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
+    fn remote_independent_snapshot(
+        host: &str,
+        generation: &str,
+        name: &str,
+        repository_key: Option<RepositoryKey>,
+    ) -> FleetReplicaSnapshot {
         let host = HostName::new(host);
         let session = ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", name);
         let row = IndependentRow::builder()
             .resource(session)
             .name(name)
+            .maybe_repository_key(repository_key)
             .host(HostName::new("incorrect-source-host"))
             .attach(name)
             .phase(SessionPhase::Running)
@@ -1354,7 +1314,7 @@ mod tests {
             host,
             generation: Some(generation.to_string()),
             rows: Vec::new(),
-            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents(vec![row]), state: Default::default() }],
+            result_sets: vec![ResultSet { seq: 1, rows: Rows::Independents { scope: None, rows: vec![row] }, state: Default::default() }],
         }
     }
 
@@ -1510,7 +1470,7 @@ mod tests {
     async fn replica_cache_merges_repository_checkout_rows_and_sets_origin_host() {
         let state = AggregatorProjectionState::new();
         let repo = RepositoryKey("repo-widgets".into());
-        state.replace_checkout_catalog(HashSet::from([repo.clone()]), HashMap::new()).await;
+        state.replace_store_catalog(HashSet::from([repo.clone()]), HashMap::new()).await;
         let scope = None;
         let row = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "remote-checkout"))
@@ -1545,14 +1505,22 @@ mod tests {
     #[tokio::test]
     async fn replica_cache_unions_independents_and_stamps_origin_host() {
         let state = AggregatorProjectionState::new();
+        let repository = RepositoryKey("repo-flotilla".into());
+        let scope = QueryScope::new("flotilla", "flotilla");
+        state.replace_store_catalog(HashSet::from([repository.clone()]), HashMap::from([(scope.clone(), vec![repository.clone()])])).await;
         let (tx, mut rx) = broadcast::channel(8);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
 
-        aggregator.apply_replica_cache(vec![remote_independent_snapshot("feta", "generation-1", "terminal-yeoman")]).await;
+        aggregator
+            .apply_replica_cache(vec![remote_independent_snapshot("feta", "generation-1", "terminal-yeoman", Some(repository.clone()))])
+            .await;
         let event = rx.recv().await.expect("independents replica event");
-        assert!(matches!(event, DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Independents));
+        assert!(
+            matches!(event, DaemonEvent::ResultDelta(ref delta) if delta.query() == (QueryId::Independents { scope: None })),
+            "unexpected first replica event: {event:?}",
+        );
 
-        let result_set = state.independents_result_set().await;
+        let result_set = state.independents_result_set(&Some(scope)).await;
         let rows = result_set.rows.as_independents().expect("independent rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].resource.host, Some(HostName::new("feta")));
@@ -1710,16 +1678,17 @@ mod tests {
             Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources, replica_rx).await
         });
 
-        let initial = recv_query_event(&mut event_rx, QueryId::Independents, "initial independents result set timeout").await;
+        let initial =
+            recv_query_event(&mut event_rx, QueryId::Independents { scope: None }, "initial independents result set timeout").await;
         let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial independents result set") };
         assert_eq!(initial.rows.as_independents().expect("independent rows")[0].name, "deleted-while-watch-expired");
 
-        let removal = recv_query_event(&mut event_rx, QueryId::Independents, "independents relist delta timeout").await;
+        let removal = recv_query_event(&mut event_rx, QueryId::Independents { scope: None }, "independents relist delta timeout").await;
         let DaemonEvent::ResultDelta(removal) = removal else { panic!("expected independents relist delta") };
         let removed = removal.changes.removed_resources().expect("independent removals");
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].name, "deleted-while-watch-expired");
-        assert!(state.independents_result_set().await.rows.is_empty());
+        assert!(state.independents_result_set(&None).await.rows.is_empty());
         assert_eq!(durable_sessions.list_calls.load(Ordering::SeqCst), 2);
         assert_eq!(durable_sessions.watch_calls.load(Ordering::SeqCst), 2);
         assert!(!task.is_finished(), "aggregator should remain alive after session relist");

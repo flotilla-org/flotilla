@@ -438,7 +438,6 @@ mod tests {
         let rows = convoys.iter().collect::<Vec<_>>();
         table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows {
             convoys: rows,
-            independents: vec![],
             ..table_view::TableRows::default()
         })
         .expect("project snapshot table")
