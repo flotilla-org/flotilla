@@ -97,9 +97,9 @@ pub use provider_data::{
 };
 pub use query::{
     CrewCommandContext, CrewListMember, CrewListResponse, DiscoveryEntry, FleetListResponse, FleetListRow, FleetReplicaSnapshot,
-    FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProviderHealthMap,
-    ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary, RepoWorkResponse, StatusResponse, TopologyResponse,
-    TopologyRoute, UnmetRequirementInfo,
+    FleetReplicaStatus, FleetStaleness, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListEntry,
+    ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary,
+    RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
