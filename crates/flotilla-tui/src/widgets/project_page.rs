@@ -235,12 +235,10 @@ impl ProjectPageWidget {
                 if !layout.panel.table.meta.conditions.is_empty() {
                     label.push_str(&format!(" · ⚠ {}", layout.panel.table.meta.conditions.join("; ")));
                 }
-                let style = if state.active() == layout.panel.kind && state.header_focused() {
-                    theme.header_style().add_modifier(Modifier::REVERSED)
-                } else {
-                    theme.header_style()
-                };
-                ui_helpers::render_section_divider(frame, &label, theme, header_area, style);
+                let focused = state.active() == layout.panel.kind && state.header_focused();
+                let style = if focused { theme.header_style().add_modifier(Modifier::REVERSED) } else { theme.header_style() };
+                let row_style = if focused { style } else { Default::default() };
+                ui_helpers::render_section_divider(frame, &label, theme, header_area, row_style, style);
             }
             if let Some(columns_area) = self.line_area(layout.columns_line, state) {
                 super::table::TablePanel::render_header(frame, columns_area, theme, &layout.panel.table);
@@ -563,6 +561,21 @@ mod tests {
         ProjectPageWidget::select_panel_delta(&ProjectPageWidget::layouts(&panels), &mut state, 1);
         assert_eq!(state.active(), ProjectPanelKind::Independents);
         assert!(state.header_focused());
+    }
+
+    #[test]
+    fn focused_panel_header_reverses_the_full_divider_row() {
+        let panels = vec![panel(ProjectPanelKind::Convoys, "Convoys", "convoys/flotilla", "convoy-a")];
+        let mut terminal = Terminal::new(TestBackend::new(80, 3)).expect("terminal");
+        let mut widget = ProjectPageWidget::default();
+        let mut state = ProjectTableState::default();
+        state.focus_header();
+
+        terminal.draw(|frame| widget.render_composite(frame, frame.area(), &Theme::classic(), &panels, &mut state)).expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(79, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

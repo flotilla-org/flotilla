@@ -652,6 +652,7 @@ impl SplitTable {
                     section.header_label(),
                     theme,
                     row_rect,
+                    Style::default(),
                     Style::default().fg(theme.section_header),
                 );
             }
