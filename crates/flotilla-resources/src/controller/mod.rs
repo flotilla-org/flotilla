@@ -140,7 +140,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelMappedWatch<W, P> {
                 Self::enqueue_from_object(self.label_key, &sender, object).await?;
             }
 
-            let mut watch = resolver.watch(WatchStart::FromVersion(listed.resource_version)).await?;
+            let mut watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -178,7 +178,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for ResolverLabelMappedWatch<W, P>
             for object in &listed.items {
                 LabelMappedWatch::<W, P>::enqueue_from_object(self.label_key, &sender, object).await?;
             }
-            let mut watch = self.resolver.watch(WatchStart::FromVersion(listed.resource_version)).await?;
+            let mut watch = self.resolver.watch(WatchStart::resuming_from(&listed)).await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -240,7 +240,7 @@ impl<W: Resource, P: Resource> SecondaryWatch for LabelJoinWatch<W, P> {
                 Self::enqueue_matching_primaries(self.label_key, &sender, object, &primaries).await?;
             }
 
-            let mut watch = watched.watch(WatchStart::FromVersion(listed.resource_version)).await?;
+            let mut watch = watched.watch(WatchStart::resuming_from(&listed)).await?;
             while let Some(event) = watch.next().await {
                 match event? {
                     WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {
@@ -355,7 +355,7 @@ impl<R: Reconciler> ControllerLoop<R> {
                         .map_err(|_| ResourceError::other("controller queue closed while forwarding initial primary list"))?;
                 }
 
-                let mut watch = primary.watch(WatchStart::FromVersion(listed.resource_version)).await?;
+                let mut watch = primary.watch(WatchStart::resuming_from(&listed)).await?;
                 while let Some(event) = watch.next().await {
                     match event? {
                         WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => {

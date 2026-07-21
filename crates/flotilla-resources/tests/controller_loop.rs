@@ -10,7 +10,7 @@ use std::{
 
 use common::{resource_meta, TestLoopHarness};
 use flotilla_resources::{
-    controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler},
+    controller::{Actuation, ControllerLoop, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, ResolverLabelMappedWatch},
     ApiPaths, InMemoryBackend, InputMeta, LifecycleAuthority, NoStatusPatch, Presentation, PresentationSpec, Resource, ResourceBackend,
     ResourceError, ResourceObject, StatusPatch, TypedResolver, Vessel, VesselSpec,
 };
@@ -442,6 +442,124 @@ async fn controller_loop_reconciles_existing_primary_objects_from_initial_list()
     })
     .await
     .expect("initial list should reconcile alpha");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_loop_watches_survive_resume_on_a_generational_backend() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let secondaries = backend.clone().using::<SecondaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(LabelMappedWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/primary",
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend: backend.clone(),
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("primary watch should resume within the store generation");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    secondaries
+        .create(&secondary_meta("secondary-a", "alpha"), &SecondarySpec { value: "wake".to_string() })
+        .await
+        .expect("secondary create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("secondary watch should resume within the store generation");
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn resolver_label_mapped_watch_resumes_on_a_generational_observed_backend() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+    let primaries = backend.clone().using::<PrimaryResource>("flotilla");
+    let observed_secondaries = observed.clone().using::<SecondaryResource>("flotilla");
+    primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
+
+    let reconciled = Arc::new(Mutex::new(Vec::new()));
+    let mut harness = TestLoopHarness::new();
+    harness.spawn(
+        ControllerLoop {
+            primary: primaries,
+            secondaries: vec![Box::new(ResolverLabelMappedWatch::<SecondaryResource, PrimaryResource> {
+                label_key: "flotilla.work/primary",
+                resolver: observed_secondaries.clone(),
+                _marker: std::marker::PhantomData,
+            })],
+            reconciler: RecordingReconciler::new(Arc::clone(&reconciled)),
+            resync_interval: Duration::from_secs(60),
+            backend,
+        }
+        .run(),
+    );
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("initial list should reconcile alpha");
+
+    {
+        let mut reconciled = reconciled.lock().expect("reconciled lock");
+        reconciled.clear();
+    }
+
+    observed_secondaries
+        .create(&secondary_meta("secondary-a", "alpha"), &SecondarySpec { value: "wake".to_string() })
+        .await
+        .expect("observed secondary create should succeed");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if reconciled.lock().expect("reconciled lock").iter().any(|name| name == "alpha") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observed secondary watch should resume within the store generation");
 
     harness.shutdown().await;
 }

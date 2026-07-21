@@ -449,7 +449,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<Convoy>,
     ) -> Result<WatchStream<Convoy>, ResourceError> {
         let listed = resolver.list().await?;
-        let start = watch_start(&listed);
+        let start = WatchStart::resuming_from(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_convoy_source(source, listed.items).await;
         Ok(watch)
@@ -461,7 +461,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<Presentation>,
     ) -> Result<WatchStream<Presentation>, ResourceError> {
         let listed = resolver.list().await?;
-        let start = watch_start(&listed);
+        let start = WatchStart::resuming_from(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_presentation_source(source, listed.items).await;
         Ok(watch)
@@ -479,7 +479,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<Environment>,
     ) -> Result<WatchStream<Environment>, ResourceError> {
         let listed = resolver.list().await?;
-        let watch = resolver.watch(watch_start(&listed)).await?;
+        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
         self.rebuild_independents_projection().await;
         Ok(watch)
     }
@@ -490,7 +490,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<TerminalSession>,
     ) -> Result<WatchStream<TerminalSession>, ResourceError> {
         let listed = resolver.list().await?;
-        let start = watch_start(&listed);
+        let start = WatchStart::resuming_from(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_session_source(source, listed.items).await;
         Ok(watch)
@@ -501,7 +501,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<Project>,
     ) -> Result<WatchStream<Project>, ResourceError> {
         let listed = resolver.list().await?;
-        let watch = resolver.watch(watch_start(&listed)).await?;
+        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
         self.projects = listed
             .items
             .into_iter()
@@ -516,7 +516,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<Repository>,
     ) -> Result<WatchStream<Repository>, ResourceError> {
         let listed = resolver.list().await?;
-        let watch = resolver.watch(watch_start(&listed)).await?;
+        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
         self.repositories = listed.items.into_iter().map(|repository| (repository.spec.key(), repository)).collect();
         self.rebuild_store_catalog().await;
         Ok(watch)
@@ -527,7 +527,7 @@ impl Aggregator {
         resolver: &dyn AggregatorWatchSource<Checkout>,
     ) -> Result<WatchStream<Checkout>, ResourceError> {
         let listed = resolver.list().await?;
-        let watch = resolver.watch(watch_start(&listed)).await?;
+        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
         self.observed_checkouts = listed
             .items
             .into_iter()
@@ -977,15 +977,6 @@ impl Aggregator {
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .build()
-    }
-}
-
-fn watch_start<T: Resource>(listed: &ResourceList<T>) -> WatchStart {
-    match &listed.generation {
-        Some(generation) => {
-            WatchStart::FromVersionInGeneration { generation: generation.clone(), resource_version: listed.resource_version.clone() }
-        }
-        None => WatchStart::FromVersion(listed.resource_version.clone()),
     }
 }
 
