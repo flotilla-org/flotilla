@@ -377,6 +377,31 @@ async fn repeated_snapshots_do_not_queue_duplicate_initial_issue_pages() {
     drain_until_first_issue(&mut app, &repo_identity, "1").await;
 }
 
+/// Regression test for #786: every production repo carries a `repository_key`
+/// (the daemon's `list_repos` always resolves one), and a guard introduced in
+/// #759 skipped the default issue fetch for keyed repos — leaving the repo
+/// page's issues section permanently empty. The fake-discovery harness leaves
+/// the key unset (the temp dir is not a git repo), so mirror the production
+/// shape through the repo-added enrichment path before the snapshot arrives.
+#[tokio::test]
+async fn snapshot_triggers_default_issue_fetch_for_repo_with_repository_key() {
+    let service = Arc::new(ScriptedIssueProvider::new(vec![QueryStep { expected_page: 1, gate: None, result: issue_page(1..=1, false) }]));
+    let (_temp, repo, daemon, mut app) = app_with_issue_provider(service.clone()).await;
+
+    let repo_identity = app.model.active_repo_identity().clone();
+    let mut info = repo_info(app.model.repos[&repo_identity].path.clone(), "repo", RepoLabels::default());
+    info.identity = repo_identity.clone();
+    info.repository_key = Some(flotilla_protocol::RepositoryKey("repo_test".into()));
+    app.handle_repo_added(info);
+    assert!(app.model.repos[&repo_identity].repository_key.is_some(), "test setup should mirror production keyed repos");
+
+    let snapshot = daemon.get_state(&RepoSelector::Path(repo)).await.expect("repo snapshot");
+    app.handle_daemon_event(DaemonEvent::RepoSnapshot(Box::new(snapshot)));
+
+    drain_until_requests(&mut app, &service, &[1]).await;
+    drain_until_first_issue(&mut app, &repo_identity, "1").await;
+}
+
 #[tokio::test]
 async fn manual_refresh_replaces_default_issue_page_when_fresh_results_arrive() {
     let refreshed_page_gate = Arc::new(Semaphore::new(0));

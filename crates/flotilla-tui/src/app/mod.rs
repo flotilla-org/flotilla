@@ -902,9 +902,6 @@ impl App {
 
     /// Fetch default issues for a repo if they haven't been fetched yet.
     fn maybe_fetch_default_issues(&mut self, repo_identity: &RepoIdentity) {
-        if self.model.repos.get(repo_identity).is_some_and(|repo| repo.repository_key.is_some()) {
-            return;
-        }
         if self.model.repos.get(repo_identity).is_some_and(|r| r.path.starts_with("<remote>")) {
             return;
         }
