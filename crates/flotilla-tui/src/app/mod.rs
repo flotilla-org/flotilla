@@ -47,8 +47,6 @@ use crate::{
     },
 };
 
-const RECENT_COMMAND_FINISH_LIMIT: usize = 64;
-
 /// Owned version of `SelectedRow` for use when the borrow can't be held.
 pub(super) enum OwnedSelectedRow {
     WorkItem(Box<WorkItem>),
@@ -440,10 +438,14 @@ pub struct App {
     /// Command IDs whose execute acknowledgement has arrived but whose
     /// CommandFinished event has not yet been handled.
     pub acknowledged_dispatches: HashSet<u64>,
-    /// Recently finished commands whose execute acknowledgement was not seen
-    /// first. This bounded cache reconciles independent event/response stream
-    /// ordering without retaining commands initiated by other clients.
-    pub recent_command_finishes: VecDeque<(u64, Option<String>)>,
+    /// Number of this TUI's pending-action dispatches whose execute
+    /// acknowledgement has not arrived yet.
+    pub pending_dispatch_acks: usize,
+    /// Commands that finished while at least one pending-action dispatch was
+    /// awaiting its acknowledgement. Lifecycle events are system-wide, so
+    /// unrelated finishes may appear here temporarily; the map is cleared as
+    /// soon as this TUI has no acknowledgements left to reconcile.
+    pub recent_command_finishes: HashMap<u64, Option<String>>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
     pub screen: crate::widgets::screen::Screen,
@@ -547,7 +549,8 @@ impl App {
             proto_commands: Default::default(),
             in_flight: HashMap::new(),
             acknowledged_dispatches: HashSet::new(),
-            recent_command_finishes: VecDeque::new(),
+            pending_dispatch_acks: 0,
+            recent_command_finishes: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
             screen,
@@ -1279,11 +1282,8 @@ impl App {
                         }
                     }
 
-                    if !self.acknowledged_dispatches.remove(&command_id) {
-                        self.recent_command_finishes.push_back((command_id, error_message));
-                        if self.recent_command_finishes.len() > RECENT_COMMAND_FINISH_LIMIT {
-                            self.recent_command_finishes.pop_front();
-                        }
+                    if !self.acknowledged_dispatches.remove(&command_id) && self.pending_dispatch_acks > 0 {
+                        self.recent_command_finishes.insert(command_id, error_message);
                     }
                 }
             }

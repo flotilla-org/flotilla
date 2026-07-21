@@ -55,8 +55,17 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
     if let Some(ctx) = &pending_ctx {
         let action = PendingAction { status: PendingStatus::Submitting, description: ctx.description.clone() };
         if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
+            if page
+                .pending_actions
+                .get(&ctx.identity)
+                .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+            {
+                app.model.status_message = Some("An action is already in progress for this item".into());
+                return;
+            }
             page.pending_actions.insert(ctx.identity.clone(), action);
         }
+        app.pending_dispatch_acks += 1;
     }
 
     let daemon = app.daemon.clone();
@@ -67,14 +76,14 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
 }
 
 pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Option<PendingActionContext>, app: &mut App) {
+    if pending_ctx.is_some() {
+        debug_assert!(app.pending_dispatch_acks > 0, "pending-action acknowledgement without a tracked dispatch");
+        app.pending_dispatch_acks = app.pending_dispatch_acks.saturating_sub(1);
+    }
+
     match result {
         Ok(command_id) => {
-            let finished_error = app
-                .recent_command_finishes
-                .iter()
-                .position(|(finished_id, _)| *finished_id == command_id)
-                .and_then(|index| app.recent_command_finishes.remove(index))
-                .map(|(_, error)| error);
+            let finished_error = app.recent_command_finishes.remove(&command_id);
             if let Some(finished_error) = finished_error {
                 if let Some(ctx) = pending_ctx {
                     match finished_error {
@@ -82,11 +91,9 @@ pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Opti
                         None => remove_pending_action(app, &ctx),
                     }
                 }
-            } else {
+            } else if let Some(ctx) = pending_ctx {
                 app.acknowledged_dispatches.insert(command_id);
-                if let Some(ctx) = pending_ctx {
-                    set_pending_status(app, &ctx, PendingStatus::InFlight { command_id });
-                }
+                set_pending_status(app, &ctx, PendingStatus::InFlight { command_id });
             }
         }
         Err(message) => {
@@ -96,6 +103,10 @@ pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Opti
             reset_loading_mode(app);
             app.model.status_message = Some(message);
         }
+    }
+
+    if app.pending_dispatch_acks == 0 {
+        app.recent_command_finishes.clear();
     }
 }
 
@@ -340,6 +351,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_rejects_a_second_pending_action_for_the_same_identity() {
+        let execute_gate = Arc::new(Semaphore::new(0));
+        let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let repo_identity = app.model.repo_order[0].clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx =
+            PendingActionContext { identity: identity.clone(), description: "Refresh".into(), repo_identity: repo_identity.clone() };
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx.clone()), event_tx.clone());
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
+
+        assert_eq!(app.pending_dispatch_acks, 1);
+        assert_eq!(app.model.status_message.as_deref(), Some("An action is already in progress for this item"));
+
+        execute_gate.add_permits(2);
+        let event = event_rx.recv().await.expect("first dispatch completion event");
+        match event {
+            Event::CommandDispatchCompleted { result, pending_ctx } => {
+                handle_dispatch_completion(result, pending_ctx, &mut app);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let duplicate_event = tokio::time::timeout(Duration::from_millis(20), event_rx.recv()).await;
+        assert!(!matches!(duplicate_event, Ok(Some(_))), "the duplicate dispatch should not reach the daemon");
+        assert!(matches!(app.screen.repo_pages[&repo_identity].pending_actions[&identity].status, PendingStatus::InFlight {
+            command_id: 1
+        }));
+    }
+
+    #[tokio::test]
     async fn pane_attach_query_hands_the_resolved_command_to_the_event_loop() {
         let mut app = stub_app_with_query_result(Ok(CommandValue::AttachCommandResolved {
             command: "cleat attach terminal-scratch".to_string(),
@@ -406,6 +450,7 @@ mod tests {
             .expect("repo page")
             .pending_actions
             .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
 
         app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
             command_id: 42,
@@ -430,6 +475,53 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_finishes_cannot_evict_a_finish_awaiting_its_ack() {
+        let mut app = stub_app();
+        let repo_identity = app.model.repo_order[0].clone();
+        let repo = app.model.repos[&repo_identity].path.clone();
+        let identity = WorkItemIdentity::Session("session-1".into());
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Archive session".into(),
+            repo_identity: repo_identity.clone(),
+        };
+        app.screen
+            .repo_pages
+            .get_mut(&repo_identity)
+            .expect("repo page")
+            .pending_actions
+            .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
+
+        for command_id in std::iter::once(42).chain(100..166) {
+            app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+                command_id,
+                node_id: NodeId::new(HostName::local().as_str()),
+                repo_identity: repo_identity.clone(),
+                repo: Some(repo.clone()),
+                description: format!("command {command_id}"),
+            });
+            app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+                command_id,
+                node_id: NodeId::new(HostName::local().as_str()),
+                repo_identity: repo_identity.clone(),
+                repo: Some(repo.clone()),
+                result: CommandValue::Ok,
+            });
+        }
+
+        assert!(app.recent_command_finishes.contains_key(&42));
+        assert_eq!(app.recent_command_finishes.len(), 67);
+
+        handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
+
+        assert!(!app.screen.repo_pages[&repo_identity].pending_actions.contains_key(&identity));
+        assert_eq!(app.pending_dispatch_acks, 0);
+        assert!(app.recent_command_finishes.is_empty());
+        assert!(app.acknowledged_dispatches.is_empty());
+    }
+
+    #[test]
     fn command_error_before_ack_marks_pending_action_failed() {
         let mut app = stub_app();
         let repo_identity = app.model.repo_order[0].clone();
@@ -446,6 +538,7 @@ mod tests {
             .expect("repo page")
             .pending_actions
             .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
 
         app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
             command_id: 42,
@@ -490,6 +583,7 @@ mod tests {
             .expect("repo page")
             .pending_actions
             .insert(identity.clone(), PendingAction { status: PendingStatus::Submitting, description: pending_ctx.description.clone() });
+        app.pending_dispatch_acks = 1;
 
         handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
         app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
