@@ -782,6 +782,45 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         backend.using::<ResourceConvoy>("flotilla").get("missing-adapter").await,
         Err(flotilla_resources::ResourceError::NotFound { .. })
     ));
+
+    let legacy_command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "missing-adapter-legacy".into(),
+                workflow_ref: "single-agent-contained".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: Some("fix/missing-adapter-legacy".into()),
+                project_ref: Some("flotilla".into()),
+                placement_policy: Some("docker-test".into()),
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("legacy create command accepted");
+    let legacy_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == legacy_command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("legacy create command should finish");
+
+    assert_eq!(legacy_result, CommandValue::Error {
+        message: "workflow requires agent adapter `codex`, which is not available in placement `docker-test` (image `ubuntu:24.04`)"
+            .to_string()
+    });
+    assert!(matches!(
+        backend.using::<ResourceConvoy>("flotilla").get("missing-adapter-legacy").await,
+        Err(flotilla_resources::ResourceError::NotFound { .. })
+    ));
 }
 
 #[tokio::test]
