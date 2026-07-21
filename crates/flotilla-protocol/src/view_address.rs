@@ -163,7 +163,7 @@ impl FromStr for ViewAddress {
                 [namespace] => Ok(Self::Convoys { namespace: decode(namespace)? }),
                 _ => Err(format!("convoys takes exactly one parameter (namespace): {s}")),
             },
-            "independents" => match segments.len() {
+            kind if kind.eq_ignore_ascii_case("independents") => match segments.len() {
                 1 => {
                     let scope = parameters.remove("project").map(parse_project_scope).transpose()?;
                     Ok(Self::Independents { scope })
@@ -309,6 +309,10 @@ mod tests {
         assert_eq!(
             "ISSUES?project=flotilla%2Froadmap".parse::<ViewAddress>().expect("parse issues").to_string(),
             "issues?project=flotilla%2Froadmap"
+        );
+        assert_eq!(
+            "INDEPENDENTS?project=flotilla%2Froadmap".parse::<ViewAddress>().expect("parse independents").to_string(),
+            "independents?project=flotilla%2Froadmap"
         );
         assert!("OVERVIEW".parse::<ViewAddress>().is_err());
         assert!("REPO/github.com/flotilla-org/flotilla".parse::<ViewAddress>().is_err());
