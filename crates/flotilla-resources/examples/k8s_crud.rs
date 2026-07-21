@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listed = convoy_resolver.list().await?;
     println!("listed {} convoys at rv={}", listed.items.len(), listed.resource_version);
 
-    let mut watch = convoy_resolver.watch(WatchStart::FromVersion(listed.resource_version.clone())).await?;
+    let mut watch = convoy_resolver.watch(WatchStart::resuming_from(&listed)).await?;
     println!("updating convoy status");
     let updated_convoy = convoy_resolver
         .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
