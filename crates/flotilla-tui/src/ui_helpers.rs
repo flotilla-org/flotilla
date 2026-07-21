@@ -3,8 +3,9 @@ use std::path::Path;
 use flotilla_protocol::{ChangeRequestStatus, Checkout, SessionStatus, WorkItemKind};
 use ratatui::{
     layout::{Constraint, Flex, Layout, Rect},
-    style::Color,
-    widgets::Block,
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
 };
 
 use crate::theme::Theme;
@@ -64,6 +65,20 @@ pub fn render_popup_frame(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     (area, inner)
+}
+
+/// Render a full-width section divider: "── Label ──".
+pub fn render_section_divider(frame: &mut ratatui::Frame, label: &str, theme: &Theme, area: Rect, row_style: Style, label_style: Style) {
+    let dashes_left = 2;
+    let left = "\u{2500}".repeat(dashes_left);
+    let right_width = area.width.saturating_sub(dashes_left as u16 + label.chars().count() as u16 + 4);
+    let right = "\u{2500}".repeat(right_width as usize);
+    let header_line = Line::from(vec![
+        Span::styled(format!("{left} "), Style::default().fg(theme.muted)),
+        Span::styled(label.to_string(), label_style),
+        Span::styled(format!(" {right}"), Style::default().fg(theme.muted)),
+    ]);
+    frame.render_widget(Paragraph::new(header_line).style(row_style), area);
 }
 
 pub fn bottom_anchored_overlay(frame_area: Rect, reserved_top_rows: u16, requested_body_rows: u16) -> BottomAnchoredOverlayLayout {

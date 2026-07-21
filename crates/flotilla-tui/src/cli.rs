@@ -181,7 +181,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
             Cell::new(repositories),
             Cell::new(issue_source),
             Cell::new(&project.default_workflow_ref),
-            Cell::new(project.address.to_string()),
+            Cell::new(project.address.human_label()),
         ]);
     }
     format!("{table}\n")

@@ -452,7 +452,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             view.meta = result_set_meta(result.state);
             Ok(view)
         }
-        ViewAddress::Project { .. } => Err(format!("project views are composite: {address}")),
+        ViewAddress::Project { .. } => Err(format!("project views are composite: {}", address.human_label())),
         ViewAddress::Convoy { namespace, name } => {
             let convoy = find_convoy(&data.convoys, namespace, name)?;
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
@@ -505,7 +505,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             view.meta = result_set_meta(result.state);
             Ok(view)
         }
-        ViewAddress::Overview | ViewAddress::Repo { .. } => Err(format!("view is not table-backed: {address}")),
+        ViewAddress::Overview | ViewAddress::Repo { .. } => Err(format!("view is not table-backed: {}", address.human_label())),
     }
 }
 
@@ -514,7 +514,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
 /// and future registry changes stay identical in the embedded panel.
 pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec<ProjectPanel>, String> {
     let ViewAddress::Project { namespace, name } = address else {
-        return Err(format!("view is not project-backed: {address}"));
+        return Err(format!("view is not project-backed: {}", address.human_label()));
     };
     let scope = QueryScope::new(namespace, name);
     let convoys = convoy_spec().project(

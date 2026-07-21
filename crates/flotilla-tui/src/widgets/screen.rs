@@ -136,7 +136,7 @@ impl Screen {
                 } else {
                     ActivePage::Error {
                         title: format!("repo not tracked: {}/{}", identity.authority, identity.path),
-                        detail: format!("view address: {}", ViewAddress::repo(identity.clone())),
+                        detail: format!("view address: {}", ViewAddress::repo(identity.clone()).human_label()),
                     }
                 }
             }
@@ -389,8 +389,7 @@ impl InteractiveWidget for Screen {
                 let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
                 match crate::table_view::project(&address, &rows).map(|view| view.filtered(&filter)) {
                     Ok(view) => {
-                        let breadcrumbs =
-                            ctx.views.active().breadcrumb_addresses().into_iter().map(ToString::to_string).collect::<Vec<_>>();
+                        let breadcrumbs = ctx.views.active().breadcrumb_addresses();
                         self.table.render_table(frame, chunks[1], ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
                     }
                     Err(detail) => Self::render_error_page(frame, chunks[1], ctx.theme, "table view unavailable", &detail),

@@ -95,14 +95,14 @@ impl OpenView {
         }
     }
 
-    pub fn breadcrumb_addresses(&self) -> Vec<&ViewAddress> {
+    pub fn breadcrumb_addresses(&self) -> Vec<ViewAddress> {
         self.history
             .iter()
             .filter_map(|frame| match &frame.target {
-                ViewTarget::View(address) => Some(address),
+                ViewTarget::View(address) => Some(address.clone()),
                 ViewTarget::Broken { .. } => None,
             })
-            .chain(self.address())
+            .chain(self.address().cloned())
             .collect()
     }
 

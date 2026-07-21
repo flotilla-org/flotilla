@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{QueryId, ViewAddress};
-use ratatui::{layout::Rect, style::Modifier, widgets::Paragraph, Frame};
+use ratatui::{layout::Rect, style::Modifier, Frame};
 
 use super::{
     describe::DescribeWidget, table_action_menu::TableActionMenuWidget, table_search::TableSearchWidget, AppAction, InteractiveWidget,
@@ -14,6 +14,7 @@ use crate::{
     keymap::Action,
     table_view::{self, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId},
     theme::Theme,
+    ui_helpers,
 };
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
@@ -221,7 +222,7 @@ impl ProjectPageWidget {
         self.ensure_active_visible(&layouts, state);
         for layout in &layouts {
             if let Some(header_area) = self.line_area(layout.header_line, state) {
-                let mut label = format!(" {}  › {}", layout.panel.table.title, layout.panel.target);
+                let mut label = format!("{}  › {}", layout.panel.table.title, layout.panel.target.human_label());
                 if let Some(as_of) = layout.panel.table.meta.as_of {
                     label.push_str(&format!(" · as of {}", as_of.format("%Y-%m-%d %H:%M")));
                 }
@@ -234,14 +235,10 @@ impl ProjectPageWidget {
                 if !layout.panel.table.meta.conditions.is_empty() {
                     label.push_str(&format!(" · ⚠ {}", layout.panel.table.meta.conditions.join("; ")));
                 }
-                let style = if state.active() == layout.panel.kind && state.header_focused() {
-                    theme.header_style().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else if state.active() == layout.panel.kind {
-                    theme.header_style().add_modifier(Modifier::BOLD)
-                } else {
-                    theme.header_style()
-                };
-                frame.render_widget(Paragraph::new(label).style(style), header_area);
+                let focused = state.active() == layout.panel.kind && state.header_focused();
+                let style = if focused { theme.header_style().add_modifier(Modifier::REVERSED) } else { theme.header_style() };
+                let row_style = if focused { style } else { Default::default() };
+                ui_helpers::render_section_divider(frame, &label, theme, header_area, row_style, style);
             }
             if let Some(columns_area) = self.line_area(layout.columns_line, state) {
                 super::table::TablePanel::render_header(frame, columns_area, theme, &layout.panel.table);
@@ -461,13 +458,16 @@ mod tests {
 
     #[test]
     fn composite_renders_the_four_panels_as_one_stacked_page() {
-        let panels = vec![
+        let mut panels = vec![
             panel(ProjectPanelKind::Convoys, "Convoys", "convoys/flotilla", "convoy-a"),
             panel(ProjectPanelKind::Checkouts, "Checkouts", "checkouts?project=flotilla%2Froadmap", "checkout-a"),
             panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "issue-a"),
             panel(ProjectPanelKind::Independents, "Independents", "independents?project=flotilla%2Froadmap", "governor"),
         ];
-        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+        panels[2].table.meta.as_of = Some("2026-07-21T12:30:00Z".parse().expect("timestamp"));
+        panels[2].table.meta.has_more = true;
+        panels[2].table.meta.conditions = vec!["one source stale".into()];
+        let mut terminal = Terminal::new(TestBackend::new(140, 16)).expect("terminal");
         let mut widget = ProjectPageWidget::default();
         let mut state = ProjectTableState::default();
         terminal.draw(|frame| widget.render_composite(frame, frame.area(), &Theme::classic(), &panels, &mut state)).expect("render");
@@ -478,10 +478,16 @@ mod tests {
         let issue = rendered.find("Issues").expect("issues header");
         let independents = rendered.find("Independents").expect("independents header");
         assert!(convoy < checkout && checkout < issue && issue < independents, "panels should retain the fixed v1 order");
+        assert!(rendered.contains("── Issues"), "panel headers should use section-divider chrome");
         assert!(rendered.contains("convoy-a"));
         assert!(rendered.contains("checkout-a"));
         assert!(rendered.contains("issue-a"));
         assert!(rendered.contains("governor"));
+        assert!(rendered.contains("issues?project=flotilla/roadmap"));
+        assert!(!rendered.contains("%2F"));
+        assert!(rendered.contains("as of 2026-07-21 12:30"));
+        assert!(rendered.contains("more available"));
+        assert!(rendered.contains("⚠ one source stale"));
     }
 
     #[test]
@@ -555,6 +561,21 @@ mod tests {
         ProjectPageWidget::select_panel_delta(&ProjectPageWidget::layouts(&panels), &mut state, 1);
         assert_eq!(state.active(), ProjectPanelKind::Independents);
         assert!(state.header_focused());
+    }
+
+    #[test]
+    fn focused_panel_header_reverses_the_full_divider_row() {
+        let panels = vec![panel(ProjectPanelKind::Convoys, "Convoys", "convoys/flotilla", "convoy-a")];
+        let mut terminal = Terminal::new(TestBackend::new(80, 3)).expect("terminal");
+        let mut widget = ProjectPageWidget::default();
+        let mut state = ProjectTableState::default();
+        state.focus_header();
+
+        terminal.draw(|frame| widget.render_composite(frame, frame.area(), &Theme::classic(), &panels, &mut state)).expect("render");
+
+        let buffer = terminal.backend().buffer();
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buffer[(79, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

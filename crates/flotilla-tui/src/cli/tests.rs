@@ -231,10 +231,10 @@ mod project_list_human {
     #[test]
     fn project_list_shows_addresses_slugs_and_configuration() {
         let few = ProjectListEntry::builder()
-            .namespace("flotilla".to_string())
+            .namespace("flotilla platform".to_string())
             .name("suite".to_string())
             .display_name("Flotilla Suite".to_string())
-            .address(ViewAddress::Project { namespace: "flotilla".into(), name: "suite".into() })
+            .address(ViewAddress::Project { namespace: "flotilla platform".into(), name: "suite".into() })
             .repositories(vec![repository("flotilla-org/cleat"), repository("flotilla-org/flotilla")])
             .maybe_issue_source(Some(IssueSource { service: "https://linear.app".into(), scope: "FLOT".into() }))
             .default_workflow_ref("review-and-fix".to_string())
@@ -250,8 +250,9 @@ mod project_list_human {
             .build();
 
         let output = format_project_list_human(&ProjectListResponse { projects: vec![few, many] });
-        assert!(output.contains("flotilla/suite"));
-        assert!(output.contains("project/flotilla/suite"));
+        assert!(output.contains("flotilla platform/suite"));
+        assert!(output.contains("project/flotilla platform/suite"));
+        assert!(!output.contains("%20"));
         assert!(output.contains("flotilla-org/cleat, flotilla-org/flotilla"));
         assert!(output.contains("https://linear.app / FLOT"));
         assert!(output.contains("review-and-fix"));
