@@ -5,6 +5,7 @@
 | Key | Action |
 |-----|--------|
 | `j` / `k` / `↑` / `↓` | Navigate list |
+| Tab / Shift+Tab | Move between panels on a Project page |
 | `[` / `]` | Switch tabs |
 | `{` / `}` | Reorder tabs |
 | Click | Select item |

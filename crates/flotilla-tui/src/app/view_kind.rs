@@ -67,7 +67,7 @@ pub(crate) fn kind_modes(address: Option<&ViewAddress>) -> Vec<BindingModeId> {
         ) => {
             vec![BindingModeId::Convoys]
         }
-        Some(ViewAddress::Project { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable],
+        Some(ViewAddress::Project { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable, BindingModeId::Project],
         Some(ViewAddress::Issues { .. }) => vec![BindingModeId::Convoys, BindingModeId::DemandTable],
         Some(ViewAddress::Repo { .. }) => vec![BindingModeId::Normal],
         None => vec![],
@@ -92,6 +92,7 @@ mod tests {
             QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None },
             QueryId::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) },
         ]);
+        assert_eq!(kind_modes(Some(&address)), vec![BindingModeId::Convoys, BindingModeId::DemandTable, BindingModeId::Project]);
     }
 
     #[test]

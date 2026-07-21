@@ -19,6 +19,8 @@ use crate::{
 pub enum Action {
     SelectNext,
     SelectPrev,
+    NextPanel,
+    PrevPanel,
     Confirm,
     Dismiss,
     Quit,
@@ -93,6 +95,8 @@ impl Action {
         let action = match s {
             "select_next" => Action::SelectNext,
             "select_prev" => Action::SelectPrev,
+            "next_panel" => Action::NextPanel,
+            "prev_panel" => Action::PrevPanel,
             "confirm" => Action::Confirm,
             "dismiss" => Action::Dismiss,
             "quit" => Action::Quit,
@@ -146,6 +150,8 @@ impl Action {
         match self {
             Action::SelectNext => "select_next",
             Action::SelectPrev => "select_prev",
+            Action::NextPanel => "next_panel",
+            Action::PrevPanel => "prev_panel",
             Action::Confirm => "confirm",
             Action::Dismiss => "dismiss",
             Action::Quit => "quit",
@@ -196,6 +202,8 @@ impl Action {
         match self {
             Action::SelectNext => "Move selection down",
             Action::SelectPrev => "Move selection up",
+            Action::NextPanel => "Move to next panel",
+            Action::PrevPanel => "Move to previous panel",
             Action::Confirm => "Confirm / execute",
             Action::Dismiss => "Dismiss / go back",
             Action::Quit => "Quit the application",
@@ -296,6 +304,7 @@ impl Keymap {
             (&config.help, BindingModeId::Help),
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
+            (&config.project, BindingModeId::Project),
             (&config.convoy_vessels, BindingModeId::ConvoyVessels),
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
@@ -384,7 +393,7 @@ impl Keymap {
 
         // Define sections and their actions in display order.
         let section_defs: &[(&str, &[Action])] = &[
-            ("Navigation", &[Action::SelectNext, Action::SelectPrev]),
+            ("Navigation", &[Action::SelectNext, Action::SelectPrev, Action::NextPanel, Action::PrevPanel]),
             ("Actions", &[
                 Action::Confirm,
                 Action::OpenCommandPalette,
