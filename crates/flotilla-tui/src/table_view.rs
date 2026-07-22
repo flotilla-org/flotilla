@@ -1757,6 +1757,21 @@ mod tests {
     }
 
     #[test]
+    fn full_authoritative_snapshot_clears_pending_rows_for_its_query() {
+        let mut state = TableState::default();
+        let convoy = RowId::new("dev/tables");
+        let issue = RowId::new("issue:809");
+        let issues_query = QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None };
+        state.begin_pending(QueryId::Convoys, convoy.clone(), "Delete convoy".into()).expect("convoy should become pending");
+        state.begin_pending(issues_query.clone(), issue.clone(), "Start convoy".into()).expect("issue should become pending");
+
+        state.reconcile_authoritative(&QueryId::Convoys, &AuthoritativeRowUpdate::Full);
+
+        assert!(state.row_state(&convoy).is_none());
+        assert!(matches!(state.row_state(&issue), Some(RowState::Submitting { .. })));
+    }
+
+    #[test]
     fn table_filter_matches_any_projected_cell() {
         let mut failed = convoy(vec![]);
         failed.phase = ConvoyPhase::Failed;
