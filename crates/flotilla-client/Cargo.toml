@@ -17,4 +17,5 @@ libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+flotilla-test-support = { path = "../flotilla-test-support" }
 tempfile = "3"

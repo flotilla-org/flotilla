@@ -30,7 +30,7 @@ Before pushing, run the exact CI commands: `cargo +nightly-2026-03-12 fmt --chec
 
 **Nightly toolchain:** All nightly-dependent tools (rustfmt, llvm-cov, Dylint) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
 
-In the Codex sandbox, prefer `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped.
+In the Codex sandbox, prefer `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
 
 Package-local `flotilla-core` daemon integration coverage uses shared discovery test helpers behind `test-support`, so run it as:
 

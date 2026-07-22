@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use flotilla_core::{config::ConfigStore, daemon::DaemonHandle, providers::discovery::test_support::git_process_discovery};
 use flotilla_daemon::server::DaemonServer;
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, RepoSelector, StreamKey};
+use flotilla_test_support::TestSocketDir;
 use tokio::time::Instant;
 
 /// Execute a query command via execute_query and return the result directly.
@@ -14,8 +15,8 @@ async fn run_query(daemon: &dyn DaemonHandle, action: CommandAction) -> CommandV
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn socket_roundtrip() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let socket_path = tmp.path().join("test.sock");
+    let tmp = TestSocketDir::new();
+    let socket_path = tmp.socket_path("test.sock");
 
     // Use workspace root (a real git repo) as the test repo.
     // CARGO_MANIFEST_DIR points to crates/flotilla-daemon; go up two levels.
@@ -145,8 +146,8 @@ async fn socket_roundtrip() {
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn query_commands_roundtrip() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let socket_path = tmp.path().join("test.sock");
+    let tmp = TestSocketDir::new();
+    let socket_path = tmp.socket_path("test.sock");
 
     // Use workspace root (a real git repo) as the test repo.
     // CARGO_MANIFEST_DIR points to crates/flotilla-daemon; go up two levels.
@@ -275,8 +276,8 @@ async fn query_commands_roundtrip() {
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
 async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let socket_path = tmp.path().join("test.sock");
+    let tmp = TestSocketDir::new();
+    let socket_path = tmp.socket_path("test.sock");
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo = manifest_dir.parent().expect("parent").parent().expect("grandparent").to_path_buf();

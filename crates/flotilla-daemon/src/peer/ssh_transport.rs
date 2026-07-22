@@ -682,8 +682,8 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
     async fn connect_socket_preserves_peer_message_buffered_after_hello() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("peer.sock");
+        let dir = flotilla_test_support::TestSocketDir::new();
+        let socket_path = dir.socket_path("peer.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind listener");
 
         let config = RemoteHostConfig {

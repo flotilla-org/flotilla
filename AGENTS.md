@@ -12,7 +12,7 @@ Socket bind/listen is blocked. Use the sandbox-safe test command:
 mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests
 ```
 
-The repo-local `TMPDIR` avoids native build failures from crates like `aws-lc-sys` under the sandbox.
+The repo-local `TMPDIR` avoids native build failures from crates like `aws-lc-sys` under the sandbox. Unix-socket tests are exempt: their shared test harness creates SUN_LEN-safe paths directly beneath `/tmp`, so do not work around this command by changing `TMPDIR`.
 
 Use this when `CODEX_SANDBOX` is set or socket-bind tests fail with `Operation not permitted`.
 
