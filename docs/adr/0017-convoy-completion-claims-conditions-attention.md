@@ -85,7 +85,8 @@ auto-resolved. That inference is what this ADR forbids.
   the agent running — retryable once the infrastructure is fixed) and crew
   testimony of defeat (`flotilla crew fail` — do not blindly retry; the
   plan is wrong). Consumers must not parse message strings to tell them
-  apart.
+  apart. `Steward` has no writer yet — it is reserved for stewards
+  (ADR 0009) independently failing work once they exist.
 - **Completion policy per workflow is a named, deferred extension point.**
   The current rollup (any work fails → convoy fails; all works settle →
   convoy completes) is correct for sequential workflows and wrong for
@@ -95,7 +96,12 @@ auto-resolved. That inference is what this ADR forbids.
 ## The teardown contract
 
 Teardown-eligibility is `(Clean ∧ Pushed ∧ Landed)` **∨**
-`Abandoned(authority, reason)`. Mechanics:
+`Abandoned(authority, reason)`.
+
+The abandonment disjunct is the **one deliberate exception** to "claims are
+never evidence of safety": abandonment is a claim whose very meaning is
+"we accept the loss", so it may substitute for verified integration — and
+nothing else may. Mechanics:
 
 - Verification runs at execution moment, per checkout, through each
   checkout's environment runner. Standing conditions inform displays and
