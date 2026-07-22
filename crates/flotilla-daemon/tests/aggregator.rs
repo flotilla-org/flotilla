@@ -555,7 +555,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
                 ]))
                 .build(),
             &TerminalSessionSpec {
-                env_ref: "host-direct-local".to_string(),
+                env_ref: environment_name.clone(),
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),

@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
-use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
+use flotilla_core::agent_adapter::{append_convoy_work_context, build_crew_brief, CrewAssignment, CrewBriefMember};
 use flotilla_resources::{
     clone_key,
     controller::{
@@ -616,7 +616,12 @@ impl Reconciler for VesselReconciler {
                                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
                                 })
                                 .collect::<Vec<_>>();
-                            let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, prompt.as_deref(), &members);
+                            let assignment = match prompt.as_deref() {
+                                Some(prompt) => CrewAssignment::Prompt(prompt),
+                                None if !convoy.spec.issues.is_empty() => CrewAssignment::CarriedIssue,
+                                None => CrewAssignment::Unassigned,
+                            };
+                            let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, assignment, &members);
                             append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
                             brief.copies = brief_copies.clone();
                             flotilla_resources::TerminalSessionSource::Agent { selector: selector.clone(), brief, context, message: None }
@@ -756,40 +761,6 @@ fn checkout_path_component(branch: &str) -> String {
 
 fn checkout_target_path(repo_default_dir: &str, convoy_slug: &str, repo_slug: &str, branch_slug: &str) -> String {
     format!("{}/{}/{}.{}", repo_default_dir.trim_end_matches('/'), convoy_slug, repo_slug, branch_slug)
-}
-
-fn append_convoy_work_context(content: &mut String, convoy: &ResourceObject<Convoy>, repository_refs: &[RepositoryKey]) {
-    content.push_str("\n\n## Work context\n\n");
-    if let Some(branch) = &convoy.spec.r#ref {
-        content.push_str(&format!("- Branch: `{branch}`\n"));
-    }
-    content.push_str("- Repositories:\n");
-    for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
-        content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
-    }
-    if !convoy.spec.issues.is_empty() {
-        let header = if convoy.spec.issues.len() == 1 { "Issue snapshot" } else { "Issue snapshots" };
-        content.push_str(&format!("\n## {header}\n\n"));
-    }
-    for issue in &convoy.spec.issues {
-        content.push_str(&format!(
-            "Source-qualified reference: `{}` / `{}` / `{}`\n\n",
-            issue.reference.source.service, issue.reference.source.scope, issue.reference.id
-        ));
-        content.push_str(&format!("Snapshot as of `{}`.\n\n", issue.snapshot.as_of.to_rfc3339()));
-        content.push_str(&format!("### {}\n\n", issue.snapshot.title));
-        content.push_str(&format!("State: `{:?}`\n\n", issue.snapshot.state).to_lowercase());
-        content.push_str(&format!("Labels: {}\n\n", issue.snapshot.labels.join(", ")));
-        if let Some(body) = &issue.snapshot.body {
-            content.push_str(body);
-            content.push('\n');
-        }
-    }
-    if let Some(instruction) = &convoy.spec.instruction {
-        content.push_str("\n## Human instruction\n\n");
-        content.push_str(instruction);
-        content.push('\n');
-    }
 }
 
 fn owned_child_meta(name: &str, workspace: &ResourceObject<Vessel>, mut extra_labels: BTreeMap<String, String>) -> InputMeta {

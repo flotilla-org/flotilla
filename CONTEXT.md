@@ -324,6 +324,47 @@ How running work is surfaced to a person — which panes/surfaces show which
 **Processes**, across multiplexers and external windows. Dual to placement.
 _Avoid_: Layout, UI, workspace template (the latter is one mechanism).
 
+**Demand**:
+A work-side call on a **Principal**'s attention: the work cannot progress
+without a person — a permission prompt, a workflow human-gate, a review/demo
+approval. Queue-natured (raised, routed, satisfied/acknowledged) and addressed
+through the principal's **Regards** for surfacing. Derived from attention
+observations and explicit gates; never itself a phase.
+_Avoid_: Notification, alert (those are renderings of a routed Demand).
+
+**Regard**:
+A **Principal**'s intention to be looking at a thing (a vessel today; convoys
+and other kinds later) — *expressed* (attach, focus, opening a latent) or
+*implicit* (policy-emitted, e.g. at convoy creation; expected to narrow as
+trust grows). Regards decay when the thing leaves actual focus across the
+principal's surfaces; a **pin** is a regard that never expires. The live
+regard set is the principal's **searchlight**; any "working set" is derived
+from it, never curated as a separate list. Ambient surfaces (kiosk grids,
+fleet visualisations) neither emit nor refresh regards — only focal
+interaction does.
+_Avoid_: Subscription, watch (mechanisms), working set (a derivation, not a
+thing).
+
+**Principal**:
+A person whose attention the system routes and economises. Principals hold
+**Regards**, receive **Demands**, and act with human authority (overrides,
+approvals). Agents are never principals.
+_Avoid_: User (ambiguous with OS users), operator.
+
+**Latent**:
+An awareness-band presentation entry rendered with presence but no
+attachment to real processes — a ready issue in a sidebar, a dormant repo, a
+running-but-unregarded convoy. Opening a latent *is* expressing a **Regard**.
+_Avoid_: Placeholder, stub, collapsed tab (renderings of a latent).
+
+**Salience**:
+The centrally-computed urgency hint on a projection node or entry
+(none/info/attention/urgent). The mesh decides what *is* urgent (the
+demand-join, computed once); each **Surface** decides what urgent *looks*
+like. Badges are renderings of salience, never data.
+_Avoid_: Priority (work-scheduling word), severity (error word), badge (a
+rendering).
+
 **Surface**:
 A presentation client of Flotilla — the ratatui **TUI**, a future web UI, or
 **uishell** — that consumes the resource store + **Aggregator** + a shared

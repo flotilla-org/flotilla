@@ -11,7 +11,7 @@ use flotilla_protocol::{
     test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
     CrewCommandContext, DaemonEvent, EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostProviderStatus, HostSummary, ImageId,
-    QueryCursor, QueryScope, RepoSelector, ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
+    QueryCursor, QueryScope, RepoSelector, RepositoryKey, ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
@@ -47,6 +47,8 @@ use crate::{
         ChannelLabel, CommandOutput, CommandRunner,
     },
 };
+
+const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
 #[test]
 fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
@@ -380,7 +382,8 @@ async fn new_attach_test_daemon_with_pool(config_base: &Path) -> (Arc<InProcessD
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn crate::providers::terminal::TerminalPool>),
     );
-    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::local()).await;
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::new(TEST_LOCAL_ATTACH_HOST)).await;
     (daemon, terminal_pool)
 }
 
@@ -427,8 +430,7 @@ fn write_attach_hosts_config(config_base: &Path, hosts: &[(&str, &str, Option<&s
 }
 
 fn non_local_attach_hosts() -> (&'static str, &'static str) {
-    let local = HostName::local();
-    let mut candidates = ["feta", "gouda", "kiwi"].into_iter().filter(|host| *host != local.as_str());
+    let mut candidates = ["feta", "gouda", "kiwi"].into_iter().filter(|host| *host != TEST_LOCAL_ATTACH_HOST);
     (candidates.next().expect("first non-local host"), candidates.next().expect("second non-local host"))
 }
 
@@ -2539,6 +2541,50 @@ fn collect_linked_issue_ids_from_checkouts() {
 
     let ids = collect_linked_issue_ids(&providers);
     assert_eq!(ids, vec!["7"]);
+}
+
+#[tokio::test]
+async fn convoy_change_request_resolves_from_peer_data_for_virtual_repo() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"feta-host\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::new("feta")).await;
+    let identity = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
+    let repository_key = RepositoryKey("repo_flotilla".into());
+    let mut peer_data = ProviderData::default();
+    peer_data.change_requests.insert("846".into(), ChangeRequest {
+        title: "Fix remote convoy PR refs".into(),
+        branch: "fix/remote-pr-ref".into(),
+        status: ChangeRequestStatus::Open,
+        body: None,
+        correlation_keys: vec![CorrelationKey::ChangeRequestRef("github".into(), "846".into())],
+        association_keys: vec![],
+        provider_name: "github".into(),
+        provider_display_name: "GitHub".into(),
+    });
+
+    daemon
+        .add_virtual_repo(
+            identity,
+            Some(repository_key.clone()),
+            PathBuf::from("/virtual/kiwi/flotilla"),
+            vec![(node("kiwi"), peer_data)],
+            1,
+        )
+        .await
+        .expect("add virtual repo");
+
+    let resolved = daemon
+        .resolve_convoy_change_request(std::slice::from_ref(&repository_key), "fix/remote-pr-ref")
+        .await
+        .expect("resolve change request")
+        .expect("peer-backed change request");
+
+    assert_eq!(resolved.id, "846");
+    assert_eq!(resolved.status, ChangeRequestStatus::Open);
+    assert_eq!(resolved.repository_key, repository_key);
 }
 
 #[test]

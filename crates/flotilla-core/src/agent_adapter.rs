@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
@@ -6,7 +6,7 @@ use flotilla_resources::TerminalBrief;
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{discovery::EnvironmentBag, CommandRunner},
+    providers::{discovery::EnvironmentBag, ChannelLabel, CommandRunner},
 };
 
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
@@ -26,11 +26,27 @@ pub struct CrewBriefMember {
     pub is_agent: bool,
 }
 
+/// What the `## Assignment` section of a crew brief should say. Distinct from
+/// `Option<&str>` because "no ad-hoc prompt" splits into two very different
+/// situations: the convoy carries an issue (the issue *is* the assignment) or
+/// nothing was provided at all. Conflating them taught a crew to read "no
+/// additional assignment" as overriding the issue contract below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrewAssignment<'a> {
+    /// An explicit dispatch or handoff prompt.
+    Prompt(&'a str),
+    /// The convoy carries issue snapshots appended below the brief; those issues
+    /// are the assignment.
+    CarriedIssue,
+    /// Nothing was provided.
+    Unassigned,
+}
+
 pub fn build_crew_brief(
     context: &flotilla_resources::TerminalCrewContext,
     vessel: &str,
     role: &str,
-    prompt: Option<&str>,
+    assignment: CrewAssignment<'_>,
     members: &[CrewBriefMember],
 ) -> flotilla_resources::TerminalBrief {
     let mut content = format!(
@@ -46,9 +62,57 @@ pub fn build_crew_brief(
     }
     content.push_str(&format!(
         "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
-        prompt.unwrap_or("No additional assignment was provided.")
+        match assignment {
+            CrewAssignment::Prompt(prompt) => prompt,
+            CrewAssignment::CarriedIssue =>
+                "Your assignment is the issue snapshot section below. Its body is the contract: work it to completion and deliver as described above.",
+            CrewAssignment::Unassigned =>
+                "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
+        }
     ));
     flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() }
+}
+
+/// Appends the convoy's work context (branch, repositories, issue snapshots,
+/// human instruction) to a crew brief. Every brief whose assignment is
+/// [`CrewAssignment::CarriedIssue`] must pass through here — the assignment text
+/// points at the issue snapshot section this writes.
+pub fn append_convoy_work_context(
+    content: &mut String,
+    convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
+    repository_refs: &[flotilla_resources::RepositoryKey],
+) {
+    content.push_str("\n\n## Work context\n\n");
+    if let Some(branch) = &convoy.spec.r#ref {
+        content.push_str(&format!("- Branch: `{branch}`\n"));
+    }
+    content.push_str("- Repositories:\n");
+    for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
+        content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
+    }
+    if !convoy.spec.issues.is_empty() {
+        let header = if convoy.spec.issues.len() == 1 { "Issue snapshot" } else { "Issue snapshots" };
+        content.push_str(&format!("\n## {header}\n\n"));
+    }
+    for issue in &convoy.spec.issues {
+        content.push_str(&format!(
+            "Source-qualified reference: `{}` / `{}` / `{}`\n\n",
+            issue.reference.source.service, issue.reference.source.scope, issue.reference.id
+        ));
+        content.push_str(&format!("Snapshot as of `{}`.\n\n", issue.snapshot.as_of.to_rfc3339()));
+        content.push_str(&format!("### {}\n\n", issue.snapshot.title));
+        content.push_str(&format!("State: `{:?}`\n\n", issue.snapshot.state).to_lowercase());
+        content.push_str(&format!("Labels: {}\n\n", issue.snapshot.labels.join(", ")));
+        if let Some(body) = &issue.snapshot.body {
+            content.push_str(body);
+            content.push('\n');
+        }
+    }
+    if let Some(instruction) = &convoy.spec.instruction {
+        content.push_str("\n## Human instruction\n\n");
+        content.push_str(instruction);
+        content.push('\n');
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +166,9 @@ impl Default for CapabilityTable {
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String>;
+    async fn cleanup(&self, _cwd: &ExecutionEnvironmentPath, _brief: &TerminalBrief) -> Result<(), String> {
+        Ok(())
+    }
     fn deliver_brief(&self, brief: &TerminalBrief) -> String {
         format!("Read your crew brief at {} and follow it.", brief.path)
     }
@@ -134,12 +201,53 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
-        self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await
+        self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
+        ensure_flotilla_git_exclude(&*self.runner, cwd.as_path()).await
+    }
+
+    async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
+        remove_agent_brief(&*self.runner, cwd.as_path(), brief).await
     }
 
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
         Ok(AgentLaunchPlan { command: self.command(request), env: Vec::new(), stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
+}
+
+async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
+    let Ok(output) = runner.run_output("git", &["rev-parse", "--git-path", "info/exclude"], cwd, &ChannelLabel::Noop).await else {
+        return Ok(());
+    };
+    if !output.success {
+        return Ok(());
+    }
+    let exclude_path = output.stdout.trim();
+    if exclude_path.is_empty() {
+        return Ok(());
+    }
+
+    let script = format!(
+        "set -eu; exclude={}; mkdir -p \"$(dirname \"$exclude\")\"; touch \"$exclude\"; grep -qxF '.flotilla/' \"$exclude\" || printf '%s\\n' '.flotilla/' >> \"$exclude\"",
+        flotilla_protocol::arg::shell_quote(exclude_path),
+    );
+    let _ = runner.run("sh", &["-lc", &script], cwd, &ChannelLabel::Noop).await;
+    Ok(())
+}
+
+async fn remove_agent_brief(runner: &dyn CommandRunner, cwd: &Path, brief: &TerminalBrief) -> Result<(), String> {
+    let path = cwd.join(&brief.path);
+    let path_str = path.to_str().ok_or_else(|| format!("brief path is not valid UTF-8: {}", path.display()))?;
+    runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Noop).await?;
+
+    for parent in [path.parent(), path.parent().and_then(Path::parent)].into_iter().flatten() {
+        if parent != cwd {
+            let Some(parent) = parent.to_str() else {
+                continue;
+            };
+            let _ = runner.run("rmdir", &[parent], Path::new("/"), &ChannelLabel::Noop).await;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -184,16 +292,17 @@ impl AgentAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{process::Command as ProcessCommand, sync::Arc};
 
     use flotilla_resources::{single_agent_contained_workflow_spec, CrewSource, TerminalCrewContext};
 
     use crate::{
-        agent_adapter::{build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewBriefMember},
+        agent_adapter::{build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember},
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{EnvironmentAssertion, EnvironmentBag},
             testing::MockRunner,
+            ProcessCommandRunner,
         },
     };
 
@@ -201,7 +310,7 @@ mod tests {
         let env = EnvironmentBag::new()
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"))
             .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
-        AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(vec![])))
+        AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(vec![Ok(".git/info/exclude\n".into()), Ok(String::new())])))
     }
 
     #[test]
@@ -224,13 +333,48 @@ mod tests {
             },
             "work",
             "coder",
-            prompt.as_deref(),
+            prompt.as_deref().map_or(CrewAssignment::Unassigned, CrewAssignment::Prompt),
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
         );
 
         assert!(brief.content.contains(
             "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
         ));
+    }
+
+    fn brief_for(assignment: CrewAssignment<'_>) -> String {
+        build_crew_brief(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "fix-delivery".to_string(),
+                vessel_ref: "vessel-fix-delivery-work".to_string(),
+            },
+            "work",
+            "coder",
+            assignment,
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+        )
+        .content
+    }
+
+    #[test]
+    fn carried_issue_assignment_points_at_the_issue_section_instead_of_disclaiming() {
+        let content = brief_for(CrewAssignment::CarriedIssue);
+        assert!(content.contains("## Assignment\n\nYour assignment is the issue snapshot section below."));
+        assert!(!content.contains("No assignment was provided"));
+    }
+
+    #[test]
+    fn unassigned_brief_says_so_and_forbids_inventing_work() {
+        let content = brief_for(CrewAssignment::Unassigned);
+        assert!(content.contains("No assignment was provided with this dispatch."));
+        assert!(content.contains("rather than inventing work"));
+    }
+
+    #[test]
+    fn prompt_assignment_is_verbatim() {
+        let content = brief_for(CrewAssignment::Prompt("Fix the flux capacitor."));
+        assert!(content.contains("## Assignment\n\nFix the flux capacitor.\n"));
     }
 
     #[test]
@@ -279,5 +423,68 @@ mod tests {
             "/tools/claude --dangerously-skip-permissions --model opus 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
         );
         assert!(!plan.command.contains("Implement the issue"));
+    }
+
+    #[tokio::test]
+    async fn prepare_excludes_flotilla_brief_from_git_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        assert!(ProcessCommand::new("git")
+            .args(["init", "-q", repo.to_str().expect("utf-8 repo path")])
+            .status()
+            .expect("git init")
+            .success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", repo.to_str().expect("utf-8 repo path"), "config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config email")
+            .success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", repo.to_str().expect("utf-8 repo path"), "config", "user.name", "Test"])
+            .status()
+            .expect("git config name")
+            .success());
+        std::fs::write(repo.join("README.md"), "hello\n").expect("write readme");
+        assert!(ProcessCommand::new("git")
+            .args(["-C", repo.to_str().expect("utf-8 repo path"), "add", "README.md"])
+            .status()
+            .expect("git add")
+            .success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", repo.to_str().expect("utf-8 repo path"), "commit", "-q", "-m", "init"])
+            .status()
+            .expect("git commit")
+            .success());
+
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let brief = flotilla_resources::TerminalBrief {
+            path: ".flotilla/briefs/coder.md".into(),
+            content: "secret assignment".into(),
+            copies: Vec::new(),
+        };
+        registry
+            .get("codex")
+            .expect("codex adapter")
+            .prepare(&ExecutionEnvironmentPath::new(repo.to_str().expect("utf-8 repo path")), &brief)
+            .await
+            .expect("prepare brief");
+
+        let status = ProcessCommand::new("git")
+            .args(["-C", repo.to_str().expect("utf-8 repo path"), "status", "--short"])
+            .output()
+            .expect("git status");
+        assert!(status.status.success());
+        assert_eq!(String::from_utf8(status.stdout).expect("utf-8 status"), "");
+        assert_eq!(std::fs::read_to_string(repo.join(".git/info/exclude")).expect("read exclude").matches(".flotilla/").count(), 1);
+
+        registry
+            .get("codex")
+            .expect("codex adapter")
+            .cleanup(&ExecutionEnvironmentPath::new(repo.to_str().expect("utf-8 repo path")), &brief)
+            .await
+            .expect("cleanup brief");
+        assert!(!repo.join(".flotilla/briefs/coder.md").exists(), "brief file should be removed");
+        assert!(!repo.join(".flotilla/briefs").exists(), "empty briefs directory should be removed");
     }
 }

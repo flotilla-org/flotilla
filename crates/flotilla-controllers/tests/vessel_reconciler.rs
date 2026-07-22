@@ -1308,6 +1308,98 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
 }
 
 #[tokio::test]
+async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let repository_key = repository_spec.key();
+    ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &repository_key, &repository_spec).await.expect("repository create");
+    let convoy = backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .create(&meta("convoy-issue-brief"), &ConvoySpec {
+            workflow_ref: "wf".to_string(),
+            inputs: BTreeMap::new(),
+            placement_policy: None,
+            repositories: vec![ConvoyRepositorySpec {
+                url: "https://github.com/flotilla-org/flotilla".to_string(),
+                repo_ref: repository_key.clone(),
+                base_ref: "main".to_string(),
+                workspace_slug: "flotilla".to_string(),
+                subpaths: Vec::new(),
+            }],
+            r#ref: Some("feat/issue-brief".to_string()),
+            project_ref: None,
+            adopted_checkout_refs: BTreeMap::new(),
+            issues: vec![ConvoyIssue {
+                reference: IssueRef {
+                    source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                    id: "811".into(),
+                },
+                repository_ref: Some(repository_key.clone()),
+                snapshot: IssueSnapshot {
+                    title: "Attention signal".into(),
+                    body: Some("The issue body is the contract.".into()),
+                    state: IssueState::Open,
+                    labels: vec!["enhancement".into()],
+                    as_of: "2026-07-22T09:30:00Z".parse().expect("timestamp"),
+                },
+            }],
+            instruction: None,
+        })
+        .await
+        .expect("convoy create");
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-issue-brief", &convoy.metadata.resource_version, &ConvoyStatus {
+            workflow_snapshot: Some(WorkflowSnapshot {
+                vessels: vec![VesselRequirement {
+                    name: "implement".to_string(),
+                    stance: Stance::Trusted,
+                    depends_on: Vec::new(),
+                    repository_refs: None,
+                    crew: vec![CrewSpec::builder()
+                        .role("coder".to_string())
+                        .source(CrewSource::Agent { selector: Selector { capability: "coding".to_string() }, prompt: None })
+                        .build()],
+                }],
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("convoy status update");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-issue-brief", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-checkout-issue-brief", "/Users/alice/dev/flotilla-existing").await;
+    let workspace = backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-issue-brief", "https://github.com/flotilla-org/flotilla"), &VesselSpec {
+            convoy_ref: "convoy-issue-brief".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-issue-brief".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(repository_key, "adopted-checkout-issue-brief".to_string())]),
+        })
+        .await
+        .expect("workspace create");
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    let Actuation::CreateTerminalSession { spec, .. } = outcome.actuations.first().expect("coder session actuation") else {
+        panic!("expected terminal session actuation");
+    };
+    let TerminalSessionSource::Agent { brief, .. } = &spec.source else {
+        panic!("expected structured agent launch");
+    };
+    assert!(brief.content.contains("## Assignment\n\nYour assignment is the issue snapshot section below."));
+    assert!(brief.content.contains("## Issue snapshot"));
+    assert!(brief.content.contains("The issue body is the contract."));
+    assert!(!brief.content.contains("No assignment was provided"));
+}
+
+#[tokio::test]
 async fn observed_checkout_at_managed_name_marks_workspace_failed() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-observed", "implement", REPO_URL, GIT_REF).await;

@@ -121,6 +121,29 @@ impl HostRegistry {
         self.hosts.read().await.get(environment_id).filter(|state| !state.removed).map(|state| state.node_id.clone())
     }
 
+    pub(crate) async fn node_id_for_host_name(&self, host: &HostName) -> Result<Option<NodeId>, String> {
+        let hosts = self.hosts.read().await;
+        let mut matches = hosts
+            .values()
+            .filter(|state| !state.removed)
+            .filter_map(|state| {
+                state
+                    .summary
+                    .as_ref()
+                    .and_then(|summary| summary.host_name.as_ref())
+                    .filter(|name| *name == host)
+                    .map(|_| state.node_id.clone())
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [node_id] => Ok(Some(node_id.clone())),
+            _ => Err(format!("host name '{host}' matches multiple routed nodes")),
+        }
+    }
+
     pub(crate) async fn get_host_status(
         &self,
         environment_id: &EnvironmentId,
