@@ -25,8 +25,8 @@ mod workflow_template;
 
 pub use backend::{ResourceBackend, TypedResolver};
 pub use checkout::{
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec, FreshCloneCheckoutSpec,
-    ObservedCheckoutSpec,
+    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, CheckoutWorktreeSpec,
+    FreshCloneCheckoutSpec, ObservedCheckoutSpec,
 };
 pub use clone::{Clone, ClonePhase, CloneSpec, CloneStatus, CloneStatusPatch};
 pub use convoy::{

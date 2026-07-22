@@ -296,6 +296,7 @@ pub async fn create_ready_checkout(
             phase: CheckoutPhase::Ready,
             path: Some(fixture.path.clone()),
             commit: Some("44982740".to_string()),
+            branch_provenance: Default::default(),
             message: None,
         })
         .await

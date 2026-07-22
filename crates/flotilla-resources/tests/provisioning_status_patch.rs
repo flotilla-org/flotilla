@@ -1,9 +1,9 @@
 use chrono::{TimeZone, Utc};
 use flotilla_resources::{
-    CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus, CloneStatusPatch, EnvironmentPhase, EnvironmentStatus,
-    EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, PresentationPhase, PresentationStatus,
-    PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus, TerminalSessionStatusPatch, VesselPhase,
-    VesselStatus, VesselStatusPatch,
+    CheckoutBranchProvenance, CheckoutPhase, CheckoutStatus, CheckoutStatusPatch, ClonePhase, CloneStatus, CloneStatusPatch,
+    EnvironmentPhase, EnvironmentStatus, EnvironmentStatusPatch, HostStatus, HostStatusPatch, InnerCommandStatus, PresentationPhase,
+    PresentationStatus, PresentationStatusPatch, Stance, StatusPatch, TerminalSessionPhase, TerminalSessionStatus,
+    TerminalSessionStatusPatch, VesselPhase, VesselStatus, VesselStatusPatch,
 };
 
 #[test]
@@ -51,10 +51,16 @@ fn checkout_status_patch_marks_ready_and_failed() {
     CheckoutStatusPatch::MarkPreparing.apply(&mut status);
     assert_eq!(status.phase, CheckoutPhase::Preparing);
 
-    CheckoutStatusPatch::MarkReady { path: "/workspace".to_string(), commit: Some("44982740".to_string()) }.apply(&mut status);
+    CheckoutStatusPatch::MarkReady {
+        path: "/workspace".to_string(),
+        commit: Some("44982740".to_string()),
+        branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+    }
+    .apply(&mut status);
     assert_eq!(status.phase, CheckoutPhase::Ready);
     assert_eq!(status.path.as_deref(), Some("/workspace"));
     assert_eq!(status.commit.as_deref(), Some("44982740"));
+    assert_eq!(status.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
 
     CheckoutStatusPatch::MarkFailed { message: "worktree add failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, CheckoutPhase::Failed);

@@ -90,6 +90,20 @@ pub enum CheckoutPhase {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutBranchProvenance {
+    #[default]
+    PreExisting,
+    CreatedForConvoy,
+}
+
+impl CheckoutBranchProvenance {
+    fn is_pre_existing(&self) -> bool {
+        *self == Self::PreExisting
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CheckoutStatus {
     pub phase: CheckoutPhase,
@@ -97,6 +111,9 @@ pub struct CheckoutStatus {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "CheckoutBranchProvenance::is_pre_existing")]
+    #[builder(default)]
+    pub branch_provenance: CheckoutBranchProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -104,7 +121,7 @@ pub struct CheckoutStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutStatusPatch {
     MarkPreparing,
-    MarkReady { path: String, commit: Option<String> },
+    MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkTerminating,
     MarkFailed { message: String },
 }
@@ -116,10 +133,11 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
                 status.phase = CheckoutPhase::Preparing;
                 status.message = None;
             }
-            Self::MarkReady { path, commit } => {
+            Self::MarkReady { path, commit, branch_provenance } => {
                 status.phase = CheckoutPhase::Ready;
                 status.path = Some(path.clone());
                 status.commit = commit.clone();
+                status.branch_provenance = *branch_provenance;
                 status.message = None;
             }
             Self::MarkTerminating => {

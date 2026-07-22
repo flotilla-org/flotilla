@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, Clone, ClonePhase, ResourceBackend, ResourceError, ResourceObject,
-    TypedResolver,
+    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, Clone, ClonePhase, ResourceBackend,
+    ResourceError, ResourceObject, TypedResolver,
 };
 use tracing::warn;
 
@@ -27,6 +27,12 @@ pub enum CheckoutRemovalOutcome {
     PreservedBranch { branch: String, reason: BranchPreservationReason },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCheckout {
+    pub commit: Option<String>,
+    pub branch_provenance: CheckoutBranchProvenance,
+}
+
 #[async_trait]
 pub trait CheckoutRuntime: Send + Sync {
     async fn create_worktree(
@@ -35,14 +41,14 @@ pub trait CheckoutRuntime: Send + Sync {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
-    ) -> Result<Option<String>, String>;
+    ) -> Result<PreparedCheckout, String>;
     async fn create_fresh_clone(
         &self,
         repo_url: &str,
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
-    ) -> Result<Option<String>, String>;
+    ) -> Result<PreparedCheckout, String>;
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
 }
 
@@ -59,7 +65,7 @@ impl<R> CheckoutReconciler<R> {
 
 pub enum CheckoutDeps {
     None,
-    Ready { commit: Option<String> },
+    Ready { prepared: PreparedCheckout },
     Waiting,
     Failed(String),
 }
@@ -90,13 +96,13 @@ where
                     return Ok(CheckoutDeps::Failed("worktree clone env_ref mismatch".to_string()));
                 }
                 Ok(match self.runtime.create_worktree(&clone.spec.path, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
-                    Ok(commit) => CheckoutDeps::Ready { commit },
+                    Ok(prepared) => CheckoutDeps::Ready { prepared },
                     Err(err) => CheckoutDeps::Failed(err),
                 })
             }
             CheckoutSpec::FreshClone(spec) => {
                 Ok(match self.runtime.create_fresh_clone(&spec.url, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path).await {
-                    Ok(commit) => CheckoutDeps::Ready { commit },
+                    Ok(prepared) => CheckoutDeps::Ready { prepared },
                     Err(err) => CheckoutDeps::Failed(err),
                 })
             }
@@ -114,9 +120,11 @@ where
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending {
             match deps {
-                CheckoutDeps::Ready { commit } => {
-                    obj.spec.target_path().map(|path| CheckoutStatusPatch::MarkReady { path: path.to_string(), commit: commit.clone() })
-                }
+                CheckoutDeps::Ready { prepared } => obj.spec.target_path().map(|path| CheckoutStatusPatch::MarkReady {
+                    path: path.to_string(),
+                    commit: prepared.commit.clone(),
+                    branch_provenance: prepared.branch_provenance,
+                }),
                 CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutDeps::Waiting | CheckoutDeps::None => None,
             }
