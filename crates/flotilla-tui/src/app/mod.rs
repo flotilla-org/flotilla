@@ -1406,6 +1406,9 @@ impl App {
                         StepStatus::Succeeded => {
                             tracing::info!(%command_id, %node_id, step = %step_label, %description, "step succeeded");
                         }
+                        StepStatus::Produced { .. } => {
+                            tracing::info!(%command_id, %node_id, step = %step_label, %description, "step produced output");
+                        }
                         StepStatus::Failed { ref message } => {
                             tracing::warn!(%command_id, %node_id, step = %step_label, %description, error = %message, "step failed");
                             self.set_status_message(Some(format!("{description}: {message}")));

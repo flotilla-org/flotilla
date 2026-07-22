@@ -147,7 +147,9 @@ impl RemoteCommandRouter {
         let desc = command.description();
         info!(%target_node_id, %local, %desc, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
-            if command.action.is_query() || matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
+            if command.action.is_query()
+                || matches!(command.action, CommandAction::ConvoyStartPrepared { .. } | CommandAction::ResourceWatch { .. })
+            {
                 let request_id = {
                     let mut pm = self.peer_manager.lock().await;
                     pm.next_request_id()

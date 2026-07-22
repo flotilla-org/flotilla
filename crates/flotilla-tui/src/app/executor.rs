@@ -246,7 +246,10 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::HostProviders(_)
         | CommandValue::FleetList(_)
         | CommandValue::CrewList(_)
-        | CommandValue::FleetReplicaSnapshot(_) => {
+        | CommandValue::FleetReplicaSnapshot(_)
+        | CommandValue::ResourceList(_)
+        | CommandValue::ResourceObject(_)
+        | CommandValue::ResourceWatchEvent(_) => {
             tracing::warn!("query result reached TUI handler — should be handled by CLI");
         }
         CommandValue::ImageEnsured { .. } | CommandValue::EnvironmentCreated { .. } | CommandValue::EnvironmentSpecRead { .. } => {

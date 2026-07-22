@@ -20,17 +20,19 @@ use flotilla_protocol::{
     arg::{flatten, Arg},
     qualified_path::QualifiedPath,
     result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
-    AttachBinding, Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
-    FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
+    AttachBinding, Command, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry,
+    EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
     HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProjectListEntry,
-    ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoInfo,
-    RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, StatusResponse, StreamKey, SystemInfo,
-    ToolInventory, TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity,
+    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, ResourceJsonResponse,
+    ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
-    external_patches as convoy_external_patches, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    external_patches as convoy_external_patches, get_resource_kind, list_resource_kind, normalize_project_spec,
+    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, Checkout as ResourceCheckout,
+    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
@@ -124,6 +126,82 @@ fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
     // Use a deterministic temporary id encoded directly from the daemon.toml
     // entry key bytes so distinct legal config keys remain injective in this tranche.
     EnvironmentId::new(format!("static-ssh-{suffix}"))
+}
+
+#[derive(bon::Builder)]
+struct ResourceWatchCommandContext {
+    backend: ResourceBackend,
+    namespace: String,
+    kind: String,
+    command_id: u64,
+    node_id: NodeId,
+    repo_identity: RepoIdentity,
+    event_tx: broadcast::Sender<DaemonEvent>,
+    token: CancellationToken,
+}
+
+async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> CommandValue {
+    let watch = match watch_resource_kind(&context.backend, &context.namespace, &context.kind).await {
+        Ok(watch) => watch,
+        Err(error) => return CommandValue::Error { message: error.to_string() },
+    };
+
+    let kind = watch.kind;
+    let plural = watch.plural;
+    let namespace = watch.namespace;
+    for event in watch.initial {
+        if context.token.is_cancelled() {
+            return CommandValue::Cancelled;
+        }
+        send_resource_watch_event(&context.event_tx, context.command_id, &context.node_id, &context.repo_identity, ResourceWatchResponse {
+            kind: kind.clone(),
+            plural: plural.clone(),
+            namespace: namespace.clone(),
+            event,
+        });
+    }
+
+    let mut stream = watch.stream;
+    loop {
+        tokio::select! {
+            _ = context.token.cancelled() => return CommandValue::Cancelled,
+            event = stream.next() => {
+                match event {
+                    Some(Ok(event)) => {
+                        send_resource_watch_event(
+                            &context.event_tx,
+                            context.command_id,
+                            &context.node_id,
+                            &context.repo_identity,
+                            ResourceWatchResponse { kind: kind.clone(), plural: plural.clone(), namespace: namespace.clone(), event },
+                        );
+                    }
+                    Some(Err(error)) => return CommandValue::Error { message: error.to_string() },
+                    None => return CommandValue::Ok,
+                }
+            }
+        }
+    }
+}
+
+fn send_resource_watch_event(
+    event_tx: &broadcast::Sender<DaemonEvent>,
+    command_id: u64,
+    node_id: &NodeId,
+    repo_identity: &RepoIdentity,
+    response: ResourceWatchResponse,
+) {
+    let description = format!("{} {}", response.event["type"].as_str().unwrap_or("EVENT"), response.kind);
+    let _ = event_tx.send(DaemonEvent::CommandStepUpdate {
+        command_id,
+        node_id: node_id.clone(),
+        repo_identity: repo_identity.clone(),
+        repo: None,
+        step_index: 0,
+        step_count: 1,
+        description,
+        status: StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(Box::new(response))) },
+    });
 }
 
 #[derive(Default)]
@@ -5021,6 +5099,51 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
+        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind } = command.action {
+            let repo_identity = empty_repo_identity();
+            let description = format!("watch resource {namespace}/{kind}");
+            let token = CancellationToken::new();
+            {
+                let mut guard = self.active_commands.lock().await;
+                guard.insert(id, token.clone());
+            }
+            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+                command_id: id,
+                node_id: command_node_id.clone(),
+                repo_identity: repo_identity.clone(),
+                repo: None,
+                description,
+            });
+
+            let backend = self.resource_backend.clone();
+            let event_tx = self.event_tx.clone();
+            let active_ref = Arc::clone(&self.active_commands);
+            tokio::spawn(async move {
+                let result = run_resource_watch_command(
+                    ResourceWatchCommandContext::builder()
+                        .backend(backend)
+                        .namespace(namespace)
+                        .kind(kind)
+                        .command_id(id)
+                        .node_id(command_node_id.clone())
+                        .repo_identity(repo_identity.clone())
+                        .event_tx(event_tx.clone())
+                        .token(token)
+                        .build(),
+                )
+                .await;
+                active_ref.lock().await.remove(&id);
+                let _ = event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: command_node_id,
+                    repo_identity,
+                    repo: None,
+                    result,
+                });
+            });
+            return Ok(id);
+        }
+
         if matches!(command.action, flotilla_protocol::CommandAction::Refresh { repo: None }) {
             let repo_paths = {
                 let repos = self.repos.read().await;
@@ -5918,6 +6041,27 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetReplicaSnapshot(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
+            CommandAction::QueryResourceList { namespace, kind } => match list_resource_kind(&self.resource_backend, namespace, kind).await
+            {
+                Ok(v) => Ok(flotilla_protocol::CommandValue::ResourceList(Box::new(ResourceJsonResponse {
+                    kind: v.kind,
+                    plural: v.plural,
+                    namespace: v.namespace,
+                    value: v.value,
+                }))),
+                Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
+            },
+            CommandAction::QueryResourceGet { namespace, kind, name } => {
+                match get_resource_kind(&self.resource_backend, namespace, kind, name).await {
+                    Ok(v) => Ok(flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                        kind: v.kind,
+                        plural: v.plural,
+                        namespace: v.namespace,
+                        value: v.value,
+                    }))),
+                    Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
+                }
+            }
             CommandAction::Attach { reference } => match self.resolve_attach_command_internal(reference).await {
                 Ok(resolved) => {
                     Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command: resolved.command, binding: resolved.binding })

@@ -13,6 +13,7 @@ mod placement_policy;
 mod presentation;
 mod project;
 mod provisioning_identity;
+mod registry;
 mod repository;
 mod resource;
 mod retention;
@@ -56,6 +57,10 @@ pub use project::{
     ProjectRepositorySpec, ProjectSpec,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
+pub use registry::{
+    get_resource_kind, list_resource_kind, resource_list_api_version, watch_resource_kind, DynamicResourceList, DynamicResourceObject,
+    DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+};
 pub use repository::{
     ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,
     RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,

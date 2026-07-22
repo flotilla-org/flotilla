@@ -87,7 +87,8 @@ pub(crate) mod test_helpers {
 
 pub use commands::{
     AttachBinding, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent,
-    IssueSelector, PreparedConvoyStart, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, StepStatus,
+    IssueSelector, PreparedConvoyStart, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand,
+    ResourceJsonResponse, ResourceWatchResponse, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

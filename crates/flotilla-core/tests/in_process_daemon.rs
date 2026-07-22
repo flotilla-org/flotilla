@@ -43,7 +43,7 @@ use flotilla_protocol::{
     AssociationKey, Change, Checkout, CheckoutSelector, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent,
     CorrelationKey, DaemonEvent, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostEnvironment, HostName, HostPath,
     HostProviderStatus, HostSummary, ImageId, IssueRef, IssueSelector, IssueSource, NodeId, NodeInfo, PeerConnectionState, ProviderData,
-    RepoIdentity, RepoSelector, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
+    RepoIdentity, RepoSelector, StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, single_agent_contained_workflow_spec,
@@ -697,6 +697,102 @@ async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
     assert_eq!(fetched.reference, reference);
     assert_eq!(fetched.title, "Source-addressed issue fetch seam");
     assert!(daemon.list_repos().await.expect("list repos").is_empty());
+}
+
+#[tokio::test]
+async fn resource_list_and_get_queries_return_wire_json() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<ResourceConvoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("resource-demo".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+
+    let listed = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceList { namespace: "flotilla".to_string(), kind: "convoys".to_string() },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("list query");
+    let CommandValue::ResourceList(listed) = listed else { panic!("expected resource list") };
+    assert_eq!(listed.value["items"][0]["apiVersion"], "flotilla.work/v1");
+    assert_eq!(listed.value["items"][0]["kind"], "Convoy");
+    assert_eq!(listed.value["items"][0]["metadata"]["name"], "resource-demo");
+
+    let fetched = daemon
+        .execute_query(
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceGet {
+                    namespace: "flotilla".to_string(),
+                    kind: "Convoy".to_string(),
+                    name: "resource-demo".to_string(),
+                },
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("get query");
+    let CommandValue::ResourceObject(fetched) = fetched else { panic!("expected resource object") };
+    assert_eq!(fetched.value["metadata"]["name"], "resource-demo");
+    assert_eq!(fetched.value["spec"]["workflow_ref"], "wf");
+}
+
+#[tokio::test]
+async fn resource_watch_emits_initial_resources_as_wire_events() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    daemon
+        .resource_backend()
+        .using::<ResourceConvoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("watched-convoy".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create convoy");
+
+    let mut rx = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceWatch { namespace: "flotilla".to_string(), kind: "convoys".to_string() },
+        })
+        .await
+        .expect("watch command");
+
+    let watched = loop {
+        match recv_event(&mut rx).await {
+            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
+                let StepStatus::Produced { value } = status else { continue };
+                let CommandValue::ResourceWatchEvent(event) = *value else { continue };
+                break event;
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(watched.event["type"], "ADDED");
+    assert_eq!(watched.event["object"]["metadata"]["name"], "watched-convoy");
+
+    daemon.cancel(command_id).await.expect("cancel watch");
+    assert!(matches!(recv_command_finished(&mut rx, command_id).await, CommandValue::Cancelled));
 }
 
 async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {
