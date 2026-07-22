@@ -1034,6 +1034,7 @@ fn handoff_crew_brief(
     target: &str,
     prompt: Option<&str>,
     members: &[CrewListMember],
+    repository_refs: &[RepositoryKey],
 ) -> TerminalBrief {
     let assignment = match prompt {
         Some(prompt) => crate::agent_adapter::CrewAssignment::Prompt(prompt),
@@ -1058,8 +1059,7 @@ fn handoff_crew_brief(
             })
             .collect::<Vec<_>>(),
     );
-    let repository_refs = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
-    crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, &repository_refs);
+    crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, repository_refs);
     brief
 }
 
@@ -4536,6 +4536,10 @@ impl InProcessDaemon {
             .enumerate()
             .find(|(_, process)| process.role == target && target != context.caller_role)
             .ok_or_else(|| crew_handoff_address_error(target, &context.vessel))?;
+        let repository_refs = task
+            .repository_refs
+            .clone()
+            .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
         let CrewSource::Agent { selector, prompt } = &process.source else {
             return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
         };
@@ -4592,7 +4596,7 @@ impl InProcessDaemon {
                         .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?
                 };
                 let current = self.crew_list_internal(requested).await?;
-                let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members);
+                let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, &repository_refs);
                 sessions
                     .create(&identity.input_meta(), &flotilla_resources::TerminalSessionSpec {
                         env_ref: anchor.spec.env_ref,
