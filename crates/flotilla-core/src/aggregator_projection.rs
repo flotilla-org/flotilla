@@ -315,7 +315,11 @@ fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
 }
 
 fn convoy_matches_scope(row: &ConvoyRow, scope: &QueryScope) -> bool {
-    row.project_ref.as_deref().is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+    row.resource.namespace == scope.namespace
+        && row
+            .project_ref
+            .as_deref()
+            .is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
 }
 
 fn merged_issue_state(issue_sets: &[(QueryScope, ResultSet)]) -> ResultSetState {
@@ -344,8 +348,22 @@ mod tests {
 
     use super::*;
 
+    fn scope_in(namespace: &str, name: &str) -> QueryScope {
+        QueryScope::new(namespace, name)
+    }
+
     fn scope(name: &str) -> QueryScope {
-        QueryScope::new("flotilla", name)
+        scope_in("flotilla", name)
+    }
+
+    fn convoy_row(namespace: &str, name: &str, project_ref: &str) -> ConvoyRow {
+        ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name))
+            .name(name)
+            .workflow_ref("implement")
+            .phase(ConvoyPhase::Active)
+            .project_ref(project_ref)
+            .build()
     }
 
     fn issue_row(scope: &str, id: &str) -> IssueRow {
@@ -399,5 +417,27 @@ mod tests {
                 && node.scope.as_ref() == Some(&project)
                 && node.entries.iter().any(|entry| entry.kind == AwarenessKind::Issue)
         }));
+    }
+
+    #[tokio::test]
+    async fn scoped_awareness_filters_convoys_by_project_namespace() {
+        let state = AggregatorProjectionState::new();
+        let project = scope_in("team-a", "roadmap");
+        let matching = convoy_row("team-a", "matching", "roadmap");
+        let other_namespace = convoy_row("team-b", "other-namespace", "roadmap");
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows = [matching.clone(), other_namespace].into_iter().map(|row| (row.resource.clone(), row)).collect();
+            convoys.seq = 1;
+        }
+
+        let result = state.awareness_result_set(&Some(project.clone()), AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        let Rows::Awareness { rows, .. } = result.rows else { panic!("awareness rows") };
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope.as_ref(), Some(&project));
+        assert_eq!(rows[0].counts.convoys, 1);
+        assert_eq!(rows[0].entries.iter().filter(|entry| entry.kind == AwarenessKind::Convoy).count(), 1);
+        assert!(rows[0].refs.contains(&matching.resource));
     }
 }

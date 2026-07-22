@@ -47,10 +47,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
 
     for convoy in &input.convoys {
         let key = input.scope.as_ref().map(group_key_for_scope).unwrap_or_else(|| group_key_for_convoy(input.grouping, convoy));
-        let kind = match input.grouping {
-            AwarenessGrouping::Project => AwarenessKind::Project,
-            AwarenessGrouping::Convoy => AwarenessKind::Convoy,
-        };
+        let kind = group_kind_for_query(input.scope.as_ref(), input.grouping);
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, kind));
         group.refs.push(convoy.resource.clone());
         group.add_entry(
@@ -226,6 +223,16 @@ fn group_key_for_scope(scope: &QueryScope) -> GroupKey {
     GroupKey::scoped(scope.clone())
 }
 
+fn group_kind_for_query(scope: Option<&QueryScope>, grouping: AwarenessGrouping) -> AwarenessKind {
+    if scope.is_some() {
+        return AwarenessKind::Project;
+    }
+    match grouping {
+        AwarenessGrouping::Project => AwarenessKind::Project,
+        AwarenessGrouping::Convoy => AwarenessKind::Convoy,
+    }
+}
+
 fn group_key_for_convoy(grouping: AwarenessGrouping, convoy: &ConvoyRow) -> GroupKey {
     match grouping {
         AwarenessGrouping::Project => convoy.project_ref.as_deref().map(project_ref_key).unwrap_or_else(|| {
@@ -377,6 +384,22 @@ mod tests {
         assert_eq!(nodes[0].counts.checkouts, 1);
         assert_eq!(nodes[0].counts.independents, 1);
         assert!(nodes[0].entries.iter().any(|entry| entry.kind == AwarenessKind::Convoy && entry.label == "ship-it"));
+    }
+
+    #[test]
+    fn scoped_awareness_reports_project_kind_even_with_convoy_grouping() {
+        let scope = QueryScope::new("flotilla", "platform");
+        let (nodes, _) = project_awareness(AwarenessInput {
+            scope: Some(scope.clone()),
+            grouping: AwarenessGrouping::Convoy,
+            convoys: vec![convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active)],
+            ..AwarenessInput::default()
+        });
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].kind, AwarenessKind::Project);
+        assert_eq!(nodes[0].scope.as_ref(), Some(&scope));
+        assert_eq!(nodes[0].counts.convoys, 1);
     }
 
     #[test]
