@@ -117,6 +117,10 @@ impl HostRegistry {
         self.node_environments.read().await.get(node_id).cloned()
     }
 
+    pub(crate) async fn node_id_for_environment(&self, environment_id: &EnvironmentId) -> Option<NodeId> {
+        self.hosts.read().await.get(environment_id).filter(|state| !state.removed).map(|state| state.node_id.clone())
+    }
+
     pub(crate) async fn get_host_status(
         &self,
         environment_id: &EnvironmentId,

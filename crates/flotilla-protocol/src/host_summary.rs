@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::qualified_path::HostId;
 use crate::{EnvironmentId, EnvironmentInfo, HostName, NodeId};
 
+pub const AGENT_ADAPTER_PROVIDER_CATEGORY: &str = "agent_adapter";
+pub const TERMINAL_POOL_PROVIDER_CATEGORY: &str = "terminal_pool";
+
 /// Mesh identity plus the human-readable label that should be shown in the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -19,17 +22,20 @@ impl NodeInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostSummary {
     pub environment_id: EnvironmentId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_name: Option<HostName>,
     pub node: NodeInfo,
     pub system: SystemInfo,
+    #[builder(default)]
     #[serde(default)]
     pub inventory: ToolInventory,
+    #[builder(default)]
     #[serde(default)]
     pub providers: Vec<HostProviderStatus>,
+    #[builder(default)]
     #[serde(default)]
     pub environments: Vec<EnvironmentInfo>,
 }
@@ -80,7 +86,7 @@ pub struct DiscoveryFact {
     pub detail: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostProviderStatus {
     pub category: String,
     /// Display name for the provider (e.g. "Docker").
@@ -89,6 +95,13 @@ pub struct HostProviderStatus {
     #[serde(default)]
     pub implementation: String,
     pub healthy: bool,
+}
+
+impl HostProviderStatus {
+    pub fn available(category: impl Into<String>, implementation: impl Into<String>) -> Self {
+        let implementation = implementation.into();
+        Self::builder().category(category.into()).name(implementation.clone()).implementation(implementation).healthy(true).build()
+    }
 }
 
 /// Full snapshot of one node's state — system info, inventory, provider health.

@@ -30,6 +30,7 @@ pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, Environme
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
     DiscoveryFact, HostEnvironment, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 pub use lifecycle::LifecycleAuthority;
 pub use path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -86,7 +87,7 @@ pub(crate) mod test_helpers {
 
 pub use commands::{
     AttachBinding, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent,
-    IssueSelector, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, StepStatus,
+    IssueSelector, PreparedConvoyStart, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

@@ -24,7 +24,7 @@ use tracing::info;
 
 use crate::peer::{PeerManager, PeerSender};
 
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
 pub(super) struct PendingRemoteCommand {
     pub(super) command_id: u64,
     pub(super) target_node_id: NodeId,
@@ -126,26 +126,42 @@ impl RemoteCommandRouter {
         }
     }
 
-    pub(super) async fn dispatch_execute(&self, command: Command) -> Result<u64, String> {
+    pub(super) async fn dispatch_execute(&self, mut command: Command) -> Result<u64, String> {
+        if matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
+            return Err("prepared convoy starts are reserved for authenticated peer forwarding".to_string());
+        }
+        if let CommandAction::ConvoyStart { intent } = &command.action {
+            let placement_target = self.daemon.resolve_convoy_start_target_node(intent).await?;
+            let intended_target = placement_target.as_ref().unwrap_or_else(|| self.daemon.node_id());
+            if command.node_id.as_ref().is_some_and(|target| target != intended_target) {
+                return Err("convoy command target does not match its host-direct placement policy".to_string());
+            }
+            if intended_target != self.daemon.node_id() {
+                command.node_id = Some(intended_target.clone());
+                let prepared = self.daemon.prepare_remote_convoy_start(intent).await?;
+                command.action = CommandAction::ConvoyStartPrepared { start: Box::new(prepared) };
+            }
+        }
         let target_node_id = command.node_id.clone().unwrap_or_else(|| self.daemon.node_id().clone());
         let local = self.daemon.node_id();
         let desc = command.description();
         info!(%target_node_id, %local, %desc, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
-            if command.action.is_query() {
+            if command.action.is_query() || matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
                 let request_id = {
                     let mut pm = self.peer_manager.lock().await;
                     pm.next_request_id()
                 };
                 let command_id = self.next_remote_command_id.fetch_add(1, Ordering::Relaxed);
-                self.pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
-                    command_id,
-                    target_node_id: target_node_id.clone(),
-                    repo_identity: extract_command_repo_identity(&command),
-                    repo: None,
-                    finished_via_event: false,
-                    query_completion: None,
-                });
+                self.pending_remote_commands.lock().await.insert(
+                    request_id,
+                    PendingRemoteCommand::builder()
+                        .command_id(command_id)
+                        .target_node_id(target_node_id.clone())
+                        .maybe_repo_identity(extract_command_repo_identity(&command))
+                        .finished_via_event(false)
+                        .build(),
+                );
 
                 let routed = RoutedPeerMessage::CommandRequest {
                     request_id,
@@ -194,14 +210,16 @@ impl RemoteCommandRouter {
 
         let (tx, rx) = oneshot::channel();
 
-        self.pending_remote_commands.lock().await.insert(request_id, PendingRemoteCommand {
-            command_id,
-            target_node_id: target_node_id.clone(),
-            repo_identity: extract_command_repo_identity(&command),
-            repo: None,
-            finished_via_event: false,
-            query_completion: Some(tx),
-        });
+        self.pending_remote_commands.lock().await.insert(
+            request_id,
+            PendingRemoteCommand::builder()
+                .command_id(command_id)
+                .target_node_id(target_node_id.clone())
+                .maybe_repo_identity(extract_command_repo_identity(&command))
+                .finished_via_event(false)
+                .query_completion(tx)
+                .build(),
+        );
 
         let routed = RoutedPeerMessage::CommandRequest {
             request_id,
@@ -328,6 +346,12 @@ impl RemoteCommandRouter {
     }
 
     pub(super) async fn emit_remote_command_event(&self, request_id: u64, responder_node_id: NodeId, event: CommandPeerEvent) {
+        let event = match event {
+            CommandPeerEvent::Finished { repo_identity, repo, result } => {
+                CommandPeerEvent::Finished { repo_identity, repo, result: self.route_remote_result(result).await }
+            }
+            event => event,
+        };
         let mut pending = self.pending_remote_commands.lock().await;
         let Some(entry) = pending.get_mut(&request_id) else {
             return;
@@ -375,6 +399,7 @@ impl RemoteCommandRouter {
     }
 
     pub(super) async fn complete_remote_command(&self, request_id: u64, responder_node_id: NodeId, result: CommandValue) {
+        let result = self.route_remote_result(result).await;
         let mut pending = self.pending_remote_commands.lock().await;
         let Some(entry) = pending.remove(&request_id) else {
             return;
@@ -407,6 +432,22 @@ impl RemoteCommandRouter {
             repo: entry.repo,
             result,
         });
+    }
+
+    async fn route_remote_result(&self, result: CommandValue) -> CommandValue {
+        let CommandValue::ConvoyStarted { name, attach_command, binding } = result else {
+            return result;
+        };
+        let Some(binding) = binding else {
+            return CommandValue::ConvoyStarted { name, attach_command, binding: None };
+        };
+        if attach_command.is_none() || binding.host == *self.daemon.host_name() {
+            return CommandValue::ConvoyStarted { name, attach_command, binding: Some(binding) };
+        }
+        match self.daemon.route_remote_attach_binding(&binding).await {
+            Ok(command) => CommandValue::ConvoyStarted { name, attach_command: Some(command), binding: Some(binding) },
+            Err(message) => CommandValue::Error { message: format!("convoy {name} started, but remote attach routing failed: {message}") },
+        }
     }
 
     pub(super) async fn complete_remote_cancel(&self, cancel_id: u64, error: Option<String>) {

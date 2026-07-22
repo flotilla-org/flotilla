@@ -74,7 +74,7 @@ pub struct PreparedWorkspace {
 }
 
 /// Routed command envelope shared by all frontends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct Command {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<crate::NodeId>,
@@ -121,6 +121,28 @@ pub struct ConvoyStartIntent {
     pub instruction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
+    #[builder(default)]
+    #[serde(default)]
+    pub auto_attach: bool,
+}
+
+/// A convoy launch admitted by the presentation host and ready to be
+/// persisted by the selected execution host.
+///
+/// Resource specs remain opaque at the protocol boundary so the protocol
+/// crate does not depend on the resource model. The execution host validates
+/// and deserializes each snapshot before storing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct PreparedConvoyStart {
+    pub namespace: String,
+    pub name: String,
+    pub convoy_spec: serde_json::Value,
+    pub workflow_name: String,
+    pub workflow_spec: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_policy_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_policy_spec: Option<serde_json::Value>,
     #[builder(default)]
     #[serde(default)]
     pub auto_attach: bool,
@@ -239,6 +261,11 @@ pub enum CommandAction {
     },
     ConvoyStart {
         intent: Box<ConvoyStartIntent>,
+    },
+    /// Internal peer command carrying the exact resource snapshots admitted
+    /// by the presentation host.
+    ConvoyStartPrepared {
+        start: Box<PreparedConvoyStart>,
     },
     WorkflowTemplateApply {
         name: String,
@@ -362,6 +389,7 @@ impl Command {
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::ConvoyStart { .. } => "Starting convoy...",
+            CommandAction::ConvoyStartPrepared { .. } => "Starting convoy...",
             CommandAction::WorkflowTemplateApply { .. } => "Applying workflow template...",
             CommandAction::ProjectAdd { .. } => "Adding project...",
             CommandAction::ProjectApply { .. } => "Applying project...",
