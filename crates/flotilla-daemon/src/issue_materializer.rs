@@ -890,31 +890,17 @@ mod tests {
         }]));
         let (materializer, mut events) = manager(&state, &query, vec![source], provider);
         let _ = next_event(&mut events).await;
-        let initial_ids = state
-            .result_set_for(&query)
-            .await
-            .expect("initial window")
-            .rows
-            .as_issues()
-            .expect("issue rows")
-            .iter()
-            .map(|row| row.reference.id.as_str())
-            .collect::<Vec<_>>();
+        let initial_window = state.result_set_for(&query).await.expect("initial window");
+        let initial_ids =
+            initial_window.rows.as_issues().expect("issue rows").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>();
         assert_eq!(initial_ids, vec!["10", "1"]);
 
         materializer.refresh(&query);
 
         let _ = next_event(&mut events).await;
-        let refreshed_ids = state
-            .result_set_for(&query)
-            .await
-            .expect("refreshed window")
-            .rows
-            .as_issues()
-            .expect("issue rows")
-            .iter()
-            .map(|row| row.reference.id.as_str())
-            .collect::<Vec<_>>();
+        let refreshed_window = state.result_set_for(&query).await.expect("refreshed window");
+        let refreshed_ids =
+            refreshed_window.rows.as_issues().expect("issue rows").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>();
         assert_eq!(refreshed_ids, vec!["10", "1"], "an update timestamp must not move issue rows");
     }
 
