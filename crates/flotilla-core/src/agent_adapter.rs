@@ -45,7 +45,7 @@ pub fn build_crew_brief(
         content.push_str(&format!("Hand off to {} with `flotilla crew {} handoff --message '...'`.\n", member.role, member.role));
     }
     content.push_str(&format!(
-        "Complete your assignment with `flotilla crew complete --message '...'`. If it cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
+        "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
         prompt.unwrap_or("No additional assignment was provided.")
     ));
     flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() }
@@ -186,8 +186,10 @@ impl AgentAdapterRegistry {
 mod tests {
     use std::sync::Arc;
 
+    use flotilla_resources::{single_agent_contained_workflow_spec, CrewSource, TerminalCrewContext};
+
     use crate::{
-        agent_adapter::{AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable},
+        agent_adapter::{build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewBriefMember},
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -200,6 +202,35 @@ mod tests {
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"))
             .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
         AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(vec![])))
+    }
+
+    #[test]
+    fn default_single_agent_brief_requires_pr_delivery_before_completion() {
+        let workflow = single_agent_contained_workflow_spec();
+        let [vessel] = workflow.vessels.as_slice() else {
+            panic!("default workflow should have one vessel");
+        };
+        let [coder] = vessel.crew.as_slice() else {
+            panic!("default vessel should have one crew member");
+        };
+        let CrewSource::Agent { prompt, .. } = &coder.source else {
+            panic!("default coder should be an agent");
+        };
+        let brief = build_crew_brief(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "fix-delivery".to_string(),
+                vessel_ref: "vessel-fix-delivery-work".to_string(),
+            },
+            "work",
+            "coder",
+            prompt.as_deref(),
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+        );
+
+        assert!(brief.content.contains(
+            "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
+        ));
     }
 
     #[test]
