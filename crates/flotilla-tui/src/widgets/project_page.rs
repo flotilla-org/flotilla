@@ -12,7 +12,7 @@ use crate::{
     app::{NamespaceMap, QueryTableCache},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
-    table_view::{self, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId},
+    table_view::{self, AvailableAction, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId, TableIntent, TableIssueStart},
     theme::Theme,
     ui_helpers,
 };
@@ -215,6 +215,41 @@ impl ProjectPageWidget {
         Self::active_row(layouts, state).and_then(|(_, row)| super::table::TablePanel::row_action(row))
     }
 
+    fn selected_issue_starts(layouts: &[PanelLayout<'_>], state: &ProjectTableState) -> Option<(String, String, Vec<TableIssueStart>)> {
+        let layout = layouts.iter().find(|layout| layout.panel.kind == ProjectPanelKind::Issues)?;
+        let ViewAddress::Issues { scope } = &layout.panel.target else { return None };
+        let table_state = state.table(ProjectPanelKind::Issues);
+        let mut selected = Vec::new();
+        for row in &layout.panel.table.rows {
+            if table_state.multi_selected.contains(&row.id) {
+                if let Some(issue) = issue_start_from_row(row) {
+                    selected.push(issue);
+                }
+            }
+        }
+        if let Some(row) = table_state.selected_row(&layout.panel.table) {
+            if !table_state.multi_selected.contains(&row.id) {
+                if let Some(issue) = issue_start_from_row(row) {
+                    selected.push(issue);
+                }
+            }
+        }
+        if selected.len() <= 1 {
+            return None;
+        }
+        Some((scope.namespace.clone(), scope.name.clone(), selected))
+    }
+
+    fn selected_issue_bulk_action(layouts: &[PanelLayout<'_>], state: &ProjectTableState) -> Option<AvailableAction> {
+        let (namespace, project, issues) = Self::selected_issue_starts(layouts, state)?;
+        Some(AvailableAction {
+            id: "start_convoys",
+            label: "Start convoys",
+            key: 'c',
+            intent: TableIntent::StartConvoys { namespace, project, issues },
+        })
+    }
+
     fn render_composite(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, panels: &[ProjectPanel], state: &mut ProjectTableState) {
         self.area = area;
         let layouts = Self::layouts(panels);
@@ -254,7 +289,19 @@ impl ProjectPageWidget {
                     if state.active() == layout.panel.kind && state.header_focused() {
                         unfocused_state.clear_selection();
                     }
-                    super::table::TablePanel::render_rows(frame, rows_area, theme, &layout.panel.table, &unfocused_state, first, count);
+                    let table_state = state.table(layout.panel.kind);
+                    super::table::TablePanel::render_rows(
+                        frame,
+                        rows_area,
+                        theme,
+                        &layout.panel.table,
+                        &unfocused_state,
+                        super::table::RowDecorations {
+                            multi_selected: &table_state.multi_selected,
+                            pending_actions: &table_state.pending_actions,
+                        },
+                        first..first.saturating_add(count),
+                    );
                 }
             }
         }
@@ -299,6 +346,13 @@ impl InteractiveWidget for ProjectPageWidget {
                 self.ensure_active_visible(&layouts, state);
                 Outcome::Consumed
             }
+            Action::ToggleMultiSelect => {
+                let state = ctx.views.active_project_table_state_mut();
+                if !state.header_focused() {
+                    state.active_table_mut().toggle_selected_row();
+                }
+                Outcome::Consumed
+            }
             Action::NextPanel => {
                 let state = ctx.views.active_project_table_state_mut();
                 Self::select_panel_delta(&layouts, state, 1);
@@ -334,13 +388,16 @@ impl InteractiveWidget for ProjectPageWidget {
                 Some((panel, row)) => Outcome::Push(Box::new(DescribeWidget::new(panel.table.title.clone(), row.describe.clone()))),
                 None => Outcome::Consumed,
             },
-            Action::OpenActionMenu => match Self::active_row(&layouts, ctx.views.active_project_table_state()) {
-                Some((_, row)) if !row.actions.is_empty() => Outcome::Push(Box::new(TableActionMenuWidget::new(row.actions.clone()))),
-                Some(_) => {
-                    ctx.app_actions.push(AppAction::ShowStatus("No actions available for the selected row".into()));
-                    Outcome::Consumed
-                }
-                None => Outcome::Consumed,
+            Action::OpenActionMenu => match Self::selected_issue_bulk_action(&layouts, ctx.views.active_project_table_state()) {
+                Some(action) => Outcome::Push(Box::new(TableActionMenuWidget::new(vec![action]))),
+                None => match Self::active_row(&layouts, ctx.views.active_project_table_state()) {
+                    Some((_, row)) if !row.actions.is_empty() => Outcome::Push(Box::new(TableActionMenuWidget::new(row.actions.clone()))),
+                    Some(_) => {
+                        ctx.app_actions.push(AppAction::ShowStatus("No actions available for the selected row".into()));
+                        Outcome::Consumed
+                    }
+                    None => Outcome::Consumed,
+                },
             },
             _ => Outcome::Ignored,
         }
@@ -425,6 +482,13 @@ impl InteractiveWidget for ProjectPageWidget {
     }
 }
 
+fn issue_start_from_row(row: &table_view::ProjectedRow) -> Option<TableIssueStart> {
+    row.actions.iter().find_map(|action| match &action.intent {
+        TableIntent::StartConvoy { issue, .. } => Some(TableIssueStart { row_id: row.id.clone(), issue: issue.clone() }),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
@@ -453,6 +517,25 @@ mod tests {
                 }],
                 meta: TableMeta::default(),
             },
+        }
+    }
+
+    fn issue_row(id: &str) -> ProjectedRow {
+        let issue = flotilla_protocol::IssueRef {
+            source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: id.into(),
+        };
+        ProjectedRow {
+            id: RowId::new(format!("issue:flotilla:roadmap:https://github.com:flotilla-org/flotilla:{id}")),
+            cells: vec![CellValue { text: id.into(), tone: CellTone::Plain }],
+            drill: None,
+            describe: vec![],
+            actions: vec![AvailableAction {
+                id: "start",
+                label: "Start convoy",
+                key: 'c',
+                intent: TableIntent::StartConvoy { namespace: "flotilla".into(), project: "roadmap".into(), issue },
+            }],
         }
     }
 
@@ -508,6 +591,27 @@ mod tests {
         assert_eq!(state.active(), ProjectPanelKind::Issues);
         assert!(ProjectPageWidget::fetch_more_query(&layouts, &state, crate::widgets::table::FetchTrigger::Explicit).is_some());
         assert!(matches!(ProjectPageWidget::active_action(&layouts, &state), Some(AppAction::DrillView(ViewAddress::Issues { .. }))));
+    }
+
+    #[test]
+    fn selected_issue_rows_expose_one_bulk_start_action() {
+        let mut issues = panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "placeholder");
+        issues.table.rows = vec![issue_row("809"), issue_row("810"), issue_row("811")];
+        let panels = vec![issues];
+        let layouts = ProjectPageWidget::layouts(&panels);
+        let mut state = ProjectTableState::default();
+        state.set_active(ProjectPanelKind::Issues);
+        state.focus_rows();
+        state.table_mut(ProjectPanelKind::Issues).select_index(&panels[0].table, 2);
+        state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[0].id.clone());
+        state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[1].id.clone());
+
+        let action = ProjectPageWidget::selected_issue_bulk_action(&layouts, &state).expect("bulk action");
+
+        assert_eq!(action.label, "Start convoys");
+        let TableIntent::StartConvoys { namespace, project, issues } = action.intent else { panic!("expected bulk start") };
+        assert_eq!((namespace.as_str(), project.as_str()), ("flotilla", "roadmap"));
+        assert_eq!(issues.iter().map(|issue| issue.issue.id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
     }
 
     #[test]

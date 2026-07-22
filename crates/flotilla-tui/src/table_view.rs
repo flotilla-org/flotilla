@@ -11,7 +11,10 @@ use flotilla_protocol::{
     RepositoryKey, ResultSetCondition, ResultSetState, SessionPhase, ViewAddress,
 };
 
-use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
+use crate::{
+    app::ui_state::PendingAction,
+    convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowId(String);
@@ -20,11 +23,17 @@ impl RowId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct TableState {
     selected: Option<RowId>,
+    pub multi_selected: HashSet<RowId>,
+    pub pending_actions: HashMap<RowId, PendingAction>,
     pub filter: String,
     /// Ephemeral provider-side search for demand-backed issue tables. This is
     /// deliberately View state rather than part of the persisted address.
@@ -51,6 +60,8 @@ impl TableState {
         if !selected_exists {
             self.selected = view.rows.first().map(|row| row.id.clone());
         }
+        self.multi_selected.retain(|selected| view.rows.iter().any(|row| &row.id == selected));
+        self.pending_actions.retain(|selected, _| view.rows.iter().any(|row| &row.id == selected));
         self.scroll_offset = self.scroll_offset.min(view.rows.len().saturating_sub(1));
     }
 
@@ -91,6 +102,17 @@ impl TableState {
     pub fn selected_row<'a>(&self, view: &'a TableView) -> Option<&'a ProjectedRow> {
         let selected = self.selected.as_ref()?;
         view.rows.iter().find(|row| &row.id == selected)
+    }
+
+    pub fn selected_id(&self) -> Option<&RowId> {
+        self.selected.as_ref()
+    }
+
+    pub fn toggle_selected_row(&mut self) {
+        let Some(selected) = self.selected.clone() else { return };
+        if !self.multi_selected.remove(&selected) {
+            self.multi_selected.insert(selected);
+        }
     }
 }
 
@@ -175,6 +197,10 @@ impl ProjectTableState {
 
     pub fn active_table_mut(&mut self) -> &mut TableState {
         self.table_mut(self.active)
+    }
+
+    pub fn tables(&self) -> [&TableState; 4] {
+        [&self.convoys, &self.checkouts, &self.issues, &self.independents]
     }
 
     pub fn issue_source_search(&self) -> Option<&str> {
@@ -295,6 +321,13 @@ pub enum TableIntent {
     OpenChangeRequest { id: String, repository_key: RepositoryKey, host: Option<HostName> },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
     StartConvoy { namespace: String, project: String, issue: IssueRef },
+    StartConvoys { namespace: String, project: String, issues: Vec<TableIssueStart> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableIssueStart {
+    pub row_id: RowId,
+    pub issue: IssueRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]

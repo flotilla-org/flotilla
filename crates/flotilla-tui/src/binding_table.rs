@@ -172,6 +172,7 @@ pub static BINDINGS: &[Binding] = &[
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
     h(BindingModeId::DemandTable, "f", Action::FetchMore, "Fetch more"),
+    h(BindingModeId::DemandTable, "space", Action::ToggleMultiSelect, "Select"),
     h(BindingModeId::Project, "tab", Action::NextPanel, "Next panel"),
     b(BindingModeId::Project, "S-tab", Action::PrevPanel),
     b(BindingModeId::Project, "backtab", Action::PrevPanel),

@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{Command, CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey, WorkItem};
+use flotilla_protocol::{
+    Command, CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey, WorkItem, WorkItemIdentity,
+};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
@@ -318,6 +320,7 @@ impl App {
                                 identity: item.identity.clone(),
                                 description: intent.label(self.model.active_labels()),
                                 repo_identity: self.model.active_repo_identity().clone(),
+                                project_issue_start: None,
                             };
                             self.proto_commands.push_with_context(cmd, Some(pending_ctx));
                             return;
@@ -369,6 +372,7 @@ impl App {
                 identity: item.identity.clone(),
                 description: intent.label(self.model.active_labels()),
                 repo_identity: self.model.active_repo_identity().clone(),
+                project_issue_start: None,
             };
             self.proto_commands.push_with_context(cmd, Some(pending_ctx));
         }
@@ -445,6 +449,44 @@ impl App {
                         auto_attach: true,
                     }),
                 }));
+                return;
+            }
+            TableIntent::StartConvoys { namespace, project, issues } => {
+                let Some(address) = self.views.active_address().cloned() else { return };
+                let batch_id = self.begin_project_issue_start_batch(issues.len());
+                for issue in issues {
+                    let command = self.command(CommandAction::ConvoyStart {
+                        intent: Box::new(ConvoyStartIntent {
+                            namespace: Some(namespace.clone()),
+                            project_ref: project.clone(),
+                            issue: Some(IssueSelector::Reference(issue.issue.clone())),
+                            name: None,
+                            branch: None,
+                            workflow_ref: None,
+                            inputs: Vec::new(),
+                            instruction: None,
+                            placement_policy: None,
+                            auto_attach: true,
+                        }),
+                    });
+                    let pending_ctx = PendingActionContext {
+                        identity: WorkItemIdentity::Issue(issue.issue.id.clone()),
+                        description: "Start convoy".into(),
+                        repo_identity: RepoIdentity { authority: "project".into(), path: address.to_string() },
+                        project_issue_start: Some(crate::app::ui_state::ProjectIssueStartContext {
+                            address: address.clone(),
+                            row_id: issue.row_id,
+                            issue: issue.issue,
+                            batch_id,
+                        }),
+                    };
+                    self.proto_commands.push_with_context(command, Some(pending_ctx));
+                }
+                if let Some(index) = self.views.find(&address) {
+                    if let Some(view) = self.views.get_mut(index) {
+                        view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).multi_selected.clear();
+                    }
+                }
                 return;
             }
         };

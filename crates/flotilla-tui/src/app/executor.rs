@@ -54,7 +54,9 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
 
     if let Some(ctx) = &pending_ctx {
         let action = PendingAction { status: PendingStatus::Submitting, description: ctx.description.clone() };
-        if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
+        if let Some(project_ctx) = &ctx.project_issue_start {
+            app.set_project_issue_start_pending(project_ctx, PendingStatus::Submitting, ctx.description.clone());
+        } else if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
             if page
                 .pending_actions
                 .get(&ctx.identity)
@@ -86,22 +88,42 @@ pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Opti
             let finished_error = app.recent_command_finishes.remove(&command_id);
             if let Some(finished_error) = finished_error {
                 if let Some(ctx) = pending_ctx {
-                    match finished_error {
-                        Some(message) => set_pending_status(app, &ctx, PendingStatus::Failed(message)),
-                        None => remove_pending_action(app, &ctx),
+                    if let Some(project_ctx) = ctx.project_issue_start {
+                        match finished_error {
+                            Some(message) => app.record_project_issue_start_result(project_ctx, Err(message)),
+                            None => app.record_project_issue_start_result(project_ctx, Ok(None)),
+                        }
+                    } else {
+                        match finished_error {
+                            Some(message) => set_pending_status(app, &ctx, PendingStatus::Failed(message)),
+                            None => remove_pending_action(app, &ctx),
+                        }
                     }
                 }
             } else if let Some(ctx) = pending_ctx {
                 app.acknowledged_dispatches.insert(command_id);
-                set_pending_status(app, &ctx, PendingStatus::InFlight { command_id });
+                if let Some(project_ctx) = &ctx.project_issue_start {
+                    app.command_project_issue_starts.insert(command_id, project_ctx.clone());
+                    app.set_project_issue_start_pending(project_ctx, PendingStatus::InFlight { command_id }, ctx.description.clone());
+                } else {
+                    set_pending_status(app, &ctx, PendingStatus::InFlight { command_id });
+                }
             }
         }
         Err(message) => {
+            let mut handled_by_project_batch = false;
             if let Some(ctx) = pending_ctx {
-                remove_pending_action(app, &ctx);
+                if let Some(project_ctx) = ctx.project_issue_start {
+                    app.record_project_issue_start_result(project_ctx, Err(message.clone()));
+                    handled_by_project_batch = true;
+                } else {
+                    remove_pending_action(app, &ctx);
+                }
             }
             reset_loading_mode(app);
-            app.set_status_message(Some(message));
+            if !handled_by_project_batch {
+                app.set_status_message(Some(message));
+            }
         }
     }
 
@@ -291,8 +313,12 @@ mod tests {
         let identity = WorkItemIdentity::Session("session-1".into());
         activate_repo_tab(&mut app, 0);
         setup_selectable_table(&mut app, vec![session_item("session-1")]);
-        let pending_ctx =
-            PendingActionContext { identity: identity.clone(), description: "Refresh".into(), repo_identity: repo_identity.clone() };
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Refresh".into(),
+            repo_identity: repo_identity.clone(),
+            project_issue_start: None,
+        };
         let mut events = EventHandler::new(Duration::from_secs(60));
         events.pause_terminal_input().await;
 
@@ -358,8 +384,12 @@ mod tests {
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
         let repo_identity = app.model.repo_order[0].clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx =
-            PendingActionContext { identity: identity.clone(), description: "Refresh".into(), repo_identity: repo_identity.clone() };
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Refresh".into(),
+            repo_identity: repo_identity.clone(),
+            project_issue_start: None,
+        };
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx.clone()), event_tx.clone());
@@ -413,8 +443,12 @@ mod tests {
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
         let repo_identity = app.model.repo_order[0].clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx =
-            PendingActionContext { identity: identity.clone(), description: "Delete session".into(), repo_identity: repo_identity.clone() };
+        let pending_ctx = PendingActionContext {
+            identity: identity.clone(),
+            description: "Delete session".into(),
+            repo_identity: repo_identity.clone(),
+            project_issue_start: None,
+        };
         app.screen.modal_stack.push(Box::new(DeleteConfirmWidget::new(identity.clone(), None, None)));
         let command = app.command(CommandAction::Refresh { repo: None });
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -443,6 +477,7 @@ mod tests {
             identity: identity.clone(),
             description: "Archive session".into(),
             repo_identity: repo_identity.clone(),
+            project_issue_start: None,
         };
         app.screen
             .repo_pages
@@ -484,6 +519,7 @@ mod tests {
             identity: identity.clone(),
             description: "Archive session".into(),
             repo_identity: repo_identity.clone(),
+            project_issue_start: None,
         };
         app.screen
             .repo_pages
@@ -531,6 +567,7 @@ mod tests {
             identity: identity.clone(),
             description: "Archive session".into(),
             repo_identity: repo_identity.clone(),
+            project_issue_start: None,
         };
         app.screen
             .repo_pages
@@ -576,6 +613,7 @@ mod tests {
             identity: identity.clone(),
             description: "Archive session".into(),
             repo_identity: repo_identity.clone(),
+            project_issue_start: None,
         };
         app.screen
             .repo_pages
