@@ -558,12 +558,12 @@ async fn controller_loop_creates_one_presentation_per_active_task() {
     })
     .await
     .map(|(implement, review)| {
-        assert_eq!(implement.spec.name, "implement");
+        assert_eq!(implement.spec.name, "convoy-multi:implement");
         assert_eq!(implement.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
         assert_eq!(implement.spec.process_selector.get(VESSEL_LABEL).map(String::as_str), Some("implement"));
         assert_eq!(implement.metadata.labels.get(VESSEL_LABEL).map(String::as_str), Some("implement"));
 
-        assert_eq!(review.spec.name, "review");
+        assert_eq!(review.spec.name, "convoy-multi:review");
         assert_eq!(review.spec.process_selector.get(CONVOY_LABEL).map(String::as_str), Some("convoy-multi"));
         assert_eq!(review.spec.process_selector.get(VESSEL_LABEL).map(String::as_str), Some("review"));
         assert_eq!(review.metadata.labels.get(VESSEL_LABEL).map(String::as_str), Some("review"));
