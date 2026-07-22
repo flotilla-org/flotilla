@@ -746,7 +746,7 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
     remote_command_router.dispatch_execute(command.clone()).await.expect("remote convoy start should dispatch");
 
     assert_eq!(pending_remote_commands.lock().await.len(), 1);
-    let routed = {
+    let (routed, workflow_snapshot_name, placement_snapshot_name) = {
         let sent = sent.lock().expect("lock sent messages");
         let [PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command: routed, .. })] = sent.as_slice() else {
             panic!("expected one routed command request");
@@ -756,11 +756,12 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
         let CommandAction::ConvoyStartPrepared { start } = &routed.action else {
             panic!("remote launch must carry an admitted convoy snapshot");
         };
-        assert_eq!(start.workflow_name, "remote-work-remote-workflow");
-        assert_eq!(start.placement_policy_name.as_deref(), Some("remote-work-remote-placement"));
+        assert!(start.workflow_name.starts_with("remote-work-remote-workflow-"));
+        let placement_snapshot_name = start.placement_policy_name.clone().expect("prepared placement snapshot name");
+        assert!(placement_snapshot_name.starts_with("remote-work-remote-placement-"));
         let mut delivered = routed.as_ref().clone();
         delivered.node_id = None;
-        delivered
+        (delivered, start.workflow_name.clone(), placement_snapshot_name)
     };
 
     assert_eq!(
@@ -774,18 +775,18 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
     assert_eq!(remote_result, CommandValue::ConvoyStarted { name: "remote-work".to_string(), attach_command: None, binding: None });
     let remote_backend = remote_daemon.resource_backend();
     let convoy = remote_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("remote daemon should persist convoy");
-    assert_eq!(convoy.spec.workflow_ref, "remote-work-remote-workflow");
-    assert_eq!(convoy.spec.placement_policy.as_deref(), Some("remote-work-remote-placement"));
+    assert_eq!(convoy.spec.workflow_ref, workflow_snapshot_name);
+    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(placement_snapshot_name.as_str()));
     let remote_workflow = remote_backend
         .clone()
         .using::<WorkflowTemplate>("flotilla")
-        .get("remote-work-remote-workflow")
+        .get(&workflow_snapshot_name)
         .await
         .expect("remote daemon should persist workflow snapshot");
     assert_eq!(remote_workflow.spec.vessels[0].stance, Stance::Trusted);
     let remote_policy = remote_backend
         .using::<PlacementPolicy>("flotilla")
-        .get("remote-work-remote-placement")
+        .get(&placement_snapshot_name)
         .await
         .expect("remote daemon should persist placement snapshot");
     assert_eq!(remote_policy.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);

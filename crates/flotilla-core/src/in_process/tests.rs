@@ -77,6 +77,17 @@ fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
     validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
 }
 
+#[test]
+fn prepared_snapshot_names_are_content_addressed_for_safe_convoy_name_reuse() {
+    let first =
+        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["implement"] })).expect("first snapshot name");
+    let second =
+        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["review"] })).expect("second snapshot name");
+
+    assert_ne!(first, second);
+    assert!(first.starts_with("remote-work-remote-workflow-"));
+}
+
 #[tokio::test]
 async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_required_adapter() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -161,6 +172,28 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_and_routi
         daemon.resolve_convoy_start_target_node(&intent).await.expect("placement should route"),
         Some(flotilla_protocol::NodeId::new("feta-node"))
     );
+
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(HostId::new("feta-host")))
+                .host_name(HostName::new("feta"))
+                .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("feta-node"), "feta"))
+                .system(SystemInfo::default())
+                .providers(vec![
+                    HostProviderStatus::available(AGENT_ADAPTER_PROVIDER_CATEGORY, "codex"),
+                    HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "zellij"),
+                ])
+                .build(),
+        )
+        .await;
+    let refreshed = daemon
+        .resource_backend()
+        .using::<PlacementPolicy>("flotilla")
+        .get("host-direct-feta-host")
+        .await
+        .expect("peer placement policy should update");
+    assert_eq!(refreshed.spec.pool, "zellij");
 }
 
 #[test]

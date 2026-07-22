@@ -1742,25 +1742,26 @@ impl InProcessDaemon {
 
         let policy_name = format!("host-direct-{host_name}");
         let policies = self.resource_backend.clone().using::<PlacementPolicy>(&namespace);
+        let pool = terminal_pools.into_iter().next().unwrap_or_else(|| "passthrough".to_string());
+        let desired = PlacementPolicySpec::builder()
+            .pool(pool)
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: host_name.clone(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
         match policies.get(&policy_name).await {
-            Ok(_) => Ok(()),
-            Err(ResourceError::NotFound { .. }) => {
-                let pool = terminal_pools.into_iter().next().unwrap_or_else(|| "passthrough".to_string());
-                policies
-                    .create(
-                        &InputMeta::builder().name(policy_name).build(),
-                        &PlacementPolicySpec::builder()
-                            .pool(pool)
-                            .host_direct(HostDirectPlacementPolicySpec {
-                                host_ref: host_name,
-                                checkout: HostDirectPlacementPolicyCheckout::Worktree,
-                            })
-                            .build(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            }
+            Ok(existing) if existing.spec == desired => Ok(()),
+            Ok(existing) => policies
+                .update(&InputMeta::builder().name(policy_name).build(), &existing.metadata.resource_version, &desired)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(ResourceError::NotFound { .. }) => policies
+                .create(&InputMeta::builder().name(policy_name).build(), &desired)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -1808,13 +1809,15 @@ impl InProcessDaemon {
             return Err(format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"));
         }
         let mut admission = self.prepare_convoy_admission(&namespace, intent).await?;
-        let workflow_name = format!("{}-remote-workflow", admission.name);
+        let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
+        let workflow_name = prepared_snapshot_name(&admission.name, "workflow", &workflow_value)?;
         admission.spec.workflow_ref.clone_from(&workflow_name);
         let (placement_policy_name, placement_policy_spec) = match admission.placement_policy {
             Some(spec) => {
-                let name = format!("{}-remote-placement", admission.name);
+                let value = serde_json::to_value(spec).map_err(|error| error.to_string())?;
+                let name = prepared_snapshot_name(&admission.name, "placement", &value)?;
                 admission.spec.placement_policy = Some(name.clone());
-                (Some(name), Some(serde_json::to_value(spec).map_err(|error| error.to_string())?))
+                (Some(name), Some(value))
             }
             None => (None, None),
         };
@@ -1823,7 +1826,7 @@ impl InProcessDaemon {
             .name(admission.name)
             .convoy_spec(serde_json::to_value(admission.spec).map_err(|error| error.to_string())?)
             .workflow_name(workflow_name)
-            .workflow_spec(serde_json::to_value(admission.workflow).map_err(|error| error.to_string())?)
+            .workflow_spec(workflow_value)
             .maybe_placement_policy_name(placement_policy_name)
             .maybe_placement_policy_spec(placement_policy_spec)
             .auto_attach(intent.auto_attach)
@@ -2539,6 +2542,13 @@ async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, names
         Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn prepared_snapshot_name(convoy_name: &str, kind: &str, spec: &serde_json::Value) -> Result<String, String> {
+    let encoded = serde_json::to_vec(spec).map_err(|error| error.to_string())?;
+    let digest = Sha256::digest(encoded);
+    let suffix = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    Ok(format!("{convoy_name}-remote-{kind}-{suffix}"))
 }
 
 async fn ensure_prepared_workflow_snapshot(
