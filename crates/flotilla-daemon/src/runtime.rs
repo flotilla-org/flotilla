@@ -1330,17 +1330,21 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
         let pool = self.pool_for_spec(spec)?;
-        if pool.tracks_session_liveness()
-            && pool
-                .list_sessions()
-                .await?
-                .iter()
-                .any(|session| session.session_name == session_id && session.status == TerminalStatus::Running)
-        {
-            if let TerminalSessionSource::Agent { context, .. } = &spec.source {
-                warn!(%session_id, convoy = %context.convoy, vessel = %context.vessel_ref, "convoy teardown is terminating an attached terminal session");
-            } else {
-                warn!(%session_id, "convoy teardown is terminating an attached terminal session");
+        if pool.tracks_session_liveness() {
+            match pool.list_sessions().await {
+                Ok(sessions) => {
+                    let Some(session) = sessions.iter().find(|session| session.session_name == session_id) else {
+                        return Ok(());
+                    };
+                    if session.status == TerminalStatus::Running {
+                        if let TerminalSessionSource::Agent { context, .. } = &spec.source {
+                            warn!(%session_id, convoy = %context.convoy, vessel = %context.vessel_ref, "convoy teardown is terminating an attached terminal session");
+                        } else {
+                            warn!(%session_id, "convoy teardown is terminating an attached terminal session");
+                        }
+                    }
+                }
+                Err(error) => warn!(%session_id, %error, "could not inspect terminal session before teardown; attempting kill"),
             }
         }
         pool.kill_session(session_id).await
@@ -2469,6 +2473,40 @@ mod tests {
         runtime.kill_session(session_name, &spec).await.expect("teardown should resolve the persisted session pool");
 
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn terminal_teardown_skips_a_session_absent_from_the_pool() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+        let runtime = TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                local_registry,
+                None,
+                profile.host_id.clone(),
+                None,
+                profile.host_direct_environment_name(),
+            )),
+        };
+        let spec = flotilla_resources::TerminalSessionSpec {
+            env_ref: profile.host_direct_environment_name(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+            cwd: "/repo".to_string(),
+            pool: "fake-terminals".to_string(),
+        };
+
+        runtime.kill_session("terminal-demo-implement-coder", &spec).await.expect("missing sessions should be idempotent");
+
+        assert!(pool.killed.lock().await.is_empty(), "teardown must not invoke the pool for an already-gone session");
     }
 
     #[tokio::test]
