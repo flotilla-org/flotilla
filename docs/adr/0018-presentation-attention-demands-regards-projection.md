@@ -99,6 +99,24 @@ attachment. **Opening a latent is expressing a regard** — sidebar click →
 regard emitted → materialization. Discovery and attention are one mechanism
 joined at the regard.
 
+**Fleet composition tracks the live catalog, not a one-time expansion.** A
+fleet-wide awareness subscription's per-project member queries are
+demand-backed exactly like any other ADR 0014 query: when a project drops
+out of the composed catalog (removed, unshared, filtered out of the fleet
+grouping) the subscription's demand on that project must shrink to match,
+tearing down the now-unwanted per-project entry rather than leaving it
+polled until the whole subscription is torn down and re-established. This
+composition-derived demand is tracked apart from a principal's own explicit
+per-project demand (e.g. a project page held open directly): a catalog
+shrink retracts only what the fleet composition itself contributed, never an
+explicit subscription on that same project, and the reverse holds too — an
+explicit subscription outliving its project's fleet membership is
+unaffected by composition changes elsewhere. Any v1 implementation of the
+awareness band's fleet composition must reconcile against the current
+catalog on every catalog change, the same way `ScopedStoreProjection`
+already recomputes store-backed scopes against catalog membership (ADR
+0014), rather than only at subscribe time.
+
 Structure and vocabulary:
 
 - Responses are trees: **grouping nodes** (convoy: label, summary counts,
