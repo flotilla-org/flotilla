@@ -427,6 +427,10 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
+        CommandValue::ResourceList(response) | CommandValue::ResourceObject(response) => {
+            flotilla_protocol::output::json_pretty(&response.value)
+        }
+        CommandValue::ResourceWatchEvent(response) => flotilla_protocol::output::json_pretty(&response.event),
         CommandValue::ImageEnsured { image } => format!("image ensured: {image}"),
         CommandValue::EnvironmentCreated { env_id } => format!("environment created: {env_id}"),
         CommandValue::EnvironmentSpecRead { .. } => "environment spec read".to_string(),

@@ -44,6 +44,24 @@ pub struct PreparedTerminalCommand {
     pub command: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ResourceJsonResponse {
+    #[serde(rename = "resourceKind")]
+    pub kind: String,
+    pub plural: String,
+    pub namespace: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ResourceWatchResponse {
+    #[serde(rename = "resourceKind")]
+    pub kind: String,
+    pub plural: String,
+    pub namespace: String,
+    pub event: serde_json::Value,
+}
+
 /// Structured resolved attach command for a workspace pane.
 /// Produced on the target host, consumed on the presentation host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,6 +365,19 @@ pub enum CommandAction {
         context: CrewCommandContext,
     },
     QueryFleetReplicaSnapshot {},
+    QueryResourceList {
+        namespace: String,
+        kind: String,
+    },
+    QueryResourceGet {
+        namespace: String,
+        kind: String,
+        name: String,
+    },
+    ResourceWatch {
+        namespace: String,
+        kind: String,
+    },
 }
 
 impl CommandAction {
@@ -364,6 +395,8 @@ impl CommandAction {
                 | CommandAction::QueryFleetList {}
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryFleetReplicaSnapshot {}
+                | CommandAction::QueryResourceList { .. }
+                | CommandAction::QueryResourceGet { .. }
                 | CommandAction::Attach { .. }
                 | CommandAction::AttachTransient { .. }
                 | CommandAction::QueryIssues { .. }
@@ -423,6 +456,9 @@ impl Command {
             CommandAction::QueryFleetList {} => "query fleet list",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
+            CommandAction::QueryResourceList { .. } => "query resource list",
+            CommandAction::QueryResourceGet { .. } => "query resource get",
+            CommandAction::ResourceWatch { .. } => "watch resources",
         }
     }
 }
@@ -512,6 +548,9 @@ pub enum CommandValue {
     FleetList(Box<FleetListResponse>),
     CrewList(Box<CrewListResponse>),
     FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),
+    ResourceList(Box<ResourceJsonResponse>),
+    ResourceObject(Box<ResourceJsonResponse>),
+    ResourceWatchEvent(Box<ResourceWatchResponse>),
     ImageEnsured {
         image: crate::ImageId,
     },
@@ -553,6 +592,7 @@ pub enum StepStatus {
     Skipped,
     Started,
     Succeeded,
+    Produced { value: Box<CommandValue> },
     Failed { message: String },
 }
 
@@ -840,6 +880,28 @@ mod tests {
             },
             Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
             Command {
+                node_id: Some(NodeId::new("feta")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "convoys".into() },
+            },
+            Command {
+                node_id: Some(NodeId::new("feta")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::QueryResourceGet {
+                    namespace: "flotilla".into(),
+                    kind: "convoys".into(),
+                    name: "resource-demo".into(),
+                },
+            },
+            Command {
+                node_id: Some(NodeId::new("feta")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ResourceWatch { namespace: "flotilla".into(), kind: "convoys".into() },
+            },
+            Command {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
@@ -1072,6 +1134,35 @@ mod tests {
                     .build()],
                 result_sets: vec![],
             })),
+            CommandValue::ResourceList(Box::new(ResourceJsonResponse {
+                kind: "Convoy".into(),
+                plural: "convoys".into(),
+                namespace: "flotilla".into(),
+                value: serde_json::json!({
+                    "metadata": { "resourceVersion": "1" },
+                    "items": [{ "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": { "name": "demo" }, "spec": {} }]
+                }),
+            })),
+            CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                kind: "Convoy".into(),
+                plural: "convoys".into(),
+                namespace: "flotilla".into(),
+                value: serde_json::json!({
+                    "apiVersion": "flotilla.work/v1",
+                    "kind": "Convoy",
+                    "metadata": { "name": "demo" },
+                    "spec": {}
+                }),
+            })),
+            CommandValue::ResourceWatchEvent(Box::new(ResourceWatchResponse {
+                kind: "Convoy".into(),
+                plural: "convoys".into(),
+                namespace: "flotilla".into(),
+                event: serde_json::json!({
+                    "type": "ADDED",
+                    "object": { "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": { "name": "demo" }, "spec": {} }
+                }),
+            })),
             CommandValue::ImageEnsured { image: crate::ImageId::new("sha256:abc123") },
             CommandValue::EnvironmentCreated { env_id: crate::EnvironmentId::new("env-1") },
             CommandValue::EnvironmentSpecRead {
@@ -1152,9 +1243,13 @@ mod tests {
     fn step_status_roundtrip() {
         use crate::test_helpers::assert_roundtrip;
 
-        let cases = vec![StepStatus::Skipped, StepStatus::Started, StepStatus::Succeeded, StepStatus::Failed {
-            message: "workspace creation failed".into(),
-        }];
+        let cases = vec![
+            StepStatus::Skipped,
+            StepStatus::Started,
+            StepStatus::Succeeded,
+            StepStatus::Produced { value: Box::new(CommandValue::Ok) },
+            StepStatus::Failed { message: "workspace creation failed".into() },
+        ];
         for case in cases {
             assert_roundtrip(&case);
         }

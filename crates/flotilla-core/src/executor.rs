@@ -167,6 +167,9 @@ pub async fn build_plan(
     let issue_source = forge_issue_source(&repo.identity);
 
     match action {
+        CommandAction::QueryResourceList { .. } | CommandAction::QueryResourceGet { .. } | CommandAction::ResourceWatch { .. } => {
+            Err(CommandValue::Error { message: "resource commands should be handled by the daemon resource dispatcher".to_string() })
+        }
         CommandAction::Checkout { target, issue_ids, .. } => {
             match provisioning_target {
                 Some(flotilla_protocol::ProvisioningTarget::NewEnvironment { provider, .. }) => {
