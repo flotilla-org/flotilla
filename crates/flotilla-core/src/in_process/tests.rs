@@ -194,6 +194,18 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_and_routi
         .await
         .expect("peer placement policy should update");
     assert_eq!(refreshed.spec.pool, "zellij");
+
+    daemon
+        .resource_backend()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("local-pool".to_string()).build(),
+            &PlacementPolicySpec::builder().pool("local".to_string()).build(),
+        )
+        .await
+        .expect("local placement policy create");
+    let local_intent = ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("local-pool".to_string()).build();
+    assert_eq!(daemon.resolve_convoy_start_target_node(&local_intent).await.expect("non-host-direct placement should remain local"), None);
 }
 
 #[test]

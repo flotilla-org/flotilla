@@ -1778,12 +1778,10 @@ impl InProcessDaemon {
             .get(policy_name)
             .await
             .map_err(|error| format!("placement policy {policy_name}: {error}"))?;
-        let host_ref = policy
-            .spec
-            .host_direct
-            .as_ref()
-            .map(|host_direct| host_direct.host_ref.as_str())
-            .ok_or_else(|| format!("placement policy {policy_name} is not a host-direct policy"))?;
+        let Some(host_direct) = policy.spec.host_direct.as_ref() else {
+            return Ok(None);
+        };
+        let host_ref = host_direct.host_ref.as_str();
         if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_ref) {
             return Ok(None);
         }
