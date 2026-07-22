@@ -672,6 +672,55 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
 }
 
 #[tokio::test]
+async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+    let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
+    let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+    let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    let remote_command_router = make_remote_command_router(
+        &daemon,
+        &peer_manager,
+        &pending_remote_commands,
+        &forwarded_commands,
+        &pending_remote_cancels,
+        &next_remote_command_id,
+    );
+
+    let command_id = remote_command_router
+        .dispatch_execute(Command {
+            node_id: Some(node("feta")),
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceWatch { namespace: "flotilla".into(), kind: "convoys".into() },
+        })
+        .await
+        .expect("dispatch_execute should succeed");
+
+    assert!(command_id >= (1 << 62));
+    assert_eq!(pending_remote_commands.lock().await.len(), 1);
+
+    let sent = sent.lock().expect("lock");
+    assert_eq!(sent.len(), 1);
+    match &sent[0] {
+        PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { requester_node_id, target_node_id, command, .. }) => {
+            assert_eq!(requester_node_id, daemon.node_id());
+            assert_eq!(target_node_id, &node("feta"));
+            assert_eq!(command.as_ref(), &Command {
+                node_id: Some(node("feta")),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ResourceWatch { namespace: "flotilla".into(), kind: "convoys".into() }
+            });
+        }
+        other => panic!("expected routed command request, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
