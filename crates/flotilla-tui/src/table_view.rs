@@ -318,6 +318,7 @@ pub enum TableIntent {
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
     StartConvoy { namespace: String, project: String, issue: IssueRef },
     StartConvoys { namespace: String, project: String, issues: Vec<TableIssueStart> },
+    StartBatchConvoy { namespace: String, project: String, issues: Vec<TableIssueStart> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -952,6 +953,12 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
     if let Some(change_request) = &row.change_request {
         fields.push(DetailField { label: "Pull request", value: format!("#{} · {}", change_request.id, change_request.status) });
     }
+    if !row.issues.is_empty() {
+        fields.push(DetailField {
+            label: "Issues",
+            value: row.issues.iter().map(|issue| format!("{}: {}", issue.reference.id, issue.title)).collect::<Vec<_>>().join("\n"),
+        });
+    }
     fields
 }
 
@@ -1132,6 +1139,7 @@ mod tests {
             message: None,
             repo_hint: None,
             project_ref: Some("flotilla".into()),
+            issues: Vec::new(),
             change_request: None,
             vessels,
             started_at: None,

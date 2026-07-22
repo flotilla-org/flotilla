@@ -57,7 +57,7 @@ fn project_issue_start_preserves_the_selected_namespace() {
     let flotilla_protocol::CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
     assert_eq!(intent.namespace.as_deref(), Some("other-team"));
     assert_eq!(intent.project_ref, "roadmap");
-    assert_eq!(intent.issue, Some(flotilla_protocol::IssueSelector::Reference(issue)));
+    assert_eq!(intent.issues, vec![flotilla_protocol::IssueSelector::Reference(issue)]);
 }
 
 #[test]

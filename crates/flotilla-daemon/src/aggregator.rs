@@ -794,6 +794,10 @@ impl Aggregator {
             self.emitted_queries.insert(QueryId::Convoys);
             let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
         }
+        let represented = self.state.represented_issue_refs().await;
+        for delta in self.state.suppress_issues(&represented) {
+            let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        }
     }
 
     async fn replace_session_source(&mut self, source: LocalSource, sessions: Vec<ResourceObject<TerminalSession>>) {
@@ -995,6 +999,10 @@ impl Aggregator {
                 self.emitted_queries.insert(QueryId::Convoys);
                 let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
             }
+            let represented = self.state.represented_issue_refs().await;
+            for delta in self.state.suppress_issues(&represented) {
+                let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+            }
         }
 
         let independent_deltas = self.state.replace_independent_replica_rows(independent_replacements).await;
@@ -1085,6 +1093,18 @@ impl Aggregator {
             .maybe_finished_at(status.and_then(|status| status.finished_at))
             .maybe_observed_workflow_ref(status.and_then(|status| status.observed_workflow_ref.clone()))
             .maybe_project_ref(convoy.spec.project_ref.clone())
+            .issues(
+                convoy
+                    .spec
+                    .issues
+                    .iter()
+                    .map(|issue| flotilla_protocol::result_set::ConvoyIssueRow {
+                        reference: issue.reference.clone(),
+                        title: issue.snapshot.title.clone(),
+                        state: issue.snapshot.state,
+                    })
+                    .collect(),
+            )
             .maybe_change_request(change_request)
             .vessels(vessels)
             .build()

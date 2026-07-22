@@ -16,8 +16,8 @@ use flotilla_protocol::{
     provider_data::Issue,
     qualified_path::{HostId, QualifiedPath},
     test_support::TestIssue,
-    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, IssueChangeset, IssueRef, IssueSource, NodeId,
-    NodeInfo, ProvisioningTarget, RepoIdentity, RepoSelector, ViewAddress, WorkItemIdentity,
+    Change, EnvironmentId, EnvironmentInfo, EnvironmentStatus, HostSummary, ImageId, IssueChangeset, IssueRef, IssueSelector, IssueSource,
+    NodeId, NodeInfo, ProvisioningTarget, RepoIdentity, RepoSelector, ViewAddress, WorkItemIdentity,
 };
 use ratatui::{backend::TestBackend, Terminal};
 use tempfile::tempdir;
@@ -1730,6 +1730,7 @@ fn test_convoy(
         message: None,
         repo_hint: None,
         project_ref: None,
+        issues: Vec::new(),
         change_request: None,
         vessels: vec![],
         started_at: None,
@@ -2301,13 +2302,52 @@ fn project_issue_bulk_start_queues_one_convoy_start_per_issue() {
     while let Some((command, ctx)) = app.proto_commands.take_next() {
         let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
         let Some(project_ctx) = ctx.expect("pending context").project_issue_start else { panic!("expected project context") };
-        queued.push((intent.issue, project_ctx.issue.id, intent.auto_attach));
+        queued.push((intent.issues, project_ctx.issue.id, intent.auto_attach));
     }
 
     assert_eq!(queued.len(), 3);
     assert_eq!(queued.iter().map(|(_, id, _)| id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
     assert!(queued.iter().all(|(_, _, auto_attach)| !auto_attach), "bulk convoy starts should not auto-attach one selected issue");
     assert_eq!(app.model.status_message.as_deref(), Some("Starting 3 convoys..."));
+}
+
+#[test]
+fn project_issue_batch_start_queues_one_convoy_for_all_issues() {
+    let mut app = stub_app();
+    let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(address);
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+
+    app.execute_table_intent(crate::table_view::TableIntent::StartBatchConvoy {
+        namespace: "flotilla".into(),
+        project: "roadmap".into(),
+        issues: ["809", "810", "811"]
+            .into_iter()
+            .map(|id| crate::table_view::TableIssueStart {
+                row_id: crate::table_view::RowId::new(format!("issue:{id}")),
+                issue: IssueRef { source: source.clone(), id: id.into() },
+            })
+            .collect(),
+    });
+
+    let (command, ctx) = app.proto_commands.take_next().expect("expected command");
+    assert!(app.proto_commands.take_next().is_none(), "batch start should queue exactly one command");
+    assert!(ctx.is_none(), "batch convoy start has one command-level outcome");
+    let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
+    assert_eq!(intent.issues.len(), 3);
+    assert_eq!(
+        intent
+            .issues
+            .iter()
+            .map(|selector| match selector {
+                IssueSelector::Reference(reference) => reference.id.as_str(),
+                IssueSelector::Id(id) => id.as_str(),
+            })
+            .collect::<Vec<_>>(),
+        vec!["809", "810", "811"]
+    );
+    assert!(intent.auto_attach, "batch convoy start should auto-attach the single created convoy");
+    assert_eq!(app.model.status_message.as_deref(), Some("Starting batch convoy for 3 issues..."));
 }
 
 #[test]

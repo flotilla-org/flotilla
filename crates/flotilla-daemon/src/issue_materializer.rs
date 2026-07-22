@@ -264,6 +264,7 @@ async fn load_window(
     }
     let has_more = windows.iter().any(|window| window.has_more);
     let mut rows = rows.into_values().collect::<Vec<_>>();
+    suppress_represented_rows(&mut rows, state).await;
     sort_rows(&mut rows);
     let needs_full_reload = !conditions.is_empty();
     publish_window(query, generation, rows, has_more, conditions.clone(), state, event_tx);
@@ -315,6 +316,7 @@ async fn fetch_more(
         }
     }
     window.conditions = conditions.clone();
+    suppress_represented_rows(&mut changed, state).await;
     sort_rows(&mut changed);
     let result_state = demand_state(window.sources.iter().any(|source| source.has_more), conditions);
     // Metadata-only deltas are significant: an empty final page must still
@@ -418,6 +420,7 @@ async fn refresh_window(
     }
 
     let mut changed = changed.into_values().collect::<Vec<_>>();
+    suppress_represented_rows(&mut changed, state).await;
     sort_rows(&mut changed);
     let mut removed = removed.into_iter().collect::<Vec<_>>();
     removed.sort();
@@ -456,6 +459,11 @@ fn issue_row(issue: flotilla_protocol::Issue) -> IssueRow {
 
 fn sort_rows(rows: &mut [IssueRow]) {
     rows.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference));
+}
+
+async fn suppress_represented_rows(rows: &mut Vec<IssueRow>, state: &AggregatorProjectionState) {
+    let represented = state.represented_issue_refs().await;
+    rows.retain(|row| !represented.contains(&row.reference));
 }
 
 async fn query_page(

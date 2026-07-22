@@ -47,7 +47,7 @@ fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
         r#ref: None,
         project_ref: None,
         adopted_checkout_refs: BTreeMap::new(),
-        issue: None,
+        issues: Vec::new(),
         instruction: None,
     }
 }

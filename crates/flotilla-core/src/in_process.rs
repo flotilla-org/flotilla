@@ -1099,8 +1099,7 @@ struct ConvoyStartKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum ConvoyStartSubject {
-    IssueId(String),
-    IssueReference(flotilla_protocol::IssueRef),
+    Issues(Vec<flotilla_protocol::IssueSelector>),
     Name(String),
     Anonymous {
         branch: Option<String>,
@@ -1113,10 +1112,8 @@ enum ConvoyStartSubject {
 
 impl ConvoyStartKey {
     fn new(namespace: String, intent: &flotilla_protocol::ConvoyStartIntent) -> Self {
-        let subject = match &intent.issue {
-            Some(flotilla_protocol::IssueSelector::Id(id)) => ConvoyStartSubject::IssueId(id.clone()),
-            Some(flotilla_protocol::IssueSelector::Reference(reference)) => ConvoyStartSubject::IssueReference(reference.clone()),
-            None => match &intent.name {
+        let subject = if intent.issues.is_empty() {
+            match &intent.name {
                 Some(name) => ConvoyStartSubject::Name(name.clone()),
                 None => ConvoyStartSubject::Anonymous {
                     branch: intent.branch.clone(),
@@ -1125,7 +1122,9 @@ impl ConvoyStartKey {
                     instruction: intent.instruction.clone(),
                     placement_policy: intent.placement_policy.clone(),
                 },
-            },
+            }
+        } else {
+            ConvoyStartSubject::Issues(intent.issues.clone())
         };
         Self { namespace, project_ref: intent.project_ref.clone(), subject }
     }
@@ -2941,6 +2940,21 @@ fn convoy_fallback_slug(title: &str, id: &str) -> String {
     format!("{base}-{suffix}")
 }
 
+fn convoy_issues_fallback_slug(issues: &[ConvoyIssue], project_display_name: &str, project_ref: &str) -> String {
+    match issues {
+        [] => convoy_fallback_slug(project_display_name, project_ref),
+        [issue] => convoy_fallback_slug(&issue.snapshot.title, &issue.reference.id),
+        issues => {
+            let issue_ids = issues.iter().map(|issue| issue.reference.id.as_str()).collect::<Vec<_>>().join("-");
+            convoy_fallback_slug("batch-issues", &issue_ids)
+        }
+    }
+}
+
+fn convoy_issue_name_context(issue: &ConvoyIssue) -> String {
+    format!("Issue {}: {}\n{}", issue.reference.id, issue.snapshot.title, issue.snapshot.body.as_deref().unwrap_or_default())
+}
+
 fn validate_convoy_name(name: &str) -> Result<(), String> {
     if name.len() > 63
         || !name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -3057,10 +3071,10 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
         let repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
-        let issue = match &intent.issue {
-            Some(selector) => Some(self.resolve_convoy_issue(namespace, &project, selector).await?),
-            None => None,
-        };
+        let mut issues = Vec::with_capacity(intent.issues.len());
+        for selector in &intent.issues {
+            issues.push(self.resolve_convoy_issue(namespace, &project, selector).await?);
+        }
         let workflow_ref = match intent.workflow_ref.as_deref() {
             Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
             None => project.spec.default_workflow_ref.clone(),
@@ -3073,14 +3087,9 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
 
-        let fallback_slug = issue
-            .as_ref()
-            .map(|issue| convoy_fallback_slug(&issue.snapshot.title, &issue.reference.id))
-            .unwrap_or_else(|| convoy_fallback_slug(&project.spec.display_name, project_ref));
+        let fallback_slug = convoy_issues_fallback_slug(&issues, &project.spec.display_name, project_ref);
         let generated = if intent.name.is_none() || intent.branch.is_none() {
-            let issue_context = issue.as_ref().map(|issue| {
-                format!("Issue {}: {}\n{}", issue.reference.id, issue.snapshot.title, issue.snapshot.body.as_deref().unwrap_or_default())
-            });
+            let issue_context = (!issues.is_empty()).then(|| issues.iter().map(convoy_issue_name_context).collect::<Vec<_>>().join("\n\n"));
             let context = [
                 Some(format!("Project: {}", project.spec.display_name)),
                 issue_context,
@@ -3126,7 +3135,7 @@ impl InProcessDaemon {
             r#ref: Some(branch),
             project_ref: Some(project_ref.to_string()),
             adopted_checkout_refs: BTreeMap::new(),
-            issue,
+            issues,
             instruction: intent.instruction.clone(),
         };
         Ok(ConvoyAdmission::builder()
@@ -5550,7 +5559,7 @@ impl InProcessDaemon {
                 r#ref,
                 project_ref: project_ref.clone(),
                 adopted_checkout_refs,
-                issue: None,
+                issues: Vec::new(),
                 instruction: None,
             };
             let meta = InputMeta::builder().name(name.clone()).build();

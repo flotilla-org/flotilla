@@ -240,14 +240,22 @@ impl ProjectPageWidget {
         Some((scope.namespace.clone(), scope.name.clone(), selected))
     }
 
-    fn selected_issue_bulk_action(layouts: &[PanelLayout<'_>], state: &ProjectTableState) -> Option<AvailableAction> {
+    fn selected_issue_bulk_actions(layouts: &[PanelLayout<'_>], state: &ProjectTableState) -> Option<Vec<AvailableAction>> {
         let (namespace, project, issues) = Self::selected_issue_starts(layouts, state)?;
-        Some(AvailableAction {
-            id: "start_convoys",
-            label: "Start convoys",
-            key: 'c',
-            intent: TableIntent::StartConvoys { namespace, project, issues },
-        })
+        Some(vec![
+            AvailableAction {
+                id: "start_convoys",
+                label: "Start convoys",
+                key: 'c',
+                intent: TableIntent::StartConvoys { namespace: namespace.clone(), project: project.clone(), issues: issues.clone() },
+            },
+            AvailableAction {
+                id: "start_batch_convoy",
+                label: "Start batch convoy",
+                key: 'b',
+                intent: TableIntent::StartBatchConvoy { namespace, project, issues },
+            },
+        ])
     }
 
     fn render_composite(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, panels: &[ProjectPanel], state: &mut ProjectTableState) {
@@ -388,8 +396,8 @@ impl InteractiveWidget for ProjectPageWidget {
                 Some((panel, row)) => Outcome::Push(Box::new(DescribeWidget::new(panel.table.title.clone(), row.describe.clone()))),
                 None => Outcome::Consumed,
             },
-            Action::OpenActionMenu => match Self::selected_issue_bulk_action(&layouts, ctx.views.active_project_table_state()) {
-                Some(action) => Outcome::Push(Box::new(TableActionMenuWidget::new(vec![action]))),
+            Action::OpenActionMenu => match Self::selected_issue_bulk_actions(&layouts, ctx.views.active_project_table_state()) {
+                Some(actions) => Outcome::Push(Box::new(TableActionMenuWidget::new(actions))),
                 None => match Self::active_row(&layouts, ctx.views.active_project_table_state()) {
                     Some((_, row)) if !row.actions.is_empty() => Outcome::Push(Box::new(TableActionMenuWidget::new(row.actions.clone()))),
                     Some(_) => {
@@ -616,11 +624,16 @@ mod tests {
         state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[0].id.clone());
         state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[1].id.clone());
 
-        let action = ProjectPageWidget::selected_issue_bulk_action(&layouts, &state).expect("bulk action");
+        let actions = ProjectPageWidget::selected_issue_bulk_actions(&layouts, &state).expect("bulk actions");
+        let action = actions.iter().find(|action| action.id == "start_convoys").expect("fan-out action");
+        let batch = actions.iter().find(|action| action.id == "start_batch_convoy").expect("batch action");
 
         assert_eq!(action.label, "Start convoys");
-        let TableIntent::StartConvoys { namespace, project, issues } = action.intent else { panic!("expected bulk start") };
+        assert_eq!(batch.label, "Start batch convoy");
+        let TableIntent::StartConvoys { namespace, project, issues } = &action.intent else { panic!("expected bulk start") };
         assert_eq!((namespace.as_str(), project.as_str()), ("flotilla", "roadmap"));
+        assert_eq!(issues.iter().map(|issue| issue.issue.id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
+        let TableIntent::StartBatchConvoy { issues, .. } = &batch.intent else { panic!("expected batch start") };
         assert_eq!(issues.iter().map(|issue| issue.issue.id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
     }
 
@@ -641,9 +654,10 @@ mod tests {
             description: "Start convoy".into(),
         });
 
-        let action = ProjectPageWidget::selected_issue_bulk_action(&layouts, &state).expect("bulk action");
+        let actions = ProjectPageWidget::selected_issue_bulk_actions(&layouts, &state).expect("bulk actions");
+        let action = actions.iter().find(|action| action.id == "start_convoys").expect("fan-out action");
 
-        let TableIntent::StartConvoys { issues, .. } = action.intent else { panic!("expected bulk start") };
+        let TableIntent::StartConvoys { issues, .. } = &action.intent else { panic!("expected bulk start") };
         assert_eq!(issues.iter().map(|issue| issue.issue.id.as_str()).collect::<Vec<_>>(), vec!["809", "811"]);
     }
 

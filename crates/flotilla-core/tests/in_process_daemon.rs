@@ -887,7 +887,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issue: None,
+                    issues: Vec::new(),
                     name: Some("missing-adapter".into()),
                     branch: Some("fix/missing-adapter".into()),
                     workflow_ref: None,
@@ -965,11 +965,16 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
 async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snapshot() {
     let reference =
         IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/planning".into() }, id: "732".into() };
+    let reference_two =
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/planning".into() }, id: "733".into() };
     let mut issue = TestIssue::new("Start convoy from an issue").id("732").with_labels(vec!["enhancement".into()]).build();
     issue.reference = reference.clone();
     issue.body = Some("Capture the issue at admission time.".into());
+    let mut issue_two = TestIssue::new("Carry a second issue").id("733").with_labels(vec!["quick-win".into()]).build();
+    issue_two.reference = reference_two.clone();
+    issue_two.body = Some("Include this issue in the same convoy.".into());
     let provider = Arc::new(FakeIssueProvider::new());
-    provider.add_issues(vec![(reference.id.clone(), issue.clone())]).await;
+    provider.add_issues(vec![(reference.id.clone(), issue.clone()), (reference_two.id.clone(), issue_two.clone())]).await;
     let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(false) });
     let mut discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(provider as Arc<dyn flotilla_core::providers::issue_tracker::IssueProvider>),
@@ -1013,7 +1018,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issue: Some(IssueSelector::Reference(reference.clone())),
+                    issues: vec![IssueSelector::Reference(reference.clone())],
                     name: Some("issue-732".into()),
                     branch: Some("fix/issue-732".into()),
                     workflow_ref: Some("single-agent-contained".into()),
@@ -1046,12 +1051,50 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
     assert_eq!(persisted.spec.repositories.len(), 1);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
-    let persisted_issue = persisted.spec.issue.expect("issue snapshot");
+    let persisted_issue = persisted.spec.issues.first().expect("issue snapshot");
     assert_eq!(persisted_issue.reference, reference);
     assert_eq!(persisted_issue.repository_ref, Some(repository.key()));
     assert_eq!(persisted_issue.snapshot.title, issue.title);
     assert_eq!(persisted_issue.snapshot.body, issue.body);
     assert_eq!(utility.calls.load(Ordering::SeqCst), 0, "fully specified admission must not call AI");
+
+    let batch_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    issues: vec![IssueSelector::Reference(reference.clone()), IssueSelector::Reference(reference_two.clone())],
+                    name: Some("batch-732-733".into()),
+                    branch: Some("fix/batch-732-733".into()),
+                    workflow_ref: Some("single-agent-contained".into()),
+                    inputs: Vec::new(),
+                    instruction: Some("Fix both issues in one convoy.".into()),
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("batch command accepted");
+    let batch_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id, result, .. }) if command_id == batch_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("batch start should finish");
+    assert_eq!(batch_result, CommandValue::ConvoyStarted { name: "batch-732-733".into(), attach_command: None, binding: None });
+    let batch = backend.using::<ResourceConvoy>("flotilla").get("batch-732-733").await.expect("batch convoy");
+    assert_eq!(batch.spec.issues.iter().map(|issue| &issue.reference).collect::<Vec<_>>(), vec![&reference, &reference_two]);
+    assert_eq!(batch.spec.instruction.as_deref(), Some("Fix both issues in one convoy."));
 
     utility.fail.store(true, Ordering::SeqCst);
     let fallback_id = daemon
@@ -1063,7 +1106,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issue: Some(IssueSelector::Reference(reference)),
+                    issues: vec![IssueSelector::Reference(reference)],
                     name: None,
                     branch: None,
                     workflow_ref: None,
@@ -1116,7 +1159,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: Some("flotilla".into()),
                     project_ref: "explicit-workflow".into(),
-                    issue: None,
+                    issues: Vec::new(),
                     name: Some("explicit-workflow".into()),
                     branch: Some("fix/explicit-workflow".into()),
                     workflow_ref: Some("single-agent-contained".into()),
@@ -1151,7 +1194,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: Some("other".into()),
                     project_ref: "flotilla".into(),
-                    issue: None,
+                    issues: Vec::new(),
                     name: Some("wrong-namespace".into()),
                     branch: Some("fix/wrong-namespace".into()),
                     workflow_ref: Some("single-agent-contained".into()),
@@ -1190,7 +1233,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issue: None,
+                    issues: Vec::new(),
                     name: Some("invalid-branch".into()),
                     branch: Some("bad branch".into()),
                     workflow_ref: Some("single-agent-contained".into()),
@@ -1266,7 +1309,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issue: None,
+                    issues: Vec::new(),
                     name: None,
                     branch: None,
                     workflow_ref: None,
@@ -1318,7 +1361,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                         intent: Box::new(ConvoyStartIntent {
                             namespace: None,
                             project_ref: "flotilla".into(),
-                            issue: None,
+                            issues: Vec::new(),
                             name: None,
                             branch: None,
                             workflow_ref: None,
@@ -1382,7 +1425,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "flotilla".into(),
-                issue: Some(IssueSelector::Reference(reference)),
+                issues: vec![IssueSelector::Reference(reference)],
                 name: None,
                 branch: None,
                 workflow_ref: None,
@@ -1469,7 +1512,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issue: None,
+                    issues: Vec::new(),
                     name: Some("bootstrap-failure".into()),
                     branch: Some("fix/bootstrap-failure".into()),
                     workflow_ref: Some("single-agent-contained".into()),

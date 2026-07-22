@@ -31,8 +31,9 @@ pub struct ConvoySpec {
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub adopted_checkout_refs: BTreeMap<RepositoryKey, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue: Option<ConvoyIssue>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<ConvoyIssue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 }

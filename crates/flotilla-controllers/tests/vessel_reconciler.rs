@@ -43,7 +43,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
@@ -318,7 +318,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
-            issue: Some(ConvoyIssue {
+            issues: vec![ConvoyIssue {
                 reference: IssueRef {
                     source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
                     id: "732".into(),
@@ -331,7 +331,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                     labels: vec!["enhancement".into()],
                     as_of: "2026-07-18T09:30:00Z".parse().expect("timestamp"),
                 },
-            }),
+            }],
             instruction: Some("Keep the public seam stable.".into()),
         })
         .await
@@ -498,7 +498,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
@@ -649,7 +649,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
@@ -757,7 +757,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             r#ref: Some("feature/scoped".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
@@ -1634,7 +1634,7 @@ async fn create_convoy_with_labeled_processes(
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await

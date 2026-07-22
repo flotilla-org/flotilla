@@ -815,6 +815,7 @@ mod tests {
             message: None,
             repo_hint: None,
             project_ref: None,
+            issues: Vec::new(),
             change_request: None,
             vessels: vessels
                 .iter()

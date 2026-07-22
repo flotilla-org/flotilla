@@ -536,7 +536,8 @@ impl Reconciler for VesselReconciler {
         let brief_copies = checkout_paths
             .iter()
             .filter(|(repo_ref, _)| {
-                convoy.spec.issue.as_ref().and_then(|issue| issue.repository_ref.as_ref()).is_none_or(|relevant| relevant == *repo_ref)
+                let relevant_issue_refs = convoy.spec.issues.iter().filter_map(|issue| issue.repository_ref.as_ref()).collect::<Vec<_>>();
+                relevant_issue_refs.is_empty() || relevant_issue_refs.contains(repo_ref)
             })
             .map(|(repo_ref, path)| match &strategy {
                 PlacementStrategy::DockerWorktreeOnHostAndMount { mount_path, .. } => {
@@ -763,8 +764,10 @@ fn append_convoy_work_context(content: &mut String, convoy: &ResourceObject<Conv
     for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
         content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
     }
-    if let Some(issue) = &convoy.spec.issue {
-        content.push_str("\n## Issue snapshot\n\n");
+    if !convoy.spec.issues.is_empty() {
+        content.push_str("\n## Issue snapshots\n\n");
+    }
+    for issue in &convoy.spec.issues {
         content.push_str(&format!(
             "Source-qualified reference: `{}` / `{}` / `{}`\n\n",
             issue.reference.source.service, issue.reference.source.scope, issue.reference.id

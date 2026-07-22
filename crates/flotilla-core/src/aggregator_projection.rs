@@ -217,6 +217,20 @@ impl AggregatorProjectionState {
         self.demand_backed.apply_issue_changes(query, generation, changed, removed, state)
     }
 
+    pub async fn represented_issue_refs(&self) -> HashSet<IssueRef> {
+        let convoys = self.convoys.read().await;
+        convoys
+            .local_rows
+            .values()
+            .chain(convoys.replica_rows.values().flat_map(|rows| rows.values()))
+            .flat_map(|convoy| convoy.issues.iter().map(|issue| issue.reference.clone()))
+            .collect()
+    }
+
+    pub fn suppress_issues(&self, represented: &HashSet<IssueRef>) -> Vec<ResultDelta> {
+        self.demand_backed.suppress_issues(represented)
+    }
+
     /// The current fleet-merged result set for one named query.
     pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {

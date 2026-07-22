@@ -18,7 +18,7 @@ use crate::{
     provider_data::{ChangeRequestStatus, Issue},
     resource_ref::ResourceRef,
     snapshot::RepoKey,
-    IssueRef, IssueSource, LifecycleAuthority, RepositoryKey,
+    IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey,
 };
 
 pub type Timestamp = DateTime<Utc>;
@@ -501,6 +501,10 @@ pub struct ConvoyRow {
     /// The Project this convoy belongs to, from `ConvoySpec.project_ref`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_ref: Option<String>,
+    /// Issues represented by this convoy, captured at admission time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub issues: Vec<ConvoyIssueRow>,
     /// Shallow forge lookup for the convoy branch. This is display/reference
     /// data, not a Flotilla-managed resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,6 +513,13 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub vessels: Vec<VesselRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoyIssueRow {
+    pub reference: IssueRef,
+    pub title: String,
+    pub state: IssueState,
 }
 
 /// The external change request currently associated with a convoy branch.

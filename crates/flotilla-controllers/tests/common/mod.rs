@@ -90,7 +90,7 @@ pub async fn create_convoy_with_single_task(
             r#ref: Some(git_ref.to_string()),
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
