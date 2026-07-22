@@ -1133,12 +1133,11 @@ fn command_queue_push_with_context() {
     use crate::app::ui_state::PendingActionContext;
 
     let mut q = CommandQueue::default();
-    let ctx = PendingActionContext {
-        identity: WorkItemIdentity::Session("s1".into()),
-        description: "Archive session".into(),
-        repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
-        project_issue_start: None,
-    };
+    let ctx = PendingActionContext::work_item(
+        WorkItemIdentity::Session("s1".into()),
+        RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
+        "Archive session".into(),
+    );
     q.push_with_context(
         Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } },
         Some(ctx),
@@ -2305,8 +2304,9 @@ fn project_issue_bulk_start_queues_one_convoy_start_per_issue() {
     let mut queued = Vec::new();
     while let Some((command, ctx)) = app.proto_commands.take_next() {
         let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
-        let Some(project_ctx) = ctx.expect("pending context").project_issue_start else { panic!("expected project context") };
-        queued.push((intent.issues, project_ctx.issue.id, intent.auto_attach));
+        let ctx = ctx.expect("pending context");
+        let project_ctx = ctx.project_issue_start_context().expect("project context");
+        queued.push((intent.issues, project_ctx.issue.id.clone(), intent.auto_attach));
     }
 
     assert_eq!(queued.len(), 3);
@@ -2380,12 +2380,38 @@ fn project_issue_start_batch_keeps_success_and_rejection_visible_individually() 
     app.record_project_issue_start_result(rejected.clone(), Err("missing workflow input".into()));
 
     let issue_state = app.views.active_project_table_state().table(crate::table_view::ProjectPanelKind::Issues);
-    assert!(!issue_state.pending_actions.contains_key(&started.row_id));
+    assert!(issue_state.row_state(&started.row_id).is_none());
     assert!(matches!(
-        issue_state.pending_actions[&rejected.row_id].status,
-        PendingStatus::Failed(ref message) if message == "missing workflow input"
+        issue_state.row_state(&rejected.row_id),
+        Some(crate::table_view::RowState::Failed { message, .. }) if message == "missing workflow input"
     ));
     assert_eq!(app.model.status_message.as_deref(), Some("1 convoy started, 1 rejected: 810: missing workflow input"));
+}
+
+#[test]
+fn retrying_failed_project_issue_start_reenters_submitting() {
+    let mut app = stub_app();
+    let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(address.clone());
+    let row_id = crate::table_view::RowId::new("issue:809");
+    let ctx = ProjectIssueStartContext {
+        address,
+        row_id: row_id.clone(),
+        issue: IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "809".into(),
+        },
+        batch_id: app.begin_project_issue_start_batch(1),
+    };
+
+    app.set_project_issue_start_pending(&ctx, PendingStatus::Failed("missing workflow input".into()), "Start convoy".into());
+    app.set_project_issue_start_pending(&ctx, PendingStatus::Submitting, "Start convoy".into());
+
+    assert!(matches!(
+        app.views.active_project_table_state().table(crate::table_view::ProjectPanelKind::Issues).row_state(&row_id),
+        Some(crate::table_view::RowState::Submitting { .. })
+    ));
+    assert!(app.needs_animation());
 }
 
 #[test]

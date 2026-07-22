@@ -441,6 +441,12 @@ fn format_error_status(errors: &[ProviderError], repo_path: &Path) -> Option<Str
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct RecentCommandFinish {
+    error_message: Option<String>,
+    row_error_message: Option<String>,
+}
+
 pub struct App {
     pub daemon: Arc<dyn DaemonHandle>,
     pub config: Arc<ConfigStore>,
@@ -464,7 +470,7 @@ pub struct App {
     /// awaiting its acknowledgement. Lifecycle events are system-wide, so
     /// unrelated finishes may appear here temporarily; the map is cleared as
     /// soon as this TUI has no acknowledgements left to reconcile.
-    pub recent_command_finishes: HashMap<u64, Option<String>>,
+    pub(crate) recent_command_finishes: HashMap<u64, RecentCommandFinish>,
     pub next_project_issue_start_batch_id: u64,
     pub project_issue_start_batches: HashMap<u64, ProjectIssueStartBatch>,
     pub command_project_issue_starts: HashMap<u64, ProjectIssueStartContext>,
@@ -657,11 +663,7 @@ impl App {
         }) {
             return true;
         }
-        if self.views.iter().any(|view| {
-            view.project_table_state.tables().iter().any(|table| {
-                table.pending_actions.values().any(|a| matches!(a.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
-            })
-        }) {
+        if self.views.has_pending_rows() {
             return true;
         }
         // Check modal stack for loading states
@@ -689,18 +691,34 @@ impl App {
     }
 
     pub(crate) fn set_project_issue_start_pending(&mut self, ctx: &ProjectIssueStartContext, status: PendingStatus, description: String) {
+        let ViewAddress::Project { namespace, name } = &ctx.address else { return };
+        let query = flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new(namespace, name), search: None };
         let Some(index) = self.views.find(&ctx.address) else { return };
         let Some(view) = self.views.get_mut(index) else { return };
-        view.project_table_state
-            .table_mut(crate::table_view::ProjectPanelKind::Issues)
-            .pending_actions
-            .insert(ctx.row_id.clone(), ui_state::PendingAction { status, description });
+        let state = view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues);
+        match status {
+            PendingStatus::Submitting => {
+                let _ = state.begin_pending(query, ctx.row_id.clone(), description);
+            }
+            PendingStatus::InFlight { command_id } => {
+                if state.row_state(&ctx.row_id).is_none() {
+                    let _ = state.begin_pending(query, ctx.row_id.clone(), description);
+                }
+                state.mark_pending(&ctx.row_id, command_id);
+            }
+            PendingStatus::Failed(message) => {
+                if state.row_state(&ctx.row_id).is_none() {
+                    let _ = state.begin_pending(query, ctx.row_id.clone(), description);
+                }
+                state.mark_failed(&ctx.row_id, message);
+            }
+        }
     }
 
     pub(crate) fn clear_project_issue_start_pending(&mut self, ctx: &ProjectIssueStartContext) {
         let Some(index) = self.views.find(&ctx.address) else { return };
         let Some(view) = self.views.get_mut(index) else { return };
-        view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).pending_actions.remove(&ctx.row_id);
+        view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).clear_row_state(&ctx.row_id);
     }
 
     pub(crate) fn record_project_issue_start_result(&mut self, ctx: ProjectIssueStartContext, result: Result<Option<String>, String>) {
@@ -1407,6 +1425,11 @@ impl App {
                             None
                         }
                     };
+                    let row_error_message = match &result {
+                        CommandValue::Error { message } => Some(message.clone()),
+                        CommandValue::Cancelled => Some("Command cancelled".to_string()),
+                        _ => None,
+                    };
                     let project_issue_start = self.command_project_issue_starts.remove(&command_id);
                     executor::handle_result(result.clone(), self);
                     if let Some(ctx) = project_issue_start {
@@ -1445,8 +1468,10 @@ impl App {
                         }
                     }
 
+                    self.views.finish_pending_row_command(command_id, row_error_message.as_deref());
+
                     if !self.acknowledged_dispatches.remove(&command_id) && self.pending_dispatch_acks > 0 {
-                        self.recent_command_finishes.insert(command_id, error_message);
+                        self.recent_command_finishes.insert(command_id, RecentCommandFinish { error_message, row_error_message });
                     }
                 }
             }
@@ -1515,6 +1540,7 @@ impl App {
                 let query = result_set.query();
                 self.pending_fetch_more.remove(&query);
                 self.query_seqs.insert(query.clone(), result_set.seq);
+                self.views.reconcile_authoritative_rows(&query, &crate::table_view::AuthoritativeRowUpdate::Full);
                 match &result_set.rows {
                     flotilla_protocol::Rows::Convoys(rows) => {
                         for namespace in self.namespaces.values_mut() {
@@ -1552,6 +1578,12 @@ impl App {
                 self.query_seqs.insert(query.clone(), delta.seq);
                 match &delta.changes {
                     flotilla_protocol::QueryChanges::Convoys { changed, removed } => {
+                        let updated = changed
+                            .iter()
+                            .map(|row| crate::table_view::RowId::new(ConvoyId::for_resource(&row.resource).as_str()))
+                            .chain(removed.iter().map(|resource| crate::table_view::RowId::new(ConvoyId::for_resource(resource).as_str())))
+                            .collect();
+                        self.views.reconcile_authoritative_rows(&query, &crate::table_view::AuthoritativeRowUpdate::Rows(updated));
                         for row in changed {
                             let convoy = ConvoySummary::from(row);
                             let namespace = convoy.namespace.clone();
@@ -1584,6 +1616,15 @@ impl App {
                         );
                     }
                     flotilla_protocol::QueryChanges::Issues { changed, removed, .. } => {
+                        let flotilla_protocol::QueryId::Issues { scope, .. } = &query else {
+                            unreachable!("issue changes always have an issue query")
+                        };
+                        let updated = changed
+                            .iter()
+                            .map(|row| crate::table_view::issue_row_id(scope, &row.reference))
+                            .chain(removed.iter().map(|reference| crate::table_view::issue_row_id(scope, reference)))
+                            .collect();
+                        self.views.reconcile_authoritative_rows(&query, &crate::table_view::AuthoritativeRowUpdate::Rows(updated));
                         let result = self.query_tables.issues.entry(query.clone()).or_default();
                         result.apply_delta(
                             changed,

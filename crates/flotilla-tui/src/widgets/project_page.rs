@@ -9,7 +9,7 @@ use super::{
     Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::{ui_state::PendingStatus, NamespaceMap, QueryTableCache},
+    app::{NamespaceMap, QueryTableCache},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::{self, AvailableAction, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId, TableIntent, TableIssueStart},
@@ -313,10 +313,7 @@ impl ProjectPageWidget {
                         theme,
                         &layout.panel.table,
                         &unfocused_state,
-                        super::table::RowDecorations {
-                            multi_selected: &table_state.multi_selected,
-                            pending_actions: &table_state.pending_actions,
-                        },
+                        super::table::RowDecorations { multi_selected: &table_state.multi_selected },
                         first..first.saturating_add(count),
                     );
                 }
@@ -525,10 +522,7 @@ fn issue_start_from_row(row: &table_view::ProjectedRow) -> Option<TableIssueStar
 }
 
 fn issue_start_is_pending(table_state: &table_view::TableState, row_id: &RowId) -> bool {
-    table_state
-        .pending_actions
-        .get(row_id)
-        .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+    table_state.row_state(row_id).is_some_and(table_view::RowState::is_pending)
 }
 
 #[cfg(test)]
@@ -536,10 +530,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::{
-        app::ui_state::{PendingAction, PendingStatus},
-        table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint},
-    };
+    use crate::table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint};
 
     fn panel(kind: ProjectPanelKind, title: &str, target: &str, row: &str) -> ProjectPanel {
         ProjectPanel {
@@ -698,10 +689,14 @@ mod tests {
         state.table_mut(ProjectPanelKind::Issues).select_index(&panels[0].table, 2);
         state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[0].id.clone());
         state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[1].id.clone());
-        state.table_mut(ProjectPanelKind::Issues).pending_actions.insert(panels[0].table.rows[1].id.clone(), PendingAction {
-            status: PendingStatus::InFlight { command_id: 9 },
-            description: "Start convoy".into(),
-        });
+        state
+            .table_mut(ProjectPanelKind::Issues)
+            .begin_pending(
+                QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None },
+                panels[0].table.rows[1].id.clone(),
+                "Start convoy".into(),
+            )
+            .expect("pending issue");
 
         let actions = ProjectPageWidget::selected_issue_bulk_actions(&layouts, &state).expect("bulk actions");
         let action = actions.iter().find(|action| action.id == "start_convoys").expect("fan-out action");

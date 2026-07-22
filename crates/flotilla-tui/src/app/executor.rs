@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use super::{
-    ui_state::{PendingAction, PendingActionContext, PendingStatus},
+    ui_state::{PendingAction, PendingActionContext, PendingActionTarget, PendingStatus},
     App,
 };
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
 /// request starts so the renderer can show an indicator while the daemon
 /// acknowledgement is outstanding.
 pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>, event_tx: mpsc::UnboundedSender<Event>) {
-    let project_issue_start = pending_ctx.as_ref().is_some_and(|ctx| ctx.project_issue_start.is_some());
+    let project_issue_start = pending_ctx.as_ref().is_some_and(|ctx| matches!(ctx.target, PendingActionTarget::ProjectIssueStart(_)));
     if !project_issue_start {
         app.set_status_message(None);
     }
@@ -57,18 +57,29 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
 
     if let Some(ctx) = &pending_ctx {
         let action = PendingAction { status: PendingStatus::Submitting, description: ctx.description.clone() };
-        if let Some(project_ctx) = &ctx.project_issue_start {
-            app.set_project_issue_start_pending(project_ctx, PendingStatus::Submitting, ctx.description.clone());
-        } else if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
-            if page
-                .pending_actions
-                .get(&ctx.identity)
-                .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
-            {
-                app.set_status_message(Some("An action is already in progress for this item".into()));
-                return;
+        match &ctx.target {
+            PendingActionTarget::ProjectIssueStart(project_ctx) => {
+                app.set_project_issue_start_pending(project_ctx, PendingStatus::Submitting, ctx.description.clone());
             }
-            page.pending_actions.insert(ctx.identity.clone(), action);
+            PendingActionTarget::TableRow(row_ctx) => {
+                if let Err(message) = app.views.begin_pending_row(row_ctx, ctx.description.clone()) {
+                    app.set_status_message(Some(message));
+                    return;
+                }
+            }
+            PendingActionTarget::WorkItem { identity, repo_identity } => {
+                if let Some(page) = app.screen.repo_pages.get_mut(repo_identity) {
+                    if page
+                        .pending_actions
+                        .get(identity)
+                        .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+                    {
+                        app.set_status_message(Some("An action is already in progress for this item".into()));
+                        return;
+                    }
+                    page.pending_actions.insert(identity.clone(), action);
+                }
+            }
         }
         app.pending_dispatch_acks += 1;
     }
@@ -88,39 +99,46 @@ pub fn handle_dispatch_completion(result: Result<u64, String>, pending_ctx: Opti
 
     match result {
         Ok(command_id) => {
-            let finished_error = app.recent_command_finishes.remove(&command_id);
-            if let Some(finished_error) = finished_error {
+            let finished = app.recent_command_finishes.remove(&command_id);
+            if let Some(finished) = finished {
                 if let Some(ctx) = pending_ctx {
-                    if let Some(project_ctx) = ctx.project_issue_start {
-                        match finished_error {
+                    match ctx.target {
+                        PendingActionTarget::ProjectIssueStart(project_ctx) => match finished.row_error_message {
                             Some(message) => app.record_project_issue_start_result(project_ctx, Err(message)),
                             None => app.record_project_issue_start_result(project_ctx, Ok(None)),
-                        }
-                    } else {
-                        match finished_error {
+                        },
+                        PendingActionTarget::TableRow(row_ctx) => match finished.row_error_message {
+                            Some(message) => app.views.mark_pending_row_failed(&row_ctx, message),
+                            None => app.views.mark_pending_row(&row_ctx, command_id),
+                        },
+                        PendingActionTarget::WorkItem { .. } => match finished.error_message {
                             Some(message) => set_pending_status(app, &ctx, PendingStatus::Failed(message)),
                             None => remove_pending_action(app, &ctx),
-                        }
+                        },
                     }
                 }
             } else if let Some(ctx) = pending_ctx {
                 app.acknowledged_dispatches.insert(command_id);
-                if let Some(project_ctx) = &ctx.project_issue_start {
-                    app.command_project_issue_starts.insert(command_id, project_ctx.clone());
-                    app.set_project_issue_start_pending(project_ctx, PendingStatus::InFlight { command_id }, ctx.description.clone());
-                } else {
-                    set_pending_status(app, &ctx, PendingStatus::InFlight { command_id });
+                match &ctx.target {
+                    PendingActionTarget::ProjectIssueStart(project_ctx) => {
+                        app.command_project_issue_starts.insert(command_id, project_ctx.clone());
+                        app.set_project_issue_start_pending(project_ctx, PendingStatus::InFlight { command_id }, ctx.description.clone());
+                    }
+                    PendingActionTarget::TableRow(row_ctx) => app.views.mark_pending_row(row_ctx, command_id),
+                    PendingActionTarget::WorkItem { .. } => set_pending_status(app, &ctx, PendingStatus::InFlight { command_id }),
                 }
             }
         }
         Err(message) => {
             let mut handled_by_project_batch = false;
             if let Some(ctx) = pending_ctx {
-                if let Some(project_ctx) = ctx.project_issue_start {
-                    app.record_project_issue_start_result(project_ctx, Err(message.clone()));
-                    handled_by_project_batch = true;
-                } else {
-                    remove_pending_action(app, &ctx);
+                match ctx.target {
+                    PendingActionTarget::ProjectIssueStart(project_ctx) => {
+                        app.record_project_issue_start_result(project_ctx, Err(message.clone()));
+                        handled_by_project_batch = true;
+                    }
+                    PendingActionTarget::TableRow(row_ctx) => app.views.mark_pending_row_failed(&row_ctx, message.clone()),
+                    PendingActionTarget::WorkItem { .. } => remove_pending_action(app, &ctx),
                 }
             }
             reset_loading_mode(app);
@@ -150,14 +168,16 @@ pub fn handle_attach_dispatch_completion(result: Result<CommandValue, String>, a
 }
 
 fn set_pending_status(app: &mut App, ctx: &PendingActionContext, status: PendingStatus) {
-    if let Some(action) = app.screen.repo_pages.get_mut(&ctx.repo_identity).and_then(|page| page.pending_actions.get_mut(&ctx.identity)) {
+    let PendingActionTarget::WorkItem { identity, repo_identity } = &ctx.target else { return };
+    if let Some(action) = app.screen.repo_pages.get_mut(repo_identity).and_then(|page| page.pending_actions.get_mut(identity)) {
         action.status = status;
     }
 }
 
 fn remove_pending_action(app: &mut App, ctx: &PendingActionContext) {
-    if let Some(page) = app.screen.repo_pages.get_mut(&ctx.repo_identity) {
-        page.pending_actions.remove(&ctx.identity);
+    let PendingActionTarget::WorkItem { identity, repo_identity } = &ctx.target else { return };
+    if let Some(page) = app.screen.repo_pages.get_mut(repo_identity) {
+        page.pending_actions.remove(identity);
     }
 }
 
@@ -319,12 +339,7 @@ mod tests {
         let identity = WorkItemIdentity::Session("session-1".into());
         activate_repo_tab(&mut app, 0);
         setup_selectable_table(&mut app, vec![session_item("session-1")]);
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Refresh".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Refresh".into());
         let mut events = EventHandler::new(Duration::from_secs(60));
         events.pause_terminal_input().await;
 
@@ -383,6 +398,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn table_row_stays_pending_until_its_authoritative_removal() {
+        let execute_gate = Arc::new(Semaphore::new(0));
+        let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        app.open_view(address.clone());
+        let row_id = crate::table_view::RowId::new("flotilla/delete-me");
+        let pending_ctx = PendingActionContext::table_row(
+            crate::table_view::PendingRowContext {
+                address,
+                panel: None,
+                query: flotilla_protocol::QueryId::Convoys,
+                row_id: row_id.clone(),
+            },
+            "Delete convoy".into(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
+        assert!(matches!(app.views.active_table_state().row_state(&row_id), Some(crate::table_view::RowState::Submitting { .. })));
+
+        execute_gate.add_permits(1);
+        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion") else {
+            panic!("expected dispatch completion");
+        };
+        handle_dispatch_completion(result, pending_ctx, &mut app);
+        let repo_identity = RepoIdentity { authority: "none".into(), path: "none".into() };
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+            command_id: 1,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: None,
+            description: "Delete convoy".into(),
+        });
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+            command_id: 1,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity,
+            repo: None,
+            result: CommandValue::Ok,
+        });
+
+        assert!(matches!(
+            app.views.active_table_state().row_state(&row_id),
+            Some(crate::table_view::RowState::Pending { command_id: 1, .. })
+        ));
+
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
+            seq: 1,
+            changes: flotilla_protocol::QueryChanges::Convoys {
+                changed: vec![],
+                removed: vec![flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "delete-me")],
+            },
+            state: None,
+        })));
+
+        assert!(app.views.active_table_state().row_state(&row_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn table_row_failure_stops_shimmering_and_surfaces_the_error() {
+        let daemon = Arc::new(StubDaemon::builder().execute_result(Err("delete failed".into())).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        app.open_view(address.clone());
+        let row_id = crate::table_view::RowId::new("flotilla/delete-me");
+        let pending_ctx = PendingActionContext::table_row(
+            crate::table_view::PendingRowContext {
+                address,
+                panel: None,
+                query: flotilla_protocol::QueryId::Convoys,
+                row_id: row_id.clone(),
+            },
+            "Delete convoy".into(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
+        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion") else {
+            panic!("expected dispatch completion");
+        };
+        handle_dispatch_completion(result, pending_ctx, &mut app);
+
+        assert!(matches!(app.views.active_table_state().row_state(&row_id), Some(crate::table_view::RowState::Failed {
+            message,
+            ..
+        }) if message == "delete failed"));
+        assert!(!app.needs_animation());
+        assert_eq!(app.model.status_message.as_deref(), Some("delete failed"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_table_row_command_stops_shimmering() {
+        let daemon = Arc::new(StubDaemon::new());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        app.open_view(address.clone());
+        let row_id = crate::table_view::RowId::new("flotilla/delete-me");
+        let pending_ctx = PendingActionContext::table_row(
+            crate::table_view::PendingRowContext {
+                address,
+                panel: None,
+                query: flotilla_protocol::QueryId::Convoys,
+                row_id: row_id.clone(),
+            },
+            "Delete convoy".into(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
+        let Event::CommandDispatchCompleted { result, pending_ctx } = event_rx.recv().await.expect("dispatch completion") else {
+            panic!("expected dispatch completion");
+        };
+        handle_dispatch_completion(result, pending_ctx, &mut app);
+        let repo_identity = RepoIdentity { authority: "none".into(), path: "none".into() };
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+            command_id: 1,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: None,
+            description: "Delete convoy".into(),
+        });
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+            command_id: 1,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity,
+            repo: None,
+            result: CommandValue::Cancelled,
+        });
+
+        assert!(matches!(
+            app.views.active_table_state().row_state(&row_id),
+            Some(crate::table_view::RowState::Failed { message, .. }) if message == "Command cancelled"
+        ));
+        assert!(!app.needs_animation());
+        assert_eq!(app.model.status_message.as_deref(), Some("Command cancelled"));
+    }
+
+    #[tokio::test]
     async fn dispatch_rejects_a_second_pending_action_for_the_same_identity() {
         let execute_gate = Arc::new(Semaphore::new(0));
         let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
@@ -390,12 +547,7 @@ mod tests {
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
         let repo_identity = app.model.repo_order[0].clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Refresh".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Refresh".into());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx.clone()), event_tx.clone());
@@ -432,17 +584,10 @@ mod tests {
             source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
             id: "809".into(),
         };
-        let pending_ctx = PendingActionContext {
-            identity: WorkItemIdentity::Issue("809".into()),
-            description: "Start convoy".into(),
-            repo_identity: RepoIdentity { authority: "project".into(), path: address.to_string() },
-            project_issue_start: Some(crate::app::ui_state::ProjectIssueStartContext {
-                address,
-                row_id: crate::table_view::RowId::new("issue:809"),
-                issue,
-                batch_id,
-            }),
-        };
+        let pending_ctx = PendingActionContext::project_issue_start(
+            crate::app::ui_state::ProjectIssueStartContext { address, row_id: crate::table_view::RowId::new("issue:809"), issue, batch_id },
+            "Start convoy".into(),
+        );
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
 
         dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
@@ -480,12 +625,7 @@ mod tests {
             stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
         let repo_identity = app.model.repo_order[0].clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Delete session".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Delete session".into());
         app.screen.modal_stack.push(Box::new(DeleteConfirmWidget::new(identity.clone(), None, None)));
         let command = app.command(CommandAction::Refresh { repo: None });
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -510,12 +650,7 @@ mod tests {
         let repo_identity = app.model.repo_order[0].clone();
         let repo = app.model.repos[&repo_identity].path.clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Archive session".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Archive session".into());
         app.screen
             .repo_pages
             .get_mut(&repo_identity)
@@ -547,17 +682,56 @@ mod tests {
     }
 
     #[test]
+    fn table_row_cancellation_before_ack_stops_shimmering() {
+        let mut app = stub_app();
+        let address = ViewAddress::Convoys { namespace: "flotilla".into() };
+        app.open_view(address.clone());
+        let row_id = crate::table_view::RowId::new("flotilla/delete-me");
+        let row_ctx = crate::table_view::PendingRowContext {
+            address,
+            panel: None,
+            query: flotilla_protocol::QueryId::Convoys,
+            row_id: row_id.clone(),
+        };
+        let pending_ctx = PendingActionContext::table_row(row_ctx.clone(), "Delete convoy".into());
+        app.views.begin_pending_row(&row_ctx, pending_ctx.description.clone()).expect("row should start submitting");
+        app.pending_dispatch_acks = 1;
+        let repo_identity = app.model.repo_order[0].clone();
+        let repo = app.model.repos[&repo_identity].path.clone();
+
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandStarted {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity: repo_identity.clone(),
+            repo: Some(repo.clone()),
+            description: pending_ctx.description.clone(),
+        });
+        app.handle_daemon_event(flotilla_protocol::DaemonEvent::CommandFinished {
+            command_id: 42,
+            node_id: NodeId::new(HostName::local().as_str()),
+            repo_identity,
+            repo: Some(repo),
+            result: CommandValue::Cancelled,
+        });
+
+        assert!(matches!(app.views.active_table_state().row_state(&row_id), Some(crate::table_view::RowState::Submitting { .. })));
+        handle_dispatch_completion(Ok(42), Some(pending_ctx), &mut app);
+
+        assert!(matches!(
+            app.views.active_table_state().row_state(&row_id),
+            Some(crate::table_view::RowState::Failed { message, .. }) if message == "Command cancelled"
+        ));
+        assert!(!app.needs_animation());
+        assert!(app.recent_command_finishes.is_empty());
+    }
+
+    #[test]
     fn unrelated_finishes_cannot_evict_a_finish_awaiting_its_ack() {
         let mut app = stub_app();
         let repo_identity = app.model.repo_order[0].clone();
         let repo = app.model.repos[&repo_identity].path.clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Archive session".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Archive session".into());
         app.screen
             .repo_pages
             .get_mut(&repo_identity)
@@ -600,12 +774,7 @@ mod tests {
         let repo_identity = app.model.repo_order[0].clone();
         let repo = app.model.repos[&repo_identity].path.clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Archive session".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Archive session".into());
         app.screen
             .repo_pages
             .get_mut(&repo_identity)
@@ -646,12 +815,7 @@ mod tests {
         let repo_identity = app.model.repo_order[0].clone();
         let repo = app.model.repos[&repo_identity].path.clone();
         let identity = WorkItemIdentity::Session("session-1".into());
-        let pending_ctx = PendingActionContext {
-            identity: identity.clone(),
-            description: "Archive session".into(),
-            repo_identity: repo_identity.clone(),
-            project_issue_start: None,
-        };
+        let pending_ctx = PendingActionContext::work_item(identity.clone(), repo_identity.clone(), "Archive session".into());
         app.screen
             .repo_pages
             .get_mut(&repo_identity)

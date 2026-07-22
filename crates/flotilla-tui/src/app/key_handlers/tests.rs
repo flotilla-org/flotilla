@@ -131,8 +131,11 @@ fn project_issue_start_preserves_the_selected_namespace() {
 fn convoy_delete_table_intent_confirms_then_routes_to_origin_host() {
     let mut app = stub_app();
     insert_peer_host(&mut app.model, "remote-host");
+    app.open_view(flotilla_protocol::ViewAddress::Convoys { namespace: "other-team".into() });
+    let row_id = crate::table_view::RowId::new("other-team/failed-convoy@remote-host");
 
     app.execute_table_intent(TableIntent::DeleteConvoy {
+        row_id: row_id.clone(),
         namespace: "other-team".into(),
         name: "failed-convoy".into(),
         host: Some(HostName::new("remote-host")),
@@ -146,13 +149,29 @@ fn convoy_delete_table_intent_confirms_then_routes_to_origin_host() {
 
     app.handle_key(key(KeyCode::Enter));
 
-    let (command, _) = app.proto_commands.take_next().expect("confirmed delete command");
+    let (command, pending) = app.proto_commands.take_next().expect("confirmed delete command");
     assert_eq!(command.node_id, Some(NodeId::new("remote-host")));
     assert_eq!(command.action, CommandAction::ConvoyDelete {
         namespace: Some("other-team".into()),
         name: "failed-convoy".into(),
         force: false
     });
+    assert_eq!(pending.expect("pending context").table_row_context().map(|context| &context.row_id), Some(&row_id));
+}
+
+#[test]
+fn project_convoy_delete_targets_the_shared_convoys_panel_state() {
+    let mut app = stub_app();
+    app.open_view(flotilla_protocol::ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() });
+    let row_id = crate::table_view::RowId::new("flotilla/failed-convoy");
+
+    app.execute_table_intent(TableIntent::DeleteConvoy { row_id, namespace: "flotilla".into(), name: "failed-convoy".into(), host: None });
+    app.handle_key(key(KeyCode::Enter));
+
+    let (_, pending) = app.proto_commands.take_next().expect("confirmed delete command");
+    let context = pending.expect("pending context");
+    let row = context.table_row_context().expect("table row context");
+    assert_eq!(row.panel, Some(crate::table_view::ProjectPanelKind::Convoys));
 }
 
 #[test]
@@ -1226,7 +1245,7 @@ fn delete_confirm_attaches_pending_context() {
     app.handle_key(key(KeyCode::Char('y')));
     let (_, ctx) = app.proto_commands.take_next().expect("should have command");
     let ctx = ctx.expect("should have pending context");
-    assert_eq!(ctx.identity, item.identity);
+    assert_eq!(ctx.work_item_identity(), Some(&item.identity));
 }
 
 #[test]
@@ -1687,7 +1706,7 @@ fn resolve_and_push_attaches_pending_context() {
     app.resolve_and_push(Intent::CreateWorkspace, &item);
     let (_, ctx) = app.proto_commands.take_next().expect("should have command");
     let ctx = ctx.expect("should have pending context");
-    assert_eq!(ctx.identity, item.identity);
+    assert_eq!(ctx.work_item_identity(), Some(&item.identity));
 }
 
 #[test]
@@ -1706,7 +1725,7 @@ fn close_confirm_attaches_pending_context() {
     app.handle_key(key(KeyCode::Char('y')));
     let (_, ctx) = app.proto_commands.take_next().expect("should have command");
     let ctx = ctx.expect("should have pending context");
-    assert_eq!(ctx.identity, item.identity);
+    assert_eq!(ctx.work_item_identity(), Some(&item.identity));
 }
 
 #[test]

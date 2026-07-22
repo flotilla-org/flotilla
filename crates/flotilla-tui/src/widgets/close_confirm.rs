@@ -32,12 +32,11 @@ impl InteractiveWidget for CloseConfirmWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
         match action {
             Action::Confirm => {
-                let pending_ctx = PendingActionContext {
-                    identity: self.identity.clone(),
-                    description: format!("Close {}", self.id),
-                    repo_identity: ctx.model.active_repo_identity().clone(),
-                    project_issue_start: None,
-                };
+                let pending_ctx = PendingActionContext::work_item(
+                    self.identity.clone(),
+                    ctx.model.active_repo_identity().clone(),
+                    format!("Close {}", self.id),
+                );
                 ctx.commands.push_with_context(self.command.clone(), Some(pending_ctx));
                 Outcome::Finished
             }
@@ -144,7 +143,7 @@ mod tests {
 
         let (_, ctx) = harness.commands.take_next().expect("should have command");
         let ctx = ctx.expect("should have pending context");
-        assert_eq!(ctx.identity, identity);
+        assert_eq!(ctx.work_item_identity(), Some(&identity));
     }
 
     #[test]

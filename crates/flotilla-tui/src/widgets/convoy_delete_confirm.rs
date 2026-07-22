@@ -9,6 +9,7 @@ use ratatui::{
 
 use super::{InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
+    app::ui_state::PendingActionContext,
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     ui_helpers,
@@ -16,15 +17,16 @@ use crate::{
 
 pub struct ConvoyDeleteConfirmWidget {
     command: Command,
+    pending: PendingActionContext,
 }
 
 impl ConvoyDeleteConfirmWidget {
-    pub fn new(command: Command) -> Self {
+    pub fn new(command: Command, pending: PendingActionContext) -> Self {
         assert!(
             matches!(&command.action, CommandAction::ConvoyDelete { namespace: Some(_), .. }),
             "convoy delete confirmation requires an explicitly namespaced convoy delete command"
         );
-        Self { command }
+        Self { command, pending }
     }
 
     fn target(&self) -> (&str, &str) {
@@ -39,7 +41,7 @@ impl InteractiveWidget for ConvoyDeleteConfirmWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
         match action {
             Action::Confirm => {
-                ctx.commands.push(self.command.clone());
+                ctx.commands.push_with_context(self.command.clone(), Some(self.pending.clone()));
                 Outcome::Finished
             }
             Action::Dismiss => Outcome::Finished,

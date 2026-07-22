@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ops::Range,
     time::{Duration, Instant},
 };
@@ -18,10 +18,10 @@ use super::{
     describe::DescribeWidget, table_action_menu::TableActionMenuWidget, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::ui_state::{PendingAction, PendingStatus},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
-    table_view::{self, Alignment, CellTone, ProjectedColumn, RowId, TableView, WidthHint},
+    shimmer::Shimmer,
+    table_view::{self, Alignment, CellTone, ProjectedColumn, RowId, RowState, TableView, WidthHint},
     theme::Theme,
 };
 
@@ -40,7 +40,6 @@ pub(crate) struct TablePanel;
 
 pub(crate) struct RowDecorations<'a> {
     pub(crate) multi_selected: &'a HashSet<RowId>,
-    pub(crate) pending_actions: &'a HashMap<RowId, PendingAction>,
 }
 
 impl TablePanel {
@@ -76,29 +75,79 @@ impl TablePanel {
         decorations: RowDecorations<'_>,
         visible: Range<usize>,
     ) {
+        Self::render_rows_with_elapsed(frame, area, theme, view, state, decorations, visible, None);
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_rows_at(
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        view: &TableView,
+        state: &table_view::TableState,
+        decorations: RowDecorations<'_>,
+        visible: Range<usize>,
+        elapsed: Duration,
+    ) {
+        Self::render_rows_with_elapsed(frame, area, theme, view, state, decorations, visible, Some(elapsed));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_rows_with_elapsed(
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        view: &TableView,
+        state: &table_view::TableState,
+        decorations: RowDecorations<'_>,
+        visible: Range<usize>,
+        elapsed: Option<Duration>,
+    ) {
         let first = visible.start;
         let count = visible.end.saturating_sub(visible.start);
         if count == 0 {
             return;
         }
+        let widths = width_constraints(&view.columns, area.width);
+        let column_widths = widths
+            .iter()
+            .map(|constraint| match constraint {
+                Constraint::Length(width) => *width as usize,
+                _ => unreachable!("table width constraints are always resolved lengths"),
+            })
+            .collect::<Vec<_>>();
         let rows = view.rows.iter().skip(first).take(count).map(|row| {
             let selected = state.selected() == Some(&row.id);
             let multi = decorations.multi_selected.contains(&row.id);
-            let pending = decorations.pending_actions.get(&row.id);
+            let row_state = state.row_state(&row.id);
+            let shimmer = row_state.filter(|state| state.is_pending()).map(|_| {
+                elapsed.map_or_else(
+                    || Shimmer::new(area.width as usize, theme),
+                    |elapsed| Shimmer::new_at(area.width as usize, elapsed, theme),
+                )
+            });
+            let mut offset = 0usize;
             let cells = row.cells.iter().zip(&view.columns).enumerate().map(|(index, (cell, column))| {
                 let mut text = cell.text.clone();
                 if index == 0 {
-                    if let Some(pending) = pending {
-                        let marker = match pending.status {
-                            PendingStatus::Submitting | PendingStatus::InFlight { .. } => "...",
-                            PendingStatus::Failed(_) => "x",
-                        };
-                        text = format!("{marker} {text}");
+                    if matches!(row_state, Some(RowState::Failed { .. })) {
+                        text = format!("x {text}");
                     } else if multi {
                         text = format!("* {text}");
                     }
                 }
-                Cell::from(Line::from(text).alignment(ratatui_alignment(column.alignment))).style(cell_style(cell.tone, theme))
+                let line = match &shimmer {
+                    Some(shimmer) => Line::from(shimmer.spans(&text, offset)).alignment(ratatui_alignment(column.alignment)),
+                    None => Line::from(text).alignment(ratatui_alignment(column.alignment)),
+                };
+                offset += column_widths[index] + 1;
+                let rendered = Cell::from(line);
+                if shimmer.is_some() {
+                    rendered
+                } else {
+                    rendered.style(cell_style(cell.tone, theme))
+                }
             });
             let style = if selected {
                 Style::default().bg(theme.row_highlight).add_modifier(Modifier::BOLD)
@@ -109,7 +158,6 @@ impl TablePanel {
             };
             Row::new(cells).style(style)
         });
-        let widths = width_constraints(&view.columns, area.width);
         frame.render_widget(Table::new(rows, widths).column_spacing(1), area);
     }
 }
@@ -208,7 +256,7 @@ impl TableWidget {
             theme,
             view,
             state,
-            RowDecorations { multi_selected: &state.multi_selected, pending_actions: &state.pending_actions },
+            RowDecorations { multi_selected: &state.multi_selected },
             state.scroll_offset..state.scroll_offset.saturating_add(self.rows_area.height as usize),
         );
     }
@@ -526,6 +574,32 @@ mod tests {
         assert!(rendered.contains("convoys/dev"));
         assert!(rendered.contains("CONVOY"));
         assert!(rendered.contains("tables"));
+    }
+
+    #[test]
+    fn pending_row_renders_an_animated_shimmer() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 1)).expect("terminal");
+        let view = view();
+        let row_id = view.rows[0].id.clone();
+        let mut state = TableState::default();
+        state.begin_pending(flotilla_protocol::QueryId::Convoys, row_id, "Delete convoy".into()).expect("pending row");
+        terminal
+            .draw(|frame| {
+                TablePanel::render_rows_at(
+                    frame,
+                    frame.area(),
+                    &Theme::classic(),
+                    &view,
+                    &state,
+                    RowDecorations { multi_selected: &state.multi_selected },
+                    0..1,
+                    Duration::from_millis(500),
+                );
+            })
+            .expect("draw");
+
+        let styles = terminal.backend().buffer().content()[..6].iter().map(|cell| cell.style()).collect::<Vec<_>>();
+        assert!(styles.windows(2).any(|pair| pair[0] != pair[1]), "the shimmer band should vary styling across the pending row");
     }
 
     #[test]
