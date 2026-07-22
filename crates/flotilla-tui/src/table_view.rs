@@ -884,6 +884,7 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
         ConvoyPhase::Completed => CellTone::Success,
         ConvoyPhase::Failed => CellTone::Error,
         ConvoyPhase::Cancelled => CellTone::Muted,
+        ConvoyPhase::Abandoned => CellTone::Muted,
     };
     CellValue::toned(row.phase.label(), tone)
 }
@@ -1000,6 +1001,7 @@ fn vessel_phase(row: &VesselProjection) -> CellValue {
         WorkPhase::Complete => ("complete", CellTone::Success),
         WorkPhase::Failed => ("failed", CellTone::Error),
         WorkPhase::Cancelled => ("cancelled", CellTone::Muted),
+        WorkPhase::Abandoned => ("abandoned", CellTone::Muted),
     };
     CellValue::toned(label, tone)
 }

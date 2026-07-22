@@ -94,6 +94,13 @@ impl CheckoutRuntime for FakeCheckoutRuntime {
         Ok(PreparedCheckout { commit: Some("44982740".to_string()), branch_provenance: CheckoutBranchProvenance::PreExisting })
     }
 
+    async fn inspect_integration(
+        &self,
+        _checkout: &flotilla_resources::ResourceObject<Checkout>,
+    ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
+        Ok(flotilla_resources::CheckoutIntegrationStatus::default())
+    }
+
     async fn remove_checkout(&self, _removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
         Ok(CheckoutRemovalOutcome::Removed)
     }

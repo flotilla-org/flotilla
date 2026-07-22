@@ -12,6 +12,10 @@ use crate::{
     },
     AttachableSetId, IssueRef, RepoIdentity,
 };
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 #[cfg(test)]
 use crate::{qualified_path::HostId, EnvironmentId};
 
@@ -228,6 +232,14 @@ pub enum CommandAction {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
         name: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
+    ConvoyAbandon {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+        reason: String,
     },
     CrewHandoff {
         context: CrewCommandContext,
@@ -384,6 +396,7 @@ impl Command {
             CommandAction::GenerateBranchName { .. } => "Generating branch name...",
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
+            CommandAction::ConvoyAbandon { .. } => "Abandoning convoy...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
@@ -716,7 +729,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into() },
+                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false },
             },
             Command {
                 node_id: None,
@@ -1241,7 +1254,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into() },
+                action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false },
             },
             Command {
                 node_id: None,

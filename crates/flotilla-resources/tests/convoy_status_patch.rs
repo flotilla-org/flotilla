@@ -70,6 +70,36 @@ fn crew_work(phase: CrewWorkPhase) -> CrewWorkState {
 }
 
 #[test]
+fn abandon_convoy_stamps_convoy_and_open_work() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([
+            ("implement".to_string(), WorkState { phase: WorkPhase::Running, ..pending_work() }),
+            ("review".to_string(), WorkState { phase: WorkPhase::Complete, finished_at: Some(ts(20)), ..pending_work() }),
+        ]),
+        crew_work: BTreeMap::new(),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    external_patches::mark_convoy_abandoned(ts(50), WorkCompletionAuthority::HumanOverride, "superseded by operator".to_string())
+        .apply(&mut status);
+
+    assert_eq!(status.phase, ConvoyPhase::Abandoned);
+    assert_eq!(status.finished_at, Some(ts(50)));
+    assert_eq!(status.message.as_deref(), Some("abandoned by HumanOverride: superseded by operator"));
+    assert_eq!(status.work["implement"].phase, WorkPhase::Abandoned);
+    assert_eq!(status.work["implement"].completion_authority, WorkCompletionAuthority::HumanOverride);
+    assert_eq!(status.work["implement"].message.as_deref(), Some("superseded by operator"));
+    assert_eq!(status.work["implement"].finished_at, Some(ts(50)));
+    assert_eq!(status.work["review"].phase, WorkPhase::Complete);
+}
+
+#[test]
 fn crew_completion_updates_only_the_calling_agent() {
     let mut status = ConvoyStatus {
         phase: ConvoyPhase::Active,

@@ -297,6 +297,7 @@ pub async fn create_ready_checkout(
             path: Some(fixture.path.clone()),
             commit: Some("44982740".to_string()),
             branch_provenance: Default::default(),
+            integration: Default::default(),
             message: None,
         })
         .await

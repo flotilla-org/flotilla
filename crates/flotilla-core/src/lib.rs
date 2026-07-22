@@ -2,6 +2,7 @@ pub mod agent_adapter;
 pub mod agents;
 pub mod aggregator_projection;
 pub mod attachable;
+pub mod checkout_integration;
 pub mod config;
 pub mod convert;
 pub mod daemon;

@@ -30,16 +30,17 @@ use flotilla_protocol::{
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
     external_patches as convoy_external_patches, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target,
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
-    CrewSource, Environment as ResourceEnvironment, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
-    TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent,
-    WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
+    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
+    ResourceBackend, ResourceError, ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -50,6 +51,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
+    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::{DaemonHandle, QuerySubscription},
@@ -1063,9 +1065,54 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
             None => format!("convoy {} failed while starting", convoy.metadata.name),
         }),
         flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {} was cancelled while starting", convoy.metadata.name)),
-        flotilla_resources::ConvoyPhase::Pending | flotilla_resources::ConvoyPhase::Active | flotilla_resources::ConvoyPhase::Completed => {
-            None
-        }
+        flotilla_resources::ConvoyPhase::Pending
+        | flotilla_resources::ConvoyPhase::Active
+        | flotilla_resources::ConvoyPhase::Completed
+        | flotilla_resources::ConvoyPhase::Abandoned => None,
+    }
+}
+
+fn checkout_branch(checkout: &ResourceObject<ResourceCheckout>) -> &str {
+    checkout_branch_from_spec(&checkout.spec)
+}
+
+fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
+    checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
+}
+
+fn condition_is_true(condition: &IntegrationCondition) -> bool {
+    condition.value == ConditionValue::True
+}
+
+fn condition_problem(label: &str, condition: &IntegrationCondition) -> Option<String> {
+    match condition.value {
+        ConditionValue::True => None,
+        ConditionValue::False => Some(format!("{label}=False{}", condition_detail_suffix(condition))),
+        ConditionValue::Unknown => Some(format!("{label}=Unknown{}", condition_detail_suffix(condition))),
+    }
+}
+
+fn condition_detail_suffix(condition: &IntegrationCondition) -> String {
+    if condition.details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", condition.details.join(", "))
+    }
+}
+
+fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, integration: &CheckoutIntegrationStatus) -> Option<String> {
+    let problems = [
+        condition_problem("Clean", &integration.clean),
+        condition_problem("Pushed", &integration.pushed),
+        condition_problem("Landed", &integration.landed),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if problems.is_empty() {
+        None
+    } else {
+        Some(format!("{} [{}]: {}", checkout.metadata.name, checkout_path(checkout).unwrap_or("<unknown path>"), problems.join("; ")))
     }
 }
 
@@ -3509,6 +3556,7 @@ impl InProcessDaemon {
                 }),
                 commit: None,
                 branch_provenance: Default::default(),
+                integration: Default::default(),
                 message: None,
             })
             .await
@@ -4121,6 +4169,154 @@ impl InProcessDaemon {
             convoy_external_patches::mark_crew_failed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
         })
         .await
+    }
+
+    async fn runner_for_resource_checkout(&self, _checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
+        self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
+    }
+
+    async fn checkout_environment_is_destroyed(&self, namespace: &str, env_ref: &str) -> Result<bool, String> {
+        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
+        match environments.get(env_ref).await {
+            Ok(environment) => {
+                Ok(!environment.status.as_ref().is_some_and(|status| status.ready && status.phase == EnvironmentPhase::Ready))
+            }
+            Err(ResourceError::NotFound { .. }) => Ok(true),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        if force {
+            return Ok(());
+        }
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
+        if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
+            return Ok(());
+        }
+
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let checkout_list = checkouts
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
+        let mut refusals = Vec::new();
+        for checkout in checkout_list {
+            let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
+            if let Some(env_ref) = checkout.spec.env_ref() {
+                if self.checkout_environment_is_destroyed(namespace, env_ref).await? {
+                    warn!(
+                        checkout = %checkout.metadata.name,
+                        env_ref,
+                        "checkout environment is gone; allowing corpse cleanup without integration probes"
+                    );
+                    continue;
+                }
+            }
+            let path = match checkout_path(&checkout) {
+                Some(path) => Path::new(path).to_path_buf(),
+                None => {
+                    if is_adopted {
+                        warn!(checkout = %checkout.metadata.name, "adopted checkout has no resolved path; releasing without deletion");
+                        continue;
+                    }
+                    refusals.push(format!("{} [<unknown path>]: Clean=Unknown (checkout has no resolved path)", checkout.metadata.name));
+                    continue;
+                }
+            };
+            let runner = match self.runner_for_resource_checkout(&checkout).await {
+                Ok(runner) => runner,
+                Err(error) => {
+                    if is_adopted {
+                        warn!(checkout = %checkout.metadata.name, %error, "adopted checkout integration could not be probed; releasing without deletion");
+                        continue;
+                    }
+                    refusals.push(format!(
+                        "{} [{}]: Clean=Unknown ({error}); Pushed=Unknown ({error}); Landed=Unknown ({error})",
+                        checkout.metadata.name,
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            let mut integration = inspect_checkout_integration(&*runner, &path, checkout_branch(&checkout)).await;
+            if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
+                integration.landed.value = ConditionValue::True;
+                if integration.landed_evidence.is_none() {
+                    integration.landed_evidence = existing.integration.landed_evidence.clone();
+                }
+            }
+            if let Err(error) = apply_resource_status_patch(
+                &checkouts,
+                &checkout.metadata.name,
+                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+            )
+            .await
+            {
+                warn!(checkout = %checkout.metadata.name, %error, "failed to persist checkout integration conditions during teardown gate");
+            }
+            if is_adopted {
+                if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
+                    warn!(checkout = %checkout.metadata.name, summary = %summary, "adopted checkout has integration dirt; releasing without deletion");
+                }
+                continue;
+            }
+            if !(condition_is_true(&integration.clean) && condition_is_true(&integration.pushed) && condition_is_true(&integration.landed))
+            {
+                if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
+                    refusals.push(summary);
+                }
+            }
+        }
+        if refusals.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("convoy {namespace}/{name} is not safe to delete:\n{}", refusals.join("\n")))
+        }
+    }
+
+    async fn archive_convoy_checkouts_best_effort(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let checkout_list = checkouts
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
+        for checkout in checkout_list {
+            let Some(path) = checkout_path(&checkout) else {
+                continue;
+            };
+            let Ok(runner) = self.runner_for_resource_checkout(&checkout).await else {
+                continue;
+            };
+            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Noop).await;
+            if let Ok(output) = output {
+                if !output.success {
+                    warn!(checkout = %checkout.metadata.name, stderr = %output.stderr.trim(), "best-effort abandon archive push failed");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn abandon_convoy_internal(&self, namespace: &str, name: &str, reason: &str) -> Result<(), String> {
+        if reason.trim().is_empty() {
+            return Err("convoy abandon requires a non-empty reason".to_string());
+        }
+        self.archive_convoy_checkouts_best_effort(namespace, name).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        apply_resource_status_patch(
+            &convoys,
+            name,
+            &convoy_external_patches::mark_convoy_abandoned(Utc::now(), WorkCompletionAuthority::HumanOverride, reason.to_string()),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        // Abandonment is an explicit terminal override: the phase stamp above is
+        // the teardown gate, after the best-effort archive push has run.
+        convoys.delete(name).await.map_err(|err| err.to_string())
     }
 
     async fn apply_crew_work_patch(
@@ -4897,16 +5093,33 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name } = &command.action {
+        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
                 None => self.provisioning_namespace().await,
             };
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let result = match convoys.delete(name).await {
+            let result = match self.verify_convoy_teardown_gate(&namespace, name, *force).await {
+                Ok(()) => match convoys.delete(name).await {
+                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                    Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, reason } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = match namespace {
+                Some(namespace) => namespace.clone(),
+                None => self.provisioning_namespace().await,
+            };
+            let result = match self.abandon_convoy_internal(&namespace, name, reason).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);

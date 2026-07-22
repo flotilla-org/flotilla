@@ -17,6 +17,7 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
+    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::ConfigStore,
     in_process::InProcessDaemon,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -31,12 +32,12 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, Clone, CloneSpec, Convoy,
-    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
-    ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY,
+    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
+    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment,
+    EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository,
+    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -684,8 +685,9 @@ fn spawn_controller_loops(
                 supervise("checkout", supervision, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
-                    let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                    let state = Arc::clone(&state);
                     async move {
+                        let runner = state.daemon.local_command_runner().expect("local runner should exist");
                         ControllerLoop {
                             primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
                             secondaries: vec![],
@@ -974,6 +976,21 @@ struct CheckoutControllerRuntime {
     runner: Arc<dyn CommandRunner>,
 }
 
+impl CheckoutControllerRuntime {
+    fn local_runner(&self) -> Result<Arc<dyn CommandRunner>, String> {
+        Ok(Arc::clone(&self.runner))
+    }
+
+    fn checkout_path<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> Result<&'a str, String> {
+        checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
+            .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
+    }
+
+    fn checkout_branch<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> &'a str {
+        checkout_branch_from_spec(&checkout.spec)
+    }
+}
+
 #[async_trait]
 impl CheckoutRuntime for CheckoutControllerRuntime {
     async fn create_worktree(
@@ -983,35 +1000,33 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
+        let runner = self.local_runner()?;
         let clone_path = utf8_path(clone_path)?;
         let target_path = utf8_path(target_path)?;
 
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
-        let local_exists = self
-            .runner
+        let local_exists = runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
         if !local_exists
-            && self.runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
         {
             let remote_head = format!("refs/heads/{branch}");
-            let advertised = self
-                .runner
+            let advertised = runner
                 .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
             if !advertised.trim().is_empty() {
                 let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
-                self.runner
+                runner
                     .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop)
                     .await
                     .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
             }
         }
-        let remote_exists = self
-            .runner
+        let remote_exists = runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
@@ -1024,11 +1039,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         if local_exists {
             // Multiple vessels can intentionally share the convoy branch. `--force`
             // overrides Git's protection against attaching it to another worktree.
-            self.runner
+            runner
                 .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         } else if remote_exists {
-            self.runner
+            runner
                 .run(
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
@@ -1039,15 +1054,13 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         } else if let Some(base_ref) = base_ref {
             let local_base_ref = format!("refs/heads/{base_ref}");
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
-            let resolved_base_ref = if self
-                .runner
+            let resolved_base_ref = if runner
                 .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .is_ok()
             {
                 base_ref.to_string()
-            } else if self
-                .runner
+            } else if runner
                 .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .is_ok()
@@ -1056,7 +1069,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             } else {
                 base_ref.to_string()
             };
-            self.runner
+            runner
                 .run(
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
@@ -1065,17 +1078,17 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 )
                 .await?;
         } else {
-            self.runner
+            runner
                 .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         }
 
-        let commit = resolve_head_commit(&*self.runner, target_path).await?;
+        let commit = resolve_head_commit(&*runner, target_path).await?;
         if branch_provenance == CheckoutBranchProvenance::CreatedForConvoy {
             // Ownership belongs to the branch, not one checkout: sibling vessels
             // can share it and may finalize in either order.
             let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
-            self.runner
+            runner
                 .run("git", &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         }
@@ -1089,22 +1102,22 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
+        let runner = self.local_runner()?;
         let target_path = utf8_path(target_path)?;
         let clone_ref = base_ref.unwrap_or(branch);
         if clone_ref == "HEAD" {
-            self.runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+            runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
         } else {
-            self.runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+            runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
         }
         if clone_ref != branch {
             let remote_ref = format!("refs/remotes/origin/{branch}");
-            let remote_exists = self
-                .runner
+            let remote_exists = runner
                 .run("git", &["-C", target_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .is_ok();
             if remote_exists {
-                self.runner
+                runner
                     .run(
                         "git",
                         &["-C", target_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
@@ -1113,26 +1126,31 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     )
                     .await?;
             } else {
-                self.runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
             }
         }
         Ok(PreparedCheckout {
-            commit: resolve_head_commit(&*self.runner, target_path).await?,
+            commit: resolve_head_commit(&*runner, target_path).await?,
             branch_provenance: CheckoutBranchProvenance::PreExisting,
         })
     }
 
+    async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
+        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), self.checkout_branch(checkout))
+            .await)
+    }
+
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        let runner = self.local_runner()?;
         match removal {
             CheckoutRemoval::FreshClone { target_path } => {
-                self.runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
                 let clone_path = utf8_path(clone_path)?;
                 let target_path = utf8_path(target_path)?;
-                let remove = self
-                    .runner
+                let remove = runner
                     .run_output(
                         "git",
                         &["-C", clone_path, "worktree", "remove", "--force", target_path],
@@ -1147,16 +1165,14 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 
                 let branch_ref = format!("refs/heads/{branch}");
                 let bootstrap_ref = bootstrap_branch_ref(branch);
-                let head = self
-                    .runner
+                let head = runner
                     .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Noop)
                     .await?;
                 if !head.success {
-                    delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                     return Ok(CheckoutRemovalOutcome::Removed);
                 }
-                let bootstrap = self
-                    .runner
+                let bootstrap = runner
                     .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Noop)
                     .await?;
                 if !bootstrap.success {
@@ -1166,17 +1182,15 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     });
                 }
                 if head.stdout.trim() != bootstrap.stdout.trim() {
-                    delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
                         branch: branch.clone(),
                         reason: BranchPreservationReason::CommitsPastBase,
                     });
                 }
 
-                let worktrees = self
-                    .runner
-                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop)
-                    .await?;
+                let worktrees =
+                    runner.run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop).await?;
                 if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
                         branch: branch.clone(),
@@ -1184,10 +1198,10 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     });
                 }
 
-                self.runner
+                runner
                     .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Noop)
                     .await?;
-                delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
         }

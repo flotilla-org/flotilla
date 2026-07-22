@@ -52,6 +52,7 @@ pub enum ConvoyPhase {
     Completed,
     Failed,
     Cancelled,
+    Abandoned,
 }
 
 impl From<wire::ConvoyPhase> for ConvoyPhase {
@@ -62,13 +63,14 @@ impl From<wire::ConvoyPhase> for ConvoyPhase {
             wire::ConvoyPhase::Completed => Self::Completed,
             wire::ConvoyPhase::Failed => Self::Failed,
             wire::ConvoyPhase::Cancelled => Self::Cancelled,
+            wire::ConvoyPhase::Abandoned => Self::Abandoned,
         }
     }
 }
 
 impl ConvoyPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Abandoned)
     }
 
     pub fn label(self) -> &'static str {
@@ -78,6 +80,7 @@ impl ConvoyPhase {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Abandoned => "abandoned",
         }
     }
 }
@@ -91,6 +94,7 @@ pub enum WorkPhase {
     Complete,
     Failed,
     Cancelled,
+    Abandoned,
 }
 
 impl From<wire::WorkPhase> for WorkPhase {
@@ -103,6 +107,7 @@ impl From<wire::WorkPhase> for WorkPhase {
             wire::WorkPhase::Complete => Self::Complete,
             wire::WorkPhase::Failed => Self::Failed,
             wire::WorkPhase::Cancelled => Self::Cancelled,
+            wire::WorkPhase::Abandoned => Self::Abandoned,
         }
     }
 }

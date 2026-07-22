@@ -114,8 +114,57 @@ pub struct CheckoutStatus {
     #[serde(default, skip_serializing_if = "CheckoutBranchProvenance::is_pre_existing")]
     #[builder(default)]
     pub branch_provenance: CheckoutBranchProvenance,
+    #[builder(default)]
+    #[serde(default)]
+    pub integration: CheckoutIntegrationStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CheckoutIntegrationStatus {
+    #[builder(default)]
+    #[serde(default)]
+    pub clean: IntegrationCondition,
+    #[builder(default)]
+    #[serde(default)]
+    pub pushed: IntegrationCondition,
+    #[builder(default)]
+    #[serde(default)]
+    pub landed: IntegrationCondition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed_evidence: Option<LandedEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct IntegrationCondition {
+    pub value: ConditionValue,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub details: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+}
+
+impl Default for IntegrationCondition {
+    fn default() -> Self {
+        Self { value: ConditionValue::Unknown, details: Vec::new(), observed_at: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionValue {
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct LandedEvidence {
+    pub change_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +173,7 @@ pub enum CheckoutStatusPatch {
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkTerminating,
     MarkFailed { message: String },
+    UpdateIntegration { integration: CheckoutIntegrationStatus },
 }
 
 impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
@@ -146,6 +196,17 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
             Self::MarkFailed { message } => {
                 status.phase = CheckoutPhase::Failed;
                 status.message = Some(message.clone());
+            }
+            Self::UpdateIntegration { integration } => {
+                let landed_was_latched = status.integration.landed.value == ConditionValue::True;
+                let landed_evidence = status.integration.landed_evidence.clone();
+                status.integration = integration.clone();
+                if landed_was_latched {
+                    status.integration.landed.value = ConditionValue::True;
+                    if status.integration.landed_evidence.is_none() {
+                        status.integration.landed_evidence = landed_evidence;
+                    }
+                }
             }
         }
     }
