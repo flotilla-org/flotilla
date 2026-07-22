@@ -1220,6 +1220,7 @@ dependencies = [
  "bon",
  "flotilla-core",
  "flotilla-protocol",
+ "flotilla-test-support",
  "flotilla-transport",
  "libc",
  "serde_json",
@@ -1307,6 +1308,7 @@ dependencies = [
  "flotilla-daemon",
  "flotilla-protocol",
  "flotilla-resources",
+ "flotilla-test-support",
  "flotilla-transport",
  "futures",
  "indexmap",
@@ -1329,6 +1331,7 @@ dependencies = [
  "async-trait",
  "bon",
  "flotilla-protocol",
+ "flotilla-test-support",
  "serde",
  "serde_json",
  "tempfile",
@@ -1379,6 +1382,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "flotilla-test-support"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

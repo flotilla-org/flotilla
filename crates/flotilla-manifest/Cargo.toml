@@ -14,5 +14,6 @@ tokio = { version = "1", features = ["process", "net", "io-util", "sync", "time"
 tracing = { workspace = true }
 
 [dev-dependencies]
+flotilla-test-support = { path = "../flotilla-test-support" }
 tokio = { version = "1", features = ["macros", "rt", "fs"] }
 tempfile = "3"

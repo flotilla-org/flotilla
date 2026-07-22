@@ -408,8 +408,8 @@ done
 
     #[tokio::test]
     async fn unix_socket_sink_writes_one_wire_message_per_line() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket_path = dir.path().join("manifest.sock");
+        let dir = flotilla_test_support::TestSocketDir::new();
+        let socket_path = dir.socket_path("manifest.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind test socket");
 
         let patch = stamp_patch();

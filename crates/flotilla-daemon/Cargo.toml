@@ -30,6 +30,7 @@ futures = "0.3"
 visibility = "0.1.1"
 
 [dev-dependencies]
+flotilla-test-support = { path = "../flotilla-test-support" }
 indexmap = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"

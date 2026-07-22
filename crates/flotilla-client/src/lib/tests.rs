@@ -5,6 +5,7 @@ use flotilla_protocol::{
     result_set::{QueryChanges, QueryId, ResultDelta, ResultSet, Rows},
     EnvironmentId, NodeId, NodeInfo, RepoDelta, RepoIdentity, RepoSnapshot,
 };
+use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, unix_message_session, MessageSession};
 use tokio::net::UnixListener;
 
@@ -119,8 +120,8 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
     // deleting its socket and spawning over it. The test plays B: it holds
     // the spawn lock, binds a stale-version listener only after A's first
     // probe has found nothing, then releases the lock.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = dir.path().join("daemon.sock");
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("daemon.sock");
     let lock_path = std::path::PathBuf::from(format!("{}.lock", socket_path.display()));
 
     let lock_file = match acquire_spawn_lock(&lock_path) {
@@ -189,8 +190,8 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
 
 #[tokio::test]
 async fn connect_or_spawn_reports_wedged_daemon_instead_of_hanging_or_respawning() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = dir.path().join("daemon.sock");
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("daemon.sock");
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -243,8 +244,8 @@ async fn client_hello_rejects_daemon_protocol_version_mismatch() {
 
 #[tokio::test]
 async fn connect_rejects_daemon_protocol_version_mismatch() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = dir.path().join("daemon.sock");
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("daemon.sock");
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -284,8 +285,8 @@ async fn connect_rejects_daemon_protocol_version_mismatch() {
 
 #[tokio::test]
 async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = dir.path().join("daemon.sock");
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("daemon.sock");
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -438,8 +439,8 @@ async fn send_request_writes_message_and_returns_pending_response() {
 
 #[tokio::test]
 async fn dropping_socket_daemon_closes_connection_promptly() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = dir.path().join("daemon.sock");
+    let dir = TestSocketDir::new();
+    let socket_path = dir.socket_path("daemon.sock");
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
