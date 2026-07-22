@@ -144,7 +144,7 @@ pub struct Aggregator {
     #[builder(skip)]
     convoy_change_requests: HashMap<ResourceRef, ConvoyChangeRequest>,
     #[builder(skip)]
-    change_request_refresh_generations: HashMap<ResourceRef, u64>,
+    change_request_refresh_generations: HashMap<ResourceRef, uuid::Uuid>,
     #[builder(skip)]
     change_request_refresh_tasks: HashMap<ResourceRef, tokio::task::JoinHandle<()>>,
     #[builder(skip)]
@@ -158,7 +158,7 @@ pub struct Aggregator {
 
 struct ChangeRequestResolution {
     reference: ResourceRef,
-    generation: u64,
+    generation: uuid::Uuid,
     branch: String,
     result: Result<Option<ConvoyChangeRequest>, String>,
 }
@@ -658,6 +658,7 @@ impl Aggregator {
         for reference in references {
             self.handle_convoy_transition(&reference, previous.get(&reference), current.get(&reference));
         }
+        self.change_request_refresh_generations.retain(|reference, _| current.contains_key(reference));
         self.rebuild_local_projection().await;
     }
 
@@ -784,7 +785,7 @@ impl Aggregator {
             WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) | WatchEvent::Deleted(convoy) => convoy,
         };
         let reference = self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
-        let previous = self.effective_convoy(&reference).cloned();
+        let previous = self.projected_convoy(&reference).cloned();
         match event {
             WatchEvent::Added(convoy) | WatchEvent::Modified(convoy) => {
                 self.convoys_by_source.entry(source).or_default().insert(reference.clone(), convoy);
@@ -793,8 +794,11 @@ impl Aggregator {
                 self.convoys_by_source.entry(source).or_default().remove(&reference);
             }
         }
-        let current = self.effective_convoy(&reference).cloned();
+        let current = self.projected_convoy(&reference).cloned();
         self.handle_convoy_transition(&reference, previous.as_ref(), current.as_ref());
+        if current.is_none() {
+            self.change_request_refresh_generations.remove(&reference);
+        }
         self.rebuild_local_projection().await;
     }
 
@@ -827,8 +831,7 @@ impl Aggregator {
     }
 
     fn invalidate_change_request(&mut self, reference: &ResourceRef) {
-        let generation = self.change_request_refresh_generations.entry(reference.clone()).or_default();
-        *generation = generation.saturating_add(1);
+        self.change_request_refresh_generations.insert(reference.clone(), uuid::Uuid::new_v4());
         if let Some(task) = self.change_request_refresh_tasks.remove(reference) {
             task.abort();
         }
@@ -837,9 +840,8 @@ impl Aggregator {
 
     fn schedule_change_request_refresh(&mut self, convoy: &ResourceObject<Convoy>) {
         let reference = self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
-        let generation = self.change_request_refresh_generations.entry(reference.clone()).or_default();
-        *generation = generation.saturating_add(1);
-        let generation = *generation;
+        let generation = uuid::Uuid::new_v4();
+        self.change_request_refresh_generations.insert(reference.clone(), generation);
         if let Some(task) = self.change_request_refresh_tasks.remove(&reference) {
             task.abort();
         }
@@ -887,6 +889,7 @@ impl Aggregator {
     async fn refresh_all_change_requests(&mut self) {
         let effective_convoys = self.effective_convoys();
         self.convoy_change_requests.retain(|reference, _| effective_convoys.contains_key(reference));
+        self.change_request_refresh_generations.retain(|reference, _| effective_convoys.contains_key(reference));
         for convoy in effective_convoys.values() {
             self.schedule_change_request_refresh(convoy);
         }
@@ -934,11 +937,11 @@ impl Aggregator {
     }
 
     fn effective_convoy(&self, reference: &ResourceRef) -> Option<&ResourceObject<Convoy>> {
-        LOCAL_SOURCE_PRECEDENCE
-            .iter()
-            .rev()
-            .find_map(|source| self.convoys_by_source.get(source)?.get(reference))
-            .filter(|convoy| convoy.metadata.deletion_timestamp.is_none())
+        LOCAL_SOURCE_PRECEDENCE.iter().rev().find_map(|source| self.convoys_by_source.get(source)?.get(reference))
+    }
+
+    fn projected_convoy(&self, reference: &ResourceRef) -> Option<&ResourceObject<Convoy>> {
+        self.effective_convoy(reference).filter(|convoy| convoy.metadata.deletion_timestamp.is_none())
     }
 
     async fn rebuild_local_projection(&mut self) {
@@ -2199,6 +2202,62 @@ mod tests {
                 );
             } => {}
         }
+    }
+
+    #[tokio::test]
+    async fn deleting_convoy_is_hidden_from_rows_but_retained_for_salience() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let now = Utc::now();
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Completed).work_phase(ResourceWorkPhase::Complete).call();
+        convoy.metadata.deletion_timestamp = Some(now);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        session.status.as_mut().expect("running status").attention =
+            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: now, source: TerminalAttentionSource::Hook });
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+
+        assert!(state.result_set().await.rows.as_convoys().expect("convoy rows").is_empty());
+        assert!(!aggregator.salience_facts_at(now).attention[0].work_unsettled);
+    }
+
+    #[tokio::test]
+    async fn deleted_convoy_prunes_enrichment_generation_without_reusing_stale_token() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator =
+            Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::new(BlockingChangeRequestResolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+        let reference = aggregator.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        let stale_generation = *aggregator.change_request_refresh_generations.get(&reference).expect("active enrichment generation");
+
+        convoy.metadata.deletion_timestamp = Some(Utc::now());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy.clone())).await;
+        assert!(!aggregator.change_request_refresh_generations.contains_key(&reference));
+
+        convoy.metadata.deletion_timestamp = None;
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        assert_ne!(aggregator.change_request_refresh_generations.get(&reference), Some(&stale_generation));
+
+        aggregator
+            .apply_change_request_resolution(ChangeRequestResolution {
+                reference: reference.clone(),
+                generation: stale_generation,
+                branch: "feat/convoy".to_string(),
+                result: Ok(Some(ConvoyChangeRequest {
+                    id: "stale".to_string(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+            })
+            .await;
+        assert!(!aggregator.convoy_change_requests.contains_key(&reference));
     }
 
     #[tokio::test]
