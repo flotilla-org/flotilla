@@ -159,7 +159,7 @@ impl TerminalManager {
         if let Some(socket) = daemon_socket_path {
             env_vars.push(("FLOTILLA_DAEMON_SOCKET".to_string(), socket.to_string()));
         }
-        self.pool.ensure_session(&session_name, &command, &cwd, &env_vars).await
+        self.pool.ensure_session(&session_name, &command, &cwd, &env_vars, &[]).await
     }
 
     /// Returns the command string needed to attach to a terminal session.

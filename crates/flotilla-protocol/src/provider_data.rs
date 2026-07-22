@@ -252,7 +252,7 @@ impl AgentEventType {
 }
 
 /// A normalized agent hook event sent from the hook CLI to the daemon.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct AgentHookEvent {
     /// Which terminal this agent lives in (from env or allocated).
     pub attachable_id: AttachableId,
@@ -266,6 +266,16 @@ pub struct AgentHookEvent {
     pub model: Option<String>,
     /// Current working directory (if reported).
     pub cwd: Option<String>,
+    /// Control-plane identity injected into managed crew sessions. Legacy
+    /// observer hooks omit it and continue through their old path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<AgentHookTerminalRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHookTerminalRef {
+    pub namespace: String,
+    pub session_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

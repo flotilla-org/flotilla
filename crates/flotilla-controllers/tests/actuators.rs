@@ -62,6 +62,7 @@ impl TerminalPool for FakeTerminalPool {
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
+        _tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }

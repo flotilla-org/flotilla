@@ -69,6 +69,14 @@ Attention **never transitions a phase** — idle is not done; the
 (needs-attention = `NeedsInput ∨ (Idle ∧ work unsettled)`), not
 auto-resolved. That inference is what this ADR forbids.
 
+Implementation note (issue #811): Claude Code lifecycle hooks provide the
+v1 hook source, including `permission_prompt` as `NeedsInput`. Codex's
+trust-gated hook event vocabulary is not yet stable enough for a
+Flotilla-side parser, so Codex sessions deliberately use Cleat screen
+stability as their v1 fallback (`Working` / `Idle`). This keeps them visible
+and truthfully observable without claiming that a stable screen is a prompt;
+a Codex parser can take precedence once its hook contract is documented.
+
 ## Phase vocabulary
 
 - **`Abandoned`** joins `WorkPhase` and `ConvoyPhase`: a chosen terminal —

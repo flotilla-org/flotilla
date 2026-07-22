@@ -161,6 +161,71 @@ pub struct TerminalSessionStatus {
     pub launch_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_message_id: Option<String>,
+    /// A fresh observation of what the terminal's harness appears to be doing.
+    /// This deliberately does not participate in the session lifecycle phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<TerminalAttention>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalAttentionState {
+    Working,
+    NeedsInput,
+    Idle,
+    Unobservable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalAttentionSource {
+    Hook,
+    Screen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalAttention {
+    pub state: TerminalAttentionState,
+    pub as_of: DateTime<Utc>,
+    pub source: TerminalAttentionSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSessionTag {
+    pub key: String,
+    pub value: String,
+}
+
+impl TerminalSessionTag {
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { key: key.into(), value: value.into() }
+    }
+}
+
+impl TerminalAttention {
+    pub const FRESH_FOR: chrono::Duration = chrono::Duration::seconds(30);
+    pub const DEBOUNCE_FOR: chrono::Duration = chrono::Duration::seconds(5);
+
+    pub fn is_stale_at(&self, now: DateTime<Utc>) -> bool {
+        self.state != TerminalAttentionState::Unobservable && now.signed_duration_since(self.as_of) > Self::FRESH_FOR
+    }
+
+    /// Whether persisting `incoming` would add information. Hook observations
+    /// take precedence while fresh; identical observations are rate-limited.
+    pub fn should_replace_with(&self, incoming: &Self) -> bool {
+        if incoming.as_of <= self.as_of {
+            return false;
+        }
+        if self.source == TerminalAttentionSource::Hook
+            && incoming.source == TerminalAttentionSource::Screen
+            && !self.is_stale_at(incoming.as_of)
+        {
+            return false;
+        }
+        self.state != incoming.state
+            || self.source != incoming.source
+            || incoming.as_of.signed_duration_since(self.as_of) >= Self::DEBOUNCE_FOR
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -198,6 +263,9 @@ pub enum TerminalSessionStatusPatch {
         message: String,
         stopped_at: Option<DateTime<Utc>>,
     },
+    ObserveAttention {
+        attention: TerminalAttention,
+    },
 }
 
 impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
@@ -224,6 +292,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.inner_command_status = *inner_command_status;
                 status.inner_exit_code = *inner_exit_code;
                 status.message = message.clone();
+                if let Some(attention) = &mut status.attention {
+                    attention.state = TerminalAttentionState::Unobservable;
+                    attention.as_of = *stopped_at;
+                }
             }
             Self::MarkFailed { message, stopped_at } => {
                 status.phase = TerminalSessionPhase::Failed;
@@ -231,7 +303,87 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                     status.stopped_at.get_or_insert(*stopped_at);
                 }
                 status.message = Some(message.clone());
+                if let Some(attention) = &mut status.attention {
+                    attention.state = TerminalAttentionState::Unobservable;
+                    if let Some(stopped_at) = stopped_at {
+                        attention.as_of = *stopped_at;
+                    }
+                }
+            }
+            Self::ObserveAttention { attention } => {
+                let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
+                if replace {
+                    status.attention = Some(attention.clone());
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+
+    fn attention(state: TerminalAttentionState, source: TerminalAttentionSource, second: u32) -> TerminalAttention {
+        TerminalAttention { state, source, as_of: Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, second).single().expect("valid timestamp") }
+    }
+
+    #[test]
+    fn attention_observation_never_changes_a_terminal_phase() {
+        let mut status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+        TerminalSessionStatusPatch::ObserveAttention {
+            attention: TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("valid timestamp"),
+                source: TerminalAttentionSource::Hook,
+            },
+        }
+        .apply(&mut status);
+
+        assert_eq!(status.phase, TerminalSessionPhase::Running);
+        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
+    }
+
+    #[test]
+    fn fresh_hook_observation_wins_over_screen_fallback() {
+        let hook = attention(TerminalAttentionState::NeedsInput, TerminalAttentionSource::Hook, 0);
+        let screen = attention(TerminalAttentionState::Working, TerminalAttentionSource::Screen, 10);
+
+        assert!(!hook.should_replace_with(&screen));
+    }
+
+    #[test]
+    fn stale_hook_observation_yields_to_screen_fallback() {
+        let hook = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 0);
+        let screen = attention(TerminalAttentionState::Idle, TerminalAttentionSource::Screen, 31);
+
+        assert!(hook.should_replace_with(&screen));
+    }
+
+    #[test]
+    fn identical_observations_are_debounced() {
+        let first = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 0);
+        let too_soon = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 1);
+        let refresh = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 5);
+
+        assert!(!first.should_replace_with(&too_soon));
+        assert!(first.should_replace_with(&refresh));
+    }
+
+    #[test]
+    fn stopping_a_session_makes_its_attention_unobservable() {
+        let stopped_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("valid timestamp");
+        let mut status = TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            attention: Some(attention(TerminalAttentionState::NeedsInput, TerminalAttentionSource::Hook, 0)),
+            ..Default::default()
+        };
+
+        TerminalSessionStatusPatch::MarkStopped { stopped_at, inner_command_status: None, inner_exit_code: None, message: None }
+            .apply(&mut status);
+
+        assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Unobservable);
     }
 }

@@ -1050,14 +1050,20 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str) -> Result<()> {
     };
 
     // 5. Build the event
-    let event = AgentHookEvent {
-        attachable_id,
-        harness: harness_enum,
-        event_type: parsed.event_type,
-        session_id: parsed.session_id,
-        model: parsed.model,
-        cwd: parsed.cwd,
-    };
+    let terminal = std::env::var("FLOTILLA_NAMESPACE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .zip(std::env::var("FLOTILLA_TERMINAL_SESSION").ok().filter(|value| !value.is_empty()))
+        .map(|(namespace, session_name)| flotilla_protocol::AgentHookTerminalRef { namespace, session_name });
+    let event = AgentHookEvent::builder()
+        .attachable_id(attachable_id)
+        .harness(harness_enum)
+        .event_type(parsed.event_type)
+        .maybe_session_id(parsed.session_id)
+        .maybe_model(parsed.model)
+        .maybe_cwd(parsed.cwd)
+        .maybe_terminal(terminal)
+        .build();
 
     // 6. Send to daemon via socket. The daemon owns agent state as a single
     // actor — no file-level races between concurrent hook processes.

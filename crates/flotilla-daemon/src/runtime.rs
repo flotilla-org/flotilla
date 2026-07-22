@@ -25,7 +25,7 @@ use flotilla_core::{
         discovery::{EnvironmentAssertion, EnvironmentBag},
         environment::{CreateOpts, EnvironmentHandle, ProvisionedMount},
         registry::ProviderRegistry,
-        terminal::TerminalPool,
+        terminal::{ScreenActivity, TerminalPool},
         vcs::{CloneProvisioner, GitCloneProvisioner},
         ChannelLabel, CommandRunner,
     },
@@ -1250,7 +1250,12 @@ struct TerminalControllerRuntime {
 
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
-    async fn ensure_session(&self, name: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalRuntimeState, String> {
+    async fn ensure_session(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
         let registry = self.registry_for_env(&spec.env_ref)?;
         let pool = registry
             .terminal_pools
@@ -1294,6 +1299,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     ("FLOTILLA_VESSEL".to_string(), context.vessel_ref.clone()),
                     ("FLOTILLA_CREW_ROLE".to_string(), spec.role.clone()),
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
+                    ("FLOTILLA_TERMINAL_SESSION".to_string(), name.to_string()),
                 ]);
                 (plan.command, env, Some(crew), message.clone())
             }
@@ -1305,7 +1311,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 pool.kill_session(name).await?;
             }
         }
-        pool.ensure_session(name, &command, &cwd, &env).await?;
+        pool.ensure_session(name, &command, &cwd, &env, tags).await?;
         let delivered_message_id = initial_message.as_ref().map(|message| message.id.clone());
         if let Some(message) = initial_message {
             if let Err(err) = pool.deliver(name, &message.text, true).await {
@@ -1338,6 +1344,27 @@ impl TerminalRuntime for TerminalControllerRuntime {
             self.state.active_sessions.lock().await.remove(session_id);
         }
         Ok(running)
+    }
+
+    async fn observe_attention(
+        &self,
+        session_id: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+    ) -> Result<Option<flotilla_resources::TerminalAttention>, String> {
+        let pool = self.pool_for_spec(spec)?;
+        let Some(session) = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id) else {
+            return Ok(None);
+        };
+        let Some(activity) = session.screen_activity else { return Ok(None) };
+        let state = match activity {
+            ScreenActivity::Active => flotilla_resources::TerminalAttentionState::Working,
+            ScreenActivity::Stable => flotilla_resources::TerminalAttentionState::Idle,
+        };
+        Ok(Some(flotilla_resources::TerminalAttention {
+            state,
+            as_of: Utc::now(),
+            source: flotilla_resources::TerminalAttentionSource::Screen,
+        }))
     }
 
     async fn deliver_message(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec, message: &str) -> Result<(), String> {
@@ -2402,6 +2429,7 @@ mod tests {
             status: flotilla_protocol::TerminalStatus::Running,
             command: Some("old codex process with stale crew identity".to_string()),
             working_directory: Some(ExecutionEnvironmentPath::new("/repo")),
+            screen_activity: None,
         }])
         .await;
         let runtime = TerminalControllerRuntime { state };
@@ -2430,7 +2458,7 @@ mod tests {
             pool: "fake-terminals".to_string(),
         };
 
-        let launched = runtime.ensure_session(session_name, &spec).await.expect("replace stale session");
+        let launched = runtime.ensure_session(session_name, &spec, &[]).await.expect("replace stale session");
 
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
         assert_eq!(pool.ensured.lock().await.len(), 1, "the fresh agent command must actually be launched");

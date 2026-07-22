@@ -64,7 +64,7 @@ impl TerminalActuator {
         let TerminalSessionSource::Tool { command } = &spec.source else {
             return Err("agent sessions require an AgentAdapter-aware runtime".to_string());
         };
-        self.pool.ensure_session(name, command, &ExecutionEnvironmentPath::new(spec.cwd.clone()), &env_vars).await
+        self.pool.ensure_session(name, command, &ExecutionEnvironmentPath::new(spec.cwd.clone()), &env_vars, &[]).await
     }
 }
 

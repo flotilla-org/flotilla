@@ -111,7 +111,12 @@ struct FakeTerminalRuntime;
 
 #[async_trait]
 impl TerminalRuntime for FakeTerminalRuntime {
-    async fn ensure_session(&self, name: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalRuntimeState, String> {
+    async fn ensure_session(
+        &self,
+        name: &str,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+        _tags: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
         Ok(TerminalRuntimeState {
             session_id: format!("session-{name}"),
             pid: Some(42),
@@ -176,6 +181,7 @@ impl TerminalPool for FakePresentationTerminalPool {
         _command: &str,
         _cwd: &flotilla_core::path_context::ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
+        _tags: &[flotilla_core::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }

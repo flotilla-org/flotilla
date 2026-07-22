@@ -1736,6 +1736,7 @@ fn test_convoy(
         finished_at: None,
         observed_workflow_ref: None,
         initializing,
+        needs_attention: false,
     }
 }
 

@@ -237,7 +237,7 @@ async fn ensure_session_creates_via_attach_then_detach() {
     let (pool, _dir) = test_pool(runner.clone());
     let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
 
-    pool.ensure_session("test-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env).await.expect("ensure_session");
+    pool.ensure_session("test-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure_session");
 
     let calls = runner.calls();
     assert_eq!(calls.len(), 3, "should call list, attach, detach: {calls:?}");
@@ -269,7 +269,7 @@ async fn ensure_session_skips_if_session_exists() {
     let (pool, _dir) = test_pool(runner.clone());
     let env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
 
-    pool.ensure_session("test-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env).await.expect("ensure_session");
+    pool.ensure_session("test-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure_session");
 
     let calls = runner.calls();
     assert_eq!(calls.len(), 1, "should only call list (session_exists), not attach: {calls:?}");
@@ -286,7 +286,7 @@ async fn ensure_session_empty_command_starts_login_shell() {
     ]));
     let (pool, _dir) = test_pool(runner.clone());
 
-    pool.ensure_session("test-session", "", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("ensure_session");
+    pool.ensure_session("test-session", "", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[]).await.expect("ensure_session");
 
     let calls = runner.calls();
     let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
@@ -301,7 +301,7 @@ async fn ensure_session_terminal_env_defaults_appear_before_caller_env() {
     let (pool, _dir) = test_pool_with_env(runner.clone(), env_defaults);
     let caller_env = vec![("FLOTILLA_ATTACHABLE_ID".to_string(), "test-uuid".to_string())];
 
-    pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env).await.expect("ensure_session");
+    pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env, &[]).await.expect("ensure_session");
 
     let calls = runner.calls();
     let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");

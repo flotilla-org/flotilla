@@ -254,6 +254,7 @@ impl TerminalPool for MockTerminalPool {
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        _tags: &[crate::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }
@@ -1134,6 +1135,7 @@ async fn refresh_correlates_discovered_attachable_set_from_member_working_direct
             status: flotilla_protocol::TerminalStatus::Running,
             command: None,
             working_directory: None,
+            screen_activity: None,
         }])),
     );
     let handle = RepoRefreshHandle::spawn(
