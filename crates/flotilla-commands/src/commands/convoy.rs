@@ -494,6 +494,35 @@ mod tests {
     }
 
     #[test]
+    fn convoy_start_bare_issue_resolves_to_project_defaulted_selector() {
+        let resolved = parse(&["convoy", "start", "--project", "flotilla", "--issue", "834"]).resolve().expect("resolve");
+
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        issue: Some(IssueSelector::Id("834".into())),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: vec![],
+                        instruction: None,
+                        placement_policy: None,
+                        auto_attach: true,
+                    }),
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
     fn convoy_create_resolves() {
         let resolved = parse(&[
             "convoy",
