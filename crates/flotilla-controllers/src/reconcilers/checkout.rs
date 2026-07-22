@@ -6,6 +6,26 @@ use flotilla_resources::{
     Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, Clone, ClonePhase, ResourceBackend, ResourceError, ResourceObject,
     TypedResolver,
 };
+use tracing::warn;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutRemoval {
+    Worktree { clone_path: String, branch: String, target_path: String },
+    FreshClone { target_path: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchPreservationReason {
+    CommitsPastBase,
+    CheckedOutElsewhere,
+    NotCreatedForConvoy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutRemovalOutcome {
+    Removed,
+    PreservedBranch { branch: String, reason: BranchPreservationReason },
+}
 
 #[async_trait]
 pub trait CheckoutRuntime: Send + Sync {
@@ -23,7 +43,7 @@ pub trait CheckoutRuntime: Send + Sync {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<Option<String>, String>;
-    async fn remove_checkout(&self, target_path: &str) -> Result<(), String>;
+    async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
 }
 
 pub struct CheckoutReconciler<R> {
@@ -108,10 +128,19 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
-        let Some(target_path) = obj.spec.target_path() else {
-            return Ok(());
+        let removal = match &obj.spec {
+            CheckoutSpec::Worktree(spec) => {
+                let clone = self.clones.get(&spec.clone_ref).await?;
+                CheckoutRemoval::Worktree { clone_path: clone.spec.path, branch: spec.r#ref.clone(), target_path: spec.target_path.clone() }
+            }
+            CheckoutSpec::FreshClone(spec) => CheckoutRemoval::FreshClone { target_path: spec.target_path.clone() },
+            CheckoutSpec::Observed(_) => return Ok(()),
         };
-        self.runtime.remove_checkout(target_path).await.map_err(ResourceError::other)
+        let outcome = self.runtime.remove_checkout(&removal).await.map_err(ResourceError::other)?;
+        if let CheckoutRemovalOutcome::PreservedBranch { branch, reason } = outcome {
+            warn!(%branch, ?reason, "preserved branch during checkout cleanup");
+        }
+        Ok(())
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
