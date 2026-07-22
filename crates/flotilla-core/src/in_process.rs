@@ -115,6 +115,10 @@ fn host_name_for_provider_environment(providers: &ProviderData, environment_id: 
     candidates.into_iter().next()
 }
 
+fn cached_change_request_by_branch(providers: &ProviderData, branch: &str) -> Option<(String, flotilla_protocol::ChangeRequest)> {
+    providers.change_requests.iter().find(|(_, request)| request.branch == branch).map(|(id, request)| (id.clone(), request.clone()))
+}
+
 fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
     let mut encoded = String::with_capacity(config_key.len() * 2);
     for byte in config_key.as_bytes() {
@@ -2188,30 +2192,59 @@ impl InProcessDaemon {
         repository_keys: &[RepositoryKey],
         branch: &str,
     ) -> Result<Option<ConvoyChangeRequest>, String> {
-        let candidates = {
+        let (live_candidates, cached_candidates) = {
             let keys_by_path = self.repository_keys_by_path.read().await;
             let repos = self.repos.read().await;
             let order = self.repo_order.read().await;
-            let mut by_key = order
-                .iter()
-                .filter_map(|identity| {
-                    let state = repos.get(identity)?;
-                    let repository = keys_by_path.get(state.preferred_path())?;
-                    if !repository_keys.contains(repository) {
-                        return None;
+            let mut live_by_key = HashMap::new();
+            let mut cached_by_key = HashMap::new();
+
+            for identity in order.iter() {
+                let Some(state) = repos.get(identity) else { continue };
+                let Some(repository) = state
+                    .roots
+                    .iter()
+                    .filter_map(|root| keys_by_path.get(&root.path))
+                    .find(|repository| repository_keys.contains(repository))
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                if !live_by_key.contains_key(&repository) {
+                    for root in &state.roots {
+                        if keys_by_path.get(&root.path) != Some(&repository) {
+                            continue;
+                        }
+                        let providers =
+                            root.model.registry.change_requests.iter().map(|(_, provider)| Arc::clone(provider)).collect::<Vec<_>>();
+                        if !providers.is_empty() {
+                            live_by_key.insert(repository.clone(), (root.path.clone(), providers));
+                            break;
+                        }
                     }
-                    let providers = state.registry().change_requests.iter().map(|(_, provider)| Arc::clone(provider)).collect::<Vec<_>>();
-                    Some((repository.clone(), (state.preferred_path().to_path_buf(), providers)))
-                })
-                .collect::<HashMap<_, _>>();
-            repository_keys
+                }
+
+                if let Some((id, request)) =
+                    state.cached_snapshot().and_then(|snapshot| cached_change_request_by_branch(&snapshot.providers, branch))
+                {
+                    cached_by_key.entry(repository).or_insert((id, request));
+                }
+            }
+
+            let live_candidates = repository_keys
                 .iter()
-                .filter_map(|repository| by_key.remove(repository).map(|(path, providers)| (repository.clone(), path, providers)))
-                .collect::<Vec<_>>()
+                .filter_map(|repository| live_by_key.remove(repository).map(|(path, providers)| (repository.clone(), path, providers)))
+                .collect::<Vec<_>>();
+            let cached_candidates = repository_keys
+                .iter()
+                .filter_map(|repository| cached_by_key.remove(repository).map(|(id, request)| (repository.clone(), id, request)))
+                .collect::<Vec<_>>();
+            (live_candidates, cached_candidates)
         };
 
         let mut first_error = None;
-        for (repository, path, providers) in candidates {
+        for (repository, path, providers) in live_candidates {
             for provider in providers {
                 match provider.find_change_request_by_branch(&path, branch).await {
                     Ok(Some((id, request))) => {
@@ -2223,6 +2256,9 @@ impl InProcessDaemon {
                     }
                 }
             }
+        }
+        if let Some((repository, id, request)) = cached_candidates.into_iter().next() {
+            return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
         }
 
         match first_error {

@@ -291,7 +291,9 @@ impl Aggregator {
                     }
                 },
                 event = daemon_event_rx.recv() => match event {
-                    Ok(DaemonEvent::RepoRefreshCompleted { .. }) => self.refresh_all_change_requests().await,
+                    Ok(DaemonEvent::RepoRefreshCompleted { .. } | DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_)) => {
+                        self.refresh_all_change_requests().await;
+                    }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "aggregator lagged behind daemon refresh events");
@@ -1642,6 +1644,79 @@ mod tests {
                         repo: Some(std::path::PathBuf::from("/repo")),
                     })
                     .expect("publish provider refresh");
+
+                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys, "refreshed convoy delta").await;
+                let DaemonEvent::ResultDelta(delta) = refreshed else { panic!("expected refreshed result delta") };
+                assert_eq!(
+                    delta.changes.as_convoys().expect("convoy changes")[0]
+                        .change_request
+                        .as_ref()
+                        .expect("change request")
+                        .status,
+                    flotilla_protocol::ChangeRequestStatus::Closed
+                );
+            } => {}
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repo_snapshot_refreshes_convoy_change_requests() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::from([
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Closed,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+            ])),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let durable_convoys = ScriptedSource::new(
+            vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
+            vec![Ok(pending_watch())],
+        );
+        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+        let run = run_with_test_sources(
+            Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
+            &durable_convoys,
+            &durable_presentations,
+            &observed_convoys,
+            &observed_presentations,
+            replica_rx,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("aggregator stopped before repo snapshot: {result:?}"),
+            () = async {
+                let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await;
+                assert!(matches!(initial, DaemonEvent::ResultSet(_)));
+                event_tx
+                    .send(DaemonEvent::RepoSnapshot(Box::new(flotilla_protocol::RepoSnapshot {
+                        seq: 1,
+                        repo_identity: flotilla_protocol::RepoIdentity {
+                            authority: "github.com".into(),
+                            path: "flotilla-org/flotilla".into(),
+                        },
+                        repo: Some(std::path::PathBuf::from("/virtual/kiwi/flotilla")),
+                        node_id: flotilla_protocol::NodeId::new("kiwi"),
+                        work_items: Vec::new(),
+                        providers: flotilla_protocol::ProviderData::default(),
+                        provider_health: HashMap::new(),
+                        errors: Vec::new(),
+                    })))
+                    .expect("publish repo snapshot");
 
                 let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys, "refreshed convoy delta").await;
                 let DaemonEvent::ResultDelta(delta) = refreshed else { panic!("expected refreshed result delta") };
