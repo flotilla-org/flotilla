@@ -417,6 +417,16 @@ pub enum AwarenessKind {
     Checkout,
 }
 
+/// Named-query family represented by one panel of a project awareness view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwarenessFamily {
+    Convoys,
+    Issues,
+    Checkouts,
+    Independents,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AwarenessState {
@@ -442,6 +452,16 @@ pub enum Salience {
     Info,
     Attention,
     Urgent,
+}
+
+/// Centrally aggregated salience and freshness for one awareness family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct AwarenessFamilySummary {
+    pub family: AwarenessFamily,
+    #[builder(default)]
+    #[serde(default)]
+    pub salience: Salience,
+    pub as_of: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -548,6 +568,15 @@ pub struct AwarenessNode {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub entries: Vec<AwarenessEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub family_summaries: Vec<AwarenessFamilySummary>,
+}
+
+impl AwarenessNode {
+    pub fn family_summary(&self, family: AwarenessFamily) -> Option<&AwarenessFamilySummary> {
+        self.family_summaries.iter().find(|summary| summary.family == family)
+    }
 }
 
 impl AwarenessCounts {

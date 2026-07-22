@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use flotilla_protocol::{
-    AwarenessCounts, AwarenessEntry, AwarenessGrouping, AwarenessKind, AwarenessLimit, AwarenessNode, AwarenessPhase, AwarenessState,
-    CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef, ResultSetState, Salience, WorkPhase,
+    AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
+    AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
+    ResultSetState, Salience, WorkPhase,
 };
 use flotilla_resources::{api_version, Project, Resource};
 
@@ -186,6 +187,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             group.entries.sort_by(|left, right| entry_rank(left).cmp(&entry_rank(right)).then_with(|| left.label.cmp(&right.label)));
             let salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
             let node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
+            let family_summaries = awareness_family_summaries(&group.entries);
             group.entries.truncate(input.limit.entries);
             AwarenessNode::builder()
                 .id(group.id)
@@ -198,10 +200,33 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .counts(group.counts)
                 .refs(group.refs)
                 .entries(group.entries)
+                .family_summaries(family_summaries)
                 .build()
         })
         .collect();
     (rows, input.state)
+}
+
+fn awareness_family_summaries(entries: &[AwarenessEntry]) -> Vec<AwarenessFamilySummary> {
+    [AwarenessFamily::Convoys, AwarenessFamily::Issues, AwarenessFamily::Checkouts, AwarenessFamily::Independents]
+        .into_iter()
+        .filter_map(|family| {
+            let mut matching = entries.iter().filter(|entry| family_contains(family, entry.kind));
+            let first = matching.next()?;
+            let (salience, as_of) = matching
+                .fold((first.salience, first.as_of), |(salience, as_of), entry| (salience.max(entry.salience), as_of.max(entry.as_of)));
+            Some(AwarenessFamilySummary::builder().family(family).salience(salience).as_of(as_of).build())
+        })
+        .collect()
+}
+
+fn family_contains(family: AwarenessFamily, kind: AwarenessKind) -> bool {
+    match family {
+        AwarenessFamily::Convoys => matches!(kind, AwarenessKind::Convoy | AwarenessKind::Vessel),
+        AwarenessFamily::Issues => kind == AwarenessKind::Issue,
+        AwarenessFamily::Checkouts => kind == AwarenessKind::Checkout,
+        AwarenessFamily::Independents => kind == AwarenessKind::Independent,
+    }
 }
 
 fn enrich_salience(mut entry: AwarenessEntry, facts: &SalienceFacts, ancestors: &[ResourceRef]) -> AwarenessEntry {
@@ -494,6 +519,14 @@ mod tests {
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),
             convoys: vec![convoy.clone()],
+            checkouts: vec![CheckoutRow::builder()
+                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "platform"))
+                .repo(RepositoryKey("repo-a".into()))
+                .path("/work/platform")
+                .branch("main")
+                .host(HostName::new("local"))
+                .authority(flotilla_protocol::LifecycleAuthority::Observed)
+                .build()],
             salience: SalienceFacts {
                 demands: vec![DemandFact {
                     target: vessel.clone(),
@@ -522,5 +555,11 @@ mod tests {
         assert_eq!(vessel.as_of, attention_at);
         assert_eq!(node.salience, Salience::Urgent);
         assert_eq!(node.as_of, attention_at);
+        let convoys = node.family_summary(AwarenessFamily::Convoys).expect("convoy family summary");
+        assert_eq!(convoys.salience, Salience::Urgent);
+        assert_eq!(convoys.as_of, attention_at);
+        let checkouts = node.family_summary(AwarenessFamily::Checkouts).expect("checkout family summary");
+        assert_eq!(checkouts.salience, Salience::Info);
+        assert_eq!(checkouts.as_of, base);
     }
 }

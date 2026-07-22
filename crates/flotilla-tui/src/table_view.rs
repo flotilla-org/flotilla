@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    result_set::Timestamp, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName, IndependentRow,
-    IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience, SessionPhase,
-    ViewAddress,
+    result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName,
+    IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience,
+    SessionPhase, ViewAddress,
 };
 
 use crate::{
@@ -597,15 +597,13 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     }
 
     if let Some(awareness) = awareness {
-        for table in [&mut checkouts, &mut issues, &mut independents] {
-            table.meta.salience = awareness.salience;
-            table.meta.as_of = Some(awareness.as_of);
-        }
+        apply_family_summary(&mut checkouts, awareness, AwarenessFamily::Checkouts);
+        apply_family_summary(&mut issues, awareness, AwarenessFamily::Issues);
+        apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
     }
     let mut convoys = TableView { title: convoys_title, ..convoys };
     if let Some(awareness) = awareness {
-        convoys.meta.salience = awareness.salience;
-        convoys.meta.as_of = Some(awareness.as_of);
+        apply_family_summary(&mut convoys, awareness, AwarenessFamily::Convoys);
     }
 
     Ok(vec![
@@ -614,6 +612,13 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         ProjectPanel { kind: ProjectPanelKind::Issues, target: issues_address, table: issues },
         ProjectPanel { kind: ProjectPanelKind::Independents, target: independents_address, table: independents },
     ])
+}
+
+fn apply_family_summary(table: &mut TableView, awareness: &AwarenessNode, family: AwarenessFamily) {
+    if let Some(summary) = awareness.family_summary(family) {
+        table.meta.salience = summary.salience;
+        table.meta.as_of = Some(summary.as_of);
+    }
 }
 
 fn awareness_for_project<'a>(namespace: &str, name: &str, data: &'a TableRows<'_>) -> Option<&'a AwarenessNode> {
@@ -1190,8 +1195,8 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{
-        test_support::TestIssue, AwarenessCounts, AwarenessKind, AwarenessNode, AwarenessState, DemandBackedMetadata, LifecycleAuthority,
-        QueryId, QueryScope, RepositoryKey, ResourceRef, ResultSetCondition, ResultSetState,
+        test_support::TestIssue, AwarenessCounts, AwarenessFamilySummary, AwarenessKind, AwarenessNode, AwarenessState,
+        DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef, ResultSetCondition, ResultSetState,
     };
 
     use super::*;
@@ -1439,6 +1444,28 @@ mod tests {
             .salience(Salience::Urgent)
             .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
             .counts(AwarenessCounts::builder().total(4).convoys(1).issues(1).checkouts(1).independents(1).build())
+            .family_summaries(vec![
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Convoys)
+                    .salience(Salience::Urgent)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Checkouts)
+                    .salience(Salience::None)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Issues)
+                    .salience(Salience::Attention)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Independents)
+                    .salience(Salience::Info)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+            ])
             .build();
         let state = ResultSetState::default();
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
@@ -1471,7 +1498,12 @@ mod tests {
             "Issues (1)",
             "Independents (1)",
         ]);
-        assert!(panels.iter().all(|panel| panel.table.meta.salience == Salience::Urgent));
+        assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
+            Salience::Urgent,
+            Salience::None,
+            Salience::Attention,
+            Salience::Info,
+        ]);
         assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
