@@ -33,7 +33,7 @@ pub use open_views::{OpenView, OpenViews, ViewTarget};
 use tokio::sync::mpsc;
 use tui_input::Input;
 use ui_state::PendingStatus;
-pub use ui_state::{BranchInputKind, DirEntry, RepoViewLayout, TabId, UiState};
+pub use ui_state::{BranchInputKind, DirEntry, ProjectIssueStartContext, RepoViewLayout, TabId, UiState};
 
 use crate::{
     convoy_model::{ConvoyId, ConvoySummary},
@@ -361,6 +361,13 @@ pub struct InFlightCommand {
     pub description: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProjectIssueStartBatch {
+    total: usize,
+    started: usize,
+    rejected: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisibleStatusItem {
     pub id: usize,
@@ -446,6 +453,9 @@ pub struct App {
     /// unrelated finishes may appear here temporarily; the map is cleared as
     /// soon as this TUI has no acknowledgements left to reconcile.
     pub recent_command_finishes: HashMap<u64, Option<String>>,
+    pub next_project_issue_start_batch_id: u64,
+    pub project_issue_start_batches: HashMap<u64, ProjectIssueStartBatch>,
+    pub command_project_issue_starts: HashMap<u64, ProjectIssueStartContext>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
     pub screen: crate::widgets::screen::Screen,
@@ -551,6 +561,9 @@ impl App {
             acknowledged_dispatches: HashSet::new(),
             pending_dispatch_acks: 0,
             recent_command_finishes: HashMap::new(),
+            next_project_issue_start_batch_id: 1,
+            project_issue_start_batches: HashMap::new(),
+            command_project_issue_starts: HashMap::new(),
             pending_cancel: None,
             should_quit: false,
             screen,
@@ -612,6 +625,13 @@ impl App {
         }) {
             return true;
         }
+        if self.views.iter().any(|view| {
+            view.project_table_state.tables().iter().any(|table| {
+                table.pending_actions.values().any(|a| matches!(a.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+            })
+        }) {
+            return true;
+        }
         // Check modal stack for loading states
         if let Some(widget) = self.screen.modal_stack.last() {
             if let Some(biw) = widget.as_any().downcast_ref::<crate::widgets::branch_input::BranchInputWidget>() {
@@ -626,6 +646,71 @@ impl App {
             }
         }
         false
+    }
+
+    pub(crate) fn begin_project_issue_start_batch(&mut self, total: usize) -> u64 {
+        let batch_id = self.next_project_issue_start_batch_id;
+        self.next_project_issue_start_batch_id += 1;
+        self.project_issue_start_batches.insert(batch_id, ProjectIssueStartBatch { total, started: 0, rejected: Vec::new() });
+        self.set_status_message(Some(format!("Starting {total} convoys...")));
+        batch_id
+    }
+
+    pub(crate) fn set_project_issue_start_pending(&mut self, ctx: &ProjectIssueStartContext, status: PendingStatus, description: String) {
+        let Some(index) = self.views.find(&ctx.address) else { return };
+        let Some(view) = self.views.get_mut(index) else { return };
+        view.project_table_state
+            .table_mut(crate::table_view::ProjectPanelKind::Issues)
+            .pending_actions
+            .insert(ctx.row_id.clone(), ui_state::PendingAction { status, description });
+    }
+
+    pub(crate) fn clear_project_issue_start_pending(&mut self, ctx: &ProjectIssueStartContext) {
+        let Some(index) = self.views.find(&ctx.address) else { return };
+        let Some(view) = self.views.get_mut(index) else { return };
+        view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).pending_actions.remove(&ctx.row_id);
+    }
+
+    pub(crate) fn record_project_issue_start_result(&mut self, ctx: ProjectIssueStartContext, result: Result<Option<String>, String>) {
+        match result {
+            Ok(_) => {
+                self.clear_project_issue_start_pending(&ctx);
+                if let Some(batch) = self.project_issue_start_batches.get_mut(&ctx.batch_id) {
+                    batch.started += 1;
+                }
+            }
+            Err(message) => {
+                self.set_project_issue_start_pending(&ctx, PendingStatus::Failed(message.clone()), "Start convoy".into());
+                if let Some(batch) = self.project_issue_start_batches.get_mut(&ctx.batch_id) {
+                    batch.rejected.push(format!("{}: {message}", ctx.issue.id));
+                }
+            }
+        }
+        self.update_project_issue_start_status(ctx.batch_id);
+    }
+
+    fn update_project_issue_start_status(&mut self, batch_id: u64) {
+        let Some(batch) = self.project_issue_start_batches.get(&batch_id) else { return };
+        let rejected = batch.rejected.len();
+        let pending = batch.total.saturating_sub(batch.started + rejected);
+        let convoy_word = if batch.started == 1 { "convoy" } else { "convoys" };
+        let mut message = format!("{} {convoy_word} started", batch.started);
+        if pending > 0 {
+            message.push_str(&format!(", {pending} pending"));
+        }
+        if rejected > 0 {
+            message.push_str(&format!(", {rejected} rejected"));
+            if let Some(first) = batch.rejected.first() {
+                message.push_str(&format!(": {first}"));
+                if rejected > 1 {
+                    message.push_str(&format!("; +{} more", rejected - 1));
+                }
+            }
+        }
+        self.set_status_message(Some(message));
+        if pending == 0 {
+            self.project_issue_start_batches.remove(&batch_id);
+        }
     }
 
     pub fn persist_layout(&self) {
@@ -1264,7 +1349,22 @@ impl App {
                             None
                         }
                     };
-                    executor::handle_result(result, self);
+                    let project_issue_start = self.command_project_issue_starts.remove(&command_id);
+                    executor::handle_result(result.clone(), self);
+                    if let Some(ctx) = project_issue_start {
+                        match result {
+                            CommandValue::ConvoyStarted { name, .. } => {
+                                self.record_project_issue_start_result(ctx, Ok(Some(name)));
+                            }
+                            CommandValue::Error { message } => {
+                                self.record_project_issue_start_result(ctx, Err(message));
+                            }
+                            CommandValue::Cancelled => {
+                                self.record_project_issue_start_result(ctx, Err("cancelled".into()));
+                            }
+                            _ => {}
+                        }
+                    }
 
                     // Find which repo+identity has this command_id
                     let found: Option<(RepoIdentity, WorkItemIdentity)> =

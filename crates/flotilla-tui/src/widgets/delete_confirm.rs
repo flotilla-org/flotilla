@@ -51,6 +51,7 @@ impl InteractiveWidget for DeleteConfirmWidget {
                         identity: self.identity.clone(),
                         description: format!("Remove {}", info.branch),
                         repo_identity: ctx.model.active_repo_identity().clone(),
+                        project_issue_start: None,
                     };
                     let checkout = match &self.checkout_path {
                         Some(path) => CheckoutSelector::Path(path.clone()),

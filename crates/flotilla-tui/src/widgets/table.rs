@@ -1,4 +1,8 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::ViewAddress;
@@ -14,6 +18,7 @@ use super::{
     describe::DescribeWidget, table_action_menu::TableActionMenuWidget, AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext,
 };
 use crate::{
+    app::ui_state::{PendingAction, PendingStatus},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::{self, Alignment, CellTone, ProjectedColumn, RowId, TableView, WidthHint},
@@ -32,6 +37,11 @@ pub(crate) enum FetchTrigger {
 /// in any surface. `TableWidget` adds its border and breadcrumbs; the Project
 /// page composes several panels into its one scrolling document.
 pub(crate) struct TablePanel;
+
+pub(crate) struct RowDecorations<'a> {
+    pub(crate) multi_selected: &'a HashSet<RowId>,
+    pub(crate) pending_actions: &'a HashMap<RowId, PendingAction>,
+}
 
 impl TablePanel {
     pub(crate) fn row_action(row: &table_view::ProjectedRow) -> Option<AppAction> {
@@ -63,18 +73,40 @@ impl TablePanel {
         theme: &Theme,
         view: &TableView,
         state: &table_view::TableState,
-        first: usize,
-        count: usize,
+        decorations: RowDecorations<'_>,
+        visible: Range<usize>,
     ) {
+        let first = visible.start;
+        let count = visible.end.saturating_sub(visible.start);
         if count == 0 {
             return;
         }
         let rows = view.rows.iter().skip(first).take(count).map(|row| {
             let selected = state.selected() == Some(&row.id);
-            let cells = row.cells.iter().zip(&view.columns).map(|(cell, column)| {
-                Cell::from(Line::from(cell.text.clone()).alignment(ratatui_alignment(column.alignment))).style(cell_style(cell.tone, theme))
+            let multi = decorations.multi_selected.contains(&row.id);
+            let pending = decorations.pending_actions.get(&row.id);
+            let cells = row.cells.iter().zip(&view.columns).enumerate().map(|(index, (cell, column))| {
+                let mut text = cell.text.clone();
+                if index == 0 {
+                    if let Some(pending) = pending {
+                        let marker = match pending.status {
+                            PendingStatus::Submitting | PendingStatus::InFlight { .. } => "...",
+                            PendingStatus::Failed(_) => "x",
+                        };
+                        text = format!("{marker} {text}");
+                    } else if multi {
+                        text = format!("* {text}");
+                    }
+                }
+                Cell::from(Line::from(text).alignment(ratatui_alignment(column.alignment))).style(cell_style(cell.tone, theme))
             });
-            let style = if selected { Style::default().bg(theme.row_highlight).add_modifier(Modifier::BOLD) } else { Style::default() };
+            let style = if selected {
+                Style::default().bg(theme.row_highlight).add_modifier(Modifier::BOLD)
+            } else if multi {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
             Row::new(cells).style(style)
         });
         let widths = width_constraints(&view.columns, area.width);
@@ -170,7 +202,15 @@ impl TableWidget {
         state.ensure_selected_visible(view, self.rows_area.height as usize);
 
         TablePanel::render_header(frame, Rect { height: 1, ..table_area }, theme, view);
-        TablePanel::render_rows(frame, self.rows_area, theme, view, state, state.scroll_offset, self.rows_area.height as usize);
+        TablePanel::render_rows(
+            frame,
+            self.rows_area,
+            theme,
+            view,
+            state,
+            RowDecorations { multi_selected: &state.multi_selected, pending_actions: &state.pending_actions },
+            state.scroll_offset..state.scroll_offset.saturating_add(self.rows_area.height as usize),
+        );
     }
 }
 
@@ -244,6 +284,10 @@ impl InteractiveWidget for TableWidget {
             }
             Action::SelectPrev => {
                 ctx.views.active_table_state_mut().select_delta(&view, -1);
+                Outcome::Consumed
+            }
+            Action::ToggleMultiSelect => {
+                ctx.views.active_table_state_mut().toggle_selected_row();
                 Outcome::Consumed
             }
             Action::Confirm => {

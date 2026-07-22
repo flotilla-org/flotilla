@@ -36,6 +36,7 @@ impl InteractiveWidget for CloseConfirmWidget {
                     identity: self.identity.clone(),
                     description: format!("Close {}", self.id),
                     repo_identity: ctx.model.active_repo_identity().clone(),
+                    project_issue_start: None,
                 };
                 ctx.commands.push_with_context(self.command.clone(), Some(pending_ctx));
                 Outcome::Finished

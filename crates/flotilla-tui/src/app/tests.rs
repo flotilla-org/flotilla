@@ -68,6 +68,14 @@ fn insert_peer_host(model: &mut TuiModel, name: &str, status: PeerStatus) {
     insert_host(model, name, environment_id, NodeId::new(format!("node-{name}-peer")), name, false, status);
 }
 
+fn non_local_test_host() -> &'static str {
+    if HostName::local().as_str() == "feta" {
+        "kiwi"
+    } else {
+        "feta"
+    }
+}
+
 #[derive(Clone)]
 struct QueryStep {
     expected_page: u32,
@@ -1129,6 +1137,7 @@ fn command_queue_push_with_context() {
         identity: WorkItemIdentity::Session("s1".into()),
         description: "Archive session".into(),
         repo_identity: RepoIdentity { authority: "local".into(), path: "/tmp/test-repo".into() },
+        project_issue_start: None,
     };
     q.push_with_context(
         Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::Refresh { repo: None } },
@@ -2225,10 +2234,11 @@ fn independent_view_subscribes_and_generates_a_pane_attach_query() {
 fn generated_vessel_actions_route_to_the_vessels_host() {
     let mut app = stub_app();
     let repo_identity = app.model.repo_order[0].clone();
-    insert_peer_host(&mut app.model, "feta", PeerStatus::Connected);
+    let peer = non_local_test_host();
+    insert_peer_host(&mut app.model, peer, PeerStatus::Connected);
     let mut convoy = convoy_with_vessels("alpha", &["implement"]);
-    convoy.vessels[0].host = Some(HostName::new("feta"));
-    convoy.vessels[0].completion_target.as_mut().expect("completion capability").host = HostName::new("feta");
+    convoy.vessels[0].host = Some(HostName::new(peer));
+    convoy.vessels[0].completion_target.as_mut().expect("completion capability").host = HostName::new(peer);
     app.handle_daemon_event(result_set_event(Box::new(snapshot_with(vec![convoy]))));
     app.switch_tab(1);
     app.handle_key(key(KeyCode::Enter));
@@ -2237,7 +2247,7 @@ fn generated_vessel_actions_route_to_the_vessels_host() {
     app.handle_key(key(KeyCode::Enter));
 
     let command = app.proto_commands.take_next().expect("remote attach command").0;
-    assert_eq!(command.node_id, Some(NodeId::new("node-feta-peer")));
+    assert_eq!(command.node_id, Some(NodeId::new(format!("node-{peer}-peer"))));
     assert_eq!(command.context_repo, Some(RepoSelector::Identity(repo_identity)));
 }
 
@@ -2266,6 +2276,72 @@ fn table_action_repo_hint_matches_remote_repo_identity() {
         &identity,
         &flotilla_protocol::RepoKey("github-com-flotilla-org-flotilla".into())
     ));
+}
+
+#[test]
+fn project_issue_bulk_start_queues_one_convoy_start_per_issue() {
+    let mut app = stub_app();
+    let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(address.clone());
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+
+    app.execute_table_intent(crate::table_view::TableIntent::StartConvoys {
+        namespace: "flotilla".into(),
+        project: "roadmap".into(),
+        issues: ["809", "810", "811"]
+            .into_iter()
+            .map(|id| crate::table_view::TableIssueStart {
+                row_id: crate::table_view::RowId::new(format!("issue:{id}")),
+                issue: IssueRef { source: source.clone(), id: id.into() },
+            })
+            .collect(),
+    });
+
+    let mut queued = Vec::new();
+    while let Some((command, ctx)) = app.proto_commands.take_next() {
+        let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
+        let Some(project_ctx) = ctx.expect("pending context").project_issue_start else { panic!("expected project context") };
+        queued.push((intent.issue, project_ctx.issue.id, intent.auto_attach));
+    }
+
+    assert_eq!(queued.len(), 3);
+    assert_eq!(queued.iter().map(|(_, id, _)| id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
+    assert!(queued.iter().all(|(_, _, auto_attach)| !auto_attach), "bulk convoy starts should not auto-attach one selected issue");
+    assert_eq!(app.model.status_message.as_deref(), Some("Starting 3 convoys..."));
+}
+
+#[test]
+fn project_issue_start_batch_keeps_success_and_rejection_visible_individually() {
+    let mut app = stub_app();
+    let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+    app.open_view(address.clone());
+    let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+    let batch_id = app.begin_project_issue_start_batch(2);
+    let started = ProjectIssueStartContext {
+        address: address.clone(),
+        row_id: crate::table_view::RowId::new("issue:809"),
+        issue: IssueRef { source: source.clone(), id: "809".into() },
+        batch_id,
+    };
+    let rejected = ProjectIssueStartContext {
+        address,
+        row_id: crate::table_view::RowId::new("issue:810"),
+        issue: IssueRef { source, id: "810".into() },
+        batch_id,
+    };
+    app.set_project_issue_start_pending(&started, PendingStatus::InFlight { command_id: 1 }, "Start convoy".into());
+    app.set_project_issue_start_pending(&rejected, PendingStatus::InFlight { command_id: 2 }, "Start convoy".into());
+
+    app.record_project_issue_start_result(started.clone(), Ok(Some("issue-809".into())));
+    app.record_project_issue_start_result(rejected.clone(), Err("missing workflow input".into()));
+
+    let issue_state = app.views.active_project_table_state().table(crate::table_view::ProjectPanelKind::Issues);
+    assert!(!issue_state.pending_actions.contains_key(&started.row_id));
+    assert!(matches!(
+        issue_state.pending_actions[&rejected.row_id].status,
+        PendingStatus::Failed(ref message) if message == "missing workflow input"
+    ));
+    assert_eq!(app.model.status_message.as_deref(), Some("1 convoy started, 1 rejected: 810: missing workflow input"));
 }
 
 #[test]

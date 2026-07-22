@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 
-use flotilla_protocol::{HostName, ProvisioningTarget, RepoIdentity, WorkItemIdentity};
+use flotilla_protocol::{HostName, IssueRef, ProvisioningTarget, RepoIdentity, ViewAddress, WorkItemIdentity};
 use ratatui::layout::Rect;
 
-use crate::status_bar::StatusBarTarget;
+use crate::{status_bar::StatusBarTarget, table_view::RowId};
 
 #[derive(Clone)]
 pub struct DirEntry {
@@ -31,14 +31,14 @@ pub enum RepoViewLayout {
     Below,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingStatus {
     Submitting,
     InFlight { command_id: u64 },
     Failed(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingAction {
     pub status: PendingStatus,
     pub description: String,
@@ -49,6 +49,15 @@ pub struct PendingActionContext {
     pub identity: WorkItemIdentity,
     pub description: String,
     pub repo_identity: RepoIdentity,
+    pub project_issue_start: Option<ProjectIssueStartContext>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProjectIssueStartContext {
+    pub address: ViewAddress,
+    pub row_id: RowId,
+    pub issue: IssueRef,
+    pub batch_id: u64,
 }
 
 /// Identifies a clickable segment in the tab bar.

@@ -426,6 +426,12 @@ fn write_attach_hosts_config(config_base: &Path, hosts: &[(&str, &str, Option<&s
     std::fs::write(config_base.join("hosts.toml"), toml).expect("write hosts config");
 }
 
+fn non_local_attach_hosts() -> (&'static str, &'static str) {
+    let local = HostName::local();
+    let mut candidates = ["feta", "gouda", "kiwi"].into_iter().filter(|host| *host != local.as_str());
+    (candidates.next().expect("first non-local host"), candidates.next().expect("second non-local host"))
+}
+
 async fn publish_attach_host_summary(daemon: &InProcessDaemon, node_name: &str, host_name: &str) {
     daemon
         .host_registry
@@ -1546,10 +1552,12 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
 
     let daemon = new_attach_test_daemon(&config_base).await;
-    let env_ref = create_remote_attach_environment(&daemon, "feta").await;
+    let env_ref = create_remote_attach_environment(&daemon, remote_host).await;
     create_running_attach_session(
         &daemon,
         &env_ref,
@@ -1577,7 +1585,7 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
     let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the next host over SSH: {command}");
+    assert!(command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")), "command should target the next host over SSH: {command}");
     assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
     assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
@@ -1591,16 +1599,18 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
 
     let daemon = new_attach_test_daemon(&config_base).await;
-    daemon.fleet_replica_cache.write().await.insert(HostName::new("feta"), FleetReplicaCacheEntry {
+    daemon.fleet_replica_cache.write().await.insert(HostName::new(remote_host), FleetReplicaCacheEntry {
         rows: vec![FleetListRow::builder()
             .convoy("convoy-a".to_string())
             .vessel("remote-env".to_string())
             .crew("implement/coder".to_string())
             .crew_state("running".to_string())
-            .host(HostName::new("feta"))
+            .host(HostName::new(remote_host))
             .namespace("dev")
             .session("terminal-remote-coder")
             .staleness(FleetStaleness::Stale { last_sync: Utc::now() - chrono::Duration::seconds(FLEET_REPLICA_FRESH_SECS + 1) })
@@ -1628,13 +1638,16 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
         panic!("expected attach command, got {result:?}");
     };
     let binding = binding.expect("replica resolution carries the structured binding");
-    assert_eq!(binding.host.as_str(), "feta");
+    assert_eq!(binding.host.as_str(), remote_host);
     assert_eq!(binding.namespace, "dev");
     assert_eq!(binding.session.as_deref(), Some("terminal-remote-coder"), "cross-host panes stamp the full join key");
     assert_eq!(binding.convoy.as_deref(), Some("convoy-a"));
     assert_eq!(binding.vessel.as_deref(), Some("implement"));
     assert_eq!(binding.role.as_deref(), Some("coder"));
-    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the replica host over SSH: {command}");
+    assert!(
+        command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")),
+        "command should target the replica host over SSH: {command}"
+    );
     assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach: {command}");
     assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
@@ -1655,7 +1668,10 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
     let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "bare role should resolve through the replica host: {command}");
+    assert!(
+        command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")),
+        "bare role should resolve through the replica host: {command}"
+    );
     assert!(command.contains("flotilla attach"), "bare role should recursively invoke flotilla attach: {command}");
     assert!(command.contains("coder"), "command should preserve the original bare role reference: {command}");
 
@@ -1675,7 +1691,10 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
     let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "session name should resolve through the replica host: {command}");
+    assert!(
+        command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")),
+        "session name should resolve through the replica host: {command}"
+    );
     assert!(command.contains("terminal-remote-coder"), "command should preserve the independent row's attach reference: {command}");
 }
 
@@ -1685,10 +1704,13 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice")), ("gouda", "gouda.local", None)]);
+    let (selected_host, other_host) = non_local_attach_hosts();
+    let selected_hostname = format!("{selected_host}.local");
+    let other_hostname = format!("{other_host}.local");
+    write_attach_hosts_config(&config_base, &[(selected_host, &selected_hostname, Some("alice")), (other_host, &other_hostname, None)]);
 
     let daemon = new_attach_test_daemon(&config_base).await;
-    for host in ["feta", "gouda"] {
+    for host in [selected_host, other_host] {
         let host_name = HostName::new(host);
         let row = IndependentRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "dev", "terminal-scratch").on_host(host_name.clone()))
@@ -1697,7 +1719,7 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
             .attach("terminal-scratch")
             .phase(SessionPhase::Running)
             .build();
-        let fleet_rows = (host == "feta")
+        let fleet_rows = (host == selected_host)
             .then(|| {
                 FleetListRow::builder()
                     .convoy("-")
@@ -1727,7 +1749,10 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::AttachTransient { reference: "terminal-scratch".to_string(), host: Some(HostName::new("feta")) },
+                action: CommandAction::AttachTransient {
+                    reference: "terminal-scratch".to_string(),
+                    host: Some(HostName::new(selected_host)),
+                },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1738,14 +1763,17 @@ async fn transient_attach_selects_the_displayed_host_for_result_set_only_indepen
         panic!("expected attach command, got {result:?}");
     };
     let binding = binding.expect("replica resolution carries a structured binding");
-    assert_eq!(binding.host, HostName::new("feta"));
+    assert_eq!(binding.host, HostName::new(selected_host));
     assert_eq!(binding.session.as_deref(), Some("terminal-scratch"));
     assert_eq!(binding.convoy, None);
     assert_eq!(binding.role, None);
-    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "selected row should route through feta: {command}");
+    assert!(
+        command.starts_with(&format!("ssh -t 'alice@{selected_hostname}' ")),
+        "selected row should route through {selected_host}: {command}"
+    );
     assert!(command.contains("--transient"), "recursive attach must preserve the no-stamp mode: {command}");
     assert!(command.contains("--host"), "recursive attach must preserve the owning host: {command}");
-    assert!(!command.contains("gouda.local"), "same-named row on another host must not make selection ambiguous: {command}");
+    assert!(!command.contains(&other_hostname), "same-named row on another host must not make selection ambiguous: {command}");
 }
 
 #[tokio::test]
@@ -1798,22 +1826,25 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+    let (next_hop_host, target_host) = non_local_attach_hosts();
+    let next_hop_hostname = format!("{next_hop_host}.local");
+    let target_hostname = format!("{target_host}.local");
+    write_attach_hosts_config(&config_base, &[(next_hop_host, &next_hop_hostname, Some("alice"))]);
 
     let daemon = new_attach_test_daemon(&config_base).await;
-    publish_attach_host_summary(&daemon, "feta", "feta").await;
-    publish_attach_host_summary(&daemon, "gouda", "gouda").await;
+    publish_attach_host_summary(&daemon, next_hop_host, next_hop_host).await;
+    publish_attach_host_summary(&daemon, target_host, target_host).await;
     daemon
         .set_topology_routes(vec![TopologyRoute {
-            target: node("gouda"),
-            next_hop: node("feta"),
+            target: node(target_host),
+            next_hop: node(next_hop_host),
             direct: false,
             connected: true,
             fallbacks: vec![],
         }])
         .await;
 
-    let env_ref = create_remote_attach_environment(&daemon, "gouda").await;
+    let env_ref = create_remote_attach_environment(&daemon, target_host).await;
     create_running_attach_session(
         &daemon,
         &env_ref,
@@ -1841,10 +1872,10 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
     let CommandValue::AttachCommandResolved { command, .. } = result else {
         panic!("expected attach command, got {result:?}");
     };
-    assert!(command.starts_with("ssh -t 'alice@feta.local' "), "command should target the routed next hop: {command}");
+    assert!(command.starts_with(&format!("ssh -t 'alice@{next_hop_hostname}' ")), "command should target the routed next hop: {command}");
     assert!(command.contains("${SHELL:-/bin/sh} -l -c"), "command should run through a remote login shell: {command}");
     assert!(command.contains("flotilla attach"), "command should recursively invoke flotilla attach on the next hop: {command}");
-    assert!(!command.contains("gouda.local"), "command should not try to jump directly to the final host: {command}");
+    assert!(!command.contains(&target_hostname), "command should not try to jump directly to the final host: {command}");
     assert!(!command.contains("gouda-provider-session"), "command should not embed final terminal-provider attach args: {command}");
 }
 
@@ -2040,13 +2071,15 @@ async fn attach_query_reports_route_that_points_back_to_local_host() {
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
-    write_attach_hosts_config(&config_base, &[("feta", "feta.local", Some("alice"))]);
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
 
     let daemon = new_attach_test_daemon(&config_base).await;
-    publish_attach_host_summary(&daemon, "feta", "feta").await;
+    publish_attach_host_summary(&daemon, remote_host, remote_host).await;
     daemon
         .set_topology_routes(vec![TopologyRoute {
-            target: node("feta"),
+            target: node(remote_host),
             next_hop: NodeInfo::new(daemon.node_id().clone(), "local"),
             direct: false,
             connected: true,
@@ -2054,7 +2087,7 @@ async fn attach_query_reports_route_that_points_back_to_local_host() {
         }])
         .await;
 
-    let env_ref = create_remote_attach_environment(&daemon, "feta").await;
+    let env_ref = create_remote_attach_environment(&daemon, remote_host).await;
     create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
         .await;
 
@@ -2072,7 +2105,7 @@ async fn attach_query_reports_route_that_points_back_to_local_host() {
         .expect("attach query should execute");
 
     assert_eq!(result, CommandValue::Error {
-        message: "unreachable next hop for host 'feta': route points back to local host".to_string()
+        message: format!("unreachable next hop for host '{remote_host}': route points back to local host")
     });
 }
 
@@ -2084,10 +2117,11 @@ async fn attach_query_reports_ambiguous_routed_host_name() {
     std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
 
     let daemon = new_attach_test_daemon(&config_base).await;
-    publish_attach_host_summary(&daemon, "feta-a", "feta").await;
-    publish_attach_host_summary(&daemon, "feta-b", "feta").await;
+    let (remote_host, _) = non_local_attach_hosts();
+    publish_attach_host_summary(&daemon, &format!("{remote_host}-a"), remote_host).await;
+    publish_attach_host_summary(&daemon, &format!("{remote_host}-b"), remote_host).await;
 
-    let env_ref = create_remote_attach_environment(&daemon, "feta").await;
+    let env_ref = create_remote_attach_environment(&daemon, remote_host).await;
     create_running_attach_session(&daemon, &env_ref, "terminal-convoy-a-implement-coder", "session-a", "convoy-a", "implement", "coder")
         .await;
 
@@ -2104,7 +2138,7 @@ async fn attach_query_reports_ambiguous_routed_host_name() {
         .await
         .expect("attach query should execute");
 
-    assert_eq!(result, CommandValue::Error { message: "host name 'feta' matches multiple routed nodes".to_string() });
+    assert_eq!(result, CommandValue::Error { message: format!("host name '{remote_host}' matches multiple routed nodes") });
 }
 
 #[tokio::test]
