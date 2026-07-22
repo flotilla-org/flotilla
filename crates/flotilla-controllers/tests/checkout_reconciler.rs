@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{create_ready_clone, meta};
-use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
+use flotilla_controllers::reconcilers::{
+    checkout::CheckoutDeps, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
+};
 use flotilla_resources::{
     controller::Reconciler, repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus,
     CheckoutWorktreeSpec, ConditionValue, IntegrationCondition, RepositoryKey, ResourceBackend, ResourceObject,
@@ -19,6 +21,7 @@ const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";
 #[derive(Default)]
 struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
+    inspections: Mutex<usize>,
 }
 
 #[async_trait]
@@ -47,6 +50,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         &self,
         _checkout: &ResourceObject<Checkout>,
     ) -> Result<flotilla_resources::CheckoutIntegrationStatus, String> {
+        *self.inspections.lock().expect("inspections lock") += 1;
         Ok(flotilla_resources::CheckoutIntegrationStatus {
             clean: IntegrationCondition::builder().value(ConditionValue::True).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["1 unpushed commit".to_string()]).build(),
@@ -152,4 +156,52 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
         }
         patch => panic!("expected integration patch, got {patch:?}"),
     }
+}
+
+#[tokio::test]
+async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let created = checkouts
+        .create(
+            &meta("checkout-a"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/cleanup".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/convoy-a/repo.feature-cleanup".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    checkouts
+        .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
+            commit: Some("base-commit".to_string()),
+            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
+            integration: flotilla_resources::CheckoutIntegrationStatus {
+                clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
+                landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
+                landed_evidence: None,
+            },
+            message: None,
+        })
+        .await
+        .expect("checkout status update should succeed");
+    let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
+    let runtime = Arc::new(RecordingCheckoutRuntime::default());
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+
+    let deps = reconciler.fetch_dependencies(&checkout).await.expect("fetch dependencies should succeed");
+    let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
+
+    assert!(matches!(deps, CheckoutDeps::None));
+    assert!(outcome.patch.is_none(), "fresh integration status should not be patched");
+    assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0);
 }

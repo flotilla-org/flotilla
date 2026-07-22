@@ -1,12 +1,15 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, Clone, ClonePhase,
-    ResourceBackend, ResourceError, ResourceObject, TypedResolver,
+    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch, Clone,
+    ClonePhase, IntegrationCondition, ResourceBackend, ResourceError, ResourceObject, TypedResolver,
 };
 use tracing::warn;
+
+const CHECKOUT_INTEGRATION_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutRemoval {
@@ -72,6 +75,22 @@ pub enum CheckoutDeps {
     Failed(String),
 }
 
+fn integration_observed_at(condition: &IntegrationCondition) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(condition.observed_at.as_deref()?).ok().map(|observed_at| observed_at.with_timezone(&Utc))
+}
+
+fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>) -> bool {
+    let observed_at = [
+        integration_observed_at(&status.integration.clean),
+        integration_observed_at(&status.integration.pushed),
+        integration_observed_at(&status.integration.landed),
+    ];
+    let Some(oldest_observation) = observed_at.into_iter().collect::<Option<Vec<_>>>().and_then(|values| values.into_iter().min()) else {
+        return false;
+    };
+    now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < CHECKOUT_INTEGRATION_REFRESH_AFTER)
+}
+
 impl<R> Reconciler for CheckoutReconciler<R>
 where
     R: CheckoutRuntime + 'static,
@@ -81,7 +100,7 @@ where
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
+            if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready && !integration_is_fresh(status, Utc::now())) {
                 return Ok(match self.runtime.inspect_integration(obj).await {
                     Ok(status) => CheckoutDeps::Integration { status },
                     Err(err) => CheckoutDeps::Failed(err),
@@ -124,7 +143,7 @@ where
         &self,
         obj: &ResourceObject<Self::Resource>,
         deps: &Self::Dependencies,
-        _now: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         let patch = if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) == CheckoutPhase::Pending {
             match deps {
@@ -145,14 +164,17 @@ where
                         clean: flotilla_resources::IntegrationCondition::builder()
                             .value(flotilla_resources::ConditionValue::Unknown)
                             .details(vec![message.clone()])
+                            .observed_at(now.to_rfc3339())
                             .build(),
                         pushed: flotilla_resources::IntegrationCondition::builder()
                             .value(flotilla_resources::ConditionValue::Unknown)
                             .details(vec![message.clone()])
+                            .observed_at(now.to_rfc3339())
                             .build(),
                         landed: flotilla_resources::IntegrationCondition::builder()
                             .value(flotilla_resources::ConditionValue::Unknown)
                             .details(vec![message.clone()])
+                            .observed_at(now.to_rfc3339())
                             .build(),
                         landed_evidence: None,
                     },
