@@ -799,6 +799,9 @@ impl Aggregator {
             let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
         }
         if let Some(materializer) = &self.issue_materializer {
+            // The direct delta hides represented rows immediately; refiltering
+            // republishes loaded windows so rows can reappear when representation
+            // changes again.
             materializer.refilter_active_queries();
         }
     }
@@ -1007,6 +1010,9 @@ impl Aggregator {
                 let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
             }
             if let Some(materializer) = &self.issue_materializer {
+                // The direct delta hides represented rows immediately; refiltering
+                // republishes loaded windows so rows can reappear when representation
+                // changes again.
                 materializer.refilter_active_queries();
             }
         }
