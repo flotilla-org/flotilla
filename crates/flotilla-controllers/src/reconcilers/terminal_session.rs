@@ -92,20 +92,21 @@ where
             if !running {
                 return Ok(TerminalDeps::Stopped);
             }
-            if let Some(attention) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
-                return Ok(TerminalDeps::Attention(attention));
-            }
-            if obj.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| attention.is_stale_at(Utc::now())) {
-                return Ok(TerminalDeps::AttentionStale);
-            }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
                 if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
+                    // A continuous attention signal must not starve a queued handoff.
                     // Delivery is deliberately at-least-once. A crash after the pool accepts the
                     // message but before MarkMessageDelivered is persisted may redeliver it; losing
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
                     self.runtime.deliver_message(session_id, &obj.spec, &message.text).await.map_err(ResourceError::other)?;
                     return Ok(TerminalDeps::MessageDelivered(message.id.clone()));
                 }
+            }
+            if let Some(attention) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                return Ok(TerminalDeps::Attention(attention));
+            }
+            if obj.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| attention.is_stale_at(Utc::now())) {
+                return Ok(TerminalDeps::AttentionStale);
             }
             return Ok(TerminalDeps::None);
         }

@@ -218,6 +218,7 @@ impl TerminalAttention {
         }
         if self.source == TerminalAttentionSource::Hook
             && incoming.source == TerminalAttentionSource::Screen
+            && self.state != TerminalAttentionState::Unobservable
             && !self.is_stale_at(incoming.as_of)
         {
             return false;
@@ -358,6 +359,14 @@ mod tests {
     fn stale_hook_observation_yields_to_screen_fallback() {
         let hook = attention(TerminalAttentionState::Working, TerminalAttentionSource::Hook, 0);
         let screen = attention(TerminalAttentionState::Idle, TerminalAttentionSource::Screen, 31);
+
+        assert!(hook.should_replace_with(&screen));
+    }
+
+    #[test]
+    fn unobservable_hook_observation_yields_to_screen_fallback() {
+        let hook = attention(TerminalAttentionState::Unobservable, TerminalAttentionSource::Hook, 30);
+        let screen = attention(TerminalAttentionState::Working, TerminalAttentionSource::Screen, 31);
 
         assert!(hook.should_replace_with(&screen));
     }

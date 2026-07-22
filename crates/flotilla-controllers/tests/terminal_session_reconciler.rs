@@ -277,7 +277,7 @@ impl TerminalRuntime for MissingTerminalRuntime {
 }
 
 #[tokio::test]
-async fn a_message_queued_during_startup_is_delivered_after_the_session_becomes_running() {
+async fn a_message_queued_during_startup_is_delivered_before_attention_observation() {
     let backend = ResourceBackend::InMemory(Default::default());
     let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
     let created = sessions
@@ -336,7 +336,7 @@ async fn a_message_queued_during_startup_is_delivered_after_the_session_becomes_
         sessions.update_status("term-a", &session.metadata.resource_version, &acknowledged_status).await.expect("acknowledge message");
 
     let deps = reconciler.fetch_dependencies(&acknowledged).await.expect("observe acknowledged message");
-    assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalDeps::None));
+    assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalDeps::Attention(_)));
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
 }
 
@@ -436,6 +436,10 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
     async fn deliver_message(&self, session_id: &str, _spec: &TerminalSessionSpec, message: &str) -> Result<(), String> {
         self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string()));
         Ok(())
+    }
+
+    async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalAttention>, String> {
+        Ok(Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: Utc::now(), source: TerminalAttentionSource::Screen }))
     }
 
     async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
