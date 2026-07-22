@@ -33,6 +33,9 @@ pub trait TerminalRuntime: Send + Sync {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String>;
+    async fn cleanup_session_artifacts(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub struct TerminalSessionReconciler<R> {
@@ -145,10 +148,20 @@ where
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        let mut errors = Vec::new();
         if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-            self.runtime.kill_session(session_id, &obj.spec).await.map_err(ResourceError::other)?;
+            if let Err(error) = self.runtime.kill_session(session_id, &obj.spec).await {
+                errors.push(error);
+            }
         }
-        Ok(())
+        if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ResourceError::other(errors.join("; ")))
+        }
     }
 
     fn finalizer_name(&self) -> Option<&'static str> {
