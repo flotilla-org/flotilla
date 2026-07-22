@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, ConnectionRole, DaemonEvent, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoIdentity, RepoInfo, RepoSnapshot,
-    Request, Response, ResponseResult, StatusResponse, StreamKey, TopologyResponse, PROTOCOL_VERSION,
+    Request, Response, ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_VERSION,
 };
 use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -61,6 +61,14 @@ impl Drop for SpawnLockGuard {
 /// Sends a `Hello` with `ConnectionRole::Client` and a fresh `session_id`,
 /// then waits for the server's Hello reply.
 async fn do_client_hello(session: &MessageSession) -> Result<(), String> {
+    do_client_hello_with_surface(session, None).await
+}
+
+async fn do_client_hello_with_declared_surface(session: &MessageSession, surface: SurfaceDeclaration) -> Result<(), String> {
+    do_client_hello_with_surface(session, Some(surface)).await
+}
+
+async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<SurfaceDeclaration>) -> Result<(), String> {
     let session_id = uuid::Uuid::new_v4();
     session
         .write(Message::Hello {
@@ -69,6 +77,7 @@ async fn do_client_hello(session: &MessageSession) -> Result<(), String> {
             display_name: "client".into(),
             session_id,
             connection_role: Some(ConnectionRole::Client),
+            surface,
         })
         .await
         .map_err(|e| format!("failed to send Hello: {e}"))?;
@@ -105,7 +114,12 @@ impl SocketDaemon {
     /// call-site choice.
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, String> {
         let session = connect_unix_message_session(socket_path).await?;
-        from_session_stateful_bounded(socket_path, session).await
+        from_session_stateful_bounded(socket_path, session, None).await
+    }
+
+    pub async fn connect_with_surface(socket_path: &Path, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
+        let session = connect_unix_message_session(socket_path).await?;
+        from_session_stateful_bounded(socket_path, session, Some(&surface)).await
     }
 
     /// Build a client from an existing `MessageSession`, performing a Hello
@@ -113,6 +127,11 @@ impl SocketDaemon {
     /// ownership to our `session_id`.
     pub async fn from_session_stateful(session: MessageSession) -> Result<Arc<Self>, String> {
         do_client_hello(&session).await?;
+        Self::from_session(session)
+    }
+
+    pub async fn from_session_stateful_with_surface(session: MessageSession, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
+        do_client_hello_with_declared_surface(&session, surface).await?;
         Self::from_session(session)
     }
 
@@ -313,6 +332,26 @@ pub async fn connect_or_spawn(
     config_dir_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<Arc<SocketDaemon>, String> {
+    connect_or_spawn_with_optional_surface(socket_path, config_dir, config_dir_override, socket_override, None).await
+}
+
+pub async fn connect_or_spawn_with_surface(
+    socket_path: &Path,
+    config_dir: &Path,
+    config_dir_override: Option<&Path>,
+    socket_override: Option<&Path>,
+    surface: SurfaceDeclaration,
+) -> Result<Arc<SocketDaemon>, String> {
+    connect_or_spawn_with_optional_surface(socket_path, config_dir, config_dir_override, socket_override, Some(surface)).await
+}
+
+async fn connect_or_spawn_with_optional_surface(
+    socket_path: &Path,
+    config_dir: &Path,
+    config_dir_override: Option<&Path>,
+    socket_override: Option<&Path>,
+    surface: Option<SurfaceDeclaration>,
+) -> Result<Arc<SocketDaemon>, String> {
     // An existing socket must complete the stateful Hello handshake. A
     // handshake failure means a daemon is listening but is incompatible or
     // malformed; surface that error instead of treating the socket as stale
@@ -324,7 +363,7 @@ pub async fn connect_or_spawn(
     // 5s-bounded handshake is a condition the caller should hear about
     // immediately — this is the interactive path, and retries would only
     // delay an error the user has to act on anyway.
-    if let Some(daemon) = connect_existing_stateful(socket_path).await? {
+    if let Some(daemon) = connect_existing_stateful(socket_path, surface.as_ref()).await? {
         return Ok(daemon);
     }
 
@@ -351,7 +390,7 @@ pub async fn connect_or_spawn(
                 // attempt rather than aborting; but it must never fall
                 // through to the spawn path, which would delete the socket of
                 // a live (if unwell or incompatible) daemon.
-                let last_probe_error = match connect_existing_stateful(socket_path).await {
+                let last_probe_error = match connect_existing_stateful(socket_path, surface.as_ref()).await {
                     Ok(Some(daemon)) => return Ok(daemon),
                     Ok(None) => None,
                     Err(e) => {
@@ -385,7 +424,7 @@ pub async fn connect_or_spawn(
                     }
                     Ok(None) => {
                         // Someone else spawned while we waited — one last connect attempt.
-                        if let Some(daemon) = connect_existing_stateful(socket_path).await? {
+                        if let Some(daemon) = connect_existing_stateful(socket_path, surface.as_ref()).await? {
                             return Ok(daemon);
                         }
                         return Err("daemon spawn failed: all lock attempts exhausted and connect still failing".into());
@@ -407,7 +446,7 @@ pub async fn connect_or_spawn(
     // lock acquisition, which the releasing winner has left uncontended, so
     // winning the lock says nothing about the socket being free. The lock
     // makes this check race-free: nothing else may spawn while we hold it.
-    match connect_existing_stateful(socket_path).await {
+    match connect_existing_stateful(socket_path, surface.as_ref()).await {
         Ok(Some(daemon)) => return Ok(daemon),
         Ok(None) => {}
         Err(e) => {
@@ -436,7 +475,7 @@ pub async fn connect_or_spawn(
     let mut last_handshake_error: Option<String> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        match connect_existing_stateful(socket_path).await {
+        match connect_existing_stateful(socket_path, surface.as_ref()).await {
             Ok(Some(daemon)) => return Ok(daemon),
             Ok(None) => {}
             Err(e) => last_handshake_error = Some(e),
@@ -462,16 +501,26 @@ const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// a stale socket. The handshake is bounded — a daemon that accepts the
 /// connection but never replies is reported as an error rather than hanging
 /// the caller (or, worse, being treated as absent and spawned over).
-async fn connect_existing_stateful(socket_path: &Path) -> Result<Option<Arc<SocketDaemon>>, String> {
+async fn connect_existing_stateful(socket_path: &Path, surface: Option<&SurfaceDeclaration>) -> Result<Option<Arc<SocketDaemon>>, String> {
     let session = match connect_unix_message_session(socket_path).await {
         Ok(session) => session,
         Err(_) => return Ok(None),
     };
-    from_session_stateful_bounded(socket_path, session).await.map(Some)
+    from_session_stateful_bounded(socket_path, session, surface).await.map(Some)
 }
 
-async fn from_session_stateful_bounded(socket_path: &Path, session: MessageSession) -> Result<Arc<SocketDaemon>, String> {
-    match tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful(session)).await {
+async fn from_session_stateful_bounded(
+    socket_path: &Path,
+    session: MessageSession,
+    surface: Option<&SurfaceDeclaration>,
+) -> Result<Arc<SocketDaemon>, String> {
+    let result = match surface {
+        Some(surface) => {
+            tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful_with_surface(session, surface.clone())).await
+        }
+        None => tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful(session)).await,
+    };
+    match result {
         Ok(result) => result,
         Err(_) => Err(format!(
             "daemon at {} accepted the connection but did not complete the Hello handshake within {}s — it may be wedged; check or restart it",
@@ -896,6 +945,13 @@ impl DaemonHandle for SocketDaemon {
         match into_success_response(self.request(Request::Execute { command }).await?)? {
             Response::Execute { command_id } => Ok(command_id),
             other => Err(format!("unexpected response for execute: {other:?}")),
+        }
+    }
+
+    async fn observe_focus(&self, _surface_id: uuid::Uuid, targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
+        match into_success_response(self.request(Request::ObserveFocus { targets }).await?)? {
+            Response::ObserveFocus => Ok(()),
+            other => Err(format!("unexpected response for focus observation: {other:?}")),
         }
     }
 

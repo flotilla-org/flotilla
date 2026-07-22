@@ -7,7 +7,7 @@ use std::{
 };
 
 use flotilla_core::{agents::SharedAgentStateStore, daemon::DaemonHandle, in_process::InProcessDaemon};
-use flotilla_protocol::{DaemonEvent, Message, QueryId, Request};
+use flotilla_protocol::{DaemonEvent, Message, QueryId, Request, SurfaceDeclaration};
 use flotilla_transport::message::MessageSession;
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
@@ -37,6 +37,10 @@ pub(super) struct ClientConnection {
 }
 
 impl ClientConnection {
+    async fn default_surface(&self) -> SurfaceDeclaration {
+        SurfaceDeclaration::focal_for_namespace(self.daemon.provisioning_namespace().await)
+    }
+
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
         shutdown_rx: watch::Receiver<bool>,
@@ -51,7 +55,8 @@ impl ClientConnection {
     pub(super) async fn run(self, session: Arc<MessageSession>, first_id: u64, first_request: Request) {
         // Legacy clients without Hello handshake get a random session ID.
         let session_id = uuid::Uuid::new_v4();
-        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, session_id);
+        let surface = self.default_surface().await;
+        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, session_id, surface);
 
         let first_response = request_dispatcher.dispatch(first_id, first_request).await;
         if session.write(first_response).await.is_ok() {
@@ -65,8 +70,8 @@ impl ClientConnection {
     ///
     /// Unlike `run`, the first message (Hello) has already been consumed and
     /// replied to, so the loop starts by awaiting the next message.
-    pub(super) async fn run_stateful(self, session: Arc<MessageSession>, client_session_id: uuid::Uuid) {
-        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, client_session_id);
+    pub(super) async fn run_stateful(self, session: Arc<MessageSession>, client_session_id: uuid::Uuid, surface: SurfaceDeclaration) {
+        let (event_task, request_dispatcher, mut shutdown_rx) = self.start_session(&session, client_session_id, surface);
         request_loop(&session, &request_dispatcher, &mut shutdown_rx).await;
         self.finish_session(event_task, client_session_id).await;
     }
@@ -80,10 +85,12 @@ impl ClientConnection {
         &self,
         session: &Arc<MessageSession>,
         session_id: uuid::Uuid,
+        surface: SurfaceDeclaration,
     ) -> (tokio::task::JoinHandle<()>, RequestDispatcher<'_>, watch::Receiver<bool>) {
         let count = self.client_count.fetch_add(1, Ordering::SeqCst) + 1;
         info!(%count, "client connected");
         self.client_notify.notify_one();
+        self.daemon.connect_surface(session_id, surface);
 
         let event_session = Arc::clone(session);
         let mut event_rx = self.daemon.subscribe();
@@ -118,6 +125,9 @@ impl ClientConnection {
     async fn finish_session(&self, event_task: tokio::task::JoinHandle<()>, session_id: uuid::Uuid) {
         event_task.abort();
         self.daemon.unsubscribe_queries(session_id).await;
+        if let Err(error) = self.daemon.disconnect_surface(session_id).await {
+            warn!(%error, "failed to disconnect client surface");
+        }
 
         let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
         info!(%count, "client disconnected");

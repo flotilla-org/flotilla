@@ -441,9 +441,22 @@ fn message_hello_roundtrip() {
         display_name: "Desktop Workstation".into(),
         session_id: uuid::Uuid::nil(),
         connection_role: None,
+        surface: Some(SurfaceDeclaration {
+            principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
+            character: SurfaceCharacter::Ambient,
+        }),
     };
 
     test_helpers::assert_json_roundtrip(&msg);
+}
+
+#[test]
+fn observe_focus_request_round_trips_typed_resource_targets() {
+    let request = Request::ObserveFocus {
+        targets: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo").subresource("vessels/implement")],
+    };
+
+    test_helpers::assert_roundtrip(&request);
 }
 
 #[test]
@@ -577,6 +590,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         }])
         .host(HostName::new("local"))
         .attach("ws-1".to_string())
+        .materialize("terminal-implement".to_string())
         .complete_work(true)
         .build();
     let review = VesselRow::builder()
@@ -608,6 +622,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
     let rows = result_set.rows.as_convoys().expect("convoy rows");
     assert_eq!(rows[0].vessels[1].depends_on, vec![rows[0].vessels[0].name.clone()]);
     assert!(rows[0].vessels[0].attach.is_some(), "presentation join surfaces as attach capability");
+    assert_eq!(rows[0].vessels[0].materialize.as_deref(), Some("terminal-implement"));
     assert!(rows[0].vessels[1].attach.is_none());
     assert!(rows[0].vessels[0].complete_work);
     assert!(!rows[0].vessels[1].complete_work, "capabilities default closed");

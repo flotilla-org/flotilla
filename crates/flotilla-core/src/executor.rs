@@ -167,7 +167,10 @@ pub async fn build_plan(
     let issue_source = forge_issue_source(&repo.identity);
 
     match action {
-        CommandAction::QueryResourceList { .. } | CommandAction::QueryResourceGet { .. } | CommandAction::ResourceWatch { .. } => {
+        CommandAction::QueryResourceList { .. }
+        | CommandAction::QueryResourceGet { .. }
+        | CommandAction::ResourceApply { .. }
+        | CommandAction::ResourceWatch { .. } => {
             Err(CommandValue::Error { message: "resource commands should be handled by the daemon resource dispatcher".to_string() })
         }
         CommandAction::Checkout { target, issue_ids, .. } => {

@@ -8,6 +8,7 @@ pub mod interaction;
 pub mod keymap;
 pub mod palette;
 pub mod pm_connect;
+pub mod pm_open;
 pub mod run;
 pub use flotilla_client as socket;
 pub mod segment_bar;

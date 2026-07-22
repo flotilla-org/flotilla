@@ -169,6 +169,7 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::Convoys, "y", Action::Describe, "Describe"),
     h(BindingModeId::Convoys, "l", Action::Confirm, "Drill"),
     b(BindingModeId::Convoys, "right", Action::Confirm),
+    h(BindingModeId::Convoys, "o", Action::OpenInPm, "Open in PM"),
     // [, ], q come from TabPage (composed). Keep r here: refresh semantics are tab-specific.
     h(BindingModeId::Convoys, "r", Action::Refresh, "Refresh"),
     h(BindingModeId::DemandTable, "f", Action::FetchMore, "Fetch more"),

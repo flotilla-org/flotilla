@@ -232,12 +232,12 @@ async fn load_window(
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
             let conditions = vec![unavailable(None, "query scope has no issue source")];
-            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx);
+            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions };
         }
         Err(message) => {
             let conditions = vec![unavailable(None, message)];
-            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx);
+            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions };
         }
     };
@@ -342,6 +342,7 @@ async fn fetch_more(
     // clear `has_more` for clients.
     if let Some(delta) = state.apply_issue_changes(query, generation, changed, Vec::new(), result_state) {
         let _ = event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        publish_awareness_sets(state, event_tx).await;
     }
 }
 
@@ -447,10 +448,11 @@ async fn refresh_window(
     let result_state = demand_state(window.sources.iter().any(|source| source.has_more), conditions);
     if let Some(delta) = state.apply_issue_changes(query, generation, changed, removed, result_state) {
         let _ = event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        publish_awareness_sets(state, event_tx).await;
     }
 }
 
-fn publish_window(
+async fn publish_window(
     query: &QueryId,
     generation: u64,
     rows: Vec<IssueRow>,
@@ -461,6 +463,7 @@ fn publish_window(
 ) {
     if let Some(result_set) = state.replace_issues(query, generation, rows, demand_state(has_more, conditions)) {
         let _ = event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+        publish_awareness_sets(state, event_tx).await;
     }
 }
 
@@ -475,7 +478,18 @@ async fn publish_loaded_window(
 ) {
     suppress_represented_rows(&mut rows, state).await;
     sort_rows(&mut rows);
-    publish_window(query, generation, rows, has_more, conditions, state, event_tx);
+    publish_window(query, generation, rows, has_more, conditions, state, event_tx).await;
+}
+
+async fn publish_awareness_sets(state: &AggregatorProjectionState, event_tx: &broadcast::Sender<DaemonEvent>) {
+    for query in state.subscribed_queries() {
+        if !matches!(query, QueryId::Awareness { .. }) {
+            continue;
+        }
+        if let Some(result_set) = state.result_set_for(&query).await {
+            let _ = event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+        }
+    }
 }
 
 fn demand_state(has_more: bool, conditions: Vec<ResultSetCondition>) -> ResultSetState {

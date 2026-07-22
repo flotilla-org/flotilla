@@ -22,6 +22,8 @@ pub(crate) use super::test_builders::*;
 use super::{App, CommandQueue, DirEntry, InFlightCommand, OpenViews, TuiHostState, TuiModel};
 use crate::{keymap::Keymap, widgets::WidgetContext};
 
+type FocusObservations = Arc<Mutex<Vec<(uuid::Uuid, Vec<flotilla_protocol::ResourceRef>)>>>;
+
 #[derive(bon::Builder)]
 pub(crate) struct StubDaemon {
     #[builder(default = broadcast::channel(1).0)]
@@ -31,6 +33,8 @@ pub(crate) struct StubDaemon {
     execute_gate: Option<Arc<Semaphore>>,
     #[builder(default = Ok(1))]
     execute_result: Result<u64, String>,
+    #[builder(default = Arc::new(Mutex::new(Vec::new())))]
+    observations: FocusObservations,
 }
 
 static STUB_APP_CONFIG_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -62,6 +66,10 @@ fn insert_stub_local_host(model: &mut TuiModel) {
 impl StubDaemon {
     pub(crate) fn new() -> Self {
         Self::builder().build()
+    }
+
+    pub(crate) fn observations(&self) -> Vec<(uuid::Uuid, Vec<flotilla_protocol::ResourceRef>)> {
+        self.observations.lock().expect("observations lock").clone()
     }
 }
 
@@ -112,6 +120,11 @@ impl DaemonHandle for StubDaemon {
 
     async fn get_topology(&self) -> Result<TopologyResponse, String> {
         Err("stub".into())
+    }
+
+    async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
+        self.observations.lock().expect("observations lock").push((surface_id, targets));
+        Ok(())
     }
 }
 

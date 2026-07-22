@@ -1,10 +1,13 @@
+use std::collections::BTreeMap;
+
 use futures::{stream::BoxStream, StreamExt};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    api_version, Checkout, Clone as CloneResource, Convoy, Environment, Host, K8sListMeta, K8sResourceList, PlacementPolicy, Presentation,
-    Project, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, TerminalSession, Vessel, WatchEvent,
-    WatchStart, WorkflowTemplate,
+    api_version, Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList, ObjectMeta,
+    OwnerReference, PlacementPolicy, Presentation, Project, Regard, Repository, Resource, ResourceBackend, ResourceError, ResourceList,
+    ResourceObject, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,11 +23,13 @@ enum RegisteredResource {
     Checkout,
     Clone,
     Convoy,
+    Demand,
     Environment,
     Host,
     PlacementPolicy,
     Presentation,
     Project,
+    Regard,
     Repository,
     TerminalSession,
     Vessel,
@@ -59,6 +64,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Checkout>(RegisteredResource::Checkout, &[]),
     kind::<CloneResource>(RegisteredResource::Clone, &[]),
     kind::<Convoy>(RegisteredResource::Convoy, &[]),
+    kind::<Demand>(RegisteredResource::Demand, &[]),
     kind::<Environment>(RegisteredResource::Environment, &[]),
     kind::<Host>(RegisteredResource::Host, &[]),
     kind::<PlacementPolicy>(RegisteredResource::PlacementPolicy, &[
@@ -70,6 +76,7 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     ]),
     kind::<Presentation>(RegisteredResource::Presentation, &[]),
     kind::<Project>(RegisteredResource::Project, &[]),
+    kind::<Regard>(RegisteredResource::Regard, &[]),
     kind::<Repository>(RegisteredResource::Repository, &[]),
     kind::<TerminalSession>(RegisteredResource::TerminalSession, &[
         "terminalsession",
@@ -98,11 +105,13 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Checkout => $body::<Checkout>($($arg),*).await,
             RegisteredResource::Clone => $body::<CloneResource>($($arg),*).await,
             RegisteredResource::Convoy => $body::<Convoy>($($arg),*).await,
+            RegisteredResource::Demand => $body::<Demand>($($arg),*).await,
             RegisteredResource::Environment => $body::<Environment>($($arg),*).await,
             RegisteredResource::Host => $body::<Host>($($arg),*).await,
             RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>($($arg),*).await,
             RegisteredResource::Presentation => $body::<Presentation>($($arg),*).await,
             RegisteredResource::Project => $body::<Project>($($arg),*).await,
+            RegisteredResource::Regard => $body::<Regard>($($arg),*).await,
             RegisteredResource::Repository => $body::<Repository>($($arg),*).await,
             RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*).await,
             RegisteredResource::Vessel => $body::<Vessel>($($arg),*).await,
@@ -114,11 +123,13 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::Checkout => $body::<Checkout>(),
             RegisteredResource::Clone => $body::<CloneResource>(),
             RegisteredResource::Convoy => $body::<Convoy>(),
+            RegisteredResource::Demand => $body::<Demand>(),
             RegisteredResource::Environment => $body::<Environment>(),
             RegisteredResource::Host => $body::<Host>(),
             RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>(),
             RegisteredResource::Presentation => $body::<Presentation>(),
             RegisteredResource::Project => $body::<Project>(),
+            RegisteredResource::Regard => $body::<Regard>(),
             RegisteredResource::Repository => $body::<Repository>(),
             RegisteredResource::TerminalSession => $body::<TerminalSession>(),
             RegisteredResource::Vessel => $body::<Vessel>(),
@@ -152,6 +163,20 @@ pub async fn watch_resource_kind(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace).await)
 }
 
+pub async fn apply_resource_document(
+    backend: &ResourceBackend,
+    default_namespace: &str,
+    document: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let document: DynamicApplyDocument =
+        serde_json::from_value(document).map_err(|error| ResourceError::decode(format!("decode resource document: {error}")))?;
+    let namespace = document.metadata.namespace.clone().unwrap_or_else(|| default_namespace.to_string());
+    dispatch_resource_kind!(
+        lookup_resource_kind(&document.kind)?.resource,
+        apply_typed(backend, &namespace, document.metadata, document.spec).await
+    )
+}
+
 fn lookup_resource_kind(kind: &str) -> Result<&'static RegisteredResourceKind, ResourceError> {
     let normalized = kind.trim();
     REGISTERED_RESOURCE_KINDS
@@ -162,6 +187,52 @@ fn lookup_resource_kind(kind: &str) -> Result<&'static RegisteredResourceKind, R
                 || entry.aliases.iter().any(|alias| normalized.eq_ignore_ascii_case(alias))
         })
         .ok_or_else(|| unknown_kind(kind))
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicApplyDocument {
+    kind: String,
+    metadata: DynamicApplyMetadata,
+    spec: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicApplyMetadata {
+    name: String,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+    #[serde(default, rename = "ownerReferences")]
+    owner_references: Option<Vec<OwnerReference>>,
+    #[serde(default)]
+    finalizers: Option<Vec<String>>,
+}
+
+impl DynamicApplyMetadata {
+    fn input_meta_for_create(&self) -> InputMeta {
+        InputMeta {
+            name: self.name.clone(),
+            labels: self.labels.clone().unwrap_or_default(),
+            annotations: self.annotations.clone().unwrap_or_default(),
+            owner_references: self.owner_references.clone().unwrap_or_default(),
+            finalizers: self.finalizers.clone().unwrap_or_default(),
+            deletion_timestamp: None,
+        }
+    }
+
+    fn input_meta_for_update(&self, existing: &ObjectMeta) -> InputMeta {
+        InputMeta {
+            name: self.name.clone(),
+            labels: self.labels.clone().unwrap_or_else(|| existing.labels.clone()),
+            annotations: self.annotations.clone().unwrap_or_else(|| existing.annotations.clone()),
+            owner_references: self.owner_references.clone().unwrap_or_else(|| existing.owner_references.clone()),
+            finalizers: self.finalizers.clone().unwrap_or_else(|| existing.finalizers.clone()),
+            deletion_timestamp: existing.deletion_timestamp,
+        }
+    }
 }
 
 fn unknown_kind(kind: &str) -> ResourceError {
@@ -204,6 +275,31 @@ async fn watch_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) ->
     })
 }
 
+async fn apply_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    metadata: DynamicApplyMetadata,
+    spec: Value,
+) -> Result<DynamicResourceObject, ResourceError> {
+    let spec = serde_json::from_value::<T::Spec>(spec)
+        .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
+    let resolver = backend.using::<T>(namespace);
+    let object = match resolver.get(&metadata.name).await {
+        Ok(existing) => {
+            let meta = metadata.input_meta_for_update(&existing.metadata);
+            resolver.update(&meta, &existing.metadata.resource_version, &spec).await?
+        }
+        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
+        Err(error) => return Err(error),
+    };
+    Ok(DynamicResourceObject {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: object_value(&object)?,
+    })
+}
+
 fn list_value<T: Resource>(listed: &ResourceList<T>) -> Result<Value, ResourceError> {
     let list = K8sResourceList {
         metadata: K8sListMeta { resource_version: listed.resource_version.clone() },
@@ -241,8 +337,15 @@ fn api_version_typed<T: Resource>() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use flotilla_protocol::ResourceRef;
+
     use super::*;
-    use crate::{Convoy, ConvoySpec, InMemoryBackend, InputMeta};
+    use crate::{
+        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, InMemoryBackend, InputMeta, PrincipalRef, Regard,
+        RegardExpiryPolicy, RegardSource, RegardSpec,
+    };
 
     #[tokio::test]
     async fn list_resource_kind_returns_k8s_wire_list() {
@@ -268,5 +371,146 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("unknown resource kind 'nope'"));
         assert!(message.contains("convoys"));
+    }
+
+    #[tokio::test]
+    async fn attention_resource_kinds_are_registered_for_dynamic_listing() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .using::<Regard>("flotilla")
+            .create(
+                &InputMeta::builder().name("principal-default-convoy-demo".to_string()).build(),
+                &RegardSpec::builder()
+                    .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
+                    .target(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"))
+                    .source(RegardSource::Expressed)
+                    .expiry(RegardExpiryPolicy::Pin)
+                    .build(),
+            )
+            .await
+            .expect("create regard");
+        backend
+            .using::<Demand>("flotilla")
+            .create(
+                &InputMeta::builder().name("demo-permission".to_string()).build(),
+                &DemandSpec::builder()
+                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
+                    .kind(DemandKind::Permission)
+                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
+                    .build(),
+            )
+            .await
+            .expect("create demand");
+
+        let regards = list_resource_kind(&backend, "flotilla", "regards").await.expect("list regards dynamically");
+        let demands = list_resource_kind(&backend, "flotilla", "demands").await.expect("list demands dynamically");
+
+        assert_eq!(regards.kind, "Regard");
+        assert_eq!(regards.value["items"][0]["kind"], "Regard");
+        assert_eq!(demands.kind, "Demand");
+        assert_eq!(demands.value["items"][0]["kind"], "Demand");
+    }
+
+    #[tokio::test]
+    async fn apply_resource_document_creates_registered_resources() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let applied = apply_resource_document(
+            &backend,
+            "flotilla",
+            json!({
+                "apiVersion": "flotilla.work/v1",
+                "kind": "Demand",
+                "metadata": {
+                    "name": "demo-review"
+                },
+                "spec": {
+                    "originating_work_ref": {
+                        "api_version": "flotilla.work/v1",
+                        "kind": "Vessel",
+                        "namespace": "flotilla",
+                        "name": "demo-review"
+                    },
+                    "kind": "review",
+                    "addressee": {
+                        "kind": "principal",
+                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("apply demand document");
+
+        assert_eq!(applied.kind, "Demand");
+        assert_eq!(applied.value["metadata"]["name"], "demo-review");
+        assert_eq!(backend.using::<Demand>("flotilla").get("demo-review").await.expect("stored demand").spec.kind, DemandKind::Review);
+    }
+
+    #[tokio::test]
+    async fn apply_resource_document_reapply_preserves_existing_metadata_when_omitted() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<Demand>("flotilla");
+        let owner_reference = OwnerReference {
+            api_version: "flotilla.work/v1".to_string(),
+            kind: "Vessel".to_string(),
+            name: "demo-implement".to_string(),
+            controller: true,
+        };
+        resolver
+            .create(
+                &InputMeta::builder()
+                    .name("demo-review".to_string())
+                    .labels(BTreeMap::from([("controller".to_string(), "attention".to_string())]))
+                    .owner_references(vec![owner_reference.clone()])
+                    .finalizers(vec!["attention.flotilla.work/finalizer".to_string()])
+                    .build(),
+                &DemandSpec::builder()
+                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
+                    .kind(DemandKind::Permission)
+                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
+                    .build(),
+            )
+            .await
+            .expect("create demand with metadata");
+
+        let reapply_review_document = || {
+            json!({
+                "apiVersion": "flotilla.work/v1",
+                "kind": "Demand",
+                "metadata": {
+                    "name": "demo-review"
+                },
+                "spec": {
+                    "originating_work_ref": {
+                        "api_version": "flotilla.work/v1",
+                        "kind": "Vessel",
+                        "namespace": "flotilla",
+                        "name": "demo-implement"
+                    },
+                    "kind": "review",
+                    "addressee": {
+                        "kind": "principal",
+                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
+                    }
+                }
+            })
+        };
+
+        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply demand document");
+
+        let updated = resolver.get("demo-review").await.expect("updated demand");
+        assert_eq!(updated.spec.kind, DemandKind::Review);
+        assert_eq!(updated.metadata.owner_references, vec![owner_reference]);
+        assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("attention"));
+        assert_eq!(updated.metadata.finalizers, vec!["attention.flotilla.work/finalizer"]);
+
+        resolver.delete("demo-review").await.expect("mark demand for deletion");
+        let deleting = resolver.get("demo-review").await.expect("deleting demand");
+        let deletion_timestamp = deleting.metadata.deletion_timestamp.expect("deletion timestamp should be set");
+
+        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply pending-delete demand document");
+
+        let reapplied = resolver.get("demo-review").await.expect("reapplied pending-delete demand");
+        assert_eq!(reapplied.metadata.deletion_timestamp, Some(deletion_timestamp));
     }
 }

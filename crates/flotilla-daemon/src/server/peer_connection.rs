@@ -63,6 +63,7 @@ impl PeerConnection {
                 display_name: self.daemon.host_name().to_string(),
                 session_id: self.daemon.session_id(),
                 connection_role: None,
+                surface: None,
             })
             .await
             .is_err()

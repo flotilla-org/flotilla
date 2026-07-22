@@ -168,6 +168,7 @@ async fn connect_or_spawn_never_spawns_over_daemon_that_appeared_during_lock_con
                     display_name: "stale daemon".into(),
                     session_id: uuid::Uuid::new_v4(),
                     connection_role: Some(ConnectionRole::Client),
+                    surface: None,
                 })
                 .await;
         }
@@ -231,6 +232,7 @@ async fn client_hello_rejects_daemon_protocol_version_mismatch() {
                 display_name: "stale daemon".into(),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
+                surface: None,
             })
             .await
             .expect("write stale daemon hello");
@@ -267,6 +269,7 @@ async fn connect_rejects_daemon_protocol_version_mismatch() {
                 display_name: "stale daemon".into(),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
+                surface: None,
             })
             .await
             .expect("write stale daemon hello");
@@ -306,6 +309,7 @@ async fn connect_or_spawn_rejects_existing_daemon_protocol_version_mismatch() {
                 display_name: "stale daemon".into(),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
+                surface: None,
             })
             .await
             .expect("write stale daemon hello");
@@ -335,6 +339,7 @@ async fn stateful_handshake_rejects_daemon_with_version_mismatch() {
                 display_name: "daemon".into(),
                 session_id: uuid::Uuid::nil(),
                 connection_role: Some(ConnectionRole::Client),
+                surface: None,
             })
             .await
             .expect("write mismatched hello");
@@ -464,6 +469,7 @@ async fn dropping_socket_daemon_closes_connection_promptly() {
                 display_name: "daemon".into(),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
+                surface: None,
             })
             .await
             .expect("write daemon hello");

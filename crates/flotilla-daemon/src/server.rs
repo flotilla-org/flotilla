@@ -468,7 +468,7 @@ async fn handle_client_session(
                 .run(Arc::clone(&session), id, request)
                 .await;
         }
-        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role } => {
+        Message::Hello { protocol_version, node_id, display_name, session_id, connection_role, surface } => {
             if environment_context.is_some() {
                 warn!("peer/client hello on per-environment socket is unsupported");
                 return;
@@ -486,6 +486,7 @@ async fn handle_client_session(
                         display_name: daemon.host_name().to_string(),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
+                        surface: None,
                     })
                     .await
                     .is_err()
@@ -496,8 +497,12 @@ async fn handle_client_session(
                     warn!(expected = PROTOCOL_VERSION, got = protocol_version, %node_id, "rejecting client with protocol version mismatch");
                     return;
                 }
+                let surface = match surface {
+                    Some(surface) => surface,
+                    None => flotilla_protocol::SurfaceDeclaration::focal_for_namespace(daemon.provisioning_namespace().await),
+                };
                 ClientConnection::new(daemon, shutdown_rx, remote_command_router, client_count, client_notify, agent_state_store)
-                    .run_stateful(Arc::clone(&session), session_id)
+                    .run_stateful(Arc::clone(&session), session_id, surface)
                     .await;
             } else {
                 // Peer path (ConnectionRole::Peer or None) — existing behavior.

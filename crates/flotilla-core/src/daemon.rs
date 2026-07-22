@@ -92,6 +92,11 @@ pub trait DaemonHandle: Send + Sync {
         Err("fetch-more is unsupported by this daemon".to_string())
     }
 
+    /// Replace the calling surface's current focal resource set.
+    async fn observe_focus(&self, _surface_id: Uuid, _targets: Vec<flotilla_protocol::ResourceRef>) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Execute a query command synchronously. Returns the result directly
     /// without broadcasting. Only valid for commands where `action.is_query()`.
     /// The `session_id` ties cursor ownership to the calling client session.

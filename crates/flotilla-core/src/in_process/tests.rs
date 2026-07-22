@@ -16,16 +16,16 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, CrewWorkPhase,
-    CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
+    CheckoutStatus as ResourceCheckoutStatus, Convoy, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
     LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, RepositoryStatus, Selector, Stance, TerminalBrief, TerminalCrewContext,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
-    VESSEL_REF_LABEL,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
+    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -587,6 +587,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
     let convoy = convoys
         .create(&empty_input_meta("demo"), &ConvoySpec {
             workflow_ref: "coding-review".into(),
+            dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
             placement_policy: None,
             repositories: Vec::new(),
@@ -722,6 +723,70 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
         })
         .await
         .expect("run coder session");
+}
+
+async fn handoff_brief_for_demo_repository_scope(repository_refs: Option<Vec<RepositoryKey>>) -> String {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, _) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+
+    let flotilla_repo = RepositoryKey("repo-flotilla".into());
+    let cleat_repo = RepositoryKey("repo-cleat".into());
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy = convoys.get("demo").await.expect("convoy");
+    let mut spec = convoy.spec.clone();
+    spec.repositories = vec![
+        ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/flotilla".to_string())
+            .repo_ref(flotilla_repo.clone())
+            .base_ref("main".to_string())
+            .workspace_slug("flotilla".to_string())
+            .subpaths(Vec::new())
+            .build(),
+        ConvoyRepositorySpec::builder()
+            .url("https://github.com/flotilla-org/cleat".to_string())
+            .repo_ref(cleat_repo)
+            .base_ref("main".to_string())
+            .workspace_slug("cleat".to_string())
+            .subpaths(Vec::new())
+            .build(),
+    ];
+    let convoy = convoys
+        .update(&input_meta_from_resource(&convoy), &convoy.metadata.resource_version, &spec)
+        .await
+        .expect("convoy spec should update");
+    let mut status = convoy.status.expect("convoy status");
+    status
+        .workflow_snapshot
+        .as_mut()
+        .expect("workflow snapshot")
+        .vessels
+        .iter_mut()
+        .find(|vessel| vessel.name == "implement")
+        .expect("implement vessel")
+        .repository_refs = repository_refs;
+    convoys.update_status("demo", &convoy.metadata.resource_version, &status).await.expect("convoy status should update");
+
+    daemon
+        .crew_handoff_internal(
+            &CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+            "reviewer",
+            "Review the repo scope",
+        )
+        .await
+        .expect("handoff should create reviewer session");
+    let reviewer = daemon
+        .resource_backend()
+        .using::<ResourceTerminalSession>("flotilla")
+        .get("terminal-demo-implement-reviewer")
+        .await
+        .expect("reviewer session should be defined");
+    let TerminalSessionSource::Agent { brief, .. } = reviewer.spec.source else {
+        panic!("reviewer should be agent-backed");
+    };
+    brief.content
 }
 
 #[tokio::test]
@@ -865,6 +930,22 @@ async fn handoff_rejects_self_and_unknown_targets_without_delivery() {
     let coder = terminals.get("terminal-demo-implement-coder").await.expect("coder session");
     assert!(matches!(coder.spec.source, TerminalSessionSource::Agent { message: None, .. }));
     assert!(terminals.get("terminal-demo-implement-architect").await.is_err(), "misaddressed handoff must not create a target session");
+}
+
+#[tokio::test]
+async fn handoff_brief_uses_vessel_repository_scope() {
+    let brief = handoff_brief_for_demo_repository_scope(Some(vec![RepositoryKey("repo-flotilla".into())])).await;
+
+    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla\n"));
+    assert!(!brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat\n"));
+}
+
+#[tokio::test]
+async fn handoff_brief_for_unscoped_vessel_lists_all_repositories() {
+    let brief = handoff_brief_for_demo_repository_scope(None).await;
+
+    assert!(brief.contains("  - `repo-flotilla` — https://github.com/flotilla-org/flotilla\n"));
+    assert!(brief.contains("  - `repo-cleat` — https://github.com/flotilla-org/cleat\n"));
 }
 
 #[tokio::test]
@@ -1508,6 +1589,13 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
     assert_eq!(binding.convoy.as_deref(), Some("convoy-a"));
     assert_eq!(binding.vessel.as_deref(), Some("implement"));
     assert_eq!(binding.role.as_deref(), Some("coder"));
+    let regards = daemon.resource_backend().using::<Regard>("flotilla").list().await.expect("list attach regards");
+    assert_eq!(regards.items.len(), 1);
+    assert_eq!(regards.items[0].spec.source, RegardSource::Expressed);
+    assert_eq!(
+        regards.items[0].spec.target,
+        ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a").subresource("vessels/implement")
+    );
 }
 
 #[tokio::test]
@@ -2800,6 +2888,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
     let created = convoys
         .create(&empty_input_meta("convoy-a"), &ConvoySpec {
             workflow_ref: "review-and-fix".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
             placement_policy: Some("laptop-docker".to_string()),
             repositories: Vec::new(),
@@ -3257,6 +3346,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
     let created = convoys
         .create(&empty_input_meta("convoy-a"), &ConvoySpec {
             workflow_ref: "review-and-fix".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
             placement_policy: Some("laptop-docker".to_string()),
             repositories: Vec::new(),
