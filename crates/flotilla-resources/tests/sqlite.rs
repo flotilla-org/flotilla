@@ -11,7 +11,7 @@ use common::{
         assert_repeated_delete_with_pending_finalizers_is_noop_with_backend, assert_stale_resource_version_conflicts_with_backend,
         assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays_with_backend,
         assert_watch_now_semantics_with_backend, assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
-        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture,
+        assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
     convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, TestLoopHarness,
 };
@@ -23,7 +23,6 @@ use flotilla_resources::{
     WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
-use rstest::rstest;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
@@ -62,112 +61,99 @@ impl Resource for SlowResource {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.test", version: "v1", plural: "slowresources", kind: "SlowResource" };
 }
 
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn create_get_list_roundtrip(#[case] _fixture: ConvoyFixture) {
-    assert_create_get_list_roundtrip_with_backend::<ConvoyFixture>(backend()).await;
+macro_rules! resource_contract_tests {
+    ($module:ident, $fixture:ty) => {
+        mod $module {
+            use super::*;
+
+            #[tokio::test]
+            async fn create_get_list_roundtrip() {
+                assert_create_get_list_roundtrip_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn update_requires_current_resource_version() {
+                assert_stale_resource_version_conflicts_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn identical_update_preserves_resource_version_and_emits_no_event() {
+                assert_identical_update_is_noop_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn identical_status_update_preserves_resource_version_and_emits_no_event() {
+                assert_identical_status_update_is_noop_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn delete_emits_deleted_event() {
+                assert_delete_emits_event_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn repeated_delete_is_noop_while_finalizers_are_pending() {
+                assert_repeated_delete_with_pending_finalizers_is_noop_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn watch_from_version_replays_gaplessly_after_list() {
+                assert_watch_from_version_replays_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn watch_now_only_sees_future_events() {
+                assert_watch_now_semantics_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn watch_below_retention_floor_expires() {
+                let retention = EventRetention::new(2).expect("valid retention");
+                let backend = ResourceBackend::Sqlite(
+                    SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"),
+                );
+                assert_watch_retention_expires_only_versions_below_floor_with_backend::<$fixture>(backend).await;
+            }
+
+            #[tokio::test]
+            async fn expired_watch_consumer_relists_and_converges() {
+                let retention = EventRetention::new(2).expect("valid retention");
+                let backend = ResourceBackend::Sqlite(
+                    SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"),
+                );
+                assert_consumer_relists_after_expired_watch_and_converges_with_backend::<$fixture>(backend).await;
+            }
+
+            #[tokio::test]
+            async fn diagnostics_report_bounded_event_log() {
+                let retention = EventRetention::new(2).expect("valid retention");
+                let backend = ResourceBackend::Sqlite(
+                    SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"),
+                );
+                assert_store_diagnostics_report_retained_events_with_backend::<$fixture>(backend).await;
+            }
+
+            #[tokio::test]
+            async fn watch_only_diagnostics_match_mutation_based_stream_semantics() {
+                assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn namespaces_are_isolated() {
+                assert_namespace_isolation_with_backend::<$fixture>(backend()).await;
+            }
+
+            #[tokio::test]
+            async fn owner_references_roundtrip_through_sqlite_backend() {
+                assert_metadata_roundtrip_with_backend::<$fixture>(backend()).await;
+            }
+        }
+    };
 }
 
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn update_requires_current_resource_version(#[case] _fixture: ConvoyFixture) {
-    assert_stale_resource_version_conflicts_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn identical_update_preserves_resource_version_and_emits_no_event(#[case] _fixture: ConvoyFixture) {
-    assert_identical_update_is_noop_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn identical_status_update_preserves_resource_version_and_emits_no_event(#[case] _fixture: ConvoyFixture) {
-    assert_identical_status_update_is_noop_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn delete_emits_deleted_event(#[case] _fixture: ConvoyFixture) {
-    assert_delete_emits_event_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn repeated_delete_is_noop_while_finalizers_are_pending(#[case] _fixture: ConvoyFixture) {
-    assert_repeated_delete_with_pending_finalizers_is_noop_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn watch_from_version_replays_gaplessly_after_list(#[case] _fixture: ConvoyFixture) {
-    assert_watch_from_version_replays_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn watch_now_only_sees_future_events(#[case] _fixture: ConvoyFixture) {
-    assert_watch_now_semantics_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn watch_below_retention_floor_expires(#[case] _fixture: ConvoyFixture) {
-    let retention = EventRetention::new(2).expect("valid retention");
-    let backend =
-        ResourceBackend::Sqlite(SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"));
-    assert_watch_retention_expires_only_versions_below_floor_with_backend::<ConvoyFixture>(backend).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn expired_watch_consumer_relists_and_converges(#[case] _fixture: ConvoyFixture) {
-    let retention = EventRetention::new(2).expect("valid retention");
-    let backend =
-        ResourceBackend::Sqlite(SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"));
-    assert_consumer_relists_after_expired_watch_and_converges_with_backend::<ConvoyFixture>(backend).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn diagnostics_report_bounded_event_log(#[case] _fixture: ConvoyFixture) {
-    let retention = EventRetention::new(2).expect("valid retention");
-    let backend =
-        ResourceBackend::Sqlite(SqliteBackend::open_in_memory_with_event_retention(retention).expect("sqlite backend should open"));
-    assert_store_diagnostics_report_retained_events_with_backend::<ConvoyFixture>(backend).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn watch_only_diagnostics_match_mutation_based_stream_semantics(#[case] _fixture: ConvoyFixture) {
-    assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn namespaces_are_isolated(#[case] _fixture: ConvoyFixture) {
-    assert_namespace_isolation_with_backend::<ConvoyFixture>(backend()).await;
-}
-
-#[rstest]
-#[case(ConvoyFixture)]
-#[tokio::test]
-async fn owner_references_roundtrip_through_sqlite_backend(#[case] _fixture: ConvoyFixture) {
-    assert_metadata_roundtrip_with_backend::<ConvoyFixture>(backend()).await;
-}
+resource_contract_tests!(convoy_contract, ConvoyFixture);
+resource_contract_tests!(regard_contract, RegardFixture);
+resource_contract_tests!(demand_contract, DemandFixture);
 
 #[tokio::test]
 async fn objects_and_resource_versions_survive_restart() {

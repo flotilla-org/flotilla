@@ -29,10 +29,10 @@ use flotilla_protocol::{
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
-    external_patches as convoy_external_patches, get_resource_kind, list_resource_kind, normalize_project_spec,
-    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, Checkout as ResourceCheckout,
-    CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    apply_resource_document, apply_status_patch as apply_resource_status_patch,
+    apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
+    list_resource_kind, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
@@ -5200,6 +5200,21 @@ impl InProcessDaemon {
                 repo: None,
                 result,
             });
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let result = match apply_resource_document(&self.resource_backend, namespace, document.clone()).await {
+                Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                    kind: applied.kind,
+                    plural: applied.plural,
+                    namespace: applied.namespace,
+                    value: applied.value,
+                })),
+                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }
 
