@@ -418,6 +418,7 @@ pub enum ConvoyPhase {
     Completed,
     Failed,
     Cancelled,
+    Abandoned,
 }
 
 impl ConvoyPhase {
@@ -428,6 +429,7 @@ impl ConvoyPhase {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Abandoned => "abandoned",
         }
     }
 }
@@ -450,6 +452,7 @@ pub enum WorkPhase {
     Complete,
     Failed,
     Cancelled,
+    Abandoned,
 }
 
 impl WorkPhase {
@@ -462,6 +465,7 @@ impl WorkPhase {
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Abandoned => "abandoned",
         }
     }
 }

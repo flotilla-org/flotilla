@@ -181,7 +181,7 @@ fn reconcile_internal(
 ) -> InternalReconcileOutcome {
     let status = convoy.status.clone().unwrap_or_default();
 
-    if matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled) {
+    if matches!(status.phase, ConvoyPhase::Failed | ConvoyPhase::Cancelled | ConvoyPhase::Abandoned) {
         return with_cleanup(convoy, &status, vessels, presentations, InternalReconcileOutcome {
             patch: None,
             actuations: Vec::new(),
@@ -450,7 +450,7 @@ fn fail_fast_outcome(status: &super::ConvoyStatus, now: DateTime<Utc>) -> Option
         .work
         .iter()
         .filter_map(|(name, state)| match state.phase {
-            WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => None,
+            WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => None,
             _ => Some((name.clone(), now)),
         })
         .collect::<BTreeMap<_, _>>();
@@ -631,7 +631,7 @@ fn vessel_outcome(
                     return work_failed_outcome(requirement.name.clone(), state.phase, vessel_failure_message(vessel), now, actuations);
                 }
             }
-            WorkPhase::Pending | WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {}
+            WorkPhase::Pending | WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => {}
         }
     }
 
@@ -672,7 +672,7 @@ fn cleanup_actuations(
                 }
             }
             WorkPhase::Complete if predicted_status.crew_work.get(work).is_some_and(|crew| !crew.is_empty()) => {}
-            WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {
+            WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => {
                 if presentations.contains_key(&resource_name) {
                     actuations.push(Actuation::DeletePresentation { name: resource_name.clone() });
                 }

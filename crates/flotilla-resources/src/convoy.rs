@@ -116,6 +116,7 @@ pub enum ConvoyPhase {
     Completed,
     Failed,
     Cancelled,
+    Abandoned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -147,11 +148,12 @@ pub enum WorkPhase {
     Complete,
     Failed,
     Cancelled,
+    Abandoned,
 }
 
 impl WorkPhase {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Complete | Self::Failed | Self::Cancelled)
+        matches!(self, Self::Complete | Self::Failed | Self::Cancelled | Self::Abandoned)
     }
 }
 
@@ -250,6 +252,11 @@ pub enum ConvoyStatusPatch {
     MarkWorkCancelled {
         work: String,
         finished_at: DateTime<Utc>,
+    },
+    MarkConvoyAbandoned {
+        finished_at: DateTime<Utc>,
+        authority: WorkCompletionAuthority,
+        reason: String,
     },
     MarkCrewCompleted {
         vessel: String,
@@ -391,6 +398,17 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.finished_at.get_or_insert(*finished_at);
                 }
             }
+            Self::MarkConvoyAbandoned { finished_at, authority, reason } => {
+                status.phase = ConvoyPhase::Abandoned;
+                status.finished_at.get_or_insert(*finished_at);
+                status.message = Some(format!("abandoned by {authority:?}: {reason}"));
+                for state in status.work.values_mut().filter(|state| !state.phase.is_terminal()) {
+                    state.phase = WorkPhase::Abandoned;
+                    state.completion_authority = *authority;
+                    state.finished_at.get_or_insert(*finished_at);
+                    state.message = Some(reason.clone());
+                }
+            }
             Self::MarkCrewCompleted { vessel, role, finished_at, message } => {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     // Duplicate settlement is sticky; changing the settled outcome records its own time.
@@ -449,7 +467,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = message.clone();
                     match phase {
-                        WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled => {
+                        WorkPhase::Complete | WorkPhase::Failed | WorkPhase::Cancelled | WorkPhase::Abandoned => {
                             if previous_phase != *phase {
                                 state.finished_at = None;
                             }
@@ -537,6 +555,10 @@ pub mod external_patches {
 
     pub fn mark_work_cancelled(work: String, finished_at: DateTime<Utc>) -> ConvoyStatusPatch {
         ConvoyStatusPatch::MarkWorkCancelled { work, finished_at }
+    }
+
+    pub fn mark_convoy_abandoned(finished_at: DateTime<Utc>, authority: WorkCompletionAuthority, reason: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::MarkConvoyAbandoned { finished_at, authority, reason }
     }
 
     pub fn mark_crew_completed(vessel: String, role: String, finished_at: DateTime<Utc>, message: Option<String>) -> ConvoyStatusPatch {

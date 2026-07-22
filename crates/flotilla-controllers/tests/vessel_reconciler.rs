@@ -221,6 +221,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
             path: checkout_spec.target_path().map(str::to_string),
             commit: None,
             branch_provenance: Default::default(),
+            integration: Default::default(),
             message: None,
         })
         .await
@@ -414,6 +415,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 path: spec.target_path().map(str::to_string),
                 commit: Some("44982740".to_string()),
                 branch_provenance: Default::default(),
+                integration: Default::default(),
                 message: None,
             })
             .await
@@ -559,6 +561,7 @@ async fn multi_repository_docker_mounts_the_shared_workspace_root_once() {
                 path: Some(path),
                 commit: Some("44982740".to_string()),
                 branch_provenance: Default::default(),
+                integration: Default::default(),
                 message: None,
             })
             .await
@@ -827,6 +830,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
             path: Some(adopted_path.to_string()),
             commit: Some("abc123".to_string()),
             branch_provenance: Default::default(),
+            integration: Default::default(),
             message: None,
         })
         .await
@@ -1797,6 +1801,7 @@ async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &st
             path: Some(path.to_string()),
             commit: Some("abc123".to_string()),
             branch_provenance: Default::default(),
+            integration: Default::default(),
             message: None,
         })
         .await
@@ -1824,6 +1829,7 @@ async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBa
             path: None,
             commit: Some("abc123".to_string()),
             branch_provenance: Default::default(),
+            integration: Default::default(),
             message: None,
         })
         .await

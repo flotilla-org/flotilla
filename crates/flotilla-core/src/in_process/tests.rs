@@ -532,10 +532,46 @@ async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &s
             path: Some("/repo".to_string()),
             commit: None,
             branch_provenance: Default::default(),
+            integration: Default::default(),
             message: None,
         })
         .await
         .expect("adopted checkout should be ready");
+}
+
+async fn create_ready_observed_checkout_for_convoy(
+    daemon: &InProcessDaemon,
+    namespace: &str,
+    convoy: &str,
+    checkout_name: &str,
+    path: &str,
+    branch: &str,
+) {
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>(namespace);
+    let created = checkouts
+        .create(
+            &input_meta_with_labels(checkout_name, BTreeMap::from([(CONVOY_LABEL.to_string(), convoy.to_string())])),
+            &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                r#ref: branch.to_string(),
+                path: path.to_string(),
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                host_ref: "host-01".to_string(),
+                is_main: false,
+            }),
+        )
+        .await
+        .expect("checkout should be created");
+    checkouts
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some(path.to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: Default::default(),
+            message: None,
+        })
+        .await
+        .expect("checkout should be ready");
 }
 
 async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
@@ -3170,7 +3206,7 @@ async fn convoy_delete_command_targets_requested_namespace_or_configured_default
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".to_string() },
+            action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".to_string(), force: false },
         })
         .await
         .expect("execute should return a command id");
@@ -3185,13 +3221,226 @@ async fn convoy_delete_command_targets_requested_namespace_or_configured_default
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ConvoyDelete { namespace: Some("explicit-ns".to_string()), name: "completed-convoy".to_string() },
+            action: CommandAction::ConvoyDelete {
+                namespace: Some("explicit-ns".to_string()),
+                name: "completed-convoy".to_string(),
+                force: false,
+            },
         })
         .await
         .expect("execute should return a command id");
 
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert!(matches!(explicit_convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_forced() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = DiscoveryMockRunner::builder()
+        .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+        .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/main\n".into()))
+        .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
+        .on_run(
+            "gh",
+            &["pr", "list", "--head", "feature/missing-push", "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            Ok(r#"[{"number":812,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]"#.into()),
+        )
+        .build();
+    let mut discovery = fake_discovery(false);
+    discovery.runner = Arc::new(runner);
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    daemon.set_provisioning_namespace("custom-ns".to_string()).await;
+
+    let convoy_spec = ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build();
+    let convoys = daemon.resource_backend().using::<Convoy>("custom-ns");
+    let created = convoys.create(&empty_input_meta("completed-convoy"), &convoy_spec).await.expect("convoy create should succeed");
+    convoys
+        .update_status("completed-convoy", &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Completed,
+            workflow_snapshot: None,
+            work: BTreeMap::from([("implement".to_string(), WorkState {
+                phase: WorkPhase::Complete,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
+                ready_at: None,
+                started_at: None,
+                finished_at: Some(chrono::Utc::now()),
+                message: Some("done".to_string()),
+                placement: None,
+            })]),
+            crew_work: BTreeMap::new(),
+            message: None,
+            started_at: None,
+            finished_at: Some(chrono::Utc::now()),
+            observed_workflow_ref: Some("review-and-fix".to_string()),
+            observed_workflows: None,
+        })
+        .await
+        .expect("convoy status should update");
+    create_ready_observed_checkout_for_convoy(
+        &daemon,
+        "custom-ns",
+        "completed-convoy",
+        "checkout-missing-push",
+        "/repo",
+        "feature/missing-push",
+    )
+    .await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: None, name: "completed-convoy".to_string(), force: false },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    match wait_for_command_result(&mut events, command_id).await {
+        CommandValue::Error { message } => {
+            assert!(message.contains("checkout-missing-push [/repo]"), "refusal should name checkout dirt: {message}");
+            assert!(message.contains("Pushed=False (1 unpushed commit)"), "refusal should name pushed condition: {message}");
+        }
+        other => panic!("delete should refuse unpushed checkout, got {other:?}"),
+    }
+    convoys.get("completed-convoy").await.expect("refused convoy should remain");
+
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: None, name: "completed-convoy".to_string(), force: true },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert!(matches!(convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn convoy_delete_allows_env_scoped_checkout_when_environment_is_destroyed() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let convoy_spec = ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build();
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    convoys.create(&empty_input_meta("corpse-convoy"), &convoy_spec).await.expect("convoy create should succeed");
+    let checkouts = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    let checkout = checkouts
+        .create(
+            &input_meta_with_labels("checkout-corpse", BTreeMap::from([(CONVOY_LABEL.to_string(), "corpse-convoy".to_string())])),
+            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref: flotilla_resources::RepositoryKey("repo".to_string()),
+                env_ref: "destroyed-env".to_string(),
+                r#ref: "feature/corpse".to_string(),
+                base_ref: None,
+                target_path: "/repo".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout create should succeed");
+    checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: ResourceCheckoutPhase::Ready,
+            path: Some("/repo".to_string()),
+            commit: None,
+            branch_provenance: Default::default(),
+            integration: Default::default(),
+            message: None,
+        })
+        .await
+        .expect("checkout status should update");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: None, name: "corpse-convoy".to_string(), force: false },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert!(matches!(convoys.get("corpse-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn convoy_abandon_command_archives_and_deletes_under_abandoned_gate() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let runner = Arc::new(
+        DiscoveryMockRunner::builder()
+            .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
+            .on_run("git", &["push", "-u", "origin", "HEAD"], Ok(String::new()))
+            .build(),
+    );
+    let mut discovery = fake_discovery(false);
+    discovery.runner = runner.clone();
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+
+    let convoy_spec = ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build();
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let created = convoys.create(&empty_input_meta("active-convoy"), &convoy_spec).await.expect("convoy create should succeed");
+    convoys
+        .update_status("active-convoy", &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            workflow_snapshot: None,
+            work: BTreeMap::from([("implement".to_string(), WorkState {
+                phase: WorkPhase::Running,
+                completion_authority: WorkCompletionAuthority::CrewRollup,
+                ready_at: None,
+                started_at: None,
+                finished_at: None,
+                message: None,
+                placement: None,
+            })]),
+            crew_work: BTreeMap::new(),
+            message: None,
+            started_at: None,
+            finished_at: None,
+            observed_workflow_ref: Some("review-and-fix".to_string()),
+            observed_workflows: None,
+        })
+        .await
+        .expect("convoy status should update");
+    create_ready_observed_checkout_for_convoy(&daemon, "flotilla", "active-convoy", "checkout-to-archive", "/repo", "feature/abandon")
+        .await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyAbandon {
+                namespace: None,
+                name: "active-convoy".to_string(),
+                reason: "operator superseded the work".to_string(),
+            },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert!(runner.saw_cwd(Path::new("/repo")), "abandon should try to archive checkout work from its checkout path");
+    assert!(matches!(convoys.get("active-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
 }
 
 #[tokio::test]

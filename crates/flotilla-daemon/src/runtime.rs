@@ -31,12 +31,12 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, Clone, CloneSpec, Convoy,
-    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
-    ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError,
-    ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
-    AGENT_ADAPTERS_CAPABILITY,
+    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
+    CloneSpec, ConditionValue, Convoy, ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, IntegrationCondition, LandedEvidence, PlacementPolicy,
+    PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource,
+    Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -684,13 +684,14 @@ fn spawn_controller_loops(
                 supervise("checkout", supervision, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
-                    let runner = state.daemon.local_command_runner().expect("local runner should exist");
+                    let state = Arc::clone(&state);
                     async move {
+                        let runner = state.daemon.local_command_runner().expect("local runner should exist");
                         ControllerLoop {
                             primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
                             secondaries: vec![],
                             reconciler: CheckoutReconciler::new(
-                                Arc::new(CheckoutControllerRuntime { runner }),
+                                Arc::new(CheckoutControllerRuntime { state: Some(state), runner }),
                                 backend.clone(),
                                 &namespace_string,
                             ),
@@ -971,7 +972,48 @@ impl CloneRuntime for CloneControllerRuntime {
 }
 
 struct CheckoutControllerRuntime {
+    state: Option<Arc<ControllerRuntimeState>>,
     runner: Arc<dyn CommandRunner>,
+}
+
+impl CheckoutControllerRuntime {
+    fn local_runner(&self) -> Result<Arc<dyn CommandRunner>, String> {
+        Ok(Arc::clone(&self.runner))
+    }
+
+    fn checkout_runner(&self, checkout: &ResourceObject<Checkout>) -> Result<Arc<dyn CommandRunner>, String> {
+        let Some(env_ref) = checkout.spec.env_ref() else {
+            return self.local_runner();
+        };
+        let Some(state) = &self.state else {
+            return self.local_runner();
+        };
+        state
+            .daemon
+            .command_runner_for_environment(&EnvironmentId::new(env_ref))
+            .ok_or_else(|| format!("checkout environment {env_ref} has no command runner"))
+    }
+
+    fn checkout_path<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> Result<&'a str, String> {
+        checkout
+            .status
+            .as_ref()
+            .and_then(|status| status.path.as_deref())
+            .or_else(|| checkout.spec.target_path())
+            .or(match &checkout.spec {
+                flotilla_resources::CheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
+    }
+
+    fn checkout_branch<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> &'a str {
+        match &checkout.spec {
+            flotilla_resources::CheckoutSpec::Worktree(spec) => &spec.r#ref,
+            flotilla_resources::CheckoutSpec::FreshClone(spec) => &spec.r#ref,
+            flotilla_resources::CheckoutSpec::Observed(spec) => &spec.r#ref,
+        }
+    }
 }
 
 #[async_trait]
@@ -983,35 +1025,33 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
+        let runner = self.local_runner()?;
         let clone_path = utf8_path(clone_path)?;
         let target_path = utf8_path(target_path)?;
 
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
-        let local_exists = self
-            .runner
+        let local_exists = runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
         if !local_exists
-            && self.runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
+            && runner.run("git", &["-C", clone_path, "remote", "get-url", "origin"], Path::new("/"), &ChannelLabel::Noop).await.is_ok()
         {
             let remote_head = format!("refs/heads/{branch}");
-            let advertised = self
-                .runner
+            let advertised = runner
                 .run("git", &["-C", clone_path, "ls-remote", "--heads", "origin", &remote_head], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
             if !advertised.trim().is_empty() {
                 let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
-                self.runner
+                runner
                     .run("git", &["-C", clone_path, "fetch", "origin", &refspec], Path::new("/"), &ChannelLabel::Noop)
                     .await
                     .map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
             }
         }
-        let remote_exists = self
-            .runner
+        let remote_exists = runner
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
@@ -1024,11 +1064,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         if local_exists {
             // Multiple vessels can intentionally share the convoy branch. `--force`
             // overrides Git's protection against attaching it to another worktree.
-            self.runner
+            runner
                 .run("git", &["-C", clone_path, "worktree", "add", "--force", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         } else if remote_exists {
-            self.runner
+            runner
                 .run(
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, "--track", target_path, &format!("origin/{branch}")],
@@ -1039,15 +1079,13 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         } else if let Some(base_ref) = base_ref {
             let local_base_ref = format!("refs/heads/{base_ref}");
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
-            let resolved_base_ref = if self
-                .runner
+            let resolved_base_ref = if runner
                 .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &local_base_ref], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .is_ok()
             {
                 base_ref.to_string()
-            } else if self
-                .runner
+            } else if runner
                 .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_base_ref], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .is_ok()
@@ -1056,7 +1094,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             } else {
                 base_ref.to_string()
             };
-            self.runner
+            runner
                 .run(
                     "git",
                     &["-C", clone_path, "worktree", "add", "-b", branch, target_path, &resolved_base_ref],
@@ -1065,17 +1103,17 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 )
                 .await?;
         } else {
-            self.runner
+            runner
                 .run("git", &["-C", clone_path, "worktree", "add", "--detach", target_path, branch], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         }
 
-        let commit = resolve_head_commit(&*self.runner, target_path).await?;
+        let commit = resolve_head_commit(&*runner, target_path).await?;
         if branch_provenance == CheckoutBranchProvenance::CreatedForConvoy {
             // Ownership belongs to the branch, not one checkout: sibling vessels
             // can share it and may finalize in either order.
             let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
-            self.runner
+            runner
                 .run("git", &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         }
@@ -1089,22 +1127,22 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
+        let runner = self.local_runner()?;
         let target_path = utf8_path(target_path)?;
         let clone_ref = base_ref.unwrap_or(branch);
         if clone_ref == "HEAD" {
-            self.runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+            runner.run("git", &["clone", repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
         } else {
-            self.runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+            runner.run("git", &["clone", "--branch", clone_ref, repo_url, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
         }
         if clone_ref != branch {
             let remote_ref = format!("refs/remotes/origin/{branch}");
-            let remote_exists = self
-                .runner
+            let remote_exists = runner
                 .run("git", &["-C", target_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
                 .await
                 .is_ok();
             if remote_exists {
-                self.runner
+                runner
                     .run(
                         "git",
                         &["-C", target_path, "switch", "-c", branch, "--track", &format!("origin/{branch}")],
@@ -1113,26 +1151,30 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     )
                     .await?;
             } else {
-                self.runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
             }
         }
         Ok(PreparedCheckout {
-            commit: resolve_head_commit(&*self.runner, target_path).await?,
+            commit: resolve_head_commit(&*runner, target_path).await?,
             branch_provenance: CheckoutBranchProvenance::PreExisting,
         })
     }
 
+    async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
+        inspect_checkout_integration(&*self.checkout_runner(checkout)?, self.checkout_path(checkout)?, self.checkout_branch(checkout)).await
+    }
+
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        let runner = self.local_runner()?;
         match removal {
             CheckoutRemoval::FreshClone { target_path } => {
-                self.runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
+                runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
                 let clone_path = utf8_path(clone_path)?;
                 let target_path = utf8_path(target_path)?;
-                let remove = self
-                    .runner
+                let remove = runner
                     .run_output(
                         "git",
                         &["-C", clone_path, "worktree", "remove", "--force", target_path],
@@ -1147,16 +1189,14 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
 
                 let branch_ref = format!("refs/heads/{branch}");
                 let bootstrap_ref = bootstrap_branch_ref(branch);
-                let head = self
-                    .runner
+                let head = runner
                     .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Noop)
                     .await?;
                 if !head.success {
-                    delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                     return Ok(CheckoutRemovalOutcome::Removed);
                 }
-                let bootstrap = self
-                    .runner
+                let bootstrap = runner
                     .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Noop)
                     .await?;
                 if !bootstrap.success {
@@ -1166,17 +1206,15 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     });
                 }
                 if head.stdout.trim() != bootstrap.stdout.trim() {
-                    delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                    delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
                         branch: branch.clone(),
                         reason: BranchPreservationReason::CommitsPastBase,
                     });
                 }
 
-                let worktrees = self
-                    .runner
-                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop)
-                    .await?;
+                let worktrees =
+                    runner.run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop).await?;
                 if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
                     return Ok(CheckoutRemovalOutcome::PreservedBranch {
                         branch: branch.clone(),
@@ -1184,13 +1222,196 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                     });
                 }
 
-                self.runner
+                runner
                     .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Noop)
                     .await?;
-                delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                delete_ref(&*runner, clone_path, &bootstrap_ref).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
         }
+    }
+}
+
+async fn inspect_checkout_integration(
+    runner: &dyn CommandRunner,
+    checkout_path: &str,
+    branch: &str,
+) -> Result<CheckoutIntegrationStatus, String> {
+    let path = Path::new(checkout_path);
+    let observed_at = Utc::now().to_rfc3339();
+    let clean = inspect_clean(runner, path, &observed_at).await;
+    let pushed = inspect_pushed(runner, path, &observed_at).await;
+    let (landed, landed_evidence) = inspect_landed(runner, path, branch, &observed_at).await;
+    Ok(CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence })
+}
+
+async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success => {
+            let files = output
+                .stdout
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("?? .flotilla/briefs/") && !trimmed.starts_with(".flotilla/briefs/")
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
+            } else {
+                IntegrationCondition::builder().value(ConditionValue::False).details(files).observed_at(observed_at.to_string()).build()
+            }
+        }
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("git status failed", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("git status could not run: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
+}
+
+async fn inspect_pushed(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+    let upstream = match runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        _ => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
+            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            Ok(output) => {
+                return IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![non_empty_output_or("could not determine upstream for pushed check", &output.stderr)])
+                    .observed_at(observed_at.to_string())
+                    .build();
+            }
+            Err(error) => {
+                return IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![format!("could not determine upstream for pushed check: {error}")])
+                    .observed_at(observed_at.to_string())
+                    .build();
+            }
+        },
+    };
+    let range = format!("{upstream}..HEAD");
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+            Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
+            Ok(count) => IntegrationCondition::builder()
+                .value(ConditionValue::False)
+                .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
+                .observed_at(observed_at.to_string())
+                .build(),
+            Err(_) => IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
+                .observed_at(observed_at.to_string())
+                .build(),
+        },
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("git rev-list could not run: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
+}
+
+async fn inspect_landed(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    branch: &str,
+    observed_at: &str,
+) -> (IntegrationCondition, Option<LandedEvidence>) {
+    match runner
+        .run_output(
+            "gh",
+            &["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            checkout_path,
+            &ChannelLabel::Noop,
+        )
+        .await
+    {
+        Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
+            Ok(serde_json::Value::Array(items)) => match items.first() {
+                Some(item) => {
+                    let number =
+                        item.get("number").and_then(serde_json::Value::as_i64).map(|number| number.to_string()).unwrap_or_default();
+                    let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+                    let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                    if state.eq_ignore_ascii_case("MERGED") || merged_at.is_some() {
+                        (
+                            IntegrationCondition::builder()
+                                .value(ConditionValue::True)
+                                .details(vec![format!("PR #{number} merged")])
+                                .observed_at(observed_at.to_string())
+                                .build(),
+                            Some(
+                                LandedEvidence::builder().change_request_id(number).maybe_merged_at(merged_at.map(str::to_string)).build(),
+                            ),
+                        )
+                    } else {
+                        (
+                            IntegrationCondition::builder()
+                                .value(ConditionValue::False)
+                                .details(vec![format!("PR #{number} {state}, not merged")])
+                                .observed_at(observed_at.to_string())
+                                .build(),
+                            None,
+                        )
+                    }
+                }
+                None => (
+                    IntegrationCondition::builder()
+                        .value(ConditionValue::False)
+                        .details(vec!["no PR found for branch".to_string()])
+                        .observed_at(observed_at.to_string())
+                        .build(),
+                    None,
+                ),
+            },
+            Ok(_) | Err(_) => (
+                IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec!["could not parse gh PR lookup output".to_string()])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+                None,
+            ),
+        },
+        Ok(output) => (
+            IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![non_empty_output_or("gh PR lookup failed", &output.stderr)])
+                .observed_at(observed_at.to_string())
+                .build(),
+            None,
+        ),
+        Err(error) => (
+            IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![format!("gh PR lookup could not run: {error}")])
+                .observed_at(observed_at.to_string())
+                .build(),
+            None,
+        ),
+    }
+}
+
+fn non_empty_output_or(fallback: &str, output: &str) -> String {
+    let output = output.trim();
+    if output.is_empty() {
+        fallback.to_string()
+    } else {
+        output.to_string()
     }
 }
 
@@ -1437,7 +1658,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_worktree(
@@ -1463,7 +1684,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("flotilla.feature-cleanup");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         let prepared = runtime
             .create_worktree(
@@ -1504,7 +1725,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("feature-work/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         let prepared = runtime
             .create_worktree(
@@ -1563,7 +1784,7 @@ mod tests {
     async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_order() {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         for reverse_teardown in [false, true] {
             let case = if reverse_teardown { "reverse" } else { "forward" };
@@ -1618,7 +1839,7 @@ mod tests {
             .with_initial_commit()
             .with_origin(missing_origin.to_str().expect("utf-8 origin path"));
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         let prepared = runtime
             .create_worktree(
@@ -1679,7 +1900,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_worktree(
@@ -1724,7 +1945,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_worktree(
@@ -1774,7 +1995,7 @@ mod tests {
             .success());
 
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
         runtime
             .create_worktree(
                 clone_path.to_str().expect("utf-8 clone path"),
@@ -1798,7 +2019,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_fresh_clone(
@@ -1823,7 +2044,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_fresh_clone(
@@ -1860,7 +2081,7 @@ mod tests {
             .expect("git commit should run")
             .success());
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_fresh_clone(source_path, "feature/existing", Some("main"), target.to_str().expect("utf-8 target path"))

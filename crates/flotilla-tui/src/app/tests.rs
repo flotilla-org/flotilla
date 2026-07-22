@@ -1555,6 +1555,7 @@ fn wire_convoy_phase(phase: crate::convoy_model::ConvoyPhase) -> flotilla_protoc
         crate::convoy_model::ConvoyPhase::Completed => Wire::Completed,
         crate::convoy_model::ConvoyPhase::Failed => Wire::Failed,
         crate::convoy_model::ConvoyPhase::Cancelled => Wire::Cancelled,
+        crate::convoy_model::ConvoyPhase::Abandoned => Wire::Abandoned,
     }
 }
 
@@ -1568,6 +1569,7 @@ fn wire_work_phase(phase: crate::convoy_model::WorkPhase) -> flotilla_protocol::
         crate::convoy_model::WorkPhase::Complete => Wire::Complete,
         crate::convoy_model::WorkPhase::Failed => Wire::Failed,
         crate::convoy_model::WorkPhase::Cancelled => Wire::Cancelled,
+        crate::convoy_model::WorkPhase::Abandoned => Wire::Abandoned,
     }
 }
 

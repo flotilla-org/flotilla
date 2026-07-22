@@ -1170,11 +1170,15 @@ fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
         ResourceConvoyPhase::Completed => ConvoyPhase::Completed,
         ResourceConvoyPhase::Failed => ConvoyPhase::Failed,
         ResourceConvoyPhase::Cancelled => ConvoyPhase::Cancelled,
+        ResourceConvoyPhase::Abandoned => ConvoyPhase::Abandoned,
     }
 }
 
 fn convoy_phase_is_terminal(phase: ResourceConvoyPhase) -> bool {
-    matches!(phase, ResourceConvoyPhase::Completed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Cancelled)
+    matches!(
+        phase,
+        ResourceConvoyPhase::Completed | ResourceConvoyPhase::Failed | ResourceConvoyPhase::Cancelled | ResourceConvoyPhase::Abandoned
+    )
 }
 
 fn convoy_is_initializing(status: Option<&ConvoyStatus>) -> bool {
@@ -1190,6 +1194,7 @@ fn work_phase(phase: ResourceWorkPhase) -> WorkPhase {
         ResourceWorkPhase::Complete => WorkPhase::Complete,
         ResourceWorkPhase::Failed => WorkPhase::Failed,
         ResourceWorkPhase::Cancelled => WorkPhase::Cancelled,
+        ResourceWorkPhase::Abandoned => WorkPhase::Abandoned,
     }
 }
 

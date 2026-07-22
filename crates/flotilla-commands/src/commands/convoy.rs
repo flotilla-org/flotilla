@@ -27,6 +27,17 @@ pub enum ConvoyVerb {
     Delete {
         /// Convoy resource name
         name: String,
+        /// Skip integration safety checks
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Abandon a convoy, archive best-effort, and tear it down
+    Abandon {
+        /// Convoy resource name
+        name: String,
+        /// Human-readable reason for accepting loss of uncommitted work
+        #[arg(long)]
+        reason: String,
     },
     /// Start a convoy through Project-scoped admission completion
     Start {
@@ -144,7 +155,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
-            ConvoyVerb::Delete { name } => {
+            ConvoyVerb::Delete { name, force } => {
                 if self.subject.is_some() {
                     return Err("convoy delete takes its name after `delete`".to_string());
                 }
@@ -153,7 +164,25 @@ impl ConvoyNoun {
                         node_id: None,
                         provisioning_target: None,
                         context_repo: None,
-                        action: CommandAction::ConvoyDelete { namespace: None, name },
+                        action: CommandAction::ConvoyDelete { namespace: None, name, force },
+                    },
+                    repo: RepoContext::None,
+                    host: HostResolution::Local,
+                })
+            }
+            ConvoyVerb::Abandon { name, reason } => {
+                if self.subject.is_some() {
+                    return Err("convoy abandon takes its name after `abandon`".to_string());
+                }
+                if reason.trim().is_empty() {
+                    return Err("convoy abandon requires a non-empty --reason".to_string());
+                }
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: None,
+                        context_repo: None,
+                        action: CommandAction::ConvoyAbandon { namespace: None, name, reason },
                     },
                     repo: RepoContext::None,
                     host: HostResolution::Local,
@@ -284,8 +313,14 @@ impl std::fmt::Display for ConvoyNoun {
                     }
                 }
             }
-            ConvoyVerb::Delete { name } => {
+            ConvoyVerb::Delete { name, force } => {
                 write!(f, " delete {}", quote_value(name))?;
+                if *force {
+                    write!(f, " --force")?;
+                }
+            }
+            ConvoyVerb::Abandon { name, reason } => {
+                write!(f, " abandon {} --reason {}", quote_value(name), quote_value(reason))?;
             }
             ConvoyVerb::Start {
                 project,
@@ -427,7 +462,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".into() },
+                action: CommandAction::ConvoyDelete { namespace: None, name: "failed-convoy".into(), force: false },
             },
             repo: RepoContext::None,
             host: HostResolution::Local,

@@ -59,6 +59,7 @@ define_patch_kinds! {
     ConvoyForceWorkCompleted => DUPLICATE,
     ConvoyMarkWorkFailed => DUPLICATE,
     ConvoyMarkWorkCancelled => DUPLICATE,
+    ConvoyMarkConvoyAbandoned => DUPLICATE,
     ConvoyMarkCrewCompleted => DUPLICATE_RESETTLEMENT,
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
     ConvoyHandoffCrewWork => CONTINUATION,
@@ -90,6 +91,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::ForceWorkCompleted { .. } => PatchKind::ConvoyForceWorkCompleted,
         ConvoyStatusPatch::MarkWorkFailed { .. } => PatchKind::ConvoyMarkWorkFailed,
         ConvoyStatusPatch::MarkWorkCancelled { .. } => PatchKind::ConvoyMarkWorkCancelled,
+        ConvoyStatusPatch::MarkConvoyAbandoned { .. } => PatchKind::ConvoyMarkConvoyAbandoned,
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
@@ -333,6 +335,22 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, work_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "convoy abandonment",
+            kind: PatchKind::ConvoyMarkConvoyAbandoned,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                status.phase = ConvoyPhase::Abandoned;
+                let before = convoy_timestamps(&status);
+                let patch = ConvoyStatusPatch::MarkConvoyAbandoned {
+                    finished_at: ts(30),
+                    authority: WorkCompletionAuthority::HumanOverride,
+                    reason: "already abandoned".to_string(),
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, convoy_timestamps(&status))
             },
         },
         LifecycleCase {

@@ -29,7 +29,7 @@ impl ConvoyDeleteConfirmWidget {
 
     fn target(&self) -> (&str, &str) {
         match &self.command.action {
-            CommandAction::ConvoyDelete { namespace: Some(namespace), name } => (namespace, name),
+            CommandAction::ConvoyDelete { namespace: Some(namespace), name, .. } => (namespace, name),
             _ => unreachable!("constructor validates the command action"),
         }
     }
@@ -49,13 +49,20 @@ impl InteractiveWidget for ConvoyDeleteConfirmWidget {
 
     fn render(&mut self, frame: &mut Frame, area: Rect, ctx: &mut RenderContext) {
         let (namespace, name) = self.target();
-        let popup = ui_helpers::popup_area(area, 56, 28);
+        let popup = ui_helpers::popup_area(area, 64, 34);
         frame.render_widget(Clear, popup);
 
         let lines = vec![
             Line::from(vec![Span::raw("Convoy: "), Span::styled(format!("{namespace}/{name}"), Style::default().bold())]),
             Line::from(""),
             Line::from("Managed vessels, environments, and terminal sessions will be torn down."),
+            Line::from(""),
+            Line::from("Teardown gate:"),
+            Line::from("  Clean=True"),
+            Line::from("  Pushed=True"),
+            Line::from("  Landed=True"),
+            Line::from(""),
+            Line::from("Abandoned convoys bypass the gate. Force skips only this safety check."),
             Line::from(""),
             Line::from(Span::styled("y/Enter: confirm    n/Esc: cancel", Style::default().fg(ctx.theme.muted))),
         ];

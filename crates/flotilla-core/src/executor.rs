@@ -334,6 +334,7 @@ pub async fn build_plan(
         // Daemon-level commands should not reach build_plan.
         CommandAction::ConvoyWorkForceComplete { .. }
         | CommandAction::ConvoyDelete { .. }
+        | CommandAction::ConvoyAbandon { .. }
         | CommandAction::CrewComplete { .. }
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewHandoff { .. }

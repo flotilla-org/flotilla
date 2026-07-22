@@ -30,16 +30,17 @@ use flotilla_protocol::{
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, apply_status_patch_checked as apply_resource_status_patch_checked,
     external_patches as convoy_external_patches, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target,
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
-    CrewSource, Environment as ResourceEnvironment, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority,
+    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
+    CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
+    ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
+    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LandedEvidence, LifecycleAuthority,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
     ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, TerminalBrief,
     TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent,
-    WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL,
+    REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -1053,9 +1054,243 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
             None => format!("convoy {} failed while starting", convoy.metadata.name),
         }),
         flotilla_resources::ConvoyPhase::Cancelled => Some(format!("convoy {} was cancelled while starting", convoy.metadata.name)),
-        flotilla_resources::ConvoyPhase::Pending | flotilla_resources::ConvoyPhase::Active | flotilla_resources::ConvoyPhase::Completed => {
-            None
+        flotilla_resources::ConvoyPhase::Pending
+        | flotilla_resources::ConvoyPhase::Active
+        | flotilla_resources::ConvoyPhase::Completed
+        | flotilla_resources::ConvoyPhase::Abandoned => None,
+    }
+}
+
+fn checkout_branch(checkout: &ResourceObject<ResourceCheckout>) -> &str {
+    match &checkout.spec {
+        ResourceCheckoutSpec::Worktree(spec) => &spec.r#ref,
+        ResourceCheckoutSpec::FreshClone(spec) => &spec.r#ref,
+        ResourceCheckoutSpec::Observed(spec) => &spec.r#ref,
+    }
+}
+
+fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
+    checkout.status.as_ref().and_then(|status| status.path.as_deref()).or_else(|| checkout.spec.target_path()).or(match &checkout.spec {
+        ResourceCheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
+        _ => None,
+    })
+}
+
+fn condition_is_true(condition: &IntegrationCondition) -> bool {
+    condition.value == ConditionValue::True
+}
+
+fn condition_problem(label: &str, condition: &IntegrationCondition) -> Option<String> {
+    match condition.value {
+        ConditionValue::True => None,
+        ConditionValue::False => Some(format!("{label}=False{}", condition_detail_suffix(condition))),
+        ConditionValue::Unknown => Some(format!("{label}=Unknown{}", condition_detail_suffix(condition))),
+    }
+}
+
+fn condition_detail_suffix(condition: &IntegrationCondition) -> String {
+    if condition.details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", condition.details.join(", "))
+    }
+}
+
+fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, integration: &CheckoutIntegrationStatus) -> Option<String> {
+    let problems = [
+        condition_problem("Clean", &integration.clean),
+        condition_problem("Pushed", &integration.pushed),
+        condition_problem("Landed", &integration.landed),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if problems.is_empty() {
+        None
+    } else {
+        Some(format!("{} [{}]: {}", checkout.metadata.name, checkout_path(checkout).unwrap_or("<unknown path>"), problems.join("; ")))
+    }
+}
+
+async fn inspect_resource_checkout_integration(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    branch: &str,
+) -> CheckoutIntegrationStatus {
+    let observed_at = Utc::now().to_rfc3339();
+    let clean = inspect_resource_checkout_clean(runner, checkout_path, &observed_at).await;
+    let pushed = inspect_resource_checkout_pushed(runner, checkout_path, &observed_at).await;
+    let (landed, landed_evidence) = inspect_resource_checkout_landed(runner, checkout_path, branch, &observed_at).await;
+    CheckoutIntegrationStatus { clean, pushed, landed, landed_evidence }
+}
+
+async fn inspect_resource_checkout_clean(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+    match runner.run_output("git", &["status", "--porcelain"], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success => {
+            let files = output
+                .stdout
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("?? .flotilla/briefs/") && !trimmed.starts_with(".flotilla/briefs/")
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if files.is_empty() {
+                IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build()
+            } else {
+                IntegrationCondition::builder().value(ConditionValue::False).details(files).observed_at(observed_at.to_string()).build()
+            }
         }
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("git status failed", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("git status could not run: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
+}
+
+async fn inspect_resource_checkout_pushed(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
+    let upstream = match runner.run_output("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        _ => match runner.run_output("git", &["rev-parse", "--abbrev-ref", "origin/HEAD"], checkout_path, &ChannelLabel::Noop).await {
+            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            Ok(output) => {
+                return IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![non_empty_output_or("could not determine upstream for pushed check", &output.stderr)])
+                    .observed_at(observed_at.to_string())
+                    .build();
+            }
+            Err(error) => {
+                return IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec![format!("could not determine upstream for pushed check: {error}")])
+                    .observed_at(observed_at.to_string())
+                    .build();
+            }
+        },
+    };
+    let range = format!("{upstream}..HEAD");
+    match runner.run_output("git", &["rev-list", "--count", &range], checkout_path, &ChannelLabel::Noop).await {
+        Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+            Ok(0) => IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.to_string()).build(),
+            Ok(count) => IntegrationCondition::builder()
+                .value(ConditionValue::False)
+                .details(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })])
+                .observed_at(observed_at.to_string())
+                .build(),
+            Err(_) => IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())])
+                .observed_at(observed_at.to_string())
+                .build(),
+        },
+        Ok(output) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![non_empty_output_or("git rev-list failed", &output.stderr)])
+            .observed_at(observed_at.to_string())
+            .build(),
+        Err(error) => IntegrationCondition::builder()
+            .value(ConditionValue::Unknown)
+            .details(vec![format!("git rev-list could not run: {error}")])
+            .observed_at(observed_at.to_string())
+            .build(),
+    }
+}
+
+async fn inspect_resource_checkout_landed(
+    runner: &dyn CommandRunner,
+    checkout_path: &Path,
+    branch: &str,
+    observed_at: &str,
+) -> (IntegrationCondition, Option<LandedEvidence>) {
+    match runner
+        .run_output(
+            "gh",
+            &["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,mergedAt", "--limit", "1"],
+            checkout_path,
+            &ChannelLabel::Noop,
+        )
+        .await
+    {
+        Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
+            Ok(serde_json::Value::Array(items)) => match items.first() {
+                Some(item) => {
+                    let number =
+                        item.get("number").and_then(serde_json::Value::as_i64).map(|number| number.to_string()).unwrap_or_default();
+                    let state = item.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+                    let merged_at = item.get("mergedAt").and_then(serde_json::Value::as_str).filter(|value| !value.is_empty());
+                    if state.eq_ignore_ascii_case("MERGED") || merged_at.is_some() {
+                        (
+                            IntegrationCondition::builder()
+                                .value(ConditionValue::True)
+                                .details(vec![format!("PR #{number} merged")])
+                                .observed_at(observed_at.to_string())
+                                .build(),
+                            Some(
+                                LandedEvidence::builder().change_request_id(number).maybe_merged_at(merged_at.map(str::to_string)).build(),
+                            ),
+                        )
+                    } else {
+                        (
+                            IntegrationCondition::builder()
+                                .value(ConditionValue::False)
+                                .details(vec![format!("PR #{number} {state}, not merged")])
+                                .observed_at(observed_at.to_string())
+                                .build(),
+                            None,
+                        )
+                    }
+                }
+                None => (
+                    IntegrationCondition::builder()
+                        .value(ConditionValue::False)
+                        .details(vec!["no PR found for branch".to_string()])
+                        .observed_at(observed_at.to_string())
+                        .build(),
+                    None,
+                ),
+            },
+            Ok(_) | Err(_) => (
+                IntegrationCondition::builder()
+                    .value(ConditionValue::Unknown)
+                    .details(vec!["could not parse gh PR lookup output".to_string()])
+                    .observed_at(observed_at.to_string())
+                    .build(),
+                None,
+            ),
+        },
+        Ok(output) => (
+            IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![non_empty_output_or("gh PR lookup failed", &output.stderr)])
+                .observed_at(observed_at.to_string())
+                .build(),
+            None,
+        ),
+        Err(error) => (
+            IntegrationCondition::builder()
+                .value(ConditionValue::Unknown)
+                .details(vec![format!("gh PR lookup could not run: {error}")])
+                .observed_at(observed_at.to_string())
+                .build(),
+            None,
+        ),
+    }
+}
+
+fn non_empty_output_or(fallback: &str, output: &str) -> String {
+    let output = output.trim();
+    if output.is_empty() {
+        fallback.to_string()
+    } else {
+        output.to_string()
     }
 }
 
@@ -3499,6 +3734,7 @@ impl InProcessDaemon {
                 }),
                 commit: None,
                 branch_provenance: Default::default(),
+                integration: Default::default(),
                 message: None,
             })
             .await
@@ -4111,6 +4347,148 @@ impl InProcessDaemon {
             convoy_external_patches::mark_crew_failed(context.vessel.clone(), context.caller_role.clone(), chrono::Utc::now(), message)
         })
         .await
+    }
+
+    async fn runner_for_resource_checkout(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
+        let Some(env_ref) = checkout.spec.env_ref() else {
+            return self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string());
+        };
+        self.command_runner_for_environment(&EnvironmentId::new(env_ref))
+            .ok_or_else(|| format!("checkout environment {env_ref} has no command runner"))
+    }
+
+    async fn checkout_environment_is_destroyed(&self, namespace: &str, env_ref: &str) -> Result<bool, String> {
+        let environments = self.resource_backend.clone().using::<ResourceEnvironment>(namespace);
+        match environments.get(env_ref).await {
+            Ok(environment) => {
+                Ok(!environment.status.as_ref().is_some_and(|status| status.ready && status.phase == EnvironmentPhase::Ready))
+            }
+            Err(ResourceError::NotFound { .. }) => Ok(true),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    async fn verify_convoy_teardown_gate(&self, namespace: &str, name: &str, force: bool) -> Result<(), String> {
+        if force {
+            return Ok(());
+        }
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
+        if convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Abandoned) {
+            return Ok(());
+        }
+
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let checkout_list = checkouts
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
+        let mut refusals = Vec::new();
+        for checkout in checkout_list {
+            let path = match checkout_path(&checkout) {
+                Some(path) => Path::new(path).to_path_buf(),
+                None => {
+                    refusals.push(format!("{} [<unknown path>]: Clean=Unknown (checkout has no resolved path)", checkout.metadata.name));
+                    continue;
+                }
+            };
+            let runner = match self.runner_for_resource_checkout(&checkout).await {
+                Ok(runner) => runner,
+                Err(error) => {
+                    if let Some(env_ref) = checkout.spec.env_ref() {
+                        if self.checkout_environment_is_destroyed(namespace, env_ref).await? {
+                            warn!(
+                                checkout = %checkout.metadata.name,
+                                env_ref,
+                                "checkout environment is gone; allowing corpse cleanup without integration probes"
+                            );
+                            continue;
+                        }
+                    }
+                    refusals.push(format!(
+                        "{} [{}]: Clean=Unknown ({error}); Pushed=Unknown ({error}); Landed=Unknown ({error})",
+                        checkout.metadata.name,
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            let mut integration = inspect_resource_checkout_integration(&*runner, &path, checkout_branch(&checkout)).await;
+            if let Some(existing) = checkout.status.as_ref().filter(|status| status.integration.landed.value == ConditionValue::True) {
+                integration.landed.value = ConditionValue::True;
+                if integration.landed_evidence.is_none() {
+                    integration.landed_evidence = existing.integration.landed_evidence.clone();
+                }
+            }
+            if let Err(error) = apply_resource_status_patch(
+                &checkouts,
+                &checkout.metadata.name,
+                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: integration.clone() },
+            )
+            .await
+            {
+                warn!(checkout = %checkout.metadata.name, %error, "failed to persist checkout integration conditions during teardown gate");
+            }
+            if checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted) {
+                if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
+                    warn!(checkout = %checkout.metadata.name, summary = %summary, "adopted checkout has integration dirt; releasing without deletion");
+                }
+                continue;
+            }
+            if !(condition_is_true(&integration.clean) && condition_is_true(&integration.pushed) && condition_is_true(&integration.landed))
+            {
+                if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
+                    refusals.push(summary);
+                }
+            }
+        }
+        if refusals.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("convoy {namespace}/{name} is not safe to delete:\n{}", refusals.join("\n")))
+        }
+    }
+
+    async fn archive_convoy_checkouts_best_effort(&self, namespace: &str, name: &str) -> Result<(), String> {
+        let checkouts = self.resource_backend.clone().using::<ResourceCheckout>(namespace);
+        let checkout_list = checkouts
+            .list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), name.to_string())]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
+        for checkout in checkout_list {
+            let Some(path) = checkout_path(&checkout) else {
+                continue;
+            };
+            let Ok(runner) = self.runner_for_resource_checkout(&checkout).await else {
+                continue;
+            };
+            let output = runner.run_output("git", &["push", "-u", "origin", "HEAD"], Path::new(path), &ChannelLabel::Noop).await;
+            if let Ok(output) = output {
+                if !output.success {
+                    warn!(checkout = %checkout.metadata.name, stderr = %output.stderr.trim(), "best-effort abandon archive push failed");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn abandon_convoy_internal(&self, namespace: &str, name: &str, reason: &str) -> Result<(), String> {
+        if reason.trim().is_empty() {
+            return Err("convoy abandon requires a non-empty reason".to_string());
+        }
+        self.archive_convoy_checkouts_best_effort(namespace, name).await?;
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        apply_resource_status_patch(
+            &convoys,
+            name,
+            &convoy_external_patches::mark_convoy_abandoned(Utc::now(), WorkCompletionAuthority::HumanOverride, reason.to_string()),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        self.verify_convoy_teardown_gate(namespace, name, false).await?;
+        convoys.delete(name).await.map_err(|err| err.to_string())
     }
 
     async fn apply_crew_work_patch(
@@ -4884,16 +5262,33 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name } = &command.action {
+        if let flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, force } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = match namespace {
                 Some(namespace) => namespace.clone(),
                 None => self.provisioning_namespace().await,
             };
             let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&namespace);
-            let result = match convoys.delete(name).await {
+            let result = match self.verify_convoy_teardown_gate(&namespace, name, *force).await {
+                Ok(()) => match convoys.delete(name).await {
+                    Ok(()) => flotilla_protocol::CommandValue::Ok,
+                    Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, reason } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = match namespace {
+                Some(namespace) => namespace.clone(),
+                None => self.provisioning_namespace().await,
+            };
+            let result = match self.abandon_convoy_internal(&namespace, name, reason).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);

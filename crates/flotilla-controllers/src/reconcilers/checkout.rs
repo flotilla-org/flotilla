@@ -3,8 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, Clone, ClonePhase, ResourceBackend,
-    ResourceError, ResourceObject, TypedResolver,
+    Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatusPatch, Clone, ClonePhase,
+    ResourceBackend, ResourceError, ResourceObject, TypedResolver,
 };
 use tracing::warn;
 
@@ -49,6 +49,7 @@ pub trait CheckoutRuntime: Send + Sync {
         base_ref: Option<&str>,
         target_path: &str,
     ) -> Result<PreparedCheckout, String>;
+    async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String>;
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String>;
 }
 
@@ -66,6 +67,7 @@ impl<R> CheckoutReconciler<R> {
 pub enum CheckoutDeps {
     None,
     Ready { prepared: PreparedCheckout },
+    Integration { status: CheckoutIntegrationStatus },
     Waiting,
     Failed(String),
 }
@@ -79,6 +81,12 @@ where
 
     async fn fetch_dependencies(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Dependencies, ResourceError> {
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
+            if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
+                return Ok(match self.runtime.inspect_integration(obj).await {
+                    Ok(status) => CheckoutDeps::Integration { status },
+                    Err(err) => CheckoutDeps::Failed(err),
+                });
+            }
             return Ok(CheckoutDeps::None);
         }
 
@@ -125,8 +133,31 @@ where
                     commit: prepared.commit.clone(),
                     branch_provenance: prepared.branch_provenance,
                 }),
+                CheckoutDeps::Integration { .. } => None,
                 CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutDeps::Waiting | CheckoutDeps::None => None,
+            }
+        } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
+            match deps {
+                CheckoutDeps::Integration { status } => Some(CheckoutStatusPatch::UpdateIntegration { integration: status.clone() }),
+                CheckoutDeps::Failed(message) => Some(CheckoutStatusPatch::UpdateIntegration {
+                    integration: CheckoutIntegrationStatus {
+                        clean: flotilla_resources::IntegrationCondition::builder()
+                            .value(flotilla_resources::ConditionValue::Unknown)
+                            .details(vec![message.clone()])
+                            .build(),
+                        pushed: flotilla_resources::IntegrationCondition::builder()
+                            .value(flotilla_resources::ConditionValue::Unknown)
+                            .details(vec![message.clone()])
+                            .build(),
+                        landed: flotilla_resources::IntegrationCondition::builder()
+                            .value(flotilla_resources::ConditionValue::Unknown)
+                            .details(vec![message.clone()])
+                            .build(),
+                        landed_evidence: None,
+                    },
+                }),
+                CheckoutDeps::None | CheckoutDeps::Ready { .. } | CheckoutDeps::Waiting => None,
             }
         } else {
             None

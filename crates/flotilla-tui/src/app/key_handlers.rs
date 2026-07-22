@@ -404,7 +404,8 @@ impl App {
                 let Ok(node_id) = self.table_intent_node_id(host.as_ref()) else {
                     return;
                 };
-                let mut command = self.command(CommandAction::ConvoyDelete { namespace: Some(namespace.clone()), name: name.clone() });
+                let mut command =
+                    self.command(CommandAction::ConvoyDelete { namespace: Some(namespace.clone()), name: name.clone(), force: false });
                 command.node_id = node_id;
                 self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command)));
                 return;

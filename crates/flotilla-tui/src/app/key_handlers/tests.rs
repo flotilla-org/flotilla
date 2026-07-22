@@ -81,7 +81,11 @@ fn convoy_delete_table_intent_confirms_then_routes_to_origin_host() {
 
     let (command, _) = app.proto_commands.take_next().expect("confirmed delete command");
     assert_eq!(command.node_id, Some(NodeId::new("remote-host")));
-    assert_eq!(command.action, CommandAction::ConvoyDelete { namespace: Some("other-team".into()), name: "failed-convoy".into() });
+    assert_eq!(command.action, CommandAction::ConvoyDelete {
+        namespace: Some("other-team".into()),
+        name: "failed-convoy".into(),
+        force: false
+    });
 }
 
 #[test]
