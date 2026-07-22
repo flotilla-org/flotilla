@@ -3738,12 +3738,16 @@ impl InProcessDaemon {
         let migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
 
         let mut project_objects = projects.list().await.map_err(|error| error.to_string())?.items;
+        let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let mut generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
+        let mut generated_display_names = BTreeSet::from([display_name.clone()]);
         for key in &migratable_keys {
             if let Some(spec) = repository_specs.get(key) {
                 generated_names.extend(whole_repository_project_names(spec)?);
+                generated_display_names.insert(normalize_project_name(&spec.leaf_slug())?);
             }
         }
+        let mut migrated_project_names = BTreeSet::new();
         for project in &mut project_objects {
             let mut updated = project.spec.clone();
             let mut changed = false;
@@ -3760,19 +3764,30 @@ impl InProcessDaemon {
                     .await
                     .map_err(|error| error.to_string())?;
                 project.spec = updated;
+                migrated_project_names.insert(project.metadata.name.clone());
             }
         }
 
-        let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
         let primary_name = project_objects
             .iter()
             .filter(|project| project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()))
-            .min_by_key(|project| (generated_names.contains(&project.metadata.name), project.metadata.name.as_str()))
+            .min_by_key(|project| {
+                (
+                    !migrated_project_names.contains(&project.metadata.name),
+                    generated_names.contains(&project.metadata.name),
+                    project.metadata.name.as_str(),
+                )
+            })
             .map(|project| project.metadata.name.clone());
         if let Some(primary_name) = &primary_name {
             for duplicate in project_objects.iter().filter(|project| {
-                project.metadata.name != *primary_name && generated_names.contains(&project.metadata.name) && project.spec == spec
+                project.metadata.name != *primary_name
+                    && generated_names.contains(&project.metadata.name)
+                    && generated_display_names.contains(&project.spec.display_name)
+                    && project.spec.default_workflow_ref == spec.default_workflow_ref
+                    && project.spec.issue_source == spec.issue_source
+                    && project.spec.repositories == spec.repositories
             }) {
                 projects.delete(&duplicate.metadata.name).await.map_err(|error| error.to_string())?;
             }

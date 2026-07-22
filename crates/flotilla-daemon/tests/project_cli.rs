@@ -311,6 +311,67 @@ async fn tracking_after_custom_project_identity_change_does_not_create_generated
 }
 
 #[tokio::test]
+async fn identity_change_preserves_migrated_project_when_local_and_remote_names_differ() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    let checkout_path = tmp.path().join("z-local-name");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
+    let inspected_spec = Arc::new(RwLock::new(local_spec));
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    let add_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
+        })
+        .await
+        .expect("initial repo add");
+    assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
+
+    let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/a-remote-name").expect("remote repository spec");
+    let remote_key = remote_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(remote_key.to_string()).build(), &remote_spec)
+        .await
+        .expect("pre-existing remote repository");
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("a-remote-name".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("a-remote-name".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
+                .build(),
+        )
+        .await
+        .expect("pre-existing remote project twin");
+
+    *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let second_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path },
+        })
+        .await
+        .expect("repo add after remote appears");
+    assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
+
+    let projects = backend.using::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.items.len(), 1, "the pre-existing remote twin should be removed");
+    assert_eq!(projects.items[0].metadata.name, "z-local-name", "the migrated Project should retain its identity");
+    assert_eq!(projects.items[0].spec.display_name, "z-local-name");
+    assert_eq!(projects.items[0].spec.repositories[0].repo, remote_key);
+}
+
+#[tokio::test]
 async fn refresh_surfaces_and_reconciles_repository_identity_change() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
