@@ -94,7 +94,7 @@ pub struct Command {
 /// reference or as an opaque ID whose source must be resolved through the
 /// Project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum IssueSelector {
     Id(String),
     Reference(IssueRef),
@@ -570,6 +570,8 @@ pub struct CheckoutStatus {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::{
         arg::Arg,
@@ -1119,6 +1121,31 @@ mod tests {
     #[test]
     fn repo_selector_identity_roundtrip() {
         assert_json_roundtrip(&RepoSelector::Identity(repo_identity()));
+    }
+
+    #[test]
+    fn issue_selector_json_is_stable_and_roundtrips_all_variants() {
+        let cases = [
+            (IssueSelector::Id("834".into()), json!({"kind": "id", "value": "834"})),
+            (
+                IssueSelector::Reference(IssueRef {
+                    source: crate::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                    id: "834".into(),
+                }),
+                json!({
+                    "kind": "reference",
+                    "value": {
+                        "source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"},
+                        "id": "834"
+                    }
+                }),
+            ),
+        ];
+
+        for (selector, expected_json) in cases {
+            assert_eq!(serde_json::to_value(&selector).expect("serialize"), expected_json);
+            assert_json_roundtrip(&selector);
+        }
     }
 
     #[test]
