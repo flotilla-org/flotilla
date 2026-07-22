@@ -466,12 +466,14 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         tracing::warn!(requested = %theme_name, using = %initial_theme.name, "unknown theme, falling back");
     }
 
+    let pm_connector = flotilla_tui::pm_open::detect_connector();
     loop {
         let repos_info = daemon.list_repos().await.unwrap_or_default();
         let app = match scoped_view.clone() {
             Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
             None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
-        };
+        }
+        .with_pm_connector(pm_connector.clone());
 
         match flotilla_tui::run::run_event_loop(terminal, app).await? {
             flotilla_tui::run::EventLoopExit::Quit => return Ok(()),
