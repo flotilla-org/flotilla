@@ -32,7 +32,7 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<(), String> {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
-    async fn kill_session(&self, session_id: &str) -> Result<(), String>;
+    async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String>;
 }
 
 pub struct TerminalSessionReconciler<R> {
@@ -146,7 +146,7 @@ where
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
         if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-            self.runtime.kill_session(session_id).await.map_err(ResourceError::other)?;
+            self.runtime.kill_session(session_id, &obj.spec).await.map_err(ResourceError::other)?;
         }
         Ok(())
     }
