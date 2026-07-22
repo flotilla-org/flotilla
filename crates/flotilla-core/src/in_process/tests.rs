@@ -39,7 +39,7 @@ use crate::{
         discovery::{
             test_support::{
                 fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner,
-                FakeDiscoveryProviders, FakeTerminalPool,
+                FakeDiscoveryProviders, FakeTerminalPool, MergedPrProcessRunner,
             },
             EnvironmentAssertion, EnvironmentBag,
         },
@@ -1181,35 +1181,6 @@ impl CommandRunner for QueuedOutputRunner {
 
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
         false
-    }
-}
-
-struct MergedPrProcessRunner;
-
-#[async_trait]
-impl CommandRunner for MergedPrProcessRunner {
-    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        if cmd == "gh" {
-            Ok(r#"[{"number":884,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]"#.to_string())
-        } else {
-            crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
-        }
-    }
-
-    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-        if cmd == "gh" {
-            Ok(CommandOutput {
-                stdout: r#"[{"number":884,"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}]"#.to_string(),
-                stderr: String::new(),
-                success: true,
-            })
-        } else {
-            crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
-        }
-    }
-
-    async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-        crate::providers::ProcessCommandRunner.exists(cmd, args).await
     }
 }
 
@@ -3601,9 +3572,18 @@ async fn convoy_delete_refuses_ignored_embedded_repository_with_local_commits() 
         .status()
         .expect("create embedded repository branch");
     assert!(branch_status.success());
+    for args in [
+        ["switch", "-c", "hidden/local"].as_slice(),
+        ["commit", "--allow-empty", "-m", "hidden local work"].as_slice(),
+        ["switch", "feat/local"].as_slice(),
+    ] {
+        let status =
+            std::process::Command::new("git").arg("-C").arg(&embedded).args(args).status().expect("prepare local-only embedded refs");
+        assert!(status.success());
+    }
 
     let mut discovery = git_process_discovery(false);
-    discovery.runner = Arc::new(MergedPrProcessRunner);
+    discovery.runner = Arc::new(MergedPrProcessRunner::new(884));
     let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
     let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
     convoys
@@ -3635,7 +3615,7 @@ async fn convoy_delete_refuses_ignored_embedded_repository_with_local_commits() 
         CommandValue::Error { message } => {
             assert!(message.contains("embedded repository embedded/"), "refusal should name embedded repository: {message}");
             assert!(message.contains("branch feat/local"), "refusal should name embedded branch: {message}");
-            assert!(message.contains("1 local commit"), "refusal should name local commit count: {message}");
+            assert!(message.contains("2 local commits"), "refusal should count local commits across refs: {message}");
         }
         other => panic!("delete should refuse an embedded repository, got {other:?}"),
     }

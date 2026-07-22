@@ -33,7 +33,7 @@ use crate::{
         terminal::TerminalPool,
         types::BranchInfo,
         vcs::{CheckoutManager, Vcs},
-        ChannelLabel, CommandOutput, CommandRunner,
+        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     },
 };
 
@@ -51,6 +51,43 @@ pub struct DiscoveryMockRunner {
     files: Mutex<HashMap<PathBuf, String>>,
     seen_cwds: Mutex<Vec<PathBuf>>,
     exists_calls: Mutex<Vec<(String, String)>>,
+}
+
+pub struct MergedPrProcessRunner {
+    pr_number: u64,
+}
+
+impl MergedPrProcessRunner {
+    pub fn new(pr_number: u64) -> Self {
+        Self { pr_number }
+    }
+
+    fn response(&self) -> String {
+        format!(r#"[{{"number":{},"state":"MERGED","mergedAt":"2026-07-22T00:00:00Z"}}]"#, self.pr_number)
+    }
+}
+
+#[async_trait]
+impl CommandRunner for MergedPrProcessRunner {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "gh" {
+            Ok(self.response())
+        } else {
+            ProcessCommandRunner.run(cmd, args, cwd, label).await
+        }
+    }
+
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        if cmd == "gh" {
+            Ok(CommandOutput { stdout: self.response(), stderr: String::new(), success: true })
+        } else {
+            ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+        }
+    }
+
+    async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+        ProcessCommandRunner.exists(cmd, args).await
+    }
 }
 
 #[derive(Default)]

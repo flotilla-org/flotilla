@@ -1,13 +1,16 @@
-use std::{fmt, path::Path};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use chrono::Utc;
 use flotilla_resources::{CheckoutIntegrationStatus, CheckoutSpec, CheckoutStatus, ConditionValue, IntegrationCondition, LandedEvidence};
 
 use crate::providers::{ChannelLabel, CommandRunner};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EmbeddedRepository {
-    path: String,
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+struct EmbeddedRepository {
+    path: PathBuf,
     branch: String,
     local_commits: Option<usize>,
     uncommitted_entries: Option<usize>,
@@ -19,7 +22,7 @@ impl fmt::Display for EmbeddedRepository {
             || "local commits unknown".to_string(),
             |count| format!("{count} local commit{}", if count == 1 { "" } else { "s" }),
         );
-        write!(formatter, "embedded repository {}/ (branch {}, {local_commits}", self.path, self.branch)?;
+        write!(formatter, "embedded repository {}/ (branch {}, {local_commits}", self.path.display(), self.branch)?;
         if let Some(count) = self.uncommitted_entries.filter(|count| *count > 0) {
             write!(formatter, ", {count} uncommitted entr{}", if count == 1 { "y" } else { "ies" })?;
         }
@@ -92,7 +95,7 @@ async fn inspect_clean(runner: &dyn CommandRunner, checkout_path: &Path, observe
     }
 }
 
-pub async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path: &Path) -> Result<Vec<EmbeddedRepository>, String> {
+async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path: &Path) -> Result<Vec<EmbeddedRepository>, String> {
     let output = runner
         .run_output(
             "find",
@@ -112,50 +115,53 @@ pub async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_
         .filter_map(|git_path| Path::new(git_path).parent())
         .filter_map(|repository_path| repository_path.strip_prefix(".").ok())
         .filter(|repository_path| !repository_path.as_os_str().is_empty())
-        .map(|repository_path| repository_path.to_string_lossy().to_string())
+        .map(Path::to_path_buf)
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
 
     let mut repositories = Vec::new();
     for path in paths {
-        if is_gitlink(runner, checkout_path, &path).await {
-            continue;
-        }
         repositories.push(inspect_embedded_repository(runner, checkout_path, path).await);
     }
     Ok(repositories)
 }
 
-async fn is_gitlink(runner: &dyn CommandRunner, checkout_path: &Path, path: &str) -> bool {
-    runner
-        .run_output("git", &["ls-files", "--stage", "--", path], checkout_path, &ChannelLabel::Noop)
+async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: PathBuf) -> EmbeddedRepository {
+    let path_arg = path.to_string_lossy();
+    let branch = match runner
+        .run_output("git", &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Noop)
         .await
-        .is_ok_and(|output| output.success && output.stdout.lines().any(|line| line.starts_with("160000 ")))
-}
-
-async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: String) -> EmbeddedRepository {
-    let branch =
-        match runner.run_output("git", &["-C", &path, "symbolic-ref", "--short", "-q", "HEAD"], checkout_path, &ChannelLabel::Noop).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-            _ => match runner.run_output("git", &["-C", &path, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Noop).await {
-                Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
-                _ => "unknown".to_string(),
-            },
-        };
+    {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        _ => match runner.run_output("git", &["-C", &path_arg, "rev-parse", "--short", "HEAD"], checkout_path, &ChannelLabel::Noop).await {
+            Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
+            _ => "unknown".to_string(),
+        },
+    };
     let local_commits = runner
-        .run_output("git", &["-C", &path, "rev-list", "--count", "HEAD", "--not", "--remotes"], checkout_path, &ChannelLabel::Noop)
+        .run_output(
+            "git",
+            &["-C", &path_arg, "rev-list", "--count", "HEAD", "--all", "--not", "--remotes"],
+            checkout_path,
+            &ChannelLabel::Noop,
+        )
         .await
         .ok()
         .filter(|output| output.success)
         .and_then(|output| output.stdout.trim().parse().ok());
     let uncommitted_entries = runner
-        .run_output("git", &["-C", &path, "status", "--porcelain"], checkout_path, &ChannelLabel::Noop)
+        .run_output("git", &["-C", &path_arg, "status", "--porcelain"], checkout_path, &ChannelLabel::Noop)
         .await
         .ok()
         .filter(|output| output.success)
         .map(|output| output.stdout.lines().count());
-    EmbeddedRepository { path, branch, local_commits, uncommitted_entries }
+    EmbeddedRepository::builder()
+        .path(path)
+        .branch(branch)
+        .maybe_local_commits(local_commits)
+        .maybe_uncommitted_entries(uncommitted_entries)
+        .build()
 }
 
 async fn inspect_pushed(runner: &dyn CommandRunner, checkout_path: &Path, observed_at: &str) -> IntegrationCondition {
