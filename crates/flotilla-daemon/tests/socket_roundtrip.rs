@@ -370,7 +370,7 @@ async fn execute_refresh_all_roundtrip_emits_lifecycle_events() {
     assert_eq!(lifecycle.0, Some(command_id));
     let (finished_id, result) = lifecycle.1.expect("command finished event");
     assert_eq!(finished_id, command_id);
-    assert_eq!(result, CommandValue::Refreshed { repos: vec![repo.clone()] });
+    assert_eq!(result, CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
 
     server_handle.abort();
 }

@@ -50,8 +50,8 @@ use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositorySpec, TypedResolver, WorkPhase,
+    WorkState, WorkflowSnapshot, WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -1047,10 +1047,16 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let persisted = backend.using::<ResourceConvoy>("flotilla").get("issue-732").await.expect("persisted convoy");
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
     assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
+    assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/issue-732"));
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
     assert_eq!(persisted.spec.repositories.len(), 1);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
+    let regards = backend.using::<Regard>("flotilla").list().await.expect("list dispatcher regards");
+    let regard = regards.items.iter().find(|regard| regard.spec.target.name == "issue-732").expect("implicit dispatcher regard");
+    assert_eq!(regard.spec.principal_ref, persisted.spec.dispatching_principal_ref);
+    assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
+    assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
     let persisted_issue = persisted.spec.issues.first().expect("issue snapshot");
     assert_eq!(persisted_issue.reference, reference);
     assert_eq!(persisted_issue.repository_ref, Some(repository.key()));
@@ -3081,6 +3087,7 @@ async fn repository_identity_change_reconciles_old_identity_shared_by_another_ro
             fixed_repository_by_path: HashMap::from([(repo_b.clone(), "old-repo".to_string())]),
         }))
         .await;
+    daemon.materialize_tracked_repo_projects().await.expect("materialize projects for the shared identity");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 
@@ -3118,6 +3125,13 @@ async fn repository_identity_change_reconciles_old_identity_shared_by_another_ro
         checkout.metadata.labels.get(REPO_LABEL).map(String::as_str) == Some("github-com-owner-new-repo")
             && matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == repo_a.to_string_lossy())
     }));
+
+    let projects = daemon.resource_backend().using::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.items.len(), 2, "the shared old identity must retain its own Project");
+    assert!(projects.items.iter().any(|project| project.spec.repositories[0].repo
+        == RepositorySpec::remote("https://github.com/owner/old-repo").expect("old repository spec").key()));
+    assert!(projects.items.iter().any(|project| project.spec.repositories[0].repo
+        == RepositorySpec::remote("https://github.com/owner/new-repo").expect("new repository spec").key()));
 }
 
 #[tokio::test]
@@ -4491,7 +4505,8 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
         .add_virtual_repo(identity.clone(), None, PathBuf::from("/remote/desktop/owner/repo"), vec![], 0)
         .await
         .expect("add virtual repo");
-    let (tracked_path, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
+    let outcome = daemon.add_repo(&local_repo).await.expect("add local repo");
+    let tracked_path = outcome.tracked_path;
     // Path may be canonicalized (e.g. /var -> /private/var on macOS)
     let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
 
@@ -4957,7 +4972,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     .await
     .expect("timeout waiting for refresh all CommandFinished");
 
-    assert!(matches!(finished, CommandValue::Refreshed { repos } if repos.len() == 2));
+    assert!(matches!(finished, CommandValue::Refreshed { repos, .. } if repos.len() == 2));
 }
 
 #[tokio::test]
@@ -5308,7 +5323,9 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
         )))
         .expect("replace local environment bag");
 
-    let (tracked_path, resolved_from) = daemon.add_repo(&repo).await.expect("add repo");
+    let outcome = daemon.add_repo(&repo).await.expect("add repo");
+    let tracked_path = outcome.tracked_path;
+    let resolved_from = outcome.resolved_from;
 
     assert_eq!(tracked_path, repo);
     assert_eq!(resolved_from, None);

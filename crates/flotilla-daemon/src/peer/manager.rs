@@ -168,6 +168,7 @@ pub struct PendingPeerSend {
 struct ConfiguredPeerTarget {
     expected_host_name: HostName,
     expected_node_id: Option<NodeId>,
+    connection_address: String,
     transport: Box<dyn PeerTransport>,
 }
 
@@ -353,7 +354,8 @@ impl PeerManager {
         transport: Box<dyn PeerTransport>,
     ) {
         info!(target = %label.0, expected_host = %expected_host_name, expected_node_id = ?expected_node_id, "registered configured peer target");
-        self.configured_targets.insert(label, ConfiguredPeerTarget { expected_host_name, expected_node_id, transport });
+        let connection_address = transport.connection_address();
+        self.configured_targets.insert(label, ConfiguredPeerTarget { expected_host_name, expected_node_id, connection_address, transport });
     }
 
     /// Register or replace a sender for a connected peer.
@@ -1489,6 +1491,33 @@ impl PeerManager {
 
         let route = self.routes.get(name).ok_or_else(|| format!("unknown peer: {name}"))?;
         self.senders.get(&route.primary.next_hop).cloned().ok_or_else(|| format!("missing next hop sender: {}", route.primary.next_hop))
+    }
+
+    pub fn connection_address_for(&self, target: &NodeId, host: &HostName) -> String {
+        let next_hop = if self.senders.contains_key(target) {
+            target
+        } else {
+            self.routes.get(target).map(|route| &route.primary.next_hop).unwrap_or(target)
+        };
+        if let Some(configured) = self
+            .active_connections
+            .get(next_hop)
+            .and_then(|active| active.meta.config_label.as_ref())
+            .and_then(|label| self.configured_targets.get(label))
+        {
+            return configured.connection_address.clone();
+        }
+        if let Some(configured) = self
+            .configured_targets
+            .iter()
+            .find_map(|(_, configured)| (configured.expected_node_id.as_ref() == Some(next_hop)).then_some(configured))
+        {
+            return configured.connection_address.clone();
+        }
+        self.configured_targets
+            .values()
+            .find_map(|configured| (configured.expected_host_name == *host).then(|| configured.connection_address.clone()))
+            .unwrap_or_else(|| format!("peer://{next_hop}"))
     }
 
     pub fn take_displaced_sender(&mut self, name: &NodeId, generation: u64) -> Option<Arc<dyn PeerSender>> {

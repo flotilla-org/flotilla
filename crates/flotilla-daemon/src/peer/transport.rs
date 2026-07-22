@@ -24,6 +24,9 @@ pub trait PeerTransport: Send + Sync {
     async fn disconnect(&mut self) -> Result<(), String>;
     fn status(&self) -> PeerConnectionStatus;
 
+    /// Human-readable address used for connection attempts and diagnostics.
+    fn connection_address(&self) -> String;
+
     /// Subscribe to inbound peer wire messages.
     async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String>;
 

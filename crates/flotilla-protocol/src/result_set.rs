@@ -8,7 +8,7 @@
 //! (columns, labels, tab composition) are consumer config and never appear
 //! on the wire.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use crate::{
     provider_data::{ChangeRequestStatus, Issue},
     resource_ref::ResourceRef,
     snapshot::RepoKey,
-    IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey,
+    IssueRef, IssueSource, IssueState, LifecycleAuthority, PrincipalRef, RepositoryKey,
 };
 
 pub type Timestamp = DateTime<Utc>;
@@ -44,6 +44,14 @@ pub enum QueryId {
     },
     /// Concrete observed checkouts fleet-wide (`None`) or in one Project.
     Checkouts { scope: Option<QueryScope> },
+    /// Awareness-band enrichment tree, fleet-wide or in one Project.
+    Awareness {
+        scope: Option<QueryScope>,
+        #[serde(default)]
+        grouping: AwarenessGrouping,
+        #[serde(default)]
+        limit: AwarenessLimit,
+    },
 }
 
 /// The Project scope owned by a curated query family. Repository membership
@@ -73,6 +81,7 @@ impl QueryId {
             Self::Independents { .. } => "independents",
             Self::Issues { .. } => "issues",
             Self::Checkouts { .. } => "checkouts",
+            Self::Awareness { .. } => "awareness",
         }
     }
 }
@@ -152,6 +161,14 @@ pub enum QueryChanges {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
     },
+    Awareness {
+        scope: Option<QueryScope>,
+        grouping: AwarenessGrouping,
+        limit: AwarenessLimit,
+        changed: Vec<AwarenessNode>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        removed: Vec<String>,
+    },
 }
 
 impl QueryChanges {
@@ -161,6 +178,9 @@ impl QueryChanges {
             Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
             Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
+            Self::Awareness { scope, grouping, limit, .. } => {
+                QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
+            }
         }
     }
 
@@ -170,6 +190,7 @@ impl QueryChanges {
             Self::Independents { changed, .. } => changed.len(),
             Self::Issues { changed, .. } => changed.len(),
             Self::Checkouts { changed, .. } => changed.len(),
+            Self::Awareness { changed, .. } => changed.len(),
         }
     }
 
@@ -177,6 +198,7 @@ impl QueryChanges {
         match self {
             Self::Convoys { removed, .. } | Self::Independents { removed, .. } | Self::Checkouts { removed, .. } => removed.len(),
             Self::Issues { removed, .. } => removed.len(),
+            Self::Awareness { removed, .. } => removed.len(),
         }
     }
 
@@ -212,17 +234,24 @@ impl QueryChanges {
         }
     }
 
+    pub fn as_awareness(&self) -> Option<&[AwarenessNode]> {
+        match self {
+            Self::Awareness { changed, .. } => Some(changed),
+            _ => None,
+        }
+    }
+
     pub fn removed_resources(&self) -> Option<&[ResourceRef]> {
         match self {
             Self::Convoys { removed, .. } | Self::Independents { removed, .. } | Self::Checkouts { removed, .. } => Some(removed),
-            Self::Issues { .. } => None,
+            Self::Issues { .. } | Self::Awareness { .. } => None,
         }
     }
 
     pub fn removed_issues(&self) -> Option<&[IssueRef]> {
         match self {
             Self::Issues { removed, .. } => Some(removed),
-            _ => None,
+            Self::Convoys { .. } | Self::Independents { .. } | Self::Checkouts { .. } | Self::Awareness { .. } => None,
         }
     }
 }
@@ -285,6 +314,12 @@ pub enum Rows {
         scope: Option<QueryScope>,
         rows: Vec<CheckoutRow>,
     },
+    Awareness {
+        scope: Option<QueryScope>,
+        grouping: AwarenessGrouping,
+        limit: AwarenessLimit,
+        rows: Vec<AwarenessNode>,
+    },
 }
 
 impl Rows {
@@ -294,6 +329,9 @@ impl Rows {
             Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
             Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
+            Self::Awareness { scope, grouping, limit, .. } => {
+                QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
+            }
         }
     }
 
@@ -303,6 +341,7 @@ impl Rows {
             Self::Independents { rows, .. } => rows.len(),
             Self::Issues { rows, .. } => rows.len(),
             Self::Checkouts { rows, .. } => rows.len(),
+            Self::Awareness { rows, .. } => rows.len(),
         }
     }
 
@@ -337,6 +376,217 @@ impl Rows {
             _ => None,
         }
     }
+
+    pub fn as_awareness(&self) -> Option<&[AwarenessNode]> {
+        match self {
+            Self::Awareness { rows, .. } => Some(rows),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwarenessGrouping {
+    #[default]
+    Project,
+    Convoy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AwarenessLimit {
+    pub groups: usize,
+    pub entries: usize,
+}
+
+impl Default for AwarenessLimit {
+    fn default() -> Self {
+        Self { groups: 32, entries: 32 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwarenessKind {
+    Fleet,
+    Project,
+    Convoy,
+    Issue,
+    Vessel,
+    Independent,
+    Checkout,
+}
+
+/// Named-query family represented by one panel of a project awareness view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwarenessFamily {
+    Convoys,
+    Issues,
+    Checkouts,
+    Independents,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwarenessState {
+    #[default]
+    Unknown,
+    Pending,
+    Waiting,
+    Active,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// Centrally-computed urgency of an awareness node or entry.
+///
+/// Surfaces render this value but must not derive it from the underlying
+/// demand, regard, or attention facts themselves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Salience {
+    #[default]
+    None,
+    Info,
+    Attention,
+    Urgent,
+}
+
+/// Centrally aggregated salience and freshness for one awareness family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct AwarenessFamilySummary {
+    pub family: AwarenessFamily,
+    #[builder(default)]
+    #[serde(default)]
+    pub salience: Salience,
+    pub as_of: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum AwarenessPhase {
+    Convoy(ConvoyPhase),
+    Work(WorkPhase),
+    Session(SessionPhase),
+    Issue(IssueState),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct AwarenessCounts {
+    #[builder(default)]
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub active: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub waiting: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub done: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub failed: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub issues: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub convoys: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub vessels: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub checkouts: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[builder(default)]
+    pub independents: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwarenessLink {
+    pub rel: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct AwarenessEntry {
+    pub id: String,
+    pub kind: AwarenessKind,
+    pub label: String,
+    pub state: AwarenessState,
+    #[builder(default)]
+    #[serde(default)]
+    pub salience: Salience,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AwarenessPhase>,
+    pub as_of: Timestamp,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub refs: Vec<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub issue_refs: Vec<IssueRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub links: Vec<AwarenessLink>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[builder(default)]
+    pub annotations: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct AwarenessNode {
+    pub id: String,
+    pub kind: AwarenessKind,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<QueryScope>,
+    pub state: AwarenessState,
+    #[builder(default)]
+    #[serde(default)]
+    pub salience: Salience,
+    pub as_of: Timestamp,
+    #[serde(default, skip_serializing_if = "AwarenessCounts::is_empty")]
+    #[builder(default)]
+    pub counts: AwarenessCounts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub refs: Vec<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub issue_refs: Vec<IssueRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub links: Vec<AwarenessLink>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[builder(default)]
+    pub annotations: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub entries: Vec<AwarenessEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub family_summaries: Vec<AwarenessFamilySummary>,
+}
+
+impl AwarenessNode {
+    pub fn family_summary(&self, family: AwarenessFamily) -> Option<&AwarenessFamilySummary> {
+        self.family_summaries.iter().find(|summary| summary.family == family)
+    }
+}
+
+impl AwarenessCounts {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One row in an `issues{scope}` result set.
@@ -484,6 +734,10 @@ pub struct ConvoyRow {
     pub resource: ResourceRef,
     pub name: String,
     pub workflow_ref: String,
+    /// Human principal that dispatched the convoy.
+    #[builder(default)]
+    #[serde(default)]
+    pub dispatching_principal_ref: PrincipalRef,
     pub phase: ConvoyPhase,
     /// The convoy has no workflow snapshot yet and is not terminal.
     #[builder(default)]
@@ -538,6 +792,10 @@ pub struct ConvoyChangeRequest {
 pub struct VesselRow {
     /// `convoy_ref.subresource("vessels/{name}")`.
     pub resource: ResourceRef,
+    /// Concrete Vessel resource realizing this workflow requirement, when it
+    /// has been placed. Demand origins use this control-plane identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel_resource: Option<ResourceRef>,
     pub name: String,
     pub phase: WorkPhase,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -566,6 +824,11 @@ pub struct VesselRow {
     /// an attach on this row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
+    /// Terminal-session reference from which a presentation manager can
+    /// materialize this vessel's workspace. This is deliberately distinct
+    /// from `attach`, which names an already-observed PM workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize: Option<String>,
     /// Capability fact: the daemon will accept completing this vessel's work.
     #[builder(default)]
     pub complete_work: bool,

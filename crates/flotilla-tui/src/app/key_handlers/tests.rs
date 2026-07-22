@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_protocol::{
@@ -18,9 +21,73 @@ use crate::{
         },
         PeerStatus, TuiHostState,
     },
+    pm_open::{OpenInPmTarget, PmConnector},
     status_bar::{StatusBarAction, StatusBarTarget},
     widgets::section_table::IssueRow,
 };
+
+#[derive(Default)]
+struct RecordingPmConnector {
+    calls: Mutex<Vec<OpenInPmTarget>>,
+}
+
+#[async_trait::async_trait]
+impl PmConnector for RecordingPmConnector {
+    async fn open(&self, target: &OpenInPmTarget, _working_directory: &Path) -> Result<(), String> {
+        self.calls.lock().expect("recording connector lock").push(target.clone());
+        Ok(())
+    }
+}
+
+fn pm_target(host: HostName) -> OpenInPmTarget {
+    OpenInPmTarget {
+        namespace: "dev".into(),
+        convoy: "tables".into(),
+        vessel: Some("implement".into()),
+        label: "tables".into(),
+        host: Some(host),
+        project_ref: Some("flotilla".into()),
+        repo_hint: None,
+        workspace_ref: None,
+        materialize_ref: Some("terminal-implement".into()),
+    }
+}
+
+#[tokio::test]
+async fn open_in_pm_intent_dispatches_only_local_targets_to_the_injected_connector() {
+    let mut app = stub_app();
+    let local = app.model.my_host().expect("stub local host").clone();
+    let connector = Arc::new(RecordingPmConnector::default());
+    app.pm_connector = Some(connector.clone());
+
+    let local_target = pm_target(local);
+    app.execute_table_intent(TableIntent::OpenInPm(local_target.clone()));
+    tokio::task::yield_now().await;
+    app.drain_background_updates();
+
+    assert_eq!(*connector.calls.lock().expect("recorded calls"), vec![local_target]);
+    assert_eq!(app.model.status_message.as_deref(), Some("Opened tables in PM"));
+
+    let remote_target = pm_target(HostName::new("feta"));
+    app.execute_table_intent(TableIntent::OpenInPm(remote_target));
+    assert_eq!(connector.calls.lock().expect("recorded calls").len(), 1, "remote targets must not dispatch");
+    assert!(app.model.status_message.as_deref().is_some_and(|message| message.contains("not reachable from this PM yet")));
+
+    app.model.hosts.clear();
+    app.execute_table_intent(TableIntent::OpenInPm(pm_target(HostName::new("unknown-without-model"))));
+    assert_eq!(connector.calls.lock().expect("recorded calls").len(), 1, "unknown locality must fail closed");
+    assert!(app.model.status_message.as_deref().is_some_and(|message| message.contains("not reachable from this PM yet")));
+}
+
+#[test]
+fn open_in_pm_without_a_connector_reports_that_no_pm_is_connected() {
+    let mut app = stub_app();
+    let local = app.model.my_host().expect("stub local host").clone();
+
+    app.execute_table_intent(TableIntent::OpenInPm(pm_target(local)));
+
+    assert_eq!(app.model.status_message.as_deref(), Some("No presentation manager is connected"));
+}
 
 fn hp(path: &str) -> HostPath {
     HostPath::new(HostName::local(), PathBuf::from(path))

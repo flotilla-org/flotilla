@@ -41,6 +41,7 @@ fn round_trip_non_dispatch_actions() {
         Action::OpenCommandPalette,
         Action::OpenContextualPalette,
         Action::FillSelected,
+        Action::OpenInPm,
     ];
     for action in actions {
         let s = action.as_config_str();
@@ -113,6 +114,7 @@ fn all_actions_have_descriptions() {
         Action::OpenCommandPalette,
         Action::OpenContextualPalette,
         Action::FillSelected,
+        Action::OpenInPm,
         Action::Dispatch(Intent::SwitchToWorkspace),
         Action::Dispatch(Intent::CreateWorkspace),
         Action::Dispatch(Intent::RemoveCheckout),
@@ -159,6 +161,12 @@ fn defaults_resolve_project_panel_navigation() {
     assert_eq!(km.resolve(&mode, kc(KeyCode::Tab, KeyModifiers::SHIFT)), Some(Action::PrevPanel));
     assert_eq!(km.resolve(&mode, kc(KeyCode::BackTab, KeyModifiers::NONE)), Some(Action::PrevPanel));
     assert_eq!(km.resolve(&mode, kc(KeyCode::BackTab, KeyModifiers::SHIFT)), Some(Action::PrevPanel));
+}
+
+#[test]
+fn convoy_rows_bind_o_to_open_in_pm() {
+    let km = Keymap::defaults();
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::Convoys), crokey::key!(o)), Some(Action::OpenInPm));
 }
 
 #[test]

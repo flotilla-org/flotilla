@@ -41,6 +41,7 @@ fn updated_workflow_spec() -> WorkflowTemplateSpec {
 fn convoy_spec(workflow_ref: &str) -> ConvoySpec {
     ConvoySpec {
         workflow_ref: workflow_ref.to_string(),
+        dispatching_principal_ref: Default::default(),
         inputs: [
             ("feature".to_string(), InputValue::String("Retry logic for the poller".to_string())),
             ("branch".to_string(), InputValue::String("fix-bug-123".to_string())),

@@ -22,44 +22,34 @@ impl Recipe {
     }
 }
 
-/// A scoped-view target, mirroring ADR 0013's kind-rooted, host-free
-/// addresses without depending on the (unlanded) address type itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ViewTarget {
-    Project { namespace: String, name: String },
-    Convoy { namespace: String, name: String },
-    Vessel { namespace: String, convoy: String, vessel: String },
-}
-
 pub trait RecipeMint: Send + Sync {
     /// Recipe attaching a live entity — a session into a pane, or a vessel's
     /// running session into a workspace; `attach_ref` is any reference the
     /// daemon accepts (rows expose it as a capability fact).
     fn attach(&self, attach_ref: &str) -> Option<Recipe>;
     /// Recipe materialising a scoped view of an entity with no live session.
-    fn scoped_view(&self, target: &ViewTarget) -> Option<Recipe>;
+    fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe>;
 }
 
-/// v0 mint: attach recipes only. Scoped views return `None` — the entry
-/// lists truthfully unmaterialisable — until #589 lands and a view-capable
-/// mint replaces this one.
-pub struct AttachOnlyRecipes {
+/// Recipes implemented by the Flotilla CLI: attach a live entity or open a
+/// scoped focal view for an awareness-band latent.
+pub struct FlotillaRecipes {
     flotilla_bin: String,
 }
 
-impl AttachOnlyRecipes {
+impl FlotillaRecipes {
     pub fn new(flotilla_bin: impl Into<String>) -> Self {
-        AttachOnlyRecipes { flotilla_bin: flotilla_bin.into() }
+        Self { flotilla_bin: flotilla_bin.into() }
     }
 }
 
-impl RecipeMint for AttachOnlyRecipes {
+impl RecipeMint for FlotillaRecipes {
     fn attach(&self, attach_ref: &str) -> Option<Recipe> {
         Some(Recipe::Command(format!("{} attach {attach_ref}", self.flotilla_bin)))
     }
 
-    fn scoped_view(&self, _target: &ViewTarget) -> Option<Recipe> {
-        None
+    fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe> {
+        Some(Recipe::Command(format!("{} view {}", self.flotilla_bin, flotilla_protocol::arg::shell_quote(&target.to_string()))))
     }
 }
 
@@ -68,16 +58,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attach_only_mint_formats_attach_and_declines_views() {
-        let mint = AttachOnlyRecipes::new("flotilla");
+    fn flotilla_mint_formats_attach_and_scoped_view_recipes() {
+        let mint = FlotillaRecipes::new("flotilla");
         assert_eq!(mint.attach("implement"), Some(Recipe::Command("flotilla attach implement".to_owned())));
         assert_eq!(
-            mint.scoped_view(&ViewTarget::Vessel {
+            mint.scoped_view(&flotilla_protocol::ViewAddress::Vessel {
                 namespace: "dev".to_owned(),
                 convoy: "manifest-extraction".to_owned(),
                 vessel: "implement".to_owned(),
             }),
-            None
+            Some(Recipe::Command("flotilla view 'vessel/dev/manifest-extraction/implement'".to_owned()))
         );
     }
 }

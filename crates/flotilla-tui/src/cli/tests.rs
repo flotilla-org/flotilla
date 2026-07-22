@@ -426,7 +426,7 @@ mod command_result_human {
     use std::path::PathBuf;
 
     use flotilla_protocol::{
-        commands::{CheckoutStatus, CommandValue},
+        commands::{CheckoutStatus, CommandValue, RepositoryIdentityChange},
         qualified_path::{HostId, QualifiedPath},
         CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostName, NodeId,
         PreparedWorkspace,
@@ -441,7 +441,7 @@ mod command_result_human {
 
     #[test]
     fn repo_tracked() {
-        let result = CommandValue::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: None };
+        let result = CommandValue::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: None, identity_change: None };
         let output = format_command_result(&result);
         assert!(output.contains("repo tracked"), "should say repo tracked");
         assert!(output.contains("/tmp/my-repo"), "should include path");
@@ -450,12 +450,32 @@ mod command_result_human {
 
     #[test]
     fn repo_tracked_with_resolved_from() {
-        let result =
-            CommandValue::RepoTracked { path: PathBuf::from("/tmp/my-repo"), resolved_from: Some(PathBuf::from("/tmp/my-repo/wt-feat")) };
+        let result = CommandValue::RepoTracked {
+            path: PathBuf::from("/tmp/my-repo"),
+            resolved_from: Some(PathBuf::from("/tmp/my-repo/wt-feat")),
+            identity_change: None,
+        };
         let output = format_command_result(&result);
         assert!(output.contains("repo tracked"), "should say repo tracked");
         assert!(output.contains("/tmp/my-repo/wt-feat"), "should include original path");
         assert!(output.contains("resolved from"), "should mention resolution");
+    }
+
+    #[test]
+    fn repo_tracked_with_identity_change() {
+        let result = CommandValue::RepoTracked {
+            path: PathBuf::from("/tmp/my-repo"),
+            resolved_from: None,
+            identity_change: Some(RepositoryIdentityChange {
+                previous_display: "local".to_string(),
+                current_display: "https://github.com/flotilla-org/my-repo".to_string(),
+            }),
+        };
+
+        assert_eq!(
+            format_command_result(&result),
+            "repo tracked: /tmp/my-repo\nrepository identity changed: local → https://github.com/flotilla-org/my-repo"
+        );
     }
 
     #[test]
@@ -468,14 +488,17 @@ mod command_result_human {
 
     #[test]
     fn refreshed() {
-        let result = CommandValue::Refreshed { repos: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")] };
+        let result = CommandValue::Refreshed {
+            repos: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")],
+            identity_changes: Vec::new(),
+        };
         let output = format_command_result(&result);
         assert!(output.contains("refreshed 3 repo(s)"), "should show count of repos");
     }
 
     #[test]
     fn refreshed_empty() {
-        let result = CommandValue::Refreshed { repos: vec![] };
+        let result = CommandValue::Refreshed { repos: vec![], identity_changes: Vec::new() };
         let output = format_command_result(&result);
         assert!(output.contains("refreshed 0 repo(s)"), "should handle zero repos");
     }

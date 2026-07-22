@@ -24,8 +24,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, ViewAddress,
-    WorkItem, WorkItemIdentity,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus,
+    ViewAddress, WorkItem, WorkItemIdentity,
 };
 use indexmap::IndexMap;
 pub use intent::Intent;
@@ -38,6 +38,7 @@ pub use ui_state::{BranchInputKind, DirEntry, ProjectIssueStartContext, RepoView
 use crate::{
     convoy_model::{ConvoyId, ConvoySummary},
     keymap::Keymap,
+    pm_open::PmConnector,
     shared::Shared,
     theme::Theme,
     widgets::{
@@ -290,6 +291,7 @@ pub struct QueryTableCache {
     pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
     pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
     pub checkouts: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::CheckoutRow>>,
+    pub awareness: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::AwarenessNode>>,
 }
 
 pub struct QueryTableResult<R> {
@@ -350,6 +352,11 @@ pub fn table_rows<'a>(
             .iter()
             .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
             .collect(),
+        awareness_results: queries
+            .awareness
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
         source_search,
     }
 }
@@ -366,6 +373,11 @@ pub struct ProjectIssueStartBatch {
     total: usize,
     started: usize,
     rejected: Vec<String>,
+}
+
+struct PmOpenUpdate {
+    label: String,
+    result: Result<(), String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -479,6 +491,11 @@ pub struct App {
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
     /// Receiver half, drained each event-loop iteration.
     pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
+    /// Connected presentation-manager realization path, when this TUI is
+    /// running inside a supported PM.
+    pub pm_connector: Option<Arc<dyn PmConnector>>,
+    pm_update_tx: mpsc::UnboundedSender<PmOpenUpdate>,
+    pm_update_rx: mpsc::UnboundedReceiver<PmOpenUpdate>,
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
     /// Drop guard that gives in-process subscribers the same teardown
@@ -502,6 +519,12 @@ pub struct App {
 
 impl App {
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
+        let app = Self::new_unreported(daemon, repos_info, config, theme);
+        app.report_active_view_focus();
+        app
+    }
+
+    fn new_unreported(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
         let mut model = TuiModel::from_repo_info(repos_info);
         // Open-view set: persisted if present, else seeded to match the
         // pre-View tab bar (overview + convoys + one tab per tracked repo).
@@ -551,6 +574,7 @@ impl App {
         }
 
         let (issue_update_tx, issue_update_rx) = mpsc::unbounded_channel();
+        let (pm_update_tx, pm_update_rx) = mpsc::unbounded_channel();
         let session_id = uuid::Uuid::new_v4();
         let query_subscription = daemon.query_subscription(session_id);
 
@@ -579,6 +603,9 @@ impl App {
             pending_fetch_more: HashSet::new(),
             issue_update_tx,
             issue_update_rx,
+            pm_connector: None,
+            pm_update_tx,
+            pm_update_rx,
             session_id,
             _query_subscription: query_subscription,
             namespaces: HashMap::new(),
@@ -587,6 +614,11 @@ impl App {
             subscriptions_dirty: true,
             pending_attach_command: None,
         }
+    }
+
+    pub fn with_pm_connector(mut self, connector: Option<Arc<dyn PmConnector>>) -> Self {
+        self.pm_connector = connector;
+        self
     }
 
     /// Construct an `App` in scoped mode: exactly the one View at `address`,
@@ -598,7 +630,7 @@ impl App {
         theme: Theme,
         address: ViewAddress,
     ) -> Self {
-        let mut app = Self::new(daemon, repos_info, config, theme);
+        let mut app = Self::new_unreported(daemon, repos_info, config, theme);
         app.views = OpenViews::scoped(address);
         app.subscriptions_dirty = true;
         app.sync_active_view();
@@ -896,6 +928,25 @@ impl App {
                 self.ui.view_layout = page.layout;
             }
         }
+        self.report_active_view_focus();
+    }
+
+    fn report_active_view_focus(&self) {
+        let targets = self.views.active_address().and_then(view_regard_target).into_iter().collect();
+        self.report_focus(targets);
+    }
+
+    pub(super) fn report_focus(&self, targets: Vec<ResourceRef>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let daemon = Arc::clone(&self.daemon);
+        let surface_id = self.session_id;
+        runtime.spawn(async move {
+            if let Err(error) = daemon.observe_focus(surface_id, targets).await {
+                tracing::warn!(%error, "failed to report TUI focus");
+            }
+        });
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
@@ -961,6 +1012,13 @@ impl App {
                         self.spawn_query_page(repo, params, 1, 50);
                     }
                 }
+            }
+        }
+
+        while let Ok(update) = self.pm_update_rx.try_recv() {
+            match update.result {
+                Ok(()) => self.set_status_message(Some(format!("Opened {} in PM", update.label))),
+                Err(error) => self.set_status_message(Some(format!("Could not open {} in PM: {error}", update.label))),
             }
         }
     }
@@ -1509,6 +1567,9 @@ impl App {
                     flotilla_protocol::Rows::Checkouts { rows, .. } => {
                         self.query_tables.checkouts.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
+                    flotilla_protocol::Rows::Awareness { rows, .. } => {
+                        self.query_tables.awareness.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1583,6 +1644,16 @@ impl App {
                             |left, right| {
                                 (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
                             },
+                        );
+                    }
+                    flotilla_protocol::QueryChanges::Awareness { changed, removed, .. } => {
+                        let result = self.query_tables.awareness.entry(query).or_default();
+                        result.apply_delta(
+                            changed,
+                            removed,
+                            delta.state.as_ref(),
+                            |row| row.id.clone(),
+                            |left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)),
                         );
                     }
                 }
@@ -1850,6 +1921,25 @@ impl App {
         let input = Input::from(format!("{}/", start_dir.display()).as_str());
         let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
         self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
+    }
+}
+
+fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
+    match address {
+        ViewAddress::Convoy { namespace, name } => Some(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name)),
+        ViewAddress::Vessel { namespace, convoy, vessel } => {
+            Some(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, convoy).subresource(format!("vessels/{vessel}")))
+        }
+        ViewAddress::Project { namespace, name } => Some(ResourceRef::new("flotilla.work/v1", "Project", namespace, name)),
+        ViewAddress::Issues { scope } | ViewAddress::Checkouts { scope: Some(scope) } => {
+            Some(ResourceRef::new("flotilla.work/v1", "Project", &scope.namespace, &scope.name))
+        }
+        ViewAddress::Repo { repository_key: Some(key), .. } => Some(ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", &key.0)),
+        ViewAddress::Overview
+        | ViewAddress::Convoys { .. }
+        | ViewAddress::Independents { .. }
+        | ViewAddress::Checkouts { scope: None }
+        | ViewAddress::Repo { repository_key: None, .. } => None,
     }
 }
 

@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, process::ExitStatus, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -223,6 +223,8 @@ enum HooksSubCommand {
 enum ResourceSubCommand {
     /// List resources of a kind
     List(ResourceListArgs),
+    /// Create or update a raw resource document
+    Apply(ResourceApplyArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
     /// Watch resources of a kind
@@ -251,6 +253,19 @@ struct ResourceGetArgs {
     #[arg(long, default_value = "flotilla")]
     namespace: String,
     /// Route the query to a peer host
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceApplyArgs {
+    /// Resource document path (JSON or YAML)
+    #[arg(short, long)]
+    file: PathBuf,
+    /// Default namespace when metadata.namespace is omitted
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the mutation to a peer host
     #[arg(long)]
     host: Option<String>,
 }
@@ -451,12 +466,14 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         tracing::warn!(requested = %theme_name, using = %initial_theme.name, "unknown theme, falling back");
     }
 
+    let pm_connector = flotilla_tui::pm_open::detect_connector();
     loop {
         let repos_info = daemon.list_repos().await.unwrap_or_default();
         let app = match scoped_view.clone() {
             Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
             None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
-        };
+        }
+        .with_pm_connector(pm_connector.clone());
 
         match flotilla_tui::run::run_event_loop(terminal, app).await? {
             flotilla_tui::run::EventLoopExit::Quit => return Ok(()),
@@ -591,7 +608,7 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     if let CommandValue::ConvoyStarted { name, attach_command: Some(command), binding } = result {
         if matches!(format, OutputFormat::Human) {
             stamp_pane_identity(&name, binding.as_ref()).await;
-            return exec_attach_command(&command);
+            return run_attach_command(&command);
         }
     }
     Ok(())
@@ -627,7 +644,7 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
                 if !transient {
                     stamp_pane_identity(reference, binding.as_ref()).await;
                 }
-                exec_attach_command(&command)
+                run_attach_command(&command)
             }
         },
         CommandValue::Error { message } => match format {
@@ -645,7 +662,7 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
 }
 
 /// Publish pane ≙ identity into the enclosing PM's metadata plane before
-/// exec'ing the attach command — the one moment a process knows the binding
+/// launching the attach command — the one moment a process knows the binding
 /// (flotilla-org/flotilla#708, half 1). Best-effort: a PM-less or failed
 /// stamp never blocks the attach.
 async fn stamp_pane_identity(reference: &str, binding: Option<&flotilla_protocol::AttachBinding>) {
@@ -729,6 +746,24 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
             print_resource_query_result(result, format)
+        }
+        ResourceSubCommand::Apply(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+            let raw = std::fs::read_to_string(&args.file)
+                .map_err(|error| color_eyre::eyre::eyre!("read resource document {}: {error}", args.file.display()))?;
+            let document: serde_json::Value = serde_yml::from_str(&raw)
+                .map_err(|error| color_eyre::eyre::eyre!("parse resource document {}: {error}", args.file.display()))?;
+            run_control_command(
+                cli,
+                Command {
+                    node_id,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ResourceApply { namespace: args.namespace, document },
+                },
+                format,
+            )
+            .await
         }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
@@ -819,23 +854,42 @@ fn print_resource_watch_event(response: &flotilla_protocol::ResourceWatchRespons
     }
 }
 
-#[cfg(unix)]
-fn exec_attach_command(command: &str) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    Err(std::process::Command::new("sh").arg("-lc").arg(command).exec().into())
+fn run_attach_command(command: &str) -> Result<()> {
+    let status = std::process::Command::new("sh").arg("-lc").arg(command).status()?;
+    terminate_with_attach_status(status)
 }
 
-#[cfg(not(unix))]
-fn exec_attach_command(command: &str) -> Result<()> {
-    let status = std::process::Command::new("sh").arg("-lc").arg(command).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(color_eyre::eyre::eyre!(
-            "attach command exited with status {}",
-            status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
-        ))
+#[derive(Debug, PartialEq, Eq)]
+enum AttachExitDisposition {
+    Code(i32),
+    #[cfg(unix)]
+    Signal(i32),
+}
+
+fn attach_exit_disposition(status: ExitStatus) -> AttachExitDisposition {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return AttachExitDisposition::Signal(signal);
+        }
+    }
+    AttachExitDisposition::Code(status.code().unwrap_or(1))
+}
+
+fn terminate_with_attach_status(status: ExitStatus) -> ! {
+    match attach_exit_disposition(status) {
+        AttachExitDisposition::Code(code) => std::process::exit(code),
+        #[cfg(unix)]
+        AttachExitDisposition::Signal(signal) => {
+            // Match the old `exec` path: callers should observe the attach
+            // process's terminating signal, not a generic Flotilla error.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            std::process::exit(128 + signal)
+        }
     }
 }
 
@@ -1309,7 +1363,10 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use clap::Parser;
     use flotilla_protocol::{
@@ -1317,9 +1374,22 @@ mod tests {
     };
 
     use super::{
-        provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots, Cli, ResourceGetArgs,
-        ResourceListArgs, ResourceSubCommand, SubCommand,
+        attach_exit_disposition, provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots,
+        AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
+
+    #[test]
+    fn attach_exit_disposition_preserves_child_exit_code() {
+        let status = Command::new("sh").args(["-c", "exit 42"]).status().expect("run child");
+        assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Code(42));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_exit_disposition_preserves_child_signal() {
+        let status = Command::new("sh").args(["-c", "kill -TERM $$"]).status().expect("run child");
+        assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Signal(libc::SIGTERM));
+    }
 
     #[test]
     fn explicit_repo_roots_take_precedence_over_cwd_detection() {
@@ -1383,6 +1453,15 @@ mod tests {
             Some(SubCommand::Resource {
                 command: ResourceSubCommand::Get(ResourceGetArgs { kind, name, namespace, host: None })
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
+        ));
+
+        let apply = Cli::try_parse_from(["flotilla", "resource", "apply", "-f", "demand.yaml", "--namespace", "ops"])
+            .expect("resource apply should parse");
+        assert!(matches!(
+            apply.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Apply(ResourceApplyArgs { file, namespace, host: None })
+            }) if file.as_path() == Path::new("demand.yaml") && namespace == "ops"
         ));
 
         let watch =

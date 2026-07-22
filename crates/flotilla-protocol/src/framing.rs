@@ -30,6 +30,7 @@ mod tests {
             display_name: "test".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
         let mut buf = Vec::new();
         write_message_line(&mut buf, &msg).await.expect("write should succeed");

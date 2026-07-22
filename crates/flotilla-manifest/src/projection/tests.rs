@@ -1,10 +1,13 @@
-use flotilla_protocol::{result_set::CrewMemberSummary, HostName, RepoKey, ResourceRef};
+use flotilla_protocol::{
+    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, CrewMemberSummary},
+    HostName, RepoKey, ResourceRef,
+};
 
 use super::*;
-use crate::{recipe::AttachOnlyRecipes, wire::MetadataPathValue};
+use crate::{recipe::FlotillaRecipes, wire::MetadataPathValue};
 
-fn mint() -> AttachOnlyRecipes {
-    AttachOnlyRecipes::new("flotilla")
+fn mint() -> FlotillaRecipes {
+    FlotillaRecipes::new("flotilla")
 }
 
 fn convoy_ref(namespace: &str, name: &str) -> ResourceRef {
@@ -16,13 +19,13 @@ fn session_ref(namespace: &str, name: &str) -> ResourceRef {
 }
 
 #[bon::builder]
-fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, attach: Option<&str>) -> VesselRow {
+fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, materialize: Option<&str>) -> VesselRow {
     VesselRow::builder()
         .resource(convoy.subresource(format!("vessels/{name}")))
         .name(name)
         .phase(phase)
         .host(HostName::new("feta"))
-        .maybe_attach(attach.map(str::to_owned))
+        .maybe_materialize(materialize.map(str::to_owned))
         .build()
 }
 
@@ -58,6 +61,56 @@ fn text(patch: &MetadataPatch, key: &str) -> String {
 }
 
 #[test]
+fn awareness_tree_projects_project_issue_and_materializable_entries() {
+    let issue = AwarenessEntry::builder()
+        .id("issue/flotilla-org/flotilla/862".to_string())
+        .kind(AwarenessKind::Issue)
+        .label("#862 awareness band".to_string())
+        .state(AwarenessState::Waiting)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .build();
+    let vessel = AwarenessEntry::builder()
+        .id("vessel/dev/ship-it/coder".to_string())
+        .kind(AwarenessKind::Vessel)
+        .label("coder".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .phase(flotilla_protocol::AwarenessPhase::Work(WorkPhase::Running))
+        .annotations(std::collections::HashMap::from([(KEY_VESSEL_HOST.to_string(), "feta".to_string())]))
+        .build();
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_string())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_string())
+        .state(AwarenessState::Waiting)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(2).issues(1).vessels(1).build())
+        .entries(vec![issue, vessel])
+        .build();
+
+    let catalog = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint());
+    let patches = catalog.reassert_patches();
+
+    let project = GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform");
+    let issue_patch = find(
+        &patches,
+        &group(vec![
+            project.clone(),
+            GroupSegment::text(SEGMENT_ISSUE, "issue/flotilla-org/flotilla/862").with_label("#862 awareness band"),
+        ]),
+    );
+    assert_eq!(text(issue_patch, KEY_STATUS_STATE), "waiting");
+    assert_eq!(issue_patch.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));
+
+    let vessel_patch =
+        find(&patches, &group(vec![project, GroupSegment::text(SEGMENT_VESSEL, "vessel/dev/ship-it/coder").with_label("coder")]));
+    assert_eq!(text(vessel_patch, KEY_WORK_PHASE), "running");
+    assert_eq!(text(vessel_patch, KEY_VESSEL_HOST), "feta");
+    assert_eq!(text(vessel_patch, KEY_MATERIALIZE_TARGET), "workspace");
+    assert_eq!(text(vessel_patch, KEY_MATERIALIZE_RECIPE), "flotilla view 'vessel/dev/ship-it/coder'");
+}
+
+#[test]
 fn convoy_with_project_ref_projects_the_full_spine() {
     let reference = convoy_ref("dev", "manifest-extraction");
     let convoy = ConvoyRow::builder()
@@ -87,12 +140,12 @@ fn convoy_with_project_ref_projects_the_full_spine() {
                     },
                 ])
                 .host(HostName::new("feta"))
-                .attach("workspace-1")
+                .materialize("terminal-implement")
                 .build(),
             vessel().convoy(&reference).name("review").phase(WorkPhase::Complete).call(),
         ])
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     // project_ref wins over the repo as the project segment value.
@@ -118,7 +171,7 @@ fn convoy_with_project_ref_projects_the_full_spine() {
     assert_eq!(text(implement, KEY_STATUS_STATE), "active");
     assert_eq!(text(implement, KEY_VESSEL_HOST), "feta");
     assert_eq!(text(implement, KEY_MATERIALIZE_TARGET), "workspace");
-    assert_eq!(text(implement, KEY_MATERIALIZE_RECIPE), "flotilla attach workspace-1");
+    assert_eq!(text(implement, KEY_MATERIALIZE_RECIPE), "flotilla attach terminal-implement");
     assert_eq!(text(implement, KEY_FACTORY_ID), "flotilla:convoys/dev/manifest-extraction/implement");
     assert_eq!(implement.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned(), "reviewer".to_owned()]));
 
@@ -139,7 +192,7 @@ fn failed_convoy_surfaces_attention_and_message() {
         .message("vessel checkout failed: disk full")
         .repo(RepoKey("flotilla-org/flotilla".to_owned()))
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let project_segment = GroupSegment::text(SEGMENT_PROJECT, "flotilla-org/flotilla");
@@ -159,7 +212,7 @@ fn initializing_convoy_reads_waiting_whatever_its_phase() {
         .phase(ConvoyPhase::Active)
         .initializing(true)
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let convoy_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_CONVOY, "dev/warming-up")]));
@@ -177,7 +230,7 @@ fn ready_vessel_waits_with_attention() {
         .phase(ConvoyPhase::Active)
         .vessels(vec![vessel().convoy(&reference).name("implement").phase(WorkPhase::Ready).call()])
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let implement =
@@ -195,7 +248,7 @@ fn independent_with_repo_groups_under_project_and_publishes_identity() {
         .repo("flotilla-org/flotilla")
         .attach("terminal-scratch")
         .call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let project_segment = GroupSegment::text(SEGMENT_PROJECT, "flotilla-org/flotilla");
@@ -224,7 +277,7 @@ fn independent_with_repo_groups_under_project_and_publishes_identity() {
 #[test]
 fn independent_without_repo_is_archipelago_ordered_first() {
     let independent = independent().namespace("dev").name("yeoman").phase(SessionPhase::Running).attach("yeoman").call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let group_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_VESSEL, "yeoman")]));
@@ -239,7 +292,7 @@ fn independent_without_repo_is_archipelago_ordered_first() {
 #[test]
 fn independent_without_attach_lists_without_recipe() {
     let independent = independent().namespace("dev").name("wedged").phase(SessionPhase::Failed).repo("flotilla-org/flotilla").call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let group_patch = find(
@@ -262,11 +315,11 @@ fn diff_sets_changes_and_unsets_disappearances() {
         .message("boom")
         .build();
     let old_independent = independent().namespace("dev").name("scratch").phase(SessionPhase::Running).attach("scratch").call();
-    let previous = project_catalog(&CatalogInput { convoys: &[failed], independents: &[old_independent] }, &mint());
+    let previous = project_catalog(&CatalogInput { awareness: None, convoys: &[failed], independents: &[old_independent] }, &mint());
 
     let recovered =
         ConvoyRow::builder().resource(reference).name("auth").workflow_ref("implement-review").phase(ConvoyPhase::Active).build();
-    let current = project_catalog(&CatalogInput { convoys: &[recovered], independents: &[] }, &mint());
+    let current = project_catalog(&CatalogInput { awareness: None, convoys: &[recovered], independents: &[] }, &mint());
 
     let patches = current.diff_patches(&previous);
 
@@ -294,7 +347,7 @@ fn diff_sets_changes_and_unsets_disappearances() {
 fn reassert_covers_every_target() {
     let independent =
         independent().namespace("dev").name("scratch").phase(SessionPhase::Running).repo("flotilla-org/flotilla").attach("scratch").call();
-    let catalog = project_catalog(&CatalogInput { convoys: &[], independents: &[independent] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
     assert_eq!(patches.len(), 3, "project group + independent group + independent identity");
     assert!(patches.iter().all(|patch| patch.unset.is_empty()));
@@ -312,7 +365,7 @@ fn shared_spine_helpers_match_the_catalog_targets() {
         .repo(RepoKey("flotilla-org/flotilla".to_owned()))
         .vessels(vec![vessel().convoy(&reference).name("implement").phase(WorkPhase::Running).call()])
         .build();
-    let catalog = project_catalog(&CatalogInput { convoys: &[convoy], independents: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     // The actuator's tab stamp builds its scope with these helpers; they

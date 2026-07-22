@@ -11,6 +11,7 @@ mod in_memory;
 mod labels;
 mod placement_policy;
 mod presentation;
+mod principal_attention;
 mod project;
 mod provisioning_identity;
 mod registry;
@@ -40,6 +41,7 @@ pub use environment::{
     EnvironmentStatusPatch, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
+pub use flotilla_protocol::PrincipalRef;
 pub use host::{Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, TERMINAL_POOLS_CAPABILITY};
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
@@ -52,14 +54,18 @@ pub use placement_policy::{
     PlacementPolicy, PlacementPolicySpec,
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
+pub use principal_attention::{
+    Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, Regard,
+    RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
+};
 pub use project::{
     normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,
     ProjectRepositorySpec, ProjectSpec,
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
-    get_resource_kind, list_resource_kind, resource_list_api_version, watch_resource_kind, DynamicResourceList, DynamicResourceObject,
-    DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    apply_resource_document, get_resource_kind, list_resource_kind, resource_list_api_version, watch_resource_kind, DynamicResourceList,
+    DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
 pub use repository::{
     ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,

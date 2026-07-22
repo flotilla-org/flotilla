@@ -218,7 +218,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         CommandValue::RepoUntracked { path } => {
             info!(path = %path.display(), "untracked repo");
         }
-        CommandValue::Refreshed { repos } => {
+        CommandValue::Refreshed { repos, .. } => {
             info!(count = repos.len(), "refresh completed");
         }
         CommandValue::CheckoutCreated { branch, .. } => {
@@ -895,7 +895,10 @@ mod tests {
     #[test]
     fn repo_tracked_does_not_set_status_message() {
         let mut app = stub_app();
-        handle_result(CommandValue::RepoTracked { path: PathBuf::from("/tmp/new-repo"), resolved_from: None }, &mut app);
+        handle_result(
+            CommandValue::RepoTracked { path: PathBuf::from("/tmp/new-repo"), resolved_from: None, identity_change: None },
+            &mut app,
+        );
         assert!(app.model.status_message.is_none());
         assert!(app.proto_commands.take_next().is_none());
     }
@@ -911,7 +914,13 @@ mod tests {
     #[test]
     fn refreshed_does_not_set_status_message() {
         let mut app = stub_app();
-        handle_result(CommandValue::Refreshed { repos: vec![PathBuf::from("/tmp/repo-a"), PathBuf::from("/tmp/repo-b")] }, &mut app);
+        handle_result(
+            CommandValue::Refreshed {
+                repos: vec![PathBuf::from("/tmp/repo-a"), PathBuf::from("/tmp/repo-b")],
+                identity_changes: Vec::new(),
+            },
+            &mut app,
+        );
         assert!(app.model.status_message.is_none());
         assert!(app.proto_commands.take_next().is_none());
     }
