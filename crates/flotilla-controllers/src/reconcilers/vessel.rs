@@ -533,10 +533,14 @@ impl Reconciler for VesselReconciler {
             }
         };
         let terminal_cwd = strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories);
+        let issue_repository_refs = convoy.spec.issues.iter().map(|issue| issue.repository_ref.as_ref()).collect::<Vec<_>>();
+        let copy_to_all_repositories = issue_repository_refs.iter().any(|repository_ref| repository_ref.is_none());
         let brief_copies = checkout_paths
             .iter()
             .filter(|(repo_ref, _)| {
-                convoy.spec.issue.as_ref().and_then(|issue| issue.repository_ref.as_ref()).is_none_or(|relevant| relevant == *repo_ref)
+                copy_to_all_repositories
+                    || issue_repository_refs.is_empty()
+                    || issue_repository_refs.iter().flatten().any(|relevant| *relevant == *repo_ref)
             })
             .map(|(repo_ref, path)| match &strategy {
                 PlacementStrategy::DockerWorktreeOnHostAndMount { mount_path, .. } => {
@@ -614,7 +618,7 @@ impl Reconciler for VesselReconciler {
                                 .collect::<Vec<_>>();
                             let assignment = match prompt.as_deref() {
                                 Some(prompt) => CrewAssignment::Prompt(prompt),
-                                None if convoy.spec.issue.is_some() => CrewAssignment::CarriedIssue,
+                                None if !convoy.spec.issues.is_empty() => CrewAssignment::CarriedIssue,
                                 None => CrewAssignment::Unassigned,
                             };
                             let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, assignment, &members);

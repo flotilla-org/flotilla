@@ -440,7 +440,7 @@ impl App {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: Some(namespace),
                         project_ref: project,
-                        issue: Some(IssueSelector::Reference(issue)),
+                        issues: vec![IssueSelector::Reference(issue)],
                         name: None,
                         branch: None,
                         workflow_ref: None,
@@ -460,7 +460,7 @@ impl App {
                         intent: Box::new(ConvoyStartIntent {
                             namespace: Some(namespace.clone()),
                             project_ref: project.clone(),
-                            issue: Some(IssueSelector::Reference(issue.issue.clone())),
+                            issues: vec![IssueSelector::Reference(issue.issue.clone())],
                             name: None,
                             branch: None,
                             workflow_ref: None,
@@ -488,6 +488,31 @@ impl App {
                         view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).multi_selected.clear();
                     }
                 }
+                return;
+            }
+            TableIntent::StartBatchConvoy { namespace, project, issues } => {
+                let Some(address) = self.views.active_address().cloned() else { return };
+                let issue_count = issues.len();
+                self.proto_commands.push(self.command(CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: Some(namespace),
+                        project_ref: project,
+                        issues: issues.into_iter().map(|issue| IssueSelector::Reference(issue.issue)).collect(),
+                        name: None,
+                        branch: None,
+                        workflow_ref: None,
+                        inputs: Vec::new(),
+                        instruction: None,
+                        placement_policy: None,
+                        auto_attach: true,
+                    }),
+                }));
+                if let Some(index) = self.views.find(&address) {
+                    if let Some(view) = self.views.get_mut(index) {
+                        view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).multi_selected.clear();
+                    }
+                }
+                self.set_status_message(Some(format!("Starting batch convoy for {issue_count} issues...")));
                 return;
             }
         };

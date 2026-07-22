@@ -10,7 +10,9 @@ use std::{
 };
 
 use flotilla_protocol::{
-    result_set::{CheckoutRow, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows},
+    result_set::{
+        CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows,
+    },
     HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
 use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
@@ -217,6 +219,21 @@ impl AggregatorProjectionState {
         self.demand_backed.apply_issue_changes(query, generation, changed, removed, state)
     }
 
+    pub async fn represented_issue_refs(&self) -> HashSet<IssueRef> {
+        let convoys = self.convoys.read().await;
+        convoys
+            .local_rows
+            .values()
+            .chain(convoys.replica_rows.values().flat_map(|rows| rows.values()))
+            .filter(|convoy| convoy_phase_represents_issues(convoy.phase))
+            .flat_map(|convoy| convoy.issues.iter().map(|issue| issue.reference.clone()))
+            .collect()
+    }
+
+    pub fn suppress_issues(&self, represented: &HashSet<IssueRef>) -> Vec<ResultDelta> {
+        self.demand_backed.suppress_issues(represented)
+    }
+
     /// The current fleet-merged result set for one named query.
     pub async fn result_set_for(&self, query: &QueryId) -> Option<ResultSet> {
         match query {
@@ -226,4 +243,8 @@ impl AggregatorProjectionState {
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
         }
     }
+}
+
+fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
+    matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active)
 }

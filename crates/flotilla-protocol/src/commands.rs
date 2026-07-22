@@ -108,10 +108,10 @@ pub struct Command {
     pub action: CommandAction,
 }
 
-/// An issue supplied to convoy admission either as a fully source-qualified
+/// One issue supplied to convoy admission either as a fully source-qualified
 /// reference or as an opaque ID whose source must be resolved through the
-/// Project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Project. A start intent may carry several selectors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum IssueSelector {
     Id(String),
@@ -120,6 +120,8 @@ pub enum IssueSelector {
 
 /// Partial intent accepted by the convoy start verb. Admission completes any
 /// omitted fields before persisting a `ConvoySpec`.
+/// `issues` contains zero or more issue selectors to snapshot into the
+/// admitted convoy.
 ///
 /// This type lives in protocol rather than resources because incomplete
 /// intent must never enter the resource store.
@@ -128,8 +130,9 @@ pub struct ConvoyStartIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub project_ref: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue: Option<IssueSelector>,
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<IssueSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

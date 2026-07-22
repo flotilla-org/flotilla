@@ -204,11 +204,11 @@ impl ConvoyNoun {
                 if self.subject.is_some() {
                     return Err("convoy start does not take a positional convoy name; use --name".to_string());
                 }
-                let issue = match (issue, issue_service, issue_scope) {
-                    (None, None, None) => None,
-                    (Some(id), None, None) => Some(IssueSelector::Id(id)),
+                let issues = match (issue, issue_service, issue_scope) {
+                    (None, None, None) => Vec::new(),
+                    (Some(id), None, None) => vec![IssueSelector::Id(id)],
                     (Some(id), Some(service), Some(scope)) => {
-                        Some(IssueSelector::Reference(IssueRef { source: IssueSource { service, scope }, id }))
+                        vec![IssueSelector::Reference(IssueRef { source: IssueSource { service, scope }, id })]
                     }
                     (None, Some(_), _) | (None, _, Some(_)) => {
                         return Err("--issue-service and --issue-scope require --issue".to_string());
@@ -226,7 +226,7 @@ impl ConvoyNoun {
                             intent: Box::new(ConvoyStartIntent {
                                 namespace: None,
                                 project_ref: project,
-                                issue,
+                                issues,
                                 name,
                                 branch,
                                 workflow_ref: workflow,
@@ -253,7 +253,7 @@ impl ConvoyNoun {
                                 intent: Box::new(ConvoyStartIntent {
                                     namespace: None,
                                     project_ref: project_ref.clone(),
-                                    issue: None,
+                                    issues: Vec::new(),
                                     name: Some(name),
                                     branch: r#ref,
                                     workflow_ref: Some(template),
@@ -509,10 +509,10 @@ mod tests {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: None,
                         project_ref: "widgets".into(),
-                        issue: Some(IssueSelector::Reference(IssueRef {
+                        issues: vec![IssueSelector::Reference(IssueRef {
                             source: IssueSource { service: "https://linear.app".into(), scope: "WIDGET".into() },
                             id: "WIDGET-732".into(),
-                        })),
+                        })],
                         name: Some("repair-widget-admission".into()),
                         branch: Some("fix/repair-widget-admission".into()),
                         workflow_ref: Some("single-agent-contained".into()),
@@ -541,7 +541,7 @@ mod tests {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: None,
                         project_ref: "flotilla".into(),
-                        issue: Some(IssueSelector::Id("834".into())),
+                        issues: vec![IssueSelector::Id("834".into())],
                         name: None,
                         branch: None,
                         workflow_ref: None,
@@ -642,7 +642,7 @@ mod tests {
             intent: Box::new(ConvoyStartIntent {
                 namespace: None,
                 project_ref: "widgets".into(),
-                issue: None,
+                issues: Vec::new(),
                 name: Some("project-work".into()),
                 branch: Some("fix/widgets".into()),
                 workflow_ref: Some("single-agent-contained".into()),

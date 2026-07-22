@@ -593,7 +593,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
@@ -2777,7 +2777,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await
@@ -3234,7 +3234,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await

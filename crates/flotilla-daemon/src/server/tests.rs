@@ -306,7 +306,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
             r#ref: None,
             project_ref: None,
             adopted_checkout_refs: BTreeMap::new(),
-            issue: None,
+            issues: Vec::new(),
             instruction: None,
         })
         .await

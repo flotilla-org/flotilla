@@ -48,6 +48,7 @@ impl IssueMaterializationResolver for InProcessDaemon {
 
 enum MaterializationIntent {
     FetchMore,
+    Refilter,
     #[cfg(test)]
     Refresh,
 }
@@ -124,6 +125,14 @@ impl IssueMaterializer {
         }
     }
 
+    pub(crate) fn refilter_active_queries(&self) {
+        for (query, active) in &self.active {
+            if let Err(error) = active.intents.try_send(MaterializationIntent::Refilter) {
+                tracing::warn!(%query, %error, "could not enqueue issue refilter intent");
+            }
+        }
+    }
+
     #[cfg(test)]
     fn refresh(&self, query: &QueryId) {
         self.active.get(query).expect("active materialization").intents.try_send(MaterializationIntent::Refresh).expect("enqueue refresh");
@@ -154,6 +163,16 @@ struct MaterializedWindow {
     conditions: Vec<ResultSetCondition>,
 }
 
+impl MaterializedWindow {
+    fn rows(&self) -> Vec<IssueRow> {
+        self.sources.iter().flat_map(|source| source.rows.values().cloned()).collect()
+    }
+
+    fn has_more(&self) -> bool {
+        self.sources.iter().any(|source| source.has_more)
+    }
+}
+
 async fn run_materialization(
     query: QueryId,
     generation: u64,
@@ -177,6 +196,9 @@ async fn run_materialization(
                         _ = cancel.cancelled() => return,
                         _ = fetch_more(&query, generation, &mut window, &state, &event_tx) => {}
                     }
+                }
+                Some(MaterializationIntent::Refilter) => {
+                    publish_loaded_window(&query, generation, window.rows(), window.has_more(), window.conditions.clone(), &state, &event_tx).await;
                 }
                 #[cfg(test)]
                 Some(MaterializationIntent::Refresh) => {
@@ -262,11 +284,9 @@ async fn load_window(
             Err(condition) => conditions.push(condition),
         }
     }
-    let has_more = windows.iter().any(|window| window.has_more);
-    let mut rows = rows.into_values().collect::<Vec<_>>();
-    sort_rows(&mut rows);
+    let rows = rows.into_values().collect::<Vec<_>>();
     let needs_full_reload = !conditions.is_empty();
-    publish_window(query, generation, rows, has_more, conditions.clone(), state, event_tx);
+    publish_loaded_window(query, generation, rows, windows.iter().any(|window| window.has_more), conditions.clone(), state, event_tx).await;
     MaterializedWindow { sources: windows, needs_full_reload, conditions }
 }
 
@@ -315,6 +335,7 @@ async fn fetch_more(
         }
     }
     window.conditions = conditions.clone();
+    suppress_represented_rows(&mut changed, state).await;
     sort_rows(&mut changed);
     let result_state = demand_state(window.sources.iter().any(|source| source.has_more), conditions);
     // Metadata-only deltas are significant: an empty final page must still
@@ -418,6 +439,7 @@ async fn refresh_window(
     }
 
     let mut changed = changed.into_values().collect::<Vec<_>>();
+    suppress_represented_rows(&mut changed, state).await;
     sort_rows(&mut changed);
     let mut removed = removed.into_iter().collect::<Vec<_>>();
     removed.sort();
@@ -442,6 +464,20 @@ fn publish_window(
     }
 }
 
+async fn publish_loaded_window(
+    query: &QueryId,
+    generation: u64,
+    mut rows: Vec<IssueRow>,
+    has_more: bool,
+    conditions: Vec<ResultSetCondition>,
+    state: &AggregatorProjectionState,
+    event_tx: &broadcast::Sender<DaemonEvent>,
+) {
+    suppress_represented_rows(&mut rows, state).await;
+    sort_rows(&mut rows);
+    publish_window(query, generation, rows, has_more, conditions, state, event_tx);
+}
+
 fn demand_state(has_more: bool, conditions: Vec<ResultSetCondition>) -> ResultSetState {
     ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions }
 }
@@ -456,6 +492,11 @@ fn issue_row(issue: flotilla_protocol::Issue) -> IssueRow {
 
 fn sort_rows(rows: &mut [IssueRow]) {
     rows.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference));
+}
+
+async fn suppress_represented_rows(rows: &mut Vec<IssueRow>, state: &AggregatorProjectionState) {
+    let represented = state.represented_issue_refs().await;
+    rows.retain(|row| !represented.contains(&row.reference));
 }
 
 async fn query_page(
@@ -480,7 +521,12 @@ mod tests {
     use std::collections::VecDeque;
 
     use chrono::Duration as ChronoDuration;
-    use flotilla_protocol::{issue_query::IssueResultPage, test_support::TestIssue, Issue, IssueChangeset, QueryCursor};
+    use flotilla_protocol::{
+        issue_query::IssueResultPage,
+        result_set::{ConvoyIssueRow, ConvoyPhase, ConvoyRow},
+        test_support::TestIssue,
+        Issue, IssueChangeset, QueryCursor, ResourceRef,
+    };
     use tokio::sync::{Mutex, Notify};
     use uuid::Uuid;
 
@@ -734,6 +780,50 @@ mod tests {
         assert_eq!(result.rows.as_issues().expect("issue rows")[0].reference, IssueRef { source, id: "WIDGET-123".into() });
         assert!(!result.state.demand.expect("demand metadata").has_more);
         assert!(result.state.conditions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refilter_republishes_loaded_issue_rows_when_convoy_representation_changes() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("repo_widget");
+        let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
+        let represented = IssueRef { source: source.clone(), id: "WIDGET-810".into() };
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["WIDGET-809", "WIDGET-810"], false)], vec![]));
+        let (materializer, mut events) = manager(&state, &query, vec![source], provider);
+        let _ = next_event(&mut events).await;
+        let resource = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "batch");
+
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows.insert(
+                resource.clone(),
+                ConvoyRow::builder()
+                    .resource(resource.clone())
+                    .name("batch")
+                    .workflow_ref("workflow")
+                    .phase(ConvoyPhase::Active)
+                    .issues(vec![ConvoyIssueRow {
+                        reference: represented.clone(),
+                        title: "Issue WIDGET-810".into(),
+                        state: IssueState::Open,
+                    }])
+                    .build(),
+            );
+        }
+        materializer.refilter_active_queries();
+        let DaemonEvent::ResultSet(suppressed) = next_event(&mut events).await else { panic!("refilter must emit a result set") };
+        assert_eq!(
+            suppressed.rows.as_issues().expect("suppressed issue rows").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>(),
+            vec!["WIDGET-809"]
+        );
+
+        state.write().await.local_rows.get_mut(&resource).expect("represented convoy row").phase = ConvoyPhase::Completed;
+        materializer.refilter_active_queries();
+        let DaemonEvent::ResultSet(restored) = next_event(&mut events).await else { panic!("refilter must emit a result set") };
+        assert_eq!(
+            restored.rows.as_issues().expect("restored issue rows").iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>(),
+            vec!["WIDGET-810", "WIDGET-809"]
+        );
     }
 
     #[tokio::test]

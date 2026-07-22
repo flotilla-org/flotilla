@@ -44,7 +44,7 @@ async fn convoy_persists_source_qualified_issue_snapshot_and_instruction() {
     let convoys = backend.using::<Convoy>("flotilla");
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let mut spec = valid_convoy_spec();
-    spec.issue = Some(ConvoyIssue {
+    spec.issues.push(ConvoyIssue {
         reference: IssueRef {
             source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
             id: "WIDGET-732".into(),
@@ -63,7 +63,7 @@ async fn convoy_persists_source_qualified_issue_snapshot_and_instruction() {
     convoys.create(&convoy_meta("issue-work"), &spec).await.expect("convoy create");
     let persisted = convoys.get("issue-work").await.expect("convoy get");
 
-    assert_eq!(persisted.spec.issue, spec.issue);
+    assert_eq!(persisted.spec.issues, spec.issues);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Preserve the public API."));
 }
 

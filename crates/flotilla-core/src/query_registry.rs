@@ -114,6 +114,38 @@ impl QueryRegistry {
         })
     }
 
+    pub fn suppress_issues(&self, represented: &HashSet<IssueRef>) -> Vec<ResultDelta> {
+        if represented.is_empty() {
+            return Vec::new();
+        }
+        let mut registry = self.inner.lock().expect("query registry lock poisoned");
+        let mut deltas = Vec::new();
+        for (query, current) in &mut registry.demand_backed {
+            let QueryId::Issues { scope, search } = query else { continue };
+            let Rows::Issues { rows, .. } = &mut current.rows else { continue };
+            let mut removed = Vec::new();
+            rows.retain(|row| {
+                let suppress = represented.contains(&row.reference);
+                if suppress {
+                    removed.push(row.reference.clone());
+                }
+                !suppress
+            });
+            if removed.is_empty() {
+                continue;
+            }
+            removed.sort();
+            current.seq = current.seq.saturating_add(1);
+            let result_state = current.state.clone();
+            deltas.push(ResultDelta {
+                seq: current.seq,
+                changes: QueryChanges::Issues { scope: scope.clone(), search: search.clone(), changed: Vec::new(), removed },
+                state: Some(result_state.clone()),
+            });
+        }
+        deltas
+    }
+
     pub fn subscribe_demand(&self) -> watch::Receiver<HashMap<QueryId, u64>> {
         self.demand_tx.subscribe()
     }
@@ -191,7 +223,7 @@ fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
 
 #[cfg(test)]
 mod tests {
-    use flotilla_protocol::QueryScope;
+    use flotilla_protocol::{Issue, IssueSource, IssueState, QueryScope};
 
     use super::*;
 
@@ -201,6 +233,25 @@ mod tests {
 
     fn cursor(query: QueryId) -> QueryCursor {
         QueryCursor { query, since: None }
+    }
+
+    fn issue_row(id: &str) -> IssueRow {
+        let reference =
+            IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: id.into() };
+        IssueRow {
+            reference: reference.clone(),
+            issue: Issue {
+                reference,
+                title: format!("Issue {id}"),
+                body: None,
+                state: IssueState::Open,
+                labels: Vec::new(),
+                as_of: Utc::now(),
+                association_keys: Vec::new(),
+                provider_name: "github".into(),
+                provider_display_name: "GitHub".into(),
+            },
+        }
     }
 
     #[test]
@@ -238,6 +289,29 @@ mod tests {
         assert!(result.rows.is_empty());
         assert!(matches!(result.state.conditions.as_slice(), [ResultSetCondition::IssueSourceUnavailable { source: None, .. }]));
         assert!(result.state.demand.is_some());
+    }
+
+    #[test]
+    fn suppress_issues_removes_represented_rows_from_live_issue_sets() {
+        let registry = QueryRegistry::default();
+        let query = issues("represented");
+        registry.replace(Uuid::new_v4(), &[cursor(query.clone())]);
+        let generation = registry.generation(&query);
+        let ready = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }), conditions: vec![] };
+        registry.replace_issues(&query, generation, vec![issue_row("809"), issue_row("810")], ready).expect("issue window");
+
+        let represented = HashSet::from([IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "810".into(),
+        }]);
+        let deltas = registry.suppress_issues(&represented);
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].changes.removed_issues().expect("removed issue refs"), represented.iter().cloned().collect::<Vec<_>>());
+        let result = registry.result_set(&query).expect("live issue window");
+        let Rows::Issues { rows, .. } = result.rows else { panic!("expected issue rows") };
+        assert_eq!(rows.iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>(), vec!["809"]);
+        assert!(result.state.demand.as_ref().expect("demand metadata").has_more, "suppression should preserve demand metadata");
     }
 
     #[test]
