@@ -1028,8 +1028,19 @@ fn input_meta_from_resource<T: Resource>(resource: &flotilla_resources::Resource
         .build()
 }
 
-fn handoff_crew_brief(context: &ResolvedCrewContext, target: &str, prompt: Option<&str>, members: &[CrewListMember]) -> TerminalBrief {
-    crate::agent_adapter::build_crew_brief(
+fn handoff_crew_brief(
+    context: &ResolvedCrewContext,
+    convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
+    target: &str,
+    prompt: Option<&str>,
+    members: &[CrewListMember],
+) -> TerminalBrief {
+    let assignment = match prompt {
+        Some(prompt) => crate::agent_adapter::CrewAssignment::Prompt(prompt),
+        None if convoy.spec.issue.is_some() => crate::agent_adapter::CrewAssignment::CarriedIssue,
+        None => crate::agent_adapter::CrewAssignment::Unassigned,
+    };
+    let mut brief = crate::agent_adapter::build_crew_brief(
         &TerminalCrewContext {
             namespace: context.namespace.clone(),
             convoy: context.convoy.clone(),
@@ -1037,7 +1048,7 @@ fn handoff_crew_brief(context: &ResolvedCrewContext, target: &str, prompt: Optio
         },
         &context.vessel,
         target,
-        prompt.map_or(crate::agent_adapter::CrewAssignment::Unassigned, crate::agent_adapter::CrewAssignment::Prompt),
+        assignment,
         &members
             .iter()
             .map(|member| crate::agent_adapter::CrewBriefMember {
@@ -1046,7 +1057,10 @@ fn handoff_crew_brief(context: &ResolvedCrewContext, target: &str, prompt: Optio
                 is_agent: member.kind == "agent",
             })
             .collect::<Vec<_>>(),
-    )
+    );
+    let repository_refs = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
+    crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, &repository_refs);
+    brief
 }
 
 fn pending_crew_message(text: &str) -> TerminalCrewMessage {
@@ -4566,7 +4580,7 @@ impl InProcessDaemon {
                         .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?
                 };
                 let current = self.crew_list_internal(requested).await?;
-                let brief = handoff_crew_brief(&context, target, prompt.as_deref(), &current.members);
+                let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members);
                 sessions
                     .create(&identity.input_meta(), &flotilla_resources::TerminalSessionSpec {
                         env_ref: anchor.spec.env_ref,

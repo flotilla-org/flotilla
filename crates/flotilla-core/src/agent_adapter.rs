@@ -72,6 +72,45 @@ pub fn build_crew_brief(
     flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() }
 }
 
+/// Appends the convoy's work context (branch, repositories, assigned issue, human
+/// instruction) to a crew brief. Every brief whose assignment is
+/// [`CrewAssignment::CarriedIssue`] must pass through here — the assignment text
+/// points at the `## Assigned issue` section this writes.
+pub fn append_convoy_work_context(
+    content: &mut String,
+    convoy: &flotilla_resources::ResourceObject<flotilla_resources::Convoy>,
+    repository_refs: &[flotilla_resources::RepositoryKey],
+) {
+    content.push_str("\n\n## Work context\n\n");
+    if let Some(branch) = &convoy.spec.r#ref {
+        content.push_str(&format!("- Branch: `{branch}`\n"));
+    }
+    content.push_str("- Repositories:\n");
+    for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
+        content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
+    }
+    if let Some(issue) = &convoy.spec.issue {
+        content.push_str("\n## Assigned issue\n\n");
+        content.push_str(&format!(
+            "Source-qualified reference: `{}` / `{}` / `{}`\n\n",
+            issue.reference.source.service, issue.reference.source.scope, issue.reference.id
+        ));
+        content.push_str(&format!("Snapshot as of `{}`.\n\n", issue.snapshot.as_of.to_rfc3339()));
+        content.push_str(&format!("### {}\n\n", issue.snapshot.title));
+        content.push_str(&format!("State: `{:?}`\n\n", issue.snapshot.state).to_lowercase());
+        content.push_str(&format!("Labels: {}\n\n", issue.snapshot.labels.join(", ")));
+        if let Some(body) = &issue.snapshot.body {
+            content.push_str(body);
+            content.push('\n');
+        }
+    }
+    if let Some(instruction) = &convoy.spec.instruction {
+        content.push_str("\n## Human instruction\n\n");
+        content.push_str(instruction);
+        content.push('\n');
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLaunchRequest {
     pub role: String,
