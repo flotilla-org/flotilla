@@ -268,6 +268,49 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
 }
 
 #[tokio::test]
+async fn tracking_after_custom_project_identity_change_does_not_create_generated_twin() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    let checkout_path = tmp.path().join("custom-repo");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
+    let inspected_spec = Arc::new(RwLock::new(local_spec));
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+
+    assert_eq!(
+        execute_project_add(
+            &daemon,
+            &mut rx,
+            checkout_path.to_string_lossy().into_owned(),
+            Some("my-custom-project"),
+            Some("My Custom Project"),
+        )
+        .await,
+        CommandValue::ProjectAdded { name: "my-custom-project".into() }
+    );
+
+    let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/custom-repo").expect("remote repository spec");
+    let remote_key = remote_spec.key();
+    *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let track_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path },
+        })
+        .await
+        .expect("track repo after remote appears");
+    assert!(matches!(await_command_result(&mut rx, track_id).await, CommandValue::RepoTracked { .. }));
+
+    let projects = backend.using::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.items.len(), 1, "identity migration must not create a generated twin for a custom-named project");
+    assert_eq!(projects.items[0].metadata.name, "my-custom-project");
+    assert_eq!(projects.items[0].spec.display_name, "My Custom Project");
+    assert_eq!(projects.items[0].spec.repositories[0].repo, remote_key);
+}
+
+#[tokio::test]
 async fn refresh_surfaces_and_reconciles_repository_identity_change() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();

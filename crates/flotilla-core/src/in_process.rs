@@ -3765,12 +3765,11 @@ impl InProcessDaemon {
 
         let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
-        let primary_name = whole_repository_project_names(repository_spec)?.into_iter().find(|candidate| {
-            project_objects.iter().any(|project| {
-                project.metadata.name == *candidate
-                    && project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none())
-            })
-        });
+        let primary_name = project_objects
+            .iter()
+            .filter(|project| project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()))
+            .min_by_key(|project| (generated_names.contains(&project.metadata.name), project.metadata.name.as_str()))
+            .map(|project| project.metadata.name.clone());
         if let Some(primary_name) = &primary_name {
             for duplicate in project_objects.iter().filter(|project| {
                 project.metadata.name != *primary_name && generated_names.contains(&project.metadata.name) && project.spec == spec
