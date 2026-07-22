@@ -127,7 +127,7 @@ impl TerminalRuntime for FakeTerminalRuntime {
         })
     }
 
-    async fn kill_session(&self, _session_id: &str) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
         Ok(())
     }
 }

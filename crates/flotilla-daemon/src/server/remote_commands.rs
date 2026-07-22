@@ -130,6 +130,9 @@ impl RemoteCommandRouter {
         if matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
             return Err("prepared convoy starts are reserved for authenticated peer forwarding".to_string());
         }
+        if let Some(target_node_id) = self.daemon.resolve_existing_convoy_target_node(&command.action).await? {
+            command.node_id = Some(target_node_id);
+        }
         if let CommandAction::ConvoyStart { intent } = &command.action {
             let placement_target = self.daemon.resolve_convoy_start_target_node(intent).await?;
             let intended_target = placement_target.as_ref().unwrap_or_else(|| self.daemon.node_id());
@@ -148,7 +151,14 @@ impl RemoteCommandRouter {
         info!(%target_node_id, %local, %desc, "dispatch_execute");
         if target_node_id != *self.daemon.node_id() {
             if command.action.is_query()
-                || matches!(command.action, CommandAction::ConvoyStartPrepared { .. } | CommandAction::ResourceWatch { .. })
+                || matches!(
+                    command.action,
+                    CommandAction::ConvoyStartPrepared { .. }
+                        | CommandAction::ConvoyDelete { .. }
+                        | CommandAction::ConvoyAbandon { .. }
+                        | CommandAction::ConvoyWorkForceComplete { .. }
+                        | CommandAction::ResourceWatch { .. }
+                )
             {
                 let request_id = {
                     let mut pm = self.peer_manager.lock().await;
