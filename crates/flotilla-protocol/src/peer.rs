@@ -477,7 +477,7 @@ mod tests {
             requester_node_id: NodeId::new("workstation"),
             responder_node_id: NodeId::new("feta"),
             remaining_hops: 7,
-            result: Box::new(CommandValue::RepoTracked { path: PathBuf::from("/srv/repo"), resolved_from: None }),
+            result: Box::new(CommandValue::RepoTracked { path: PathBuf::from("/srv/repo"), resolved_from: None, identity_change: None }),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: RoutedPeerMessage = serde_json::from_str(&json).expect("deserialize");

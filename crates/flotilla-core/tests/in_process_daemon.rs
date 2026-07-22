@@ -4491,7 +4491,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
         .add_virtual_repo(identity.clone(), None, PathBuf::from("/remote/desktop/owner/repo"), vec![], 0)
         .await
         .expect("add virtual repo");
-    let (tracked_path, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
+    let (tracked_path, _, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
     // Path may be canonicalized (e.g. /var -> /private/var on macOS)
     let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
 
@@ -5308,7 +5308,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
         )))
         .expect("replace local environment bag");
 
-    let (tracked_path, resolved_from) = daemon.add_repo(&repo).await.expect("add repo");
+    let (tracked_path, resolved_from, _) = daemon.add_repo(&repo).await.expect("add repo");
 
     assert_eq!(tracked_path, repo);
     assert_eq!(resolved_from, None);

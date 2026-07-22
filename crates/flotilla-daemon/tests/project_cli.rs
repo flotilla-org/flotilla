@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -15,10 +15,10 @@ use flotilla_core::{
     repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
+use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName};
 use flotilla_resources::{
-    Checkout, Convoy, InMemoryBackend, InputMeta, IssueSource, Project, Repository, RepositoryKey, RepositorySpec, RepositoryStatus,
-    ResourceBackend,
+    Checkout, Convoy, InMemoryBackend, InputMeta, IssueSource, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec,
+    RepositoryStatus, ResourceBackend,
 };
 
 fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
@@ -54,6 +54,27 @@ async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigSto
 struct FixedInspector {
     spec: RepositorySpec,
     host_ref: String,
+}
+
+#[derive(Clone)]
+struct MutableInspector {
+    spec: Arc<RwLock<RepositorySpec>>,
+}
+
+#[async_trait]
+impl RepositoryInspector for MutableInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: self.spec.read().expect("repository identity lock should not be poisoned").clone(),
+            checkout: LocalCheckoutInspection {
+                path: path.to_path_buf(),
+                host_ref: "host-01".to_string(),
+                git_ref: "main".to_string(),
+                is_main: true,
+            },
+            transport_url: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -142,6 +163,108 @@ async fn tracking_repo_materializes_whole_repo_project() {
         subpath: None,
         default_branch: None,
     }]);
+}
+
+#[tokio::test]
+async fn retracking_path_after_remote_appears_migrates_repository_identity() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    let checkout_path = tmp.path().join("andamento");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
+    let local_key = local_spec.key();
+    let inspected_spec = Arc::new(RwLock::new(local_spec));
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+
+    let first_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
+        })
+        .await
+        .expect("initial repo add");
+    assert!(matches!(await_command_result(&mut rx, first_id).await, CommandValue::RepoTracked { .. }));
+
+    let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/andamento").expect("remote repository spec");
+    let remote_key = remote_spec.key();
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(remote_key.to_string()).build(), &remote_spec)
+        .await
+        .expect("stale remote repository generation");
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("github-com-flotilla-org-andamento".to_string()).build(),
+            &ProjectSpec::builder()
+                .display_name("andamento".to_string())
+                .default_workflow_ref("single-agent-contained".to_string())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(remote_key.clone()).build()])
+                .build(),
+        )
+        .await
+        .expect("stale disambiguated project twin");
+    *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let second_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
+        })
+        .await
+        .expect("repo add after remote appears");
+    assert_eq!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked {
+        path: checkout_path.clone(),
+        resolved_from: None,
+        identity_change: Some(RepositoryIdentityChange {
+            previous: "local".to_string(),
+            current: "https://github.com/flotilla-org/andamento".to_string(),
+        }),
+    });
+
+    let projects = backend.using::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.items.len(), 1, "identity migration must not leave a disambiguated twin");
+    assert_eq!(projects.items[0].metadata.name, "andamento");
+    assert_eq!(projects.items[0].spec.repositories[0].repo, remote_key);
+    let repositories = backend.using::<Repository>("flotilla").list().await.expect("repository list");
+    assert_eq!(repositories.items.len(), 1, "superseded repository identities should be garbage-collected");
+    assert_eq!(repositories.items[0].metadata.name, remote_key.to_string());
+    assert!(backend.using::<Repository>("flotilla").get(&local_key.to_string()).await.is_err());
+
+    let repository = backend.clone().using::<Repository>("flotilla").get(&remote_key.to_string()).await.expect("remote repository");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .update_status(&repository.metadata.name, &repository.metadata.resource_version, &RepositoryStatus {
+            default_branch: Some("main".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("repository status update");
+    let convoy_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "identity-migrated".into(),
+                workflow_ref: "scratch".into(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: Some("andamento".into()),
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("convoy create");
+    assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated { name: "identity-migrated".into() });
 }
 
 #[tokio::test]

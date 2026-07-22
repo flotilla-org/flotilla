@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
+    commands::RepositoryIdentityChange,
     qualified_path::QualifiedPath,
     result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry,
@@ -2489,14 +2490,21 @@ impl InProcessDaemon {
                 }
             };
             let repository_key = inspection.key();
-            if let Err(error) = flotilla_resources::ensure_repository(
-                &self.resource_backend.clone().using::<Repository>(&namespace),
-                &repository_key,
-                &inspection.spec,
-            )
-            .await
-            {
-                warn!(repo = %identity.path, %error, "failed to ensure repository for observed checkouts");
+            let stored_key = self.repository_keys_by_path.read().await.get(&local_root).cloned();
+            let reconcile_result = if stored_key.as_ref() == Some(&repository_key) {
+                flotilla_resources::ensure_repository(
+                    &self.resource_backend.clone().using::<Repository>(&namespace),
+                    &repository_key,
+                    &inspection.spec,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            } else {
+                self.reconcile_whole_repository_project(&inspection).await.map(|_| ())
+            };
+            if let Err(error) = reconcile_result {
+                warn!(repo = %identity.path, %error, "failed to reconcile repository identity for observed checkouts");
                 continue;
             }
             let _reconciliation = self.observed_checkout_reconciliation.lock().await;
@@ -2904,6 +2912,41 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
         issue_source: None,
         repositories: vec![ProjectRepositorySpec { repo: repository_key, subpath: None, default_branch: None }],
     })
+}
+
+fn whole_repository_project_names(repository_spec: &RepositorySpec) -> Result<Vec<String>, String> {
+    let repository_key = repository_spec.key();
+    let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
+    let catalog_name = normalize_project_name(&repository_spec.catalog_slug())?;
+    let key_suffix = repository_key.0.chars().take(8).collect::<String>();
+    let disambiguated_name = format!("{catalog_name}-{key_suffix}");
+    let mut candidates = Vec::new();
+    for candidate in [display_name, catalog_name, disambiguated_name] {
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+fn repository_identity_display(spec: &RepositorySpec) -> String {
+    match spec.identity() {
+        flotilla_resources::RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
+        flotilla_resources::RepositoryIdentity::Local { .. } => "local".to_string(),
+    }
+}
+
+fn local_repository_matches_checkout(spec: &RepositorySpec, checkout: &crate::repository_inspection::LocalCheckoutInspection) -> bool {
+    match spec.identity() {
+        flotilla_resources::RepositoryIdentity::Local { host_ref, git_common_dir } => {
+            host_ref == &checkout.host_ref && Path::new(git_common_dir).parent() == Some(checkout.path.as_path())
+        }
+        flotilla_resources::RepositoryIdentity::Remote { .. } => false,
+    }
+}
+
+struct RepositoryProjectReconciliation {
+    identity_change: Option<RepositoryIdentityChange>,
 }
 
 fn normalize_workspace_slug(candidate: &str) -> String {
@@ -3631,42 +3674,141 @@ impl InProcessDaemon {
         Ok(project_name)
     }
 
-    async fn ensure_whole_repository_project(&self, repository_spec: &RepositorySpec) -> Result<String, String> {
+    async fn reconcile_whole_repository_project(
+        &self,
+        inspection: &crate::repository_inspection::RepositoryInspection,
+    ) -> Result<RepositoryProjectReconciliation, String> {
         let namespace = self.provisioning_namespace().await;
+        let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &repository_key, repository_spec).await?;
 
         let projects = self.resource_backend.clone().using::<Project>(&namespace);
-        if let Some(existing) = projects
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let repository_objects = repositories.list().await.map_err(|error| error.to_string())?.items;
+        let repository_specs = repository_objects
+            .iter()
+            .map(|repository| (RepositoryKey(repository.metadata.name.clone()), repository.spec.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut superseded_keys = BTreeSet::new();
+        let previous_tracked_key = self
+            .repository_keys_by_path
+            .read()
+            .await
+            .get(&inspection.checkout.path)
+            .filter(|previous| *previous != &repository_key)
+            .cloned();
+        if let Some(previous) = &previous_tracked_key {
+            superseded_keys.insert(previous.clone());
+        }
+        for (key, spec) in &repository_specs {
+            if key != &repository_key && local_repository_matches_checkout(spec, &inspection.checkout) {
+                superseded_keys.insert(key.clone());
+            }
+        }
+        for checkout in self
+            .observed_resource_backend
+            .clone()
+            .using::<ResourceCheckout>(&namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?
             .items
-            .into_iter()
-            .find(|project| project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()))
         {
-            return Ok(existing.metadata.name);
-        }
-
-        let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
-        let catalog_name = normalize_project_name(&repository_spec.catalog_slug())?;
-        let key_suffix = repository_key.0.chars().take(8).collect::<String>();
-        let disambiguated_name = format!("{catalog_name}-{key_suffix}");
-        let mut candidates = Vec::new();
-        for candidate in [display_name.clone(), catalog_name, disambiguated_name] {
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
+            if let ResourceCheckoutSpec::Observed(observed) = checkout.spec {
+                if Path::new(&observed.path) == inspection.checkout.path && observed.repo_ref != repository_key {
+                    superseded_keys.insert(observed.repo_ref);
+                }
             }
         }
 
+        let mut project_objects = projects.list().await.map_err(|error| error.to_string())?.items;
+        let mut generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
+        for key in &superseded_keys {
+            if let Some(spec) = repository_specs.get(key) {
+                generated_names.extend(whole_repository_project_names(spec)?);
+            }
+        }
+        for project in &mut project_objects {
+            let mut updated = project.spec.clone();
+            let mut changed = false;
+            for entry in &mut updated.repositories {
+                if superseded_keys.contains(&entry.repo) {
+                    entry.repo = repository_key.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                updated = normalize_project_spec(updated)?;
+                projects
+                    .update(&InputMeta::from(&project.metadata), &project.metadata.resource_version, &updated)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                project.spec = updated;
+            }
+        }
+
+        let display_name = normalize_project_name(&repository_spec.leaf_slug())?;
         let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
-        for project_name in candidates {
+        let primary_name = whole_repository_project_names(repository_spec)?.into_iter().find(|candidate| {
+            project_objects.iter().any(|project| {
+                project.metadata.name == *candidate
+                    && project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none())
+            })
+        });
+        if let Some(primary_name) = &primary_name {
+            for duplicate in project_objects.iter().filter(|project| {
+                project.metadata.name != *primary_name && generated_names.contains(&project.metadata.name) && project.spec == spec
+            }) {
+                projects.delete(&duplicate.metadata.name).await.map_err(|error| error.to_string())?;
+            }
+        }
+
+        let other_tracked_keys = self
+            .repository_keys_by_path
+            .read()
+            .await
+            .iter()
+            .filter(|(path, _)| *path != &inspection.checkout.path)
+            .map(|(_, key)| key.clone())
+            .collect::<BTreeSet<_>>();
+        let remaining_projects = projects.list().await.map_err(|error| error.to_string())?.items;
+        let durable_checkouts =
+            self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
+        for old_key in &superseded_keys {
+            let still_referenced =
+                remaining_projects.iter().any(|project| project.spec.repositories.iter().any(|entry| &entry.repo == old_key));
+            let has_durable_checkout = durable_checkouts.iter().any(|checkout| checkout.spec.repo_ref() == old_key);
+            if !still_referenced && !has_durable_checkout && !other_tracked_keys.contains(old_key) {
+                crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, old_key)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                match repositories.delete(&old_key.to_string()).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+
+        let previous_spec = previous_tracked_key
+            .as_ref()
+            .and_then(|key| repository_specs.get(key))
+            .or_else(|| superseded_keys.iter().find_map(|key| repository_specs.get(key)));
+        let identity_change = previous_spec.map(|previous| RepositoryIdentityChange {
+            previous: repository_identity_display(previous),
+            current: repository_identity_display(repository_spec),
+        });
+        if primary_name.is_some() {
+            return Ok(RepositoryProjectReconciliation { identity_change });
+        }
+
+        for project_name in whole_repository_project_names(repository_spec)? {
             match projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await {
-                Ok(_) => return Ok(project_name),
+                Ok(_) => return Ok(RepositoryProjectReconciliation { identity_change }),
                 Err(ResourceError::Conflict { .. }) => {
                     let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
                     if existing.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()) {
-                        return Ok(project_name);
+                        return Ok(RepositoryProjectReconciliation { identity_change });
                     }
                 }
                 Err(error) => return Err(error.to_string()),
@@ -3684,7 +3826,7 @@ impl InProcessDaemon {
                     continue;
                 }
             };
-            self.ensure_whole_repository_project(&inspection.spec)
+            self.reconcile_whole_repository_project(&inspection)
                 .await
                 .map_err(|error| format!("materialize whole-repository Project for {}: {error}", repo_path.display()))?;
         }
@@ -3806,12 +3948,12 @@ impl InProcessDaemon {
         }
     }
 
-    /// Add a repo to tracking, returning `(tracked_path, resolved_from)`.
+    /// Add a repo to tracking, returning `(tracked_path, resolved_from, identity_change)`.
     ///
     /// If `path` is a git worktree, the main repo root is resolved via
     /// `git rev-parse --path-format=absolute --git-common-dir` and tracked
     /// instead. `resolved_from` is `Some(original_path)` in that case.
-    pub async fn add_repo(&self, path: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
+    pub async fn add_repo(&self, path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<RepositoryIdentityChange>), String> {
         let (path, resolved_from) = self.normalize_repo_path(path).await;
 
         // Create the model outside the lock (spawns provider detection and refresh)
@@ -3837,7 +3979,8 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
         let repository_key = Some(repository_inspection.key());
-        self.ensure_whole_repository_project(&repository_inspection.spec).await?;
+        let project_reconciliation = self.reconcile_whole_repository_project(&repository_inspection).await?;
+        let identity_change = project_reconciliation.identity_change;
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
             if tracked_identity == identity {
                 let key_became_available = {
@@ -3855,7 +3998,7 @@ impl InProcessDaemon {
                     self.publish_repo_info_update(&identity).await;
                 }
                 if self.tracked_repo_identity_for_path(&path).await.as_ref() == Some(&identity) {
-                    return Ok((path, resolved_from));
+                    return Ok((path, resolved_from, identity_change));
                 }
             }
             if let Err(error) = self.remove_repo(&path).await {
@@ -3900,7 +4043,7 @@ impl InProcessDaemon {
         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
         let already_tracked = self.path_identities.read().await.contains_key(&path);
         if already_tracked {
-            return Ok((path, resolved_from));
+            return Ok((path, resolved_from, identity_change));
         }
         {
             let mut repos = self.repos.write().await;
@@ -3929,7 +4072,7 @@ impl InProcessDaemon {
             self.broadcast_snapshot_inner(&path, false).await;
         }
 
-        Ok((path, resolved_from))
+        Ok((path, resolved_from, identity_change))
     }
 
     pub async fn remove_repo(&self, path: &Path) -> Result<(), String> {
@@ -5782,7 +5925,9 @@ impl InProcessDaemon {
                 description,
             });
             let result = match self.add_repo(path).await {
-                Ok((tracked_path, resolved_from)) => flotilla_protocol::CommandValue::RepoTracked { path: tracked_path, resolved_from },
+                Ok((tracked_path, resolved_from, identity_change)) => {
+                    flotilla_protocol::CommandValue::RepoTracked { path: tracked_path, resolved_from, identity_change }
+                }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
