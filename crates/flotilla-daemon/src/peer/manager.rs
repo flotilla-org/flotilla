@@ -1288,6 +1288,13 @@ impl PeerManager {
         &self.peer_host_summaries
     }
 
+    pub fn node_for_host_environment(&self, environment_id: &EnvironmentId) -> Result<(NodeId, HostName), String> {
+        let summary =
+            self.peer_host_summaries.get(environment_id).ok_or_else(|| format!("no peer summary for host environment {environment_id}"))?;
+        let host_name = summary.host_name.clone().unwrap_or_else(|| HostName::new(summary.node.display_name.clone()));
+        Ok((summary.node.node_id.clone(), host_name))
+    }
+
     pub fn topology_routes(&self) -> Vec<TopologyRoute> {
         let mut routes: Vec<_> = self
             .routes

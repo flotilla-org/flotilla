@@ -30,9 +30,9 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectSpec, ResourceBackend, ResourceError, Stance,
-    StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-    TerminalSessionStatusPatch, WorkflowTemplate,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend, ResourceError, Stance, StatusPatch,
+    TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    WorkflowTemplate,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
@@ -56,7 +56,7 @@ use super::{
     },
     request_dispatch::RequestDispatcher,
     shared::{sync_peer_query_state, write_message, SocketPeerSender},
-    test_support::apply_convoy_replica_feed,
+    test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
     DaemonServer, PeerConnectedNotice,
 };
 use crate::peer::{
@@ -855,44 +855,25 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
     let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
     let remote_host_id = remote_daemon.local_host_id().expect("remote host identity").to_string();
     let remote_policy_name = format!("host-direct-{remote_host_id}");
-    daemon
-        .publish_peer_summary(
-            HostSummary::builder()
-                .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
-                .host_name(HostName::new("feta"))
-                .node(node_info("feta"))
-                .system(flotilla_protocol::SystemInfo::default())
-                .providers(vec![
-                    HostProviderStatus::available(AGENT_ADAPTER_PROVIDER_CATEGORY, "codex"),
-                    HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "cleat"),
-                ])
-                .build(),
-        )
-        .await;
-    let backend = daemon.resource_backend();
-    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
-    workflow.vessels[0].stance = Stance::Trusted;
-    backend
-        .clone()
-        .using::<WorkflowTemplate>("flotilla")
-        .create(&InputMeta::builder().name("remote-workflow".to_string()).build(), &workflow)
-        .await
-        .expect("create workflow");
-    backend
-        .using::<Project>("flotilla")
-        .create(
-            &InputMeta::builder().name("flotilla".to_string()).build(),
-            &ProjectSpec::builder().display_name("Flotilla".to_string()).default_workflow_ref("remote-workflow".to_string()).build(),
-        )
-        .await
-        .expect("create project");
+    let remote_summary = HostSummary::builder()
+        .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
+        .host_name(HostName::new("feta"))
+        .node(node_info("feta"))
+        .system(flotilla_protocol::SystemInfo::default())
+        .providers(vec![
+            HostProviderStatus::available(AGENT_ADAPTER_PROVIDER_CATEGORY, "codex"),
+            HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "cleat"),
+        ])
+        .build();
+    daemon.publish_peer_summary(remote_summary.clone()).await;
+    seed_trusted_remote_convoy_project(&daemon, "flotilla").await;
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
     let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
     let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
-    peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    peer_manager.lock().await.store_host_summary(remote_summary);
     let remote_command_router = make_remote_command_router(
         &daemon,
         &peer_manager,
@@ -908,11 +889,18 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
                     .project_ref("flotilla".to_string())
                     .name("remote-work".to_string())
                     .branch("feat/remote-work".to_string())
-                    .placement_policy(remote_policy_name)
+                    .placement_policy(remote_policy_name.clone())
                     .build(),
             ),
         })
         .build();
+
+    assert_eq!(
+        remote_command_router.dispatch_execute(command.clone()).await.expect_err("missing live route must reject remote placement"),
+        format!("connect to feta at peer://feta for placement policy {remote_policy_name} (host {remote_host_id}): unknown peer: feta")
+    );
+
+    peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
 
     let mut mismatched = command.clone();
     mismatched.node_id = Some(daemon.node_id().clone());
