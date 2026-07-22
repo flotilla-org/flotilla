@@ -1037,7 +1037,7 @@ fn handoff_crew_brief(context: &ResolvedCrewContext, target: &str, prompt: Optio
         },
         &context.vessel,
         target,
-        prompt,
+        prompt.map_or(crate::agent_adapter::CrewAssignment::Unassigned, crate::agent_adapter::CrewAssignment::Prompt),
         &members
             .iter()
             .map(|member| crate::agent_adapter::CrewBriefMember {

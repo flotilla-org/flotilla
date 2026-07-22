@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
-use flotilla_core::agent_adapter::{build_crew_brief, CrewBriefMember};
+use flotilla_core::agent_adapter::{build_crew_brief, CrewAssignment, CrewBriefMember};
 use flotilla_resources::{
     clone_key,
     controller::{
@@ -612,7 +612,12 @@ impl Reconciler for VesselReconciler {
                                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
                                 })
                                 .collect::<Vec<_>>();
-                            let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, prompt.as_deref(), &members);
+                            let assignment = match prompt.as_deref() {
+                                Some(prompt) => CrewAssignment::Prompt(prompt),
+                                None if convoy.spec.issue.is_some() => CrewAssignment::CarriedIssue,
+                                None => CrewAssignment::Unassigned,
+                            };
+                            let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, assignment, &members);
                             append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
                             brief.copies = brief_copies.clone();
                             flotilla_resources::TerminalSessionSource::Agent { selector: selector.clone(), brief, context, message: None }
@@ -764,7 +769,7 @@ fn append_convoy_work_context(content: &mut String, convoy: &ResourceObject<Conv
         content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
     }
     if let Some(issue) = &convoy.spec.issue {
-        content.push_str("\n## Issue snapshot\n\n");
+        content.push_str("\n## Assigned issue\n\n");
         content.push_str(&format!(
             "Source-qualified reference: `{}` / `{}` / `{}`\n\n",
             issue.reference.source.service, issue.reference.source.scope, issue.reference.id

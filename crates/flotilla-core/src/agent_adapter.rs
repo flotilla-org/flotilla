@@ -26,11 +26,26 @@ pub struct CrewBriefMember {
     pub is_agent: bool,
 }
 
+/// What the `## Assignment` section of a crew brief should say. Distinct from
+/// `Option<&str>` because "no ad-hoc prompt" splits into two very different
+/// situations: the convoy carries an issue (the issue *is* the assignment) or
+/// nothing was provided at all. Conflating them taught a crew to read "no
+/// additional assignment" as overriding the issue contract below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrewAssignment<'a> {
+    /// An explicit dispatch or handoff prompt.
+    Prompt(&'a str),
+    /// The convoy carries an issue, appended below the brief; that issue is the assignment.
+    CarriedIssue,
+    /// Nothing was provided.
+    Unassigned,
+}
+
 pub fn build_crew_brief(
     context: &flotilla_resources::TerminalCrewContext,
     vessel: &str,
     role: &str,
-    prompt: Option<&str>,
+    assignment: CrewAssignment<'_>,
     members: &[CrewBriefMember],
 ) -> flotilla_resources::TerminalBrief {
     let mut content = format!(
@@ -46,7 +61,13 @@ pub fn build_crew_brief(
     }
     content.push_str(&format!(
         "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
-        prompt.unwrap_or("No additional assignment was provided.")
+        match assignment {
+            CrewAssignment::Prompt(prompt) => prompt,
+            CrewAssignment::CarriedIssue =>
+                "Your assignment is the issue in the `## Assigned issue` section below. Its body is the contract: work it to completion and deliver as described above.",
+            CrewAssignment::Unassigned =>
+                "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
+        }
     ));
     flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() }
 }
@@ -189,7 +210,7 @@ mod tests {
     use flotilla_resources::{single_agent_contained_workflow_spec, CrewSource, TerminalCrewContext};
 
     use crate::{
-        agent_adapter::{build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewBriefMember},
+        agent_adapter::{build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember},
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -224,13 +245,48 @@ mod tests {
             },
             "work",
             "coder",
-            prompt.as_deref(),
+            prompt.as_deref().map_or(CrewAssignment::Unassigned, CrewAssignment::Prompt),
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
         );
 
         assert!(brief.content.contains(
             "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
         ));
+    }
+
+    fn brief_for(assignment: CrewAssignment<'_>) -> String {
+        build_crew_brief(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "fix-delivery".to_string(),
+                vessel_ref: "vessel-fix-delivery-work".to_string(),
+            },
+            "work",
+            "coder",
+            assignment,
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+        )
+        .content
+    }
+
+    #[test]
+    fn carried_issue_assignment_points_at_the_issue_section_instead_of_disclaiming() {
+        let content = brief_for(CrewAssignment::CarriedIssue);
+        assert!(content.contains("## Assignment\n\nYour assignment is the issue in the `## Assigned issue` section below."));
+        assert!(!content.contains("No assignment was provided"));
+    }
+
+    #[test]
+    fn unassigned_brief_says_so_and_forbids_inventing_work() {
+        let content = brief_for(CrewAssignment::Unassigned);
+        assert!(content.contains("No assignment was provided with this dispatch."));
+        assert!(content.contains("rather than inventing work"));
+    }
+
+    #[test]
+    fn prompt_assignment_is_verbatim() {
+        let content = brief_for(CrewAssignment::Prompt("Fix the flux capacitor."));
+        assert!(content.contains("## Assignment\n\nFix the flux capacitor.\n"));
     }
 
     #[test]
