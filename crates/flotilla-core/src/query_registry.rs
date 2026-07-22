@@ -104,7 +104,7 @@ impl QueryRegistry {
             by_reference.insert(row.reference.clone(), row.clone());
         }
         *rows = by_reference.into_values().collect();
-        rows.sort_by(|left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)));
+        rows.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference));
         current.seq = current.seq.saturating_add(1);
         current.state = result_state.clone();
         Some(ResultDelta {

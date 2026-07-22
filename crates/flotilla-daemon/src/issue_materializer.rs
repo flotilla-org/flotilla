@@ -455,7 +455,7 @@ fn issue_row(issue: flotilla_protocol::Issue) -> IssueRow {
 }
 
 fn sort_rows(rows: &mut [IssueRow]) {
-    rows.sort_by(|left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)));
+    rows.sort_by(|left, right| left.reference.cmp_id_desc(&right.reference));
 }
 
 async fn query_page(
@@ -874,6 +874,48 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["NEW-10"]
         );
+    }
+
+    #[tokio::test]
+    async fn incremental_refresh_keeps_rows_in_descending_id_order() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("repo_stable_order");
+        let source = IssueSource { service: "https://issues.example".into(), scope: "stable/order".into() };
+        let mut refreshed_low_id = issue("1");
+        refreshed_low_id.as_of = Utc::now();
+        let provider = Arc::new(ScriptedProvider::new(vec![page(&["10", "1"], false)], vec![IssueChangeset {
+            updated: vec![refreshed_low_id],
+            closed: vec![],
+            has_more: false,
+        }]));
+        let (materializer, mut events) = manager(&state, &query, vec![source], provider);
+        let _ = next_event(&mut events).await;
+        let initial_ids = state
+            .result_set_for(&query)
+            .await
+            .expect("initial window")
+            .rows
+            .as_issues()
+            .expect("issue rows")
+            .iter()
+            .map(|row| row.reference.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(initial_ids, vec!["10", "1"]);
+
+        materializer.refresh(&query);
+
+        let _ = next_event(&mut events).await;
+        let refreshed_ids = state
+            .result_set_for(&query)
+            .await
+            .expect("refreshed window")
+            .rows
+            .as_issues()
+            .expect("issue rows")
+            .iter()
+            .map(|row| row.reference.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(refreshed_ids, vec!["10", "1"], "an update timestamp must not move issue rows");
     }
 
     #[tokio::test]

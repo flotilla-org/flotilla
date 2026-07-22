@@ -1426,7 +1426,7 @@ impl App {
                             removed,
                             delta.state.as_ref(),
                             |row| row.reference.clone(),
-                            |left, right| right.issue.as_of.cmp(&left.issue.as_of).then_with(|| left.reference.cmp(&right.reference)),
+                            |left, right| left.reference.cmp_id_desc(&right.reference),
                         );
                     }
                     flotilla_protocol::QueryChanges::Checkouts { changed, removed, .. } => {
