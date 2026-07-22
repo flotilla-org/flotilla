@@ -6,7 +6,7 @@ pub mod repository;
 pub mod terminal_session;
 pub mod vessel;
 
-pub use checkout::{CheckoutReconciler, CheckoutRuntime};
+pub use checkout::{BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime};
 pub use clone::{CloneReconciler, CloneRuntime};
 pub use environment::{DockerEnvironmentRuntime, EnvironmentReconciler};
 pub use presentation::{

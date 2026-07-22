@@ -13,9 +13,9 @@ use common::{
     create_workspace, ControllerLoopHarness,
 };
 use flotilla_controllers::reconcilers::{
-    CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler, HopChainContext,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselReconciler,
+    CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime,
+    EnvironmentReconciler, HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
+    TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -94,8 +94,8 @@ impl CheckoutRuntime for FakeCheckoutRuntime {
         Ok(Some("44982740".to_string()))
     }
 
-    async fn remove_checkout(&self, _target_path: &str) -> Result<(), String> {
-        Ok(())
+    async fn remove_checkout(&self, _removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        Ok(CheckoutRemovalOutcome::Removed)
     }
 }
 

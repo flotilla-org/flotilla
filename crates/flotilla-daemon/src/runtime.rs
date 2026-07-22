@@ -9,9 +9,10 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    CheckoutReconciler, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, EnvironmentReconciler,
-    ForgeDefaultBranchResolver, HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
+    DockerEnvironmentRuntime, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PresentationPolicyRegistry,
+    PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -1011,6 +1012,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
+        let bootstrap_branch_created = !local_exists && !remote_exists && base_ref.is_some();
 
         if local_exists {
             // Multiple vessels can intentionally share the convoy branch. `--force`
@@ -1061,7 +1063,16 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 .await?;
         }
 
-        resolve_head_commit(&*self.runner, target_path).await
+        let commit = resolve_head_commit(&*self.runner, target_path).await?;
+        if bootstrap_branch_created {
+            // Ownership belongs to the branch, not one checkout: sibling vessels
+            // can share it and may finalize in either order.
+            let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
+            self.runner
+                .run("git", &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit], Path::new("/"), &ChannelLabel::Noop)
+                .await?;
+        }
+        Ok(commit)
     }
 
     async fn create_fresh_clone(
@@ -1101,10 +1112,107 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         resolve_head_commit(&*self.runner, target_path).await
     }
 
-    async fn remove_checkout(&self, target_path: &str) -> Result<(), String> {
-        self.runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
-        Ok(())
+    async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
+        match removal {
+            CheckoutRemoval::FreshClone { target_path } => {
+                self.runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
+                Ok(CheckoutRemovalOutcome::Removed)
+            }
+            CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
+                let clone_path = utf8_path(clone_path)?;
+                let target_path = utf8_path(target_path)?;
+                let remove = self
+                    .runner
+                    .run_output(
+                        "git",
+                        &["-C", clone_path, "worktree", "remove", "--force", target_path],
+                        Path::new("/"),
+                        &ChannelLabel::Noop,
+                    )
+                    .await?;
+                if !remove.success && !remove.stderr.contains("is not a working tree") {
+                    return Err(remove.stderr);
+                }
+                remove_empty_checkout_parents(clone_path, target_path).await?;
+
+                let branch_ref = format!("refs/heads/{branch}");
+                let bootstrap_ref = bootstrap_branch_ref(branch);
+                let head = self
+                    .runner
+                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &branch_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .await?;
+                if !head.success {
+                    delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                    return Ok(CheckoutRemovalOutcome::Removed);
+                }
+                let bootstrap = self
+                    .runner
+                    .run_output("git", &["-C", clone_path, "rev-parse", "--verify", &bootstrap_ref], Path::new("/"), &ChannelLabel::Noop)
+                    .await?;
+                if !bootstrap.success {
+                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
+                        branch: branch.clone(),
+                        reason: BranchPreservationReason::NotCreatedForConvoy,
+                    });
+                }
+                if head.stdout.trim() != bootstrap.stdout.trim() {
+                    delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
+                        branch: branch.clone(),
+                        reason: BranchPreservationReason::CommitsPastBase,
+                    });
+                }
+
+                let worktrees = self
+                    .runner
+                    .run("git", &["-C", clone_path, "worktree", "list", "--porcelain"], Path::new("/"), &ChannelLabel::Noop)
+                    .await?;
+                if worktrees.lines().any(|line| line == format!("branch {branch_ref}")) {
+                    return Ok(CheckoutRemovalOutcome::PreservedBranch {
+                        branch: branch.clone(),
+                        reason: BranchPreservationReason::CheckedOutElsewhere,
+                    });
+                }
+
+                self.runner
+                    .run("git", &["-C", clone_path, "branch", "--delete", "--force", branch], Path::new("/"), &ChannelLabel::Noop)
+                    .await?;
+                delete_ref(&*self.runner, clone_path, &bootstrap_ref).await?;
+                Ok(CheckoutRemovalOutcome::Removed)
+            }
+        }
     }
+}
+
+fn bootstrap_branch_ref(branch: &str) -> String {
+    format!("refs/flotilla/bootstrap/{branch}")
+}
+
+async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
+    runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Noop).await?;
+    Ok(())
+}
+
+async fn remove_empty_checkout_parents(clone_path: &str, target_path: &str) -> Result<(), String> {
+    let Some(checkout_root) = Path::new(clone_path).parent() else {
+        return Ok(());
+    };
+    let Some(mut parent) = Path::new(target_path).parent() else {
+        return Ok(());
+    };
+    while parent != checkout_root && parent.starts_with(checkout_root) {
+        match tokio::fs::remove_dir(parent).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(error) => return Err(format!("remove empty checkout parent {}: {error}", parent.display())),
+        }
+        let Some(next) = parent.parent() else {
+            break;
+        };
+        parent = next;
+    }
+    Ok(())
 }
 
 async fn resolve_head_commit(runner: &dyn CommandRunner, path: &str) -> Result<Option<String>, String> {
@@ -1340,32 +1448,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkout_runtime_attaches_the_convoy_branch_to_multiple_worktrees() {
+    async fn checkout_runtime_removes_zero_commit_worktree_without_git_or_directory_debris() {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-        let first_target = temp.path().join("workspace/first");
-        let second_target = temp.path().join("workspace/second");
+        let convoy_dir = temp.path().join("checkout-root/convoy-a");
+        let target = convoy_dir.join("flotilla.feature-cleanup");
         let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
-        for target in [&first_target, &second_target] {
-            runtime
-                .create_worktree(
-                    clone.path().to_str().expect("utf-8 clone path"),
-                    "feature/shared",
-                    Some("main"),
-                    target.to_str().expect("utf-8 target path"),
-                )
-                .await
-                .expect("worktree should create");
-        }
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/cleanup",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/cleanup".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+        assert_eq!(runtime.remove_checkout(&removal).await.expect("worktree should be removed"), CheckoutRemovalOutcome::Removed);
 
-        for target in [&first_target, &second_target] {
-            let branch = ProcessCommand::new("git")
-                .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])
-                .output()
-                .expect("git should run");
-            assert!(branch.status.success());
-            assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "feature/shared");
+        let worktrees = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "list", "--porcelain"])
+            .output()
+            .expect("git should list worktrees");
+        assert!(worktrees.status.success());
+        assert!(!String::from_utf8(worktrees.stdout).expect("utf-8 worktree list").contains(target.to_str().expect("utf-8 target path")));
+        assert!(!convoy_dir.exists(), "empty convoy directory should be removed");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "show-ref", "--verify", "--quiet", "refs/heads/feature/cleanup"])
+            .status()
+            .expect("git should inspect the branch");
+        assert!(!branch.success(), "zero-commit convoy branch should be deleted");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_preserves_and_reports_branch_with_commits() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let convoy_dir = temp.path().join("checkout-root/convoy-a");
+        let target = convoy_dir.join("feature-work/flotilla");
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        runtime
+            .create_worktree(
+                clone.path().to_str().expect("utf-8 clone path"),
+                "feature/work",
+                Some("main"),
+                target.to_str().expect("utf-8 target path"),
+            )
+            .await
+            .expect("worktree should create");
+        fs::write(target.join("work.txt"), "real work\n").expect("work file should be written");
+        assert!(ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "add", "work.txt"])
+            .status()
+            .expect("git add should run")
+            .success());
+        assert!(ProcessCommand::new("git")
+            .args(["-C", target.to_str().expect("utf-8 target path"), "commit", "-m", "real work"])
+            .status()
+            .expect("git commit should run")
+            .success());
+
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/work".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+        assert_eq!(runtime.remove_checkout(&removal).await.expect("worktree should be removed"), CheckoutRemovalOutcome::PreservedBranch {
+            branch: "feature/work".to_string(),
+            reason: BranchPreservationReason::CommitsPastBase,
+        });
+        assert!(!convoy_dir.exists(), "empty convoy directory should be removed");
+
+        let branch = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "show-ref", "--verify", "--quiet", "refs/heads/feature/work"])
+            .status()
+            .expect("git should inspect the branch");
+        assert!(branch.success(), "convoy branch with commits should be preserved");
+        let marker = ProcessCommand::new("git")
+            .args([
+                "-C",
+                clone.path().to_str().expect("utf-8 clone path"),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &bootstrap_branch_ref("feature/work"),
+            ])
+            .status()
+            .expect("git should inspect the ownership marker");
+        assert!(!marker.success(), "ownership marker should be removed after preserving committed work");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+
+        for reverse_teardown in [false, true] {
+            let case = if reverse_teardown { "reverse" } else { "forward" };
+            let branch = format!("feature/shared-{case}");
+            let workspace = temp.path().join(format!("workspace-{case}"));
+            let targets = [workspace.join("first"), workspace.join("second")];
+            for target in &targets {
+                runtime
+                    .create_worktree(
+                        clone.path().to_str().expect("utf-8 clone path"),
+                        &branch,
+                        Some("main"),
+                        target.to_str().expect("utf-8 target path"),
+                    )
+                    .await
+                    .expect("worktree should create");
+            }
+
+            let removals = targets.each_ref().map(|target| CheckoutRemoval::Worktree {
+                clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+                branch: branch.clone(),
+                target_path: target.to_str().expect("utf-8 target path").to_string(),
+            });
+            let order = if reverse_teardown { [1, 0] } else { [0, 1] };
+            assert_eq!(
+                runtime.remove_checkout(&removals[order[0]]).await.expect("first worktree should be removed"),
+                CheckoutRemovalOutcome::PreservedBranch { branch: branch.clone(), reason: BranchPreservationReason::CheckedOutElsewhere }
+            );
+            assert_eq!(
+                runtime.remove_checkout(&removals[order[1]]).await.expect("last worktree should be removed"),
+                CheckoutRemovalOutcome::Removed
+            );
+            assert!(!workspace.exists(), "empty workspace directory should be removed");
+
+            for reference in [format!("refs/heads/{branch}"), bootstrap_branch_ref(&branch)] {
+                let reference = ProcessCommand::new("git")
+                    .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "show-ref", "--verify", "--quiet", &reference])
+                    .status()
+                    .expect("git should inspect the reference");
+                assert!(!reference.success(), "zero-commit branch and ownership marker should be deleted");
+            }
         }
     }
 
@@ -1395,6 +1620,21 @@ mod tests {
             .expect("git should run");
         assert!(branch.status.success());
         assert_eq!(String::from_utf8(branch.stdout).expect("utf-8 branch").trim(), "main");
+
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+            branch: "main".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+        assert_eq!(runtime.remove_checkout(&removal).await.expect("worktree should be removed"), CheckoutRemovalOutcome::PreservedBranch {
+            branch: "main".to_string(),
+            reason: BranchPreservationReason::NotCreatedForConvoy,
+        });
+        let branch = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "show-ref", "--verify", "--quiet", "refs/heads/main"])
+            .status()
+            .expect("git should inspect the branch");
+        assert!(branch.success(), "pre-existing local branch should be preserved");
     }
 
     #[tokio::test]
