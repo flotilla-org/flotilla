@@ -1145,6 +1145,7 @@ impl Aggregator {
             .resource(resource)
             .name(name)
             .workflow_ref(&convoy.spec.workflow_ref)
+            .dispatching_principal_ref(convoy.spec.dispatching_principal_ref.clone())
             .phase(convoy_phase(phase))
             .initializing(convoy_is_initializing(status))
             .maybe_message(status.and_then(|status| status.message.clone()))
@@ -1314,7 +1315,10 @@ mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::result_set::{ResultSet, ResultSetState};
+    use flotilla_protocol::{
+        result_set::{ResultSet, ResultSetState},
+        PrincipalRef,
+    };
     use flotilla_resources::{
         ConvoyRepositorySpec, ConvoySpec, CrewSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase,
         PresentationSpec, PresentationStatus, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
@@ -1359,6 +1363,22 @@ mod tests {
         let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert!(convoy.vessels.first().expect("vessel row").needs_attention);
         assert!(convoy.needs_attention);
+    }
+
+    #[tokio::test]
+    async fn convoy_projection_carries_dispatching_principal_ref() {
+        let principal = PrincipalRef::implicit_for_namespace("people");
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("convoy-a").await;
+        convoy.spec.dispatching_principal_ref = principal.clone();
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+
+        let result_set = state.result_set().await;
+        let row = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+        assert_eq!(row.dispatching_principal_ref, principal);
     }
 
     struct ScriptedSource<T: Resource> {

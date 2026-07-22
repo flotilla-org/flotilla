@@ -1726,6 +1726,7 @@ fn test_convoy(
         name: name.into(),
         origin_host: None,
         workflow_ref: "wf".into(),
+        dispatching_principal_ref: Default::default(),
         phase,
         message: None,
         repo_hint: None,

@@ -301,6 +301,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
         .using::<Convoy>("flotilla")
         .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
             workflow_ref: "scratch".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: Default::default(),
             placement_policy: None,
             repositories: Vec::new(),

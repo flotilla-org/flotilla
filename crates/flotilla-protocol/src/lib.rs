@@ -65,6 +65,27 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Stable reference to the human principal whose attention Flotilla may route.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PrincipalRef {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl PrincipalRef {
+    pub const IMPLICIT_NAME: &'static str = "implicit";
+
+    pub fn implicit_for_namespace(namespace: impl Into<String>) -> Self {
+        Self { namespace: namespace.into(), name: Self::IMPLICIT_NAME.to_string() }
+    }
+}
+
+impl Default for PrincipalRef {
+    fn default() -> Self {
+        Self::implicit_for_namespace("flotilla")
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use serde::{de::DeserializeOwned, Serialize};

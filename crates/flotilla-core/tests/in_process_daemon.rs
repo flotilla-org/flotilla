@@ -1047,6 +1047,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let persisted = backend.using::<ResourceConvoy>("flotilla").get("issue-732").await.expect("persisted convoy");
     assert_eq!(persisted.spec.project_ref.as_deref(), Some("flotilla"));
     assert_eq!(persisted.spec.workflow_ref, "single-agent-contained");
+    assert_eq!(persisted.spec.dispatching_principal_ref, flotilla_protocol::PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(persisted.spec.r#ref.as_deref(), Some("fix/issue-732"));
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
     assert_eq!(persisted.spec.repositories.len(), 1);

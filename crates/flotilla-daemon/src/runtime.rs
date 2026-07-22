@@ -2099,6 +2099,7 @@ mod tests {
             .using::<Convoy>(NAMESPACE)
             .create(&empty_meta("convoy-a"), &ConvoySpec {
                 workflow_ref: "wf-a".to_string(),
+                dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
                 placement_policy: Some(format!("host-direct-{host_id}")),
                 repositories: vec![ConvoyRepositorySpec {

@@ -946,6 +946,10 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
         DetailField { label: "Namespace", value: row.namespace.clone() },
         DetailField { label: "Convoy", value: row.name.clone() },
         DetailField { label: "Workflow", value: row.workflow_ref.clone() },
+        DetailField {
+            label: "Dispatcher",
+            value: format!("{}/{}", row.dispatching_principal_ref.namespace, row.dispatching_principal_ref.name),
+        },
         DetailField { label: "Phase", value: convoy_phase(row).text },
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
@@ -1135,6 +1139,7 @@ mod tests {
             name: "tables".into(),
             origin_host: None,
             workflow_ref: "implement-review".into(),
+            dispatching_principal_ref: Default::default(),
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
@@ -1215,6 +1220,7 @@ mod tests {
 
         let pr_index = view.columns.iter().position(|column| column.id == "pr").expect("PR column");
         assert_eq!(view.rows[0].cells[pr_index], CellValue::toned("#815 open", CellTone::Success));
+        assert!(view.rows[0].describe.contains(&DetailField { label: "Dispatcher", value: "flotilla/implicit".into() }));
         assert!(view.rows[0].describe.contains(&DetailField { label: "Pull request", value: "#815 · open".into() }));
         assert_eq!(
             view.rows[0].actions.iter().find(|action| action.id == "open_pr"),
