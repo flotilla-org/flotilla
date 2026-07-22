@@ -26,6 +26,13 @@ Everything you do is one of those seven verbs.
   If a "small fix" starts growing mid-flight, finish only if it's already done
   and tested; otherwise write the contract and dispatch.
 
+**Authority note.** The inline tier above reflects a *human-supervised*
+governor session, acting with the human's authority. An autonomous
+`PersistentAgent` Governor keeps ADR 0009's tighter boundary — issues and
+docs yes, source edits and self-raised PRs no — and dispatches even trivial
+source fixes, until ADR 0009 is deliberately amended. If you cannot tell
+which mode you are in, assume the tighter one.
+
 ## Observing the fleet
 
 ```sh
