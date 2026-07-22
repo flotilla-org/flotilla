@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -210,8 +209,6 @@ struct DynamicApplyMetadata {
     owner_references: Option<Vec<OwnerReference>>,
     #[serde(default)]
     finalizers: Option<Vec<String>>,
-    #[serde(default, rename = "deletionTimestamp")]
-    deletion_timestamp: Option<Option<DateTime<Utc>>>,
 }
 
 impl DynamicApplyMetadata {
@@ -222,7 +219,7 @@ impl DynamicApplyMetadata {
             annotations: self.annotations.clone().unwrap_or_default(),
             owner_references: self.owner_references.clone().unwrap_or_default(),
             finalizers: self.finalizers.clone().unwrap_or_default(),
-            deletion_timestamp: self.deletion_timestamp.unwrap_or(None),
+            deletion_timestamp: None,
         }
     }
 
@@ -233,7 +230,7 @@ impl DynamicApplyMetadata {
             annotations: self.annotations.clone().unwrap_or_else(|| existing.annotations.clone()),
             owner_references: self.owner_references.clone().unwrap_or_else(|| existing.owner_references.clone()),
             finalizers: self.finalizers.clone().unwrap_or_else(|| existing.finalizers.clone()),
-            deletion_timestamp: self.deletion_timestamp.unwrap_or(existing.deletion_timestamp),
+            deletion_timestamp: existing.deletion_timestamp,
         }
     }
 }
@@ -476,9 +473,7 @@ mod tests {
             .await
             .expect("create demand with metadata");
 
-        apply_resource_document(
-            &backend,
-            "flotilla",
+        let reapply_review_document = || {
             json!({
                 "apiVersion": "flotilla.work/v1",
                 "kind": "Demand",
@@ -498,15 +493,24 @@ mod tests {
                         "principal_ref": "principal/default"
                     }
                 }
-            }),
-        )
-        .await
-        .expect("reapply demand document");
+            })
+        };
+
+        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply demand document");
 
         let updated = resolver.get("demo-review").await.expect("updated demand");
         assert_eq!(updated.spec.kind, DemandKind::Review);
         assert_eq!(updated.metadata.owner_references, vec![owner_reference]);
         assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("attention"));
         assert_eq!(updated.metadata.finalizers, vec!["attention.flotilla.work/finalizer"]);
+
+        resolver.delete("demo-review").await.expect("mark demand for deletion");
+        let deleting = resolver.get("demo-review").await.expect("deleting demand");
+        let deletion_timestamp = deleting.metadata.deletion_timestamp.expect("deletion timestamp should be set");
+
+        apply_resource_document(&backend, "flotilla", reapply_review_document()).await.expect("reapply pending-delete demand document");
+
+        let reapplied = resolver.get("demo-review").await.expect("reapplied pending-delete demand");
+        assert_eq!(reapplied.metadata.deletion_timestamp, Some(deletion_timestamp));
     }
 }
