@@ -5,12 +5,12 @@ use std::sync::{
 
 use async_trait::async_trait;
 use flotilla_manifest::{
-    keys::{KEY_SESSION, KEY_STATUS_STATE, SEGMENT_VESSEL},
+    keys::{KEY_SESSION, KEY_STATUS_STATE, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_VESSEL},
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataTarget, MetadataValue},
 };
 use flotilla_protocol::{
-    result_set::SessionPhase, Command, CommandValue, HostName, RepoInfo, RepoSelector, RepoSnapshot, ResourceRef, StatusResponse,
-    StreamKey, TopologyResponse,
+    result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, SessionPhase},
+    Command, CommandValue, HostName, RepoInfo, RepoSelector, RepoSnapshot, ResourceRef, StatusResponse, StreamKey, TopologyResponse,
 };
 use tokio::sync::broadcast;
 
@@ -40,6 +40,32 @@ fn independents_delta(seq: u64, changed: Vec<IndependentRow>, removed: Vec<Resou
 
 fn convoys_set(seq: u64) -> DaemonEvent {
     DaemonEvent::ResultSet(Box::new(ResultSet { seq, rows: Rows::Convoys(vec![]), state: Default::default() }))
+}
+
+fn awareness_set(seq: u64, rows: Vec<AwarenessNode>) -> DaemonEvent {
+    DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq,
+        rows: Rows::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default(), rows },
+        state: Default::default(),
+    }))
+}
+
+fn awareness_node() -> AwarenessNode {
+    AwarenessNode::builder()
+        .id("project/dev/platform".to_string())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_string())
+        .state(AwarenessState::Waiting)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(1).issues(1).build())
+        .entries(vec![AwarenessEntry::builder()
+            .id("issue/flotilla-org/flotilla/862".to_string())
+            .kind(AwarenessKind::Issue)
+            .label("#862 awareness band".to_string())
+            .state(AwarenessState::Waiting)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .build()])
+        .build()
 }
 
 fn mint() -> AttachOnlyRecipes {
@@ -87,6 +113,10 @@ fn gaps_and_unseeded_deltas_request_resubscription() {
     assert_eq!(independents.since, Some(1));
     let convoys = cursors.iter().find(|cursor| cursor.query == QueryId::Convoys).expect("convoys cursor");
     assert_eq!(convoys.since, None, "never-seen queries subscribe from scratch");
+    assert!(
+        cursors.iter().any(|cursor| matches!(cursor.query, QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, .. })),
+        "pm connector subscribes to awareness transport"
+    );
 }
 
 #[test]
@@ -107,6 +137,27 @@ fn rebuild_publishes_diffs_not_repeats() {
         after_removal.iter().find(|patch| patch.target == independent_group("scratch")).expect("unset patch for removed independent");
     assert!(group_patch.set.is_empty());
     assert!(group_patch.unset.contains(&KEY_STATUS_STATE.to_owned()));
+}
+
+#[test]
+fn rebuild_prefers_awareness_transport_when_available() {
+    let mut state = ConnectorState::default();
+    state.apply_event(&independents_set(1, vec![independent_row("scratch", SessionPhase::Running)]));
+    assert_eq!(state.apply_event(&awareness_set(1, vec![awareness_node()])), Applied::Updated);
+
+    let patches = state.rebuild(&mint());
+
+    assert!(patches.iter().any(|patch| {
+        patch.target
+            == MetadataTarget::Group(GroupPath(vec![
+                GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform"),
+                GroupSegment::text(SEGMENT_ISSUE, "issue/flotilla-org/flotilla/862").with_label("#862 awareness band"),
+            ]))
+    }));
+    assert!(
+        !patches.iter().any(|patch| patch.target == independent_group("scratch")),
+        "raw independent fallback is not projected once awareness is available"
+    );
 }
 
 struct RecordingSink {

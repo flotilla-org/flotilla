@@ -1,7 +1,9 @@
 use std::time::Duration;
 
+use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy, InMemoryBackend, InputMeta, OwnerReference, Resource, ResourceBackend, ResourceError, ResourceObject, TypedResolver,
+    Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, OwnerReference, PrincipalRef,
+    Regard, RegardExpiryPolicy, RegardSource, RegardSpec, Resource, ResourceBackend, ResourceError, ResourceObject, TypedResolver,
     WatchEvent, WatchStart, WorkflowTemplate,
 };
 use futures::StreamExt;
@@ -86,6 +88,92 @@ impl ResourceContractFixture for WorkflowTemplateFixture {
             other => panic!("expected tool process, got {other:?}"),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RegardFixture;
+
+impl ResourceContractFixture for RegardFixture {
+    type Resource = Regard;
+
+    fn label() -> &'static str {
+        "Regard"
+    }
+
+    fn meta(name: &str) -> InputMeta {
+        InputMeta::builder().name(name.to_string()).build()
+    }
+
+    fn spec() -> <Self::Resource as Resource>::Spec {
+        RegardSpec::builder()
+            .principal_ref(PrincipalRef("principal/default".to_string()))
+            .target(resource_ref("Convoy", "alpha"))
+            .source(RegardSource::Expressed)
+            .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: 300 })
+            .build()
+    }
+
+    fn updated_spec() -> <Self::Resource as Resource>::Spec {
+        RegardSpec::builder()
+            .principal_ref(PrincipalRef("principal/default".to_string()))
+            .target(resource_ref("Convoy", "alpha"))
+            .source(RegardSource::Implicit { policy: "convoy-start".to_string() })
+            .expiry(RegardExpiryPolicy::Pin)
+            .build()
+    }
+
+    fn assert_created(created: &ResourceObject<Self::Resource>) {
+        assert_eq!(created.spec.principal_ref, PrincipalRef("principal/default".to_string()));
+        assert!(created.status.is_none());
+    }
+
+    fn assert_updated(updated: &ResourceObject<Self::Resource>) {
+        assert_eq!(updated.spec.expiry, RegardExpiryPolicy::Pin);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DemandFixture;
+
+impl ResourceContractFixture for DemandFixture {
+    type Resource = Demand;
+
+    fn label() -> &'static str {
+        "Demand"
+    }
+
+    fn meta(name: &str) -> InputMeta {
+        InputMeta::builder().name(name.to_string()).build()
+    }
+
+    fn spec() -> <Self::Resource as Resource>::Spec {
+        DemandSpec::builder()
+            .originating_work_ref(resource_ref("Vessel", "alpha-implement"))
+            .kind(DemandKind::Permission)
+            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef("principal/default".to_string()) })
+            .build()
+    }
+
+    fn updated_spec() -> <Self::Resource as Resource>::Spec {
+        DemandSpec::builder()
+            .originating_work_ref(resource_ref("Vessel", "alpha-review"))
+            .kind(DemandKind::Review)
+            .addressee(DemandAddressee::Pool { pool_ref: DemandPoolRef("project/default".to_string()) })
+            .build()
+    }
+
+    fn assert_created(created: &ResourceObject<Self::Resource>) {
+        assert_eq!(created.spec.kind, DemandKind::Permission);
+        assert!(created.status.is_none());
+    }
+
+    fn assert_updated(updated: &ResourceObject<Self::Resource>) {
+        assert_eq!(updated.spec.kind, DemandKind::Review);
+    }
+}
+
+fn resource_ref(kind: &str, name: &str) -> ResourceRef {
+    ResourceRef::new("flotilla.work/v1", kind, "flotilla", name)
 }
 
 pub fn in_memory_backend() -> ResourceBackend {

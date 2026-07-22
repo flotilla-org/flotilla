@@ -13,13 +13,17 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_protocol::result_set::{ConvoyPhase, ConvoyRow, IndependentRow, SessionPhase, VesselRow, WorkPhase};
+use flotilla_protocol::result_set::{
+    AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow, IndependentRow, SessionPhase,
+    VesselRow, WorkPhase,
+};
 
 use crate::{
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CONVOY_MESSAGE, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_CREW_ROLES, KEY_FACTORY_ID,
         KEY_MATERIALIZE_RECIPE, KEY_MATERIALIZE_TARGET, KEY_PROJECT_NAME, KEY_SCOPE, KEY_SESSION, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
-        KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_PROJECT, SEGMENT_VESSEL, SOURCE_CONNECTOR,
+        KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_VESSEL,
+        SOURCE_CONNECTOR,
     },
     recipe::RecipeMint,
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -27,6 +31,7 @@ use crate::{
 
 /// The rows the catalog is projected from.
 pub struct CatalogInput<'a> {
+    pub awareness: Option<&'a [AwarenessNode]>,
     pub convoys: &'a [ConvoyRow],
     pub independents: &'a [IndependentRow],
 }
@@ -161,6 +166,12 @@ fn patch(target: MetadataTarget, set: BTreeMap<String, MetadataValueUpdate>, uns
 /// Project the fleet-merged rows into the catalog the PM should hold.
 pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catalog {
     let mut catalog = Catalog::default();
+    if let Some(nodes) = input.awareness {
+        for node in nodes {
+            project_awareness_node(&mut catalog, node, mint);
+        }
+        return catalog;
+    }
     for convoy in input.convoys {
         project_convoy(&mut catalog, convoy, mint);
     }
@@ -168,6 +179,64 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
         project_independent(&mut catalog, independent, mint);
     }
     catalog
+}
+
+fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, mint: &dyn RecipeMint) {
+    let project = GroupSegment::text(SEGMENT_PROJECT, node.id.clone()).with_label(node.label.clone());
+    assert_project_group(catalog, &project);
+    let project_path = GroupPath(vec![project.clone()]);
+    catalog.assert_facts(
+        MetadataTarget::Group(project_path),
+        vec![
+            (KEY_STATUS_STATE, MetadataValue::text(awareness_state(node.state))),
+            (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(&node.counts))),
+            (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:awareness/{}", node.id))),
+        ],
+        None,
+    );
+
+    for entry in &node.entries {
+        project_awareness_entry(catalog, &project, entry, mint);
+    }
+}
+
+fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry: &AwarenessEntry, _mint: &dyn RecipeMint) {
+    let segment_key = match entry.kind {
+        AwarenessKind::Convoy => SEGMENT_CONVOY,
+        AwarenessKind::Issue => SEGMENT_ISSUE,
+        AwarenessKind::Vessel | AwarenessKind::Independent | AwarenessKind::Checkout => SEGMENT_VESSEL,
+        AwarenessKind::Fleet | AwarenessKind::Project => return,
+    };
+    let path = GroupPath(vec![project.clone(), GroupSegment::text(segment_key, entry.id.clone()).with_label(entry.label.clone())]);
+    let mut facts = vec![
+        (KEY_STATUS_STATE, MetadataValue::text(awareness_state(entry.state))),
+        (KEY_SUMMARY_TEXT, MetadataValue::text(entry.label.clone())),
+        (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:awareness/{}", entry.id))),
+    ];
+    if let Some(AwarenessPhase::Work(phase)) = entry.phase {
+        facts.push((KEY_WORK_PHASE, MetadataValue::text(phase.as_str())));
+    }
+    if let Some(host) = entry.annotations.get(KEY_VESSEL_HOST) {
+        facts.push((KEY_VESSEL_HOST, MetadataValue::text(host.clone())));
+    }
+    if matches!(entry.state, AwarenessState::Waiting | AwarenessState::Failed) {
+        facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
+    }
+    catalog.assert_facts(MetadataTarget::Group(path), facts, None);
+}
+
+fn awareness_state(state: AwarenessState) -> &'static str {
+    match state {
+        AwarenessState::Unknown | AwarenessState::Pending | AwarenessState::Cancelled => "idle",
+        AwarenessState::Waiting => "waiting",
+        AwarenessState::Active => "active",
+        AwarenessState::Done => "done",
+        AwarenessState::Failed => "failed",
+    }
+}
+
+fn summary_text(counts: &flotilla_protocol::AwarenessCounts) -> String {
+    format!("{} entries · {} issues · {} vessels · {} checkouts", counts.total, counts.issues, counts.vessels, counts.checkouts)
 }
 
 /// The project-level segment: `project_ref` when set (the project→convoy
@@ -284,7 +353,7 @@ fn project_vessel(
     }
     // Vessels materialise at workspace granularity (ADR 0012); the recipe
     // exists iff the daemon can resolve the attach — a capability fact.
-    if let Some(recipe) = vessel.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
+    if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
         facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("workspace")));
         facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
     }

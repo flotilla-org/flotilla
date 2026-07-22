@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{IssueRef, IssueState};
+use flotilla_protocol::{IssueRef, IssueState, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, RepositoryKey};
@@ -15,6 +15,9 @@ define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {
     pub workflow_ref: String,
+    #[builder(default)]
+    #[serde(default)]
+    pub dispatching_principal_ref: PrincipalRef,
     #[builder(default)]
     #[serde(default)]
     pub inputs: BTreeMap<String, InputValue>,

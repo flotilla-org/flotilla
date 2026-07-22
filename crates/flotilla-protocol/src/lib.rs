@@ -65,6 +65,27 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Stable reference to the human principal whose attention Flotilla may route.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PrincipalRef {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl PrincipalRef {
+    pub const IMPLICIT_NAME: &'static str = "implicit";
+
+    pub fn implicit_for_namespace(namespace: impl Into<String>) -> Self {
+        Self { namespace: namespace.into(), name: Self::IMPLICIT_NAME.to_string() }
+    }
+}
+
+impl Default for PrincipalRef {
+    fn default() -> Self {
+        Self::implicit_for_namespace("flotilla")
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use serde::{de::DeserializeOwned, Serialize};
@@ -105,9 +126,10 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow,
-    QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow,
-    WorkPhase,
+    AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
+    AwarenessLink, AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow,
+    CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet,
+    ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase, VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +145,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.

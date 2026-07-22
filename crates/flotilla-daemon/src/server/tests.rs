@@ -56,11 +56,12 @@ use super::{
     },
     request_dispatch::RequestDispatcher,
     shared::{sync_peer_query_state, write_message, SocketPeerSender},
+    test_support::apply_convoy_replica_feed,
     DaemonServer, PeerConnectedNotice,
 };
 use crate::peer::{
     test_support::{ensure_test_connection_generation, handle_test_peer_data, wait_for_command_result, BlockingPeerSender, MockPeerSender},
-    InboundPeerEnvelope, PeerManager, PeerSender,
+    InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,
 };
 
 fn ok_response(msg: Message, expected_id: u64) -> Response {
@@ -152,6 +153,49 @@ fn make_remote_command_router(
         Arc::clone(pending_remote_cancels),
         Arc::clone(next_remote_command_id),
     )
+}
+
+struct FailingPeerSender;
+
+#[async_trait::async_trait]
+impl PeerSender for FailingPeerSender {
+    async fn send(&self, _msg: PeerWireMessage) -> Result<(), String> {
+        Err("outbound channel closed".to_string())
+    }
+
+    async fn retire(&self, _reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct FailingPeerTransport;
+
+#[async_trait::async_trait]
+impl PeerTransport for FailingPeerTransport {
+    async fn connect(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn status(&self) -> PeerConnectionStatus {
+        PeerConnectionStatus::Connected
+    }
+
+    fn connection_address(&self) -> String {
+        "ssh://feta.example".to_string()
+    }
+
+    async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(rx)
+    }
+
+    fn sender(&self) -> Option<Arc<dyn PeerSender>> {
+        Some(Arc::new(FailingPeerSender))
+    }
 }
 
 fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
@@ -301,6 +345,7 @@ async fn daemon_server_uses_sqlite_resource_backend_in_state_dir() {
         .using::<Convoy>("flotilla")
         .create(&InputMeta::builder().name("persisted".to_string()).build(), &ConvoySpec {
             workflow_ref: "scratch".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: Default::default(),
             placement_policy: None,
             repositories: Vec::new(),
@@ -761,6 +806,44 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let home = HostName::new("feta");
+    apply_convoy_replica_feed(&daemon, "flotilla", "stranded", home.clone()).await;
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")))
+                .host_name(home.clone())
+                .node(node_info("feta"))
+                .system(flotilla_protocol::SystemInfo::default())
+                .providers(vec![])
+                .build(),
+        )
+        .await;
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    {
+        let mut manager = peer_manager.lock().await;
+        manager.add_configured_target(ConfigLabel("feta".to_string()), home, Some(node("feta")), Box::new(FailingPeerTransport));
+        manager.register_sender(node("feta"), Arc::new(FailingPeerSender));
+    }
+    let remote_command_router = empty_remote_command_router(&daemon, &peer_manager);
+
+    let message = remote_command_router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true },
+        })
+        .await
+        .expect_err("failed peer send should reject dispatch");
+
+    assert_eq!(message, "connect to feta at ssh://feta.example: outbound channel closed");
 }
 
 #[tokio::test]
@@ -2097,7 +2180,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                         }
                         CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
                             assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
-                            assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()] });
+                            assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
                             saw_finished = true;
                         }
                         CommandPeerEvent::StepUpdate { .. } => {}
@@ -2113,7 +2196,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(*request_id, 7);
                     assert_eq!(requester_node_id, &NodeId::new("desktop"));
                     assert_eq!(responder_node_id, daemon.node_id());
-                    assert_eq!(result.as_ref(), &CommandValue::Refreshed { repos: vec![repo.clone()] });
+                    assert_eq!(result.as_ref(), &CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
                     saw_response = true;
                 }
                 other => panic!("unexpected proxied message: {other:?}"),

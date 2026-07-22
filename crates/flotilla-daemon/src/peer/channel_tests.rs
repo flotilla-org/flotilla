@@ -321,7 +321,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
                 requester_node_id: node("host-a"),
                 responder_node_id: node("host-c"),
                 remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                result: Box::new(CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")] }),
+                result: Box::new(CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")], identity_changes: Vec::new() }),
             }),
         )
         .await
@@ -332,7 +332,7 @@ async fn routed_command_event_and_response_reach_requester_through_relay() {
         a_response_results.as_slice(),
         [HandleResult::CommandResponseReceived { request_id: 77, responder_node_id, result }]
             if responder_node_id == &node("host-c")
-                && *result == CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")] }
+                && *result == CommandValue::Refreshed { repos: vec![PathBuf::from("/repo")], identity_changes: Vec::new() }
     ));
 }
 

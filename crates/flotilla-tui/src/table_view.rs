@@ -7,13 +7,15 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    result_set::Timestamp, ChangeRequestStatus, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey,
-    RepositoryKey, ResultSetCondition, ResultSetState, SessionPhase, ViewAddress,
+    result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName,
+    IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience,
+    SessionPhase, ViewAddress,
 };
 
 use crate::{
     app::ui_state::PendingAction,
     convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase},
+    pm_open::OpenInPmTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -311,6 +313,7 @@ pub struct DetailField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableIntent {
+    OpenInPm(OpenInPmTarget),
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
     DeleteConvoy { namespace: String, name: String, host: Option<HostName> },
@@ -380,6 +383,8 @@ pub enum TableAvailability {
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct TableMeta {
     pub as_of: Option<Timestamp>,
+    #[builder(default)]
+    pub salience: Salience,
     pub has_more: bool,
     pub conditions: Vec<String>,
     pub availability: TableAvailability,
@@ -413,7 +418,10 @@ fn fuzzy_matches(value: &str, pattern: &str) -> bool {
 struct VesselProjection {
     namespace: String,
     convoy: String,
+    origin_host: Option<HostName>,
+    project_ref: Option<String>,
     repo_hint: Option<RepoKey>,
+    vessel_count: usize,
     vessel: VesselSummary,
 }
 
@@ -432,6 +440,7 @@ pub struct TableRows<'a> {
     pub independent_results: Vec<QueryRows<'a, IndependentRow>>,
     pub issue_results: Vec<QueryRows<'a, IssueRow>>,
     pub checkout_results: Vec<QueryRows<'a, CheckoutRow>>,
+    pub awareness_results: Vec<QueryRows<'a, AwarenessNode>>,
     pub source_search: Option<&'a str>,
 }
 
@@ -489,7 +498,10 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
                 namespace: namespace.clone(),
                 convoy: name.clone(),
+                origin_host: convoy.origin_host.clone(),
+                project_ref: convoy.project_ref.clone(),
                 repo_hint: convoy.repo_hint.clone(),
+                vessel_count: convoy.vessels.len(),
                 vessel: vessel.clone(),
             });
             let title = convoy.change_request.as_ref().map_or_else(
@@ -508,7 +520,10 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             Ok(vessel_spec().project(format!("Vessel · {vessel}"), [VesselProjection {
                 namespace: namespace.clone(),
                 convoy: convoy.clone(),
+                origin_host: convoy_row.origin_host.clone(),
+                project_ref: convoy_row.project_ref.clone(),
                 repo_hint: convoy_row.repo_hint.clone(),
+                vessel_count: convoy_row.vessels.len(),
                 vessel: vessel_row.clone(),
             }]))
         }
@@ -563,12 +578,33 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     let checkouts_address = ViewAddress::Checkouts { scope: Some(scope.clone()) };
     let issues_address = ViewAddress::Issues { scope: scope.clone() };
     let independents_address = ViewAddress::Independents { scope: Some(scope) };
+    let awareness = awareness_for_project(namespace, name, data);
     let mut checkouts = project(&checkouts_address, data).unwrap_or_else(|_| pending_project_table(&checkouts_address));
     let mut issues = project(&issues_address, data).unwrap_or_else(|_| pending_project_table(&issues_address));
     let mut independents = project(&independents_address, data).unwrap_or_else(|_| pending_project_table(&independents_address));
-    checkouts.title = "Checkouts".to_string();
-    issues.title = "Issues".to_string();
-    independents.title = "Independents".to_string();
+    if let Some(counts) = awareness.map(|node| &node.counts) {
+        checkouts.title = format!("Checkouts ({})", counts.checkouts);
+        issues.title = format!("Issues ({})", counts.issues);
+        independents.title = format!("Independents ({})", counts.independents);
+    } else {
+        checkouts.title = "Checkouts".to_string();
+        issues.title = "Issues".to_string();
+        independents.title = "Independents".to_string();
+    }
+    let mut convoys_title = "Convoys".to_string();
+    if let Some(counts) = awareness.map(|node| &node.counts) {
+        convoys_title = format!("Convoys ({})", counts.convoys);
+    }
+
+    if let Some(awareness) = awareness {
+        apply_family_summary(&mut checkouts, awareness, AwarenessFamily::Checkouts);
+        apply_family_summary(&mut issues, awareness, AwarenessFamily::Issues);
+        apply_family_summary(&mut independents, awareness, AwarenessFamily::Independents);
+    }
+    let mut convoys = TableView { title: convoys_title, ..convoys };
+    if let Some(awareness) = awareness {
+        apply_family_summary(&mut convoys, awareness, AwarenessFamily::Convoys);
+    }
 
     Ok(vec![
         ProjectPanel { kind: ProjectPanelKind::Convoys, target: ViewAddress::Convoys { namespace: namespace.clone() }, table: convoys },
@@ -576,6 +612,27 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
         ProjectPanel { kind: ProjectPanelKind::Issues, target: issues_address, table: issues },
         ProjectPanel { kind: ProjectPanelKind::Independents, target: independents_address, table: independents },
     ])
+}
+
+fn apply_family_summary(table: &mut TableView, awareness: &AwarenessNode, family: AwarenessFamily) {
+    if let Some(summary) = awareness.family_summary(family) {
+        table.meta.salience = summary.salience;
+        table.meta.as_of = Some(summary.as_of);
+    }
+}
+
+fn awareness_for_project<'a>(namespace: &str, name: &str, data: &'a TableRows<'_>) -> Option<&'a AwarenessNode> {
+    let query = QueryId::Awareness {
+        scope: Some(QueryScope::new(namespace, name)),
+        grouping: AwarenessGrouping::Project,
+        limit: AwarenessLimit::default(),
+    };
+    data.awareness_results
+        .iter()
+        .find(|result| *result.query == query)?
+        .rows
+        .iter()
+        .find(|node| node.scope.as_ref().is_some_and(|scope| scope.namespace == namespace && scope.name == name))
 }
 
 fn pending_project_table(address: &ViewAddress) -> TableView {
@@ -728,13 +785,11 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
     },
 ];
 
-static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 2] =
-    [ActionSpec { id: "open_pr", label: "Open PR", key: 'p', resolve: open_convoy_change_request }, ActionSpec {
-        id: "delete",
-        label: "Delete convoy",
-        key: 'd',
-        resolve: delete_convoy,
-    }];
+static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 3] = [
+    ActionSpec { id: "open_pr", label: "Open PR", key: 'p', resolve: open_convoy_change_request },
+    ActionSpec { id: "delete", label: "Delete convoy", key: 'd', resolve: delete_convoy },
+    ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_convoy_in_pm },
+];
 
 static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     ColumnSpec {
@@ -775,13 +830,11 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     },
 ];
 
-static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 2] =
-    [ActionSpec { id: "attach", label: "Attach workspace", key: 'a', resolve: attach_vessel }, ActionSpec {
-        id: "force_complete",
-        label: "Force-complete work",
-        key: 'x',
-        resolve: force_complete_vessel,
-    }];
+static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 3] = [
+    ActionSpec { id: "attach", label: "Attach workspace", key: 'a', resolve: attach_vessel },
+    ActionSpec { id: "force_complete", label: "Force-complete work", key: 'x', resolve: force_complete_vessel },
+    ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_vessel_in_pm },
+];
 
 static INDEPENDENT_COLUMNS: [ColumnSpec<IndependentRow>; 5] = [
     ColumnSpec {
@@ -946,6 +999,10 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
         DetailField { label: "Namespace", value: row.namespace.clone() },
         DetailField { label: "Convoy", value: row.name.clone() },
         DetailField { label: "Workflow", value: row.workflow_ref.clone() },
+        DetailField {
+            label: "Dispatcher",
+            value: format!("{}/{}", row.dispatching_principal_ref.namespace, row.dispatching_principal_ref.name),
+        },
         DetailField { label: "Phase", value: convoy_phase(row).text },
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
@@ -969,6 +1026,30 @@ fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
         repository_key: change_request.repository_key.clone(),
         host: row.origin_host.clone(),
     })
+}
+
+fn open_convoy_in_pm(row: &ConvoySummary) -> Option<TableIntent> {
+    let vessel = row
+        .vessels
+        .iter()
+        .find(|vessel| vessel.workspace_ref.is_some())
+        .or_else(|| row.vessels.iter().find(|vessel| vessel.materialize_ref.is_some()))
+        .or_else(|| row.vessels.first());
+    let label = vessel.map_or_else(
+        || row.name.clone(),
+        |vessel| if row.vessels.len() == 1 { row.name.clone() } else { format!("{}:{}", row.name, vessel.name) },
+    );
+    Some(TableIntent::OpenInPm(OpenInPmTarget {
+        namespace: row.namespace.clone(),
+        convoy: row.name.clone(),
+        vessel: vessel.map(|vessel| vessel.name.clone()),
+        label,
+        host: row.origin_host.clone().or_else(|| vessel.and_then(|vessel| vessel.host.clone())),
+        project_ref: row.project_ref.clone(),
+        repo_hint: row.repo_hint.clone(),
+        workspace_ref: vessel.and_then(|vessel| vessel.workspace_ref.clone()),
+        materialize_ref: vessel.and_then(|vessel| vessel.materialize_ref.clone()),
+    }))
 }
 
 fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
@@ -1063,6 +1144,20 @@ fn attach_vessel(row: &VesselProjection) -> Option<TableIntent> {
     })
 }
 
+fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
+    Some(TableIntent::OpenInPm(OpenInPmTarget {
+        namespace: row.namespace.clone(),
+        convoy: row.convoy.clone(),
+        vessel: Some(row.vessel.name.clone()),
+        label: if row.vessel_count == 1 { row.convoy.clone() } else { format!("{}:{}", row.convoy, row.vessel.name) },
+        host: row.origin_host.clone().or_else(|| row.vessel.host.clone()),
+        project_ref: row.project_ref.clone(),
+        repo_hint: row.repo_hint.clone(),
+        workspace_ref: row.vessel.workspace_ref.clone(),
+        materialize_ref: row.vessel.materialize_ref.clone(),
+    }))
+}
+
 fn force_complete_vessel(row: &VesselProjection) -> Option<TableIntent> {
     let target = row.vessel.completion_target.as_ref()?;
     Some(TableIntent::ForceCompleteWork { convoy: target.convoy.clone(), vessel: target.vessel.clone(), host: target.host.clone() })
@@ -1100,8 +1195,8 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{
-        test_support::TestIssue, DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef,
-        ResultSetCondition, ResultSetState,
+        test_support::TestIssue, AwarenessCounts, AwarenessFamilySummary, AwarenessKind, AwarenessNode, AwarenessState,
+        DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef, ResultSetCondition, ResultSetState,
     };
 
     use super::*;
@@ -1120,6 +1215,7 @@ mod tests {
             host: Some(HostName::new("kiwi")),
             checkout: None,
             workspace_ref: None,
+            materialize_ref: None,
             completion_target: None,
             ready_at: None,
             started_at: None,
@@ -1135,6 +1231,7 @@ mod tests {
             name: "tables".into(),
             origin_host: None,
             workflow_ref: "implement-review".into(),
+            dispatching_principal_ref: Default::default(),
             phase: ConvoyPhase::Active,
             message: None,
             repo_hint: None,
@@ -1215,6 +1312,7 @@ mod tests {
 
         let pr_index = view.columns.iter().position(|column| column.id == "pr").expect("PR column");
         assert_eq!(view.rows[0].cells[pr_index], CellValue::toned("#815 open", CellTone::Success));
+        assert!(view.rows[0].describe.contains(&DetailField { label: "Dispatcher", value: "flotilla/implicit".into() }));
         assert!(view.rows[0].describe.contains(&DetailField { label: "Pull request", value: "#815 · open".into() }));
         assert_eq!(
             view.rows[0].actions.iter().find(|action| action.id == "open_pr"),
@@ -1238,12 +1336,16 @@ mod tests {
         row.origin_host = Some(HostName::new("kiwi"));
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
-        assert_eq!(view.rows[0].actions, vec![AvailableAction {
-            id: "delete",
-            label: "Delete convoy",
-            key: 'd',
-            intent: TableIntent::DeleteConvoy { namespace: "dev".into(), name: "tables".into(), host: Some(HostName::new("kiwi")) },
-        }]);
+        assert!(view.rows[0].actions.iter().any(|action| action.id == "open_in_pm" && action.label == "Open in PM" && action.key == 'o'));
+        assert!(view.rows[0].actions.iter().any(|action| {
+            action
+                == &AvailableAction {
+                    id: "delete",
+                    label: "Delete convoy",
+                    key: 'd',
+                    intent: TableIntent::DeleteConvoy { namespace: "dev".into(), name: "tables".into(), host: Some(HostName::new("kiwi")) },
+                }
+        }));
     }
 
     #[test]
@@ -1283,8 +1385,8 @@ mod tests {
         let row = convoy(vec![actionable, vessel("review", &["implement"], WorkPhase::Pending)]);
         let view = project_convoys("convoy/dev/tables", &[&row]).expect("project table");
 
-        assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete"]);
-        assert!(view.rows[1].actions.is_empty(), "unavailable actions must not render");
+        assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete", "open_in_pm"]);
+        assert_eq!(view.rows[1].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["open_in_pm"]);
     }
 
     #[test]
@@ -1331,6 +1433,40 @@ mod tests {
         let issue_query = QueryId::Issues { scope: scope.clone(), search: None };
         let checkout_query = QueryId::Checkouts { scope: Some(scope.clone()) };
         let independent_query = QueryId::Independents { scope: Some(scope.clone()) };
+        let awareness_query =
+            QueryId::Awareness { scope: Some(scope.clone()), grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
+        let awareness = AwarenessNode::builder()
+            .id("project/flotilla/roadmap".to_string())
+            .kind(AwarenessKind::Project)
+            .label("roadmap".to_string())
+            .scope(scope.clone())
+            .state(AwarenessState::Active)
+            .salience(Salience::Urgent)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .counts(AwarenessCounts::builder().total(4).convoys(1).issues(1).checkouts(1).independents(1).build())
+            .family_summaries(vec![
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Convoys)
+                    .salience(Salience::Urgent)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Checkouts)
+                    .salience(Salience::None)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Issues)
+                    .salience(Salience::Attention)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+                AwarenessFamilySummary::builder()
+                    .family(AwarenessFamily::Independents)
+                    .salience(Salience::Info)
+                    .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+                    .build(),
+            ])
+            .build();
         let state = ResultSetState::default();
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
 
@@ -1339,6 +1475,7 @@ mod tests {
             issue_results: vec![QueryRows { query: &issue_query, rows: std::slice::from_ref(&issue_row), state: &state }],
             checkout_results: vec![QueryRows { query: &checkout_query, rows: std::slice::from_ref(&checkout), state: &state }],
             independent_results: vec![QueryRows { query: &independent_query, rows: std::slice::from_ref(&independent), state: &state }],
+            awareness_results: vec![QueryRows { query: &awareness_query, rows: std::slice::from_ref(&awareness), state: &state }],
             ..TableRows::default()
         })
         .expect("project panels");
@@ -1355,6 +1492,19 @@ mod tests {
             "issues?project=flotilla%2Froadmap",
             "independents?project=flotilla%2Froadmap",
         ]);
+        assert_eq!(panels.iter().map(|panel| panel.table.title.as_str()).collect::<Vec<_>>(), vec![
+            "Convoys (1)",
+            "Checkouts (1)",
+            "Issues (1)",
+            "Independents (1)",
+        ]);
+        assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
+            Salience::Urgent,
+            Salience::None,
+            Salience::Attention,
+            Salience::Info,
+        ]);
+        assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
         assert_eq!(panels[2].table.rows[0].actions[0].intent, TableIntent::StartConvoy {

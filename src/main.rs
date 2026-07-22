@@ -223,6 +223,8 @@ enum HooksSubCommand {
 enum ResourceSubCommand {
     /// List resources of a kind
     List(ResourceListArgs),
+    /// Create or update a raw resource document
+    Apply(ResourceApplyArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
     /// Watch resources of a kind
@@ -251,6 +253,19 @@ struct ResourceGetArgs {
     #[arg(long, default_value = "flotilla")]
     namespace: String,
     /// Route the query to a peer host
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ResourceApplyArgs {
+    /// Resource document path (JSON or YAML)
+    #[arg(short, long)]
+    file: PathBuf,
+    /// Default namespace when metadata.namespace is omitted
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the mutation to a peer host
     #[arg(long)]
     host: Option<String>,
 }
@@ -451,12 +466,14 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         tracing::warn!(requested = %theme_name, using = %initial_theme.name, "unknown theme, falling back");
     }
 
+    let pm_connector = flotilla_tui::pm_open::detect_connector();
     loop {
         let repos_info = daemon.list_repos().await.unwrap_or_default();
         let app = match scoped_view.clone() {
             Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
             None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
-        };
+        }
+        .with_pm_connector(pm_connector.clone());
 
         match flotilla_tui::run::run_event_loop(terminal, app).await? {
             flotilla_tui::run::EventLoopExit::Quit => return Ok(()),
@@ -729,6 +746,24 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
             print_resource_query_result(result, format)
+        }
+        ResourceSubCommand::Apply(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+            let raw = std::fs::read_to_string(&args.file)
+                .map_err(|error| color_eyre::eyre::eyre!("read resource document {}: {error}", args.file.display()))?;
+            let document: serde_json::Value = serde_yml::from_str(&raw)
+                .map_err(|error| color_eyre::eyre::eyre!("parse resource document {}: {error}", args.file.display()))?;
+            run_control_command(
+                cli,
+                Command {
+                    node_id,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ResourceApply { namespace: args.namespace, document },
+                },
+                format,
+            )
+            .await
         }
         ResourceSubCommand::Watch(args) => run_resource_watch(cli, args, format).await,
     }
@@ -1309,7 +1344,7 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use clap::Parser;
     use flotilla_protocol::{
@@ -1317,8 +1352,8 @@ mod tests {
     };
 
     use super::{
-        provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots, Cli, ResourceGetArgs,
-        ResourceListArgs, ResourceSubCommand, SubCommand,
+        provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots, Cli, ResourceApplyArgs,
+        ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
 
     #[test]
@@ -1383,6 +1418,15 @@ mod tests {
             Some(SubCommand::Resource {
                 command: ResourceSubCommand::Get(ResourceGetArgs { kind, name, namespace, host: None })
             }) if kind == "convoys" && name == "demo" && namespace == "ops"
+        ));
+
+        let apply = Cli::try_parse_from(["flotilla", "resource", "apply", "-f", "demand.yaml", "--namespace", "ops"])
+            .expect("resource apply should parse");
+        assert!(matches!(
+            apply.command,
+            Some(SubCommand::Resource {
+                command: ResourceSubCommand::Apply(ResourceApplyArgs { file, namespace, host: None })
+            }) if file.as_path() == Path::new("demand.yaml") && namespace == "ops"
         ));
 
         let watch =

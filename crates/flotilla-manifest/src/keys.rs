@@ -85,3 +85,4 @@ pub const KEY_FACTORY_ID: &str = "factory.id";
 pub const SEGMENT_PROJECT: &str = "git.repo";
 pub const SEGMENT_CONVOY: &str = "flotilla.convoy";
 pub const SEGMENT_VESSEL: &str = "flotilla.vessel";
+pub const SEGMENT_ISSUE: &str = "flotilla.issue";

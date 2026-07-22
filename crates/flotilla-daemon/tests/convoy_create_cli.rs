@@ -7,7 +7,7 @@ use flotilla_core::{
     config::ConfigStore, daemon::DaemonHandle, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery,
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName};
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, HostName, PrincipalRef};
 use flotilla_resources::{Convoy, ConvoyPhase, CrewSource, InMemoryBackend, ResourceBackend, SqliteBackend, Stance, WorkflowTemplate};
 
 fn test_config(dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -127,6 +127,7 @@ async fn convoy_create_command_creates_convoy_resource() {
     let convoys = backend.using::<Convoy>("flotilla");
     let convoy = convoys.get("my-scratch").await.expect("convoy should exist");
     assert_eq!(convoy.spec.workflow_ref, "scratch");
+    assert_eq!(convoy.spec.dispatching_principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
     assert_eq!(convoy.spec.inputs.len(), 1);
     assert!(convoy.spec.repositories.is_empty());
     assert!(

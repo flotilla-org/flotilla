@@ -383,12 +383,24 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::Ok => "ok".to_string(),
-        CommandValue::RepoTracked { path, resolved_from } => match resolved_from {
-            Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),
-            None => format!("repo tracked: {}", path.display()),
-        },
+        CommandValue::RepoTracked { path, resolved_from, identity_change } => {
+            let mut output = match resolved_from {
+                Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),
+                None => format!("repo tracked: {}", path.display()),
+            };
+            if let Some(change) = identity_change {
+                output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous_display, change.current_display));
+            }
+            output
+        }
         CommandValue::RepoUntracked { path } => format!("repo untracked: {}", path.display()),
-        CommandValue::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
+        CommandValue::Refreshed { repos, identity_changes } => {
+            let mut output = format!("refreshed {} repo(s)", repos.len());
+            for change in identity_changes {
+                output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous_display, change.current_display));
+            }
+            output
+        }
         CommandValue::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
         CommandValue::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
         CommandValue::TerminalPrepared { branch, target_node_id, .. } => format!("terminal prepared: {branch} on {target_node_id}"),

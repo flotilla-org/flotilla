@@ -38,6 +38,7 @@ pub use ui_state::{BranchInputKind, DirEntry, ProjectIssueStartContext, RepoView
 use crate::{
     convoy_model::{ConvoyId, ConvoySummary},
     keymap::Keymap,
+    pm_open::PmConnector,
     shared::Shared,
     theme::Theme,
     widgets::{
@@ -290,6 +291,7 @@ pub struct QueryTableCache {
     pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
     pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
     pub checkouts: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::CheckoutRow>>,
+    pub awareness: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::AwarenessNode>>,
 }
 
 pub struct QueryTableResult<R> {
@@ -350,6 +352,11 @@ pub fn table_rows<'a>(
             .iter()
             .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
             .collect(),
+        awareness_results: queries
+            .awareness
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
         source_search,
     }
 }
@@ -366,6 +373,11 @@ pub struct ProjectIssueStartBatch {
     total: usize,
     started: usize,
     rejected: Vec<String>,
+}
+
+struct PmOpenUpdate {
+    label: String,
+    result: Result<(), String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -473,6 +485,11 @@ pub struct App {
     pub issue_update_tx: mpsc::UnboundedSender<issue_view::IssueQueryUpdate>,
     /// Receiver half, drained each event-loop iteration.
     pub issue_update_rx: mpsc::UnboundedReceiver<issue_view::IssueQueryUpdate>,
+    /// Connected presentation-manager realization path, when this TUI is
+    /// running inside a supported PM.
+    pub pm_connector: Option<Arc<dyn PmConnector>>,
+    pm_update_tx: mpsc::UnboundedSender<PmOpenUpdate>,
+    pm_update_rx: mpsc::UnboundedReceiver<PmOpenUpdate>,
     /// Client session ID. Passed to `execute_query` for query dispatch.
     pub session_id: uuid::Uuid,
     /// Drop guard that gives in-process subscribers the same teardown
@@ -545,6 +562,7 @@ impl App {
         }
 
         let (issue_update_tx, issue_update_rx) = mpsc::unbounded_channel();
+        let (pm_update_tx, pm_update_rx) = mpsc::unbounded_channel();
         let session_id = uuid::Uuid::new_v4();
         let query_subscription = daemon.query_subscription(session_id);
 
@@ -573,6 +591,9 @@ impl App {
             pending_fetch_more: HashSet::new(),
             issue_update_tx,
             issue_update_rx,
+            pm_connector: None,
+            pm_update_tx,
+            pm_update_rx,
             session_id,
             _query_subscription: query_subscription,
             namespaces: HashMap::new(),
@@ -581,6 +602,11 @@ impl App {
             subscriptions_dirty: true,
             pending_attach_command: None,
         }
+    }
+
+    pub fn with_pm_connector(mut self, connector: Option<Arc<dyn PmConnector>>) -> Self {
+        self.pm_connector = connector;
+        self
     }
 
     /// Construct an `App` in scoped mode: exactly the one View at `address`,
@@ -943,6 +969,13 @@ impl App {
                         self.spawn_query_page(repo, params, 1, 50);
                     }
                 }
+            }
+        }
+
+        while let Ok(update) = self.pm_update_rx.try_recv() {
+            match update.result {
+                Ok(()) => self.set_status_message(Some(format!("Opened {} in PM", update.label))),
+                Err(error) => self.set_status_message(Some(format!("Could not open {} in PM: {error}", update.label))),
             }
         }
     }
@@ -1483,6 +1516,9 @@ impl App {
                     flotilla_protocol::Rows::Checkouts { rows, .. } => {
                         self.query_tables.checkouts.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
+                    flotilla_protocol::Rows::Awareness { rows, .. } => {
+                        self.query_tables.awareness.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1542,6 +1578,16 @@ impl App {
                             |left, right| {
                                 (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
                             },
+                        );
+                    }
+                    flotilla_protocol::QueryChanges::Awareness { changed, removed, .. } => {
+                        let result = self.query_tables.awareness.entry(query).or_default();
+                        result.apply_delta(
+                            changed,
+                            removed,
+                            delta.state.as_ref(),
+                            |row| row.id.clone(),
+                            |left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)),
                         );
                     }
                 }

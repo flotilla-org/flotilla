@@ -377,6 +377,10 @@ pub enum CommandAction {
         kind: String,
         name: String,
     },
+    ResourceApply {
+        namespace: String,
+        document: serde_json::Value,
+    },
     ResourceWatch {
         namespace: String,
         kind: String,
@@ -461,6 +465,7 @@ impl Command {
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
+            CommandAction::ResourceApply { .. } => "apply resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
         }
     }
@@ -498,12 +503,16 @@ pub enum CommandValue {
         path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resolved_from: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_change: Option<RepositoryIdentityChange>,
     },
     RepoUntracked {
         path: PathBuf,
     },
     Refreshed {
         repos: Vec<PathBuf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        identity_changes: Vec<RepositoryIdentityChange>,
     },
     CheckoutCreated {
         branch: String,
@@ -586,6 +595,12 @@ pub enum CommandValue {
     ProjectApplied {
         name: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryIdentityChange {
+    pub previous_display: String,
+    pub current_display: String,
 }
 
 /// Status of an individual step within a multi-step command.
@@ -965,9 +980,16 @@ mod tests {
     fn command_value_roundtrip_covers_all_variants() {
         let cases = vec![
             CommandValue::Ok,
-            CommandValue::RepoTracked { path: PathBuf::from("/new/repo"), resolved_from: None },
+            CommandValue::RepoTracked {
+                path: PathBuf::from("/new/repo"),
+                resolved_from: None,
+                identity_change: Some(RepositoryIdentityChange {
+                    previous_display: "local".to_string(),
+                    current_display: "https://github.com/flotilla-org/flotilla".to_string(),
+                }),
+            },
             CommandValue::RepoUntracked { path: PathBuf::from("/old/repo") },
-            CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")] },
+            CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")], identity_changes: Vec::new() },
             CommandValue::CheckoutCreated {
                 branch: "feat-new".into(),
                 path: QualifiedPath::host(HostId::new("host-a"), "/repos/project/wt-1"),

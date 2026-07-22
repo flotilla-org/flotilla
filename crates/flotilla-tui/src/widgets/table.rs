@@ -319,6 +319,18 @@ impl InteractiveWidget for TableWidget {
                     Outcome::Consumed
                 }
             },
+            Action::OpenInPm => {
+                if let Some(intent) = ctx
+                    .views
+                    .active_table_state()
+                    .selected_row(&view)
+                    .and_then(|row| row.actions.iter().find(|action| action.id == "open_in_pm"))
+                    .map(|action| action.intent.clone())
+                {
+                    ctx.app_actions.push(AppAction::ExecuteTableIntent(intent));
+                }
+                Outcome::Consumed
+            }
             _ => Outcome::Ignored,
         }
     }

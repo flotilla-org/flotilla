@@ -1618,6 +1618,7 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
                 .depends_on(vessel.depends_on)
                 .host(vessel.host.unwrap_or_else(HostName::local))
                 .maybe_attach(vessel.workspace_ref)
+                .maybe_materialize(vessel.materialize_ref)
                 .complete_work(vessel.completion_target.is_some())
                 .build()
         })
@@ -1726,6 +1727,7 @@ fn test_convoy(
         name: name.into(),
         origin_host: None,
         workflow_ref: "wf".into(),
+        dispatching_principal_ref: Default::default(),
         phase,
         message: None,
         repo_hint: None,
@@ -2107,6 +2109,7 @@ fn convoy_with_vessels(name: &str, vessel_names: &[&str]) -> crate::convoy_model
             host: Some(HostName::local()),
             checkout: None,
             workspace_ref: Some(format!("ws://{vessel_name}")),
+            materialize_ref: Some(format!("terminal-{vessel_name}")),
             completion_target: Some(crate::convoy_model::WorkCompletionTarget {
                 convoy: name.to_string(),
                 vessel: (*vessel_name).to_string(),

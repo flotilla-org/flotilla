@@ -194,6 +194,7 @@ pub fn object_meta(name: &str, namespace: &str, resource_version: &str) -> Objec
 pub fn valid_convoy_spec() -> RealConvoySpec {
     RealConvoySpec {
         workflow_ref: "review-and-fix".to_string(),
+        dispatching_principal_ref: Default::default(),
         inputs: [
             ("feature".to_string(), flotilla_resources::InputValue::String("Retry logic".to_string())),
             ("branch".to_string(), flotilla_resources::InputValue::String("fix-retry-logic".to_string())),

@@ -30,7 +30,7 @@ use flotilla_manifest::{
     wire::MetadataPatch,
 };
 use flotilla_protocol::{
-    result_set::{ConvoyRow, IndependentRow, QueryChanges, ResultDelta, ResultSet, Rows},
+    result_set::{AwarenessGrouping, AwarenessLimit, AwarenessNode, ConvoyRow, IndependentRow, QueryChanges, ResultDelta, ResultSet, Rows},
     DaemonEvent, QueryCursor, QueryId, ResourceRef,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -138,6 +138,7 @@ pub enum Applied {
 /// The connector's held state: fleet-merged rows per query, per-query
 /// cursors, and the catalog as last published.
 pub struct ConnectorState {
+    awareness: Vec<AwarenessNode>,
     convoys: HashMap<ResourceRef, ConvoyRow>,
     independents: HashMap<ResourceRef, IndependentRow>,
     seqs: HashMap<QueryId, u64>,
@@ -148,6 +149,7 @@ pub struct ConnectorState {
 impl Default for ConnectorState {
     fn default() -> Self {
         Self {
+            awareness: Vec::new(),
             convoys: HashMap::new(),
             independents: HashMap::new(),
             seqs: HashMap::new(),
@@ -177,6 +179,9 @@ impl ConnectorState {
                 self.independents = rows.iter().map(|row| (row.resource.clone(), row.clone())).collect();
             }
             Rows::Independents { scope: Some(_), .. } => return Applied::Ignored,
+            Rows::Awareness { rows, .. } => {
+                self.awareness = rows.clone();
+            }
             Rows::Issues { .. } | Rows::Checkouts { .. } => return Applied::Ignored,
         }
         self.seqs.insert(query, set.seq);
@@ -212,6 +217,17 @@ impl ConnectorState {
                 }
             }
             QueryChanges::Independents { scope: Some(_), .. } => return Applied::Ignored,
+            QueryChanges::Awareness { changed: rows, removed, .. } => {
+                self.awareness.retain(|node| !removed.contains(&node.id));
+                for row in rows {
+                    if let Some(existing) = self.awareness.iter_mut().find(|node| node.id == row.id) {
+                        *existing = row.clone();
+                    } else {
+                        self.awareness.push(row.clone());
+                    }
+                }
+                self.awareness.sort_by(|left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)));
+            }
             QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
                 return Applied::Gap(query);
             }
@@ -225,7 +241,8 @@ impl ConnectorState {
     pub fn rebuild(&mut self, mint: &dyn RecipeMint) -> Vec<MetadataPatch> {
         let convoys: Vec<ConvoyRow> = self.convoys.values().cloned().collect();
         let independents: Vec<IndependentRow> = self.independents.values().cloned().collect();
-        let next = project_catalog(&CatalogInput { convoys: &convoys, independents: &independents }, mint);
+        let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
+        let next = project_catalog(&CatalogInput { awareness, convoys: &convoys, independents: &independents }, mint);
         let patches = next.diff_patches(&self.catalog);
         self.catalog = next;
         patches
@@ -240,7 +257,12 @@ impl ConnectorState {
     /// stale by construction, so resubscribing with these gets it a full
     /// [`ResultSet`].
     pub fn cursors(&self) -> Vec<QueryCursor> {
-        QueryId::ALWAYS_MATERIALIZED.iter().cloned().map(|query| QueryCursor { since: self.seqs.get(&query).copied(), query }).collect()
+        QueryId::ALWAYS_MATERIALIZED
+            .iter()
+            .cloned()
+            .chain([QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() }])
+            .map(|query| QueryCursor { since: self.seqs.get(&query).copied(), query })
+            .collect()
     }
 }
 
