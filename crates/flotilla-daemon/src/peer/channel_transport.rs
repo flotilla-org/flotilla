@@ -233,6 +233,10 @@ impl PeerTransport for ChannelTransport {
         self.status.lock().expect("status lock").clone()
     }
 
+    fn connection_address(&self) -> String {
+        format!("channel://{}", self.remote_name)
+    }
+
     async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
         {
             let status = self.status.lock().expect("status lock");
