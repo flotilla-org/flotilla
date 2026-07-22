@@ -11,10 +11,7 @@ use flotilla_protocol::{
     RepositoryKey, ResultSetCondition, ResultSetState, SessionPhase, ViewAddress,
 };
 
-use crate::{
-    app::ui_state::PendingAction,
-    convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase},
-};
+use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RowId(String);
@@ -25,11 +22,47 @@ impl RowId {
     }
 }
 
+/// Transient state for a row while a user action is being reconciled by an
+/// authoritative query. Surfaces render this state in their own idiom; the
+/// state itself contains no ratatui types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowState {
+    Submitting { query: QueryId, description: String },
+    Pending { query: QueryId, command_id: u64, description: String },
+    Failed { query: QueryId, description: String, message: String },
+}
+
+impl RowState {
+    fn query(&self) -> &QueryId {
+        match self {
+            Self::Submitting { query, .. } | Self::Pending { query, .. } | Self::Failed { query, .. } => query,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Submitting { .. } | Self::Pending { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthoritativeRowUpdate {
+    Full,
+    Rows(HashSet<RowId>),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingRowContext {
+    pub address: ViewAddress,
+    pub panel: Option<ProjectPanelKind>,
+    pub query: QueryId,
+    pub row_id: RowId,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 pub struct TableState {
     selected: Option<RowId>,
     pub multi_selected: HashSet<RowId>,
-    pub pending_actions: HashMap<RowId, PendingAction>,
+    row_states: HashMap<RowId, RowState>,
     pub filter: String,
     /// Ephemeral provider-side search for demand-backed issue tables. This is
     /// deliberately View state rather than part of the persisted address.
@@ -38,6 +71,61 @@ pub struct TableState {
 }
 
 impl TableState {
+    pub fn begin_pending(&mut self, query: QueryId, row_id: RowId, description: String) -> Result<(), String> {
+        if self.row_states.get(&row_id).is_some_and(RowState::is_pending) {
+            return Err("An action is already in progress for this row".to_string());
+        }
+        self.row_states.insert(row_id, RowState::Submitting { query, description });
+        Ok(())
+    }
+
+    pub fn row_state(&self, row_id: &RowId) -> Option<&RowState> {
+        self.row_states.get(row_id)
+    }
+
+    pub fn clear_row_state(&mut self, row_id: &RowId) {
+        self.row_states.remove(row_id);
+    }
+
+    pub fn mark_pending(&mut self, row_id: &RowId, command_id: u64) {
+        let Some(RowState::Submitting { query, description }) = self.row_states.remove(row_id) else { return };
+        self.row_states.insert(row_id.clone(), RowState::Pending { query, command_id, description });
+    }
+
+    pub fn mark_failed(&mut self, row_id: &RowId, message: String) {
+        let Some(state) = self.row_states.remove(row_id) else { return };
+        let (query, description) = match state {
+            RowState::Submitting { query, description }
+            | RowState::Pending { query, description, .. }
+            | RowState::Failed { query, description, .. } => (query, description),
+        };
+        self.row_states.insert(row_id.clone(), RowState::Failed { query, description, message });
+    }
+
+    pub fn finish_command(&mut self, command_id: u64, error: Option<&str>) {
+        let failed = self.row_states.iter().find_map(|(row_id, state)| match state {
+            RowState::Pending { command_id: pending_id, .. } if *pending_id == command_id => Some(row_id.clone()),
+            _ => None,
+        });
+        if let (Some(row_id), Some(message)) = (failed, error) {
+            self.mark_failed(&row_id, message.to_string());
+        }
+    }
+
+    pub fn has_pending_rows(&self) -> bool {
+        self.row_states.values().any(RowState::is_pending)
+    }
+
+    pub fn reconcile_authoritative(&mut self, query: &QueryId, update: &AuthoritativeRowUpdate) {
+        self.row_states.retain(|row_id, state| {
+            state.query() != query
+                || match update {
+                    AuthoritativeRowUpdate::Full => false,
+                    AuthoritativeRowUpdate::Rows(updated) => !updated.contains(row_id),
+                }
+        });
+    }
+
     pub fn selected(&self) -> Option<&RowId> {
         self.selected.as_ref()
     }
@@ -57,7 +145,6 @@ impl TableState {
             self.selected = view.rows.first().map(|row| row.id.clone());
         }
         self.multi_selected.retain(|selected| view.rows.iter().any(|row| &row.id == selected));
-        self.pending_actions.retain(|selected, _| view.rows.iter().any(|row| &row.id == selected));
         self.scroll_offset = self.scroll_offset.min(view.rows.len().saturating_sub(1));
     }
 
@@ -313,7 +400,7 @@ pub struct DetailField {
 pub enum TableIntent {
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
-    DeleteConvoy { namespace: String, name: String, host: Option<HostName> },
+    DeleteConvoy { row_id: RowId, namespace: String, name: String, host: Option<HostName> },
     OpenChangeRequest { id: String, repository_key: RepositoryKey, host: Option<HostName> },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
     StartConvoy { namespace: String, project: String, issue: IssueRef },
@@ -972,14 +1059,20 @@ fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
 }
 
 fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
-    Some(TableIntent::DeleteConvoy { namespace: row.namespace.clone(), name: row.name.clone(), host: row.origin_host.clone() })
+    Some(TableIntent::DeleteConvoy {
+        row_id: convoy_id(row),
+        namespace: row.namespace.clone(),
+        name: row.name.clone(),
+        host: row.origin_host.clone(),
+    })
 }
 
 fn scoped_issue_id(row: &ScopedIssueProjection) -> RowId {
-    RowId::new(format!(
-        "issue:{}:{}:{}:{}:{}",
-        row.scope.namespace, row.scope.name, row.row.reference.source.service, row.row.reference.source.scope, row.row.reference.id
-    ))
+    issue_row_id(&row.scope, &row.row.reference)
+}
+
+pub fn issue_row_id(scope: &QueryScope, reference: &IssueRef) -> RowId {
+    RowId::new(format!("issue:{}:{}:{}:{}:{}", scope.namespace, scope.name, reference.source.service, reference.source.scope, reference.id))
 }
 
 fn scoped_issue_description(row: &ScopedIssueProjection) -> Vec<DetailField> {
@@ -1242,7 +1335,12 @@ mod tests {
             id: "delete",
             label: "Delete convoy",
             key: 'd',
-            intent: TableIntent::DeleteConvoy { namespace: "dev".into(), name: "tables".into(), host: Some(HostName::new("kiwi")) },
+            intent: TableIntent::DeleteConvoy {
+                row_id: RowId::new("dev/tables"),
+                namespace: "dev".into(),
+                name: "tables".into(),
+                host: Some(HostName::new("kiwi")),
+            },
         }]);
     }
 
@@ -1488,6 +1586,22 @@ mod tests {
         state.select_delta(&view, -2);
         state.ensure_selected_visible(&view, 2);
         assert_eq!(state.scroll_offset, 1);
+    }
+
+    #[test]
+    fn pending_row_clears_only_on_its_next_authoritative_update() {
+        let mut state = TableState::default();
+        let pending = RowId::new("dev/tables");
+        let unrelated = RowId::new("dev/other");
+
+        state.begin_pending(QueryId::Convoys, pending.clone(), "Delete convoy".into()).expect("row should become pending");
+        state.reconcile_authoritative(&QueryId::Convoys, &AuthoritativeRowUpdate::Rows(HashSet::from([unrelated])));
+
+        assert!(matches!(state.row_state(&pending), Some(RowState::Submitting { .. })));
+
+        state.reconcile_authoritative(&QueryId::Convoys, &AuthoritativeRowUpdate::Rows(HashSet::from([pending.clone()])));
+
+        assert!(state.row_state(&pending).is_none());
     }
 
     #[test]

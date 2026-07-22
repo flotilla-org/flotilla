@@ -47,12 +47,11 @@ impl InteractiveWidget for DeleteConfirmWidget {
                     return Outcome::Consumed;
                 }
                 if let Some(ref info) = self.info {
-                    let pending_ctx = PendingActionContext {
-                        identity: self.identity.clone(),
-                        description: format!("Remove {}", info.branch),
-                        repo_identity: ctx.model.active_repo_identity().clone(),
-                        project_issue_start: None,
-                    };
+                    let pending_ctx = PendingActionContext::work_item(
+                        self.identity.clone(),
+                        ctx.model.active_repo_identity().clone(),
+                        format!("Remove {}", info.branch),
+                    );
                     let checkout = match &self.checkout_path {
                         Some(path) => CheckoutSelector::Path(path.clone()),
                         None => CheckoutSelector::Query(info.branch.clone()),
@@ -265,7 +264,7 @@ mod tests {
 
         let (_, ctx) = harness.commands.take_next().expect("should have command");
         let ctx = ctx.expect("should have pending context");
-        assert_eq!(ctx.identity, identity);
+        assert_eq!(ctx.work_item_identity(), Some(&identity));
     }
 
     #[test]

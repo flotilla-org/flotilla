@@ -3,7 +3,10 @@ use std::collections::{BTreeMap, HashSet};
 use flotilla_protocol::{HostName, IssueRef, ProvisioningTarget, RepoIdentity, ViewAddress, WorkItemIdentity};
 use ratatui::layout::Rect;
 
-use crate::{status_bar::StatusBarTarget, table_view::RowId};
+use crate::{
+    status_bar::StatusBarTarget,
+    table_view::{PendingRowContext, RowId},
+};
 
 #[derive(Clone)]
 pub struct DirEntry {
@@ -46,10 +49,50 @@ pub struct PendingAction {
 
 #[derive(Clone, Debug)]
 pub struct PendingActionContext {
-    pub identity: WorkItemIdentity,
     pub description: String,
-    pub repo_identity: RepoIdentity,
-    pub project_issue_start: Option<ProjectIssueStartContext>,
+    pub target: PendingActionTarget,
+}
+
+impl PendingActionContext {
+    pub fn work_item(identity: WorkItemIdentity, repo_identity: RepoIdentity, description: String) -> Self {
+        Self { description, target: PendingActionTarget::WorkItem { identity, repo_identity } }
+    }
+
+    pub fn table_row(target: PendingRowContext, description: String) -> Self {
+        Self { description, target: PendingActionTarget::TableRow(target) }
+    }
+
+    pub fn project_issue_start(target: ProjectIssueStartContext, description: String) -> Self {
+        Self { description, target: PendingActionTarget::ProjectIssueStart(target) }
+    }
+
+    pub fn work_item_identity(&self) -> Option<&WorkItemIdentity> {
+        match &self.target {
+            PendingActionTarget::WorkItem { identity, .. } => Some(identity),
+            _ => None,
+        }
+    }
+
+    pub fn project_issue_start_context(&self) -> Option<&ProjectIssueStartContext> {
+        match &self.target {
+            PendingActionTarget::ProjectIssueStart(context) => Some(context),
+            _ => None,
+        }
+    }
+
+    pub fn table_row_context(&self) -> Option<&PendingRowContext> {
+        match &self.target {
+            PendingActionTarget::TableRow(context) => Some(context),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PendingActionTarget {
+    WorkItem { identity: WorkItemIdentity, repo_identity: RepoIdentity },
+    TableRow(PendingRowContext),
+    ProjectIssueStart(ProjectIssueStartContext),
 }
 
 #[derive(Clone, Debug)]

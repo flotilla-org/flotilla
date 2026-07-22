@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 
 use flotilla_core::config::OpenViewEntry;
-use flotilla_protocol::{RepoIdentity, RepositoryKey, ViewAddress};
+use flotilla_protocol::{QueryId, RepoIdentity, RepositoryKey, ViewAddress};
 
-use crate::table_view::{ProjectTableState, TableState};
+use crate::table_view::{AuthoritativeRowUpdate, PendingRowContext, ProjectPanelKind, ProjectTableState, TableState};
 
 /// What an open tab points at: a parsed View address, or the raw entry that
 /// failed to parse. A broken entry renders an error view in place — it never
@@ -95,6 +95,28 @@ impl OpenView {
         }
     }
 
+    fn table_state_mut(&mut self, panel: Option<ProjectPanelKind>) -> Option<&mut TableState> {
+        match panel {
+            Some(panel) if matches!(self.address(), Some(ViewAddress::Project { .. })) => Some(self.project_table_state.table_mut(panel)),
+            Some(_) => None,
+            None => Some(&mut self.table_state),
+        }
+    }
+
+    fn visit_table_states_mut(&mut self, visit: &mut impl FnMut(&mut TableState)) {
+        visit(&mut self.table_state);
+        for panel in [ProjectPanelKind::Convoys, ProjectPanelKind::Checkouts, ProjectPanelKind::Issues, ProjectPanelKind::Independents] {
+            visit(self.project_table_state.table_mut(panel));
+        }
+        for frame in &mut self.history {
+            visit(&mut frame.table_state);
+            for panel in [ProjectPanelKind::Convoys, ProjectPanelKind::Checkouts, ProjectPanelKind::Issues, ProjectPanelKind::Independents]
+            {
+                visit(frame.project_table_state.table_mut(panel));
+            }
+        }
+    }
+
     pub fn breadcrumb_addresses(&self) -> Vec<ViewAddress> {
         self.history
             .iter()
@@ -147,6 +169,50 @@ pub struct OpenViews {
 }
 
 impl OpenViews {
+    pub fn begin_pending_row(&mut self, ctx: &PendingRowContext, description: String) -> Result<(), String> {
+        let view = self
+            .views
+            .iter_mut()
+            .find(|view| view.address() == Some(&ctx.address))
+            .ok_or_else(|| format!("pending row view is no longer open: {}", ctx.address))?;
+        let state = view.table_state_mut(ctx.panel).ok_or_else(|| "pending row panel does not match its view".to_string())?;
+        state.begin_pending(ctx.query.clone(), ctx.row_id.clone(), description)
+    }
+
+    pub fn mark_pending_row(&mut self, ctx: &PendingRowContext, command_id: u64) {
+        let Some(view) = self.views.iter_mut().find(|view| view.address() == Some(&ctx.address)) else { return };
+        let Some(state) = view.table_state_mut(ctx.panel) else { return };
+        state.mark_pending(&ctx.row_id, command_id);
+    }
+
+    pub fn mark_pending_row_failed(&mut self, ctx: &PendingRowContext, message: String) {
+        let Some(view) = self.views.iter_mut().find(|view| view.address() == Some(&ctx.address)) else { return };
+        let Some(state) = view.table_state_mut(ctx.panel) else { return };
+        state.mark_failed(&ctx.row_id, message);
+    }
+
+    pub fn finish_pending_row_command(&mut self, command_id: u64, error: Option<&str>) {
+        for view in &mut self.views {
+            view.visit_table_states_mut(&mut |state| state.finish_command(command_id, error));
+        }
+    }
+
+    pub fn reconcile_authoritative_rows(&mut self, query: &QueryId, update: &AuthoritativeRowUpdate) {
+        for view in &mut self.views {
+            view.visit_table_states_mut(&mut |state| state.reconcile_authoritative(query, update));
+        }
+    }
+
+    pub fn has_pending_rows(&self) -> bool {
+        self.views.iter().any(|view| {
+            view.table_state.has_pending_rows()
+                || view.project_table_state.tables().iter().any(|table| table.has_pending_rows())
+                || view.history.iter().any(|frame| {
+                    frame.table_state.has_pending_rows() || frame.project_table_state.tables().iter().any(|table| table.has_pending_rows())
+                })
+        })
+    }
+
     /// Build from persisted entries, restoring the pinned-overview invariant
     /// if the file was hand-edited out of shape.
     pub fn from_entries(entries: Vec<OpenViewEntry>) -> Self {

@@ -1,13 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{
-    Command, CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey, WorkItem, WorkItemIdentity,
-};
+use flotilla_protocol::{Command, CommandAction, ConvoyStartIntent, HostName, IssueSelector, NodeId, RepoIdentity, RepoKey, WorkItem};
 
 use super::{ui_state::PendingActionContext, App, BranchInputKind, Intent, OwnedSelectedRow};
 use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
-    table_view::TableIntent,
+    table_view::{PendingRowContext, TableIntent},
     widgets::{convoy_delete_confirm::ConvoyDeleteConfirmWidget, InteractiveWidget},
 };
 
@@ -316,12 +314,11 @@ impl App {
                                 }
                                 _ => {}
                             }
-                            let pending_ctx = PendingActionContext {
-                                identity: item.identity.clone(),
-                                description: intent.label(self.model.active_labels()),
-                                repo_identity: self.model.active_repo_identity().clone(),
-                                project_issue_start: None,
-                            };
+                            let pending_ctx = PendingActionContext::work_item(
+                                item.identity.clone(),
+                                self.model.active_repo_identity().clone(),
+                                intent.label(self.model.active_labels()),
+                            );
                             self.proto_commands.push_with_context(cmd, Some(pending_ctx));
                             return;
                         }
@@ -368,12 +365,11 @@ impl App {
                 }
                 _ => {}
             }
-            let pending_ctx = PendingActionContext {
-                identity: item.identity.clone(),
-                description: intent.label(self.model.active_labels()),
-                repo_identity: self.model.active_repo_identity().clone(),
-                project_issue_start: None,
-            };
+            let pending_ctx = PendingActionContext::work_item(
+                item.identity.clone(),
+                self.model.active_repo_identity().clone(),
+                intent.label(self.model.active_labels()),
+            );
             self.proto_commands.push_with_context(cmd, Some(pending_ctx));
         }
     }
@@ -404,14 +400,24 @@ impl App {
                 self.proto_commands.push(self.command(CommandAction::AttachTransient { reference, host: Some(host) }));
                 return;
             }
-            TableIntent::DeleteConvoy { namespace, name, host } => {
+            TableIntent::DeleteConvoy { row_id, namespace, name, host } => {
                 let Ok(node_id) = self.table_intent_node_id(host.as_ref()) else {
                     return;
                 };
                 let mut command =
                     self.command(CommandAction::ConvoyDelete { namespace: Some(namespace.clone()), name: name.clone(), force: false });
                 command.node_id = node_id;
-                self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command)));
+                let Some(address) = self.views.active_address().cloned() else {
+                    self.set_status_message(Some("Cannot delete convoy: active view has no address".into()));
+                    return;
+                };
+                let panel = matches!(&address, flotilla_protocol::ViewAddress::Project { .. })
+                    .then(|| self.views.active_project_table_state().active());
+                let pending = PendingActionContext::table_row(
+                    PendingRowContext { address, panel, query: flotilla_protocol::QueryId::Convoys, row_id },
+                    "Delete convoy".into(),
+                );
+                self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command, pending)));
                 return;
             }
             TableIntent::OpenChangeRequest { id, repository_key, host } => {
@@ -470,17 +476,15 @@ impl App {
                             auto_attach: false,
                         }),
                     });
-                    let pending_ctx = PendingActionContext {
-                        identity: WorkItemIdentity::Issue(issue.issue.id.clone()),
-                        description: "Start convoy".into(),
-                        repo_identity: RepoIdentity { authority: "project".into(), path: address.to_string() },
-                        project_issue_start: Some(crate::app::ui_state::ProjectIssueStartContext {
+                    let pending_ctx = PendingActionContext::project_issue_start(
+                        crate::app::ui_state::ProjectIssueStartContext {
                             address: address.clone(),
                             row_id: issue.row_id,
                             issue: issue.issue,
                             batch_id,
-                        }),
-                    };
+                        },
+                        "Start convoy".into(),
+                    );
                     self.proto_commands.push_with_context(command, Some(pending_ctx));
                 }
                 if let Some(index) = self.views.find(&address) {

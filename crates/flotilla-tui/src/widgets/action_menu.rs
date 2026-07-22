@@ -55,22 +55,12 @@ impl ActionMenuWidget {
                 };
                 let checkout_path = self.item.checkout_key().map(|hp| hp.path.clone());
                 let widget = DeleteConfirmWidget::new(self.item.identity.clone(), remote_node_id, checkout_path);
-                let pending_ctx = PendingActionContext {
-                    identity: self.item.identity.clone(),
-                    description: entry.intent.label(labels),
-                    repo_identity,
-                    project_issue_start: None,
-                };
+                let pending_ctx = PendingActionContext::work_item(self.item.identity.clone(), repo_identity, entry.intent.label(labels));
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));
                 return Outcome::Swap(Box::new(widget));
             }
             Intent::GenerateBranchName => {
-                let pending_ctx = PendingActionContext {
-                    identity: self.item.identity.clone(),
-                    description: entry.intent.label(labels),
-                    repo_identity,
-                    project_issue_start: None,
-                };
+                let pending_ctx = PendingActionContext::work_item(self.item.identity.clone(), repo_identity, entry.intent.label(labels));
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));
                 let widget = BranchInputWidget::new(BranchInputKind::Generating);
                 return Outcome::Swap(Box::new(widget));
@@ -85,12 +75,7 @@ impl ActionMenuWidget {
                 return Outcome::Swap(Box::new(widget));
             }
             _ => {
-                let pending_ctx = PendingActionContext {
-                    identity: self.item.identity.clone(),
-                    description: entry.intent.label(labels),
-                    repo_identity,
-                    project_issue_start: None,
-                };
+                let pending_ctx = PendingActionContext::work_item(self.item.identity.clone(), repo_identity, entry.intent.label(labels));
                 ctx.commands.push_with_context(entry.command.clone(), Some(pending_ctx));
             }
         }
