@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use flotilla_protocol::{QueryId, ViewAddress};
+use flotilla_protocol::{QueryId, Salience, ViewAddress};
 use ratatui::{layout::Rect, style::Modifier, Frame};
 
 use super::{
@@ -266,6 +266,9 @@ impl ProjectPageWidget {
         for layout in &layouts {
             if let Some(header_area) = self.line_area(layout.header_line, state) {
                 let mut label = format!("{}  › {}", layout.panel.table.title, layout.panel.target.human_label());
+                if let Some(marker) = salience_marker(layout.panel.table.meta.salience) {
+                    label = format!("{marker} {label}");
+                }
                 if let Some(as_of) = layout.panel.table.meta.as_of {
                     label.push_str(&format!(" · as of {}", as_of.format("%Y-%m-%d %H:%M")));
                 }
@@ -279,7 +282,13 @@ impl ProjectPageWidget {
                     label.push_str(&format!(" · ⚠ {}", layout.panel.table.meta.conditions.join("; ")));
                 }
                 let focused = state.active() == layout.panel.kind && state.header_focused();
-                let style = if focused { theme.header_style().add_modifier(Modifier::REVERSED) } else { theme.header_style() };
+                let style = match layout.panel.table.meta.salience {
+                    Salience::None => theme.header_style(),
+                    Salience::Info => theme.header_style().fg(theme.info),
+                    Salience::Attention => theme.header_style().fg(theme.warning),
+                    Salience::Urgent => theme.header_style().fg(theme.error),
+                };
+                let style = if focused { style.add_modifier(Modifier::REVERSED) } else { style };
                 let row_style = if focused { style } else { Default::default() };
                 ui_helpers::render_section_divider(frame, &label, theme, header_area, row_style, style);
             }
@@ -313,6 +322,15 @@ impl ProjectPageWidget {
                 }
             }
         }
+    }
+}
+
+fn salience_marker(salience: Salience) -> Option<&'static str> {
+    match salience {
+        Salience::None => None,
+        Salience::Info => Some("ⓘ"),
+        Salience::Attention => Some("!"),
+        Salience::Urgent => Some("‼"),
     }
 }
 
@@ -598,6 +616,28 @@ mod tests {
         assert!(rendered.contains("as of 2026-07-21 12:30"));
         assert!(rendered.contains("more available"));
         assert!(rendered.contains("⚠ one source stale"));
+    }
+
+    #[test]
+    fn project_headers_render_central_salience_levels_distinctly() {
+        let mut panels = vec![
+            panel(ProjectPanelKind::Convoys, "Convoys", "convoys/flotilla", "convoy-a"),
+            panel(ProjectPanelKind::Checkouts, "Checkouts", "checkouts?project=flotilla%2Froadmap", "checkout-a"),
+            panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "issue-a"),
+        ];
+        panels[0].table.meta.salience = Salience::Info;
+        panels[1].table.meta.salience = Salience::Attention;
+        panels[2].table.meta.salience = Salience::Urgent;
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).expect("terminal");
+        let mut widget = ProjectPageWidget::default();
+        let mut state = ProjectTableState::default();
+
+        terminal.draw(|frame| widget.render_composite(frame, frame.area(), &Theme::classic(), &panels, &mut state)).expect("render");
+
+        let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("ⓘ Convoys"));
+        assert!(rendered.contains("! Checkouts"));
+        assert!(rendered.contains("‼ Issues"));
     }
 
     #[test]

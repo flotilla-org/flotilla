@@ -6,7 +6,11 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::{aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon};
+use flotilla_core::{
+    aggregator_projection::AggregatorProjectionState,
+    in_process::InProcessDaemon,
+    salience::{AttentionFact, DemandFact, RegardFact, SalienceFacts},
+};
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope,
@@ -16,10 +20,10 @@ use flotilla_protocol::{
     RepositoryKey, ResourceRef,
 };
 use flotilla_resources::{
-    api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation,
-    Project, Repository, Resource, ResourceError, ResourceList, ResourceObject, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
-    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee,
+    DemandState, Environment, Presentation, Project, Regard, RegardExpiryPolicy, Repository, Resource, ResourceError, ResourceList,
+    ResourceObject, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent,
+    WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -33,11 +37,13 @@ type ChangeRequestFingerprint = HashMap<String, (String, String)>;
 #[derive(bon::Builder)]
 pub struct AggregatorResolvers {
     durable_convoys: TypedResolver<Convoy>,
+    durable_demands: TypedResolver<Demand>,
     durable_environments: TypedResolver<Environment>,
     durable_presentations: TypedResolver<Presentation>,
     durable_sessions: TypedResolver<TerminalSession>,
     durable_projects: TypedResolver<Project>,
     durable_repositories: TypedResolver<Repository>,
+    durable_regards: TypedResolver<Regard>,
     observed_convoys: TypedResolver<Convoy>,
     observed_presentations: TypedResolver<Presentation>,
     observed_sessions: TypedResolver<TerminalSession>,
@@ -47,11 +53,13 @@ pub struct AggregatorResolvers {
 #[derive(bon::Builder)]
 struct AggregatorSourceRefs<'a> {
     durable_convoys: &'a dyn AggregatorWatchSource<Convoy>,
+    durable_demands: &'a dyn AggregatorWatchSource<Demand>,
     durable_environments: &'a dyn AggregatorWatchSource<Environment>,
     durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     durable_sessions: &'a dyn AggregatorWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorWatchSource<Project>,
     durable_repositories: &'a dyn AggregatorWatchSource<Repository>,
+    durable_regards: &'a dyn AggregatorWatchSource<Regard>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
     observed_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     observed_sessions: &'a dyn AggregatorWatchSource<TerminalSession>,
@@ -114,6 +122,8 @@ pub struct Aggregator {
     #[builder(skip)]
     convoys_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Convoy>>>,
     #[builder(skip)]
+    demands: HashMap<ResourceRef, ResourceObject<Demand>>,
+    #[builder(skip)]
     presentations_by_source: HashMap<LocalSource, HashMap<ResourceRef, ResourceObject<Presentation>>>,
     #[builder(skip)]
     sessions_by_source: HashMap<LocalSource, HashMap<SessionKey, ResourceObject<TerminalSession>>>,
@@ -122,6 +132,8 @@ pub struct Aggregator {
     attachable_references: HashSet<String>,
     projects: HashMap<(String, String), ResourceObject<Project>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
+    #[builder(skip)]
+    regards: HashMap<ResourceRef, ResourceObject<Regard>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
@@ -146,6 +158,7 @@ impl Aggregator {
             state,
             local_host,
             convoys_by_source: HashMap::new(),
+            demands: HashMap::new(),
             presentations_by_source: HashMap::new(),
             sessions_by_source: HashMap::new(),
             presentation_workspaces: HashMap::new(),
@@ -153,6 +166,7 @@ impl Aggregator {
             attachable_references: HashSet::new(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
+            regards: HashMap::new(),
             observed_checkouts: HashMap::new(),
             bootstrapping: false,
             emitted_queries: HashSet::new(),
@@ -196,11 +210,13 @@ impl Aggregator {
     ) -> Result<(), ResourceError> {
         let AggregatorResolvers {
             durable_convoys,
+            durable_demands,
             durable_environments,
             durable_presentations,
             durable_sessions,
             durable_projects,
             durable_repositories,
+            durable_regards,
             observed_convoys,
             observed_presentations,
             observed_sessions,
@@ -208,11 +224,13 @@ impl Aggregator {
         } = resolvers;
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(&durable_convoys)
+            .durable_demands(&durable_demands)
             .durable_environments(&durable_environments)
             .durable_presentations(&durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_repositories(&durable_repositories)
+            .durable_regards(&durable_regards)
             .observed_convoys(&observed_convoys)
             .observed_presentations(&observed_presentations)
             .observed_sessions(&observed_sessions)
@@ -228,11 +246,13 @@ impl Aggregator {
     ) -> Result<(), ResourceError> {
         let AggregatorSourceRefs {
             durable_convoys,
+            durable_demands,
             durable_environments,
             durable_presentations,
             durable_sessions,
             durable_projects,
             durable_repositories,
+            durable_regards,
             observed_convoys,
             observed_presentations,
             observed_sessions,
@@ -259,11 +279,13 @@ impl Aggregator {
         }
         self.state.replace_local_independent_rows(Vec::new()).await;
         let mut durable_convoy_stream = self.recover_convoy_watch(LocalSource::Durable, durable_convoys).await?;
+        let mut durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
         let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
         let mut durable_session_stream = self.recover_session_watch(LocalSource::Durable, durable_sessions).await?;
         let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
+        let mut durable_regard_stream = self.recover_regard_watch(durable_regards).await?;
         let mut observed_convoy_stream = self.recover_convoy_watch(LocalSource::Observed, observed_convoys).await?;
         let mut observed_presentation_stream = self.recover_presentation_watch(LocalSource::Observed, observed_presentations).await?;
         let mut observed_session_stream = self.recover_session_watch(LocalSource::Observed, observed_sessions).await?;
@@ -274,7 +296,21 @@ impl Aggregator {
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
 
         loop {
+            let regard_expiry_delay = self.next_regard_expiry_delay();
+            let regard_expiry = async move {
+                match regard_expiry_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => futures::future::pending().await,
+                }
+            };
+            tokio::pin!(regard_expiry);
             tokio::select! {
+                () = &mut regard_expiry => {
+                    self.prune_expired_regards(chrono::Utc::now());
+                    if self.rebuild_salience_projection().await {
+                        self.emit_awareness_result_sets().await;
+                    }
+                }
                 demand = demand_rx.changed() => {
                     if demand.is_err() {
                         return Err(ResourceError::other("aggregator demand registry closed"));
@@ -326,6 +362,14 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable convoy watch ended")),
                 },
+                event = durable_demand_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_demand_event(event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_demand_stream = self.recover_demand_watch(durable_demands).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable demand watch ended")),
+                },
                 event = durable_environment_stream.next() => match event {
                     Some(Ok(event)) => self.apply_environment_event(event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -365,6 +409,14 @@ impl Aggregator {
                     }
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable repository watch ended")),
+                },
+                event = durable_regard_stream.next() => match event {
+                    Some(Ok(event)) => self.apply_regard_event(event).await,
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        durable_regard_stream = self.recover_regard_watch(durable_regards).await?;
+                    }
+                    Some(Err(err)) => return Err(err),
+                    None => return Err(ResourceError::other("aggregator durable regard watch ended")),
                 },
                 event = observed_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_convoy_event_from(LocalSource::Observed, event).await,
@@ -431,6 +483,24 @@ impl Aggregator {
     ) -> Result<WatchStream<Presentation>, ResourceError> {
         loop {
             match self.list_and_watch_presentations(source, resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
+    async fn recover_demand_watch(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
+        loop {
+            match self.list_and_watch_demands(resolver).await {
+                Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
+                result => return result,
+            }
+        }
+    }
+
+    async fn recover_regard_watch(&mut self, resolver: &dyn AggregatorWatchSource<Regard>) -> Result<WatchStream<Regard>, ResourceError> {
+        loop {
+            match self.list_and_watch_regards(resolver).await {
                 Err(ResourceError::WatchExpired { .. }) => tokio::time::sleep(Self::WATCH_RESTART_BACKOFF).await,
                 result => return result,
             }
@@ -519,6 +589,28 @@ impl Aggregator {
         let start = WatchStart::resuming_from(&listed);
         let watch = resolver.watch(start).await?;
         self.replace_presentation_source(source, listed.items).await;
+        Ok(watch)
+    }
+
+    async fn list_and_watch_demands(&mut self, resolver: &dyn AggregatorWatchSource<Demand>) -> Result<WatchStream<Demand>, ResourceError> {
+        let listed = resolver.list().await?;
+        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
+        self.demands =
+            listed.items.into_iter().map(|demand| (self.demand_ref(&demand.metadata.namespace, &demand.metadata.name), demand)).collect();
+        if self.rebuild_salience_projection().await && !self.bootstrapping {
+            self.emit_awareness_result_sets().await;
+        }
+        Ok(watch)
+    }
+
+    async fn list_and_watch_regards(&mut self, resolver: &dyn AggregatorWatchSource<Regard>) -> Result<WatchStream<Regard>, ResourceError> {
+        let listed = resolver.list().await?;
+        let watch = resolver.watch(WatchStart::resuming_from(&listed)).await?;
+        self.regards =
+            listed.items.into_iter().map(|regard| (self.regard_ref(&regard.metadata.namespace, &regard.metadata.name), regard)).collect();
+        if self.rebuild_salience_projection().await && !self.bootstrapping {
+            self.emit_awareness_result_sets().await;
+        }
         Ok(watch)
     }
 
@@ -626,6 +718,38 @@ impl Aggregator {
             }
         }
         self.rebuild_local_projection().await;
+    }
+
+    async fn apply_demand_event(&mut self, event: WatchEvent<Demand>) {
+        match event {
+            WatchEvent::Added(demand) | WatchEvent::Modified(demand) => {
+                let reference = self.demand_ref(&demand.metadata.namespace, &demand.metadata.name);
+                self.demands.insert(reference, demand);
+            }
+            WatchEvent::Deleted(demand) => {
+                let reference = self.demand_ref(&demand.metadata.namespace, &demand.metadata.name);
+                self.demands.remove(&reference);
+            }
+        }
+        if self.rebuild_salience_projection().await && !self.bootstrapping {
+            self.emit_awareness_result_sets().await;
+        }
+    }
+
+    async fn apply_regard_event(&mut self, event: WatchEvent<Regard>) {
+        match event {
+            WatchEvent::Added(regard) | WatchEvent::Modified(regard) => {
+                let reference = self.regard_ref(&regard.metadata.namespace, &regard.metadata.name);
+                self.regards.insert(reference, regard);
+            }
+            WatchEvent::Deleted(regard) => {
+                let reference = self.regard_ref(&regard.metadata.namespace, &regard.metadata.name);
+                self.regards.remove(&reference);
+            }
+        }
+        if self.rebuild_salience_projection().await && !self.bootstrapping {
+            self.emit_awareness_result_sets().await;
+        }
     }
 
     async fn apply_convoy_event_from(&mut self, source: LocalSource, event: WatchEvent<Convoy>) {
@@ -777,6 +901,7 @@ impl Aggregator {
 
     async fn rebuild_local_projection(&mut self) {
         let effective_convoys = self.effective_convoys();
+        let salience_changed = self.rebuild_salience_projection().await;
         let presentation_keys = effective_convoys
             .values()
             .flat_map(|convoy| {
@@ -825,6 +950,10 @@ impl Aggregator {
                 .collect::<Vec<_>>();
             let removed = view.local_rows.keys().filter(|reference| !replacement.contains_key(*reference)).cloned().collect::<Vec<_>>();
             if changed.is_empty() && removed.is_empty() {
+                drop(view);
+                if salience_changed && !self.bootstrapping {
+                    self.emit_awareness_result_sets().await;
+                }
                 return;
             }
             view.local_rows = replacement;
@@ -983,6 +1112,7 @@ impl Aggregator {
             effective_sessions.extend(sessions.iter().map(|(key, session)| (key.clone(), session.clone())));
         }
         self.terminal_sessions = effective_sessions;
+        let salience_changed = self.rebuild_salience_projection().await;
 
         self.attachable_references = match &self.attach_resolver {
             Some(daemon) => {
@@ -998,7 +1128,11 @@ impl Aggregator {
             .filter_map(|session| self.summarize_independent(session, &self.attachable_references))
             .collect();
         let deltas = self.state.replace_local_independent_rows(replacement).await;
+        let store_changed = !deltas.is_empty();
         self.emit_store_deltas(deltas).await;
+        if salience_changed && !store_changed && !self.bootstrapping {
+            self.emit_awareness_result_sets().await;
+        }
     }
 
     pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
@@ -1086,6 +1220,91 @@ impl Aggregator {
         self.emit_awareness_result_sets().await;
     }
 
+    async fn rebuild_salience_projection(&self) -> bool {
+        self.state.replace_salience_facts(self.salience_facts()).await
+    }
+
+    fn salience_facts(&self) -> SalienceFacts {
+        self.salience_facts_at(chrono::Utc::now())
+    }
+
+    fn salience_facts_at(&self, now: chrono::DateTime<chrono::Utc>) -> SalienceFacts {
+        let mut demand_resources = self.demands.values().collect::<Vec<_>>();
+        demand_resources
+            .sort_by(|left, right| (&left.metadata.namespace, &left.metadata.name).cmp(&(&right.metadata.namespace, &right.metadata.name)));
+        let demands = demand_resources
+            .into_iter()
+            .map(|demand| {
+                let state = demand.status.as_ref().map_or(DemandState::Raised, |status| status.state);
+                let as_of = demand
+                    .status
+                    .as_ref()
+                    .and_then(|status| match state {
+                        DemandState::Raised => status.raised.as_ref(),
+                        DemandState::Satisfied => status.satisfied.as_ref(),
+                        DemandState::Acknowledged => status.acknowledged.as_ref(),
+                    })
+                    .map_or(demand.metadata.creation_timestamp, |transition| transition.as_of);
+                let addressee = match &demand.spec.addressee {
+                    DemandAddressee::Principal { principal_ref } => Some(principal_ref.clone()),
+                    DemandAddressee::Pool { .. } => None,
+                };
+                DemandFact { target: demand.spec.originating_work_ref.clone(), addressee, state, as_of }
+            })
+            .collect();
+        let mut regard_resources = self.regards.values().collect::<Vec<_>>();
+        regard_resources
+            .sort_by(|left, right| (&left.metadata.namespace, &left.metadata.name).cmp(&(&right.metadata.namespace, &right.metadata.name)));
+        let regards = regard_resources
+            .into_iter()
+            .filter_map(|regard| {
+                let as_of = regard_as_of(regard);
+                let live = regard_expiry_at(regard).is_none_or(|expiry| now < expiry);
+                live.then(|| RegardFact { principal: regard.spec.principal_ref.clone(), target: regard.spec.target.clone(), as_of })
+            })
+            .collect();
+        let mut sessions = self.terminal_sessions.values().collect::<Vec<_>>();
+        sessions
+            .sort_by(|left, right| (&left.metadata.namespace, &left.metadata.name).cmp(&(&right.metadata.namespace, &right.metadata.name)));
+        let attention = sessions
+            .into_iter()
+            .filter_map(|session| {
+                let convoy = session.metadata.labels.get(CONVOY_LABEL)?;
+                let vessel = session.metadata.labels.get(VESSEL_LABEL)?;
+                let status = session.status.as_ref()?;
+                let observation = status.attention.as_ref()?;
+                if status.phase != TerminalSessionPhase::Running || observation.is_stale_at(now) {
+                    return None;
+                }
+                let convoy_ref = self.convoy_ref(&session.metadata.namespace, convoy);
+                let work_unsettled = self
+                    .effective_convoy(&convoy_ref)
+                    .and_then(|convoy| convoy.status.as_ref())
+                    .and_then(|status| status.work.get(vessel))
+                    .is_none_or(|work| !work.phase.is_terminal());
+                Some(AttentionFact {
+                    target: convoy_ref.subresource(format!("vessels/{vessel}")),
+                    state: observation.state,
+                    work_unsettled,
+                    as_of: observation.as_of,
+                })
+            })
+            .collect();
+        SalienceFacts { demands, regards, attention }
+    }
+
+    fn next_regard_expiry_delay(&self) -> Option<std::time::Duration> {
+        self.next_regard_expiry_delay_at(chrono::Utc::now())
+    }
+
+    fn next_regard_expiry_delay_at(&self, now: chrono::DateTime<chrono::Utc>) -> Option<std::time::Duration> {
+        self.regards.values().filter_map(regard_expiry_at).min().map(|expiry| (expiry - now).to_std().unwrap_or_default())
+    }
+
+    fn prune_expired_regards(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.regards.retain(|_, regard| regard_expiry_at(regard).is_none_or(|expiry| expiry > now));
+    }
+
     async fn emit_awareness_result_sets(&self) {
         for query in self.state.subscribed_queries() {
             if !matches!(query, QueryId::Awareness { .. }) {
@@ -1104,6 +1323,14 @@ impl Aggregator {
     fn presentation_ref(&self, namespace: &str, name: &str) -> ResourceRef {
         ResourceRef::new(api_version(Presentation::API_PATHS), Presentation::API_PATHS.kind, namespace, name)
             .on_host(self.local_host.clone())
+    }
+
+    fn demand_ref(&self, namespace: &str, name: &str) -> ResourceRef {
+        ResourceRef::new(api_version(Demand::API_PATHS), Demand::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
+    }
+
+    fn regard_ref(&self, namespace: &str, name: &str) -> ResourceRef {
+        ResourceRef::new(api_version(Regard::API_PATHS), Regard::API_PATHS.kind, namespace, name).on_host(self.local_host.clone())
     }
 
     fn session_ref(&self, namespace: &str, name: &str) -> ResourceRef {
@@ -1208,6 +1435,14 @@ impl Aggregator {
 
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
         let requested_stance = definition.stance.to_string();
+        let vessel_resource = state
+            .and_then(|state| state.placement.as_ref())
+            .and_then(|placement| placement.fields.get("vessel_ref"))
+            .and_then(serde_json::Value::as_str)
+            .map(|name| {
+                ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
+                    .on_host(self.local_host.clone())
+            });
         let effective_stance = state
             .and_then(|state| state.placement.as_ref())
             .and_then(|placement| placement.fields.get("effective_stance"))
@@ -1245,6 +1480,7 @@ impl Aggregator {
         });
         VesselRow::builder()
             .resource(convoy_ref.subresource(format!("vessels/{}", definition.name)))
+            .maybe_vessel_resource(vessel_resource)
             .name(&definition.name)
             .phase(work_phase(state.map(|state| state.phase).unwrap_or(ResourceWorkPhase::Pending)))
             .crew(crew)
@@ -1262,6 +1498,19 @@ impl Aggregator {
             .needs_attention(needs_attention)
             .build()
     }
+}
+
+fn regard_as_of(regard: &ResourceObject<Regard>) -> chrono::DateTime<chrono::Utc> {
+    regard.status.as_ref().and_then(|status| status.refreshed_at.or(status.created_at)).unwrap_or(regard.metadata.creation_timestamp)
+}
+
+fn regard_expiry_at(regard: &ResourceObject<Regard>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let RegardExpiryPolicy::Decaying { expires_after_seconds } = &regard.spec.expiry else {
+        return None;
+    };
+    let seconds = i64::try_from(*expires_after_seconds).ok()?;
+    let duration = chrono::TimeDelta::try_seconds(seconds)?;
+    regard_as_of(regard).checked_add_signed(duration)
 }
 
 fn attention_needs_human(state: TerminalAttentionState, work_unsettled: bool) -> bool {
@@ -1289,6 +1538,9 @@ fn set_convoy_row_host(row: &mut ConvoyRow, host: &HostName) {
     row.resource.host = Some(host.clone());
     for vessel in &mut row.vessels {
         vessel.resource.host = Some(host.clone());
+        if let Some(resource) = &mut vessel.vessel_resource {
+            resource.host = Some(host.clone());
+        }
         vessel.host = host.clone();
     }
 }
@@ -1355,12 +1607,15 @@ mod tests {
         PrincipalRef,
     };
     use flotilla_resources::{
-        ConvoyRepositorySpec, ConvoySpec, CrewSpec, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta,
-        PlacementStatus, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend, Stance, TerminalAttention,
-        TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition, EnvironmentSpec,
+        HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase, PresentationSpec,
+        PresentationStatus, PrincipalRef as AttentionPrincipalRef, RegardSource, RegardSpec, RegardStatus, ResourceBackend, Stance,
+        TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
+        WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1371,6 +1626,45 @@ mod tests {
         assert!(!attention_needs_human(TerminalAttentionState::Idle, false));
         assert!(!attention_needs_human(TerminalAttentionState::Working, true));
         assert!(!attention_needs_human(TerminalAttentionState::Unobservable, true));
+    }
+
+    #[test]
+    fn decaying_regards_schedule_expiry_and_handle_unrepresentable_durations() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx);
+        let now = Utc::now();
+        let principal = AttentionPrincipalRef("flotilla/operator".into());
+        let target = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a");
+        let decaying = ResourceObject {
+            metadata: attention_meta("decaying", now),
+            spec: RegardSpec::builder()
+                .principal_ref(principal.clone())
+                .target(target.clone())
+                .source(RegardSource::Expressed)
+                .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: 5 })
+                .build(),
+            status: Some(RegardStatus { created_at: Some(now), refreshed_at: None }),
+        };
+        let unbounded = ResourceObject {
+            metadata: attention_meta("unbounded", now),
+            spec: RegardSpec::builder()
+                .principal_ref(principal)
+                .target(target)
+                .source(RegardSource::Expressed)
+                .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: u64::MAX })
+                .build(),
+            status: Some(RegardStatus { created_at: Some(now), refreshed_at: None }),
+        };
+        aggregator.regards.insert(aggregator.regard_ref("flotilla", "decaying"), decaying);
+        aggregator.regards.insert(aggregator.regard_ref("flotilla", "unbounded"), unbounded);
+
+        assert_eq!(aggregator.next_regard_expiry_delay_at(now), Some(Duration::from_secs(5)));
+        assert_eq!(aggregator.salience_facts_at(now).regards.len(), 2);
+        assert_eq!(aggregator.salience_facts_at(now + chrono::Duration::seconds(5)).regards.len(), 1);
+        aggregator.prune_expired_regards(now + chrono::Duration::seconds(5));
+        assert_eq!(aggregator.regards.len(), 1);
+        assert_eq!(aggregator.next_regard_expiry_delay_at(now + chrono::Duration::seconds(5)), None);
     }
 
     #[tokio::test]
@@ -1414,6 +1708,107 @@ mod tests {
         let result_set = state.result_set().await;
         let row = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(row.dispatching_principal_ref, principal);
+    }
+
+    #[tokio::test]
+    async fn awareness_salience_recomputes_on_attention_demand_and_regard_changes() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let query = QueryId::Awareness {
+            scope: None,
+            grouping: flotilla_protocol::AwarenessGrouping::Convoy,
+            limit: flotilla_protocol::AwarenessLimit::default(),
+        };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+
+        let now = Utc::now();
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        session.status.as_mut().expect("running status").attention =
+            Some(TerminalAttention { state: TerminalAttentionState::NeedsInput, as_of: now, source: TerminalAttentionSource::Hook });
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
+
+        let principal = AttentionPrincipalRef("flotilla/implicit".to_string());
+        let target = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a").subresource("vessels/implement");
+        let mut demand = ResourceObject {
+            metadata: attention_meta("input-demand", now),
+            spec: DemandSpec::builder()
+                .originating_work_ref(target)
+                .kind(DemandKind::Permission)
+                .addressee(DemandAddressee::Principal { principal_ref: principal.clone() })
+                .build(),
+            status: Some(
+                DemandStatus::builder()
+                    .state(DemandState::Raised)
+                    .raised(DemandTransition { as_of: now, authority: "hook".to_string() })
+                    .build(),
+            ),
+        };
+        aggregator.apply_demand_event(WatchEvent::Added(demand.clone())).await;
+        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
+
+        let regard = ResourceObject {
+            metadata: attention_meta("convoy-regard", now),
+            spec: RegardSpec::builder()
+                .principal_ref(principal)
+                .target(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a"))
+                .source(RegardSource::Expressed)
+                .expiry(RegardExpiryPolicy::Pin)
+                .build(),
+            status: Some(RegardStatus { created_at: Some(now), refreshed_at: Some(now) }),
+        };
+        aggregator.apply_regard_event(WatchEvent::Added(regard)).await;
+        assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Urgent);
+
+        let acknowledged_at = now + chrono::Duration::seconds(1);
+        demand.metadata.resource_version = "2".to_string();
+        demand.status.as_mut().expect("demand status").state = DemandState::Acknowledged;
+        demand.status.as_mut().expect("demand status").acknowledged =
+            Some(DemandTransition { as_of: acknowledged_at, authority: "principal".to_string() });
+        aggregator.apply_demand_event(WatchEvent::Modified(demand)).await;
+        let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
+        assert_eq!(salience, flotilla_protocol::Salience::Attention);
+        assert_eq!(as_of, acknowledged_at);
+
+        let working_at = now + chrono::Duration::seconds(2);
+        session.status.as_mut().expect("running status").attention =
+            Some(TerminalAttention { state: TerminalAttentionState::Working, as_of: working_at, source: TerminalAttentionSource::Hook });
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
+        let (salience, as_of) = awareness_vessel_salience_and_time(&state, &query).await;
+        assert_eq!(salience, flotilla_protocol::Salience::Info);
+        assert_eq!(as_of, working_at);
+    }
+
+    fn attention_meta(name: &str, creation_timestamp: chrono::DateTime<Utc>) -> ObjectMeta {
+        ObjectMeta {
+            name: name.to_string(),
+            namespace: "flotilla".to_string(),
+            resource_version: "1".to_string(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            owner_references: Vec::new(),
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp,
+        }
+    }
+
+    async fn awareness_vessel_salience(state: &AggregatorProjectionState, query: &QueryId) -> flotilla_protocol::Salience {
+        awareness_vessel_salience_and_time(state, query).await.0
+    }
+
+    async fn awareness_vessel_salience_and_time(
+        state: &AggregatorProjectionState,
+        query: &QueryId,
+    ) -> (flotilla_protocol::Salience, chrono::DateTime<Utc>) {
+        let result = state.result_set_for(query).await.expect("awareness result set");
+        let node = result.rows.as_awareness().expect("awareness rows").first().expect("convoy node");
+        let vessel = node.entries.iter().find(|entry| entry.kind == flotilla_protocol::AwarenessKind::Vessel).expect("vessel entry");
+        (vessel.salience, vessel.as_of)
     }
 
     struct ScriptedSource<T: Resource> {
@@ -1524,18 +1919,22 @@ mod tests {
         replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
         let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let sources = AggregatorSourceRefs::builder()
             .durable_convoys(durable_convoys)
+            .durable_demands(&durable_demands)
             .durable_environments(&durable_environments)
             .durable_presentations(durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
             .durable_repositories(&durable_repositories)
+            .durable_regards(&durable_regards)
             .observed_convoys(observed_convoys)
             .observed_presentations(observed_presentations)
             .observed_sessions(&observed_sessions)
@@ -2309,11 +2708,13 @@ mod tests {
             .run(
                 AggregatorResolvers::builder()
                     .durable_convoys(durable.clone().using::<Convoy>("flotilla"))
+                    .durable_demands(durable.clone().using::<Demand>("flotilla"))
                     .durable_environments(durable.clone().using::<Environment>("flotilla"))
                     .durable_presentations(durable.clone().using::<Presentation>("flotilla"))
                     .durable_sessions(durable.using::<TerminalSession>("flotilla"))
                     .durable_projects(durable.using::<Project>("flotilla"))
                     .durable_repositories(durable.using::<Repository>("flotilla"))
+                    .durable_regards(durable.using::<Regard>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
                     .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
                     .observed_sessions(observed.using::<TerminalSession>("flotilla"))
@@ -2386,6 +2787,7 @@ mod tests {
         let stale = session_object("deleted-while-watch-expired").await;
         let durable_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_environments = Arc::new(ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_demands = Arc::new(ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_sessions = Arc::new(ScriptedSource::new(
             vec![ResourceList { items: vec![stale], resource_version: "1".to_string(), generation: None }, empty_list()],
@@ -2393,6 +2795,7 @@ mod tests {
         ));
         let durable_projects = Arc::new(ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let durable_repositories = Arc::new(ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_regards = Arc::new(ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
@@ -2406,11 +2809,13 @@ mod tests {
         let task = tokio::spawn(async move {
             let sources = AggregatorSourceRefs::builder()
                 .durable_convoys(durable_convoys.as_ref())
+                .durable_demands(durable_demands.as_ref())
                 .durable_environments(durable_environments.as_ref())
                 .durable_presentations(durable_presentations.as_ref())
                 .durable_sessions(run_durable_sessions.as_ref())
                 .durable_projects(durable_projects.as_ref())
                 .durable_repositories(durable_repositories.as_ref())
+                .durable_regards(durable_regards.as_ref())
                 .observed_convoys(observed_convoys.as_ref())
                 .observed_presentations(observed_presentations.as_ref())
                 .observed_sessions(observed_sessions.as_ref())

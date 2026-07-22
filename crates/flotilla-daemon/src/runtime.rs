@@ -33,11 +33,11 @@ use flotilla_core::{
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource, TerminalStatus};
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, Clone,
-    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment,
-    EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository,
-    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    CloneSpec, Convoy, ConvoyReconciler, CrewSource, CrewSpec, Demand, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec,
+    Environment, EnvironmentSpec, ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation,
+    Project, Regard, Repository, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -853,11 +853,13 @@ fn spawn_aggregator_task(
                     .run(
                         AggregatorResolvers::builder()
                             .durable_convoys(durable.clone().using::<Convoy>(&namespace))
+                            .durable_demands(durable.clone().using::<Demand>(&namespace))
                             .durable_environments(durable.clone().using::<Environment>(&namespace))
                             .durable_presentations(durable.using::<Presentation>(&namespace))
                             .durable_sessions(durable.using::<flotilla_resources::TerminalSession>(&namespace))
                             .durable_projects(durable.using::<Project>(&namespace))
                             .durable_repositories(durable.using::<Repository>(&namespace))
+                            .durable_regards(durable.using::<Regard>(&namespace))
                             .observed_convoys(observed.clone().using::<Convoy>(&namespace))
                             .observed_presentations(observed.using::<Presentation>(&namespace))
                             .observed_sessions(observed.using::<flotilla_resources::TerminalSession>(&namespace))
