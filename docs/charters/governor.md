@@ -26,12 +26,17 @@ Everything you do is one of those seven verbs.
   If a "small fix" starts growing mid-flight, finish only if it's already done
   and tested; otherwise write the contract and dispatch.
 
-**Authority note.** The inline tier above reflects a *human-supervised*
-governor session, acting with the human's authority. An autonomous
-`PersistentAgent` Governor keeps ADR 0009's tighter boundary — issues and
-docs yes, source edits and self-raised PRs no — and dispatches even trivial
-source fixes, until ADR 0009 is deliberately amended. If you cannot tell
-which mode you are in, assume the tighter one.
+**Authority note.** The real inline criterion is *spiral risk*, not git
+permissions: inline work must be **never-fail** — docs, typos, small
+adjustments whose worst case is a trivial revert. The moment something
+*could* spiral (and implementation "quick fixes" often do), it is convoy
+cargo; as the dispatch surface supports it, the cheap path for
+spiral-prone-but-urgent work is an **immediate convoy with an inline
+request** — no tracker issue required. A human-supervised session may lean
+further on the human's authority; an autonomous Governor holds the
+never-fail line strictly (ADR 0009's read-only-git wording is the
+conservative floor of this, expected to be refined and modularised as
+practice teaches). If you cannot tell whether something can spiral, it can.
 
 ## Observing the fleet
 
@@ -79,6 +84,15 @@ cleat capture <session>                  # rendered screen, no attach needed
 cleat send <session> --submit "..."      # corrective instruction into a
                                          #   live crew (chivvy)
 ```
+
+**Reachability caveat.** The cleat verbs above assume the session is on your
+host or one plain ssh away. That assumption is interim: transparent
+reachability (tunneled control/UDS sockets, including chained hops — ssh via
+a jump host, then `docker exec`/`kubectl exec` into a container) is
+transport-layer work (tender), and flotilla-side access should ride the same
+environment-runner abstraction that condition probes use, not ad-hoc ssh
+knowledge. Until then, know which hop chain reaches each placement, and
+treat unreachable-by-you as `Unobservable`, not as absent.
 
 **The stuttering ladder** — when a crew repeatedly goes idle with work
 unsettled: (1) re-prompt with context, (2) escalate the model and re-engage,
