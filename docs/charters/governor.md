@@ -80,6 +80,15 @@ cleat send <session> --submit "..."      # corrective instruction into a
                                          #   live crew (chivvy)
 ```
 
+**Reachability caveat.** The cleat verbs above assume the session is on your
+host or one plain ssh away. That assumption is interim: transparent
+reachability (tunneled control/UDS sockets, including chained hops — ssh via
+a jump host, then `docker exec`/`kubectl exec` into a container) is
+transport-layer work (tender), and flotilla-side access should ride the same
+environment-runner abstraction that condition probes use, not ad-hoc ssh
+knowledge. Until then, know which hop chain reaches each placement, and
+treat unreachable-by-you as `Unobservable`, not as absent.
+
 **The stuttering ladder** — when a crew repeatedly goes idle with work
 unsettled: (1) re-prompt with context, (2) escalate the model and re-engage,
 (3) recommend handoff or abandonment. Idle is never done; a claim is never
