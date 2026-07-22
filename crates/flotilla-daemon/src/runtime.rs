@@ -1349,6 +1349,25 @@ impl TerminalRuntime for TerminalControllerRuntime {
         }
         pool.kill_session(session_id).await
     }
+
+    async fn cleanup_session_artifacts(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
+        let TerminalSessionSource::Agent { selector, brief, .. } = &spec.source else {
+            return Ok(());
+        };
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
+        let adapter = registry
+            .agent_adapters
+            .get(&requirement.adapter)
+            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+
+        let mut roots = BTreeSet::from([spec.cwd.clone()]);
+        roots.extend(brief.copies.iter().cloned());
+        for root in roots {
+            adapter.cleanup(&ExecutionEnvironmentPath::new(root), brief).await?;
+        }
+        Ok(())
+    }
 }
 
 impl TerminalControllerRuntime {
@@ -2431,6 +2450,11 @@ mod tests {
             std::fs::read_to_string(durable_checkout.join(".flotilla/briefs/coder.md")).expect("durable brief copy"),
             "Implement the issue."
         );
+
+        runtime.cleanup_session_artifacts(&spec).await.expect("cleanup generated briefs");
+        assert!(!session_cwd.join(".flotilla/briefs/coder.md").exists(), "session brief should be removed");
+        assert!(!durable_checkout.join(".flotilla/briefs/coder.md").exists(), "durable brief copy should be removed");
+        assert!(!durable_checkout.join(".flotilla/briefs").exists(), "empty durable brief directory should be removed");
     }
 
     #[tokio::test]
