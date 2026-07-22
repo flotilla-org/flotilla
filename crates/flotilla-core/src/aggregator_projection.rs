@@ -10,7 +10,9 @@ use std::{
 };
 
 use flotilla_protocol::{
-    result_set::{CheckoutRow, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows},
+    result_set::{
+        CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows,
+    },
     HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
 use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
@@ -223,6 +225,7 @@ impl AggregatorProjectionState {
             .local_rows
             .values()
             .chain(convoys.replica_rows.values().flat_map(|rows| rows.values()))
+            .filter(|convoy| convoy_phase_represents_issues(convoy.phase))
             .flat_map(|convoy| convoy.issues.iter().map(|issue| issue.reference.clone()))
             .collect()
     }
@@ -240,4 +243,8 @@ impl AggregatorProjectionState {
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
         }
     }
+}
+
+fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
+    matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active)
 }

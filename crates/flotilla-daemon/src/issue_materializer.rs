@@ -791,18 +791,22 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["WIDGET-809", "WIDGET-810"], false)], vec![]));
         let (materializer, mut events) = manager(&state, &query, vec![source], provider);
         let _ = next_event(&mut events).await;
+        let resource = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "batch");
 
         {
             let mut convoys = state.write().await;
-            let resource = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "batch");
             convoys.local_rows.insert(
                 resource.clone(),
                 ConvoyRow::builder()
-                    .resource(resource)
+                    .resource(resource.clone())
                     .name("batch")
                     .workflow_ref("workflow")
                     .phase(ConvoyPhase::Active)
-                    .issues(vec![ConvoyIssueRow { reference: represented, title: "Issue WIDGET-810".into(), state: IssueState::Open }])
+                    .issues(vec![ConvoyIssueRow {
+                        reference: represented.clone(),
+                        title: "Issue WIDGET-810".into(),
+                        state: IssueState::Open,
+                    }])
                     .build(),
             );
         }
@@ -813,7 +817,7 @@ mod tests {
             vec!["WIDGET-809"]
         );
 
-        state.write().await.local_rows.clear();
+        state.write().await.local_rows.get_mut(&resource).expect("represented convoy row").phase = ConvoyPhase::Completed;
         materializer.refilter_active_queries();
         let DaemonEvent::ResultSet(restored) = next_event(&mut events).await else { panic!("refilter must emit a result set") };
         assert_eq!(
