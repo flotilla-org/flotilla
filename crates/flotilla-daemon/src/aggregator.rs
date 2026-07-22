@@ -798,6 +798,9 @@ impl Aggregator {
         for delta in self.state.suppress_issues(&represented) {
             let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
         }
+        if let Some(materializer) = &self.issue_materializer {
+            materializer.refilter_active_queries();
+        }
     }
 
     async fn replace_session_source(&mut self, source: LocalSource, sessions: Vec<ResourceObject<TerminalSession>>) {
@@ -1002,6 +1005,9 @@ impl Aggregator {
             let represented = self.state.represented_issue_refs().await;
             for delta in self.state.suppress_issues(&represented) {
                 let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+            }
+            if let Some(materializer) = &self.issue_materializer {
+                materializer.refilter_active_queries();
             }
         }
 

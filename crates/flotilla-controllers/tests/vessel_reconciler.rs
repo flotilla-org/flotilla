@@ -318,20 +318,36 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
             r#ref: Some("feature/multi".to_string()),
             project_ref: Some("flotilla-suite".to_string()),
             adopted_checkout_refs: BTreeMap::new(),
-            issues: vec![ConvoyIssue {
-                reference: IssueRef {
-                    source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
-                    id: "732".into(),
+            issues: vec![
+                ConvoyIssue {
+                    reference: IssueRef {
+                        source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                        id: "732".into(),
+                    },
+                    repository_ref: Some(repository_specs[0].key()),
+                    snapshot: IssueSnapshot {
+                        title: "Start convoy from an issue".into(),
+                        body: Some("Persist this exact issue body.".into()),
+                        state: IssueState::Open,
+                        labels: vec!["enhancement".into()],
+                        as_of: "2026-07-18T09:30:00Z".parse().expect("timestamp"),
+                    },
                 },
-                repository_ref: Some(repository_specs[0].key()),
-                snapshot: IssueSnapshot {
-                    title: "Start convoy from an issue".into(),
-                    body: Some("Persist this exact issue body.".into()),
-                    state: IssueState::Open,
-                    labels: vec!["enhancement".into()],
-                    as_of: "2026-07-18T09:30:00Z".parse().expect("timestamp"),
+                ConvoyIssue {
+                    reference: IssueRef {
+                        source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/cleat".into() },
+                        id: "733".into(),
+                    },
+                    repository_ref: None,
+                    snapshot: IssueSnapshot {
+                        title: "Fix shared workflow setup".into(),
+                        body: Some("This issue applies across the checked-out repositories.".into()),
+                        state: IssueState::Open,
+                        labels: vec!["enhancement".into()],
+                        as_of: "2026-07-18T09:31:00Z".parse().expect("timestamp"),
+                    },
                 },
-            }],
+            ],
             instruction: Some("Keep the public seam stable.".into()),
         })
         .await
@@ -432,10 +448,15 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                 if spec.cwd == "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi"
                     && matches!(&spec.source, TerminalSessionSource::Agent { brief, .. }
                         if brief.path == ".flotilla/briefs/coder.md"
-                            && brief.copies == ["/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla"]
+                            && brief.copies == [
+                                "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/cleat",
+                                "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla"
+                            ]
                             && brief.content.contains("https://github.com` / `flotilla-org/flotilla` / `732")
+                            && brief.content.contains("https://github.com` / `flotilla-org/cleat` / `733")
                             && brief.content.contains("Snapshot as of `2026-07-18T09:30:00+00:00`")
                             && brief.content.contains("Persist this exact issue body.")
+                            && brief.content.contains("This issue applies across the checked-out repositories.")
                             && brief.content.contains("Keep the public seam stable."))
         )
     }));

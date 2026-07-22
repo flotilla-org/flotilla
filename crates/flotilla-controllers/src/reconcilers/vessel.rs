@@ -533,11 +533,14 @@ impl Reconciler for VesselReconciler {
             }
         };
         let terminal_cwd = strategy.terminal_cwd(&workspace_root, multi_repository, has_repositories);
+        let issue_repository_refs = convoy.spec.issues.iter().map(|issue| issue.repository_ref.as_ref()).collect::<Vec<_>>();
+        let copy_to_all_repositories = issue_repository_refs.iter().any(|repository_ref| repository_ref.is_none());
         let brief_copies = checkout_paths
             .iter()
             .filter(|(repo_ref, _)| {
-                let relevant_issue_refs = convoy.spec.issues.iter().filter_map(|issue| issue.repository_ref.as_ref()).collect::<Vec<_>>();
-                relevant_issue_refs.is_empty() || relevant_issue_refs.contains(repo_ref)
+                copy_to_all_repositories
+                    || issue_repository_refs.is_empty()
+                    || issue_repository_refs.iter().flatten().any(|relevant| *relevant == *repo_ref)
             })
             .map(|(repo_ref, path)| match &strategy {
                 PlacementStrategy::DockerWorktreeOnHostAndMount { mount_path, .. } => {
@@ -765,7 +768,8 @@ fn append_convoy_work_context(content: &mut String, convoy: &ResourceObject<Conv
         content.push_str(&format!("  - `{}` — {}\n", repository.repo_ref, repository.url));
     }
     if !convoy.spec.issues.is_empty() {
-        content.push_str("\n## Issue snapshots\n\n");
+        let header = if convoy.spec.issues.len() == 1 { "Issue snapshot" } else { "Issue snapshots" };
+        content.push_str(&format!("\n## {header}\n\n"));
     }
     for issue in &convoy.spec.issues {
         content.push_str(&format!(
