@@ -295,7 +295,7 @@ async fn hostless_convoy_work_complete_routes_to_remote_home() {
 }
 
 #[tokio::test]
-async fn hostless_convoy_command_names_unreachable_home() {
+async fn hostless_convoy_command_explains_missing_home_route() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
@@ -319,11 +319,11 @@ async fn hostless_convoy_command_names_unreachable_home() {
         .await
         .expect_err("unreachable convoy home should reject dispatch");
 
-    assert_eq!(message, "convoy stranded is homed on feta, which is unreachable");
+    assert_eq!(message, "connect to feta for convoy stranded: no routed node address found for host");
 }
 
 #[tokio::test]
-async fn hostless_convoy_command_names_disconnected_home() {
+async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_stale() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
     let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
@@ -339,7 +339,14 @@ async fn hostless_convoy_command_names_disconnected_home() {
         )
         .await;
 
-    let message = topology
+    let follower_convoys = topology.follower.resource_backend().using::<Convoy>(namespace);
+    follower_convoys
+        .create(&InputMeta::builder().name(convoy_name.to_string()).build(), &convoy_spec("scratch"))
+        .await
+        .expect("create remote-homed convoy");
+
+    let mut rx = topology.leader.subscribe();
+    let command_id = topology
         .client
         .execute(Command {
             node_id: None,
@@ -348,9 +355,13 @@ async fn hostless_convoy_command_names_disconnected_home() {
             action: CommandAction::ConvoyDelete { namespace: Some(namespace.to_string()), name: convoy_name.to_string(), force: true },
         })
         .await
-        .expect_err("disconnected convoy home should reject dispatch");
+        .expect("live peer route should take precedence over stale connection status");
 
-    assert_eq!(message, "convoy offline-home is homed on follower, which is unreachable");
+    assert_eq!(await_command_result(&mut rx, command_id).await, CommandValue::Ok);
+    assert!(
+        matches!(follower_convoys.get(convoy_name).await, Err(ResourceError::NotFound { .. })),
+        "remote-homed convoy should be deleted through the live peer route"
+    );
 }
 
 /// A stateless remote issue query should return results end-to-end.

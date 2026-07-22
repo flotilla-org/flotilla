@@ -1211,6 +1211,12 @@ fn checkout_integration_summary(checkout: &ResourceObject<ResourceCheckout>, int
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingConvoyTarget {
+    pub home: HostName,
+    pub node_id: NodeId,
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1945,7 +1951,10 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("placement policy {policy_name} targets unavailable host {host_ref}"))
     }
 
-    pub async fn resolve_existing_convoy_target_node(&self, action: &flotilla_protocol::CommandAction) -> Result<Option<NodeId>, String> {
+    pub async fn resolve_existing_convoy_target(
+        &self,
+        action: &flotilla_protocol::CommandAction,
+    ) -> Result<Option<ExistingConvoyTarget>, String> {
         let (namespace, name) = match action {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
             | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. } => {
@@ -1971,7 +1980,9 @@ impl InProcessDaemon {
 
         let home = match hosts.as_slice() {
             [] => return Ok(None),
-            [host] if host == &self.host_name => return Ok(Some(self.node_id.clone())),
+            [host] if host == &self.host_name => {
+                return Ok(Some(ExistingConvoyTarget { home: host.clone(), node_id: self.node_id.clone() }));
+            }
             [host] => host.clone(),
             _ => {
                 let homes = hosts.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
@@ -1979,12 +1990,12 @@ impl InProcessDaemon {
             }
         };
 
-        match self.host_registry.node_id_for_host_name(&home).await? {
-            Some(node_id) if self.host_registry.peer_connection_status(&node_id).await == PeerConnectionState::Connected => {
-                Ok(Some(node_id))
-            }
-            Some(_) | None => Err(format!("convoy {name} is homed on {home}, which is unreachable")),
-        }
+        let node_id = self
+            .host_registry
+            .node_id_for_host_name(&home)
+            .await?
+            .ok_or_else(|| format!("connect to {home} for convoy {name}: no routed node address found for host"))?;
+        Ok(Some(ExistingConvoyTarget { home, node_id }))
     }
 
     /// Admit a convoy against this daemon's authoritative project resources,

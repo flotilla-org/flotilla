@@ -130,8 +130,9 @@ impl RemoteCommandRouter {
         if matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
             return Err("prepared convoy starts are reserved for authenticated peer forwarding".to_string());
         }
-        if let Some(target_node_id) = self.daemon.resolve_existing_convoy_target_node(&command.action).await? {
-            command.node_id = Some(target_node_id);
+        let existing_convoy_target = self.daemon.resolve_existing_convoy_target(&command.action).await?;
+        if let Some(target) = existing_convoy_target.as_ref() {
+            command.node_id = Some(target.node_id.clone());
         }
         if let CommandAction::ConvoyStart { intent } = &command.action {
             let placement_target = self.daemon.resolve_convoy_start_target_node(intent).await?;
@@ -183,7 +184,10 @@ impl RemoteCommandRouter {
                     command: Box::new(command),
                     session_id: None,
                 };
-                let send_result = self.send_routed_to(&target_node_id, routed).await;
+                let send_result = self.send_routed_to(&target_node_id, routed).await.map_err(|cause| match &existing_convoy_target {
+                    Some(target) => format!("connect to {} at peer node {}: {cause}", target.home, target.node_id),
+                    None => cause,
+                });
 
                 match send_result {
                     Ok(()) => Ok(command_id),

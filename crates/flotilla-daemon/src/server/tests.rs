@@ -20,18 +20,18 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     qualified_path::QualifiedPath,
-    result_set::{QueryChanges, QueryId, ResultDelta},
+    result_set::{ConvoyPhase as RowConvoyPhase, ConvoyRow, QueryChanges, QueryId, ResultDelta},
     AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, Checkout, CheckoutTarget, Command,
     CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, DaemonEvent, EnvironmentId, HostName, HostPath,
     HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage,
-    PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage,
-    StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION,
-    TERMINAL_POOL_PROVIDER_CATEGORY,
+    PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, ResourceRef, Response, ResponseResult,
+    RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    PROTOCOL_VERSION, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectSpec, ResourceBackend, ResourceError, Stance,
-    StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    api_version, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectSpec, Resource, ResourceBackend, ResourceError,
+    Stance, StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
     TerminalSessionStatusPatch, WorkflowTemplate,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -152,6 +152,19 @@ fn make_remote_command_router(
         Arc::clone(pending_remote_cancels),
         Arc::clone(next_remote_command_id),
     )
+}
+
+struct FailingPeerSender;
+
+#[async_trait::async_trait]
+impl PeerSender for FailingPeerSender {
+    async fn send(&self, _msg: PeerWireMessage) -> Result<(), String> {
+        Err("outbound channel closed".to_string())
+    }
+
+    async fn retire(&self, _reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn empty_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
@@ -761,6 +774,48 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_execute_remote_convoy_failure_names_transport_target_and_cause() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let home = HostName::new("feta");
+    let resource = ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, "flotilla", "stranded").on_host(home.clone());
+    let row =
+        ConvoyRow::builder().resource(resource.clone()).name("stranded").workflow_ref("scratch").phase(RowConvoyPhase::Pending).build();
+    daemon
+        .aggregator_projection_state()
+        .await
+        .write()
+        .await
+        .replace_replica_rows(HashMap::from([(home.clone(), HashMap::from([(resource, row)]))]));
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("feta-host")))
+                .host_name(home)
+                .node(node_info("feta"))
+                .system(flotilla_protocol::SystemInfo::default())
+                .providers(vec![])
+                .build(),
+        )
+        .await;
+
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
+    let remote_command_router = empty_remote_command_router(&daemon, &peer_manager);
+
+    let message = remote_command_router
+        .dispatch_execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: Some("flotilla".to_string()), name: "stranded".to_string(), force: true },
+        })
+        .await
+        .expect_err("failed peer send should reject dispatch");
+
+    assert_eq!(message, "connect to feta at peer node feta: outbound channel closed");
 }
 
 #[tokio::test]
