@@ -67,6 +67,7 @@ define_patch_kinds! {
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalMarkRunning => DUPLICATE,
     TerminalMarkMessageDelivered => NONE,
+    TerminalObserveAttention => NONE,
     TerminalMarkStopped => DUPLICATE,
     TerminalMarkFailed => DUPLICATE,
     VesselMarkProvisioning => DUPLICATE,
@@ -106,6 +107,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkMessageDelivered { .. } => PatchKind::TerminalMarkMessageDelivered,
         TerminalSessionStatusPatch::MarkStopped { .. } => PatchKind::TerminalMarkStopped,
         TerminalSessionStatusPatch::MarkFailed { .. } => PatchKind::TerminalMarkFailed,
+        TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
     }
 }
 
@@ -513,6 +515,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     crew: None,
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
+                    attention: None,
                 };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 let patch = TerminalSessionStatusPatch::MarkRunning {

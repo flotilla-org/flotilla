@@ -163,6 +163,8 @@ pub struct ConvoySummary {
     pub finished_at: Option<Timestamp>,
     pub observed_workflow_ref: Option<String>,
     pub initializing: bool,
+    #[builder(default)]
+    pub needs_attention: bool,
 }
 
 impl From<&wire::ConvoyRow> for ConvoySummary {
@@ -184,6 +186,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             finished_at: row.finished_at,
             observed_workflow_ref: row.observed_workflow_ref.clone(),
             initializing: row.initializing,
+            needs_attention: row.needs_attention,
         }
     }
 }

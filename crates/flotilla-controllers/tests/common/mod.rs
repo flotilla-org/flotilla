@@ -345,6 +345,7 @@ pub async fn create_stopped_terminal(
             crew: None,
             launch_command: Some(fixture.command),
             delivered_message_id: None,
+            attention: None,
         })
         .await
         .expect("terminal status update should succeed");

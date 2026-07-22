@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{InFlightCommand, RepoViewLayout, TuiModel, UiState},
+    app::{InFlightCommand, NamespaceMap, RepoViewLayout, TuiModel, UiState},
     binding_table::{KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
@@ -269,7 +269,7 @@ pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCom
 }
 
 /// Build mode indicators for Normal mode (layout and host).
-pub(crate) fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
+pub(crate) fn normal_mode_indicators(ui: &UiState, namespaces: &NamespaceMap) -> Vec<ModeIndicator> {
     let layout_icon = match ui.view_layout {
         RepoViewLayout::Auto => "◫",
         RepoViewLayout::Zoom => "□",
@@ -285,10 +285,16 @@ pub(crate) fn normal_mode_indicators(ui: &UiState) -> Vec<ModeIndicator> {
 
     let host_label = ui.provisioning_target.to_string();
 
-    vec![
+    let attention_count =
+        namespaces.values().flat_map(|namespace| namespace.convoys.values()).filter(|convoy| convoy.needs_attention).count();
+    let mut indicators = vec![
         ModeIndicator::new(layout_icon, layout_label, StatusBarAction::key(KeyCode::Char('l'))),
         ModeIndicator::new("", &host_label, StatusBarAction::None),
-    ]
+    ];
+    if attention_count > 0 {
+        indicators.push(ModeIndicator::new("⚠", &format!("{attention_count} need attention"), StatusBarAction::None));
+    }
+    indicators
 }
 
 /// Build a `StatusSection` from a `StatusFragment`, resolving the fragment's content.
@@ -322,7 +328,38 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::*;
-    use crate::{app::test_support::repo_info, status_bar::StatusBarAction};
+    use crate::{
+        app::{test_support::repo_info, NamespaceModel},
+        convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary},
+        status_bar::StatusBarAction,
+    };
+
+    fn attention_convoy(name: &str, needs_attention: bool) -> ConvoySummary {
+        ConvoySummary::builder()
+            .id(ConvoyId::new("flotilla", name))
+            .namespace("flotilla".to_string())
+            .name(name.to_string())
+            .workflow_ref("implement".to_string())
+            .phase(ConvoyPhase::Active)
+            .project_ref("flotilla".to_string())
+            .vessels(Vec::new())
+            .initializing(false)
+            .needs_attention(needs_attention)
+            .build()
+    }
+
+    #[test]
+    fn fleet_attention_indicator_counts_attention_convoys() {
+        let mut namespace = NamespaceModel::default();
+        for convoy in [attention_convoy("one", true), attention_convoy("two", false), attention_convoy("three", true)] {
+            namespace.convoys.insert(convoy.id.clone(), convoy);
+        }
+        let namespaces = NamespaceMap::from([("flotilla".to_string(), namespace)]);
+
+        let indicators = normal_mode_indicators(&UiState::new(&[]), &namespaces);
+
+        assert!(indicators.iter().any(|indicator| indicator.icon == "⚠" && indicator.label == "2 need attention"));
+    }
 
     #[test]
     fn handle_click_returns_none_for_miss() {

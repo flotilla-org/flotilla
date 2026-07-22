@@ -4,6 +4,7 @@ pub mod shpool;
 
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, AttachableId, AttachableSetId, TerminalStatus};
+pub use flotilla_resources::TerminalSessionTag;
 
 use crate::path_context::ExecutionEnvironmentPath;
 
@@ -12,12 +13,19 @@ pub type TerminalEnvVars = Vec<(String, String)>;
 
 /// Raw session data returned by a terminal pool CLI adapter.
 /// No AttachableId — the manager handles identity mapping.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
 pub struct TerminalSession {
     pub session_name: String,
     pub status: TerminalStatus,
     pub command: Option<String>,
     pub working_directory: Option<ExecutionEnvironmentPath>,
+    pub screen_activity: Option<ScreenActivity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenActivity {
+    Active,
+    Stable,
 }
 
 pub(crate) const MANAGED_SESSION_PREFIX: &str = "flotilla-v2:";
@@ -89,6 +97,7 @@ pub trait TerminalPool: Send + Sync {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
     ) -> Result<(), String>;
 
     /// Returns a structured `Arg` tree representing the attach command.

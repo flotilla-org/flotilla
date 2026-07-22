@@ -31,7 +31,8 @@ use flotilla_protocol::{
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectSpec, ResourceBackend, ResourceError, Stance,
-    WorkflowTemplate,
+    StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, WorkflowTemplate,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
@@ -464,14 +465,13 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
     }
 
     let response = dispatch_request_with_state(&daemon, &agent_state_store, 5, Request::AgentHook {
-        event: AgentHookEvent {
-            attachable_id: incoming_id.clone(),
-            harness: AgentHarness::ClaudeCode,
-            event_type: AgentEventType::Active,
-            session_id: Some(session_id.clone()),
-            model: Some("new-model".into()),
-            cwd: None,
-        },
+        event: AgentHookEvent::builder()
+            .attachable_id(incoming_id.clone())
+            .harness(AgentHarness::ClaudeCode)
+            .event_type(AgentEventType::Active)
+            .session_id(session_id.clone())
+            .model("new-model".to_string())
+            .build(),
     })
     .await;
 
@@ -482,6 +482,53 @@ async fn dispatch_agent_hook_started_updates_existing_session_entry() {
     assert_eq!(entry.status, AgentStatus::Active);
     assert_eq!(entry.model.as_deref(), Some("new-model"));
     assert!(store.get(&incoming_id).is_none(), "session remap should update the existing attachable id");
+}
+
+#[tokio::test]
+async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&InputMeta::builder().name("terminal-demo-coder".to_string()).build(), &TerminalSessionSpec {
+            env_ref: "host-direct".into(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Tool { command: "claude".into() },
+            cwd: "/repo".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("terminal create");
+    let mut status = TerminalSessionStatus::default();
+    TerminalSessionStatusPatch::MarkRunning {
+        session_id: "terminal-demo-coder".into(),
+        pid: None,
+        started_at: chrono::Utc::now(),
+        crew: None,
+        launch_command: "claude".into(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    sessions.update_status("terminal-demo-coder", &created.metadata.resource_version, &status).await.expect("running status");
+    let agent_state_store = flotilla_core::agents::shared_in_memory_agent_state_store();
+
+    let response = dispatch_request_with_state(&daemon, &agent_state_store, 8, Request::AgentHook {
+        event: AgentHookEvent::builder()
+            .attachable_id(AttachableId::new("att-managed"))
+            .harness(AgentHarness::ClaudeCode)
+            .event_type(AgentEventType::WaitingForPermission)
+            .session_id("claude-native-session".to_string())
+            .cwd("/repo".to_string())
+            .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "terminal-demo-coder".into() })
+            .build(),
+    })
+    .await;
+
+    assert!(matches!(ok_response(response, 8), Response::AgentHook));
+    let observed = sessions.get("terminal-demo-coder").await.expect("observed terminal");
+    assert_eq!(
+        observed.status.and_then(|status| status.attention).map(|attention| attention.state),
+        Some(TerminalAttentionState::NeedsInput)
+    );
 }
 
 #[tokio::test]
@@ -504,14 +551,12 @@ async fn dispatch_agent_hook_ended_removes_existing_session_entry() {
     }
 
     let response = dispatch_request_with_state(&daemon, &agent_state_store, 6, Request::AgentHook {
-        event: AgentHookEvent {
-            attachable_id: AttachableId::new("att-ended"),
-            harness: AgentHarness::ClaudeCode,
-            event_type: AgentEventType::Ended,
-            session_id: Some(session_id.clone()),
-            model: None,
-            cwd: None,
-        },
+        event: AgentHookEvent::builder()
+            .attachable_id(AttachableId::new("att-ended"))
+            .harness(AgentHarness::ClaudeCode)
+            .event_type(AgentEventType::Ended)
+            .session_id(session_id.clone())
+            .build(),
     })
     .await;
 
@@ -528,14 +573,12 @@ async fn dispatch_agent_hook_no_change_event_is_ok_without_creating_entry() {
     let attachable_id = AttachableId::new("att-no-change");
 
     let response = dispatch_request_with_state(&daemon, &agent_state_store, 7, Request::AgentHook {
-        event: AgentHookEvent {
-            attachable_id: attachable_id.clone(),
-            harness: AgentHarness::ClaudeCode,
-            event_type: AgentEventType::NoChange,
-            session_id: Some("sess-no-change".into()),
-            model: None,
-            cwd: None,
-        },
+        event: AgentHookEvent::builder()
+            .attachable_id(attachable_id.clone())
+            .harness(AgentHarness::ClaudeCode)
+            .event_type(AgentEventType::NoChange)
+            .session_id("sess-no-change".to_string())
+            .build(),
     })
     .await;
 

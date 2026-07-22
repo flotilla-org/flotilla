@@ -497,6 +497,7 @@ impl TerminalPool for FakeTerminalPool {
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
+        _tags: &[crate::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }

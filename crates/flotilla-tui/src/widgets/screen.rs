@@ -487,10 +487,10 @@ impl InteractiveWidget for Screen {
 
         // 3f. Mode indicators — only for Normal mode (no modals, not config or issue search)
         let mode_indicators = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
-            status_bar_widget::normal_mode_indicators(ctx.ui)
+            status_bar_widget::normal_mode_indicators(ctx.ui, ctx.namespaces)
         } else if active_mode == BindingModeId::CommandPalette {
             // CommandPalette keeps mode indicators
-            status_bar_widget::normal_mode_indicators(ctx.ui)
+            status_bar_widget::normal_mode_indicators(ctx.ui, ctx.namespaces)
         } else {
             vec![]
         };

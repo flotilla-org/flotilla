@@ -1378,6 +1378,7 @@ impl TerminalPool for MockTerminalPool {
         _cmd: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        _tags: &[crate::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }

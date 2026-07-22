@@ -838,6 +838,7 @@ mod tests {
             finished_at: None,
             observed_workflow_ref: None,
             initializing: false,
+            needs_attention: false,
         };
         let mut model = crate::app::NamespaceModel::default();
         model.convoys.insert(convoy.id.clone(), convoy);

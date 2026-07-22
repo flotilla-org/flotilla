@@ -213,14 +213,15 @@ mod tests {
 
     #[test]
     fn agent_hook_event_serde_roundtrip() {
-        let event = AgentHookEvent {
-            attachable_id: AttachableId::new("att-123"),
-            harness: AgentHarness::ClaudeCode,
-            event_type: AgentEventType::Active,
-            session_id: Some("sess-abc".into()),
-            model: Some("opus-4".into()),
-            cwd: Some("/home/dev".into()),
-        };
+        let event = AgentHookEvent::builder()
+            .attachable_id(AttachableId::new("att-123"))
+            .harness(AgentHarness::ClaudeCode)
+            .event_type(AgentEventType::Active)
+            .session_id("sess-abc".to_string())
+            .model("opus-4".to_string())
+            .cwd("/home/dev".to_string())
+            .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: "terminal-demo-coder".into() })
+            .build();
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: AgentHookEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, event);

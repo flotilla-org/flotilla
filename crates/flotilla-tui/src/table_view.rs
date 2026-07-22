@@ -700,7 +700,7 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
         label: "CONVOY",
         width: WidthHint::Flexible { minimum: 12, weight: 2 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(&row.name),
+        extract: |row| CellValue::plain(if row.needs_attention { format!("⚠ {}", row.name) } else { row.name.clone() }),
     },
     ColumnSpec {
         id: "workflow",
@@ -1146,6 +1146,7 @@ mod tests {
             finished_at: None,
             observed_workflow_ref: None,
             initializing: false,
+            needs_attention: false,
         }
     }
 
@@ -1188,6 +1189,16 @@ mod tests {
 
         assert_eq!(view.rows[0].cells[2], CellValue::toned("completed", CellTone::Success));
         assert_eq!(view.rows[1].cells[2], CellValue::toned("failed", CellTone::Error));
+    }
+
+    #[test]
+    fn project_convoy_row_badges_needs_attention() {
+        let mut row = convoy(vec![vessel("implement", &[], WorkPhase::Running)]);
+        row.needs_attention = true;
+
+        let view = project_convoys("convoys/dev", &[&row]).expect("convoy table");
+
+        assert_eq!(view.rows[0].cells[0].text, "⚠ tables");
     }
 
     #[test]

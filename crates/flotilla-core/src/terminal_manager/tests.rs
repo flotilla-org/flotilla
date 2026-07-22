@@ -53,6 +53,7 @@ impl TerminalPool for MockTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
+        _tags: &[crate::providers::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         self.calls.lock().expect("lock calls").push(PoolCall::EnsureSession {
             session_name: session_name.to_string(),
@@ -176,6 +177,7 @@ async fn ensure_running_uses_provider_discovery_session_name() {
             command: &str,
             cwd: &ExecutionEnvironmentPath,
             env_vars: &TerminalEnvVars,
+            _tags: &[crate::providers::terminal::TerminalSessionTag],
         ) -> Result<(), String> {
             self.calls.lock().expect("lock").push(PoolCall::EnsureSession {
                 session_name: session_name.to_string(),
@@ -245,7 +247,14 @@ async fn attach_command_includes_env_vars() {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, _: &str, _: &str, _: &ExecutionEnvironmentPath, _: &TerminalEnvVars) -> Result<(), String> {
+        async fn ensure_session(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecutionEnvironmentPath,
+            _: &TerminalEnvVars,
+            _: &[crate::providers::terminal::TerminalSessionTag],
+        ) -> Result<(), String> {
             Ok(())
         }
         fn attach_args(
@@ -348,7 +357,14 @@ async fn kill_terminal_delegates_to_pool() {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, _: &str, _: &str, _: &ExecutionEnvironmentPath, _: &TerminalEnvVars) -> Result<(), String> {
+        async fn ensure_session(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecutionEnvironmentPath,
+            _: &TerminalEnvVars,
+            _: &[crate::providers::terminal::TerminalSessionTag],
+        ) -> Result<(), String> {
             Ok(())
         }
         fn attach_args(
@@ -397,6 +413,7 @@ async fn refresh_updates_statuses() {
         status: TerminalStatus::Running,
         command: Some("bash".to_string()),
         working_directory: Some(ExecutionEnvironmentPath::new("/repo/wt-feat")),
+        screen_activity: None,
     }]);
     let mgr = TerminalManager::new(Arc::new(pool), store.clone(), test_host());
 
@@ -441,7 +458,14 @@ async fn cascade_delete_removes_sets_and_kills_sessions() {
         async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
             Ok(Vec::new())
         }
-        async fn ensure_session(&self, _: &str, _: &str, _: &ExecutionEnvironmentPath, _: &TerminalEnvVars) -> Result<(), String> {
+        async fn ensure_session(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecutionEnvironmentPath,
+            _: &TerminalEnvVars,
+            _: &[crate::providers::terminal::TerminalSessionTag],
+        ) -> Result<(), String> {
             Ok(())
         }
         fn attach_args(

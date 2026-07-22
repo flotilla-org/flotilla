@@ -802,6 +802,7 @@ impl TerminalPool for FakeTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &super::super::terminal::TerminalEnvVars,
+        _tags: &[super::super::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.iter().any(|s| s.session_name == session_name) {
@@ -818,6 +819,7 @@ impl TerminalPool for FakeTerminalPool {
             status: TerminalStatus::Running,
             command: Some(command.to_string()),
             working_directory: Some(cwd.clone()),
+            screen_activity: None,
         });
         Ok(())
     }

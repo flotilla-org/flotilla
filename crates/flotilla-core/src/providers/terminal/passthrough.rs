@@ -18,6 +18,7 @@ impl TerminalPool for PassthroughTerminalPool {
         _command: &str,
         _cwd: &ExecutionEnvironmentPath,
         _env_vars: &TerminalEnvVars,
+        _tags: &[super::TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }
@@ -60,7 +61,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_is_noop() {
         let pool = PassthroughTerminalPool;
-        assert!(pool.ensure_session("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &vec![]).await.is_ok());
+        assert!(pool.ensure_session("my-session", "bash", &ExecutionEnvironmentPath::new("/tmp"), &vec![], &[]).await.is_ok());
     }
 
     #[tokio::test]

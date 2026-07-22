@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
-    Environment, EnvironmentPhase, ResourceBackend, ResourceError, ResourceObject, TerminalSession, TerminalSessionPhase,
-    TerminalSessionStatusPatch, TypedResolver,
+    Environment, EnvironmentPhase, ResourceBackend, ResourceError, ResourceObject, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver,
+    CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -20,9 +21,21 @@ pub struct TerminalRuntimeState {
 
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
-    async fn ensure_session(&self, name: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalRuntimeState, String>;
+    async fn ensure_session(
+        &self,
+        name: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        tags: &[TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String>;
     async fn session_is_running(&self, _session_id: &str, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
         Ok(true)
+    }
+    async fn observe_attention(
+        &self,
+        _session_id: &str,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+    ) -> Result<Option<TerminalAttention>, String> {
+        Ok(None)
     }
     async fn deliver_message(
         &self,
@@ -55,6 +68,8 @@ pub enum TerminalDeps {
     Running(TerminalRuntimeState),
     MessageDelivered(String),
     Stopped,
+    Attention(TerminalAttention),
+    AttentionStale,
     Failed(String),
 }
 
@@ -79,12 +94,19 @@ where
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(message), .. } = &obj.spec.source {
                 if obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()) != Some(message.id.as_str()) {
+                    // A continuous attention signal must not starve a queued handoff.
                     // Delivery is deliberately at-least-once. A crash after the pool accepts the
                     // message but before MarkMessageDelivered is persisted may redeliver it; losing
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
                     self.runtime.deliver_message(session_id, &obj.spec, &message.text).await.map_err(ResourceError::other)?;
                     return Ok(TerminalDeps::MessageDelivered(message.id.clone()));
                 }
+            }
+            if let Some(attention) = self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                return Ok(TerminalDeps::Attention(attention));
+            }
+            if obj.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| attention.is_stale_at(Utc::now())) {
+                return Ok(TerminalDeps::AttentionStale);
             }
             return Ok(TerminalDeps::None);
         }
@@ -101,7 +123,14 @@ where
             return Ok(TerminalDeps::Waiting);
         }
 
-        Ok(match self.runtime.ensure_session(&obj.metadata.name, &obj.spec).await {
+        let tags = [
+            obj.metadata.labels.get(CONVOY_LABEL).map(|value| TerminalSessionTag::new("convoy", value)),
+            obj.metadata.labels.get(VESSEL_REF_LABEL).map(|value| TerminalSessionTag::new("vessel", value)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        Ok(match self.runtime.ensure_session(&obj.metadata.name, &obj.spec, &tags).await {
             Ok(state) => TerminalDeps::Running(state),
             Err(err) => TerminalDeps::Failed(err),
         })
@@ -127,7 +156,12 @@ where
                 TerminalDeps::Failed(message) => {
                     Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
                 }
-                TerminalDeps::Waiting | TerminalDeps::None | TerminalDeps::Stopped | TerminalDeps::MessageDelivered(_) => None,
+                TerminalDeps::Waiting
+                | TerminalDeps::None
+                | TerminalDeps::Stopped
+                | TerminalDeps::MessageDelivered(_)
+                | TerminalDeps::Attention(_)
+                | TerminalDeps::AttentionStale => None,
             },
             TerminalSessionPhase::Running if matches!(deps, TerminalDeps::Stopped) => Some(TerminalSessionStatusPatch::MarkStopped {
                 stopped_at: now,
@@ -139,6 +173,27 @@ where
                 TerminalDeps::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }
+                TerminalDeps::Attention(attention)
+                    if obj
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.attention.as_ref())
+                        .is_none_or(|current| current.should_replace_with(attention)) =>
+                {
+                    Some(TerminalSessionStatusPatch::ObserveAttention { attention: attention.clone() })
+                }
+                TerminalDeps::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
+                    attention: TerminalAttention {
+                        state: TerminalAttentionState::Unobservable,
+                        as_of: now,
+                        source: obj
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.attention.as_ref())
+                            .map(|attention| attention.source)
+                            .unwrap_or(TerminalAttentionSource::Screen),
+                    },
+                }),
                 _ => None,
             },
             TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,

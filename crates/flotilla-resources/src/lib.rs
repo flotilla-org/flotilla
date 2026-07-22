@@ -74,9 +74,10 @@ pub use retention::{EventRetention, ResourceStoreDiagnostics, ResourceStoreWarni
 pub use sqlite::SqliteBackend;
 pub use status_patch::{apply_status_patch, apply_status_patch_checked, NoStatusPatch, StatusPatch};
 pub use terminal_session::{
-    terminal_session_attach_target, CrewSessionStatus, InnerCommandStatus, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession, TerminalSessionAttachTarget, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
+    terminal_session_attach_target, CrewSessionStatus, InnerCommandStatus, TerminalAttention, TerminalAttentionSource,
+    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession, TerminalSessionAttachTarget,
+    TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, TerminalSessionTag,
 };
 pub use vessel::{Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch};
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};

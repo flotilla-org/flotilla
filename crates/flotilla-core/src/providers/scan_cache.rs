@@ -155,8 +155,9 @@ impl TerminalPool for SharedTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
+        tags: &[super::terminal::TerminalSessionTag],
     ) -> Result<(), String> {
-        let result = self.inner.ensure_session(session_name, command, cwd, env_vars).await;
+        let result = self.inner.ensure_session(session_name, command, cwd, env_vars, tags).await;
         if result.is_ok() {
             self.sessions.invalidate();
         }

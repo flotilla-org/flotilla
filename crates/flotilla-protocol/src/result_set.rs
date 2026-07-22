@@ -513,6 +513,8 @@ pub struct ConvoyRow {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub vessels: Vec<VesselRow>,
+    #[builder(default)]
+    pub needs_attention: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -567,6 +569,9 @@ pub struct VesselRow {
     /// Capability fact: the daemon will accept completing this vessel's work.
     #[builder(default)]
     pub complete_work: bool,
+    /// A live observation requests human attention; it never changes `phase`.
+    #[builder(default)]
+    pub needs_attention: bool,
 }
 
 /// Crew membership summary on a vessel row.

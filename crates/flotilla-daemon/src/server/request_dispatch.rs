@@ -142,7 +142,7 @@ impl<'a> RequestDispatcher<'a> {
                 Err(e) => Message::error_response(id, e),
             },
 
-            Request::AgentHook { event } => match self.handle_agent_hook(event) {
+            Request::AgentHook { event } => match self.handle_agent_hook(event).await {
                 Ok(()) => Message::ok_response(id, Response::AgentHook),
                 Err(e) => {
                     warn!(err = %e, "failed to process agent hook event");
@@ -152,7 +152,7 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
-    fn handle_agent_hook(&self, event: AgentHookEvent) -> Result<(), String> {
+    async fn handle_agent_hook(&self, event: AgentHookEvent) -> Result<(), String> {
         use flotilla_protocol::AgentEventType;
 
         tracing::info!(
@@ -163,47 +163,76 @@ impl<'a> RequestDispatcher<'a> {
             "received agent hook event"
         );
 
-        let mut store = self.agent_state_store.lock().map_err(|_| "agent state store lock poisoned".to_string())?;
+        {
+            let mut store = self.agent_state_store.lock().map_err(|_| "agent state store lock poisoned".to_string())?;
 
-        let attachable_id = if let Some(ref sid) = event.session_id {
-            if let Some(existing) = store.lookup_by_session_id(sid) {
-                existing.clone()
+            let attachable_id = if let Some(ref sid) = event.session_id {
+                if let Some(existing) = store.lookup_by_session_id(sid) {
+                    existing.clone()
+                } else {
+                    event.attachable_id.clone()
+                }
             } else {
                 event.attachable_id.clone()
-            }
-        } else {
-            event.attachable_id.clone()
-        };
-
-        let changed = if event.event_type == AgentEventType::Ended {
-            store.remove(&attachable_id);
-            true
-        } else if let Some(status) = event.event_type.to_status() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-            let existing = store.get(&attachable_id);
-            // TODO(#393): persist event.cwd for CliAgentProvider correlation
-            let entry = AgentEntry {
-                harness: event.harness.clone(),
-                status,
-                model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
-                session_title: existing.and_then(|e| e.session_title.clone()),
-                session_id: event.session_id.clone(),
-                last_event_epoch_secs: now,
             };
-            store.upsert(attachable_id, entry);
-            true
-        } else {
-            false
-        };
 
-        if changed {
-            store.save()
-        } else {
-            Ok(())
+            let changed = if event.event_type == AgentEventType::Ended {
+                store.remove(&attachable_id);
+                true
+            } else if let Some(status) = event.event_type.to_status() {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let existing = store.get(&attachable_id);
+                // TODO(#393): persist event.cwd for CliAgentProvider correlation
+                let entry = AgentEntry {
+                    harness: event.harness.clone(),
+                    status,
+                    model: event.model.clone().or_else(|| existing.and_then(|e| e.model.clone())),
+                    session_title: existing.and_then(|e| e.session_title.clone()),
+                    session_id: event.session_id.clone(),
+                    last_event_epoch_secs: now,
+                };
+                store.upsert(attachable_id, entry);
+                true
+            } else {
+                false
+            };
+
+            if changed {
+                store.save()?;
+            } else {
+                // Keep the legacy observer path a no-op when it has no control-plane identity.
+            }
         }
-        // NOTE: agent state changes are not pushed to the TUI immediately.
-        // They become visible on the next refresh cycle (~10s). A proper fix
-        // requires the log-based architecture (#256) where push events can
-        // trigger targeted view re-materialization without a full provider refresh.
+
+        let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+        let state = match event.event_type {
+            AgentEventType::Active => flotilla_resources::TerminalAttentionState::Working,
+            AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
+            AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
+            AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
+        };
+        let sessions = self.daemon.resource_backend().using::<flotilla_resources::TerminalSession>(&terminal.namespace);
+        let session = sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
+        let attention = flotilla_resources::TerminalAttention {
+            state,
+            as_of: chrono::Utc::now(),
+            source: flotilla_resources::TerminalAttentionSource::Hook,
+        };
+        if session
+            .status
+            .as_ref()
+            .and_then(|status| status.attention.as_ref())
+            .is_some_and(|current| !current.should_replace_with(&attention))
+        {
+            return Ok(());
+        }
+        flotilla_resources::apply_status_patch(
+            &sessions,
+            &terminal.session_name,
+            &flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use flotilla_protocol::arg::Arg;
 use serde::Deserialize;
 
-use super::{TerminalEnvVars, TerminalPool, TerminalSession};
+use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag};
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{run, CommandRunner},
@@ -16,6 +16,7 @@ struct SessionInfo {
     cwd: Option<std::path::PathBuf>,
     cmd: Option<String>,
     status: SessionStatus,
+    screen_activity: Option<ScreenActivityWire>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +24,13 @@ struct SessionInfo {
 enum SessionStatus {
     Attached,
     Detached,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ScreenActivityWire {
+    Active,
+    Stable,
 }
 
 pub struct CleatTerminalPool {
@@ -67,6 +75,10 @@ impl TerminalPool for CleatTerminalPool {
                     status,
                     command: session.cmd,
                     working_directory: session.cwd.map(ExecutionEnvironmentPath::new),
+                    screen_activity: session.screen_activity.map(|activity| match activity {
+                        ScreenActivityWire::Active => ScreenActivity::Active,
+                        ScreenActivityWire::Stable => ScreenActivity::Stable,
+                    }),
                 }
             })
             .collect())
@@ -78,36 +90,32 @@ impl TerminalPool for CleatTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
+        tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
-        // If the session already exists, leave it alone.
         let existing = self.list_sessions().await.unwrap_or_default();
-        if existing.iter().any(|s| s.session_name == session_name) {
+        if existing.iter().any(|session| session.session_name == session_name) {
             return Ok(());
         }
 
-        // terminal_env_defaults (from discovery) provide TERM/COLORTERM
-        // fallbacks for daemons started without a TTY (e.g. remote SSH).
         let has_env = !env_vars.is_empty() || !self.terminal_env_defaults.is_empty();
         let effective_cmd = if !has_env {
             command.to_string()
         } else {
             let mut parts = vec!["env".to_string()];
-            for (k, v) in &self.terminal_env_defaults {
-                parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
-            }
-            for (k, v) in env_vars {
-                parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
+            for (key, value) in self.terminal_env_defaults.iter().chain(env_vars) {
+                parts.push(format!("{key}={}", flotilla_protocol::arg::shell_quote(value)));
             }
             parts.push(command.to_string());
             parts.join(" ")
         };
-
-        run!(
-            self.runner,
-            &self.binary,
-            &["create", "--json", session_name, "--cwd", &cwd.as_path().display().to_string(), "--cmd", &effective_cmd],
-            Path::new("/")
-        )?;
+        let cwd = cwd.as_path().display().to_string();
+        let mut args = vec!["create", "--json", session_name, "--cwd", &cwd, "--cmd", &effective_cmd];
+        let encoded_tags = tags.iter().map(|tag| format!("{}={}", tag.key, tag.value)).collect::<Vec<_>>();
+        for tag in &encoded_tags {
+            args.push("--tag");
+            args.push(tag);
+        }
+        run!(self.runner, &self.binary, &args, Path::new("/"))?;
         Ok(())
     }
 
@@ -156,8 +164,8 @@ mod tests {
     #[tokio::test]
     async fn list_sessions_parses_json() {
         let json = r#"[
-            {"id":"sess-1","cwd":"/repo","cmd":"bash","status":"Attached"},
-            {"id":"sess-2","cwd":"/other","cmd":null,"status":"Detached"}
+            {"id":"sess-1","cwd":"/repo","cmd":"bash","status":"Attached","screen_activity":"active"},
+            {"id":"sess-2","cwd":"/other","cmd":null,"status":"Detached","screen_activity":"stable"}
         ]"#;
         let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into())])), "cleat");
 
@@ -168,10 +176,12 @@ mod tests {
         assert_eq!(sessions[0].status, flotilla_protocol::TerminalStatus::Running);
         assert_eq!(sessions[0].command.as_deref(), Some("bash"));
         assert_eq!(sessions[0].working_directory.as_ref().map(|p| p.as_path()), Some(Path::new("/repo")));
+        assert_eq!(sessions[0].screen_activity, Some(ScreenActivity::Active));
         assert_eq!(sessions[1].session_name, "sess-2");
         assert_eq!(sessions[1].status, flotilla_protocol::TerminalStatus::Disconnected);
         assert!(sessions[1].command.is_none());
         assert_eq!(sessions[1].working_directory.as_ref().map(|p| p.as_path()), Some(Path::new("/other")));
+        assert_eq!(sessions[1].screen_activity, Some(ScreenActivity::Stable));
     }
 
     #[tokio::test]
@@ -183,7 +193,7 @@ mod tests {
         ]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
-        pool.ensure_session("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("ensure session");
+        pool.ensure_session("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[]).await.expect("ensure session");
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
@@ -201,7 +211,7 @@ mod tests {
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
 
-        pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env).await.expect("ensure session");
+        pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 2);
@@ -214,6 +224,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_session_tags_convoy_and_vessel() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+
+        pool.ensure_session("terminal-demo-coder", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[
+            TerminalSessionTag::new("convoy", "demo"),
+            TerminalSessionTag::new("vessel", "demo-work"),
+        ])
+        .await
+        .expect("ensure tagged session");
+
+        assert_eq!(runner.calls()[1].1, vec![
+            "create",
+            "--json",
+            "terminal-demo-coder",
+            "--cwd",
+            "/repo",
+            "--cmd",
+            "codex",
+            "--tag",
+            "convoy=demo",
+            "--tag",
+            "vessel=demo-work",
+        ]);
+    }
+
+    #[tokio::test]
     async fn ensure_session_skips_if_session_exists() {
         let list_json = r#"[{"id":"my-session","cwd":"/repo","cmd":"claude","status":"Detached"}]"#;
         let runner = Arc::new(MockRunner::new(vec![
@@ -222,7 +259,7 @@ mod tests {
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
 
-        pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env).await.expect("ensure session");
+        pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
 
         let calls = runner.calls();
         assert_eq!(calls.len(), 1, "should only call list, not create: {calls:?}");
@@ -356,7 +393,7 @@ mod tests {
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat").with_terminal_env_defaults(env_defaults);
         let caller_env = vec![("FOO".to_string(), "bar".to_string())];
 
-        pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env).await.expect("ensure session");
+        pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env, &[]).await.expect("ensure session");
 
         let calls = runner.calls();
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");

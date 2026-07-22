@@ -17,9 +17,9 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation,
-    Project, Repository, Resource, ResourceError, ResourceList, ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver,
-    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
-    REPO_LABEL, VESSEL_LABEL,
+    Project, Repository, Resource, ResourceError, ResourceList, ResourceObject, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TypedResolver, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState,
+    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::broadcast;
@@ -856,6 +856,7 @@ impl Aggregator {
             sessions.into_iter().map(|session| ((session.metadata.namespace.clone(), session.metadata.name.clone()), session)).collect();
         self.sessions_by_source.insert(source, replacement);
         self.rebuild_independents_projection().await;
+        self.rebuild_local_projection().await;
     }
 
     async fn apply_session_event_from(&mut self, source: LocalSource, event: WatchEvent<TerminalSession>) {
@@ -874,6 +875,7 @@ impl Aggregator {
             }
         }
         self.rebuild_independents_projection().await;
+        self.rebuild_local_projection().await;
     }
 
     async fn apply_environment_event(&mut self, _event: WatchEvent<Environment>) {
@@ -1126,7 +1128,7 @@ impl Aggregator {
         let change_request = self.convoy_change_requests.get(&resource).cloned();
         let status = convoy.status.as_ref();
         let phase = status.map(|status| status.phase).unwrap_or_default();
-        let vessels = status
+        let vessels: Vec<VesselRow> = status
             .and_then(|status| status.workflow_snapshot.as_ref())
             .map(|snapshot| {
                 snapshot
@@ -1138,6 +1140,7 @@ impl Aggregator {
                     .collect()
             })
             .unwrap_or_default();
+        let needs_attention = vessels.iter().any(|vessel| vessel.needs_attention);
         ConvoyRow::builder()
             .resource(resource)
             .name(name)
@@ -1164,6 +1167,7 @@ impl Aggregator {
             )
             .maybe_change_request(change_request)
             .vessels(vessels)
+            .needs_attention(needs_attention)
             .build()
     }
 
@@ -1190,6 +1194,20 @@ impl Aggregator {
                 }
             })
             .collect();
+        let work_unsettled = !state.is_some_and(|state| state.phase.is_terminal());
+        let now = chrono::Utc::now();
+        let needs_attention = self.terminal_sessions.values().any(|session| {
+            session.metadata.namespace == convoy_ref.namespace
+                && session.metadata.labels.get(CONVOY_LABEL) == Some(&convoy_ref.name)
+                && session.metadata.labels.get(VESSEL_LABEL) == Some(&definition.name)
+                && session.status.as_ref().is_some_and(|status| {
+                    status.phase == TerminalSessionPhase::Running
+                        && status
+                            .attention
+                            .as_ref()
+                            .is_some_and(|attention| !attention.is_stale_at(now) && attention_needs_human(attention.state, work_unsettled))
+                })
+        });
         VesselRow::builder()
             .resource(convoy_ref.subresource(format!("vessels/{}", definition.name)))
             .name(&definition.name)
@@ -1205,8 +1223,13 @@ impl Aggregator {
             .host(self.local_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
+            .needs_attention(needs_attention)
             .build()
     }
+}
+
+fn attention_needs_human(state: TerminalAttentionState, work_unsettled: bool) -> bool {
+    state == TerminalAttentionState::NeedsInput || (state == TerminalAttentionState::Idle && work_unsettled)
 }
 
 fn change_request_fingerprint(providers: &ProviderData) -> ChangeRequestFingerprint {
@@ -1294,13 +1317,49 @@ mod tests {
     use flotilla_protocol::result_set::{ResultSet, ResultSetState};
     use flotilla_resources::{
         ConvoyRepositorySpec, ConvoySpec, CrewSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase,
-        PresentationSpec, PresentationStatus, ResourceBackend, Stance, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
-        VesselRequirement, WorkflowSnapshot,
+        PresentationSpec, PresentationStatus, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
+        TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
 
     use super::*;
+
+    #[test]
+    fn needs_attention_is_needs_input_or_idle_with_unsettled_work() {
+        assert!(attention_needs_human(TerminalAttentionState::NeedsInput, false));
+        assert!(attention_needs_human(TerminalAttentionState::Idle, true));
+        assert!(!attention_needs_human(TerminalAttentionState::Idle, false));
+        assert!(!attention_needs_human(TerminalAttentionState::Working, true));
+        assert!(!attention_needs_human(TerminalAttentionState::Unobservable, true));
+    }
+
+    #[tokio::test]
+    async fn attention_projection_is_namespace_scoped_and_tracks_idle_unsettled_sessions() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        session.status.as_mut().expect("running status").attention =
+            Some(TerminalAttention { state: TerminalAttentionState::Idle, as_of: Utc::now(), source: TerminalAttentionSource::Screen });
+
+        let mut foreign_session = session.clone();
+        foreign_session.metadata.namespace = "other".to_string();
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(foreign_session)).await;
+        let result_set = state.result_set().await;
+        assert!(!result_set.rows.as_convoys().expect("convoy rows")[0].needs_attention);
+
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session)).await;
+
+        let result_set = state.result_set().await;
+        let convoy = result_set.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
+        assert!(convoy.vessels.first().expect("vessel row").needs_attention);
+        assert!(convoy.needs_attention);
+    }
 
     struct ScriptedSource<T: Resource> {
         lists: Mutex<VecDeque<ResourceList<T>>>,

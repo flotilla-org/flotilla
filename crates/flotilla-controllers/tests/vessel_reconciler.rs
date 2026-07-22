@@ -1836,6 +1836,7 @@ async fn create_running_terminal(
             crew: None,
             launch_command: Some(command.to_string()),
             delivered_message_id: None,
+            attention: None,
         })
         .await
         .expect("terminal status update should succeed");

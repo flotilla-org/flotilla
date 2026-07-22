@@ -93,7 +93,13 @@ impl ShpoolTerminalPool {
             // V2 names carry discovery metadata and are decoded by the terminal
             // manager. Legacy names retain their historical validation here.
             if name.starts_with(MANAGED_SESSION_PREFIX) {
-                terminals.push(TerminalSession { session_name: name.to_string(), status, command: None, working_directory: None });
+                terminals.push(TerminalSession {
+                    session_name: name.to_string(),
+                    status,
+                    command: None,
+                    working_directory: None,
+                    screen_activity: None,
+                });
                 continue;
             }
 
@@ -117,6 +123,7 @@ impl ShpoolTerminalPool {
                 status,
                 command: None,           // shpool doesn't report the original command
                 working_directory: None, // shpool doesn't report cwd
+                screen_activity: None,
             });
         }
 
@@ -150,6 +157,7 @@ impl TerminalPool for ShpoolTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
+        _tags: &[super::TerminalSessionTag],
     ) -> Result<(), String> {
         // If the session already exists, leave it alone — don't disrupt a
         // live attach by re-running attach+detach. We can't use list_sessions()
