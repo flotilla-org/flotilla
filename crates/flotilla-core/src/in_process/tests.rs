@@ -39,7 +39,7 @@ use crate::{
         discovery::{
             test_support::{
                 fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner,
-                FakeDiscoveryProviders, FakeTerminalPool,
+                FakeDiscoveryProviders, FakeTerminalPool, MergedPrProcessRunner,
             },
             EnvironmentAssertion, EnvironmentBag,
         },
@@ -3450,6 +3450,7 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
     let runner = DiscoveryMockRunner::builder()
         .on_run("git", &["--version"], Ok("git version 2.43.0".into()))
         .on_run("git", &["status", "--porcelain"], Ok(String::new()))
+        .on_run("find", &[".", "-path", "./.git", "-prune", "-o", "-mindepth", "2", "-name", ".git", "-print", "-prune"], Ok(String::new()))
         .on_run("git", &["rev-parse", "--abbrev-ref", "@{upstream}"], Ok("origin/main\n".into()))
         .on_run("git", &["rev-list", "--count", "origin/main..HEAD"], Ok("1\n".into()))
         .on_run(
@@ -3530,6 +3531,95 @@ async fn convoy_delete_refuses_completed_convoy_with_unpushed_checkout_until_for
 
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert!(matches!(convoys.get("completed-convoy").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+}
+
+#[tokio::test]
+async fn convoy_delete_refuses_ignored_embedded_repository_with_local_commits() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+
+    let remote = temp.path().join("remote.git");
+    let remote_status = std::process::Command::new("git")
+        .args(["init", "--bare", "--initial-branch=main"])
+        .arg(&remote)
+        .status()
+        .expect("initialize bare remote");
+    assert!(remote_status.success());
+
+    let checkout = temp.path().join("checkout");
+    init_git_repo_with_remote(&checkout, remote.to_str().expect("utf-8 remote path"));
+    std::fs::write(checkout.join(".gitignore"), "embedded/\n").expect("ignore embedded repository");
+    for args in [["add", ".gitignore"].as_slice(), ["commit", "-m", "ignore scratch repository"].as_slice()] {
+        let status = std::process::Command::new("git").arg("-C").arg(&checkout).args(args).status().expect("prepare outer checkout");
+        assert!(status.success());
+    }
+    let push_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&checkout)
+        .args(["push", "--set-upstream", "origin", "main"])
+        .status()
+        .expect("push outer checkout");
+    assert!(push_status.success());
+
+    let embedded = checkout.join("embedded");
+    crate::providers::discovery::test_support::init_git_repo(&embedded);
+    let branch_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&embedded)
+        .args(["switch", "-c", "feat/local"])
+        .status()
+        .expect("create embedded repository branch");
+    assert!(branch_status.success());
+    for args in [
+        ["switch", "-c", "hidden/local"].as_slice(),
+        ["commit", "--allow-empty", "-m", "hidden local work"].as_slice(),
+        ["switch", "feat/local"].as_slice(),
+    ] {
+        let status =
+            std::process::Command::new("git").arg("-C").arg(&embedded).args(args).status().expect("prepare local-only embedded refs");
+        assert!(status.success());
+    }
+
+    let mut discovery = git_process_discovery(false);
+    discovery.runner = Arc::new(MergedPrProcessRunner::new(884));
+    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), discovery, HostName::local()).await;
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    convoys
+        .create(&empty_input_meta("embedded-repo-convoy"), &ConvoySpec::builder().workflow_ref("review-and-fix".to_string()).build())
+        .await
+        .expect("convoy create should succeed");
+    create_ready_observed_checkout_for_convoy(
+        &daemon,
+        "flotilla",
+        "embedded-repo-convoy",
+        "checkout-embedded-repo",
+        checkout.to_str().expect("utf-8 checkout path"),
+        "main",
+    )
+    .await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyDelete { namespace: None, name: "embedded-repo-convoy".to_string(), force: false },
+        })
+        .await
+        .expect("execute should return a command id");
+
+    match wait_for_command_result(&mut events, command_id).await {
+        CommandValue::Error { message } => {
+            assert!(message.contains("embedded repository embedded/"), "refusal should name embedded repository: {message}");
+            assert!(message.contains("branch feat/local"), "refusal should name embedded branch: {message}");
+            assert!(message.contains("2 local commits"), "refusal should count local commits across refs: {message}");
+        }
+        other => panic!("delete should refuse an embedded repository, got {other:?}"),
+    }
+    convoys.get("embedded-repo-convoy").await.expect("refused convoy should remain");
 }
 
 #[tokio::test]

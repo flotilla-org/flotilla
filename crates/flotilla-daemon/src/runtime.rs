@@ -1139,7 +1139,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let runner = self.local_runner()?;
         match removal {
             CheckoutRemoval::FreshClone { target_path } => {
-                runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
+                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
@@ -1156,6 +1156,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 if !remove.success && !remove.stderr.contains("is not a working tree") {
                     return Err(remove.stderr);
                 }
+                remove_checkout_path(&*runner, target_path).await?;
                 remove_empty_checkout_parents(clone_path, target_path).await?;
 
                 let branch_ref = format!("refs/heads/{branch}");
@@ -1209,6 +1210,17 @@ fn bootstrap_branch_ref(branch: &str) -> String {
 
 async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
     runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Noop).await?;
+    Ok(())
+}
+
+async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> Result<(), String> {
+    runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+    for predicate in ["-e", "-L"] {
+        let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        if remaining.success {
+            return Err(format!("checkout cleanup reported success but path remains: {target_path}"));
+        }
+    }
     Ok(())
 }
 
@@ -1469,10 +1481,13 @@ mod tests {
         in_process::DEFAULT_PROVISIONING_NAMESPACE as NAMESPACE,
         providers::{
             discovery::{
-                test_support::{fake_discovery_with_provider_set, git_process_discovery, FakeDiscoveryProviders, FakeTerminalPool},
+                test_support::{
+                    fake_discovery_with_provider_set, git_process_discovery, FakeDiscoveryProviders, FakeTerminalPool,
+                    MergedPrProcessRunner,
+                },
                 EnvironmentAssertion, EnvironmentBag,
             },
-            ProcessCommandRunner,
+            CommandRunner, ProcessCommandRunner,
         },
     };
     use flotilla_protocol::{Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent};
@@ -1485,6 +1500,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{test_git_repo::TestGitRepo, *};
+
+    #[derive(Clone, Copy)]
+    enum CompletionAction {
+        Retain,
+        Delete,
+    }
 
     #[tokio::test]
     async fn checkout_runtime_creates_convoy_branch_from_snapshotted_base() {
@@ -1550,6 +1571,27 @@ mod tests {
             .status()
             .expect("git should inspect the branch");
         assert!(!branch.success(), "zero-commit convoy branch should be deleted");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_removes_unregistered_worktree_path_with_embedded_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
+        TestGitRepo::init(target.join("embedded")).with_initial_commit();
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/cleanup".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+
+        assert_eq!(
+            runtime.remove_checkout(&removal).await.expect("stale worktree path should be removed"),
+            CheckoutRemovalOutcome::Removed
+        );
+
+        assert!(!target.exists(), "successful cleanup must not strand an embedded repository");
     }
 
     #[tokio::test]
@@ -1979,10 +2021,21 @@ mod tests {
     }
 
     async fn daemon_with_backend(tracked_repos: Vec<PathBuf>, config: Arc<ConfigStore>, backend: ResourceBackend) -> Arc<InProcessDaemon> {
+        daemon_with_backend_and_runner(tracked_repos, config, backend, Arc::new(ProcessCommandRunner)).await
+    }
+
+    async fn daemon_with_backend_and_runner(
+        tracked_repos: Vec<PathBuf>,
+        config: Arc<ConfigStore>,
+        backend: ResourceBackend,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Arc<InProcessDaemon> {
+        let mut discovery = git_process_discovery(false);
+        discovery.runner = runner;
         let daemon = InProcessDaemon::new_with_resource_backend(
             tracked_repos,
             config,
-            git_process_discovery(false),
+            discovery,
             flotilla_protocol::HostName::new("test-host"),
             backend,
         )
@@ -2051,6 +2104,7 @@ mod tests {
         config: Arc<ConfigStore>,
         repo_default_dir: PathBuf,
         repo: PathBuf,
+        completion_action: CompletionAction,
     ) {
         std::fs::create_dir_all(&repo_default_dir).expect("repo default dir");
         let host_id = daemon.local_host_id().expect("local host id").to_string();
@@ -2187,6 +2241,47 @@ mod tests {
             }
         })
         .await;
+
+        if matches!(completion_action, CompletionAction::Delete) {
+            let checkouts = backend.clone().using::<ResourceCheckout>(NAMESPACE);
+            let checkout = checkouts
+                .list()
+                .await
+                .expect("checkout list should succeed")
+                .items
+                .into_iter()
+                .find(|checkout| checkout.metadata.labels.get(flotilla_resources::CONVOY_LABEL).is_some_and(|value| value == "convoy-a"))
+                .expect("convoy checkout should exist");
+            let checkout_path = checkout.status.expect("checkout should be ready").path.expect("checkout should have a path");
+            for args in [
+                ["update-ref", "refs/remotes/origin/main", "HEAD"].as_slice(),
+                ["branch", "--set-upstream-to", "origin/main", "main"].as_slice(),
+            ] {
+                let status = ProcessCommand::new("git").arg("-C").arg(&checkout_path).args(args).status().expect("prepare pushed state");
+                assert!(status.success());
+            }
+
+            let mut events = daemon.subscribe();
+            let command_id = daemon
+                .execute(Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::ConvoyDelete { namespace: None, name: "convoy-a".to_string(), force: false },
+                })
+                .await
+                .expect("convoy delete should start");
+            assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+
+            wait_until(|| {
+                let convoys = convoys.clone();
+                let checkout_path = checkout_path.clone();
+                async move {
+                    matches!(convoys.get("convoy-a").await, Err(ResourceError::NotFound { .. })) && !Path::new(&checkout_path).exists()
+                }
+            })
+            .await;
+        }
 
         for handle in controller_handles {
             handle.abort();
@@ -2402,7 +2497,7 @@ mod tests {
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = in_memory_daemon(vec![repo.clone()], Arc::clone(&config)).await;
-        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo).await;
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
     }
 
     #[tokio::test]
@@ -2415,7 +2510,27 @@ mod tests {
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         config.save_repo(&ExecutionEnvironmentPath::new(&repo));
         let daemon = sqlite_daemon(vec![repo.clone()], Arc::clone(&config)).await;
-        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo).await;
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Retain).await;
+    }
+
+    #[tokio::test]
+    async fn passing_teardown_gate_removes_the_managed_worktree_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_default_dir = temp.path().join("flotilla-repos");
+        let git_repo =
+            TestGitRepo::init(temp.path().join("repo")).with_initial_commit().with_origin("git@github.com:flotilla-org/flotilla.git");
+        let repo = git_repo.path().to_path_buf();
+        let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
+        config.save_repo(&ExecutionEnvironmentPath::new(&repo));
+        let daemon = daemon_with_backend_and_runner(
+            vec![repo.clone()],
+            Arc::clone(&config),
+            ResourceBackend::InMemory(Default::default()),
+            Arc::new(MergedPrProcessRunner::new(884)),
+        )
+        .await;
+
+        run_stage4a_flow_reaches_running_and_completes_convoy(daemon, config, repo_default_dir, repo, CompletionAction::Delete).await;
     }
 
     #[tokio::test]

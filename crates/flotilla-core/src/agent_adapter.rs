@@ -56,7 +56,9 @@ pub fn build_crew_brief(
     for member in members {
         content.push_str(&format!("- `{}`: {}\n", member.role, member.state));
     }
-    content.push_str("\nRun `flotilla crew list` for current crew state.\n");
+    content.push_str(
+        "\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\n",
+    );
     for member in members.iter().filter(|member| member.is_agent && member.role != role) {
         content.push_str(&format!("Hand off to {} with `flotilla crew {} handoff --message '...'`.\n", member.role, member.role));
     }
@@ -349,6 +351,7 @@ mod tests {
         assert!(brief.content.contains(
             "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
         ));
+        assert!(brief.content.contains("Clone scratch repositories outside the vessel checkout"));
     }
 
     fn brief_for(assignment: CrewAssignment<'_>) -> String {
