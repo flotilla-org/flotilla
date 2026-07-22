@@ -928,12 +928,12 @@ mod tests {
         materializer.refresh(&query);
 
         let DaemonEvent::ResultDelta(delta) = next_event(&mut events).await else { panic!("refresh must emit a delta") };
-        assert_eq!(delta.changes.removed_issues().expect("boundary eviction"), &[IssueRef { source, id: "ISSUE-49".into() }]);
+        assert_eq!(delta.changes.removed_issues().expect("boundary eviction"), &[IssueRef { source, id: "ISSUE-00".into() }]);
         let result = state.result_set_for(&query).await.expect("bounded window");
         let rows = result.rows.as_issues().expect("issue rows");
         assert_eq!(rows.len(), PAGE_SIZE);
         assert_eq!(rows[0].reference.id, "NEWEST");
-        assert!(rows.iter().all(|row| row.reference.id != "ISSUE-49"));
+        assert!(rows.iter().all(|row| row.reference.id != "ISSUE-00"));
     }
 
     #[tokio::test]
