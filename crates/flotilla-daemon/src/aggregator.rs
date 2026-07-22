@@ -882,6 +882,7 @@ impl Aggregator {
 
     async fn apply_environment_event(&mut self, _event: WatchEvent<Environment>) {
         self.rebuild_independents_projection().await;
+        self.rebuild_local_projection().await;
     }
 
     async fn apply_project_event(&mut self, event: WatchEvent<Project>) {
@@ -1331,9 +1332,9 @@ mod tests {
     use chrono::Utc;
     use flotilla_protocol::result_set::{ResultSet, ResultSetState};
     use flotilla_resources::{
-        ConvoyRepositorySpec, ConvoySpec, CrewSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase,
-        PresentationSpec, PresentationStatus, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalSessionSource,
-        TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
+        ConvoyRepositorySpec, ConvoySpec, CrewSpec, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta,
+        PlacementStatus, PresentationPhase, PresentationSpec, PresentationStatus, ResourceBackend, Stance, TerminalAttention,
+        TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -1411,6 +1412,10 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct FlippingAttachResolver {
+        calls: AtomicUsize,
+    }
+
     struct ScriptedChangeRequestResolver {
         results: Mutex<VecDeque<Result<Option<flotilla_protocol::ConvoyChangeRequest>, String>>>,
         branches: Mutex<Vec<String>>,
@@ -1436,6 +1441,14 @@ mod tests {
         async fn resolvable_attach_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(references.iter().cloned().collect())
+        }
+    }
+
+    #[async_trait]
+    impl AttachCapabilityResolver for FlippingAttachResolver {
+        async fn resolvable_attach_references(&self, references: &[String]) -> Result<HashSet<String>, String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 { HashSet::new() } else { references.iter().cloned().collect() })
         }
     }
 
@@ -1603,6 +1616,18 @@ mod tests {
             .expect("set scripted terminal session status")
     }
 
+    async fn environment_object(name: &str) -> ResourceObject<Environment> {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .using::<Environment>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
+                docker: None,
+            })
+            .await
+            .expect("create scripted environment")
+    }
+
     #[tokio::test]
     async fn independents_projection_resolves_attach_capabilities_once_per_rebuild() {
         let state = AggregatorProjectionState::new();
@@ -1619,6 +1644,28 @@ mod tests {
         let rows = result_set.rows.as_independents().expect("session rows");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.attach.as_deref() == Some(row.name.as_str())));
+    }
+
+    #[tokio::test]
+    async fn environment_event_refreshes_convoy_vessel_materialization_capability() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let resolver = Arc::new(FlippingAttachResolver { calls: AtomicUsize::new(0) });
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx).with_attach_resolver(resolver);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("convoy-a").await)).await;
+
+        let mut session = session_object("terminal-convoy-a-implement").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        aggregator.replace_session_source(LocalSource::Durable, vec![session]).await;
+
+        let before = state.result_set().await;
+        assert_eq!(before.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize, None);
+
+        aggregator.apply_environment_event(WatchEvent::Modified(environment_object("local").await)).await;
+
+        let after = state.result_set().await;
+        assert_eq!(after.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize.as_deref(), Some("terminal-convoy-a-implement"));
     }
 
     #[tokio::test]
