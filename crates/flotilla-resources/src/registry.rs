@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use futures::{stream::BoxStream, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    api_version, Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList,
+    api_version, Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList, ObjectMeta,
     OwnerReference, PlacementPolicy, Presentation, Project, Regard, Repository, Resource, ResourceBackend, ResourceError, ResourceList,
     ResourceObject, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
@@ -202,24 +203,38 @@ struct DynamicApplyMetadata {
     #[serde(default)]
     namespace: Option<String>,
     #[serde(default)]
-    labels: BTreeMap<String, String>,
+    labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
-    annotations: BTreeMap<String, String>,
+    annotations: Option<BTreeMap<String, String>>,
     #[serde(default, rename = "ownerReferences")]
-    owner_references: Vec<OwnerReference>,
+    owner_references: Option<Vec<OwnerReference>>,
     #[serde(default)]
-    finalizers: Vec<String>,
+    finalizers: Option<Vec<String>>,
+    #[serde(default, rename = "deletionTimestamp")]
+    deletion_timestamp: Option<Option<DateTime<Utc>>>,
 }
 
 impl DynamicApplyMetadata {
-    fn input_meta(&self) -> InputMeta {
-        InputMeta::builder()
-            .name(self.name.clone())
-            .labels(self.labels.clone())
-            .annotations(self.annotations.clone())
-            .owner_references(self.owner_references.clone())
-            .finalizers(self.finalizers.clone())
-            .build()
+    fn input_meta_for_create(&self) -> InputMeta {
+        InputMeta {
+            name: self.name.clone(),
+            labels: self.labels.clone().unwrap_or_default(),
+            annotations: self.annotations.clone().unwrap_or_default(),
+            owner_references: self.owner_references.clone().unwrap_or_default(),
+            finalizers: self.finalizers.clone().unwrap_or_default(),
+            deletion_timestamp: self.deletion_timestamp.unwrap_or(None),
+        }
+    }
+
+    fn input_meta_for_update(&self, existing: &ObjectMeta) -> InputMeta {
+        InputMeta {
+            name: self.name.clone(),
+            labels: self.labels.clone().unwrap_or_else(|| existing.labels.clone()),
+            annotations: self.annotations.clone().unwrap_or_else(|| existing.annotations.clone()),
+            owner_references: self.owner_references.clone().unwrap_or_else(|| existing.owner_references.clone()),
+            finalizers: self.finalizers.clone().unwrap_or_else(|| existing.finalizers.clone()),
+            deletion_timestamp: self.deletion_timestamp.unwrap_or(existing.deletion_timestamp),
+        }
     }
 }
 
@@ -272,10 +287,12 @@ async fn apply_typed<T: Resource>(
     let spec = serde_json::from_value::<T::Spec>(spec)
         .map_err(|error| ResourceError::decode(format!("decode {} spec: {error}", T::API_PATHS.kind)))?;
     let resolver = backend.using::<T>(namespace);
-    let meta = metadata.input_meta();
-    let object = match resolver.get(&meta.name).await {
-        Ok(existing) => resolver.update(&meta, &existing.metadata.resource_version, &spec).await?,
-        Err(ResourceError::NotFound { .. }) => resolver.create(&meta, &spec).await?,
+    let object = match resolver.get(&metadata.name).await {
+        Ok(existing) => {
+            let meta = metadata.input_meta_for_update(&existing.metadata);
+            resolver.update(&meta, &existing.metadata.resource_version, &spec).await?
+        }
+        Err(ResourceError::NotFound { .. }) => resolver.create(&metadata.input_meta_for_create(), &spec).await?,
         Err(error) => return Err(error),
     };
     Ok(DynamicResourceObject {
@@ -323,6 +340,8 @@ fn api_version_typed<T: Resource>() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use flotilla_protocol::ResourceRef;
 
     use super::*;
@@ -428,5 +447,66 @@ mod tests {
         assert_eq!(applied.kind, "Demand");
         assert_eq!(applied.value["metadata"]["name"], "demo-review");
         assert_eq!(backend.using::<Demand>("flotilla").get("demo-review").await.expect("stored demand").spec.kind, DemandKind::Review);
+    }
+
+    #[tokio::test]
+    async fn apply_resource_document_reapply_preserves_existing_metadata_when_omitted() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<Demand>("flotilla");
+        let owner_reference = OwnerReference {
+            api_version: "flotilla.work/v1".to_string(),
+            kind: "Vessel".to_string(),
+            name: "demo-implement".to_string(),
+            controller: true,
+        };
+        resolver
+            .create(
+                &InputMeta::builder()
+                    .name("demo-review".to_string())
+                    .labels(BTreeMap::from([("controller".to_string(), "attention".to_string())]))
+                    .owner_references(vec![owner_reference.clone()])
+                    .finalizers(vec!["attention.flotilla.work/finalizer".to_string()])
+                    .build(),
+                &DemandSpec::builder()
+                    .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
+                    .kind(DemandKind::Permission)
+                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef("principal/default".to_string()) })
+                    .build(),
+            )
+            .await
+            .expect("create demand with metadata");
+
+        apply_resource_document(
+            &backend,
+            "flotilla",
+            json!({
+                "apiVersion": "flotilla.work/v1",
+                "kind": "Demand",
+                "metadata": {
+                    "name": "demo-review"
+                },
+                "spec": {
+                    "originating_work_ref": {
+                        "api_version": "flotilla.work/v1",
+                        "kind": "Vessel",
+                        "namespace": "flotilla",
+                        "name": "demo-implement"
+                    },
+                    "kind": "review",
+                    "addressee": {
+                        "kind": "principal",
+                        "principal_ref": "principal/default"
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("reapply demand document");
+
+        let updated = resolver.get("demo-review").await.expect("updated demand");
+        assert_eq!(updated.spec.kind, DemandKind::Review);
+        assert_eq!(updated.metadata.owner_references, vec![owner_reference]);
+        assert_eq!(updated.metadata.labels.get("controller").map(String::as_str), Some("attention"));
+        assert_eq!(updated.metadata.finalizers, vec!["attention.flotilla.work/finalizer"]);
     }
 }
