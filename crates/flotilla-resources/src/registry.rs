@@ -381,7 +381,7 @@ mod tests {
             .create(
                 &InputMeta::builder().name("principal-default-convoy-demo".to_string()).build(),
                 &RegardSpec::builder()
-                    .principal_ref(PrincipalRef("principal/default".to_string()))
+                    .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
                     .target(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"))
                     .source(RegardSource::Expressed)
                     .expiry(RegardExpiryPolicy::Pin)
@@ -396,7 +396,7 @@ mod tests {
                 &DemandSpec::builder()
                     .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
                     .kind(DemandKind::Permission)
-                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef("principal/default".to_string()) })
+                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
                     .build(),
             )
             .await
@@ -433,7 +433,7 @@ mod tests {
                     "kind": "review",
                     "addressee": {
                         "kind": "principal",
-                        "principal_ref": "principal/default"
+                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
                     }
                 }
             }),
@@ -467,7 +467,7 @@ mod tests {
                 &DemandSpec::builder()
                     .originating_work_ref(ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement"))
                     .kind(DemandKind::Permission)
-                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef("principal/default".to_string()) })
+                    .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
                     .build(),
             )
             .await
@@ -490,7 +490,7 @@ mod tests {
                     "kind": "review",
                     "addressee": {
                         "kind": "principal",
-                        "principal_ref": "principal/default"
+                        "principal_ref": { "namespace": "flotilla", "name": "implicit" }
                     }
                 }
             })

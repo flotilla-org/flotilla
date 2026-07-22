@@ -514,7 +514,7 @@ mod tests {
                 .host(HostName::new("local"))
                 .build(),
         );
-        let principal = PrincipalRef("flotilla/implicit".to_string());
+        let principal = PrincipalRef::implicit_for_namespace("flotilla");
 
         let (nodes, _) = project_awareness(AwarenessInput {
             scope: Some(QueryScope::new("flotilla", "platform")),

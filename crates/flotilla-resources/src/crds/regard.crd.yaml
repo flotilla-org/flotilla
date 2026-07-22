@@ -18,7 +18,7 @@ spec:
       additionalPrinterColumns:
         - name: Principal
           type: string
-          jsonPath: .spec.principal_ref
+          jsonPath: .spec.principal_ref.name
         - name: Target
           type: string
           jsonPath: .spec.target.name

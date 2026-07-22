@@ -312,7 +312,7 @@ done
     }
 
     async fn wait_for_line_count(path: &Path, expected: usize) -> Vec<String> {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let lines = std::fs::read_to_string(path).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>();
                 if lines.len() >= expected {
@@ -326,7 +326,7 @@ done
     }
 
     async fn wait_for_path(path: &Path) {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while !path.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

@@ -51,8 +51,13 @@ impl<'a> RequestDispatcher<'a> {
                     }
                 } else {
                     // Non-query commands: existing dispatch path
-                    match self.remote_command_router.dispatch_execute(command).await {
-                        Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
+                    match self.daemon.principal_for_surface(self.session_id) {
+                        Ok(principal_ref) => {
+                            match self.remote_command_router.dispatch_execute_for_principal(command, principal_ref).await {
+                                Ok(command_id) => Message::ok_response(id, Response::Execute { command_id }),
+                                Err(e) => Message::error_response(id, e),
+                            }
+                        }
                         Err(e) => Message::error_response(id, e),
                     }
                 }
@@ -131,6 +136,11 @@ impl<'a> RequestDispatcher<'a> {
                     }
                 }
             }
+
+            Request::ObserveFocus { targets } => match self.daemon.observe_surface_focus(self.session_id, targets).await {
+                Ok(()) => Message::ok_response(id, Response::ObserveFocus),
+                Err(error) => Message::error_response(id, error),
+            },
 
             Request::GetStatus => match self.daemon.get_status().await {
                 Ok(status) => Message::ok_response(id, Response::GetStatus(status)),

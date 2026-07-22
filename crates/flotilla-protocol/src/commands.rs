@@ -494,6 +494,19 @@ pub struct AttachBinding {
     pub role: Option<String>,
 }
 
+impl AttachBinding {
+    pub fn resource_ref(&self) -> Option<crate::ResourceRef> {
+        match (&self.convoy, &self.vessel, &self.session) {
+            (Some(convoy), Some(vessel), _) => Some(
+                crate::ResourceRef::new("flotilla.work/v1", "Convoy", &self.namespace, convoy).subresource(format!("vessels/{vessel}")),
+            ),
+            (Some(convoy), None, _) => Some(crate::ResourceRef::new("flotilla.work/v1", "Convoy", &self.namespace, convoy)),
+            (None, _, Some(session)) => Some(crate::ResourceRef::new("flotilla.work/v1", "TerminalSession", &self.namespace, session)),
+            (None, _, None) => None,
+        }
+    }
+}
+
 /// Result returned from command execution, or inter-step data passed between steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

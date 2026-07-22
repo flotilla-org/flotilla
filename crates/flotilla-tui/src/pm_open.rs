@@ -18,7 +18,7 @@ use flotilla_manifest::{
     projection::{convoy_group_path, project_segment, vessel_factory_id, vessel_group_path},
     stamp::WorkspaceStamp,
 };
-use flotilla_protocol::{arg::shell_quote, HostName, RepoKey};
+use flotilla_protocol::{arg::shell_quote, HostName, RepoKey, ResourceRef};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenInPmTarget {
@@ -31,6 +31,13 @@ pub struct OpenInPmTarget {
     pub repo_hint: Option<RepoKey>,
     pub workspace_ref: Option<String>,
     pub materialize_ref: Option<String>,
+}
+
+impl OpenInPmTarget {
+    pub fn resource_ref(&self) -> ResourceRef {
+        let convoy = ResourceRef::new("flotilla.work/v1", "Convoy", &self.namespace, &self.convoy);
+        self.vessel.as_ref().map_or_else(|| convoy.clone(), |vessel| convoy.subresource(format!("vessels/{vessel}")))
+    }
 }
 
 #[async_trait]

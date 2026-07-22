@@ -138,6 +138,35 @@ pub enum ConnectionRole {
     Client,
     Peer,
 }
+
+/// Whether a connected presentation surface represents a person's active
+/// attention or is only an overview/projection consumer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceCharacter {
+    #[default]
+    Focal,
+    Ambient,
+}
+
+/// Attention identity declared by a client surface when it connects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceDeclaration {
+    pub principal_ref: PrincipalRef,
+    #[serde(default)]
+    pub character: SurfaceCharacter,
+}
+
+impl SurfaceDeclaration {
+    pub fn focal_for_namespace(namespace: impl Into<String>) -> Self {
+        Self { principal_ref: PrincipalRef::implicit_for_namespace(namespace), character: SurfaceCharacter::Focal }
+    }
+
+    pub fn ambient_for_namespace(namespace: impl Into<String>) -> Self {
+        Self { principal_ref: PrincipalRef::implicit_for_namespace(namespace), character: SurfaceCharacter::Ambient }
+    }
+}
+
 pub use snapshot::{
     CategoryLabels, CheckoutRef, ProviderError, RepoInfo, RepoKey, RepoLabels, RepoSnapshot, WorkItem, WorkItemIdentity, WorkItemKind,
 };
@@ -145,7 +174,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.
@@ -216,6 +245,10 @@ pub enum Request {
     FetchMore {
         query: QueryId,
     },
+    /// Replace this connection's current set of focused resource targets.
+    ObserveFocus {
+        targets: Vec<ResourceRef>,
+    },
     GetStatus,
     GetTopology,
     AgentHook {
@@ -244,6 +277,7 @@ pub enum Response {
     /// per query whose cursor was absent or stale.
     SubscribeQueries(Vec<DaemonEvent>),
     FetchMore,
+    ObserveFocus,
     GetStatus(StatusResponse),
     GetTopology(TopologyResponse),
     AgentHook,
@@ -280,6 +314,8 @@ pub enum Message {
         session_id: uuid::Uuid,
         #[serde(default)]
         connection_role: Option<ConnectionRole>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        surface: Option<SurfaceDeclaration>,
     },
     #[serde(rename = "peer")]
     Peer(Box<PeerWireMessage>),

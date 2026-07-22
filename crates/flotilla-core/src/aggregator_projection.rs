@@ -489,7 +489,7 @@ mod tests {
             state
                 .replace_salience_facts(SalienceFacts {
                     regards: vec![RegardFact {
-                        principal: PrincipalRef("flotilla/operator".into()),
+                        principal: PrincipalRef { namespace: "flotilla".into(), name: "operator".into() },
                         target: ResourceRef::new("flotilla.work/v1", "Project", "flotilla", "roadmap"),
                         as_of: Utc::now(),
                     }],

@@ -25,7 +25,7 @@ use flotilla_manifest::{
     keys::REASSERT_INTERVAL_MS,
     pm::PmInstance,
     projection::{project_catalog, Catalog, CatalogInput},
-    recipe::{AttachOnlyRecipes, RecipeMint},
+    recipe::{FlotillaRecipes, RecipeMint},
     sink::PatchSink,
     wire::MetadataPatch,
 };
@@ -355,12 +355,18 @@ pub async fn run(
         .with_writer(std::io::stderr)
         .try_init();
     let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
-    let mint: Arc<dyn RecipeMint> = Arc::new(AttachOnlyRecipes::new(options.flotilla_bin.clone()));
+    let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()));
     run_reconnecting(
         || async {
-            crate::socket::connect_or_spawn(socket_path, config_dir, config_dir_override, socket_override)
-                .await
-                .map(|daemon| daemon as Arc<dyn DaemonHandle>)
+            crate::socket::connect_or_spawn_with_surface(
+                socket_path,
+                config_dir,
+                config_dir_override,
+                socket_override,
+                flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla"),
+            )
+            .await
+            .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },
         |daemon| run_connector(daemon, sink.clone(), mint.clone(), Duration::from_millis(REASSERT_INTERVAL_MS)),
         ReconnectBackoff::default(),

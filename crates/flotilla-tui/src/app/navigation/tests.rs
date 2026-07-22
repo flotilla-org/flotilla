@@ -1,7 +1,9 @@
-use flotilla_protocol::ViewAddress;
+use std::sync::Arc;
+
+use flotilla_protocol::{ResourceRef, ViewAddress};
 
 use crate::app::{
-    test_support::{activate_repo_tab, issue_item, set_active_table_items, stub_app_with_repos},
+    test_support::{activate_repo_tab, issue_item, set_active_table_items, stub_app_with_daemon, stub_app_with_repos, StubDaemon},
     App,
 };
 
@@ -18,6 +20,22 @@ fn active_address(app: &App) -> ViewAddress {
 
 fn convoys_address() -> ViewAddress {
     ViewAddress::Convoys { namespace: "flotilla".to_string() }
+}
+
+#[tokio::test]
+async fn opening_a_convoy_view_reports_it_as_the_focal_resource() {
+    let daemon = Arc::new(StubDaemon::new());
+    let daemon_handle = Arc::clone(&daemon) as Arc<dyn flotilla_core::daemon::DaemonHandle>;
+    let mut app = stub_app_with_daemon(daemon_handle, Vec::new());
+
+    app.open_view("convoy/flotilla/demo".parse().expect("convoy address"));
+    tokio::task::yield_now().await;
+
+    let observations = daemon.observations();
+    assert_eq!(
+        observations.last().map(|(_, targets)| targets.as_slice()),
+        Some(&[ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"),][..])
+    );
 }
 
 // Seeded tab layout for `stub_app_with_repos(n)` is

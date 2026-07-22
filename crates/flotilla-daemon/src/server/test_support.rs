@@ -4,7 +4,7 @@ use flotilla_client::SocketDaemon;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow, ResultSet, Rows},
-    FleetReplicaSnapshot, HostName, NodeInfo, ResourceRef,
+    FleetReplicaSnapshot, HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
 };
 use flotilla_resources::{api_version, Convoy, Resource};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
@@ -121,6 +121,24 @@ pub async fn spawn_in_memory_request_topology_stateful(
     leader: Arc<InProcessDaemon>,
     follower: Arc<InProcessDaemon>,
 ) -> Result<InMemoryRequestTopology, String> {
+    spawn_in_memory_request_topology_stateful_with_optional_surface(leader, follower, None).await
+}
+
+/// Stateful in-memory topology whose client declares an explicit attention
+/// character during the Hello handshake.
+pub async fn spawn_in_memory_request_topology_stateful_with_surface(
+    leader: Arc<InProcessDaemon>,
+    follower: Arc<InProcessDaemon>,
+    surface: SurfaceDeclaration,
+) -> Result<InMemoryRequestTopology, String> {
+    spawn_in_memory_request_topology_stateful_with_optional_surface(leader, follower, Some(surface)).await
+}
+
+async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
+    leader: Arc<InProcessDaemon>,
+    follower: Arc<InProcessDaemon>,
+    surface: Option<SurfaceDeclaration>,
+) -> Result<InMemoryRequestTopology, String> {
     let leader_host = leader.host_name().clone();
     let follower_host = follower.host_name().clone();
 
@@ -198,7 +216,10 @@ pub async fn spawn_in_memory_request_topology_stateful(
     });
 
     // Now the server is listening — the handshake can proceed.
-    let client = SocketDaemon::from_session_stateful(client_session).await?;
+    let client = match surface {
+        Some(surface) => SocketDaemon::from_session_stateful_with_surface(client_session, surface).await?,
+        None => SocketDaemon::from_session_stateful(client_session).await?,
+    };
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

@@ -26,6 +26,7 @@ pub mod provider_data;
 pub mod providers;
 pub mod query_registry;
 pub mod refresh;
+pub mod regard_lifecycle;
 pub(crate) mod repo_state;
 pub mod repository_inspection;
 pub mod resolve;

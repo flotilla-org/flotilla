@@ -26,11 +26,11 @@ use flotilla_protocol::{
     HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PrincipalRef,
     ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse,
     RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, ResourceJsonResponse,
-    ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    ResourceRef, ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SurfaceDeclaration, SystemInfo, ToolInventory,
+    TopologyResponse, TopologyRoute, ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    apply_resource_document, apply_status_patch as apply_resource_status_patch,
+    api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
     list_resource_kind, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
     Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -80,6 +80,7 @@ use crate::{
         ChannelLabel, CommandRunner,
     },
     refresh::RefreshSnapshot,
+    regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_REFRESH_SECONDS},
     repo_state::{RepoRootState, RepoState, SnapshotBuildContext},
     repository_inspection::{GitRepositoryInspector, RepositoryInspection, RepositoryInspector},
     step::{
@@ -1097,10 +1098,12 @@ async fn queue_pending_crew_message(
         .map_err(|err| err.to_string())
 }
 
+#[derive(bon::Builder)]
 struct ConvoyStartTask {
     command_id: u64,
     intent: flotilla_protocol::ConvoyStartIntent,
     key: ConvoyStartKey,
+    dispatching_principal_ref: PrincipalRef,
 }
 
 #[derive(bon::Builder)]
@@ -1268,6 +1271,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
+    regard_lifecycle: RegardLifecycle,
     observed_resource_backend: ResourceBackend,
     /// Serializes observed Checkout publication with repository removal so a
     /// refresh captured before untracking cannot recreate deleted resources.
@@ -1276,7 +1280,7 @@ pub struct InProcessDaemon {
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
-    provisioning_namespace: RwLock<String>,
+    provisioning_namespace: std::sync::RwLock<String>,
     fleet_replica_cache: RwLock<HashMap<HostName, FleetReplicaCacheEntry>>,
     fleet_replica_tx: broadcast::Sender<Vec<FleetReplicaSnapshot>>,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
@@ -1435,11 +1439,12 @@ impl InProcessDaemon {
             session_id: uuid::Uuid::new_v4(),
             agent_state_store,
             daemon_socket_path: RwLock::new(None),
+            regard_lifecycle: RegardLifecycle::with_system_clock(resource_backend.clone()),
             resource_backend,
             observed_resource_backend: ResourceBackend::InMemory(InMemoryBackend::observed()),
             observed_checkout_reconciliation: Mutex::new(()),
             aggregator_projection_state: AggregatorProjectionState::new(),
-            provisioning_namespace: RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
+            provisioning_namespace: std::sync::RwLock::new(DEFAULT_PROVISIONING_NAMESPACE.to_string()),
             fleet_replica_cache: RwLock::new(HashMap::new()),
             fleet_replica_tx,
             repository_inspector: RwLock::new(None),
@@ -1457,6 +1462,31 @@ impl InProcessDaemon {
                 match weak.upgrade() {
                     Some(d) => d.poll_snapshots().await,
                     None => break,
+                }
+            }
+        });
+
+        let weak = Arc::downgrade(&daemon);
+        tokio::spawn(async move {
+            let mut expiry = tokio::time::interval(Duration::from_secs(1));
+            expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut refresh = tokio::time::interval(Duration::from_secs(DEFAULT_REGARD_REFRESH_SECONDS));
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = expiry.tick() => {
+                        let Some(daemon) = weak.upgrade() else { break };
+                        let namespace = daemon.provisioning_namespace().await;
+                        if let Err(error) = daemon.regard_lifecycle.expire_due(&namespace).await {
+                            warn!(%error, "failed to expire due regards");
+                        }
+                    }
+                    _ = refresh.tick() => {
+                        let Some(daemon) = weak.upgrade() else { break };
+                        if let Err(error) = daemon.regard_lifecycle.refresh_focused().await {
+                            warn!(%error, "failed to refresh focused regards");
+                        }
+                    }
                 }
             }
         });
@@ -1672,11 +1702,11 @@ impl InProcessDaemon {
     /// (e.g. `ConvoyWorkForceComplete`). Called by the daemon runtime at startup with
     /// `RuntimeOptions::namespace`.
     pub async fn set_provisioning_namespace(&self, namespace: String) {
-        *self.provisioning_namespace.write().await = namespace;
+        *self.provisioning_namespace.write().expect("provisioning namespace lock poisoned") = namespace;
     }
 
     pub async fn provisioning_namespace(&self) -> String {
-        self.provisioning_namespace.read().await.clone()
+        self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
     }
 
     fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
@@ -1730,6 +1760,22 @@ impl InProcessDaemon {
 
     pub fn resource_backend(&self) -> ResourceBackend {
         self.resource_backend.clone()
+    }
+
+    pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
+        self.regard_lifecycle.connect_surface(surface_id, declaration);
+    }
+
+    pub fn principal_for_surface(&self, surface_id: uuid::Uuid) -> Result<Option<PrincipalRef>, String> {
+        self.regard_lifecycle.principal_for_surface(surface_id)
+    }
+
+    pub async fn disconnect_surface(&self, surface_id: uuid::Uuid) -> Result<(), String> {
+        self.regard_lifecycle.disconnect_surface(surface_id).await
+    }
+
+    pub async fn observe_surface_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
+        self.regard_lifecycle.observe_focus(surface_id, targets).await
     }
 
     pub fn observed_resource_backend(&self) -> ResourceBackend {
@@ -2008,13 +2054,16 @@ impl InProcessDaemon {
     pub async fn prepare_remote_convoy_start(
         &self,
         intent: &flotilla_protocol::ConvoyStartIntent,
+        dispatching_principal_ref: Option<&PrincipalRef>,
     ) -> Result<flotilla_protocol::PreparedConvoyStart, String> {
         let namespace = self.provisioning_namespace().await;
         let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
         if requested_namespace != namespace {
             return Err(format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"));
         }
-        let mut admission = self.prepare_convoy_admission(&namespace, intent).await?;
+        let fallback_principal = PrincipalRef::implicit_for_namespace(&namespace);
+        let mut admission =
+            self.prepare_convoy_admission(&namespace, intent, dispatching_principal_ref.unwrap_or(&fallback_principal)).await?;
         let workflow_value = serde_json::to_value(&admission.workflow).map_err(|error| error.to_string())?;
         let workflow_name = prepared_snapshot_name(&admission.name, "workflow", &workflow_value)?;
         admission.spec.workflow_ref.clone_from(&workflow_name);
@@ -3212,6 +3261,7 @@ impl InProcessDaemon {
         &self,
         namespace: &str,
         intent: &flotilla_protocol::ConvoyStartIntent,
+        dispatching_principal_ref: &PrincipalRef,
     ) -> Result<ConvoyAdmission, String> {
         let project_ref = required_admission_value(&intent.project_ref, "project")?;
         let project = self
@@ -3283,7 +3333,7 @@ impl InProcessDaemon {
         let placement_policy = placement.as_ref().map(|placement| placement.metadata.name.clone());
         let spec = ConvoySpec {
             workflow_ref,
-            dispatching_principal_ref: PrincipalRef::implicit_for_namespace(namespace),
+            dispatching_principal_ref: dispatching_principal_ref.clone(),
             inputs: intent.inputs.iter().map(|(key, value)| (key.clone(), InputValue::String(value.clone()))).collect(),
             placement_policy,
             repositories,
@@ -3301,15 +3351,39 @@ impl InProcessDaemon {
             .build())
     }
 
-    async fn admit_convoy_start(&self, namespace: &str, intent: &flotilla_protocol::ConvoyStartIntent) -> Result<String, String> {
-        let admission = self.prepare_convoy_admission(namespace, intent).await?;
-        self.resource_backend
-            .clone()
-            .using::<ResourceConvoy>(namespace)
-            .create(&InputMeta::builder().name(admission.name.clone()).build(), &admission.spec)
-            .await
-            .map_err(|error| error.to_string())?;
+    async fn admit_convoy_start(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        dispatching_principal_ref: &PrincipalRef,
+    ) -> Result<String, String> {
+        let admission = self.prepare_convoy_admission(namespace, intent, dispatching_principal_ref).await?;
+        self.create_convoy_with_regard(namespace, &admission.name, &admission.spec).await?;
         Ok(admission.name)
+    }
+
+    async fn create_convoy_with_regard(&self, namespace: &str, name: &str, spec: &ConvoySpec) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        convoys.create(&InputMeta::builder().name(name.to_string()).build(), spec).await.map_err(|error| error.to_string())?;
+        if let Err(error) = self.emit_implicit_convoy_regard(namespace, name, &spec.dispatching_principal_ref).await {
+            warn!(%error, %namespace, %name, "failed to emit convoy dispatch regard");
+        }
+        Ok(())
+    }
+
+    async fn emit_implicit_convoy_regard(&self, namespace: &str, name: &str, principal_ref: &PrincipalRef) -> Result<(), String> {
+        let target = ResourceRef::new(api_version(ResourceConvoy::API_PATHS), ResourceConvoy::API_PATHS.kind, namespace, name);
+        self.regard_lifecycle.emit_implicit(principal_ref, &target, "convoy-dispatch").await
+    }
+
+    async fn emit_attach_regard(&self, binding: &AttachBinding, surface_id: uuid::Uuid) -> Result<(), String> {
+        let target = binding.resource_ref().ok_or_else(|| "resolved attach target has no resource identity".to_string())?;
+        match self.regard_lifecycle.emit_expressed_for_surface(surface_id, &target).await? {
+            SurfaceGestureOutcome::Handled => Ok(()),
+            SurfaceGestureOutcome::UnknownSurface => {
+                self.regard_lifecycle.emit_expressed(&PrincipalRef::implicit_for_namespace(&binding.namespace), &target).await
+            }
+        }
     }
 
     async fn resolve_and_validate_convoy_placement(
@@ -3356,7 +3430,11 @@ impl InProcessDaemon {
         Ok(placement)
     }
 
-    async fn run_convoy_start(&self, intent: flotilla_protocol::ConvoyStartIntent) -> flotilla_protocol::CommandValue {
+    async fn run_convoy_start(
+        &self,
+        intent: flotilla_protocol::ConvoyStartIntent,
+        dispatching_principal_ref: PrincipalRef,
+    ) -> flotilla_protocol::CommandValue {
         let namespace = self.provisioning_namespace().await;
         let requested_namespace = intent.namespace.as_deref().unwrap_or(&namespace);
         if requested_namespace != namespace {
@@ -3364,7 +3442,7 @@ impl InProcessDaemon {
                 message: format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"),
             };
         }
-        match self.admit_convoy_start(&namespace, &intent).await {
+        match self.admit_convoy_start(&namespace, &intent, &dispatching_principal_ref).await {
             Ok(name) if intent.auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
                 Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
                     name,
@@ -3439,16 +3517,12 @@ impl InProcessDaemon {
         if let Some((name, spec)) = placement_spec {
             ensure_prepared_placement_snapshot(&self.resource_backend, &namespace, name, &spec).await?;
         }
-        convoys
-            .create(&InputMeta::builder().name(start.name.clone()).build(), &convoy_spec)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.create_convoy_with_regard(&namespace, &start.name, &convoy_spec).await
     }
 
     async fn supervise_convoy_start(&self, task: ConvoyStartTask) {
-        let ConvoyStartTask { command_id, intent, key } = task;
-        let result = match AssertUnwindSafe(self.run_convoy_start(intent)).catch_unwind().await {
+        let ConvoyStartTask { command_id, intent, key, dispatching_principal_ref } = task;
+        let result = match AssertUnwindSafe(self.run_convoy_start(intent, dispatching_principal_ref)).catch_unwind().await {
             Ok(result) => result,
             Err(_) => {
                 warn!(command_id, "convoy start worker panicked");
@@ -5328,7 +5402,11 @@ impl InProcessDaemon {
         command: Command,
         remote_executor: Arc<dyn RemoteStepExecutor>,
     ) -> Result<u64, String> {
-        self.execute_impl(command, remote_executor, true).await
+        self.execute_impl(command, remote_executor, true, None).await
+    }
+
+    pub async fn execute_for_principal(&self, command: Command, principal_ref: Option<PrincipalRef>) -> Result<u64, String> {
+        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, principal_ref).await
     }
 
     pub async fn execute_remote_step_batch(
@@ -5377,6 +5455,7 @@ impl InProcessDaemon {
         command: Command,
         remote_executor: Arc<dyn RemoteStepExecutor>,
         allow_remote_host: bool,
+        dispatching_principal_ref: Option<PrincipalRef>,
     ) -> Result<u64, String> {
         let command_node_id = command.node_id.clone().unwrap_or_else(|| self.node_id.clone());
         debug!(
@@ -5610,6 +5689,8 @@ impl InProcessDaemon {
         if let flotilla_protocol::CommandAction::ConvoyStart { intent } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let namespace = intent.namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let dispatching_principal_ref =
+                dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&namespace));
             let key = ConvoyStartKey::new(namespace, intent);
             if !self.pending_convoy_starts.lock().await.insert(key.clone()) {
                 self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {
@@ -5617,7 +5698,12 @@ impl InProcessDaemon {
                 });
                 return Ok(id);
             }
-            let task = ConvoyStartTask { command_id: id, intent: intent.as_ref().clone(), key: key.clone() };
+            let task = ConvoyStartTask::builder()
+                .command_id(id)
+                .intent(intent.as_ref().clone())
+                .key(key.clone())
+                .dispatching_principal_ref(dispatching_principal_ref)
+                .build();
             if let Some(daemon) = self.self_weak.upgrade() {
                 tokio::spawn(async move {
                     daemon.supervise_convoy_start(task).await;
@@ -5874,7 +5960,9 @@ impl InProcessDaemon {
             }
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
-                dispatching_principal_ref: PrincipalRef::implicit_for_namespace(&namespace),
+                dispatching_principal_ref: dispatching_principal_ref
+                    .clone()
+                    .unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&namespace)),
                 inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
                 placement_policy,
                 repositories,
@@ -5884,10 +5972,9 @@ impl InProcessDaemon {
                 issues: Vec::new(),
                 instruction: None,
             };
-            let meta = InputMeta::builder().name(name.clone()).build();
-            let result = match convoys.create(&meta, &spec).await {
-                Ok(_) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },
-                Err(err) => flotilla_protocol::CommandValue::Error { message: err.to_string() },
+            let result = match self.create_convoy_with_regard(&namespace, name, &spec).await {
+                Ok(()) => flotilla_protocol::CommandValue::ConvoyCreated { name: name.clone() },
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
@@ -6288,7 +6375,19 @@ impl DaemonHandle for InProcessDaemon {
 
     fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
         let state = self.aggregator_projection_state.clone();
-        QuerySubscription::new(move || state.remove_subscriber(subscriber_id))
+        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        self.connect_surface(subscriber_id, SurfaceDeclaration::focal_for_namespace(namespace));
+        let daemon = self.self_weak.clone();
+        QuerySubscription::new(move || {
+            state.remove_subscriber(subscriber_id);
+            if let Some(daemon) = daemon.upgrade() {
+                tokio::spawn(async move {
+                    if let Err(error) = daemon.disconnect_surface(subscriber_id).await {
+                        warn!(%error, "failed to disconnect in-process surface");
+                    }
+                });
+            }
+        })
     }
 
     async fn get_state(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoSnapshot, String> {
@@ -6331,10 +6430,10 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn execute(&self, command: Command) -> Result<u64, String> {
-        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false).await
+        self.execute_impl(command, Arc::new(crate::step::UnsupportedRemoteStepExecutor), false, None).await
     }
 
-    async fn execute_query(&self, command: Command, _session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
+    async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         use flotilla_protocol::CommandAction;
         match &command.action {
             CommandAction::QueryRepoDetail { repo } => match self.get_repo_detail_internal(repo).await {
@@ -6402,6 +6501,11 @@ impl DaemonHandle for InProcessDaemon {
             }
             CommandAction::Attach { reference } => match self.resolve_attach_command_internal(reference).await {
                 Ok(resolved) => {
+                    if let Some(binding) = &resolved.binding {
+                        if let Err(error) = self.emit_attach_regard(binding, session_id).await {
+                            warn!(%error, "failed to emit attach regard");
+                        }
+                    }
                     Ok(flotilla_protocol::CommandValue::AttachCommandResolved { command: resolved.command, binding: resolved.binding })
                 }
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
@@ -6434,6 +6538,10 @@ impl DaemonHandle for InProcessDaemon {
             }
             other => Err(format!("execute_query not implemented for this command type: {:?}", std::mem::discriminant(other))),
         }
+    }
+
+    async fn observe_focus(&self, surface_id: uuid::Uuid, targets: Vec<ResourceRef>) -> Result<(), String> {
+        self.observe_surface_focus(surface_id, targets).await
     }
 
     async fn cancel(&self, command_id: u64) -> Result<(), String> {

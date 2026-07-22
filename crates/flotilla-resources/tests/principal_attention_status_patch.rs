@@ -58,11 +58,11 @@ fn demand_satisfy_and_acknowledge_preserve_transition_timestamps_and_authorities
 #[test]
 fn demand_spec_defaults_to_dispatching_principal_via_constructor() {
     let work_ref = ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "demo-implement");
-    let spec =
-        DemandSpec::for_dispatching_principal(work_ref.clone(), DemandKind::Permission, PrincipalRef("principal/default".to_string()));
+    let principal_ref = PrincipalRef::implicit_for_namespace("flotilla");
+    let spec = DemandSpec::for_dispatching_principal(work_ref.clone(), DemandKind::Permission, principal_ref.clone());
 
     assert_eq!(spec.originating_work_ref, work_ref);
-    assert_eq!(spec.addressee, DemandAddressee::Principal { principal_ref: PrincipalRef("principal/default".to_string()) });
+    assert_eq!(spec.addressee, DemandAddressee::Principal { principal_ref });
 }
 
 #[test]

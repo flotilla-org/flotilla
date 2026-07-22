@@ -20,12 +20,12 @@ use flotilla_resources::{
     CrewWorkPhase, CrewWorkState, Environment as ResourceEnvironment, EnvironmentSpec as ResourceEnvironmentSpec, Host as ResourceHost,
     HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta,
     LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, RepositoryStatus, Selector, Stance, TerminalBrief, TerminalCrewContext,
-    TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, Vessel, VesselPhase,
-    VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
-    VESSEL_REF_LABEL,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardSource, Repository, RepositorySpec, RepositoryStatus, Selector, Stance,
+    TerminalBrief, TerminalCrewContext, TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus,
+    Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 use super::*;
@@ -1560,6 +1560,13 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
     assert_eq!(binding.convoy.as_deref(), Some("convoy-a"));
     assert_eq!(binding.vessel.as_deref(), Some("implement"));
     assert_eq!(binding.role.as_deref(), Some("coder"));
+    let regards = daemon.resource_backend().using::<Regard>("flotilla").list().await.expect("list attach regards");
+    assert_eq!(regards.items.len(), 1);
+    assert_eq!(regards.items[0].spec.source, RegardSource::Expressed);
+    assert_eq!(
+        regards.items[0].spec.target,
+        ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a").subresource("vessels/implement")
+    );
 }
 
 #[tokio::test]

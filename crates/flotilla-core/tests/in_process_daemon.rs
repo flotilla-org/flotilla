@@ -50,8 +50,8 @@ use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
     DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec, TypedResolver, WorkPhase, WorkState, WorkflowSnapshot,
-    WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
+    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositorySpec, TypedResolver, WorkPhase,
+    WorkState, WorkflowSnapshot, WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -1052,6 +1052,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     assert_eq!(persisted.spec.placement_policy.as_deref(), Some("docker-test"));
     assert_eq!(persisted.spec.repositories.len(), 1);
     assert_eq!(persisted.spec.instruction.as_deref(), Some("Keep the snapshot durable."));
+    let regards = backend.using::<Regard>("flotilla").list().await.expect("list dispatcher regards");
+    let regard = regards.items.iter().find(|regard| regard.spec.target.name == "issue-732").expect("implicit dispatcher regard");
+    assert_eq!(regard.spec.principal_ref, persisted.spec.dispatching_principal_ref);
+    assert_eq!(regard.spec.source, RegardSource::Implicit { policy: "convoy-dispatch".to_string() });
+    assert_eq!(regard.spec.expiry, RegardExpiryPolicy::Decaying { expires_after_seconds: 300 });
     let persisted_issue = persisted.spec.issues.first().expect("issue snapshot");
     assert_eq!(persisted_issue.reference, reference);
     assert_eq!(persisted_issue.repository_ref, Some(repository.key()));

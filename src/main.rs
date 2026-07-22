@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, process::ExitStatus, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -608,7 +608,7 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
     if let CommandValue::ConvoyStarted { name, attach_command: Some(command), binding } = result {
         if matches!(format, OutputFormat::Human) {
             stamp_pane_identity(&name, binding.as_ref()).await;
-            return exec_attach_command(&command);
+            return run_attach_command(&command);
         }
     }
     Ok(())
@@ -644,7 +644,7 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
                 if !transient {
                     stamp_pane_identity(reference, binding.as_ref()).await;
                 }
-                exec_attach_command(&command)
+                run_attach_command(&command)
             }
         },
         CommandValue::Error { message } => match format {
@@ -662,7 +662,7 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
 }
 
 /// Publish pane ≙ identity into the enclosing PM's metadata plane before
-/// exec'ing the attach command — the one moment a process knows the binding
+/// launching the attach command — the one moment a process knows the binding
 /// (flotilla-org/flotilla#708, half 1). Best-effort: a PM-less or failed
 /// stamp never blocks the attach.
 async fn stamp_pane_identity(reference: &str, binding: Option<&flotilla_protocol::AttachBinding>) {
@@ -854,23 +854,42 @@ fn print_resource_watch_event(response: &flotilla_protocol::ResourceWatchRespons
     }
 }
 
-#[cfg(unix)]
-fn exec_attach_command(command: &str) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    Err(std::process::Command::new("sh").arg("-lc").arg(command).exec().into())
+fn run_attach_command(command: &str) -> Result<()> {
+    let status = std::process::Command::new("sh").arg("-lc").arg(command).status()?;
+    terminate_with_attach_status(status)
 }
 
-#[cfg(not(unix))]
-fn exec_attach_command(command: &str) -> Result<()> {
-    let status = std::process::Command::new("sh").arg("-lc").arg(command).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(color_eyre::eyre::eyre!(
-            "attach command exited with status {}",
-            status.code().map(|code| code.to_string()).unwrap_or_else(|| "signal".to_string())
-        ))
+#[derive(Debug, PartialEq, Eq)]
+enum AttachExitDisposition {
+    Code(i32),
+    #[cfg(unix)]
+    Signal(i32),
+}
+
+fn attach_exit_disposition(status: ExitStatus) -> AttachExitDisposition {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return AttachExitDisposition::Signal(signal);
+        }
+    }
+    AttachExitDisposition::Code(status.code().unwrap_or(1))
+}
+
+fn terminate_with_attach_status(status: ExitStatus) -> ! {
+    match attach_exit_disposition(status) {
+        AttachExitDisposition::Code(code) => std::process::exit(code),
+        #[cfg(unix)]
+        AttachExitDisposition::Signal(signal) => {
+            // Match the old `exec` path: callers should observe the attach
+            // process's terminating signal, not a generic Flotilla error.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            std::process::exit(128 + signal)
+        }
     }
 }
 
@@ -1344,7 +1363,10 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        process::Command,
+    };
 
     use clap::Parser;
     use flotilla_protocol::{
@@ -1352,9 +1374,22 @@ mod tests {
     };
 
     use super::{
-        provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots, Cli, ResourceApplyArgs,
-        ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
+        attach_exit_disposition, provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots,
+        AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
+
+    #[test]
+    fn attach_exit_disposition_preserves_child_exit_code() {
+        let status = Command::new("sh").args(["-c", "exit 42"]).status().expect("run child");
+        assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Code(42));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_exit_disposition_preserves_child_signal() {
+        let status = Command::new("sh").args(["-c", "kill -TERM $$"]).status().expect("run child");
+        assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Signal(libc::SIGTERM));
+    }
 
     #[test]
     fn explicit_repo_roots_take_precedence_over_cwd_detection() {
