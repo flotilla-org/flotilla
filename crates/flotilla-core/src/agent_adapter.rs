@@ -402,6 +402,7 @@ mod tests {
             },
             spec: ConvoySpec {
                 workflow_ref: "workflow".to_string(),
+                dispatching_principal_ref: Default::default(),
                 inputs: BTreeMap::new(),
                 placement_policy: None,
                 repositories: vec![ConvoyRepositorySpec {

@@ -22,9 +22,9 @@ use flotilla_protocol::{
     result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry,
     EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
-    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProjectListEntry,
-    ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse, RepoIdentity,
-    RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, ResourceJsonResponse,
+    HostProviderStatus, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, PrincipalRef,
+    ProjectListEntry, ProjectListRepository, ProjectListResponse, ProviderData, ProviderInfo, QueryCursor, RepoDelta, RepoDetailResponse,
+    RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSnapshot, RepoSummary, RepoWorkResponse, ResolvedPaneCommand, ResourceJsonResponse,
     ResourceWatchResponse, StatusResponse, StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute, ViewAddress,
     AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
@@ -3224,6 +3224,7 @@ impl InProcessDaemon {
         let placement_policy = placement.as_ref().map(|placement| placement.metadata.name.clone());
         let spec = ConvoySpec {
             workflow_ref,
+            dispatching_principal_ref: PrincipalRef::implicit_for_namespace(namespace),
             inputs: intent.inputs.iter().map(|(key, value)| (key.clone(), InputValue::String(value.clone()))).collect(),
             placement_policy,
             repositories,
@@ -5648,6 +5649,7 @@ impl InProcessDaemon {
             }
             let spec = ConvoySpec {
                 workflow_ref: workflow_ref.clone(),
+                dispatching_principal_ref: PrincipalRef::implicit_for_namespace(&namespace),
                 inputs: inputs.iter().map(|(k, v)| (k.clone(), InputValue::String(v.clone()))).collect(),
                 placement_policy,
                 repositories,

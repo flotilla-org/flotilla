@@ -18,7 +18,7 @@ use crate::{
     provider_data::{ChangeRequestStatus, Issue},
     resource_ref::ResourceRef,
     snapshot::RepoKey,
-    IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey,
+    IssueRef, IssueSource, IssueState, LifecycleAuthority, PrincipalRef, RepositoryKey,
 };
 
 pub type Timestamp = DateTime<Utc>;
@@ -484,6 +484,10 @@ pub struct ConvoyRow {
     pub resource: ResourceRef,
     pub name: String,
     pub workflow_ref: String,
+    /// Human principal that dispatched the convoy.
+    #[builder(default)]
+    #[serde(default)]
+    pub dispatching_principal_ref: PrincipalRef,
     pub phase: ConvoyPhase,
     /// The convoy has no workflow snapshot yet and is not terminal.
     #[builder(default)]

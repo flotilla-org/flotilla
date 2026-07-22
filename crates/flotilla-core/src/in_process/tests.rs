@@ -587,6 +587,7 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
     let convoy = convoys
         .create(&empty_input_meta("demo"), &ConvoySpec {
             workflow_ref: "coding-review".into(),
+            dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
             placement_policy: None,
             repositories: Vec::new(),
@@ -2771,6 +2772,7 @@ async fn convoy_completion_command_updates_convoy_task_status() {
     let created = convoys
         .create(&empty_input_meta("convoy-a"), &ConvoySpec {
             workflow_ref: "review-and-fix".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
             placement_policy: Some("laptop-docker".to_string()),
             repositories: Vec::new(),
@@ -3228,6 +3230,7 @@ async fn convoy_completion_command_targets_configured_provisioning_namespace() {
     let created = convoys
         .create(&empty_input_meta("convoy-a"), &ConvoySpec {
             workflow_ref: "review-and-fix".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: BTreeMap::new(),
             placement_policy: Some("laptop-docker".to_string()),
             repositories: Vec::new(),

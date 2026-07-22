@@ -4,7 +4,7 @@
 //! ([`flotilla_protocol::result_set`]). This adapter model is intentionally
 //! surface-owned and may evolve with consumer-side view requirements.
 
-use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, RepoKey, ResourceRef};
+use flotilla_protocol::{result_set as wire, CheckoutRef, HostName, PrincipalRef, RepoKey, ResourceRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConvoyId(String);
@@ -150,6 +150,8 @@ pub struct ConvoySummary {
     pub name: String,
     pub origin_host: Option<HostName>,
     pub workflow_ref: String,
+    #[builder(default)]
+    pub dispatching_principal_ref: PrincipalRef,
     pub phase: ConvoyPhase,
     pub message: Option<String>,
     pub repo_hint: Option<RepoKey>,
@@ -175,6 +177,7 @@ impl From<&wire::ConvoyRow> for ConvoySummary {
             name: row.name.clone(),
             origin_host: row.resource.host.clone(),
             workflow_ref: row.workflow_ref.clone(),
+            dispatching_principal_ref: row.dispatching_principal_ref.clone(),
             phase: row.phase.into(),
             message: row.message.clone(),
             repo_hint: row.repo.clone(),

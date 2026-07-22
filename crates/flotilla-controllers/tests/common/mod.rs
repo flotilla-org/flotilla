@@ -78,6 +78,7 @@ pub async fn create_convoy_with_single_task(
     let convoy = convoys
         .create(&meta(name), &ConvoySpec {
             workflow_ref: "wf".to_string(),
+            dispatching_principal_ref: Default::default(),
             inputs: Default::default(),
             placement_policy: None,
             repositories: vec![ConvoyRepositorySpec {
