@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
     qualified_path::QualifiedPath,
-    result_set::{ConvoyRow, ResultSet, Rows},
+    result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry, EnvironmentId,
     FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
     HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, ProjectListEntry, ProjectListRepository,
@@ -1883,6 +1883,56 @@ impl InProcessDaemon {
             &self.host_name,
         );
         Some((providers, state.local_data_version()))
+    }
+
+    /// Resolve the first change request whose head matches a convoy branch
+    /// across the convoy's snapshotted repositories.
+    pub async fn resolve_convoy_change_request(
+        &self,
+        repository_keys: &[RepositoryKey],
+        branch: &str,
+    ) -> Result<Option<ConvoyChangeRequest>, String> {
+        let candidates = {
+            let keys_by_path = self.repository_keys_by_path.read().await;
+            let repos = self.repos.read().await;
+            let order = self.repo_order.read().await;
+            let mut by_key = order
+                .iter()
+                .filter_map(|identity| {
+                    let state = repos.get(identity)?;
+                    let repository = keys_by_path.get(state.preferred_path())?;
+                    if !repository_keys.contains(repository) {
+                        return None;
+                    }
+                    let providers = state.registry().change_requests.iter().map(|(_, provider)| Arc::clone(provider)).collect::<Vec<_>>();
+                    Some((repository.clone(), (state.preferred_path().to_path_buf(), providers)))
+                })
+                .collect::<HashMap<_, _>>();
+            repository_keys
+                .iter()
+                .filter_map(|repository| by_key.remove(repository).map(|(path, providers)| (repository.clone(), path, providers)))
+                .collect::<Vec<_>>()
+        };
+
+        let mut first_error = None;
+        for (repository, path, providers) in candidates {
+            for provider in providers {
+                match provider.find_change_request_by_branch(&path, branch).await {
+                    Ok(Some((id, request))) => {
+                        return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     /// Update the peer provider data overlay for a repo and trigger re-broadcast.

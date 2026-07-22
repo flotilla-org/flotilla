@@ -374,6 +374,19 @@ impl App {
         }
     }
 
+    fn table_intent_node_id(&mut self, host: Option<&HostName>) -> Result<Option<NodeId>, ()> {
+        let Some(host) = host else {
+            return Ok(None);
+        };
+        match self.panel_target_node(host) {
+            Ok(node_id) => Ok(node_id),
+            Err(message) => {
+                self.set_status_message(Some(message));
+                Err(())
+            }
+        }
+    }
+
     pub(super) fn execute_table_intent(&mut self, intent: TableIntent) {
         let (mut command, host) = match intent {
             TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
@@ -388,19 +401,30 @@ impl App {
                 return;
             }
             TableIntent::DeleteConvoy { namespace, name, host } => {
-                let node_id = match host.as_ref() {
-                    Some(host) => match self.panel_target_node(host) {
-                        Ok(node_id) => node_id,
-                        Err(message) => {
-                            self.set_status_message(Some(message));
-                            return;
-                        }
-                    },
-                    None => None,
+                let Ok(node_id) = self.table_intent_node_id(host.as_ref()) else {
+                    return;
                 };
                 let mut command = self.command(CommandAction::ConvoyDelete { namespace: Some(namespace.clone()), name: name.clone() });
                 command.node_id = node_id;
                 self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command)));
+                return;
+            }
+            TableIntent::OpenChangeRequest { id, repository_key, host } => {
+                let Some(repo_identity) = self
+                    .model
+                    .repos
+                    .iter()
+                    .find_map(|(identity, repo)| (repo.repository_key.as_ref() == Some(&repository_key)).then(|| identity.clone()))
+                else {
+                    self.set_status_message(Some(format!("Cannot open PR: repository {repository_key} is not tracked")));
+                    return;
+                };
+                let Ok(node_id) = self.table_intent_node_id(host.as_ref()) else {
+                    return;
+                };
+                let mut command = self.repo_command_for_identity(repo_identity, CommandAction::OpenChangeRequest { id });
+                command.node_id = node_id;
+                self.proto_commands.push(command);
                 return;
             }
             TableIntent::ForceCompleteWork { convoy, vessel, host } => {

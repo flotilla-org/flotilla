@@ -591,6 +591,11 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
         .name("fix-bug-123")
         .workflow_ref("fix-bug")
         .phase(ConvoyPhase::Active)
+        .change_request(ConvoyChangeRequest {
+            id: "815".into(),
+            status: ChangeRequestStatus::Open,
+            repository_key: RepositoryKey("repo_flotilla".into()),
+        })
         .vessels(vec![implement, review])
         .build();
     let event = DaemonEvent::ResultSet(Box::new(ResultSet { seq: 7, rows: Rows::Convoys(vec![row]), state: Default::default() }));
@@ -606,6 +611,7 @@ fn result_set_round_trips_a_resource_backed_vessel_dag() {
     assert!(rows[0].vessels[1].attach.is_none());
     assert!(rows[0].vessels[0].complete_work);
     assert!(!rows[0].vessels[1].complete_work, "capabilities default closed");
+    assert_eq!(rows[0].change_request.as_ref().expect("change request").id, "815");
     assert_eq!(StreamKey::Query { query: QueryId::Convoys }, StreamKey::Query { query: result_set.query() });
 }
 

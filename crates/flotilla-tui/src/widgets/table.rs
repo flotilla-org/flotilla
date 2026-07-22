@@ -407,7 +407,7 @@ mod tests {
                 .build()
         }
 
-        let convoys = [
+        let mut convoys = [
             convoy(
                 "tables",
                 ConvoyPhase::Pending,
@@ -437,6 +437,16 @@ mod tests {
                 Some("workspace launch failed"),
             ),
         ];
+        convoys[1].change_request = Some(flotilla_protocol::ConvoyChangeRequest {
+            id: "815".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key: flotilla_protocol::RepositoryKey("repo_flotilla".into()),
+        });
+        convoys[2].change_request = Some(flotilla_protocol::ConvoyChangeRequest {
+            id: "812".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Merged,
+            repository_key: flotilla_protocol::RepositoryKey("repo_flotilla".into()),
+        });
         let rows = convoys.iter().collect::<Vec<_>>();
         table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows {
             convoys: rows,

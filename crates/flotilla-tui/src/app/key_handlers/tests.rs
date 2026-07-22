@@ -84,6 +84,26 @@ fn convoy_delete_table_intent_confirms_then_routes_to_origin_host() {
     assert_eq!(command.action, CommandAction::ConvoyDelete { namespace: Some("other-team".into()), name: "failed-convoy".into() });
 }
 
+#[test]
+fn convoy_open_pr_table_intent_routes_with_repository_context() {
+    let mut app = stub_app();
+    let repository = flotilla_protocol::RepositoryKey("repo_flotilla".into());
+    let identity = app.model.repo_order[0].clone();
+    app.model.repos.get_mut(&identity).expect("tracked repo").repository_key = Some(repository.clone());
+    insert_peer_host(&mut app.model, "remote-host");
+
+    app.execute_table_intent(TableIntent::OpenChangeRequest {
+        id: "815".into(),
+        repository_key: repository,
+        host: Some(HostName::new("remote-host")),
+    });
+
+    let (command, _) = app.proto_commands.take_next().expect("open PR command");
+    assert_eq!(command.node_id, Some(NodeId::new("remote-host")));
+    assert_eq!(command.context_repo, Some(flotilla_protocol::RepoSelector::Identity(identity)));
+    assert_eq!(command.action, CommandAction::OpenChangeRequest { id: "815".into() });
+}
+
 /// Read the active RepoPage's selected flat index.
 fn active_selection(app: &App) -> Option<usize> {
     let identity = app.model.active_repo.as_ref().expect("active tab should be a repo view");
