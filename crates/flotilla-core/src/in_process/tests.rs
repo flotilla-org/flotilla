@@ -48,6 +48,8 @@ use crate::{
     },
 };
 
+const TEST_LOCAL_ATTACH_HOST: &str = "local";
+
 #[test]
 fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
     let normalized = normalize_workspace_slug("My_repo...with spaces");
@@ -380,7 +382,8 @@ async fn new_attach_test_daemon_with_pool(config_base: &Path) -> (Arc<InProcessD
     let discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_terminal_pool(Arc::clone(&terminal_pool) as Arc<dyn crate::providers::terminal::TerminalPool>),
     );
-    let daemon = InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::local()).await;
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), discovery, HostName::new(TEST_LOCAL_ATTACH_HOST)).await;
     (daemon, terminal_pool)
 }
 
@@ -427,8 +430,7 @@ fn write_attach_hosts_config(config_base: &Path, hosts: &[(&str, &str, Option<&s
 }
 
 fn non_local_attach_hosts() -> (&'static str, &'static str) {
-    let local = HostName::local();
-    let mut candidates = ["feta", "gouda", "kiwi"].into_iter().filter(|host| *host != local.as_str());
+    let mut candidates = ["feta", "gouda", "kiwi"].into_iter().filter(|host| *host != TEST_LOCAL_ATTACH_HOST);
     (candidates.next().expect("first non-local host"), candidates.next().expect("second non-local host"))
 }
 
