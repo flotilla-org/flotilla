@@ -21,7 +21,10 @@ use crate::{
 /// request starts so the renderer can show an indicator while the daemon
 /// acknowledgement is outstanding.
 pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionContext>, event_tx: mpsc::UnboundedSender<Event>) {
-    app.set_status_message(None);
+    let project_issue_start = pending_ctx.as_ref().is_some_and(|ctx| ctx.project_issue_start.is_some());
+    if !project_issue_start {
+        app.set_status_message(None);
+    }
 
     // Pane attach is a query that resolves a command for the TUI process to
     // run temporarily outside raw mode. It must not go through the ordinary
@@ -284,7 +287,7 @@ mod tests {
     use flotilla_protocol::{
         arg::Arg,
         qualified_path::{HostId, QualifiedPath},
-        CheckoutStatus, HostName, NodeId, RepoIdentity, ResolvedPaneCommand, WorkItemIdentity,
+        CheckoutStatus, HostName, IssueRef, IssueSource, NodeId, RepoIdentity, ResolvedPaneCommand, ViewAddress, WorkItemIdentity,
     };
     use ratatui::{backend::TestBackend, Terminal};
     use tokio::sync::{mpsc, Semaphore};
@@ -411,6 +414,37 @@ mod tests {
         assert!(matches!(app.screen.repo_pages[&repo_identity].pending_actions[&identity].status, PendingStatus::InFlight {
             command_id: 1
         }));
+    }
+
+    #[tokio::test]
+    async fn project_issue_dispatch_preserves_batch_start_status() {
+        let execute_gate = Arc::new(Semaphore::new(0));
+        let daemon = Arc::new(StubDaemon::builder().execute_gate(Arc::clone(&execute_gate)).build());
+        let mut app =
+            stub_app_with_daemon(daemon, vec![repo_info("/tmp/test-repo", "test-repo", flotilla_protocol::RepoLabels::default())]);
+        let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
+        app.open_view(address.clone());
+        let batch_id = app.begin_project_issue_start_batch(2);
+        let issue = IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "809".into(),
+        };
+        let pending_ctx = PendingActionContext {
+            identity: WorkItemIdentity::Issue("809".into()),
+            description: "Start convoy".into(),
+            repo_identity: RepoIdentity { authority: "project".into(), path: address.to_string() },
+            project_issue_start: Some(crate::app::ui_state::ProjectIssueStartContext {
+                address,
+                row_id: crate::table_view::RowId::new("issue:809"),
+                issue,
+                batch_id,
+            }),
+        };
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        dispatch(app.command(CommandAction::Refresh { repo: None }), &mut app, Some(pending_ctx), event_tx);
+
+        assert_eq!(app.model.status_message.as_deref(), Some("Starting 2 convoys..."));
     }
 
     #[tokio::test]
