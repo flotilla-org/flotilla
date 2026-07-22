@@ -39,7 +39,7 @@ pub use environment::{
     EnvironmentStatusPatch, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
-pub use host::{Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY};
+pub use host::{Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, TERMINAL_POOLS_CAPABILITY};
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
 pub use labels::{

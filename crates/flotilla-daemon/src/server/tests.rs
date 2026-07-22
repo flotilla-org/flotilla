@@ -21,15 +21,17 @@ use flotilla_core::{
 use flotilla_protocol::{
     qualified_path::QualifiedPath,
     result_set::{QueryChanges, QueryId, ResultDelta},
-    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachableId, Checkout, CheckoutTarget, Command, CommandAction,
-    CommandPeerEvent, CommandValue, ConfigLabel, DaemonEvent, EnvironmentId, HostName, HostPath, HostSummary, Message, NodeId, NodeInfo,
-    PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage, PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity,
-    RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage, StepAction, StepExecutionContext, StepOutcome, StepStatus,
-    StreamKey, VectorClock, PROTOCOL_VERSION,
+    AgentEventType, AgentHarness, AgentHookEvent, AgentStatus, AttachBinding, AttachableId, Checkout, CheckoutTarget, Command,
+    CommandAction, CommandPeerEvent, CommandValue, ConfigLabel, ConvoyStartIntent, DaemonEvent, EnvironmentId, HostName, HostPath,
+    HostProviderStatus, HostSummary, Message, NodeId, NodeInfo, PeerConnectionState, PeerDataKind, PeerDataMessage, PeerWireMessage,
+    PreparedWorkspace, ProviderData, QueryCursor, RepoIdentity, RepoSelector, Request, Response, ResponseResult, RoutedPeerMessage,
+    StepAction, StepExecutionContext, StepOutcome, StepStatus, StreamKey, VectorClock, AGENT_ADAPTER_PROVIDER_CATEGORY, PROTOCOL_VERSION,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, ResourceBackend, ResourceError,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, Project, ProjectSpec, ResourceBackend, ResourceError, Stance,
+    WorkflowTemplate,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
@@ -667,6 +669,184 @@ async fn dispatch_execute_remote_query_routes_through_peer_manager() {
         }
         other => panic!("expected routed command request, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (_remote_tmp, remote_daemon) = empty_daemon_named("feta").await;
+    let remote_host_id = remote_daemon.local_host_id().expect("remote host identity").to_string();
+    let remote_policy_name = format!("host-direct-{remote_host_id}");
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(&remote_host_id)))
+                .host_name(HostName::new("feta"))
+                .node(node_info("feta"))
+                .system(flotilla_protocol::SystemInfo::default())
+                .providers(vec![
+                    HostProviderStatus::available(AGENT_ADAPTER_PROVIDER_CATEGORY, "codex"),
+                    HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "cleat"),
+                ])
+                .build(),
+        )
+        .await;
+    let backend = daemon.resource_backend();
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("remote-workflow".to_string()).build(), &workflow)
+        .await
+        .expect("create workflow");
+    backend
+        .using::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec::builder().display_name("Flotilla".to_string()).default_workflow_ref("remote-workflow".to_string()).build(),
+        )
+        .await
+        .expect("create project");
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
+    let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
+    let pending_remote_cancels = Arc::new(Mutex::new(HashMap::new()));
+    let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
+    let sent = Arc::new(StdMutex::new(Vec::new()));
+    peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
+    let remote_command_router = make_remote_command_router(
+        &daemon,
+        &peer_manager,
+        &pending_remote_commands,
+        &forwarded_commands,
+        &pending_remote_cancels,
+        &next_remote_command_id,
+    );
+    let command = Command::builder()
+        .action(CommandAction::ConvoyStart {
+            intent: Box::new(
+                ConvoyStartIntent::builder()
+                    .project_ref("flotilla".to_string())
+                    .name("remote-work".to_string())
+                    .branch("feat/remote-work".to_string())
+                    .placement_policy(remote_policy_name)
+                    .build(),
+            ),
+        })
+        .build();
+
+    let mut mismatched = command.clone();
+    mismatched.node_id = Some(daemon.node_id().clone());
+    assert_eq!(
+        remote_command_router.dispatch_execute(mismatched).await.expect_err("explicit local target must not override remote placement"),
+        "convoy command target does not match its host-direct placement policy"
+    );
+
+    remote_command_router.dispatch_execute(command.clone()).await.expect("remote convoy start should dispatch");
+
+    assert_eq!(pending_remote_commands.lock().await.len(), 1);
+    let (routed, workflow_snapshot_name, placement_snapshot_name) = {
+        let sent = sent.lock().expect("lock sent messages");
+        let [PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command: routed, .. })] = sent.as_slice() else {
+            panic!("expected one routed command request");
+        };
+        assert_eq!(*target_node_id, node("feta"));
+        assert_eq!(routed.node_id.as_ref(), Some(&node("feta")));
+        let CommandAction::ConvoyStartPrepared { start } = &routed.action else {
+            panic!("remote launch must carry an admitted convoy snapshot");
+        };
+        assert!(start.workflow_name.starts_with("remote-work-remote-workflow-"));
+        let placement_snapshot_name = start.placement_policy_name.clone().expect("prepared placement snapshot name");
+        assert!(placement_snapshot_name.starts_with("remote-work-remote-placement-"));
+        let mut delivered = routed.as_ref().clone();
+        delivered.node_id = None;
+        (delivered, start.workflow_name.clone(), placement_snapshot_name)
+    };
+
+    assert_eq!(
+        remote_command_router.dispatch_execute(routed.clone()).await.expect_err("client-submitted prepared start must be rejected"),
+        "prepared convoy starts are reserved for authenticated peer forwarding"
+    );
+
+    let mut remote_events = remote_daemon.subscribe();
+    let remote_command_id = remote_daemon.execute(routed).await.expect("prepared command should be accepted by remote daemon");
+    let remote_result = wait_for_command_result(&mut remote_events, remote_command_id, StdDuration::from_secs(5)).await;
+    assert_eq!(remote_result, CommandValue::ConvoyStarted { name: "remote-work".to_string(), attach_command: None, binding: None });
+    let remote_backend = remote_daemon.resource_backend();
+    let convoy = remote_backend.clone().using::<Convoy>("flotilla").get("remote-work").await.expect("remote daemon should persist convoy");
+    assert_eq!(convoy.spec.workflow_ref, workflow_snapshot_name);
+    assert_eq!(convoy.spec.placement_policy.as_deref(), Some(placement_snapshot_name.as_str()));
+    let remote_workflow = remote_backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .get(&workflow_snapshot_name)
+        .await
+        .expect("remote daemon should persist workflow snapshot");
+    assert_eq!(remote_workflow.spec.vessels[0].stance, Stance::Trusted);
+    let remote_policy = remote_backend
+        .using::<PlacementPolicy>("flotilla")
+        .get(&placement_snapshot_name)
+        .await
+        .expect("remote daemon should persist placement snapshot");
+    assert_eq!(remote_policy.spec.host_direct.expect("host-direct snapshot").host_ref, remote_host_id);
+}
+
+#[tokio::test]
+async fn remote_convoy_started_event_routes_auto_attach_back_through_the_target_host() {
+    let (tmp, daemon) = empty_daemon().await;
+    std::fs::write(
+        tmp.path().join("config/hosts.toml"),
+        r#"[hosts.feta]
+hostname = "feta.example"
+expected_host_name = "feta"
+daemon_socket = "/run/user/1000/flotilla.sock"
+"#,
+    )
+    .expect("write peer config");
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let pending_remote_commands = Arc::new(Mutex::new(HashMap::from([(
+        7,
+        PendingRemoteCommand::builder().command_id(42).target_node_id(node("feta")).finished_via_event(false).build(),
+    )])));
+    let router = make_remote_command_router(
+        &daemon,
+        &peer_manager,
+        &pending_remote_commands,
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(Mutex::new(HashMap::new())),
+        &Arc::new(AtomicU64::new(1 << 62)),
+    );
+    let mut events = daemon.subscribe();
+
+    router
+        .emit_remote_command_event(7, node("feta"), CommandPeerEvent::Finished {
+            repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
+            repo: None,
+            result: CommandValue::ConvoyStarted {
+                name: "remote-work".to_string(),
+                attach_command: Some("cleat attach remote-session".to_string()),
+                binding: Some(
+                    AttachBinding::builder()
+                        .host(HostName::new("feta"))
+                        .namespace("flotilla".to_string())
+                        .session("remote-session".to_string())
+                        .build(),
+                ),
+            },
+        })
+        .await;
+
+    let result = match events.recv().await.expect("command event") {
+        DaemonEvent::CommandFinished { command_id: 42, result, .. } => result,
+        event => panic!("expected command finished, got {event:?}"),
+    };
+    let CommandValue::ConvoyStarted { attach_command: Some(command), .. } = result else {
+        panic!("expected routed convoy attach result, got {result:?}");
+    };
+    assert!(command.contains("feta.example"), "attach should route through configured peer: {command}");
+    assert!(command.contains("remote-session"), "attach should preserve the remote session reference: {command}");
+    assert!(!command.starts_with("cleat attach"), "origin must not execute the remote host's local attach command");
 }
 
 #[tokio::test]
@@ -1326,14 +1506,10 @@ async fn dispatch_request_cancel_remote_routes_cancel_and_waits_for_reply() {
     let sent = Arc::new(StdMutex::new(Vec::new()));
     peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
 
-    pending_remote_commands.lock().await.insert(91, PendingRemoteCommand {
-        command_id: 1u64 << 62,
-        target_node_id: NodeId::new("feta"),
-        repo_identity: None,
-        repo: None,
-        finished_via_event: false,
-        query_completion: None,
-    });
+    pending_remote_commands.lock().await.insert(
+        91,
+        PendingRemoteCommand::builder().command_id(1u64 << 62).target_node_id(NodeId::new("feta")).finished_via_event(false).build(),
+    );
 
     let daemon_for_task = Arc::clone(&daemon);
     let peer_manager_for_task = Arc::clone(&peer_manager);

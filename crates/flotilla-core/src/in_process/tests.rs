@@ -9,9 +9,10 @@ use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
     result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, IndependentRow, QueryId, ResultSet, Rows, SessionPhase},
     test_support::TestIssue,
-    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, CrewCommandContext, DaemonEvent,
-    EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostSummary, ImageId, QueryCursor, QueryScope, RepoSelector, ResourceRef,
-    ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
+    AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
+    CrewCommandContext, DaemonEvent, EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostProviderStatus, HostSummary, ImageId,
+    QueryCursor, QueryScope, RepoSelector, ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
+    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -76,6 +77,17 @@ fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
     validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
 }
 
+#[test]
+fn prepared_snapshot_names_are_content_addressed_for_safe_convoy_name_reuse() {
+    let first =
+        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["implement"] })).expect("first snapshot name");
+    let second =
+        prepared_snapshot_name("remote-work", "workflow", &serde_json::json!({ "vessels": ["review"] })).expect("second snapshot name");
+
+    assert_ne!(first, second);
+    assert!(first.starts_with("remote-work-remote-workflow-"));
+}
+
 #[tokio::test]
 async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_required_adapter() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -113,6 +125,87 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
         .expect_err("host without codex must be rejected");
 
     assert_eq!(error, "workflow requires agent adapter `codex`, which is not available in placement `host-direct-test` (host `host-test`)");
+}
+
+#[tokio::test]
+async fn peer_summary_materializes_an_admissible_host_direct_placement_and_routing_target() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"kiwi-host\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::new("kiwi")).await;
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(HostId::new("feta-host")))
+                .host_name(HostName::new("feta"))
+                .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("feta-node"), "feta"))
+                .system(SystemInfo::default())
+                .providers(vec![
+                    HostProviderStatus::available(AGENT_ADAPTER_PROVIDER_CATEGORY, "codex"),
+                    HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "cleat"),
+                ])
+                .build(),
+        )
+        .await;
+
+    let backend = daemon.resource_backend();
+    let host = backend.clone().using::<ResourceHost>("flotilla").get("feta-host").await.expect("peer host should be materialized");
+    assert_eq!(host.status.expect("peer host status").agent_adapters().expect("valid adapters"), BTreeSet::from(["codex".to_string()]));
+    let policy = backend
+        .using::<PlacementPolicy>("flotilla")
+        .get("host-direct-feta-host")
+        .await
+        .expect("peer placement policy should be materialized");
+    assert_eq!(policy.spec.pool, "cleat");
+    assert_eq!(policy.spec.host_direct.as_ref().expect("host-direct policy").host_ref, "feta-host");
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+    validate_workflow_agent_adapters(&daemon.resource_backend(), "flotilla", &workflow, Some(&policy))
+        .await
+        .expect("peer host capabilities should admit the workflow");
+
+    let intent =
+        ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("host-direct-feta-host".to_string()).build();
+    assert_eq!(
+        daemon.resolve_convoy_start_target_node(&intent).await.expect("placement should route"),
+        Some(flotilla_protocol::NodeId::new("feta-node"))
+    );
+
+    daemon
+        .publish_peer_summary(
+            HostSummary::builder()
+                .environment_id(EnvironmentId::host(HostId::new("feta-host")))
+                .host_name(HostName::new("feta"))
+                .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new("feta-node"), "feta"))
+                .system(SystemInfo::default())
+                .providers(vec![
+                    HostProviderStatus::available(AGENT_ADAPTER_PROVIDER_CATEGORY, "codex"),
+                    HostProviderStatus::available(TERMINAL_POOL_PROVIDER_CATEGORY, "zellij"),
+                ])
+                .build(),
+        )
+        .await;
+    let refreshed = daemon
+        .resource_backend()
+        .using::<PlacementPolicy>("flotilla")
+        .get("host-direct-feta-host")
+        .await
+        .expect("peer placement policy should update");
+    assert_eq!(refreshed.spec.pool, "zellij");
+
+    daemon
+        .resource_backend()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("local-pool".to_string()).build(),
+            &PlacementPolicySpec::builder().pool("local".to_string()).build(),
+        )
+        .await
+        .expect("local placement policy create");
+    let local_intent = ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("local-pool".to_string()).build();
+    assert_eq!(daemon.resolve_convoy_start_target_node(&local_intent).await.expect("non-host-direct placement should remain local"), None);
 }
 
 #[test]
@@ -957,6 +1050,51 @@ async fn fleet_list_reports_store_backed_local_sessions_with_authority() {
     let snapshot = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot should succeed");
     assert_eq!(snapshot.host, daemon.host_name);
     assert_eq!(snapshot.rows, response.rows);
+}
+
+#[tokio::test]
+async fn fleet_list_shows_simultaneous_convoys_on_kiwi_feta_and_udder() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"kiwi-host\"\n").expect("write daemon config");
+    write_attach_hosts_config(&config_base, &[("feta", "feta.local", None), ("udder", "udder.local", None)]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_running_attach_session(
+        &daemon,
+        &env_ref,
+        "terminal-kiwi-work-implement-coder",
+        "kiwi-session",
+        "kiwi-work",
+        "implement",
+        "coder",
+    )
+    .await;
+    for (host, convoy) in [("feta", "feta-work"), ("udder", "udder-work")] {
+        daemon.fleet_replica_cache.write().await.insert(HostName::new(host), FleetReplicaCacheEntry {
+            rows: vec![FleetListRow::builder()
+                .convoy(convoy.to_string())
+                .vessel("implement".to_string())
+                .crew("implement/coder".to_string())
+                .crew_state("running".to_string())
+                .host(HostName::new(host))
+                .namespace("flotilla")
+                .staleness(FleetStaleness::Local)
+                .build()],
+            result_sets: vec![],
+            last_sync: Some(Utc::now()),
+            generation: Some(format!("{host}-generation")),
+            last_error: None,
+        });
+    }
+
+    let rows = daemon.fleet_list_internal().await.expect("fleet list should succeed").rows;
+    let placements = rows.into_iter().map(|row| (row.convoy, row.host)).collect::<BTreeMap<_, _>>();
+    assert_eq!(placements.get("kiwi-work"), Some(&daemon.host_name));
+    assert_eq!(placements.get("feta-work"), Some(&HostName::new("feta")));
+    assert_eq!(placements.get("udder-work"), Some(&HostName::new("udder")));
 }
 
 #[tokio::test]

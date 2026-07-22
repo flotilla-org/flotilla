@@ -97,6 +97,7 @@ impl DaemonRuntime {
 
         let local_registry = probe_local_provider_registry(&daemon, &config).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
+        daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
         register_startup_resources(&daemon, &options.namespace, &profile).await?;
         apply_host_heartbeat(&daemon, &options.namespace, &profile).await?;
         if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {

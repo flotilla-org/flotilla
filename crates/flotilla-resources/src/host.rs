@@ -8,6 +8,7 @@ use crate::{resource::define_resource, retention::ResourceStoreDiagnostics, stat
 define_resource!(Host, "hosts", HostSpec, HostStatus, HostStatusPatch);
 
 pub const AGENT_ADAPTERS_CAPABILITY: &str = "agent_adapters";
+pub const TERMINAL_POOLS_CAPABILITY: &str = "terminal_pools";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSpec {}
