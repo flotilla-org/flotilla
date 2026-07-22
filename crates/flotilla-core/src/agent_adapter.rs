@@ -107,6 +107,7 @@ pub fn append_convoy_work_context(
             content.push_str(body);
             content.push('\n');
         }
+        content.push('\n');
     }
     if let Some(instruction) = &convoy.spec.instruction {
         content.push_str("\n## Human instruction\n\n");
@@ -292,12 +293,20 @@ impl AgentAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{process::Command as ProcessCommand, sync::Arc};
+    use std::{collections::BTreeMap, process::Command as ProcessCommand, sync::Arc};
 
-    use flotilla_resources::{single_agent_contained_workflow_spec, CrewSource, TerminalCrewContext};
+    use chrono::Utc;
+    use flotilla_protocol::{IssueRef, IssueSource, IssueState};
+    use flotilla_resources::{
+        single_agent_contained_workflow_spec, Convoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, CrewSource, IssueSnapshot, ObjectMeta,
+        RepositoryKey, ResourceObject, TerminalCrewContext,
+    };
 
     use crate::{
-        agent_adapter::{build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember},
+        agent_adapter::{
+            append_convoy_work_context, build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment,
+            CrewBriefMember,
+        },
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -362,6 +371,58 @@ mod tests {
         let content = brief_for(CrewAssignment::CarriedIssue);
         assert!(content.contains("## Assignment\n\nYour assignment is the issue snapshot section below."));
         assert!(!content.contains("No assignment was provided"));
+    }
+
+    #[test]
+    fn convoy_work_context_separates_multiple_issue_snapshots() {
+        let repo_ref = RepositoryKey("repo_widgets".to_string());
+        let source = IssueSource { service: "https://github.com".to_string(), scope: "flotilla-org/flotilla".to_string() };
+        let issue = |id: &str, title: &str, body: &str| ConvoyIssue {
+            reference: IssueRef { source: source.clone(), id: id.to_string() },
+            repository_ref: Some(repo_ref.clone()),
+            snapshot: IssueSnapshot {
+                title: title.to_string(),
+                body: Some(body.to_string()),
+                state: IssueState::Open,
+                labels: Vec::new(),
+                as_of: "2026-07-22T00:00:00Z".parse().expect("timestamp"),
+            },
+        };
+        let convoy = ResourceObject::<Convoy> {
+            metadata: ObjectMeta {
+                name: "batch".to_string(),
+                namespace: "flotilla".to_string(),
+                resource_version: "1".to_string(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                owner_references: Vec::new(),
+                finalizers: Vec::new(),
+                deletion_timestamp: None,
+                creation_timestamp: Utc::now(),
+            },
+            spec: ConvoySpec {
+                workflow_ref: "workflow".to_string(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![ConvoyRepositorySpec {
+                    url: "https://github.com/flotilla-org/flotilla".to_string(),
+                    repo_ref: repo_ref.clone(),
+                    base_ref: "main".to_string(),
+                    workspace_slug: "flotilla".to_string(),
+                    subpaths: Vec::new(),
+                }],
+                r#ref: Some("fix/batch".to_string()),
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: vec![issue("809", "First issue", "First issue body."), issue("810", "Second issue", "Second issue body.")],
+                instruction: None,
+            },
+            status: None,
+        };
+        let mut content = String::new();
+        append_convoy_work_context(&mut content, &convoy, &[repo_ref]);
+
+        assert!(content.contains("First issue body.\n\nSource-qualified reference: `https://github.com` / `flotilla-org/flotilla` / `810`"));
     }
 
     #[test]
