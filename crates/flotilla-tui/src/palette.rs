@@ -827,6 +827,7 @@ mod tests {
                     host: None,
                     checkout: None,
                     workspace_ref: None,
+                    materialize_ref: None,
                     completion_target: None,
                     ready_at: None,
                     started_at: None,

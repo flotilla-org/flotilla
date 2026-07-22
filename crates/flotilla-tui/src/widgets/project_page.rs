@@ -407,6 +407,15 @@ impl InteractiveWidget for ProjectPageWidget {
                     None => Outcome::Consumed,
                 },
             },
+            Action::OpenInPm => {
+                if let Some(intent) = Self::active_row(&layouts, ctx.views.active_project_table_state())
+                    .and_then(|(_, row)| row.actions.iter().find(|action| action.id == "open_in_pm"))
+                    .map(|action| action.intent.clone())
+                {
+                    ctx.app_actions.push(AppAction::ExecuteTableIntent(intent));
+                }
+                Outcome::Consumed
+            }
             _ => Outcome::Ignored,
         }
     }

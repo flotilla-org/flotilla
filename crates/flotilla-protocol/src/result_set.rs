@@ -566,6 +566,11 @@ pub struct VesselRow {
     /// an attach on this row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attach: Option<String>,
+    /// Terminal-session reference from which a presentation manager can
+    /// materialize this vessel's workspace. This is deliberately distinct
+    /// from `attach`, which names an already-observed PM workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialize: Option<String>,
     /// Capability fact: the daemon will accept completing this vessel's work.
     #[builder(default)]
     pub complete_work: bool,

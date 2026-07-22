@@ -52,6 +52,8 @@ pub enum Action {
     CompleteConvoyWork,
     /// Attach the active workspace manager to the selected convoy vessel's workspace.
     AttachConvoyVessel,
+    /// Materialize or focus the selected convoy/vessel in the connected PM.
+    OpenInPm,
     Dispatch(Intent),
 }
 
@@ -126,6 +128,7 @@ impl Action {
             "fill_selected" => Action::FillSelected,
             "complete_convoy_work" => Action::CompleteConvoyWork,
             "attach_convoy_vessel" => Action::AttachConvoyVessel,
+            "open_in_pm" => Action::OpenInPm,
             // Intent-wrapping actions
             "switch_to_workspace" => Action::Dispatch(Intent::SwitchToWorkspace),
             "create_workspace" => Action::Dispatch(Intent::CreateWorkspace),
@@ -181,6 +184,7 @@ impl Action {
             Action::FillSelected => "fill_selected",
             Action::CompleteConvoyWork => "complete_convoy_work",
             Action::AttachConvoyVessel => "attach_convoy_vessel",
+            Action::OpenInPm => "open_in_pm",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "switch_to_workspace",
                 Intent::CreateWorkspace => "create_workspace",
@@ -233,6 +237,7 @@ impl Action {
             Action::FillSelected => "Fill selected item",
             Action::CompleteConvoyWork => "Force complete work",
             Action::AttachConvoyVessel => "Attach to vessel workspace",
+            Action::OpenInPm => "Open in presentation manager",
             Action::Dispatch(intent) => match intent {
                 Intent::SwitchToWorkspace => "Switch to workspace",
                 Intent::CreateWorkspace => "Create workspace",

@@ -136,6 +136,7 @@ pub struct VesselSummary {
     pub host: Option<HostName>,
     pub checkout: Option<CheckoutRef>,
     pub workspace_ref: Option<String>,
+    pub materialize_ref: Option<String>,
     pub completion_target: Option<WorkCompletionTarget>,
     pub ready_at: Option<Timestamp>,
     pub started_at: Option<Timestamp>,
@@ -206,6 +207,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         // The convoys query does not yet expose checkout allocation.
         checkout: None,
         workspace_ref: vessel.attach.clone(),
+        materialize_ref: vessel.materialize.clone(),
         completion_target: vessel.complete_work.then(|| WorkCompletionTarget {
             convoy: row.name.clone(),
             vessel: vessel.name.clone(),

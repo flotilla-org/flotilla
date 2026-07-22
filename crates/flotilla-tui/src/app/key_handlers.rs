@@ -393,6 +393,34 @@ impl App {
 
     pub(super) fn execute_table_intent(&mut self, intent: TableIntent) {
         let (mut command, host) = match intent {
+            TableIntent::OpenInPm(target) => {
+                let locally_homed = target
+                    .host
+                    .as_ref()
+                    .is_some_and(|home| home == &HostName::local() || self.model.my_host().is_some_and(|local| home == local));
+                if !locally_homed {
+                    let home = target.host.as_ref().map_or_else(|| "unknown host".to_string(), ToString::to_string);
+                    self.set_status_message(Some(format!("{} is not reachable from this PM yet (homed on {home})", target.label)));
+                    return;
+                }
+                let Some(connector) = self.pm_connector.clone() else {
+                    self.set_status_message(Some("No presentation manager is connected".to_string()));
+                    return;
+                };
+                let working_directory = self
+                    .table_action_repo(target.repo_hint.as_ref())
+                    .and_then(|identity| self.model.repos.get(&identity).map(|repo| repo.path.clone()))
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let tx = self.pm_update_tx.clone();
+                let label = target.label.clone();
+                self.set_status_message(Some(format!("Opening {label} in PM...")));
+                tokio::spawn(async move {
+                    let result = connector.open(&target, &working_directory).await;
+                    let _ = tx.send(super::PmOpenUpdate { label, result });
+                });
+                return;
+            }
             TableIntent::AttachWorkspace { workspace_ref, host, repo_hint } => {
                 let Some(repo_identity) = self.table_action_repo(repo_hint.as_ref()) else {
                     self.set_status_message(Some("Cannot attach workspace: the convoy does not identify a tracked repository".to_string()));

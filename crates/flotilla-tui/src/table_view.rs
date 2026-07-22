@@ -14,6 +14,7 @@ use flotilla_protocol::{
 use crate::{
     app::ui_state::PendingAction,
     convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase},
+    pm_open::OpenInPmTarget,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -311,6 +312,7 @@ pub struct DetailField {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TableIntent {
+    OpenInPm(OpenInPmTarget),
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
     DeleteConvoy { namespace: String, name: String, host: Option<HostName> },
@@ -413,7 +415,10 @@ fn fuzzy_matches(value: &str, pattern: &str) -> bool {
 struct VesselProjection {
     namespace: String,
     convoy: String,
+    origin_host: Option<HostName>,
+    project_ref: Option<String>,
     repo_hint: Option<RepoKey>,
+    vessel_count: usize,
     vessel: VesselSummary,
 }
 
@@ -489,7 +494,10 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             let rows = stable_topological_vessels(&convoy.vessels).into_iter().map(|vessel| VesselProjection {
                 namespace: namespace.clone(),
                 convoy: name.clone(),
+                origin_host: convoy.origin_host.clone(),
+                project_ref: convoy.project_ref.clone(),
                 repo_hint: convoy.repo_hint.clone(),
+                vessel_count: convoy.vessels.len(),
                 vessel: vessel.clone(),
             });
             let title = convoy.change_request.as_ref().map_or_else(
@@ -508,7 +516,10 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
             Ok(vessel_spec().project(format!("Vessel · {vessel}"), [VesselProjection {
                 namespace: namespace.clone(),
                 convoy: convoy.clone(),
+                origin_host: convoy_row.origin_host.clone(),
+                project_ref: convoy_row.project_ref.clone(),
                 repo_hint: convoy_row.repo_hint.clone(),
+                vessel_count: convoy_row.vessels.len(),
                 vessel: vessel_row.clone(),
             }]))
         }
@@ -728,13 +739,11 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
     },
 ];
 
-static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 2] =
-    [ActionSpec { id: "open_pr", label: "Open PR", key: 'p', resolve: open_convoy_change_request }, ActionSpec {
-        id: "delete",
-        label: "Delete convoy",
-        key: 'd',
-        resolve: delete_convoy,
-    }];
+static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 3] = [
+    ActionSpec { id: "open_pr", label: "Open PR", key: 'p', resolve: open_convoy_change_request },
+    ActionSpec { id: "delete", label: "Delete convoy", key: 'd', resolve: delete_convoy },
+    ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_convoy_in_pm },
+];
 
 static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     ColumnSpec {
@@ -775,13 +784,11 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     },
 ];
 
-static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 2] =
-    [ActionSpec { id: "attach", label: "Attach workspace", key: 'a', resolve: attach_vessel }, ActionSpec {
-        id: "force_complete",
-        label: "Force-complete work",
-        key: 'x',
-        resolve: force_complete_vessel,
-    }];
+static VESSEL_ACTIONS: [ActionSpec<VesselProjection>; 3] = [
+    ActionSpec { id: "attach", label: "Attach workspace", key: 'a', resolve: attach_vessel },
+    ActionSpec { id: "force_complete", label: "Force-complete work", key: 'x', resolve: force_complete_vessel },
+    ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_vessel_in_pm },
+];
 
 static INDEPENDENT_COLUMNS: [ColumnSpec<IndependentRow>; 5] = [
     ColumnSpec {
@@ -971,6 +978,30 @@ fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
     })
 }
 
+fn open_convoy_in_pm(row: &ConvoySummary) -> Option<TableIntent> {
+    let vessel = row
+        .vessels
+        .iter()
+        .find(|vessel| vessel.workspace_ref.is_some())
+        .or_else(|| row.vessels.iter().find(|vessel| vessel.materialize_ref.is_some()))
+        .or_else(|| row.vessels.first());
+    let label = vessel.map_or_else(
+        || row.name.clone(),
+        |vessel| if row.vessels.len() == 1 { row.name.clone() } else { format!("{}:{}", row.name, vessel.name) },
+    );
+    Some(TableIntent::OpenInPm(OpenInPmTarget {
+        namespace: row.namespace.clone(),
+        convoy: row.name.clone(),
+        vessel: vessel.map(|vessel| vessel.name.clone()),
+        label,
+        host: row.origin_host.clone().or_else(|| vessel.and_then(|vessel| vessel.host.clone())),
+        project_ref: row.project_ref.clone(),
+        repo_hint: row.repo_hint.clone(),
+        workspace_ref: vessel.and_then(|vessel| vessel.workspace_ref.clone()),
+        materialize_ref: vessel.and_then(|vessel| vessel.materialize_ref.clone()),
+    }))
+}
+
 fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
     Some(TableIntent::DeleteConvoy { namespace: row.namespace.clone(), name: row.name.clone(), host: row.origin_host.clone() })
 }
@@ -1063,6 +1094,20 @@ fn attach_vessel(row: &VesselProjection) -> Option<TableIntent> {
     })
 }
 
+fn open_vessel_in_pm(row: &VesselProjection) -> Option<TableIntent> {
+    Some(TableIntent::OpenInPm(OpenInPmTarget {
+        namespace: row.namespace.clone(),
+        convoy: row.convoy.clone(),
+        vessel: Some(row.vessel.name.clone()),
+        label: if row.vessel_count == 1 { row.convoy.clone() } else { format!("{}:{}", row.convoy, row.vessel.name) },
+        host: row.origin_host.clone().or_else(|| row.vessel.host.clone()),
+        project_ref: row.project_ref.clone(),
+        repo_hint: row.repo_hint.clone(),
+        workspace_ref: row.vessel.workspace_ref.clone(),
+        materialize_ref: row.vessel.materialize_ref.clone(),
+    }))
+}
+
 fn force_complete_vessel(row: &VesselProjection) -> Option<TableIntent> {
     let target = row.vessel.completion_target.as_ref()?;
     Some(TableIntent::ForceCompleteWork { convoy: target.convoy.clone(), vessel: target.vessel.clone(), host: target.host.clone() })
@@ -1120,6 +1165,7 @@ mod tests {
             host: Some(HostName::new("kiwi")),
             checkout: None,
             workspace_ref: None,
+            materialize_ref: None,
             completion_target: None,
             ready_at: None,
             started_at: None,
@@ -1238,12 +1284,16 @@ mod tests {
         row.origin_host = Some(HostName::new("kiwi"));
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
-        assert_eq!(view.rows[0].actions, vec![AvailableAction {
-            id: "delete",
-            label: "Delete convoy",
-            key: 'd',
-            intent: TableIntent::DeleteConvoy { namespace: "dev".into(), name: "tables".into(), host: Some(HostName::new("kiwi")) },
-        }]);
+        assert!(view.rows[0].actions.iter().any(|action| action.id == "open_in_pm" && action.label == "Open in PM" && action.key == 'o'));
+        assert!(view.rows[0].actions.iter().any(|action| {
+            action
+                == &AvailableAction {
+                    id: "delete",
+                    label: "Delete convoy",
+                    key: 'd',
+                    intent: TableIntent::DeleteConvoy { namespace: "dev".into(), name: "tables".into(), host: Some(HostName::new("kiwi")) },
+                }
+        }));
     }
 
     #[test]
@@ -1283,8 +1333,8 @@ mod tests {
         let row = convoy(vec![actionable, vessel("review", &["implement"], WorkPhase::Pending)]);
         let view = project_convoys("convoy/dev/tables", &[&row]).expect("project table");
 
-        assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete"]);
-        assert!(view.rows[1].actions.is_empty(), "unavailable actions must not render");
+        assert_eq!(view.rows[0].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["attach", "force_complete", "open_in_pm"]);
+        assert_eq!(view.rows[1].actions.iter().map(|action| action.id).collect::<Vec<_>>(), vec!["open_in_pm"]);
     }
 
     #[test]

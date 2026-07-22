@@ -16,13 +16,13 @@ fn session_ref(namespace: &str, name: &str) -> ResourceRef {
 }
 
 #[bon::builder]
-fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, attach: Option<&str>) -> VesselRow {
+fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, materialize: Option<&str>) -> VesselRow {
     VesselRow::builder()
         .resource(convoy.subresource(format!("vessels/{name}")))
         .name(name)
         .phase(phase)
         .host(HostName::new("feta"))
-        .maybe_attach(attach.map(str::to_owned))
+        .maybe_materialize(materialize.map(str::to_owned))
         .build()
 }
 
@@ -87,7 +87,7 @@ fn convoy_with_project_ref_projects_the_full_spine() {
                     },
                 ])
                 .host(HostName::new("feta"))
-                .attach("workspace-1")
+                .materialize("terminal-implement")
                 .build(),
             vessel().convoy(&reference).name("review").phase(WorkPhase::Complete).call(),
         ])
@@ -118,7 +118,7 @@ fn convoy_with_project_ref_projects_the_full_spine() {
     assert_eq!(text(implement, KEY_STATUS_STATE), "active");
     assert_eq!(text(implement, KEY_VESSEL_HOST), "feta");
     assert_eq!(text(implement, KEY_MATERIALIZE_TARGET), "workspace");
-    assert_eq!(text(implement, KEY_MATERIALIZE_RECIPE), "flotilla attach workspace-1");
+    assert_eq!(text(implement, KEY_MATERIALIZE_RECIPE), "flotilla attach terminal-implement");
     assert_eq!(text(implement, KEY_FACTORY_ID), "flotilla:convoys/dev/manifest-extraction/implement");
     assert_eq!(implement.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned(), "reviewer".to_owned()]));
 

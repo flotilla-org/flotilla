@@ -119,6 +119,7 @@ pub struct Aggregator {
     sessions_by_source: HashMap<LocalSource, HashMap<SessionKey, ResourceObject<TerminalSession>>>,
     presentation_workspaces: HashMap<PresentationKey, String>,
     terminal_sessions: HashMap<SessionKey, ResourceObject<TerminalSession>>,
+    attachable_references: HashSet<String>,
     projects: HashMap<(String, String), ResourceObject<Project>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
@@ -149,6 +150,7 @@ impl Aggregator {
             sessions_by_source: HashMap::new(),
             presentation_workspaces: HashMap::new(),
             terminal_sessions: HashMap::new(),
+            attachable_references: HashSet::new(),
             projects: HashMap::new(),
             repositories: HashMap::new(),
             observed_checkouts: HashMap::new(),
@@ -977,21 +979,19 @@ impl Aggregator {
         }
         self.terminal_sessions = effective_sessions;
 
-        let attachable_references = match &self.attach_resolver {
+        self.attachable_references = match &self.attach_resolver {
             Some(daemon) => {
-                let references = self
-                    .terminal_sessions
-                    .values()
-                    .filter(|session| is_independent_session(session))
-                    .map(|session| session.metadata.name.clone())
-                    .collect::<Vec<_>>();
+                let references = self.terminal_sessions.values().map(|session| session.metadata.name.clone()).collect::<Vec<_>>();
                 daemon.resolvable_attach_references(&references).await.unwrap_or_default()
             }
             None => HashSet::new(),
         };
 
-        let replacement =
-            self.terminal_sessions.values().filter_map(|session| self.summarize_independent(session, &attachable_references)).collect();
+        let replacement = self
+            .terminal_sessions
+            .values()
+            .filter_map(|session| self.summarize_independent(session, &self.attachable_references))
+            .collect();
         let deltas = self.state.replace_local_independent_rows(replacement).await;
         self.emit_store_deltas(deltas);
     }
@@ -1121,6 +1121,20 @@ impl Aggregator {
         self.presentation_workspaces.get(&(namespace.to_string(), convoy.to_string(), vessel.to_string())).cloned()
     }
 
+    fn vessel_materialize(&self, namespace: &str, convoy: &str, vessel: &str) -> Option<String> {
+        self.terminal_sessions
+            .values()
+            .filter(|session| {
+                session.metadata.namespace == namespace
+                    && session.metadata.labels.get(CONVOY_LABEL).is_some_and(|value| value == convoy)
+                    && session.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel)
+                    && session.status.as_ref().is_some_and(|status| status.phase == TerminalSessionPhase::Running)
+                    && self.attachable_references.contains(&session.metadata.name)
+            })
+            .min_by_key(|session| &session.metadata.name)
+            .map(|session| session.metadata.name.clone())
+    }
+
     fn summarize(&self, convoy: &ResourceObject<Convoy>) -> ConvoyRow {
         let namespace = &convoy.metadata.namespace;
         let name = &convoy.metadata.name;
@@ -1222,6 +1236,7 @@ impl Aggregator {
             .depends_on(definition.depends_on.clone())
             .host(self.local_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
+            .maybe_materialize(self.vessel_materialize(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .needs_attention(needs_attention)
             .build()

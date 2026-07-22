@@ -284,7 +284,7 @@ fn project_vessel(
     }
     // Vessels materialise at workspace granularity (ADR 0012); the recipe
     // exists iff the daemon can resolve the attach — a capability fact.
-    if let Some(recipe) = vessel.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
+    if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref)) {
         facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("workspace")));
         facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
     }
