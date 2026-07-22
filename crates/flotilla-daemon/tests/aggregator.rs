@@ -404,7 +404,7 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     .expect("materialized issue window");
     let rows = result.rows.as_issues().expect("issue rows");
     assert_eq!(rows.len(), 50);
-    assert_eq!(rows[0].reference.id, "WIDGET-000");
+    assert_eq!(rows[0].reference.id, "WIDGET-049");
     assert!(result.state.demand.as_ref().expect("demand metadata").has_more);
     assert!(result.state.conditions.is_empty());
 
