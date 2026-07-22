@@ -17,7 +17,7 @@ pub struct GitHubChangeRequest {
     runner: Arc<dyn CommandRunner>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
 struct GhPr {
     number: i64,
     title: String,
@@ -67,15 +67,17 @@ impl GitHubChangeRequest {
     }
 
     fn parse_pull_request(value: &serde_json::Value) -> Option<GhPr> {
-        Some(GhPr {
-            number: value["number"].as_i64()?,
-            title: value["title"].as_str()?.to_string(),
-            head_ref_name: value["head"]["ref"].as_str()?.to_string(),
-            state: value["state"].as_str().unwrap_or("open").to_string(),
-            body: value["body"].as_str().map(str::to_string),
-            is_draft: value["draft"].as_bool().unwrap_or(false),
-            merged_at: value["merged_at"].as_str().map(str::to_string),
-        })
+        Some(
+            GhPr::builder()
+                .number(value["number"].as_i64()?)
+                .title(value["title"].as_str()?.to_string())
+                .head_ref_name(value["head"]["ref"].as_str()?.to_string())
+                .state(value["state"].as_str().unwrap_or("open").to_string())
+                .maybe_body(value["body"].as_str().map(str::to_string))
+                .is_draft(value["draft"].as_bool().unwrap_or(false))
+                .maybe_merged_at(value["merged_at"].as_str().map(str::to_string))
+                .build(),
+        )
     }
 
     fn gh_pr_to_change_request(&self, pr: &GhPr) -> (String, ChangeRequest) {
@@ -136,18 +138,14 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     }
 
     async fn find_change_request_by_branch(&self, repo_root: &Path, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
-        let owner = self.repo_slug.split_once('/').map(|(owner, _)| owner).ok_or("GitHub repository slug is missing its owner")?;
-        let head_filter = format!("{owner}:{branch}");
-        let head = urlencoding::encode(&head_filter);
-        let endpoint = format!("repos/{}/pulls?state=all&head={head}&per_page=1", self.repo_slug);
+        let endpoint = format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug);
         let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| error.to_string())?;
-        let Some(value) = items.first() else {
-            return Ok(None);
-        };
-
-        let pull_request = Self::parse_pull_request(value).ok_or("malformed pull request")?;
-        Ok(Some(self.gh_pr_to_change_request(&pull_request)))
+        Ok(items
+            .iter()
+            .filter_map(Self::parse_pull_request)
+            .find(|pull_request| pull_request.head_ref_name == branch)
+            .map(|pull_request| self.gh_pr_to_change_request(&pull_request)))
     }
 
     async fn get_change_request(&self, repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
@@ -353,9 +351,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finds_merged_pull_request_by_branch() {
+    async fn finds_merged_fork_pull_request_by_branch() {
         let api = Arc::new(StubGhApi {
-            body: r#"[{"number":815,"title":"Ship convoy","head":{"ref":"feat/convoy"},"state":"closed","merged_at":"2026-07-21T12:00:00Z","body":null,"draft":false}]"#.into(),
+            body: r#"[{"number":814,"title":"Other work","head":{"ref":"feat/other"},"state":"open","merged_at":null,"body":null,"draft":false},{"number":815,"title":"Ship convoy","head":{"ref":"feat/convoy"},"state":"closed","merged_at":"2026-07-21T12:00:00Z","body":null,"draft":false}]"#.into(),
             endpoints: Mutex::new(Vec::new()),
         });
         let provider = provider_with_api(api.clone());
@@ -368,9 +366,7 @@ mod tests {
 
         assert_eq!(result.0, "815");
         assert_eq!(result.1.status, ChangeRequestStatus::Merged);
-        assert_eq!(api.endpoints.lock().expect("endpoint lock").as_slice(), [
-            "repos/owner/repo/pulls?state=all&head=owner%3Afeat%2Fconvoy&per_page=1"
-        ]);
+        assert_eq!(api.endpoints.lock().expect("endpoint lock").as_slice(), ["repos/owner/repo/pulls?state=all&per_page=100"]);
     }
 
     #[tokio::test]
@@ -384,15 +380,13 @@ mod tests {
     }
 
     fn gh_pr(number: i64) -> GhPr {
-        GhPr {
-            number,
-            title: "Add feature".into(),
-            head_ref_name: "feat/add-feature".into(),
-            state: "OPEN".into(),
-            body: None,
-            is_draft: false,
-            merged_at: None,
-        }
+        GhPr::builder()
+            .number(number)
+            .title("Add feature".to_string())
+            .head_ref_name("feat/add-feature".to_string())
+            .state("OPEN".to_string())
+            .is_draft(false)
+            .build()
     }
 
     #[test]

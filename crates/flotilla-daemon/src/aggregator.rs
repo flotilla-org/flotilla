@@ -610,15 +610,19 @@ impl Aggregator {
             }
             WatchEvent::Modified(convoy) => {
                 let reference = self.convoy_ref(&convoy.metadata.namespace, &convoy.metadata.name);
-                let should_refresh =
-                    self.convoys_by_source.get(&source).and_then(|convoys| convoys.get(&reference)).is_none_or(|previous| {
-                        previous.status.as_ref().map(|status| status.phase) != convoy.status.as_ref().map(|status| status.phase)
-                            || previous.spec.r#ref != convoy.spec.r#ref
-                            || previous.spec.repositories != convoy.spec.repositories
-                    });
+                let previous = self.convoys_by_source.get(&source).and_then(|convoys| convoys.get(&reference));
+                let association_changed = previous.is_none_or(|previous| {
+                    previous.spec.r#ref != convoy.spec.r#ref || previous.spec.repositories != convoy.spec.repositories
+                });
+                let phase_changed = previous.is_none_or(|previous| {
+                    previous.status.as_ref().map(|status| status.phase) != convoy.status.as_ref().map(|status| status.phase)
+                });
+                if association_changed {
+                    self.convoy_change_requests.remove(&reference);
+                }
                 self.convoys_by_source.entry(source).or_default().insert(reference, convoy.clone());
                 self.rebuild_local_projection().await;
-                if should_refresh {
+                if association_changed || phase_changed {
                     self.refresh_change_request(&convoy).await;
                     self.rebuild_local_projection().await;
                 }
@@ -664,23 +668,24 @@ impl Aggregator {
     }
 
     async fn refresh_all_change_requests(&mut self) {
-        let mut effective_convoys = HashMap::new();
-        for source in LOCAL_SOURCE_PRECEDENCE {
-            let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
-            effective_convoys.extend(convoys.iter().map(|(reference, convoy)| (reference.clone(), convoy.clone())));
-        }
+        let effective_convoys = self.effective_convoys();
         for convoy in effective_convoys.values() {
             self.refresh_change_request(convoy).await;
         }
         self.rebuild_local_projection().await;
     }
 
-    async fn rebuild_local_projection(&mut self) {
+    fn effective_convoys(&self) -> HashMap<ResourceRef, ResourceObject<Convoy>> {
         let mut effective_convoys = HashMap::new();
         for source in LOCAL_SOURCE_PRECEDENCE {
             let Some(convoys) = self.convoys_by_source.get(&source) else { continue };
             effective_convoys.extend(convoys.iter().map(|(reference, convoy)| (reference.clone(), convoy.clone())));
         }
+        effective_convoys
+    }
+
+    async fn rebuild_local_projection(&mut self) {
+        let effective_convoys = self.effective_convoys();
         let presentation_keys = effective_convoys
             .values()
             .flat_map(|convoy| {
@@ -1203,7 +1208,8 @@ mod tests {
     }
 
     struct ScriptedChangeRequestResolver {
-        results: Mutex<VecDeque<Option<flotilla_protocol::ConvoyChangeRequest>>>,
+        results: Mutex<VecDeque<Result<Option<flotilla_protocol::ConvoyChangeRequest>, String>>>,
+        branches: Mutex<Vec<String>>,
         calls: AtomicUsize,
     }
 
@@ -1215,9 +1221,9 @@ mod tests {
             branch: &str,
         ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
             assert_eq!(repositories, [RepositoryKey("repo_flotilla".into())]);
-            assert_eq!(branch, "feat/convoy");
+            self.branches.lock().await.push(branch.to_string());
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.results.lock().await.pop_front().flatten())
+            self.results.lock().await.pop_front().unwrap_or(Ok(None))
         }
     }
 
@@ -1417,17 +1423,18 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let resolver = Arc::new(ScriptedChangeRequestResolver {
             results: Mutex::new(VecDeque::from([
-                Some(flotilla_protocol::ConvoyChangeRequest {
+                Ok(Some(flotilla_protocol::ConvoyChangeRequest {
                     id: "815".into(),
                     status: flotilla_protocol::ChangeRequestStatus::Open,
                     repository_key: RepositoryKey("repo_flotilla".into()),
-                }),
-                Some(flotilla_protocol::ConvoyChangeRequest {
+                })),
+                Ok(Some(flotilla_protocol::ConvoyChangeRequest {
                     id: "815".into(),
                     status: flotilla_protocol::ChangeRequestStatus::Merged,
                     repository_key: RepositoryKey("repo_flotilla".into()),
-                }),
+                })),
             ])),
+            branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
         let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
@@ -1462,22 +1469,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn convoy_branch_change_clears_the_previous_change_request_before_refresh() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::from([
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+                Err("forge unavailable".into()),
+            ])),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::clone(&resolver));
+        let mut convoy = convoy_with_branch("convoy-a").await;
+
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy.clone())).await;
+        assert!(matches!(event_rx.recv().await.expect("initial result set"), DaemonEvent::ResultSet(_)));
+
+        convoy.spec.r#ref = Some("feat/rebased".into());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Modified(convoy)).await;
+        let DaemonEvent::ResultDelta(delta) = event_rx.recv().await.expect("association removal delta") else {
+            panic!("expected result delta");
+        };
+        assert!(delta.changes.as_convoys().expect("convoy changes")[0].change_request.is_none());
+        assert_eq!(resolver.branches.lock().await.as_slice(), ["feat/convoy", "feat/rebased"]);
+    }
+
+    #[tokio::test]
     async fn provider_refresh_cadence_refreshes_convoy_change_requests() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let resolver = Arc::new(ScriptedChangeRequestResolver {
             results: Mutex::new(VecDeque::from([
-                Some(ConvoyChangeRequest {
+                Ok(Some(ConvoyChangeRequest {
                     id: "815".into(),
                     status: flotilla_protocol::ChangeRequestStatus::Open,
                     repository_key: RepositoryKey("repo_flotilla".into()),
-                }),
-                Some(ConvoyChangeRequest {
+                })),
+                Ok(Some(ConvoyChangeRequest {
                     id: "815".into(),
                     status: flotilla_protocol::ChangeRequestStatus::Closed,
                     repository_key: RepositoryKey("repo_flotilla".into()),
-                }),
+                })),
             ])),
+            branches: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
         });
         let durable_convoys = ScriptedSource::new(
