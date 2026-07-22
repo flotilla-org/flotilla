@@ -15,10 +15,10 @@ use flotilla_core::{
     repository_inspection::{LocalCheckoutInspection, RepositoryInspection, RepositoryInspector},
 };
 use flotilla_daemon::runtime::{DaemonRuntime, RuntimeOptions};
-use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName};
+use flotilla_protocol::{commands::RepositoryIdentityChange, Command, CommandAction, CommandValue, DaemonEvent, HostName, RepoSelector};
 use flotilla_resources::{
-    Checkout, Convoy, InMemoryBackend, InputMeta, IssueSource, Project, ProjectSpec, Repository, RepositoryKey, RepositorySpec,
-    RepositoryStatus, ResourceBackend,
+    Checkout, CheckoutSpec, Convoy, InMemoryBackend, InputMeta, IssueSource, ObservedCheckoutSpec, Project, ProjectSpec, Repository,
+    RepositoryKey, RepositorySpec, RepositoryStatus, ResourceBackend,
 };
 
 fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
@@ -222,8 +222,8 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
         path: checkout_path.clone(),
         resolved_from: None,
         identity_change: Some(RepositoryIdentityChange {
-            previous: "local".to_string(),
-            current: "https://github.com/flotilla-org/andamento".to_string(),
+            previous_display: "local".to_string(),
+            current_display: "https://github.com/flotilla-org/andamento".to_string(),
         }),
     });
 
@@ -265,6 +265,105 @@ async fn retracking_path_after_remote_appears_migrates_repository_identity() {
         .await
         .expect("convoy create");
     assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated { name: "identity-migrated".into() });
+}
+
+#[tokio::test]
+async fn refresh_surfaces_and_reconciles_repository_identity_change() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    let checkout_path = tmp.path().join("refreshed");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let inspected_spec = Arc::new(RwLock::new(
+        RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec"),
+    ));
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    let add_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
+        })
+        .await
+        .expect("initial repo add");
+    assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
+
+    let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/refreshed").expect("remote repository spec");
+    let remote_key = remote_spec.key();
+    *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let refresh_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::Refresh { repo: Some(RepoSelector::Path(checkout_path.clone())) },
+        })
+        .await
+        .expect("refresh command");
+
+    assert_eq!(await_command_result(&mut rx, refresh_id).await, CommandValue::Refreshed {
+        repos: vec![checkout_path],
+        identity_changes: vec![RepositoryIdentityChange {
+            previous_display: "local".to_string(),
+            current_display: "https://github.com/flotilla-org/refreshed".to_string(),
+        }],
+    });
+    let project = backend.using::<Project>("flotilla").get("refreshed").await.expect("migrated project");
+    assert_eq!(project.spec.repositories[0].repo, remote_key);
+}
+
+#[tokio::test]
+async fn identity_migration_marks_repository_retained_by_durable_checkout() {
+    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let mut rx = daemon.subscribe();
+    let checkout_path = tmp.path().join("retained");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
+    let local_key = local_spec.key();
+    let inspected_spec = Arc::new(RwLock::new(local_spec));
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    let add_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path.clone() },
+        })
+        .await
+        .expect("initial repo add");
+    assert!(matches!(await_command_result(&mut rx, add_id).await, CommandValue::RepoTracked { .. }));
+    backend
+        .clone()
+        .using::<Checkout>("flotilla")
+        .create(
+            &InputMeta::builder().name("durable-old-checkout".to_string()).build(),
+            &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                r#ref: "main".to_string(),
+                path: checkout_path.to_string_lossy().into_owned(),
+                repo_ref: local_key.clone(),
+                host_ref: "host-01".to_string(),
+                is_main: true,
+            }),
+        )
+        .await
+        .expect("durable checkout");
+
+    let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/retained").expect("remote repository spec");
+    let remote_key = remote_spec.key();
+    *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    let second_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::TrackRepoPath { path: checkout_path },
+        })
+        .await
+        .expect("repo add after remote appears");
+    assert!(matches!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked { .. }));
+
+    let retained = backend.using::<Repository>("flotilla").get(&local_key.to_string()).await.expect("retained old repository");
+    assert_eq!(retained.metadata.annotations.get("flotilla.work/superseded-by"), Some(&remote_key.to_string()));
 }
 
 #[tokio::test]

@@ -389,12 +389,18 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                 None => format!("repo tracked: {}", path.display()),
             };
             if let Some(change) = identity_change {
-                output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous, change.current));
+                output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous_display, change.current_display));
             }
             output
         }
         CommandValue::RepoUntracked { path } => format!("repo untracked: {}", path.display()),
-        CommandValue::Refreshed { repos } => format!("refreshed {} repo(s)", repos.len()),
+        CommandValue::Refreshed { repos, identity_changes } => {
+            let mut output = format!("refreshed {} repo(s)", repos.len());
+            for change in identity_changes {
+                output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous_display, change.current_display));
+            }
+            output
+        }
         CommandValue::CheckoutCreated { branch, .. } => format!("checkout created: {branch}"),
         CommandValue::CheckoutRemoved { branch } => format!("checkout removed: {branch}"),
         CommandValue::TerminalPrepared { branch, target_node_id, .. } => format!("terminal prepared: {branch} on {target_node_id}"),

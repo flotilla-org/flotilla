@@ -3081,6 +3081,7 @@ async fn repository_identity_change_reconciles_old_identity_shared_by_another_ro
             fixed_repository_by_path: HashMap::from([(repo_b.clone(), "old-repo".to_string())]),
         }))
         .await;
+    daemon.materialize_tracked_repo_projects().await.expect("materialize projects for the shared identity");
     let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla");
     let mut events = daemon.subscribe();
 
@@ -3118,6 +3119,13 @@ async fn repository_identity_change_reconciles_old_identity_shared_by_another_ro
         checkout.metadata.labels.get(REPO_LABEL).map(String::as_str) == Some("github-com-owner-new-repo")
             && matches!(&checkout.spec, ResourceCheckoutSpec::Observed(spec) if spec.path == repo_a.to_string_lossy())
     }));
+
+    let projects = daemon.resource_backend().using::<Project>("flotilla").list().await.expect("project list");
+    assert_eq!(projects.items.len(), 2, "the shared old identity must retain its own Project");
+    assert!(projects.items.iter().any(|project| project.spec.repositories[0].repo
+        == RepositorySpec::remote("https://github.com/owner/old-repo").expect("old repository spec").key()));
+    assert!(projects.items.iter().any(|project| project.spec.repositories[0].repo
+        == RepositorySpec::remote("https://github.com/owner/new-repo").expect("new repository spec").key()));
 }
 
 #[tokio::test]
@@ -4491,7 +4499,8 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
         .add_virtual_repo(identity.clone(), None, PathBuf::from("/remote/desktop/owner/repo"), vec![], 0)
         .await
         .expect("add virtual repo");
-    let (tracked_path, _, _) = daemon.add_repo(&local_repo).await.expect("add local repo");
+    let outcome = daemon.add_repo(&local_repo).await.expect("add local repo");
+    let tracked_path = outcome.tracked_path;
     // Path may be canonicalized (e.g. /var -> /private/var on macOS)
     let canonical_repo = std::fs::canonicalize(&local_repo).unwrap_or_else(|_| local_repo.clone());
 
@@ -4957,7 +4966,7 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     .await
     .expect("timeout waiting for refresh all CommandFinished");
 
-    assert!(matches!(finished, CommandValue::Refreshed { repos } if repos.len() == 2));
+    assert!(matches!(finished, CommandValue::Refreshed { repos, .. } if repos.len() == 2));
 }
 
 #[tokio::test]
@@ -5308,7 +5317,9 @@ async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
         )))
         .expect("replace local environment bag");
 
-    let (tracked_path, resolved_from, _) = daemon.add_repo(&repo).await.expect("add repo");
+    let outcome = daemon.add_repo(&repo).await.expect("add repo");
+    let tracked_path = outcome.tracked_path;
+    let resolved_from = outcome.resolved_from;
 
     assert_eq!(tracked_path, repo);
     assert_eq!(resolved_from, None);

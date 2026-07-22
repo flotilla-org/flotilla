@@ -467,8 +467,8 @@ mod command_result_human {
             path: PathBuf::from("/tmp/my-repo"),
             resolved_from: None,
             identity_change: Some(RepositoryIdentityChange {
-                previous: "local".to_string(),
-                current: "https://github.com/flotilla-org/my-repo".to_string(),
+                previous_display: "local".to_string(),
+                current_display: "https://github.com/flotilla-org/my-repo".to_string(),
             }),
         };
 
@@ -488,14 +488,17 @@ mod command_result_human {
 
     #[test]
     fn refreshed() {
-        let result = CommandValue::Refreshed { repos: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")] };
+        let result = CommandValue::Refreshed {
+            repos: vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")],
+            identity_changes: Vec::new(),
+        };
         let output = format_command_result(&result);
         assert!(output.contains("refreshed 3 repo(s)"), "should show count of repos");
     }
 
     #[test]
     fn refreshed_empty() {
-        let result = CommandValue::Refreshed { repos: vec![] };
+        let result = CommandValue::Refreshed { repos: vec![], identity_changes: Vec::new() };
         let output = format_command_result(&result);
         assert!(output.contains("refreshed 0 repo(s)"), "should handle zero repos");
     }

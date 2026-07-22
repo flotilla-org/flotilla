@@ -1008,6 +1008,8 @@ struct FleetReplicaCacheEntry {
     last_error: Option<String>,
 }
 
+const SUPERSEDED_BY_ANNOTATION: &str = "flotilla.work/superseded-by";
+
 #[derive(bon::Builder)]
 struct ResolvedCrewContext {
     namespace: String,
@@ -2945,8 +2947,11 @@ fn local_repository_matches_checkout(spec: &RepositorySpec, checkout: &crate::re
     }
 }
 
-struct RepositoryProjectReconciliation {
-    identity_change: Option<RepositoryIdentityChange>,
+#[derive(Debug)]
+pub struct AddRepoOutcome {
+    pub tracked_path: PathBuf,
+    pub resolved_from: Option<PathBuf>,
+    pub identity_change: Option<RepositoryIdentityChange>,
 }
 
 fn normalize_workspace_slug(candidate: &str) -> String {
@@ -3677,7 +3682,7 @@ impl InProcessDaemon {
     async fn reconcile_whole_repository_project(
         &self,
         inspection: &crate::repository_inspection::RepositoryInspection,
-    ) -> Result<RepositoryProjectReconciliation, String> {
+    ) -> Result<Option<RepositoryIdentityChange>, String> {
         let namespace = self.provisioning_namespace().await;
         let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
@@ -3722,9 +3727,19 @@ impl InProcessDaemon {
             }
         }
 
+        let other_tracked_keys = self
+            .repository_keys_by_path
+            .read()
+            .await
+            .iter()
+            .filter(|(path, _)| *path != &inspection.checkout.path)
+            .map(|(_, key)| key.clone())
+            .collect::<BTreeSet<_>>();
+        let migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
+
         let mut project_objects = projects.list().await.map_err(|error| error.to_string())?.items;
         let mut generated_names = whole_repository_project_names(repository_spec)?.into_iter().collect::<BTreeSet<_>>();
-        for key in &superseded_keys {
+        for key in &migratable_keys {
             if let Some(spec) = repository_specs.get(key) {
                 generated_names.extend(whole_repository_project_names(spec)?);
             }
@@ -3733,7 +3748,7 @@ impl InProcessDaemon {
             let mut updated = project.spec.clone();
             let mut changed = false;
             for entry in &mut updated.repositories {
-                if superseded_keys.contains(&entry.repo) {
+                if migratable_keys.contains(&entry.repo) {
                     entry.repo = repository_key.clone();
                     changed = true;
                 }
@@ -3764,22 +3779,14 @@ impl InProcessDaemon {
             }
         }
 
-        let other_tracked_keys = self
-            .repository_keys_by_path
-            .read()
-            .await
-            .iter()
-            .filter(|(path, _)| *path != &inspection.checkout.path)
-            .map(|(_, key)| key.clone())
-            .collect::<BTreeSet<_>>();
         let remaining_projects = projects.list().await.map_err(|error| error.to_string())?.items;
         let durable_checkouts =
             self.resource_backend.clone().using::<ResourceCheckout>(&namespace).list().await.map_err(|error| error.to_string())?.items;
-        for old_key in &superseded_keys {
+        for old_key in &migratable_keys {
             let still_referenced =
                 remaining_projects.iter().any(|project| project.spec.repositories.iter().any(|entry| &entry.repo == old_key));
             let has_durable_checkout = durable_checkouts.iter().any(|checkout| checkout.spec.repo_ref() == old_key);
-            if !still_referenced && !has_durable_checkout && !other_tracked_keys.contains(old_key) {
+            if !still_referenced && !has_durable_checkout {
                 crate::observed_resources::delete_observed_checkouts(&self.observed_resource_backend, &namespace, old_key)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -3787,6 +3794,17 @@ impl InProcessDaemon {
                     Ok(()) | Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
+            } else if !still_referenced && has_durable_checkout {
+                let old_repository = repository_objects
+                    .iter()
+                    .find(|repository| repository.metadata.name == old_key.to_string())
+                    .expect("superseded key came from the listed repositories");
+                let mut meta = InputMeta::from(&old_repository.metadata);
+                meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), repository_key.to_string());
+                repositories
+                    .update(&meta, &old_repository.metadata.resource_version, &old_repository.spec)
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
         }
 
@@ -3795,20 +3813,20 @@ impl InProcessDaemon {
             .and_then(|key| repository_specs.get(key))
             .or_else(|| superseded_keys.iter().find_map(|key| repository_specs.get(key)));
         let identity_change = previous_spec.map(|previous| RepositoryIdentityChange {
-            previous: repository_identity_display(previous),
-            current: repository_identity_display(repository_spec),
+            previous_display: repository_identity_display(previous),
+            current_display: repository_identity_display(repository_spec),
         });
         if primary_name.is_some() {
-            return Ok(RepositoryProjectReconciliation { identity_change });
+            return Ok(identity_change);
         }
 
         for project_name in whole_repository_project_names(repository_spec)? {
             match projects.create(&InputMeta::builder().name(project_name.clone()).build(), &spec).await {
-                Ok(_) => return Ok(RepositoryProjectReconciliation { identity_change }),
+                Ok(_) => return Ok(identity_change),
                 Err(ResourceError::Conflict { .. }) => {
                     let existing = projects.get(&project_name).await.map_err(|error| error.to_string())?;
                     if existing.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()) {
-                        return Ok(RepositoryProjectReconciliation { identity_change });
+                        return Ok(identity_change);
                     }
                 }
                 Err(error) => return Err(error.to_string()),
@@ -3888,11 +3906,29 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<(), String> {
+    pub async fn refresh(&self, repo: &flotilla_protocol::RepoSelector) -> Result<Option<RepositoryIdentityChange>, String> {
         let repo = self.resolve_repo_selector(repo).await?;
+        let identity = self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+        let identity_change = match self.inspect_repository_path(&repo, None).await {
+            Ok(inspection) if self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key()) => {
+                let identity_change = self.reconcile_whole_repository_project(&inspection).await?;
+                {
+                    let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+                    if self.tracked_repo_identity_for_path(&repo).await.as_ref() != Some(&identity) {
+                        return Err(format!("repo not tracked: {}", repo.display()));
+                    }
+                    self.repository_keys_by_path.write().await.insert(repo.clone(), inspection.key());
+                }
+                self.publish_repo_info_update(&identity).await;
+                identity_change
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(repo = %repo.display(), %error, "repository identity is unavailable during refresh");
+                None
+            }
+        };
         {
-            let identity =
-                self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             let repos = self.repos.read().await;
             let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
             for root in &state.roots {
@@ -3902,7 +3938,7 @@ impl InProcessDaemon {
             }
         };
 
-        Ok(())
+        Ok(identity_change)
     }
 
     /// Resolve a path that might be a git worktree to the main repo root.
@@ -3948,12 +3984,12 @@ impl InProcessDaemon {
         }
     }
 
-    /// Add a repo to tracking, returning `(tracked_path, resolved_from, identity_change)`.
+    /// Add a repo to tracking and report path normalization or identity migration.
     ///
     /// If `path` is a git worktree, the main repo root is resolved via
     /// `git rev-parse --path-format=absolute --git-common-dir` and tracked
     /// instead. `resolved_from` is `Some(original_path)` in that case.
-    pub async fn add_repo(&self, path: &Path) -> Result<(PathBuf, Option<PathBuf>, Option<RepositoryIdentityChange>), String> {
+    pub async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String> {
         let (path, resolved_from) = self.normalize_repo_path(path).await;
 
         // Create the model outside the lock (spawns provider detection and refresh)
@@ -3979,8 +4015,7 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
         let repository_key = Some(repository_inspection.key());
-        let project_reconciliation = self.reconcile_whole_repository_project(&repository_inspection).await?;
-        let identity_change = project_reconciliation.identity_change;
+        let identity_change = self.reconcile_whole_repository_project(&repository_inspection).await?;
         if let Some(tracked_identity) = self.tracked_repo_identity_for_path(&path).await {
             if tracked_identity == identity {
                 let key_became_available = {
@@ -3998,7 +4033,7 @@ impl InProcessDaemon {
                     self.publish_repo_info_update(&identity).await;
                 }
                 if self.tracked_repo_identity_for_path(&path).await.as_ref() == Some(&identity) {
-                    return Ok((path, resolved_from, identity_change));
+                    return Ok(AddRepoOutcome { tracked_path: path, resolved_from, identity_change });
                 }
             }
             if let Err(error) = self.remove_repo(&path).await {
@@ -4043,7 +4078,7 @@ impl InProcessDaemon {
         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
         let already_tracked = self.path_identities.read().await.contains_key(&path);
         if already_tracked {
-            return Ok((path, resolved_from, identity_change));
+            return Ok(AddRepoOutcome { tracked_path: path, resolved_from, identity_change });
         }
         {
             let mut repos = self.repos.write().await;
@@ -4072,7 +4107,7 @@ impl InProcessDaemon {
             self.broadcast_snapshot_inner(&path, false).await;
         }
 
-        Ok((path, resolved_from, identity_change))
+        Ok(AddRepoOutcome { tracked_path: path, resolved_from, identity_change })
     }
 
     pub async fn remove_repo(&self, path: &Path) -> Result<(), String> {
@@ -5411,16 +5446,19 @@ impl InProcessDaemon {
                 description,
             });
             let mut refreshed = Vec::new();
+            let mut identity_changes = Vec::new();
             let result = match async {
                 for repo in &repo_paths {
-                    self.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await?;
+                    if let Some(change) = self.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await? {
+                        identity_changes.push(change);
+                    }
                     refreshed.push(repo.clone());
                 }
                 Ok::<(), String>(())
             }
             .await
             {
-                Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: refreshed },
+                Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: refreshed, identity_changes },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -5925,9 +5963,11 @@ impl InProcessDaemon {
                 description,
             });
             let result = match self.add_repo(path).await {
-                Ok((tracked_path, resolved_from, identity_change)) => {
-                    flotilla_protocol::CommandValue::RepoTracked { path: tracked_path, resolved_from, identity_change }
-                }
+                Ok(outcome) => flotilla_protocol::CommandValue::RepoTracked {
+                    path: outcome.tracked_path,
+                    resolved_from: outcome.resolved_from,
+                    identity_change: outcome.identity_change,
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -5979,7 +6019,10 @@ impl InProcessDaemon {
                 description,
             });
             let result = match self.refresh(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
-                Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: vec![repo_path.clone()] },
+                Ok(identity_change) => flotilla_protocol::CommandValue::Refreshed {
+                    repos: vec![repo_path.clone()],
+                    identity_changes: identity_change.into_iter().collect(),
+                },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {

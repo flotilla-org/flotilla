@@ -506,6 +506,8 @@ pub enum CommandValue {
     },
     Refreshed {
         repos: Vec<PathBuf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        identity_changes: Vec<RepositoryIdentityChange>,
     },
     CheckoutCreated {
         branch: String,
@@ -592,8 +594,8 @@ pub enum CommandValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryIdentityChange {
-    pub previous: String,
-    pub current: String,
+    pub previous_display: String,
+    pub current_display: String,
 }
 
 /// Status of an individual step within a multi-step command.
@@ -977,12 +979,12 @@ mod tests {
                 path: PathBuf::from("/new/repo"),
                 resolved_from: None,
                 identity_change: Some(RepositoryIdentityChange {
-                    previous: "local".to_string(),
-                    current: "https://github.com/flotilla-org/flotilla".to_string(),
+                    previous_display: "local".to_string(),
+                    current_display: "https://github.com/flotilla-org/flotilla".to_string(),
                 }),
             },
             CommandValue::RepoUntracked { path: PathBuf::from("/old/repo") },
-            CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")] },
+            CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")], identity_changes: Vec::new() },
             CommandValue::CheckoutCreated {
                 branch: "feat-new".into(),
                 path: QualifiedPath::host(HostId::new("host-a"), "/repos/project/wt-1"),

@@ -2097,7 +2097,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                         }
                         CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
                             assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
-                            assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()] });
+                            assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
                             saw_finished = true;
                         }
                         CommandPeerEvent::StepUpdate { .. } => {}
@@ -2113,7 +2113,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(*request_id, 7);
                     assert_eq!(requester_node_id, &NodeId::new("desktop"));
                     assert_eq!(responder_node_id, daemon.node_id());
-                    assert_eq!(result.as_ref(), &CommandValue::Refreshed { repos: vec![repo.clone()] });
+                    assert_eq!(result.as_ref(), &CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
                     saw_response = true;
                 }
                 other => panic!("unexpected proxied message: {other:?}"),
