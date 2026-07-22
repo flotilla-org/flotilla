@@ -92,7 +92,7 @@ impl TableState {
     }
 
     pub fn mark_pending(&mut self, row_id: &RowId, command_id: u64) {
-        let Some(RowState::Submitting { query, description }) = self.row_states.remove(row_id) else { return };
+        let Some(RowState::Submitting { query, description }) = self.row_states.get(row_id).cloned() else { return };
         self.row_states.insert(row_id.clone(), RowState::Pending { query, command_id, description });
     }
 
@@ -1769,6 +1769,23 @@ mod tests {
 
         assert!(state.row_state(&convoy).is_none());
         assert!(matches!(state.row_state(&issue), Some(RowState::Submitting { .. })));
+    }
+
+    #[test]
+    fn out_of_order_mark_pending_preserves_existing_row_state() {
+        let mut state = TableState::default();
+        let pending = RowId::new("dev/pending");
+        let failed = RowId::new("dev/failed");
+        state.begin_pending(QueryId::Convoys, pending.clone(), "Delete convoy".into()).expect("row should submit");
+        state.mark_pending(&pending, 1);
+        state.begin_pending(QueryId::Convoys, failed.clone(), "Delete convoy".into()).expect("row should submit");
+        state.mark_failed(&failed, "delete failed".into());
+
+        state.mark_pending(&pending, 2);
+        state.mark_pending(&failed, 3);
+
+        assert!(matches!(state.row_state(&pending), Some(RowState::Pending { command_id: 1, .. })));
+        assert!(matches!(state.row_state(&failed), Some(RowState::Failed { message, .. }) if message == "delete failed"));
     }
 
     #[test]
