@@ -12,7 +12,8 @@ use flotilla_protocol::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, QueryChanges, QueryId, QueryScope,
         ResultDelta, Rows, SessionPhase, VesselRow, WorkPhase,
     },
-    DaemonEvent, FleetReplicaSnapshot, HostName, LifecycleAuthority, RepositoryKey, ResourceRef,
+    Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ProviderData, RepoDelta, RepoIdentity, RepoSnapshot,
+    RepositoryKey, ResourceRef,
 };
 use flotilla_resources::{
     api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Environment, Presentation,
@@ -27,6 +28,7 @@ use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer}
 
 type PresentationKey = (String, String, String);
 type SessionKey = (String, String);
+type ChangeRequestFingerprint = HashMap<String, (String, String)>;
 
 #[derive(bon::Builder)]
 pub struct AggregatorResolvers {
@@ -129,6 +131,8 @@ pub struct Aggregator {
     #[builder(skip)]
     convoy_change_requests: HashMap<ResourceRef, ConvoyChangeRequest>,
     #[builder(skip)]
+    repo_change_requests: HashMap<RepoIdentity, ChangeRequestFingerprint>,
+    #[builder(skip)]
     issue_materializer: Option<IssueMaterializer>,
     event_tx: broadcast::Sender<DaemonEvent>,
 }
@@ -153,6 +157,7 @@ impl Aggregator {
             attach_resolver: None,
             change_request_resolver: None,
             convoy_change_requests: HashMap::new(),
+            repo_change_requests: HashMap::new(),
             issue_materializer: None,
             event_tx,
         }
@@ -292,6 +297,16 @@ impl Aggregator {
                 },
                 event = daemon_event_rx.recv() => match event {
                     Ok(DaemonEvent::RepoRefreshCompleted { .. }) => self.refresh_all_change_requests().await,
+                    Ok(DaemonEvent::RepoSnapshot(snapshot)) => {
+                        if self.repo_snapshot_changed_change_requests(&snapshot) {
+                            self.refresh_all_change_requests().await;
+                        }
+                    }
+                    Ok(DaemonEvent::RepoDelta(delta)) => {
+                        if self.repo_delta_changed_change_requests(&delta) {
+                            self.refresh_all_change_requests().await;
+                        }
+                    }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "aggregator lagged behind daemon refresh events");
@@ -715,6 +730,36 @@ impl Aggregator {
         self.rebuild_local_projection().await;
     }
 
+    fn repo_snapshot_changed_change_requests(&mut self, snapshot: &RepoSnapshot) -> bool {
+        let current = change_request_fingerprint(&snapshot.providers);
+        match self.repo_change_requests.get(&snapshot.repo_identity) {
+            Some(previous) if previous == &current => false,
+            None if current.is_empty() => false,
+            _ => {
+                self.repo_change_requests.insert(snapshot.repo_identity.clone(), current);
+                true
+            }
+        }
+    }
+
+    fn repo_delta_changed_change_requests(&mut self, delta: &RepoDelta) -> bool {
+        let mut changed = false;
+        let fingerprint = self.repo_change_requests.entry(delta.repo_identity.clone()).or_default();
+        for change in &delta.changes {
+            let Change::ChangeRequest { key, op } = change else { continue };
+            changed = true;
+            match op {
+                EntryOp::Added(request) | EntryOp::Updated(request) => {
+                    fingerprint.insert(key.clone(), (request.branch.clone(), request.status.to_string()));
+                }
+                EntryOp::Removed => {
+                    fingerprint.remove(key);
+                }
+            }
+        }
+        changed
+    }
+
     fn effective_convoys(&self) -> HashMap<ResourceRef, ResourceObject<Convoy>> {
         let mut effective_convoys = HashMap::new();
         for source in LOCAL_SOURCE_PRECEDENCE {
@@ -1130,6 +1175,10 @@ impl Aggregator {
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
             .build()
     }
+}
+
+fn change_request_fingerprint(providers: &ProviderData) -> ChangeRequestFingerprint {
+    providers.change_requests.iter().map(|(key, request)| (key.clone(), (request.branch.clone(), request.status.to_string()))).collect()
 }
 
 fn presentation_key(presentation: &ResourceObject<Presentation>) -> Option<PresentationKey> {
@@ -1656,6 +1705,124 @@ mod tests {
             } => {}
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn repo_snapshot_refreshes_convoy_change_requests() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::from([
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Closed,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+            ])),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let durable_convoys = ScriptedSource::new(
+            vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
+            vec![Ok(pending_watch())],
+        );
+        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+        let run = run_with_test_sources(
+            Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
+            &durable_convoys,
+            &durable_presentations,
+            &observed_convoys,
+            &observed_presentations,
+            replica_rx,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("aggregator stopped before repo snapshot: {result:?}"),
+            () = async {
+                let initial = recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await;
+                assert!(matches!(initial, DaemonEvent::ResultSet(_)));
+                let mut providers = flotilla_protocol::ProviderData::default();
+                providers.change_requests.insert("815".into(), flotilla_protocol::ChangeRequest {
+                    title: "Fix convoy PR refs".into(),
+                    branch: "feat/convoy".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    body: None,
+                    correlation_keys: Vec::new(),
+                    association_keys: Vec::new(),
+                    provider_name: "github".into(),
+                    provider_display_name: "GitHub".into(),
+                });
+                event_tx
+                    .send(DaemonEvent::RepoSnapshot(Box::new(flotilla_protocol::RepoSnapshot {
+                        seq: 1,
+                        repo_identity: flotilla_protocol::RepoIdentity {
+                            authority: "github.com".into(),
+                            path: "flotilla-org/flotilla".into(),
+                        },
+                        repo: Some(std::path::PathBuf::from("/virtual/kiwi/flotilla")),
+                        node_id: flotilla_protocol::NodeId::new("kiwi"),
+                        work_items: Vec::new(),
+                        providers,
+                        provider_health: HashMap::new(),
+                        errors: Vec::new(),
+                    })))
+                    .expect("publish repo snapshot");
+
+                let refreshed = recv_query_event(&mut event_rx, QueryId::Convoys, "refreshed convoy delta").await;
+                let DaemonEvent::ResultDelta(delta) = refreshed else { panic!("expected refreshed result delta") };
+                assert_eq!(
+                    delta.changes.as_convoys().expect("convoy changes")[0]
+                        .change_request
+                        .as_ref()
+                        .expect("change request")
+                        .status,
+                    flotilla_protocol::ChangeRequestStatus::Closed
+                );
+            } => {}
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unchanged_repo_snapshot_does_not_refresh_convoy_change_requests() {
+        let (event_tx, _event_rx) = broadcast::channel(1);
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx);
+        let repo_identity = flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
+        let empty = flotilla_protocol::RepoSnapshot {
+            seq: 1,
+            repo_identity: repo_identity.clone(),
+            repo: Some(std::path::PathBuf::from("/repo")),
+            node_id: flotilla_protocol::NodeId::new("kiwi"),
+            work_items: Vec::new(),
+            providers: flotilla_protocol::ProviderData::default(),
+            provider_health: HashMap::new(),
+            errors: Vec::new(),
+        };
+        assert!(!aggregator.repo_snapshot_changed_change_requests(&empty));
+
+        let mut providers = flotilla_protocol::ProviderData::default();
+        providers.change_requests.insert("815".into(), flotilla_protocol::ChangeRequest {
+            title: "Fix convoy PR refs".into(),
+            branch: "feat/convoy".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            body: None,
+            correlation_keys: Vec::new(),
+            association_keys: Vec::new(),
+            provider_name: "github".into(),
+            provider_display_name: "GitHub".into(),
+        });
+        let with_change_request = flotilla_protocol::RepoSnapshot { providers, seq: 2, ..empty };
+
+        assert!(aggregator.repo_snapshot_changed_change_requests(&with_change_request));
+        assert!(!aggregator.repo_snapshot_changed_change_requests(&with_change_request));
     }
 
     fn remote_snapshot(host: &str, generation: &str, name: &str) -> FleetReplicaSnapshot {
