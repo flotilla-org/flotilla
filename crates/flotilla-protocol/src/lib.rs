@@ -126,8 +126,9 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow,
-    QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow,
+    AwarenessCounts, AwarenessEntry, AwarenessGrouping, AwarenessKind, AwarenessLimit, AwarenessLink, AwarenessNode, AwarenessPhase,
+    AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow,
+    IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow,
     WorkPhase,
 };
 use serde::{Deserialize, Serialize};

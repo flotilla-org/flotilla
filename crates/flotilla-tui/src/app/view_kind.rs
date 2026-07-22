@@ -6,7 +6,7 @@
 //! `widgets::screen` (rendering dispatch deliberately stays with the
 //! widgets).
 
-use flotilla_protocol::{QueryId, QueryScope, ViewAddress};
+use flotilla_protocol::{AwarenessGrouping, AwarenessLimit, QueryId, QueryScope, ViewAddress};
 
 use crate::binding_table::{BindingModeId, KeyBindingMode};
 
@@ -17,6 +17,11 @@ pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec
         ViewAddress::Convoys { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. } => vec![QueryId::Convoys],
         ViewAddress::Project { namespace, name } => {
             vec![
+                QueryId::Awareness {
+                    scope: Some(QueryScope::new(namespace, name)),
+                    grouping: AwarenessGrouping::Project,
+                    limit: AwarenessLimit::default(),
+                },
                 QueryId::Convoys,
                 QueryId::Checkouts { scope: Some(QueryScope::new(namespace, name)) },
                 QueryId::Issues {
@@ -87,6 +92,11 @@ mod tests {
     fn project_view_composes_store_and_demand_backed_queries() {
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
         assert_eq!(queries(&address, None), vec![
+            QueryId::Awareness {
+                scope: Some(QueryScope::new("flotilla", "roadmap")),
+                grouping: AwarenessGrouping::Project,
+                limit: AwarenessLimit::default(),
+            },
             QueryId::Convoys,
             QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
             QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None },

@@ -290,6 +290,7 @@ pub struct QueryTableCache {
     pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
     pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
     pub checkouts: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::CheckoutRow>>,
+    pub awareness: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::AwarenessNode>>,
 }
 
 pub struct QueryTableResult<R> {
@@ -347,6 +348,11 @@ pub fn table_rows<'a>(
             .collect(),
         checkout_results: queries
             .checkouts
+            .iter()
+            .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
+        awareness_results: queries
+            .awareness
             .iter()
             .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
             .collect(),
@@ -1483,6 +1489,9 @@ impl App {
                     flotilla_protocol::Rows::Checkouts { rows, .. } => {
                         self.query_tables.checkouts.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
+                    flotilla_protocol::Rows::Awareness { rows, .. } => {
+                        self.query_tables.awareness.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
+                    }
                 }
             }
             DaemonEvent::ResultDelta(delta) => {
@@ -1542,6 +1551,16 @@ impl App {
                             |left, right| {
                                 (&left.host, &left.path, &left.resource.name).cmp(&(&right.host, &right.path, &right.resource.name))
                             },
+                        );
+                    }
+                    flotilla_protocol::QueryChanges::Awareness { changed, removed, .. } => {
+                        let result = self.query_tables.awareness.entry(query).or_default();
+                        result.apply_delta(
+                            changed,
+                            removed,
+                            delta.state.as_ref(),
+                            |row| row.id.clone(),
+                            |left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)),
                         );
                     }
                 }
