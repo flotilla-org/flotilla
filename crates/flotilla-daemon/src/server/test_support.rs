@@ -6,7 +6,7 @@ use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow, ResultSet, Rows},
     FleetReplicaSnapshot, HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
 };
-use flotilla_resources::{api_version, Convoy, Resource};
+use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, Stance, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use super::{build_remote_command_router, handle_client_session, spawn_peer_networking_runtime};
@@ -27,6 +27,26 @@ pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str
     };
     let mut aggregator = Aggregator::new(daemon.aggregator_projection_state().await, daemon.host_name().clone(), daemon.event_sender());
     aggregator.apply_replica_cache(vec![snapshot]).await;
+}
+
+pub async fn seed_trusted_remote_convoy_project(daemon: &InProcessDaemon, namespace: &str) {
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+    let backend = daemon.resource_backend();
+    backend
+        .clone()
+        .using::<WorkflowTemplate>(namespace)
+        .create(&InputMeta::builder().name("remote-workflow".to_string()).build(), &workflow)
+        .await
+        .expect("create workflow");
+    backend
+        .using::<Project>(namespace)
+        .create(
+            &InputMeta::builder().name("flotilla".to_string()).build(),
+            &ProjectSpec::builder().display_name("Flotilla".to_string()).default_workflow_ref("remote-workflow".to_string()).build(),
+        )
+        .await
+        .expect("create project");
 }
 
 pub struct InMemoryRequestTopology {

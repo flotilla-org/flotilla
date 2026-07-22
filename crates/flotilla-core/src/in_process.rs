@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
     commands::RepositoryIdentityChange,
-    qualified_path::QualifiedPath,
+    qualified_path::{HostId, QualifiedPath},
     result_set::{ConvoyChangeRequest, ConvoyRow, ResultSet, Rows},
     AttachBinding, Command, CommandValue, CorrelationKey, CrewCommandContext, CrewListMember, CrewListResponse, DaemonEvent, DeltaEntry,
     EnvironmentId, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness, HostListResponse, HostName,
@@ -1223,6 +1223,12 @@ pub struct ExistingConvoyTarget {
     pub node_id: NodeId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvoyStartTarget {
+    pub policy_name: String,
+    pub host_id: HostId,
+}
+
 pub struct InProcessDaemon {
     repos: RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1973,7 +1979,10 @@ impl InProcessDaemon {
         }
     }
 
-    pub async fn resolve_convoy_start_target_node(&self, intent: &flotilla_protocol::ConvoyStartIntent) -> Result<Option<NodeId>, String> {
+    pub async fn resolve_convoy_start_target(
+        &self,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<Option<ConvoyStartTarget>, String> {
         let Some(policy_name) = intent.placement_policy.as_deref() else {
             return Ok(None);
         };
@@ -1992,12 +2001,7 @@ impl InProcessDaemon {
         if self.local_host_id().as_ref().is_some_and(|host_id| host_id.as_str() == host_ref) {
             return Ok(None);
         }
-        let environment_id = EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new(host_ref));
-        self.host_registry
-            .node_id_for_environment(&environment_id)
-            .await
-            .map(Some)
-            .ok_or_else(|| format!("placement policy {policy_name} targets unavailable host {host_ref}"))
+        Ok(Some(ConvoyStartTarget { policy_name: policy_name.to_string(), host_id: HostId::new(host_ref) }))
     }
 
     pub async fn resolve_existing_convoy_target(

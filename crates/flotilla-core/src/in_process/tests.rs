@@ -130,7 +130,7 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
 }
 
 #[tokio::test]
-async fn peer_summary_materializes_an_admissible_host_direct_placement_and_routing_target() {
+async fn peer_summary_materializes_an_admissible_host_direct_placement_target() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let config_base = temp.path().join("config");
     std::fs::create_dir_all(&config_base).expect("create config dir");
@@ -171,8 +171,8 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_and_routi
     let intent =
         ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("host-direct-feta-host".to_string()).build();
     assert_eq!(
-        daemon.resolve_convoy_start_target_node(&intent).await.expect("placement should route"),
-        Some(flotilla_protocol::NodeId::new("feta-node"))
+        daemon.resolve_convoy_start_target(&intent).await.expect("placement should resolve"),
+        Some(ConvoyStartTarget { policy_name: "host-direct-feta-host".to_string(), host_id: HostId::new("feta-host") })
     );
 
     daemon
@@ -207,7 +207,7 @@ async fn peer_summary_materializes_an_admissible_host_direct_placement_and_routi
         .await
         .expect("local placement policy create");
     let local_intent = ConvoyStartIntent::builder().project_ref("flotilla".to_string()).placement_policy("local-pool".to_string()).build();
-    assert_eq!(daemon.resolve_convoy_start_target_node(&local_intent).await.expect("non-host-direct placement should remain local"), None);
+    assert_eq!(daemon.resolve_convoy_start_target(&local_intent).await.expect("non-host-direct placement should remain local"), None);
 }
 
 #[test]

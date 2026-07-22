@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use flotilla_core::{
@@ -11,18 +15,18 @@ use flotilla_core::{
     },
 };
 use flotilla_daemon::server::test_support::{
-    apply_convoy_replica_feed, spawn_in_memory_request_topology, spawn_in_memory_request_topology_stateful,
-    spawn_in_memory_request_topology_stateful_with_surface,
+    apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_topology,
+    spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_surface,
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     test_support::TestIssue,
-    Command, CommandAction, CommandValue, DaemonEvent, HostName, Issue, IssueChangeset, IssueRef, IssueSource, NodeInfo,
+    Command, CommandAction, CommandValue, ConvoyStartIntent, DaemonEvent, HostName, Issue, IssueChangeset, IssueRef, IssueSource, NodeInfo,
     PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, Regard, Resource, ResourceError,
-    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, PlacementPolicy, Regard, Resource,
+    ResourceError, WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -440,6 +444,86 @@ async fn hostless_convoy_delete_uses_live_peer_route_when_connection_status_is_s
         matches!(follower_convoys.get(convoy_name).await, Err(ResourceError::NotFound { .. })),
         "remote-homed convoy should be deleted through the live peer route"
     );
+}
+
+#[tokio::test]
+async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    follower.set_local_placement_capabilities(&BTreeSet::from(["codex".to_string()]), &["cleat".to_string()]).await;
+    let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("spawn stateful topology");
+    let namespace = "flotilla";
+    let remote_host_id = topology.follower.local_host_id().expect("follower host identity").to_string();
+    let placement_policy = format!("host-direct-{remote_host_id}");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if topology.leader.resource_backend().using::<PlacementPolicy>(namespace).get(&placement_policy).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer host summary should materialize placement policy");
+
+    seed_trusted_remote_convoy_project(&topology.leader, namespace).await;
+
+    apply_convoy_replica_feed(&topology.leader, namespace, "fresh-feed", topology.follower_host.clone()).await;
+    topology
+        .leader
+        .publish_peer_connection_status(
+            &NodeInfo::new(topology.follower.node_id().clone(), topology.follower_host.to_string()),
+            PeerConnectionState::Disconnected,
+        )
+        .await;
+    topology.leader.set_peer_host_summaries(HashMap::new()).await;
+    assert_eq!(topology.leader.peer_connection_status(topology.follower.node_id()).await, PeerConnectionState::Disconnected);
+    assert!(
+        topology
+            .leader
+            .get_topology()
+            .await
+            .expect("leader topology")
+            .routes
+            .iter()
+            .any(|route| route.target.node_id == *topology.follower.node_id() && route.connected),
+        "peer manager route should remain live"
+    );
+
+    let mut events = topology.leader.subscribe();
+    let command_id = topology
+        .client
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(
+                    ConvoyStartIntent::builder()
+                        .project_ref("flotilla".to_string())
+                        .name("remote-work".to_string())
+                        .branch("fix/remote-work".to_string())
+                        .placement_policy(placement_policy)
+                        .build(),
+                ),
+            },
+        })
+        .await
+        .expect("live peer route should admit remote placement despite stale presentation membership");
+
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
+        name: "remote-work".to_string(),
+        attach_command: None,
+        binding: None
+    });
+    topology
+        .follower
+        .resource_backend()
+        .using::<Convoy>(namespace)
+        .get("remote-work")
+        .await
+        .expect("convoy should be created on live placement host");
 }
 
 /// A stateless remote issue query should return results end-to-end.
