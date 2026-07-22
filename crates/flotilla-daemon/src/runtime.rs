@@ -2626,12 +2626,11 @@ mod tests {
             .expect("reviewer session");
         let reviewer_id = reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).expect("reviewer identity").id.clone();
         assert_eq!(reviewer.status.as_ref().and_then(|status| status.crew.as_ref()).map(|crew| crew.adapter.as_str()), Some("claude-code"));
-        assert!(pool
-            .delivered
-            .lock()
-            .await
-            .iter()
-            .any(|(session, text, submit)| session.ends_with("-reviewer") && text == "Review commit abc123" && *submit));
+        let delivered = pool.delivered.lock().await;
+        assert!(delivered.iter().any(|(session, text, submit)| {
+            session.ends_with("-reviewer") && text == "handoff from coder@implement\n\nReview commit abc123" && *submit
+        }));
+        drop(delivered);
 
         let mut rx = daemon.subscribe();
         let reviewer_complete_id = daemon
@@ -2675,12 +2674,11 @@ mod tests {
             .await
             .expect("hand back to coder");
         assert_eq!(wait_for_command_result(&mut rx, hand_back_id).await, CommandValue::Ok);
-        assert!(pool
-            .delivered
-            .lock()
-            .await
-            .iter()
-            .any(|(session, text, submit)| session.ends_with("-coder") && text == "Address the review findings" && *submit));
+        let delivered = pool.delivered.lock().await;
+        assert!(delivered.iter().any(|(session, text, submit)| {
+            session.ends_with("-coder") && text == "handoff from reviewer@implement\n\nAddress the review findings" && *submit
+        }));
+        drop(delivered);
         wait_until(|| {
             let convoys = convoys.clone();
             async move {

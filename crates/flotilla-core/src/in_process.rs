@@ -969,6 +969,16 @@ fn pending_crew_message(text: &str) -> TerminalCrewMessage {
     TerminalCrewMessage { id: uuid::Uuid::new_v4().to_string(), text: text.to_string() }
 }
 
+fn crew_handoff_address_error(target: &str, vessel: &str) -> String {
+    format!(
+        "no such crew member in your vessel; crew messaging is intra-vessel and requires a different crew member (target `{target}`, vessel `{vessel}`)"
+    )
+}
+
+fn crew_handoff_message(context: &ResolvedCrewContext, message: &str) -> String {
+    format!("handoff from {}@{}\n\n{message}", context.caller_role, context.vessel)
+}
+
 async fn queue_pending_crew_message(
     sessions: &flotilla_resources::TypedResolver<ResourceTerminalSession>,
     existing: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
@@ -4147,7 +4157,10 @@ impl InProcessDaemon {
             .iter()
             .enumerate()
             .find(|(_, process)| process.role == target)
-            .ok_or_else(|| format!("crew target `{target}` is not defined for vessel `{}`", context.vessel))?;
+            .ok_or_else(|| crew_handoff_address_error(target, &context.vessel))?;
+        if target == context.caller_role {
+            return Err(crew_handoff_address_error(target, &context.vessel));
+        }
         let CrewSource::Agent { selector, prompt } = &process.source else {
             return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
         };
@@ -4161,6 +4174,7 @@ impl InProcessDaemon {
             return Err(format!("crew target `{target}` has failed work and cannot receive a handoff"));
         }
 
+        let delivered_message = crew_handoff_message(&context, message);
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
             .vessel_ref(context.vessel_ref.clone())
@@ -4174,9 +4188,9 @@ impl InProcessDaemon {
         let terminal_name = identity.name();
         let handoff_result = match sessions.get(&terminal_name).await {
             Ok(existing) => match existing.status.as_ref().map(|status| status.phase) {
-                Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&existing, message).await,
+                Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&existing, &delivered_message).await,
                 Some(ResourceTerminalSessionPhase::Stopped) => {
-                    queue_pending_crew_message(&sessions, &existing, message).await?;
+                    queue_pending_crew_message(&sessions, &existing, &delivered_message).await?;
                     apply_resource_status_patch(&sessions, &terminal_name, &TerminalSessionStatusPatch::MarkStarting)
                         .await
                         .map(|_| ())
@@ -4185,7 +4199,9 @@ impl InProcessDaemon {
                 Some(ResourceTerminalSessionPhase::Failed) => {
                     Err(format!("crew target `{target}` failed provisioning and cannot be revived"))
                 }
-                Some(ResourceTerminalSessionPhase::Starting) | None => queue_pending_crew_message(&sessions, &existing, message).await,
+                Some(ResourceTerminalSessionPhase::Starting) | None => {
+                    queue_pending_crew_message(&sessions, &existing, &delivered_message).await
+                }
             },
             Err(ResourceError::NotFound { .. }) => {
                 let anchor = if let Some(caller) = context.caller_session.as_ref() {
@@ -4214,7 +4230,7 @@ impl InProcessDaemon {
                                 convoy: context.convoy.clone(),
                                 vessel_ref: context.vessel_ref.clone(),
                             },
-                            message: Some(pending_crew_message(message)),
+                            message: Some(pending_crew_message(&delivered_message)),
                         },
                         cwd: anchor.spec.cwd,
                         pool: anchor.spec.pool,

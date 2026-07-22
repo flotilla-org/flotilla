@@ -792,6 +792,38 @@ async fn handoff_rejects_failed_target_instead_of_succeeding_without_state_chang
 }
 
 #[tokio::test]
+async fn handoff_rejects_self_and_unknown_targets_without_delivery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    let context = CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() };
+
+    let self_error =
+        daemon.crew_handoff_internal(&context, "coder", "This should not echo back").await.expect_err("self handoff should be rejected");
+    assert_eq!(
+        self_error,
+        "no such crew member in your vessel; crew messaging is intra-vessel and requires a different crew member (target `coder`, vessel `implement`)"
+    );
+
+    let missing_error = daemon
+        .crew_handoff_internal(&context, "architect", "This should not be delivered")
+        .await
+        .expect_err("unknown target should be rejected");
+    assert_eq!(
+        missing_error,
+        "no such crew member in your vessel; crew messaging is intra-vessel and requires a different crew member (target `architect`, vessel `implement`)"
+    );
+    assert!(terminal_pool.delivered.lock().await.is_empty());
+
+    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let coder = terminals.get("terminal-demo-implement-coder").await.expect("coder session");
+    assert!(matches!(coder.spec.source, TerminalSessionSource::Agent { message: None, .. }));
+    assert!(terminals.get("terminal-demo-implement-architect").await.is_err(), "misaddressed handoff must not create a target session");
+}
+
+#[tokio::test]
 async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
@@ -847,9 +879,11 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
         .get("terminal-demo-implement-reviewer")
         .await
         .expect("reviewer session should be defined");
-    assert!(
-        matches!(reviewer.spec.source, TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Review commit abc123")
-    );
+    assert!(matches!(
+        reviewer.spec.source,
+        TerminalSessionSource::Agent { message: Some(ref message), .. }
+            if message.text == "handoff from coder@implement\n\nReview commit abc123"
+    ));
     assert_eq!(reviewer.metadata.labels.get(VESSEL_ORDINAL_LABEL).map(String::as_str), Some("001"));
     assert_eq!(reviewer.metadata.labels.get(CREW_ORDINAL_LABEL).map(String::as_str), Some("001"));
 
@@ -876,7 +910,8 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
         .expect("reviewer session should still exist");
     assert!(matches!(
         reviewer.spec.source,
-        TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Use the amended commit"
+        TerminalSessionSource::Agent { message: Some(ref message), .. }
+            if message.text == "handoff from coder@implement\n\nUse the amended commit"
     ));
 
     let explicit_context = CrewCommandContext {
@@ -903,7 +938,7 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     assert_eq!(terminal_pool.delivered.lock().await.as_slice(), &[(
         "session-coder".to_string(),
-        "Address the review findings".to_string(),
+        "handoff from reviewer@implement\n\nAddress the review findings".to_string(),
         true
     )]);
     let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("demo").await.expect("convoy");
@@ -935,9 +970,11 @@ async fn crew_list_includes_defined_latent_members_and_handoff_activates_one() {
     assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
     let coder = terminals.get("terminal-demo-implement-coder").await.expect("restarting coder");
     assert_eq!(coder.status.expect("coder status").phase, ResourceTerminalSessionPhase::Starting);
-    assert!(
-        matches!(coder.spec.source, TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Resume after review")
-    );
+    assert!(matches!(
+        coder.spec.source,
+        TerminalSessionSource::Agent { message: Some(ref message), .. }
+            if message.text == "handoff from reviewer@implement\n\nResume after review"
+    ));
 }
 
 #[test]
