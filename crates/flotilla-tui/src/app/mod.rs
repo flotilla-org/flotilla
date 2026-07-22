@@ -24,8 +24,8 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
-    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, StepStatus, ViewAddress,
-    WorkItem, WorkItemIdentity,
+    ProviderError, ProvisioningTarget, RepoDelta, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, RepoSnapshot, ResourceRef, StepStatus,
+    ViewAddress, WorkItem, WorkItemIdentity,
 };
 use indexmap::IndexMap;
 pub use intent::Intent;
@@ -513,6 +513,12 @@ pub struct App {
 
 impl App {
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
+        let app = Self::new_unreported(daemon, repos_info, config, theme);
+        app.report_active_view_focus();
+        app
+    }
+
+    fn new_unreported(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
         let mut model = TuiModel::from_repo_info(repos_info);
         // Open-view set: persisted if present, else seeded to match the
         // pre-View tab bar (overview + convoys + one tab per tracked repo).
@@ -618,7 +624,7 @@ impl App {
         theme: Theme,
         address: ViewAddress,
     ) -> Self {
-        let mut app = Self::new(daemon, repos_info, config, theme);
+        let mut app = Self::new_unreported(daemon, repos_info, config, theme);
         app.views = OpenViews::scoped(address);
         app.subscriptions_dirty = true;
         app.sync_active_view();
@@ -904,6 +910,25 @@ impl App {
                 self.ui.view_layout = page.layout;
             }
         }
+        self.report_active_view_focus();
+    }
+
+    fn report_active_view_focus(&self) {
+        let targets = self.views.active_address().and_then(view_regard_target).into_iter().collect();
+        self.report_focus(targets);
+    }
+
+    pub(super) fn report_focus(&self, targets: Vec<ResourceRef>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let daemon = Arc::clone(&self.daemon);
+        let surface_id = self.session_id;
+        runtime.spawn(async move {
+            if let Err(error) = daemon.observe_focus(surface_id, targets).await {
+                tracing::warn!(%error, "failed to report TUI focus");
+            }
+        });
     }
 
     pub fn dismiss_status_item(&mut self, id: usize) {
@@ -1855,6 +1880,25 @@ impl App {
         let input = Input::from(format!("{}/", start_dir.display()).as_str());
         let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
         self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
+    }
+}
+
+fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
+    match address {
+        ViewAddress::Convoy { namespace, name } => Some(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, name)),
+        ViewAddress::Vessel { namespace, convoy, vessel } => {
+            Some(ResourceRef::new("flotilla.work/v1", "Convoy", namespace, convoy).subresource(format!("vessels/{vessel}")))
+        }
+        ViewAddress::Project { namespace, name } => Some(ResourceRef::new("flotilla.work/v1", "Project", namespace, name)),
+        ViewAddress::Issues { scope } | ViewAddress::Checkouts { scope: Some(scope) } => {
+            Some(ResourceRef::new("flotilla.work/v1", "Project", &scope.namespace, &scope.name))
+        }
+        ViewAddress::Repo { repository_key: Some(key), .. } => Some(ResourceRef::new("flotilla.work/v1", "Repository", "flotilla", &key.0)),
+        ViewAddress::Overview
+        | ViewAddress::Convoys { .. }
+        | ViewAddress::Independents { .. }
+        | ViewAddress::Checkouts { scope: None }
+        | ViewAddress::Repo { repository_key: None, .. } => None,
     }
 }
 

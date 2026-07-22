@@ -68,8 +68,8 @@ fn awareness_node() -> AwarenessNode {
         .build()
 }
 
-fn mint() -> AttachOnlyRecipes {
-    AttachOnlyRecipes::new("flotilla")
+fn mint() -> FlotillaRecipes {
+    FlotillaRecipes::new("flotilla")
 }
 
 fn independent_group(name: &str) -> MetadataTarget {

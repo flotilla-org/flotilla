@@ -1634,7 +1634,7 @@ mod tests {
         let (event_tx, _) = broadcast::channel(4);
         let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx);
         let now = Utc::now();
-        let principal = AttentionPrincipalRef("flotilla/operator".into());
+        let principal = AttentionPrincipalRef { namespace: "flotilla".into(), name: "operator".into() };
         let target = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a");
         let decaying = ResourceObject {
             metadata: attention_meta("decaying", now),
@@ -1732,7 +1732,7 @@ mod tests {
         aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
         assert_eq!(awareness_vessel_salience(&state, &query).await, flotilla_protocol::Salience::Attention);
 
-        let principal = AttentionPrincipalRef("flotilla/implicit".to_string());
+        let principal = AttentionPrincipalRef::implicit_for_namespace("flotilla");
         let target = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "convoy-a").subresource("vessels/implement");
         let mut demand = ResourceObject {
             metadata: attention_meta("input-demand", now),

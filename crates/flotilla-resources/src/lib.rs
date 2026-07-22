@@ -41,6 +41,7 @@ pub use environment::{
     EnvironmentStatusPatch, HostDirectEnvironmentSpec,
 };
 pub use error::ResourceError;
+pub use flotilla_protocol::PrincipalRef;
 pub use host::{Host, HostSpec, HostStatus, HostStatusPatch, AGENT_ADAPTERS_CAPABILITY, TERMINAL_POOLS_CAPABILITY};
 pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
@@ -54,8 +55,8 @@ pub use placement_policy::{
 };
 pub use presentation::{Presentation, PresentationPhase, PresentationSpec, PresentationStatus, PresentationStatusPatch};
 pub use principal_attention::{
-    Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition,
-    PrincipalRef, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
+    Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, DemandState, DemandStatus, DemandStatusPatch, DemandTransition, Regard,
+    RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
     normalize_project_spec, resolve_project_issue_sources, IssueSource, IssueSourceResolution, IssueSourceUnavailable, Project,

@@ -12,16 +12,17 @@ use flotilla_core::{
 };
 use flotilla_daemon::server::test_support::{
     apply_convoy_replica_feed, spawn_in_memory_request_topology, spawn_in_memory_request_topology_stateful,
+    spawn_in_memory_request_topology_stateful_with_surface,
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     test_support::TestIssue,
     Command, CommandAction, CommandValue, DaemonEvent, HostName, Issue, IssueChangeset, IssueRef, IssueSource, NodeInfo,
-    PeerConnectionState, RepoSelector,
+    PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, ResourceError, WorkPhase as ResourceWorkPhase,
-    WorkState,
+    api_version, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoySpec, ConvoyStatus, InputMeta, Regard, Resource, ResourceError,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowTemplate, WorkflowTemplateSpec,
 };
 
 fn test_config_store(config_dir: std::path::PathBuf) -> Arc<ConfigStore> {
@@ -52,6 +53,101 @@ async fn await_command_result(rx: &mut tokio::sync::broadcast::Receiver<DaemonEv
     })
     .await
     .expect("timed out waiting for command result")
+}
+
+#[tokio::test]
+async fn ambient_surface_observations_do_not_create_regards_over_the_client_protocol() {
+    let leader = empty_daemon_named("leader").await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
+        principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
+        character: SurfaceCharacter::Ambient,
+    })
+    .await
+    .expect("spawn ambient client topology");
+
+    topology
+        .client
+        .observe_focus(uuid::Uuid::nil(), vec![ResourceRef::new(
+            api_version(Convoy::API_PATHS),
+            Convoy::API_PATHS.kind,
+            "flotilla",
+            "ambient-demo",
+        )])
+        .await
+        .expect("report ambient focus");
+
+    assert!(leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards").items.is_empty());
+}
+
+#[tokio::test]
+async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
+    let leader = empty_daemon_named("leader").await;
+    leader.set_provisioning_namespace("dev".to_string()).await;
+    let follower = empty_daemon_named("follower").await;
+    let topology = spawn_in_memory_request_topology_stateful(Arc::clone(&leader), follower).await.expect("spawn default client topology");
+
+    topology
+        .client
+        .observe_focus(uuid::Uuid::nil(), vec![ResourceRef::new(
+            api_version(Convoy::API_PATHS),
+            Convoy::API_PATHS.kind,
+            "dev",
+            "focused-demo",
+        )])
+        .await
+        .expect("report focal focus");
+
+    let regards = leader.resource_backend().using::<Regard>("dev").list().await.expect("list regards");
+    assert_eq!(regards.items.len(), 1);
+    assert_eq!(regards.items[0].spec.principal_ref, PrincipalRef::implicit_for_namespace("dev"));
+}
+
+#[tokio::test]
+async fn convoy_creation_attributes_provenance_and_regard_to_the_surface_principal() {
+    let leader = empty_daemon_named("leader").await;
+    leader
+        .resource_backend()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("empty".to_string()).build(), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
+        .await
+        .expect("create workflow");
+    let follower = empty_daemon_named("follower").await;
+    let principal_ref = PrincipalRef { namespace: "flotilla".to_string(), name: "alice".to_string() };
+    let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
+        principal_ref: principal_ref.clone(),
+        character: SurfaceCharacter::Focal,
+    })
+    .await
+    .expect("spawn named focal client topology");
+    let mut events = leader.subscribe();
+
+    let command_id = topology
+        .client
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyCreate {
+                name: "alice-dispatch".to_string(),
+                workflow_ref: "empty".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy: None,
+                adopted_checkout: None,
+            },
+        })
+        .await
+        .expect("dispatch convoy creation");
+    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyCreated { name: "alice-dispatch".to_string() });
+
+    let convoy = leader.resource_backend().using::<Convoy>("flotilla").get("alice-dispatch").await.expect("created convoy");
+    assert_eq!(convoy.spec.dispatching_principal_ref, principal_ref);
+    let regards = leader.resource_backend().using::<Regard>("flotilla").list().await.expect("list regards");
+    assert_eq!(regards.items.len(), 1);
+    assert_eq!(regards.items[0].spec.principal_ref, convoy.spec.dispatching_principal_ref);
 }
 
 // ---------------------------------------------------------------------------

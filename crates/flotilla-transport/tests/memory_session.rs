@@ -36,6 +36,7 @@ async fn message_session_pair_transfers_protocol_messages() {
             display_name: "remote".into(),
             session_id: Default::default(),
             connection_role: None,
+            surface: None,
         })
         .await
         .expect("write hello");

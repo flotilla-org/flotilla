@@ -106,7 +106,7 @@ impl ResourceContractFixture for RegardFixture {
 
     fn spec() -> <Self::Resource as Resource>::Spec {
         RegardSpec::builder()
-            .principal_ref(PrincipalRef("principal/default".to_string()))
+            .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
             .target(resource_ref("Convoy", "alpha"))
             .source(RegardSource::Expressed)
             .expiry(RegardExpiryPolicy::Decaying { expires_after_seconds: 300 })
@@ -115,7 +115,7 @@ impl ResourceContractFixture for RegardFixture {
 
     fn updated_spec() -> <Self::Resource as Resource>::Spec {
         RegardSpec::builder()
-            .principal_ref(PrincipalRef("principal/default".to_string()))
+            .principal_ref(PrincipalRef::implicit_for_namespace("flotilla"))
             .target(resource_ref("Convoy", "alpha"))
             .source(RegardSource::Implicit { policy: "convoy-start".to_string() })
             .expiry(RegardExpiryPolicy::Pin)
@@ -123,7 +123,7 @@ impl ResourceContractFixture for RegardFixture {
     }
 
     fn assert_created(created: &ResourceObject<Self::Resource>) {
-        assert_eq!(created.spec.principal_ref, PrincipalRef("principal/default".to_string()));
+        assert_eq!(created.spec.principal_ref, PrincipalRef::implicit_for_namespace("flotilla"));
         assert!(created.status.is_none());
     }
 
@@ -150,7 +150,7 @@ impl ResourceContractFixture for DemandFixture {
         DemandSpec::builder()
             .originating_work_ref(resource_ref("Vessel", "alpha-implement"))
             .kind(DemandKind::Permission)
-            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef("principal/default".to_string()) })
+            .addressee(DemandAddressee::Principal { principal_ref: PrincipalRef::implicit_for_namespace("flotilla") })
             .build()
     }
 

@@ -126,7 +126,16 @@ impl RemoteCommandRouter {
         }
     }
 
-    pub(super) async fn dispatch_execute(&self, mut command: Command) -> Result<u64, String> {
+    #[cfg(test)]
+    pub(super) async fn dispatch_execute(&self, command: Command) -> Result<u64, String> {
+        self.dispatch_execute_for_principal(command, None).await
+    }
+
+    pub(super) async fn dispatch_execute_for_principal(
+        &self,
+        mut command: Command,
+        dispatching_principal_ref: Option<flotilla_protocol::PrincipalRef>,
+    ) -> Result<u64, String> {
         if matches!(command.action, CommandAction::ConvoyStartPrepared { .. }) {
             return Err("prepared convoy starts are reserved for authenticated peer forwarding".to_string());
         }
@@ -142,7 +151,7 @@ impl RemoteCommandRouter {
             }
             if intended_target != self.daemon.node_id() {
                 command.node_id = Some(intended_target.clone());
-                let prepared = self.daemon.prepare_remote_convoy_start(intent).await?;
+                let prepared = self.daemon.prepare_remote_convoy_start(intent, dispatching_principal_ref.as_ref()).await?;
                 command.action = CommandAction::ConvoyStartPrepared { start: Box::new(prepared) };
             }
         }
@@ -201,7 +210,7 @@ impl RemoteCommandRouter {
                 self.daemon.execute_with_remote_executor(command, remote_executor).await
             }
         } else {
-            self.daemon.execute(command).await
+            self.daemon.execute_for_principal(command, dispatching_principal_ref).await
         }
     }
 

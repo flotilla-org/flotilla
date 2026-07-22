@@ -4,10 +4,10 @@ use flotilla_protocol::{
 };
 
 use super::*;
-use crate::{recipe::AttachOnlyRecipes, wire::MetadataPathValue};
+use crate::{recipe::FlotillaRecipes, wire::MetadataPathValue};
 
-fn mint() -> AttachOnlyRecipes {
-    AttachOnlyRecipes::new("flotilla")
+fn mint() -> FlotillaRecipes {
+    FlotillaRecipes::new("flotilla")
 }
 
 fn convoy_ref(namespace: &str, name: &str) -> ResourceRef {
@@ -106,8 +106,8 @@ fn awareness_tree_projects_project_issue_and_materializable_entries() {
         find(&patches, &group(vec![project, GroupSegment::text(SEGMENT_VESSEL, "vessel/dev/ship-it/coder").with_label("coder")]));
     assert_eq!(text(vessel_patch, KEY_WORK_PHASE), "running");
     assert_eq!(text(vessel_patch, KEY_VESSEL_HOST), "feta");
-    assert!(!vessel_patch.set.contains_key(KEY_MATERIALIZE_TARGET));
-    assert!(!vessel_patch.set.contains_key(KEY_MATERIALIZE_RECIPE));
+    assert_eq!(text(vessel_patch, KEY_MATERIALIZE_TARGET), "workspace");
+    assert_eq!(text(vessel_patch, KEY_MATERIALIZE_RECIPE), "flotilla view 'vessel/dev/ship-it/coder'");
 }
 
 #[test]

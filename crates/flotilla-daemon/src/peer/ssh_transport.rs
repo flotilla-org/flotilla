@@ -217,6 +217,7 @@ impl SshTransport {
             display_name: self.local_display_name.clone(),
             session_id: self.local_session_id,
             connection_role: None,
+            surface: None,
         })
         .await?;
 
@@ -569,6 +570,7 @@ mod tests {
             display_name: "remote-host".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
 
         let (node, session_id) =
@@ -585,6 +587,7 @@ mod tests {
             display_name: "remote".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
 
         let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), None, hello)
@@ -600,6 +603,7 @@ mod tests {
             display_name: "different-display".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
 
         let (node, _) = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), hello)
@@ -615,6 +619,7 @@ mod tests {
             display_name: "different-display".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
 
         let err = SshTransport::validate_remote_hello(&HostName::new("expected-host"), Some(&NodeId::new("expected-node")), hello)
@@ -630,6 +635,7 @@ mod tests {
             display_name: "different-display".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
 
         let (node, _) =
@@ -724,6 +730,7 @@ mod tests {
                 display_name: "remote".into(),
                 session_id: uuid::Uuid::nil(),
                 connection_role: None,
+                surface: None,
             })
             .expect("serialize hello");
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {

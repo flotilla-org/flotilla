@@ -441,9 +441,22 @@ fn message_hello_roundtrip() {
         display_name: "Desktop Workstation".into(),
         session_id: uuid::Uuid::nil(),
         connection_role: None,
+        surface: Some(SurfaceDeclaration {
+            principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
+            character: SurfaceCharacter::Ambient,
+        }),
     };
 
     test_helpers::assert_json_roundtrip(&msg);
+}
+
+#[test]
+fn observe_focus_request_round_trips_typed_resource_targets() {
+    let request = Request::ObserveFocus {
+        targets: vec![ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo").subresource("vessels/implement")],
+    };
+
+    test_helpers::assert_roundtrip(&request);
 }
 
 #[test]

@@ -319,7 +319,10 @@ async fn dispatch_add_list_remove_repo_round_trip() {
         other => panic!("expected list repos response, got {:?}", other),
     };
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].path.as_deref(), Some(repo_path.as_path()));
+    assert_eq!(
+        listed[0].path.as_ref().map(|path| path.canonicalize().expect("canonical listed repo path")),
+        Some(repo_path.canonicalize().expect("canonical requested repo path"))
+    );
 
     let remove = dispatch_request_test(&daemon, 12, Request::RemoveRepo {
         path: listed[0].path.clone().expect("tracked repo should have local path"),
@@ -2543,6 +2546,7 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
         display_name: "remote-host".into(),
         session_id: uuid::Uuid::nil(),
         connection_role: None,
+        surface: None,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -2876,6 +2880,7 @@ async fn handle_client_rejects_client_hello_with_version_mismatch() {
         display_name: "client".into(),
         session_id: uuid::Uuid::nil(),
         connection_role: Some(flotilla_protocol::ConnectionRole::Client),
+        surface: None,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 
@@ -3348,6 +3353,7 @@ async fn handle_client_relays_outbound_peer_messages() {
         display_name: "remote-host".into(),
         session_id: uuid::Uuid::nil(),
         connection_role: None,
+        surface: None,
     };
     flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
     let _ = reader.next_line().await.expect("read hello").expect("line");
@@ -3461,6 +3467,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
             display_name: "peer".into(),
             session_id: uuid::Uuid::nil(),
             connection_role: None,
+            surface: None,
         };
         flotilla_protocol::framing::write_message_line(&mut writer, &hello).await.expect("write hello");
 

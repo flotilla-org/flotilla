@@ -13,9 +13,12 @@
 
 use std::collections::BTreeMap;
 
-use flotilla_protocol::result_set::{
-    AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow, IndependentRow, SessionPhase,
-    VesselRow, WorkPhase,
+use flotilla_protocol::{
+    result_set::{
+        AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, ConvoyPhase, ConvoyRow, IndependentRow, SessionPhase,
+        VesselRow, WorkPhase,
+    },
+    ViewAddress,
 };
 
 use crate::{
@@ -200,7 +203,7 @@ fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, mint: &dy
     }
 }
 
-fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry: &AwarenessEntry, _mint: &dyn RecipeMint) {
+fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry: &AwarenessEntry, mint: &dyn RecipeMint) {
     let segment_key = match entry.kind {
         AwarenessKind::Convoy => SEGMENT_CONVOY,
         AwarenessKind::Issue => SEGMENT_ISSUE,
@@ -222,7 +225,18 @@ fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry:
     if matches!(entry.state, AwarenessState::Waiting | AwarenessState::Failed) {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
+    if let Some(recipe) = awareness_view_target(&entry.id).and_then(|target| mint.scoped_view(&target)) {
+        facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("workspace")));
+        facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
+    }
     catalog.assert_facts(MetadataTarget::Group(path), facts, None);
+}
+
+fn awareness_view_target(id: &str) -> Option<ViewAddress> {
+    match id.parse().ok()? {
+        address @ (ViewAddress::Project { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. }) => Some(address),
+        _ => None,
+    }
 }
 
 fn awareness_state(state: AwarenessState) -> &'static str {

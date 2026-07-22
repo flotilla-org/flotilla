@@ -1,15 +1,11 @@
 use chrono::{DateTime, Utc};
-use flotilla_protocol::ResourceRef;
+use flotilla_protocol::{PrincipalRef, ResourceRef};
 use serde::{Deserialize, Serialize};
 
 use crate::{resource::define_resource, status_patch::StatusPatch};
 
 define_resource!(Regard, "regards", RegardSpec, RegardStatus, RegardStatusPatch);
 define_resource!(Demand, "demands", DemandSpec, DemandStatus, DemandStatusPatch);
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PrincipalRef(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
