@@ -403,6 +403,31 @@ impl App {
                 self.screen.modal_stack.push(Box::new(ConvoyDeleteConfirmWidget::new(command)));
                 return;
             }
+            TableIntent::OpenChangeRequest { id, repository_key, host } => {
+                let Some(repo_identity) = self
+                    .model
+                    .repos
+                    .iter()
+                    .find_map(|(identity, repo)| (repo.repository_key.as_ref() == Some(&repository_key)).then(|| identity.clone()))
+                else {
+                    self.set_status_message(Some(format!("Cannot open PR: repository {repository_key} is not tracked")));
+                    return;
+                };
+                let node_id = match host.as_ref() {
+                    Some(host) => match self.panel_target_node(host) {
+                        Ok(node_id) => node_id,
+                        Err(message) => {
+                            self.set_status_message(Some(message));
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                let mut command = self.repo_command_for_identity(repo_identity, CommandAction::OpenChangeRequest { id });
+                command.node_id = node_id;
+                self.proto_commands.push(command);
+                return;
+            }
             TableIntent::ForceCompleteWork { convoy, vessel, host } => {
                 (self.command(CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }), host)
             }

@@ -815,6 +815,7 @@ mod tests {
             message: None,
             repo_hint: None,
             project_ref: None,
+            change_request: None,
             vessels: vessels
                 .iter()
                 .map(|t| VesselSummary {

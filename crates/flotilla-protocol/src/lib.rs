@@ -103,8 +103,9 @@ pub use query::{
 };
 pub use resource_ref::ResourceRef;
 pub use result_set::{
-    CheckoutRow, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId,
-    QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow, WorkPhase,
+    CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow, IssueRow,
+    QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow,
+    WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 
@@ -120,7 +121,7 @@ pub use snapshot::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConfigLabel(pub String);
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Key for identifying an event stream in replay cursors.
 /// Each stream has its own independent sequence counter.

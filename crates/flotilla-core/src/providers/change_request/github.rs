@@ -25,6 +25,7 @@ struct GhPr {
     state: String,
     body: Option<String>,
     is_draft: bool,
+    merged_at: Option<String>,
 }
 
 impl GitHubChangeRequest {
@@ -65,6 +66,18 @@ impl GitHubChangeRequest {
         issues
     }
 
+    fn parse_pull_request(value: &serde_json::Value) -> Option<GhPr> {
+        Some(GhPr {
+            number: value["number"].as_i64()?,
+            title: value["title"].as_str()?.to_string(),
+            head_ref_name: value["head"]["ref"].as_str()?.to_string(),
+            state: value["state"].as_str().unwrap_or("open").to_string(),
+            body: value["body"].as_str().map(str::to_string),
+            is_draft: value["draft"].as_bool().unwrap_or(false),
+            merged_at: value["merged_at"].as_str().map(str::to_string),
+        })
+    }
+
     fn gh_pr_to_change_request(&self, pr: &GhPr) -> (String, ChangeRequest) {
         let id = pr.number.to_string();
         let correlation_keys = vec![
@@ -84,8 +97,13 @@ impl GitHubChangeRequest {
             }
         }
 
-        let status =
-            if pr.state.to_uppercase() == "OPEN" && pr.is_draft { ChangeRequestStatus::Draft } else { Self::parse_state(&pr.state) };
+        let status = if pr.merged_at.is_some() {
+            ChangeRequestStatus::Merged
+        } else if pr.state.to_uppercase() == "OPEN" && pr.is_draft {
+            ChangeRequestStatus::Draft
+        } else {
+            Self::parse_state(&pr.state)
+        };
 
         (id, ChangeRequest {
             title: pr.title.clone(),
@@ -110,18 +128,26 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 
         Ok(items
             .iter()
-            .filter_map(|v| {
-                let number = v["number"].as_i64()?;
-                let title = v["title"].as_str()?.to_string();
-                let head_ref = v["head"]["ref"].as_str()?.to_string();
-                let state = v["state"].as_str().unwrap_or("open").to_string();
-                let body_text = v["body"].as_str().map(|s| s.to_string());
-                let is_draft = v["draft"].as_bool().unwrap_or(false);
-
-                let pr = GhPr { number, title, head_ref_name: head_ref, state, body: body_text, is_draft };
+            .filter_map(|value| {
+                let pr = Self::parse_pull_request(value)?;
                 Some(self.gh_pr_to_change_request(&pr))
             })
             .collect())
+    }
+
+    async fn find_change_request_by_branch(&self, repo_root: &Path, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
+        let owner = self.repo_slug.split_once('/').map(|(owner, _)| owner).ok_or("GitHub repository slug is missing its owner")?;
+        let head_filter = format!("{owner}:{branch}");
+        let head = urlencoding::encode(&head_filter);
+        let endpoint = format!("repos/{}/pulls?state=all&head={head}&per_page=1", self.repo_slug);
+        let body = gh_api_get!(self.api, &endpoint, repo_root)?;
+        let items: Vec<serde_json::Value> = serde_json::from_str(&body).map_err(|error| error.to_string())?;
+        let Some(value) = items.first() else {
+            return Ok(None);
+        };
+
+        let pull_request = Self::parse_pull_request(value).ok_or("malformed pull request")?;
+        Ok(Some(self.gh_pr_to_change_request(&pull_request)))
     }
 
     async fn get_change_request(&self, repo_root: &Path, id: &str) -> Result<(String, ChangeRequest), String> {
@@ -129,14 +155,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         let body = gh_api_get!(self.api, &endpoint, repo_root)?;
         let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
 
-        let number = v["number"].as_i64().ok_or("missing number")?;
-        let title = v["title"].as_str().ok_or("missing title")?.to_string();
-        let head_ref = v["head"]["ref"].as_str().ok_or("missing head ref")?.to_string();
-        let state = v["state"].as_str().unwrap_or("open").to_string();
-        let body_text = v["body"].as_str().map(|s| s.to_string());
-        let is_draft = v["draft"].as_bool().unwrap_or(false);
-
-        let pr = GhPr { number, title, head_ref_name: head_ref, state, body: body_text, is_draft };
+        let pr = Self::parse_pull_request(&v).ok_or("malformed pull request")?;
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
@@ -166,15 +185,22 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+    };
+
+    use async_trait::async_trait;
 
     use super::*;
     use crate::providers::{
         change_request::ChangeRequestTracker,
+        github_api::{GhApi, GhApiResponse},
         github_test_support::{build_api_and_runner, repo_root_for_recording},
         replay::{
             Masks, {self},
         },
+        ChannelLabel,
     };
 
     fn fixture(name: &str) -> String {
@@ -304,6 +330,59 @@ mod tests {
         GitHubChangeRequest::new("github".into(), "owner/repo".into(), api, runner)
     }
 
+    struct StubGhApi {
+        body: String,
+        endpoints: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl GhApi for StubGhApi {
+        async fn get(&self, endpoint: &str, _repo_root: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.endpoints.lock().expect("endpoint lock").push(endpoint.to_string());
+            Ok(self.body.clone())
+        }
+
+        async fn get_with_headers(&self, _endpoint: &str, _repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
+            unreachable!("branch lookup uses the ordinary GET interface")
+        }
+    }
+
+    fn provider_with_api(api: Arc<dyn GhApi>) -> GitHubChangeRequest {
+        let fallback = provider_with_empty_replay();
+        GitHubChangeRequest::new("github".into(), "owner/repo".into(), api, fallback.runner)
+    }
+
+    #[tokio::test]
+    async fn finds_merged_pull_request_by_branch() {
+        let api = Arc::new(StubGhApi {
+            body: r#"[{"number":815,"title":"Ship convoy","head":{"ref":"feat/convoy"},"state":"closed","merged_at":"2026-07-21T12:00:00Z","body":null,"draft":false}]"#.into(),
+            endpoints: Mutex::new(Vec::new()),
+        });
+        let provider = provider_with_api(api.clone());
+
+        let result = provider
+            .find_change_request_by_branch(Path::new("/repo"), "feat/convoy")
+            .await
+            .expect("branch lookup")
+            .expect("matching pull request");
+
+        assert_eq!(result.0, "815");
+        assert_eq!(result.1.status, ChangeRequestStatus::Merged);
+        assert_eq!(api.endpoints.lock().expect("endpoint lock").as_slice(), [
+            "repos/owner/repo/pulls?state=all&head=owner%3Afeat%2Fconvoy&per_page=1"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn branch_lookup_returns_none_when_the_forge_has_no_pull_request() {
+        let api = Arc::new(StubGhApi { body: "[]".into(), endpoints: Mutex::new(Vec::new()) });
+        let provider = provider_with_api(api);
+
+        let result = provider.find_change_request_by_branch(Path::new("/repo"), "feat/missing").await.expect("branch lookup");
+
+        assert!(result.is_none());
+    }
+
     fn gh_pr(number: i64) -> GhPr {
         GhPr {
             number,
@@ -312,6 +391,7 @@ mod tests {
             state: "OPEN".into(),
             body: None,
             is_draft: false,
+            merged_at: None,
         }
     }
 

@@ -7,8 +7,8 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    result_set::Timestamp, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, ResultSetCondition,
-    ResultSetState, SessionPhase, ViewAddress,
+    result_set::Timestamp, ChangeRequestStatus, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey,
+    RepositoryKey, ResultSetCondition, ResultSetState, SessionPhase, ViewAddress,
 };
 
 use crate::convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase};
@@ -292,6 +292,7 @@ pub enum TableIntent {
     AttachWorkspace { workspace_ref: String, host: HostName, repo_hint: Option<RepoKey> },
     AttachPane { reference: String, host: HostName },
     DeleteConvoy { namespace: String, name: String, host: Option<HostName> },
+    OpenChangeRequest { id: String, repository_key: RepositoryKey, host: Option<HostName> },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
     StartConvoy { namespace: String, project: String, issue: IssueRef },
 }
@@ -461,7 +462,11 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 repo_hint: convoy.repo_hint.clone(),
                 vessel: vessel.clone(),
             });
-            Ok(vessel_spec().project(format!("Convoy · {name}"), rows))
+            let title = convoy.change_request.as_ref().map_or_else(
+                || format!("Convoy · {name}"),
+                |change_request| format!("Convoy · {name} · PR #{} {}", change_request.id, change_request.status),
+            );
+            Ok(vessel_spec().project(title, rows))
         }
         ViewAddress::Vessel { namespace, convoy, vessel } => {
             let convoy_row = find_convoy(&data.convoys, namespace, convoy)?;
@@ -659,7 +664,7 @@ fn checkout_spec() -> TableSpec<CheckoutRow> {
     }
 }
 
-static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 6] = [
+static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
     ColumnSpec {
         id: "name",
         label: "CONVOY",
@@ -675,6 +680,7 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 6] = [
         extract: |row| CellValue::plain(&row.workflow_ref),
     },
     ColumnSpec { id: "phase", label: "PHASE", width: WidthHint::Fixed(12), alignment: Alignment::Left, extract: convoy_phase },
+    ColumnSpec { id: "pr", label: "PR", width: WidthHint::Fixed(14), alignment: Alignment::Left, extract: convoy_change_request },
     ColumnSpec { id: "vessels", label: "VESSELS", width: WidthHint::Fixed(9), alignment: Alignment::Right, extract: convoy_progress },
     ColumnSpec {
         id: "scope",
@@ -692,8 +698,13 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 6] = [
     },
 ];
 
-static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 1] =
-    [ActionSpec { id: "delete", label: "Delete convoy", key: 'd', resolve: delete_convoy }];
+static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 2] =
+    [ActionSpec { id: "open_pr", label: "Open PR", key: 'p', resolve: open_convoy_change_request }, ActionSpec {
+        id: "delete",
+        label: "Delete convoy",
+        key: 'd',
+        resolve: delete_convoy,
+    }];
 
 static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
     ColumnSpec {
@@ -882,19 +893,45 @@ fn convoy_progress(row: &ConvoySummary) -> CellValue {
     CellValue::plain(format!("{complete}/{}", row.vessels.len()))
 }
 
+fn convoy_change_request(row: &ConvoySummary) -> CellValue {
+    let Some(change_request) = &row.change_request else {
+        return CellValue::plain("");
+    };
+    let tone = match change_request.status {
+        ChangeRequestStatus::Open => CellTone::Success,
+        ChangeRequestStatus::Draft => CellTone::Warning,
+        ChangeRequestStatus::Merged => CellTone::Success,
+        ChangeRequestStatus::Closed => CellTone::Muted,
+    };
+    CellValue::toned(format!("#{} {}", change_request.id, change_request.status), tone)
+}
+
 fn convoy_scope(row: &ConvoySummary) -> CellValue {
     CellValue::plain(row.project_ref.as_deref().or_else(|| row.repo_hint.as_ref().map(|repo| repo.0.as_str())).unwrap_or_default())
 }
 
 fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
-    vec![
+    let mut fields = vec![
         DetailField { label: "Namespace", value: row.namespace.clone() },
         DetailField { label: "Convoy", value: row.name.clone() },
         DetailField { label: "Workflow", value: row.workflow_ref.clone() },
         DetailField { label: "Phase", value: convoy_phase(row).text },
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
-    ]
+    ];
+    if let Some(change_request) = &row.change_request {
+        fields.push(DetailField { label: "Pull request", value: format!("#{} · {}", change_request.id, change_request.status) });
+    }
+    fields
+}
+
+fn open_convoy_change_request(row: &ConvoySummary) -> Option<TableIntent> {
+    let change_request = row.change_request.as_ref()?;
+    Some(TableIntent::OpenChangeRequest {
+        id: change_request.id.clone(),
+        repository_key: change_request.repository_key.clone(),
+        host: row.origin_host.clone(),
+    })
 }
 
 fn delete_convoy(row: &ConvoySummary) -> Option<TableIntent> {
@@ -1064,6 +1101,7 @@ mod tests {
             message: None,
             repo_hint: None,
             project_ref: Some("flotilla".into()),
+            change_request: None,
             vessels,
             started_at: None,
             finished_at: None,
@@ -1091,11 +1129,57 @@ mod tests {
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
         assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec![
-            "name", "workflow", "phase", "vessels", "scope", "message"
+            "name", "workflow", "phase", "pr", "vessels", "scope", "message"
         ]);
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
-        assert_eq!(view.rows[0].cells[5].text, "workspace launch failed: disk full");
+        assert_eq!(view.rows[0].cells[6].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
+    }
+
+    #[test]
+    fn terminal_convoy_phases_have_distinct_row_tones() {
+        let mut completed = convoy(vec![]);
+        completed.phase = ConvoyPhase::Completed;
+        let mut failed = convoy(vec![]);
+        failed.id = ConvoyId::new("dev", "failed");
+        failed.name = "failed".into();
+        failed.phase = ConvoyPhase::Failed;
+
+        let view = project_convoys("convoys/dev", &[&completed, &failed]).expect("convoy table");
+
+        assert_eq!(view.rows[0].cells[2], CellValue::toned("completed", CellTone::Success));
+        assert_eq!(view.rows[1].cells[2], CellValue::toned("failed", CellTone::Error));
+    }
+
+    #[test]
+    fn convoy_projection_shows_change_request_and_exposes_open_action() {
+        let mut row = convoy(vec![]);
+        row.origin_host = Some(HostName::new("kiwi"));
+        row.change_request = Some(flotilla_protocol::ConvoyChangeRequest {
+            id: "815".into(),
+            status: flotilla_protocol::ChangeRequestStatus::Open,
+            repository_key: RepositoryKey("repo_flotilla".into()),
+        });
+
+        let view = project_convoys("convoys/dev", &[&row]).expect("project table");
+
+        let pr_index = view.columns.iter().position(|column| column.id == "pr").expect("PR column");
+        assert_eq!(view.rows[0].cells[pr_index], CellValue::toned("#815 open", CellTone::Success));
+        assert!(view.rows[0].describe.contains(&DetailField { label: "Pull request", value: "#815 · open".into() }));
+        assert_eq!(
+            view.rows[0].actions.iter().find(|action| action.id == "open_pr"),
+            Some(&AvailableAction {
+                id: "open_pr",
+                label: "Open PR",
+                key: 'p',
+                intent: TableIntent::OpenChangeRequest {
+                    id: "815".into(),
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                    host: Some(HostName::new("kiwi")),
+                },
+            })
+        );
+        assert_eq!(project_convoys("convoy/dev/tables", &[&row]).expect("convoy view").title, "Convoy · tables · PR #815 open");
     }
 
     #[test]

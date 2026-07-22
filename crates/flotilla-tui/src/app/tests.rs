@@ -1620,6 +1620,7 @@ fn wire_convoy_row(convoy: crate::convoy_model::ConvoySummary) -> flotilla_proto
         .maybe_message(convoy.message)
         .maybe_repo(convoy.repo_hint)
         .maybe_project_ref(convoy.project_ref)
+        .maybe_change_request(convoy.change_request)
         .maybe_started_at(convoy.started_at)
         .maybe_finished_at(convoy.finished_at)
         .maybe_observed_workflow_ref(convoy.observed_workflow_ref)
@@ -1718,6 +1719,7 @@ fn test_convoy(
         message: None,
         repo_hint: None,
         project_ref: None,
+        change_request: None,
         vessels: vec![],
         started_at: None,
         finished_at: None,
