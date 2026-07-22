@@ -108,9 +108,9 @@ pub struct Command {
     pub action: CommandAction,
 }
 
-/// An issue supplied to convoy admission either as a fully source-qualified
+/// One issue supplied to convoy admission either as a fully source-qualified
 /// reference or as an opaque ID whose source must be resolved through the
-/// Project.
+/// Project. A start intent may carry several selectors.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum IssueSelector {
@@ -120,6 +120,8 @@ pub enum IssueSelector {
 
 /// Partial intent accepted by the convoy start verb. Admission completes any
 /// omitted fields before persisting a `ConvoySpec`.
+/// `issues` contains zero or more issue selectors to snapshot into the
+/// admitted convoy.
 ///
 /// This type lives in protocol rather than resources because incomplete
 /// intent must never enter the resource store.

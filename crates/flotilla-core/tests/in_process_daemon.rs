@@ -1067,7 +1067,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 intent: Box::new(ConvoyStartIntent {
                     namespace: None,
                     project_ref: "flotilla".into(),
-                    issues: vec![IssueSelector::Reference(reference.clone()), IssueSelector::Reference(reference_two.clone())],
+                    issues: vec![
+                        IssueSelector::Reference(reference.clone()),
+                        IssueSelector::Reference(reference_two.clone()),
+                        IssueSelector::Reference(reference_two.clone()),
+                    ],
                     name: Some("batch-732-733".into()),
                     branch: Some("fix/batch-732-733".into()),
                     workflow_ref: Some("single-agent-contained".into()),

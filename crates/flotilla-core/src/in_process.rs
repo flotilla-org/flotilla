@@ -3071,9 +3071,12 @@ impl InProcessDaemon {
             .await
             .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
         let repositories = self.snapshot_project_repositories(namespace, project_ref).await?;
+        let mut seen_issue_selectors = HashSet::new();
         let mut issues = Vec::with_capacity(intent.issues.len());
         for selector in &intent.issues {
-            issues.push(self.resolve_convoy_issue(namespace, &project, selector).await?);
+            if seen_issue_selectors.insert(selector.clone()) {
+                issues.push(self.resolve_convoy_issue(namespace, &project, selector).await?);
+            }
         }
         let workflow_ref = match intent.workflow_ref.as_deref() {
             Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
