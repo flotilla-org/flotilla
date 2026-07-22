@@ -1,9 +1,24 @@
 use std::path::Path;
 
 use chrono::Utc;
-use flotilla_resources::{CheckoutIntegrationStatus, ConditionValue, IntegrationCondition, LandedEvidence};
+use flotilla_resources::{CheckoutIntegrationStatus, CheckoutSpec, CheckoutStatus, ConditionValue, IntegrationCondition, LandedEvidence};
 
 use crate::providers::{ChannelLabel, CommandRunner};
+
+pub fn checkout_branch_from_spec(spec: &CheckoutSpec) -> &str {
+    match spec {
+        CheckoutSpec::Worktree(spec) => &spec.r#ref,
+        CheckoutSpec::FreshClone(spec) => &spec.r#ref,
+        CheckoutSpec::Observed(spec) => &spec.r#ref,
+    }
+}
+
+pub fn checkout_path_from_status_and_spec<'a>(status: Option<&'a CheckoutStatus>, spec: &'a CheckoutSpec) -> Option<&'a str> {
+    status.as_ref().and_then(|status| status.path.as_deref()).or_else(|| spec.target_path()).or(match spec {
+        CheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
+        _ => None,
+    })
+}
 
 pub async fn inspect_checkout_integration(runner: &dyn CommandRunner, checkout_path: &Path, branch: &str) -> CheckoutIntegrationStatus {
     let observed_at = Utc::now().to_rfc3339();

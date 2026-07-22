@@ -17,7 +17,7 @@ use flotilla_controllers::reconcilers::{
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::inspect_checkout_integration,
+    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::ConfigStore,
     in_process::InProcessDaemon,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -692,7 +692,7 @@ fn spawn_controller_loops(
                             primary: backend.clone().using::<flotilla_resources::Checkout>(&namespace_string),
                             secondaries: vec![],
                             reconciler: CheckoutReconciler::new(
-                                Arc::new(CheckoutControllerRuntime { state: Some(state), runner }),
+                                Arc::new(CheckoutControllerRuntime { runner }),
                                 backend.clone(),
                                 &namespace_string,
                             ),
@@ -973,7 +973,6 @@ impl CloneRuntime for CloneControllerRuntime {
 }
 
 struct CheckoutControllerRuntime {
-    state: Option<Arc<ControllerRuntimeState>>,
     runner: Arc<dyn CommandRunner>,
 }
 
@@ -982,38 +981,13 @@ impl CheckoutControllerRuntime {
         Ok(Arc::clone(&self.runner))
     }
 
-    fn checkout_runner(&self, checkout: &ResourceObject<Checkout>) -> Result<Arc<dyn CommandRunner>, String> {
-        let Some(env_ref) = checkout.spec.env_ref() else {
-            return self.local_runner();
-        };
-        let Some(state) = &self.state else {
-            return self.local_runner();
-        };
-        state
-            .daemon
-            .command_runner_for_environment(&EnvironmentId::new(env_ref))
-            .ok_or_else(|| format!("checkout environment {env_ref} has no command runner"))
-    }
-
     fn checkout_path<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> Result<&'a str, String> {
-        checkout
-            .status
-            .as_ref()
-            .and_then(|status| status.path.as_deref())
-            .or_else(|| checkout.spec.target_path())
-            .or(match &checkout.spec {
-                flotilla_resources::CheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
-                _ => None,
-            })
+        checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
             .ok_or_else(|| format!("checkout {} has no resolved path", checkout.metadata.name))
     }
 
     fn checkout_branch<'a>(&self, checkout: &'a ResourceObject<Checkout>) -> &'a str {
-        match &checkout.spec {
-            flotilla_resources::CheckoutSpec::Worktree(spec) => &spec.r#ref,
-            flotilla_resources::CheckoutSpec::FreshClone(spec) => &spec.r#ref,
-            flotilla_resources::CheckoutSpec::Observed(spec) => &spec.r#ref,
-        }
+        checkout_branch_from_spec(&checkout.spec)
     }
 }
 
@@ -1162,12 +1136,8 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     }
 
     async fn inspect_integration(&self, checkout: &ResourceObject<Checkout>) -> Result<CheckoutIntegrationStatus, String> {
-        Ok(inspect_checkout_integration(
-            &*self.checkout_runner(checkout)?,
-            Path::new(self.checkout_path(checkout)?),
-            self.checkout_branch(checkout),
-        )
-        .await)
+        Ok(inspect_checkout_integration(&*self.local_runner()?, Path::new(self.checkout_path(checkout)?), self.checkout_branch(checkout))
+            .await)
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
@@ -1481,7 +1451,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_worktree(
@@ -1507,7 +1477,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("flotilla.feature-cleanup");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         let prepared = runtime
             .create_worktree(
@@ -1548,7 +1518,7 @@ mod tests {
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let convoy_dir = temp.path().join("checkout-root/convoy-a");
         let target = convoy_dir.join("feature-work/flotilla");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         let prepared = runtime
             .create_worktree(
@@ -1607,7 +1577,7 @@ mod tests {
     async fn checkout_runtime_removes_a_shared_bootstrap_branch_in_either_teardown_order() {
         let temp = TempDir::new().expect("tempdir");
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         for reverse_teardown in [false, true] {
             let case = if reverse_teardown { "reverse" } else { "forward" };
@@ -1662,7 +1632,7 @@ mod tests {
             .with_initial_commit()
             .with_origin(missing_origin.to_str().expect("utf-8 origin path"));
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         let prepared = runtime
             .create_worktree(
@@ -1723,7 +1693,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_worktree(
@@ -1768,7 +1738,7 @@ mod tests {
             .expect("git clone should run")
             .success());
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_worktree(
@@ -1818,7 +1788,7 @@ mod tests {
             .success());
 
         let target = temp.path().join("workspace/flotilla");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
         runtime
             .create_worktree(
                 clone_path.to_str().expect("utf-8 clone path"),
@@ -1842,7 +1812,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_fresh_clone(
@@ -1867,7 +1837,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_fresh_clone(
@@ -1904,7 +1874,7 @@ mod tests {
             .expect("git commit should run")
             .success());
         let target = temp.path().join("fresh-clone");
-        let runtime = CheckoutControllerRuntime { state: None, runner: Arc::new(ProcessCommandRunner) };
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
         runtime
             .create_fresh_clone(source_path, "feature/existing", Some("main"), target.to_str().expect("utf-8 target path"))

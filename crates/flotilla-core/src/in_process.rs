@@ -51,7 +51,7 @@ use tracing::{debug, info, warn};
 use crate::{
     agent_adapter::CapabilityTable,
     aggregator_projection::AggregatorProjectionState,
-    checkout_integration::inspect_checkout_integration,
+    checkout_integration::{checkout_branch_from_spec, checkout_path_from_status_and_spec, inspect_checkout_integration},
     config::{ConfigStore, RemoteHostConfig, StaticEnvironmentConfig},
     convert::snapshot_to_proto,
     daemon::{DaemonHandle, QuerySubscription},
@@ -1063,18 +1063,11 @@ fn convoy_start_failure(convoy: &ResourceObject<ResourceConvoy>) -> Option<Strin
 }
 
 fn checkout_branch(checkout: &ResourceObject<ResourceCheckout>) -> &str {
-    match &checkout.spec {
-        ResourceCheckoutSpec::Worktree(spec) => &spec.r#ref,
-        ResourceCheckoutSpec::FreshClone(spec) => &spec.r#ref,
-        ResourceCheckoutSpec::Observed(spec) => &spec.r#ref,
-    }
+    checkout_branch_from_spec(&checkout.spec)
 }
 
 fn checkout_path(checkout: &ResourceObject<ResourceCheckout>) -> Option<&str> {
-    checkout.status.as_ref().and_then(|status| status.path.as_deref()).or_else(|| checkout.spec.target_path()).or(match &checkout.spec {
-        ResourceCheckoutSpec::Observed(spec) => Some(spec.path.as_str()),
-        _ => None,
-    })
+    checkout_path_from_status_and_spec(checkout.status.as_ref(), &checkout.spec)
 }
 
 fn condition_is_true(condition: &IntegrationCondition) -> bool {
@@ -4168,12 +4161,8 @@ impl InProcessDaemon {
         .await
     }
 
-    async fn runner_for_resource_checkout(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
-        let Some(env_ref) = checkout.spec.env_ref() else {
-            return self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string());
-        };
-        self.command_runner_for_environment(&EnvironmentId::new(env_ref))
-            .ok_or_else(|| format!("checkout environment {env_ref} has no command runner"))
+    async fn runner_for_resource_checkout(&self, _checkout: &ResourceObject<ResourceCheckout>) -> Result<Arc<dyn CommandRunner>, String> {
+        self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())
     }
 
     async fn checkout_environment_is_destroyed(&self, namespace: &str, env_ref: &str) -> Result<bool, String> {
@@ -4205,9 +4194,24 @@ impl InProcessDaemon {
             .items;
         let mut refusals = Vec::new();
         for checkout in checkout_list {
+            let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
+            if let Some(env_ref) = checkout.spec.env_ref() {
+                if self.checkout_environment_is_destroyed(namespace, env_ref).await? {
+                    warn!(
+                        checkout = %checkout.metadata.name,
+                        env_ref,
+                        "checkout environment is gone; allowing corpse cleanup without integration probes"
+                    );
+                    continue;
+                }
+            }
             let path = match checkout_path(&checkout) {
                 Some(path) => Path::new(path).to_path_buf(),
                 None => {
+                    if is_adopted {
+                        warn!(checkout = %checkout.metadata.name, "adopted checkout has no resolved path; releasing without deletion");
+                        continue;
+                    }
                     refusals.push(format!("{} [<unknown path>]: Clean=Unknown (checkout has no resolved path)", checkout.metadata.name));
                     continue;
                 }
@@ -4215,15 +4219,9 @@ impl InProcessDaemon {
             let runner = match self.runner_for_resource_checkout(&checkout).await {
                 Ok(runner) => runner,
                 Err(error) => {
-                    if let Some(env_ref) = checkout.spec.env_ref() {
-                        if self.checkout_environment_is_destroyed(namespace, env_ref).await? {
-                            warn!(
-                                checkout = %checkout.metadata.name,
-                                env_ref,
-                                "checkout environment is gone; allowing corpse cleanup without integration probes"
-                            );
-                            continue;
-                        }
+                    if is_adopted {
+                        warn!(checkout = %checkout.metadata.name, %error, "adopted checkout integration could not be probed; releasing without deletion");
+                        continue;
                     }
                     refusals.push(format!(
                         "{} [{}]: Clean=Unknown ({error}); Pushed=Unknown ({error}); Landed=Unknown ({error})",
@@ -4249,7 +4247,7 @@ impl InProcessDaemon {
             {
                 warn!(checkout = %checkout.metadata.name, %error, "failed to persist checkout integration conditions during teardown gate");
             }
-            if checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted) {
+            if is_adopted {
                 if let Some(summary) = checkout_integration_summary(&checkout, &integration) {
                     warn!(checkout = %checkout.metadata.name, summary = %summary, "adopted checkout has integration dirt; releasing without deletion");
                 }
