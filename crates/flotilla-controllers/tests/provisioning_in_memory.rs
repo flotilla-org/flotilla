@@ -14,8 +14,8 @@ use common::{
 };
 use flotilla_controllers::reconcilers::{
     CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime,
-    EnvironmentReconciler, HopChainContext, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
+    EnvironmentReconciler, HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler,
+    ProviderPresentationRuntime, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     path_context::DaemonHostPath,
@@ -29,11 +29,11 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec,
-    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
-    HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation, PresentationPhase, PresentationSpec, ResourceBackend, ResourceError,
-    StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
-    VESSEL_REF_LABEL,
+    clone_key, controller::ControllerLoop, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
+    ClonePhase, CloneSpec, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
+    Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation, PresentationPhase, PresentationSpec, ResourceBackend,
+    ResourceError, StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, CONVOY_LABEL, CREW_ORDINAL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -80,8 +80,8 @@ impl CheckoutRuntime for FakeCheckoutRuntime {
         _branch: &str,
         _base_ref: Option<&str>,
         _target_path: &str,
-    ) -> Result<Option<String>, String> {
-        Ok(Some("44982740".to_string()))
+    ) -> Result<PreparedCheckout, String> {
+        Ok(PreparedCheckout { commit: Some("44982740".to_string()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy })
     }
 
     async fn create_fresh_clone(
@@ -90,8 +90,8 @@ impl CheckoutRuntime for FakeCheckoutRuntime {
         _branch: &str,
         _base_ref: Option<&str>,
         _target_path: &str,
-    ) -> Result<Option<String>, String> {
-        Ok(Some("44982740".to_string()))
+    ) -> Result<PreparedCheckout, String> {
+        Ok(PreparedCheckout { commit: Some("44982740".to_string()), branch_provenance: CheckoutBranchProvenance::PreExisting })
     }
 
     async fn remove_checkout(&self, _removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {

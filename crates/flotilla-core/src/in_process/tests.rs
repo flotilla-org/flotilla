@@ -531,6 +531,7 @@ async fn create_adopted_checkout_for_convoy(daemon: &InProcessDaemon, convoy: &s
             phase: ResourceCheckoutPhase::Ready,
             path: Some("/repo".to_string()),
             commit: None,
+            branch_provenance: Default::default(),
             message: None,
         })
         .await

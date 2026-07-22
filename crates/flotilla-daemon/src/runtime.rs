@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
     BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PresentationPolicyRegistry,
-    PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselReconciler,
+    DockerEnvironmentRuntime, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalRuntime,
+    TerminalRuntimeState, TerminalSessionReconciler, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentLaunchRequest, CapabilityTable},
@@ -31,11 +31,12 @@ use flotilla_core::{
 };
 use flotilla_protocol::{EnvironmentId, EnvironmentSpec as RuntimeEnvironmentSpec, HostSummary, ImageId, ImageSource};
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, Clone, CloneSpec, Convoy, ConvoyReconciler, CrewSource,
-    CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, ForgeIdentity, Host,
-    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputDefinition,
-    InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError, ResourceObject,
-    Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec, AGENT_ADAPTERS_CAPABILITY,
+    clone_key, controller::ControllerLoop, descriptive_repo_slug, Checkout, CheckoutBranchProvenance, Clone, CloneSpec, Convoy,
+    ConvoyReconciler, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
+    ForgeIdentity, Host, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
+    InputDefinition, InputMeta, PlacementPolicy, PlacementPolicySpec, Presentation, Project, Repository, ResourceBackend, ResourceError,
+    ResourceObject, Stance, TerminalSessionSource, Vessel, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    AGENT_ADAPTERS_CAPABILITY,
 };
 use serde_json::json;
 use tokio::{sync::Mutex, task::JoinHandle};
@@ -981,7 +982,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<PreparedCheckout, String> {
         let clone_path = utf8_path(clone_path)?;
         let target_path = utf8_path(target_path)?;
 
@@ -1014,7 +1015,11 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
             .run("git", &["-C", clone_path, "show-ref", "--verify", "--quiet", &remote_ref], Path::new("/"), &ChannelLabel::Noop)
             .await
             .is_ok();
-        let bootstrap_branch_created = !local_exists && !remote_exists && base_ref.is_some();
+        let branch_provenance = if !local_exists && !remote_exists && base_ref.is_some() {
+            CheckoutBranchProvenance::CreatedForConvoy
+        } else {
+            CheckoutBranchProvenance::PreExisting
+        };
 
         if local_exists {
             // Multiple vessels can intentionally share the convoy branch. `--force`
@@ -1066,7 +1071,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         }
 
         let commit = resolve_head_commit(&*self.runner, target_path).await?;
-        if bootstrap_branch_created {
+        if branch_provenance == CheckoutBranchProvenance::CreatedForConvoy {
             // Ownership belongs to the branch, not one checkout: sibling vessels
             // can share it and may finalize in either order.
             let commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
@@ -1074,7 +1079,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 .run("git", &["-C", clone_path, "update-ref", &bootstrap_branch_ref(branch), commit], Path::new("/"), &ChannelLabel::Noop)
                 .await?;
         }
-        Ok(commit)
+        Ok(PreparedCheckout { commit, branch_provenance })
     }
 
     async fn create_fresh_clone(
@@ -1083,7 +1088,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<PreparedCheckout, String> {
         let target_path = utf8_path(target_path)?;
         let clone_ref = base_ref.unwrap_or(branch);
         if clone_ref == "HEAD" {
@@ -1111,7 +1116,10 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 self.runner.run("git", &["-C", target_path, "switch", "-c", branch], Path::new("/"), &ChannelLabel::Noop).await?;
             }
         }
-        resolve_head_commit(&*self.runner, target_path).await
+        Ok(PreparedCheckout {
+            commit: resolve_head_commit(&*self.runner, target_path).await?,
+            branch_provenance: CheckoutBranchProvenance::PreExisting,
+        })
     }
 
     async fn remove_checkout(&self, removal: &CheckoutRemoval) -> Result<CheckoutRemovalOutcome, String> {
@@ -1457,7 +1465,7 @@ mod tests {
         let target = convoy_dir.join("flotilla.feature-cleanup");
         let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
-        runtime
+        let prepared = runtime
             .create_worktree(
                 clone.path().to_str().expect("utf-8 clone path"),
                 "feature/cleanup",
@@ -1466,6 +1474,8 @@ mod tests {
             )
             .await
             .expect("worktree should create");
+        assert_eq!(prepared.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
+        assert!(prepared.commit.is_some(), "worktree should resolve its initial commit");
         let removal = CheckoutRemoval::Worktree {
             clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
             branch: "feature/cleanup".to_string(),
@@ -1496,7 +1506,7 @@ mod tests {
         let target = convoy_dir.join("feature-work/flotilla");
         let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
-        runtime
+        let prepared = runtime
             .create_worktree(
                 clone.path().to_str().expect("utf-8 clone path"),
                 "feature/work",
@@ -1505,6 +1515,8 @@ mod tests {
             )
             .await
             .expect("worktree should create");
+        assert_eq!(prepared.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
+        assert!(prepared.commit.is_some(), "worktree should resolve its initial commit");
         fs::write(target.join("work.txt"), "real work\n").expect("work file should be written");
         assert!(ProcessCommand::new("git")
             .args(["-C", target.to_str().expect("utf-8 target path"), "add", "work.txt"])
@@ -1558,8 +1570,8 @@ mod tests {
             let branch = format!("feature/shared-{case}");
             let workspace = temp.path().join(format!("workspace-{case}"));
             let targets = [workspace.join("first"), workspace.join("second")];
-            for target in &targets {
-                runtime
+            for (index, target) in targets.iter().enumerate() {
+                let prepared = runtime
                     .create_worktree(
                         clone.path().to_str().expect("utf-8 clone path"),
                         &branch,
@@ -1568,6 +1580,8 @@ mod tests {
                     )
                     .await
                     .expect("worktree should create");
+                let expected = if index == 0 { CheckoutBranchProvenance::CreatedForConvoy } else { CheckoutBranchProvenance::PreExisting };
+                assert_eq!(prepared.branch_provenance, expected, "only the creating checkout should record convoy provenance");
             }
 
             let removals = targets.each_ref().map(|target| CheckoutRemoval::Worktree {
@@ -1606,7 +1620,7 @@ mod tests {
         let target = temp.path().join("workspace/flotilla");
         let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
 
-        runtime
+        let prepared = runtime
             .create_worktree(
                 clone.path().to_str().expect("utf-8 clone path"),
                 "main",
@@ -1615,6 +1629,7 @@ mod tests {
             )
             .await
             .expect("local branch should not require its origin");
+        assert_eq!(prepared.branch_provenance, CheckoutBranchProvenance::PreExisting);
 
         let branch = ProcessCommand::new("git")
             .args(["-C", target.to_str().expect("utf-8 target path"), "branch", "--show-current"])

@@ -3498,6 +3498,7 @@ impl InProcessDaemon {
                     _ => None,
                 }),
                 commit: None,
+                branch_provenance: Default::default(),
                 message: None,
             })
             .await

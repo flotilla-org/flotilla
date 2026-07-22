@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use common::{create_ready_clone, meta};
-use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime};
+use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
 use flotilla_resources::{
-    controller::Reconciler, repo_key, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, RepositoryKey,
-    ResourceBackend,
+    controller::Reconciler, repo_key, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutStatus,
+    CheckoutWorktreeSpec, RepositoryKey, ResourceBackend,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -29,7 +29,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         _branch: &str,
         _base_ref: Option<&str>,
         _target_path: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<PreparedCheckout, String> {
         Err("creation is outside this test's scope".to_string())
     }
 
@@ -39,7 +39,7 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         _branch: &str,
         _base_ref: Option<&str>,
         _target_path: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<PreparedCheckout, String> {
         Err("creation is outside this test's scope".to_string())
     }
 
@@ -73,6 +73,7 @@ async fn worktree_finalizer_supplies_clone_branch_and_target_to_runtime() {
             phase: CheckoutPhase::Ready,
             path: Some("/checkouts/convoy-a/repo.feature-cleanup".to_string()),
             commit: Some("base-commit".to_string()),
+            branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
             message: None,
         })
         .await
