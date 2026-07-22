@@ -466,7 +466,7 @@ impl App {
                             inputs: Vec::new(),
                             instruction: None,
                             placement_policy: None,
-                            auto_attach: true,
+                            auto_attach: false,
                         }),
                     });
                     let pending_ctx = PendingActionContext {
