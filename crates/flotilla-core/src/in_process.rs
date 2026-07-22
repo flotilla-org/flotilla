@@ -4156,11 +4156,8 @@ impl InProcessDaemon {
             .crew
             .iter()
             .enumerate()
-            .find(|(_, process)| process.role == target)
+            .find(|(_, process)| process.role == target && target != context.caller_role)
             .ok_or_else(|| crew_handoff_address_error(target, &context.vessel))?;
-        if target == context.caller_role {
-            return Err(crew_handoff_address_error(target, &context.vessel));
-        }
         let CrewSource::Agent { selector, prompt } = &process.source else {
             return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
         };
