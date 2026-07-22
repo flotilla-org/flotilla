@@ -128,8 +128,8 @@ pub use resource_ref::ResourceRef;
 pub use result_set::{
     AwarenessCounts, AwarenessEntry, AwarenessGrouping, AwarenessKind, AwarenessLimit, AwarenessLink, AwarenessNode, AwarenessPhase,
     AwarenessState, CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, DemandBackedMetadata, IndependentRow,
-    IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, SessionPhase, VesselRow,
-    WorkPhase,
+    IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetCondition, ResultSetState, Rows, Salience, SessionPhase,
+    VesselRow, WorkPhase,
 };
 use serde::{Deserialize, Serialize};
 

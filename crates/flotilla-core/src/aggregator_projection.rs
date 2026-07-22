@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::{
     awareness_projection::{project_awareness, AwarenessInput, ScopedIssueRow},
     query_registry::QueryRegistry,
+    salience::SalienceFacts,
     scoped_store::{ScopedCheckoutProjection, ScopedIndependentProjection},
 };
 
@@ -108,6 +109,12 @@ impl<R: QueryRow + PartialEq> QueryProjection<R> {
     }
 }
 
+#[derive(Debug, Default)]
+struct SalienceProjection {
+    facts: SalienceFacts,
+    revision: u64,
+}
+
 #[derive(Debug, Default, Clone, bon::Builder)]
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
@@ -115,6 +122,8 @@ pub struct AggregatorProjectionState {
     independents: Arc<RwLock<ScopedIndependentProjection>>,
     #[builder(skip)]
     checkouts: Arc<RwLock<ScopedCheckoutProjection>>,
+    #[builder(skip)]
+    salience: Arc<RwLock<SalienceProjection>>,
     /// Subscriber ownership and demand-backed materializations belong to the
     /// Aggregator state, shared with the daemon's subscription transport.
     demand_backed: QueryRegistry,
@@ -180,6 +189,18 @@ impl AggregatorProjectionState {
 
     pub async fn replace_checkout_replica_rows(&self, replicas: HashMap<HostName, Vec<CheckoutRow>>) -> Vec<ResultDelta> {
         self.checkouts.write().await.replace_replica_rows(replicas)
+    }
+
+    /// Replace the mesh-side facts used by the central salience join. Returns
+    /// whether any projected salience may have changed.
+    pub async fn replace_salience_facts(&self, facts: SalienceFacts) -> bool {
+        let mut current = self.salience.write().await;
+        if current.facts == facts {
+            return false;
+        }
+        current.facts = facts;
+        current.revision = current.revision.saturating_add(1);
+        true
     }
 
     /// Replace one subscriber's complete demand and return queries whose
@@ -287,12 +308,27 @@ impl AggregatorProjectionState {
             })
             .collect::<Vec<_>>();
         let state = merged_issue_state(&issue_sets);
-        let seq = [self.seq().await, independents_set.seq, checkouts_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
-            .into_iter()
-            .max()
-            .unwrap_or(0);
-        let (rows, state) =
-            project_awareness(AwarenessInput { scope: scope.clone(), grouping, limit, convoys, issues, checkouts, independents, state });
+        let (salience, salience_revision) = {
+            let projection = self.salience.read().await;
+            (projection.facts.clone(), projection.revision)
+        };
+        let base_seq =
+            [self.seq().await, independents_set.seq, checkouts_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+        let seq = base_seq.saturating_add(salience_revision);
+        let (rows, state) = project_awareness(AwarenessInput {
+            scope: scope.clone(),
+            grouping,
+            limit,
+            convoys,
+            issues,
+            checkouts,
+            independents,
+            salience,
+            state,
+        });
         ResultSet { seq, rows: Rows::Awareness { scope: scope.clone(), grouping, limit, rows }, state }
     }
 
@@ -345,8 +381,10 @@ mod tests {
     use flotilla_protocol::{
         AwarenessKind, DemandBackedMetadata, Issue, IssueRef, IssueSource, IssueState, QueryCursor, ResultSetState, Rows,
     };
+    use flotilla_resources::PrincipalRef;
 
     use super::*;
+    use crate::salience::RegardFact;
 
     fn scope_in(namespace: &str, name: &str) -> QueryScope {
         QueryScope::new(namespace, name)
@@ -439,5 +477,28 @@ mod tests {
         assert_eq!(rows[0].counts.convoys, 1);
         assert_eq!(rows[0].entries.iter().filter(|entry| entry.kind == AwarenessKind::Convoy).count(), 1);
         assert!(rows[0].refs.contains(&matching.resource));
+    }
+
+    #[tokio::test]
+    async fn salience_only_changes_advance_awareness_sequence() {
+        let state = AggregatorProjectionState::new();
+        let query_scope = Some(scope("roadmap"));
+        let before = state.awareness_result_set(&query_scope, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+
+        assert!(
+            state
+                .replace_salience_facts(SalienceFacts {
+                    regards: vec![RegardFact {
+                        principal: PrincipalRef("flotilla/operator".into()),
+                        target: ResourceRef::new("flotilla.work/v1", "Project", "flotilla", "roadmap"),
+                        as_of: Utc::now(),
+                    }],
+                    ..SalienceFacts::default()
+                })
+                .await
+        );
+
+        let after = state.awareness_result_set(&query_scope, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        assert!(after.seq > before.seq);
     }
 }

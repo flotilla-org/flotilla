@@ -8,8 +8,11 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessGrouping, AwarenessKind, AwarenessLimit, AwarenessNode, AwarenessPhase, AwarenessState,
-    CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef, ResultSetState, WorkPhase,
+    CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef, ResultSetState, Salience, WorkPhase,
 };
+use flotilla_resources::{api_version, Project, Resource};
+
+use crate::salience::{evaluate_entry, SalienceFacts};
 
 #[derive(Debug, Clone, Default)]
 pub struct AwarenessInput {
@@ -20,6 +23,7 @@ pub struct AwarenessInput {
     pub issues: Vec<ScopedIssueRow>,
     pub checkouts: Vec<CheckoutRow>,
     pub independents: Vec<IndependentRow>,
+    pub salience: SalienceFacts,
     pub state: ResultSetState,
 }
 
@@ -50,7 +54,13 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         let kind = group_kind_for_query(input.scope.as_ref(), input.grouping);
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, kind));
         group.refs.push(convoy.resource.clone());
-        group.add_entry(
+        let project_ancestors = convoy
+            .project_ref
+            .as_deref()
+            .map(|project| project_resource_ref(&convoy.resource.namespace, project))
+            .into_iter()
+            .collect::<Vec<_>>();
+        group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("convoy/{}/{}", convoy.resource.namespace, convoy.name))
                 .kind(AwarenessKind::Convoy)
@@ -61,9 +71,15 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .refs(vec![convoy.resource.clone()])
                 .issue_refs(convoy.issues.iter().map(|issue| issue.reference.clone()).collect())
                 .build(),
-        );
+            &input.salience,
+            &project_ancestors,
+        ));
         for vessel in &convoy.vessels {
-            group.add_entry(
+            let mut refs = vec![vessel.resource.clone()];
+            refs.extend(vessel.vessel_resource.clone());
+            let mut ancestors = vec![convoy.resource.clone()];
+            ancestors.extend(project_ancestors.clone());
+            group.add_entry(enrich_salience(
                 AwarenessEntry::builder()
                     .id(format!("vessel/{}/{}/{}", convoy.resource.namespace, convoy.name, vessel.name))
                     .kind(AwarenessKind::Vessel)
@@ -71,9 +87,11 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                     .state(work_state(vessel.phase))
                     .phase(AwarenessPhase::Work(vessel.phase))
                     .as_of(as_of)
-                    .refs(vec![vessel.resource.clone()])
+                    .refs(refs)
                     .build(),
-            );
+                &input.salience,
+                &ancestors,
+            ));
         }
     }
 
@@ -84,7 +102,14 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 GroupKey::new(format!("issue-source/{}", row.reference.source.scope), row.reference.source.scope.clone())
             });
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
-        group.add_entry(
+        let project_ancestors = issue
+            .scope
+            .as_ref()
+            .or(input.scope.as_ref())
+            .map(|scope| project_resource_ref(&scope.namespace, &scope.name))
+            .into_iter()
+            .collect::<Vec<_>>();
+        group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("issue/{}/{}", row.reference.source.scope, row.reference.id))
                 .kind(AwarenessKind::Issue)
@@ -94,7 +119,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .as_of(row.issue.as_of)
                 .issue_refs(vec![row.reference.clone()])
                 .build(),
-        );
+            &input.salience,
+            &project_ancestors,
+        ));
     }
 
     for checkout in &input.checkouts {
@@ -104,7 +131,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             .map(group_key_for_scope)
             .unwrap_or_else(|| GroupKey::new(format!("repo/{}", checkout.repo), checkout.repo.to_string()));
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
-        group.add_entry(
+        let project_ancestors =
+            input.scope.as_ref().map(|scope| project_resource_ref(&scope.namespace, &scope.name)).into_iter().collect::<Vec<_>>();
+        group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("checkout/{}/{}", checkout.host, checkout.path))
                 .kind(AwarenessKind::Checkout)
@@ -113,7 +142,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .as_of(as_of)
                 .refs(vec![checkout.resource.clone()])
                 .build(),
-        );
+            &input.salience,
+            &project_ancestors,
+        ));
     }
 
     for independent in &input.independents {
@@ -124,7 +155,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             .or_else(|| independent.repository_key.as_ref().map(|repo| GroupKey::new(format!("repo/{repo}"), repo.to_string())))
             .unwrap_or_else(|| GroupKey::new("unparented", "Unparented"));
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
-        group.add_entry(
+        let project_ancestors =
+            input.scope.as_ref().map(|scope| project_resource_ref(&scope.namespace, &scope.name)).into_iter().collect::<Vec<_>>();
+        group.add_entry(enrich_salience(
             AwarenessEntry::builder()
                 .id(format!("independent/{}/{}", independent.resource.namespace, independent.name))
                 .kind(AwarenessKind::Independent)
@@ -139,7 +172,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .as_of(as_of)
                 .refs(vec![independent.resource.clone()])
                 .build(),
-        );
+            &input.salience,
+            &project_ancestors,
+        ));
     }
 
     let mut nodes = groups.into_values().collect::<Vec<_>>();
@@ -149,6 +184,8 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         .into_iter()
         .map(|mut group| {
             group.entries.sort_by(|left, right| entry_rank(left).cmp(&entry_rank(right)).then_with(|| left.label.cmp(&right.label)));
+            let salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
+            let node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
             group.entries.truncate(input.limit.entries);
             AwarenessNode::builder()
                 .id(group.id)
@@ -156,7 +193,8 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .label(group.label)
                 .maybe_scope(group.scope)
                 .state(group.state)
-                .as_of(as_of)
+                .salience(salience)
+                .as_of(node_as_of)
                 .counts(group.counts)
                 .refs(group.refs)
                 .entries(group.entries)
@@ -164,6 +202,20 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         })
         .collect();
     (rows, input.state)
+}
+
+fn enrich_salience(mut entry: AwarenessEntry, facts: &SalienceFacts, ancestors: &[ResourceRef]) -> AwarenessEntry {
+    let mut coverage_targets = entry.refs.clone();
+    coverage_targets.extend_from_slice(ancestors);
+    let evaluation = evaluate_entry(&entry.refs, &coverage_targets, facts, entry.as_of);
+    entry.salience = evaluation.salience;
+    entry.as_of = evaluation.as_of;
+    entry
+}
+
+fn project_resource_ref(default_namespace: &str, project_ref: &str) -> ResourceRef {
+    let (namespace, name) = project_ref.split_once('/').unwrap_or((default_namespace, project_ref));
+    ResourceRef::new(api_version(Project::API_PATHS), Project::API_PATHS.kind, namespace, name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,9 +371,12 @@ fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
     use flotilla_protocol::{HostName, Issue, IssueRef, IssueSource, IssueState, RepositoryKey, ResourceRef, SessionPhase};
+    use flotilla_resources::{DemandState, PrincipalRef, TerminalAttentionState};
 
     use super::*;
+    use crate::salience::{AttentionFact, DemandFact, RegardFact};
 
     fn convoy(project_ref: Option<&str>, name: &str, phase: ConvoyPhase) -> ConvoyRow {
         ConvoyRow::builder()
@@ -417,5 +472,55 @@ mod tests {
 
         assert_eq!(project_nodes.len(), 1);
         assert_eq!(convoy_nodes.len(), 2);
+    }
+
+    #[test]
+    fn salience_is_joined_onto_entries_and_aggregated_to_their_node() {
+        let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("timestamp");
+        let demand_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("timestamp");
+        let attention_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 2, 0).single().expect("timestamp");
+        let mut convoy = convoy(Some("flotilla/platform"), "ship-it", ConvoyPhase::Active);
+        let vessel = convoy.resource.subresource("vessels/implement");
+        convoy.vessels.push(
+            flotilla_protocol::VesselRow::builder()
+                .resource(vessel.clone())
+                .name("implement")
+                .phase(WorkPhase::Running)
+                .host(HostName::new("local"))
+                .build(),
+        );
+        let principal = PrincipalRef("flotilla/implicit".to_string());
+
+        let (nodes, _) = project_awareness(AwarenessInput {
+            scope: Some(QueryScope::new("flotilla", "platform")),
+            convoys: vec![convoy.clone()],
+            salience: SalienceFacts {
+                demands: vec![DemandFact {
+                    target: vessel.clone(),
+                    addressee: Some(principal.clone()),
+                    state: DemandState::Raised,
+                    as_of: demand_at,
+                }],
+                regards: vec![RegardFact { principal, target: project_resource_ref("flotilla", "flotilla/platform"), as_of: base }],
+                attention: vec![AttentionFact {
+                    target: vessel,
+                    state: TerminalAttentionState::NeedsInput,
+                    work_unsettled: true,
+                    as_of: attention_at,
+                }],
+            },
+            state: ResultSetState {
+                demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),
+                conditions: Vec::new(),
+            },
+            ..AwarenessInput::default()
+        });
+
+        let node = nodes.first().expect("project node");
+        let vessel = node.entries.iter().find(|entry| entry.kind == AwarenessKind::Vessel).expect("vessel entry");
+        assert_eq!(vessel.salience, Salience::Urgent);
+        assert_eq!(vessel.as_of, attention_at);
+        assert_eq!(node.salience, Salience::Urgent);
+        assert_eq!(node.as_of, attention_at);
     }
 }

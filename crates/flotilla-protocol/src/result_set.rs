@@ -430,6 +430,20 @@ pub enum AwarenessState {
     Cancelled,
 }
 
+/// Centrally-computed urgency of an awareness node or entry.
+///
+/// Surfaces render this value but must not derive it from the underlying
+/// demand, regard, or attention facts themselves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Salience {
+    #[default]
+    None,
+    Info,
+    Attention,
+    Urgent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum AwarenessPhase {
@@ -484,6 +498,9 @@ pub struct AwarenessEntry {
     pub kind: AwarenessKind,
     pub label: String,
     pub state: AwarenessState,
+    #[builder(default)]
+    #[serde(default)]
+    pub salience: Salience,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<AwarenessPhase>,
     pub as_of: Timestamp,
@@ -509,6 +526,9 @@ pub struct AwarenessNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<QueryScope>,
     pub state: AwarenessState,
+    #[builder(default)]
+    #[serde(default)]
+    pub salience: Salience,
     pub as_of: Timestamp,
     #[serde(default, skip_serializing_if = "AwarenessCounts::is_empty")]
     #[builder(default)]
@@ -743,6 +763,10 @@ pub struct ConvoyChangeRequest {
 pub struct VesselRow {
     /// `convoy_ref.subresource("vessels/{name}")`.
     pub resource: ResourceRef,
+    /// Concrete Vessel resource realizing this workflow requirement, when it
+    /// has been placed. Demand origins use this control-plane identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vessel_resource: Option<ResourceRef>,
     pub name: String,
     pub phase: WorkPhase,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
