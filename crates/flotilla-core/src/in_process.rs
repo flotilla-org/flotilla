@@ -4536,13 +4536,13 @@ impl InProcessDaemon {
             .enumerate()
             .find(|(_, process)| process.role == target && target != context.caller_role)
             .ok_or_else(|| crew_handoff_address_error(target, &context.vessel))?;
+        let CrewSource::Agent { selector, prompt } = &process.source else {
+            return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
+        };
         let repository_refs = task
             .repository_refs
             .clone()
             .unwrap_or_else(|| convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect());
-        let CrewSource::Agent { selector, prompt } = &process.source else {
-            return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
-        };
         if convoy
             .status
             .as_ref()
