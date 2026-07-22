@@ -1137,7 +1137,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         let runner = self.local_runner()?;
         match removal {
             CheckoutRemoval::FreshClone { target_path } => {
-                runner.run("rm", &["-rf", utf8_path(target_path)?], Path::new("/"), &ChannelLabel::Noop).await?;
+                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { clone_path, branch, target_path } => {
@@ -1151,8 +1151,14 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                         &ChannelLabel::Noop,
                     )
                     .await?;
-                if !remove.success && !remove.stderr.contains("is not a working tree") {
-                    return Err(remove.stderr);
+                if !remove.success {
+                    if remove.stderr.contains("is not a working tree") {
+                        remove_checkout_path(&*runner, target_path).await?;
+                    } else {
+                        return Err(remove.stderr);
+                    }
+                } else {
+                    remove_checkout_path(&*runner, target_path).await?;
                 }
                 remove_empty_checkout_parents(clone_path, target_path).await?;
 
@@ -1207,6 +1213,17 @@ fn bootstrap_branch_ref(branch: &str) -> String {
 
 async fn delete_ref(runner: &dyn CommandRunner, clone_path: &str, reference: &str) -> Result<(), String> {
     runner.run("git", &["-C", clone_path, "update-ref", "-d", reference], Path::new("/"), &ChannelLabel::Noop).await?;
+    Ok(())
+}
+
+async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> Result<(), String> {
+    runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+    for predicate in ["-e", "-L"] {
+        let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Noop).await?;
+        if remaining.success {
+            return Err(format!("checkout cleanup reported success but path remains: {target_path}"));
+        }
+    }
     Ok(())
 }
 
@@ -1548,6 +1565,27 @@ mod tests {
             .status()
             .expect("git should inspect the branch");
         assert!(!branch.success(), "zero-commit convoy branch should be deleted");
+    }
+
+    #[tokio::test]
+    async fn checkout_runtime_removes_unregistered_worktree_path_with_embedded_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
+        let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
+        TestGitRepo::init(target.join("embedded")).with_initial_commit();
+        let runtime = CheckoutControllerRuntime { runner: Arc::new(ProcessCommandRunner) };
+        let removal = CheckoutRemoval::Worktree {
+            clone_path: clone.path().to_str().expect("utf-8 clone path").to_string(),
+            branch: "feature/cleanup".to_string(),
+            target_path: target.to_str().expect("utf-8 target path").to_string(),
+        };
+
+        assert_eq!(
+            runtime.remove_checkout(&removal).await.expect("stale worktree path should be removed"),
+            CheckoutRemovalOutcome::Removed
+        );
+
+        assert!(!target.exists(), "successful cleanup must not strand an embedded repository");
     }
 
     #[tokio::test]
