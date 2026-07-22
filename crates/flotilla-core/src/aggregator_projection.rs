@@ -11,7 +11,8 @@ use std::{
 
 use flotilla_protocol::{
     result_set::{
-        CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta, ResultSet, ResultSetState, Rows,
+        AwarenessGrouping, AwarenessLimit, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta,
+        ResultSet, ResultSetState, Rows,
     },
     HostName, IssueRef, QueryCursor, RepositoryKey, ResourceRef,
 };
@@ -19,6 +20,7 @@ use tokio::sync::{broadcast, watch, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 
 use crate::{
+    awareness_projection::{project_awareness, AwarenessInput, ScopedIssueRow},
     query_registry::QueryRegistry,
     scoped_store::{ScopedCheckoutProjection, ScopedIndependentProjection},
 };
@@ -159,6 +161,8 @@ impl AggregatorProjectionState {
     ) -> Vec<ResultDelta> {
         let mut deltas = self.independents.write().await.replace_catalog(repositories.clone(), projects.clone());
         deltas.extend(self.checkouts.write().await.replace_catalog(repositories, projects));
+        let scopes = self.checkouts.read().await.project_scopes();
+        self.demand_backed.expand_fleet_awareness_demands(&scopes);
         deltas
     }
 
@@ -184,8 +188,25 @@ impl AggregatorProjectionState {
         self.demand_backed.replace(subscriber, cursors)
     }
 
+    pub async fn replace_subscriber_expanding_awareness(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
+        let mut expanded = cursors.to_vec();
+        if cursors.iter().any(|cursor| matches!(cursor.query, QueryId::Awareness { scope: None, .. })) {
+            for scope in self.checkouts.read().await.project_scopes() {
+                let query = QueryId::Issues { scope, search: None };
+                if !expanded.iter().any(|cursor| cursor.query == query) {
+                    expanded.push(QueryCursor { query, since: None });
+                }
+            }
+        }
+        self.replace_subscriber(subscriber, &expanded)
+    }
+
     pub fn remove_subscriber(&self, subscriber: Uuid) {
         self.demand_backed.remove(subscriber);
+    }
+
+    pub fn subscribed_queries(&self) -> HashSet<QueryId> {
+        self.demand_backed.subscribed_queries()
     }
 
     /// Observe the complete set of live demand-backed query identities.
@@ -241,10 +262,142 @@ impl AggregatorProjectionState {
             QueryId::Independents { scope } => Some(self.independents_result_set(scope).await),
             QueryId::Issues { .. } => self.demand_backed.result_set(query),
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
+            QueryId::Awareness { scope, grouping, limit } => Some(self.awareness_result_set(scope, *grouping, *limit).await),
         }
+    }
+
+    pub async fn awareness_result_set(&self, scope: &Option<QueryScope>, grouping: AwarenessGrouping, limit: AwarenessLimit) -> ResultSet {
+        let convoys = {
+            let set = self.result_set().await;
+            let rows = match set.rows {
+                Rows::Convoys(rows) => rows,
+                _ => Vec::new(),
+            };
+            rows.into_iter().filter(|row| scope.as_ref().is_none_or(|scope| convoy_matches_scope(row, scope))).collect::<Vec<_>>()
+        };
+        let independents_set = self.independents_result_set(scope).await;
+        let independents = independents_set.rows.as_independents().map_or_else(Vec::new, ToOwned::to_owned);
+        let checkouts_set = self.checkouts.write().await.result_set(scope);
+        let checkouts = checkouts_set.rows.as_checkouts().map_or_else(Vec::new, ToOwned::to_owned);
+        let issue_sets = self.issue_sets_for_awareness(scope).await;
+        let issues = issue_sets
+            .iter()
+            .flat_map(|(scope, set)| {
+                set.rows.as_issues().into_iter().flatten().cloned().map(|row| ScopedIssueRow { scope: Some(scope.clone()), row })
+            })
+            .collect::<Vec<_>>();
+        let state = merged_issue_state(&issue_sets);
+        let seq = [self.seq().await, independents_set.seq, checkouts_set.seq, issue_sets.iter().map(|(_, set)| set.seq).max().unwrap_or(0)]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let (rows, state) =
+            project_awareness(AwarenessInput { scope: scope.clone(), grouping, limit, convoys, issues, checkouts, independents, state });
+        ResultSet { seq, rows: Rows::Awareness { scope: scope.clone(), grouping, limit, rows }, state }
+    }
+
+    async fn issue_sets_for_awareness(&self, scope: &Option<QueryScope>) -> Vec<(QueryScope, ResultSet)> {
+        let scopes = match scope {
+            Some(scope) => vec![scope.clone()],
+            None => self.checkouts.read().await.project_scopes(),
+        };
+        scopes
+            .into_iter()
+            .filter_map(|scope| {
+                self.demand_backed.result_set(&QueryId::Issues { scope: scope.clone(), search: None }).map(|set| (scope, set))
+            })
+            .collect()
     }
 }
 
 fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
     matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active)
+}
+
+fn convoy_matches_scope(row: &ConvoyRow, scope: &QueryScope) -> bool {
+    row.project_ref.as_deref().is_some_and(|project| project == scope.name || project == format!("{}/{}", scope.namespace, scope.name))
+}
+
+fn merged_issue_state(issue_sets: &[(QueryScope, ResultSet)]) -> ResultSetState {
+    let mut state = ResultSetState::default();
+    for (_, set) in issue_sets {
+        state.conditions.extend(set.state.conditions.clone());
+        if let Some(demand) = &set.state.demand {
+            state.demand = Some(match state.demand {
+                Some(existing) => flotilla_protocol::DemandBackedMetadata {
+                    as_of: existing.as_of.max(demand.as_of),
+                    has_more: existing.has_more || demand.has_more,
+                },
+                None => demand.clone(),
+            });
+        }
+    }
+    state
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use flotilla_protocol::{
+        AwarenessKind, DemandBackedMetadata, Issue, IssueRef, IssueSource, IssueState, QueryCursor, ResultSetState, Rows,
+    };
+
+    use super::*;
+
+    fn scope(name: &str) -> QueryScope {
+        QueryScope::new("flotilla", name)
+    }
+
+    fn issue_row(scope: &str, id: &str) -> IssueRow {
+        let reference = IssueRef { source: IssueSource { service: "https://github.com".into(), scope: scope.into() }, id: id.into() };
+        IssueRow {
+            reference: reference.clone(),
+            issue: Issue {
+                reference,
+                title: format!("Issue {id}"),
+                body: None,
+                state: IssueState::Open,
+                labels: vec![],
+                as_of: Utc::now(),
+                association_keys: vec![],
+                provider_name: "github".into(),
+                provider_display_name: "GitHub".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_awareness_subscription_demands_project_issue_windows() {
+        let state = AggregatorProjectionState::new();
+        let project = scope("roadmap");
+        state.replace_store_catalog(HashSet::from([RepositoryKey("repo-a".into())]), HashMap::from([(project.clone(), vec![])])).await;
+
+        let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
+        state.replace_subscriber_expanding_awareness(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]).await;
+
+        assert!(state.subscribe_demand().borrow().contains_key(&QueryId::Issues { scope: project, search: None }));
+    }
+
+    #[tokio::test]
+    async fn fleet_awareness_groups_loaded_project_issues_under_projects() {
+        let state = AggregatorProjectionState::new();
+        let project = scope("roadmap");
+        state.replace_store_catalog(HashSet::from([RepositoryKey("repo-a".into())]), HashMap::from([(project.clone(), vec![])])).await;
+        let issue_query = QueryId::Issues { scope: project.clone(), search: None };
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: issue_query.clone(), since: None }]);
+        let generation = *state.subscribe_demand().borrow().get(&issue_query).expect("issue query generation");
+        state.replace_issues(&issue_query, generation, vec![issue_row("flotilla-org/flotilla", "862")], ResultSetState {
+            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
+            conditions: vec![],
+        });
+
+        let result = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        let Rows::Awareness { rows, .. } = result.rows else { panic!("awareness rows") };
+
+        assert!(rows.iter().any(|node| {
+            node.kind == AwarenessKind::Project
+                && node.scope.as_ref() == Some(&project)
+                && node.entries.iter().any(|entry| entry.kind == AwarenessKind::Issue)
+        }));
+    }
 }

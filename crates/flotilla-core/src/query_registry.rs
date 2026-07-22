@@ -51,6 +51,21 @@ impl QueryRegistry {
         created
     }
 
+    pub fn expand_fleet_awareness_demands(&self, scopes: &[flotilla_protocol::QueryScope]) -> HashSet<QueryId> {
+        let mut state = self.inner.lock().expect("query registry lock poisoned");
+        for queries in state.subscribers.values_mut() {
+            if !queries.iter().any(|query| matches!(query, QueryId::Awareness { scope: None, .. })) {
+                continue;
+            }
+            for scope in scopes {
+                queries.insert(QueryId::Issues { scope: scope.clone(), search: None });
+            }
+        }
+        let created = reconcile_demand(&mut state);
+        self.publish_demand(&state);
+        created
+    }
+
     pub fn remove(&self, subscriber: Uuid) {
         let mut state = self.inner.lock().expect("query registry lock poisoned");
         state.subscribers.remove(&subscriber);
@@ -60,6 +75,10 @@ impl QueryRegistry {
 
     pub fn result_set(&self, query: &QueryId) -> Option<ResultSet> {
         self.inner.lock().expect("query registry lock poisoned").demand_backed.get(query).cloned()
+    }
+
+    pub fn subscribed_queries(&self) -> HashSet<QueryId> {
+        self.inner.lock().expect("query registry lock poisoned").subscribers.values().flat_map(|queries| queries.iter().cloned()).collect()
     }
 
     /// Replace the current window of a live issue materialization. A fetch
@@ -184,13 +203,7 @@ impl QueryRegistry {
 }
 
 fn reconcile_demand(state: &mut RegistryState) -> HashSet<QueryId> {
-    let demanded: HashSet<QueryId> = state
-        .subscribers
-        .values()
-        .flat_map(|queries| queries.iter())
-        .filter(|query| matches!(query, QueryId::Issues { .. }))
-        .cloned()
-        .collect();
+    let demanded: HashSet<QueryId> = state.subscribers.values().flat_map(|queries| queries.iter().filter_map(issue_demand_query)).collect();
     state.demand_backed.retain(|query, _| demanded.contains(query));
     state.generations.retain(|query, _| demanded.contains(query));
     let mut created = HashSet::new();
@@ -204,6 +217,14 @@ fn reconcile_demand(state: &mut RegistryState) -> HashSet<QueryId> {
         }
     }
     created
+}
+
+fn issue_demand_query(query: &QueryId) -> Option<QueryId> {
+    match query {
+        QueryId::Issues { .. } => Some(query.clone()),
+        QueryId::Awareness { scope: Some(scope), .. } => Some(QueryId::Issues { scope: scope.clone(), search: None }),
+        QueryId::Convoys | QueryId::Independents { .. } | QueryId::Checkouts { .. } | QueryId::Awareness { scope: None, .. } => None,
+    }
 }
 
 fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
@@ -229,6 +250,14 @@ mod tests {
 
     fn issues(name: &str) -> QueryId {
         QueryId::Issues { scope: QueryScope::new("flotilla", name), search: None }
+    }
+
+    fn awareness(name: &str) -> QueryId {
+        QueryId::Awareness {
+            scope: Some(QueryScope::new("flotilla", name)),
+            grouping: flotilla_protocol::AwarenessGrouping::Project,
+            limit: flotilla_protocol::AwarenessLimit::default(),
+        }
     }
 
     fn cursor(query: QueryId) -> QueryCursor {
@@ -357,6 +386,16 @@ mod tests {
 
         let mut demand = registry.subscribe_demand();
         assert_eq!(demand.borrow_and_update().keys().cloned().collect::<HashSet<_>>(), HashSet::from([query]));
+    }
+
+    #[test]
+    fn project_awareness_subscription_demands_its_issue_window() {
+        let registry = QueryRegistry::default();
+        let issue_query = issues("roadmap");
+        registry.replace(Uuid::new_v4(), &[cursor(awareness("roadmap"))]);
+
+        assert!(registry.result_set(&issue_query).is_some());
+        assert_eq!(registry.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([issue_query]));
     }
 
     #[test]

@@ -165,6 +165,12 @@ impl<R: ScopedStoreRow> ScopedStoreProjection<R> {
         vec![MaterializedSet { seq, rows, state: ResultSetState::default() }.result_set(&scope)]
     }
 
+    pub fn project_scopes(&self) -> Vec<QueryScope> {
+        let mut scopes = self.projects.keys().cloned().collect::<Vec<_>>();
+        scopes.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+        scopes
+    }
+
     fn recompute_all(&mut self) -> Vec<ResultDelta> {
         let mut scopes = self.sets.keys().cloned().collect::<HashSet<_>>();
         scopes.insert(None);

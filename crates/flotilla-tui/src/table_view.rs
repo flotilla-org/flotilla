@@ -7,8 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    result_set::Timestamp, ChangeRequestStatus, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey,
-    RepositoryKey, ResultSetCondition, ResultSetState, SessionPhase, ViewAddress,
+    result_set::Timestamp, AwarenessCounts, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName,
+    IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, SessionPhase,
+    ViewAddress,
 };
 
 use crate::{
@@ -432,6 +433,7 @@ pub struct TableRows<'a> {
     pub independent_results: Vec<QueryRows<'a, IndependentRow>>,
     pub issue_results: Vec<QueryRows<'a, IssueRow>>,
     pub checkout_results: Vec<QueryRows<'a, CheckoutRow>>,
+    pub awareness_results: Vec<QueryRows<'a, AwarenessNode>>,
     pub source_search: Option<&'a str>,
 }
 
@@ -563,19 +565,49 @@ pub fn project_panels(address: &ViewAddress, data: &TableRows<'_>) -> Result<Vec
     let checkouts_address = ViewAddress::Checkouts { scope: Some(scope.clone()) };
     let issues_address = ViewAddress::Issues { scope: scope.clone() };
     let independents_address = ViewAddress::Independents { scope: Some(scope) };
+    let awareness_counts = awareness_counts_for_project(namespace, name, data);
     let mut checkouts = project(&checkouts_address, data).unwrap_or_else(|_| pending_project_table(&checkouts_address));
     let mut issues = project(&issues_address, data).unwrap_or_else(|_| pending_project_table(&issues_address));
     let mut independents = project(&independents_address, data).unwrap_or_else(|_| pending_project_table(&independents_address));
-    checkouts.title = "Checkouts".to_string();
-    issues.title = "Issues".to_string();
-    independents.title = "Independents".to_string();
+    if let Some(counts) = awareness_counts {
+        checkouts.title = format!("Checkouts ({})", counts.checkouts);
+        issues.title = format!("Issues ({})", counts.issues);
+        independents.title = format!("Independents ({})", counts.independents);
+    } else {
+        checkouts.title = "Checkouts".to_string();
+        issues.title = "Issues".to_string();
+        independents.title = "Independents".to_string();
+    }
+    let mut convoys_title = "Convoys".to_string();
+    if let Some(counts) = awareness_counts {
+        convoys_title = format!("Convoys ({})", counts.convoys);
+    }
 
     Ok(vec![
-        ProjectPanel { kind: ProjectPanelKind::Convoys, target: ViewAddress::Convoys { namespace: namespace.clone() }, table: convoys },
+        ProjectPanel {
+            kind: ProjectPanelKind::Convoys,
+            target: ViewAddress::Convoys { namespace: namespace.clone() },
+            table: TableView { title: convoys_title, ..convoys },
+        },
         ProjectPanel { kind: ProjectPanelKind::Checkouts, target: checkouts_address, table: checkouts },
         ProjectPanel { kind: ProjectPanelKind::Issues, target: issues_address, table: issues },
         ProjectPanel { kind: ProjectPanelKind::Independents, target: independents_address, table: independents },
     ])
+}
+
+fn awareness_counts_for_project<'a>(namespace: &str, name: &str, data: &'a TableRows<'_>) -> Option<&'a AwarenessCounts> {
+    let query = QueryId::Awareness {
+        scope: Some(QueryScope::new(namespace, name)),
+        grouping: AwarenessGrouping::Project,
+        limit: AwarenessLimit::default(),
+    };
+    data.awareness_results
+        .iter()
+        .find(|result| *result.query == query)?
+        .rows
+        .iter()
+        .find(|node| node.scope.as_ref().is_some_and(|scope| scope.namespace == namespace && scope.name == name))
+        .map(|node| &node.counts)
 }
 
 fn pending_project_table(address: &ViewAddress) -> TableView {
@@ -1100,8 +1132,8 @@ fn attach_independent(row: &IndependentRow) -> Option<TableIntent> {
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::{
-        test_support::TestIssue, DemandBackedMetadata, LifecycleAuthority, QueryId, QueryScope, RepositoryKey, ResourceRef,
-        ResultSetCondition, ResultSetState,
+        test_support::TestIssue, AwarenessCounts, AwarenessKind, AwarenessNode, AwarenessState, DemandBackedMetadata, LifecycleAuthority,
+        QueryId, QueryScope, RepositoryKey, ResourceRef, ResultSetCondition, ResultSetState,
     };
 
     use super::*;
@@ -1331,6 +1363,17 @@ mod tests {
         let issue_query = QueryId::Issues { scope: scope.clone(), search: None };
         let checkout_query = QueryId::Checkouts { scope: Some(scope.clone()) };
         let independent_query = QueryId::Independents { scope: Some(scope.clone()) };
+        let awareness_query =
+            QueryId::Awareness { scope: Some(scope.clone()), grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
+        let awareness = AwarenessNode::builder()
+            .id("project/flotilla/roadmap".to_string())
+            .kind(AwarenessKind::Project)
+            .label("roadmap".to_string())
+            .scope(scope.clone())
+            .state(AwarenessState::Active)
+            .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+            .counts(AwarenessCounts::builder().total(4).convoys(1).issues(1).checkouts(1).independents(1).build())
+            .build();
         let state = ResultSetState::default();
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
 
@@ -1339,6 +1382,7 @@ mod tests {
             issue_results: vec![QueryRows { query: &issue_query, rows: std::slice::from_ref(&issue_row), state: &state }],
             checkout_results: vec![QueryRows { query: &checkout_query, rows: std::slice::from_ref(&checkout), state: &state }],
             independent_results: vec![QueryRows { query: &independent_query, rows: std::slice::from_ref(&independent), state: &state }],
+            awareness_results: vec![QueryRows { query: &awareness_query, rows: std::slice::from_ref(&awareness), state: &state }],
             ..TableRows::default()
         })
         .expect("project panels");
@@ -1354,6 +1398,12 @@ mod tests {
             "checkouts?project=flotilla%2Froadmap",
             "issues?project=flotilla%2Froadmap",
             "independents?project=flotilla%2Froadmap",
+        ]);
+        assert_eq!(panels.iter().map(|panel| panel.table.title.as_str()).collect::<Vec<_>>(), vec![
+            "Convoys (1)",
+            "Checkouts (1)",
+            "Issues (1)",
+            "Independents (1)",
         ]);
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");

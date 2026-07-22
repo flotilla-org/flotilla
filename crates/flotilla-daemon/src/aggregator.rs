@@ -932,7 +932,7 @@ impl Aggregator {
             })
             .collect();
         let deltas = self.state.replace_store_catalog(repositories, projects).await;
-        self.emit_store_deltas(deltas);
+        self.emit_store_deltas(deltas).await;
     }
 
     async fn rebuild_checkout_rows(&self) -> Result<(), ResourceError> {
@@ -956,16 +956,20 @@ impl Aggregator {
             })
             .collect::<Result<Vec<_>, ResourceError>>()?;
         let deltas = self.state.replace_local_checkout_rows(rows).await;
-        self.emit_store_deltas(deltas);
+        self.emit_store_deltas(deltas).await;
         Ok(())
     }
 
-    fn emit_store_deltas(&self, deltas: Vec<ResultDelta>) {
+    async fn emit_store_deltas(&self, deltas: Vec<ResultDelta>) {
         if self.bootstrapping {
             return;
         }
+        let changed = !deltas.is_empty();
         for delta in deltas {
             let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+        }
+        if changed {
+            self.emit_awareness_result_sets().await;
         }
     }
 
@@ -993,7 +997,7 @@ impl Aggregator {
         let replacement =
             self.terminal_sessions.values().filter_map(|session| self.summarize_independent(session, &attachable_references)).collect();
         let deltas = self.state.replace_local_independent_rows(replacement).await;
-        self.emit_store_deltas(deltas);
+        self.emit_store_deltas(deltas).await;
     }
 
     pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
@@ -1034,6 +1038,9 @@ impl Aggregator {
                     Rows::Checkouts { scope: Some(_), .. } => {
                         tracing::warn!(host = %host, "ignoring derived project checkout set in fleet replica snapshot");
                     }
+                    Rows::Awareness { .. } => {
+                        tracing::warn!(host = %host, "ignoring derived awareness tree in fleet replica snapshot");
+                    }
                 }
             }
             convoy_replacements.insert(host.clone(), convoy_rows);
@@ -1065,16 +1072,28 @@ impl Aggregator {
         }
 
         let independent_deltas = self.state.replace_independent_replica_rows(independent_replacements).await;
-        self.emit_store_deltas(independent_deltas);
+        self.emit_store_deltas(independent_deltas).await;
 
         let checkout_deltas = self.state.replace_checkout_replica_rows(checkout_replacements).await;
-        self.emit_store_deltas(checkout_deltas);
+        self.emit_store_deltas(checkout_deltas).await;
     }
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
         let changes = QueryChanges::Convoys { changed, removed };
         let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
+        self.emit_awareness_result_sets().await;
+    }
+
+    async fn emit_awareness_result_sets(&self) {
+        for query in self.state.subscribed_queries() {
+            if !matches!(query, QueryId::Awareness { .. }) {
+                continue;
+            }
+            if let Some(result_set) = self.state.result_set_for(&query).await {
+                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+            }
+        }
     }
 
     fn convoy_ref(&self, namespace: &str, name: &str) -> ResourceRef {
