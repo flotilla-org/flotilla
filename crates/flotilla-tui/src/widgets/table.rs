@@ -85,9 +85,9 @@ impl TablePanel {
             let selected = state.selected() == Some(&row.id);
             let multi = decorations.multi_selected.contains(&row.id);
             let pending = decorations.pending_actions.get(&row.id);
-            let cells = row.cells.iter().zip(&view.columns).map(|(cell, column)| {
+            let cells = row.cells.iter().zip(&view.columns).enumerate().map(|(index, (cell, column))| {
                 let mut text = cell.text.clone();
-                if column.id == view.columns[0].id {
+                if index == 0 {
                     if let Some(pending) = pending {
                         let marker = match pending.status {
                             PendingStatus::Submitting | PendingStatus::InFlight { .. } => "...",
