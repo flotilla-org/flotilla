@@ -65,7 +65,58 @@ impl TerminalRuntime for FailingTerminalRuntime {
         Err("boom".to_string())
     }
 
-    async fn kill_session(&self, _session_id: &str) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<flotilla_resources::TerminalSession>("flotilla");
+    let spec = TerminalSessionSpec {
+        env_ref: "host-direct-feta".to_string(),
+        role: "coder".to_string(),
+        source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+        cwd: "/workspace".to_string(),
+        pool: "cleat".to_string(),
+    };
+    let created = sessions.create(&meta("terminal-convoy-work-coder"), &spec).await.expect("session create");
+    let mut status = flotilla_resources::TerminalSessionStatus::default();
+    flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+        session_id: "terminal-convoy-work-coder".to_string(),
+        pid: None,
+        started_at: Utc::now(),
+        crew: None,
+        launch_command: "codex".to_string(),
+        delivered_message_id: None,
+    }
+    .apply(&mut status);
+    let session = sessions
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &status)
+        .await
+        .expect("session should be running");
+    let runtime = Arc::new(RecordingTerminalRuntime::default());
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+
+    reconciler.run_finalizer(&session).await.expect("terminal finalizer should kill the session");
+
+    assert_eq!(runtime.killed.lock().expect("killed mutex").as_slice(), &[("terminal-convoy-work-coder".to_string(), spec)]);
+}
+
+#[derive(Default)]
+struct RecordingTerminalRuntime {
+    killed: Mutex<Vec<(String, TerminalSessionSpec)>>,
+}
+
+#[async_trait]
+impl TerminalRuntime for RecordingTerminalRuntime {
+    async fn ensure_session(&self, _name: &str, _spec: &TerminalSessionSpec) -> Result<TerminalRuntimeState, String> {
+        panic!("terminal finalization must not ensure a new session")
+    }
+
+    async fn kill_session(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<(), String> {
+        self.killed.lock().expect("killed mutex").push((session_id.to_string(), spec.clone()));
         Ok(())
     }
 }
@@ -132,7 +183,7 @@ impl TerminalRuntime for MissingTerminalRuntime {
         Ok(false)
     }
 
-    async fn kill_session(&self, _session_id: &str) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
         Ok(())
     }
 }
@@ -217,7 +268,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         Ok(())
     }
 
-    async fn kill_session(&self, _session_id: &str) -> Result<(), String> {
+    async fn kill_session(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<(), String> {
         Ok(())
     }
 }
