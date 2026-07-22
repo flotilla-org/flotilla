@@ -1207,6 +1207,7 @@ dependencies = [
  "libc",
  "ratatui",
  "serde_json",
+ "serde_yml",
  "tokio",
  "tracing",
  "uuid",

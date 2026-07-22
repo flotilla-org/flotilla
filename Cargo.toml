@@ -51,5 +51,6 @@ color-eyre = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+serde_yml = "0.0.12"
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,28 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: regards.flotilla.work
+spec:
+  group: flotilla.work
+  scope: Namespaced
+  names:
+    plural: regards
+    singular: regard
+    kind: Regard
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Principal
+          type: string
+          jsonPath: .spec.principal_ref
+        - name: Target
+          type: string
+          jsonPath: .spec.target.name
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true

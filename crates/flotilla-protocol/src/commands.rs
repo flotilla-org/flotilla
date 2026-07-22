@@ -377,6 +377,10 @@ pub enum CommandAction {
         kind: String,
         name: String,
     },
+    ResourceApply {
+        namespace: String,
+        document: serde_json::Value,
+    },
     ResourceWatch {
         namespace: String,
         kind: String,
@@ -461,6 +465,7 @@ impl Command {
             CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
+            CommandAction::ResourceApply { .. } => "apply resource",
             CommandAction::ResourceWatch { .. } => "watch resources",
         }
     }
