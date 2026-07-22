@@ -10,8 +10,9 @@ use crate::providers::types::ChangeRequest;
 pub trait ChangeRequestTracker: Send + Sync {
     async fn list_change_requests(&self, repo_root: &Path, limit: usize) -> Result<Vec<(String, ChangeRequest)>, String>;
     /// Resolve the newest change request whose head is exactly `branch`.
-    /// Providers should include terminal requests so callers can distinguish
-    /// open, merged, and closed work.
+    /// Provider overrides may include terminal requests so callers can
+    /// distinguish open, merged, and closed work. The default implementation
+    /// inherits the visibility of [`Self::list_change_requests`].
     async fn find_change_request_by_branch(&self, repo_root: &Path, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
         Ok(self.list_change_requests(repo_root, 100).await?.into_iter().find(|(_, request)| request.branch == branch))
     }
