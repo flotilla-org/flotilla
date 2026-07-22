@@ -271,6 +271,10 @@ impl PeerTransport for MockTransport {
         self.status.clone()
     }
 
+    fn connection_address(&self) -> String {
+        self.remote_node.as_ref().map(|node| format!("mock://{}", node.node_id)).unwrap_or_else(|| "mock://unknown".to_string())
+    }
+
     async fn subscribe(&mut self) -> Result<tokio::sync::mpsc::Receiver<PeerWireMessage>, String> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)

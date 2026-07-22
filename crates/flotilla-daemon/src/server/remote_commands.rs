@@ -184,10 +184,10 @@ impl RemoteCommandRouter {
                     command: Box::new(command),
                     session_id: None,
                 };
-                let send_result = self.send_routed_to(&target_node_id, routed).await.map_err(|cause| match &existing_convoy_target {
-                    Some(target) => format!("connect to {} at peer node {}: {cause}", target.home, target.node_id),
-                    None => cause,
-                });
+                let send_result = match &existing_convoy_target {
+                    Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
+                    None => self.send_routed_to(&target_node_id, routed).await,
+                };
 
                 match send_result {
                     Ok(()) => Ok(command_id),
@@ -825,6 +825,21 @@ impl RemoteStepExecutor for RemoteCommandRouter {
 }
 
 impl RemoteCommandRouter {
+    async fn send_routed_to_convoy_home(
+        &self,
+        home: &flotilla_protocol::HostName,
+        node_id: &NodeId,
+        msg: RoutedPeerMessage,
+    ) -> Result<(), String> {
+        let (sender, address) = {
+            let pm = self.peer_manager.lock().await;
+            let address = pm.connection_address_for(node_id, home);
+            let sender = pm.resolve_sender(node_id).map_err(|cause| format!("connect to {home} at {address}: {cause}"))?;
+            (sender, address)
+        };
+        sender.send(PeerWireMessage::Routed(msg)).await.map_err(|cause| format!("connect to {home} at {address}: {cause}"))
+    }
+
     async fn resolve_sender(&self, node_id: &NodeId) -> Result<Arc<dyn PeerSender>, String> {
         let pm = self.peer_manager.lock().await;
         pm.resolve_sender(node_id)

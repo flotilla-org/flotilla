@@ -426,6 +426,13 @@ impl PeerTransport for SshTransport {
         self.status.clone()
     }
 
+    fn connection_address(&self) -> String {
+        match &self.config.user {
+            Some(user) => format!("ssh://{user}@{}", self.config.hostname),
+            None => format!("ssh://{}", self.config.hostname),
+        }
+    }
+
     async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
         if self.status != PeerConnectionStatus::Connected {
             return Err("not connected".to_string());
