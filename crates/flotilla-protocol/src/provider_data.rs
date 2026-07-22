@@ -110,6 +110,19 @@ pub struct IssueRef {
     pub id: String,
 }
 
+impl IssueRef {
+    /// Compare issue references for the default issue-panel order: newest ID
+    /// first. Numeric IDs use numeric ordering; opaque IDs fall back to
+    /// descending lexical order. The source is a deterministic tie-breaker.
+    pub fn cmp_id_desc(&self, other: &Self) -> std::cmp::Ordering {
+        let by_id = match (self.id.parse::<u64>(), other.id.parse::<u64>()) {
+            (Ok(left), Ok(right)) => right.cmp(&left),
+            _ => other.id.cmp(&self.id),
+        };
+        by_id.then_with(|| self.source.cmp(&other.source))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueState {
@@ -509,6 +522,17 @@ mod tests {
         assert_eq!(json["source"]["service"], "https://github.com");
         assert_eq!(json["source"]["scope"], "flotilla-org/flotilla");
         assert_eq!(json["id"], "WIDGET-123");
+    }
+
+    #[test]
+    fn issue_reference_default_order_is_descending_by_id() {
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let newer = IssueRef { source: source.clone(), id: "10".into() };
+        let older = IssueRef { source: source.clone(), id: "9".into() };
+        let opaque = IssueRef { source, id: "WIDGET-123".into() };
+
+        assert!(newer.cmp_id_desc(&older).is_lt(), "numeric IDs sort numerically");
+        assert!(opaque.cmp_id_desc(&newer).is_lt(), "opaque IDs retain a deterministic lexical order");
     }
 
     #[test]

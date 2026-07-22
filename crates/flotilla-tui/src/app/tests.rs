@@ -1885,6 +1885,48 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
 }
 
 #[test]
+fn app_keeps_issue_rows_in_id_order_when_an_existing_issue_is_updated() {
+    let mut app = stub_app();
+    let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None };
+    let mut high_id = TestIssue::new("High ID").id("10").build();
+    high_id.as_of = "2026-07-15T12:00:00Z".parse().expect("timestamp");
+    let mut low_id = TestIssue::new("Low ID").id("1").build();
+    low_id.as_of = "2026-07-15T12:00:00Z".parse().expect("timestamp");
+
+    app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
+        seq: 1,
+        rows: flotilla_protocol::Rows::Issues {
+            scope: scope.clone(),
+            search: None,
+            rows: vec![flotilla_protocol::IssueRow { reference: high_id.reference.clone(), issue: high_id }, flotilla_protocol::IssueRow {
+                reference: low_id.reference.clone(),
+                issue: low_id.clone(),
+            }],
+        },
+        state: Default::default(),
+    })));
+
+    low_id.as_of = "2026-07-15T12:01:00Z".parse().expect("timestamp");
+    app.handle_daemon_event(DaemonEvent::ResultDelta(Box::new(flotilla_protocol::ResultDelta {
+        seq: 2,
+        changes: flotilla_protocol::QueryChanges::Issues {
+            scope,
+            search: None,
+            changed: vec![flotilla_protocol::IssueRow { reference: low_id.reference.clone(), issue: low_id }],
+            removed: vec![],
+        },
+        state: None,
+    })));
+
+    assert_eq!(
+        app.query_tables.issues[&query].rows.iter().map(|row| row.reference.id.as_str()).collect::<Vec<_>>(),
+        vec!["10", "1"],
+        "a newer timestamp must not change the issue-panel row order"
+    );
+}
+
+#[test]
 fn app_applies_checkout_sets_and_removal_deltas_to_the_typed_query_cache() {
     let mut app = stub_app();
     let query = flotilla_protocol::QueryId::Checkouts { scope: None };
