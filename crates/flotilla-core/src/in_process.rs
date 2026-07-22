@@ -1928,6 +1928,48 @@ impl InProcessDaemon {
             .ok_or_else(|| format!("placement policy {policy_name} targets unavailable host {host_ref}"))
     }
 
+    pub async fn resolve_existing_convoy_target_node(&self, action: &flotilla_protocol::CommandAction) -> Result<Option<NodeId>, String> {
+        let (namespace, name) = match action {
+            flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. } => {
+                (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
+            }
+            flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
+                (self.provisioning_namespace().await, convoy.as_str())
+            }
+            _ => return Ok(None),
+        };
+
+        let result_set = self.aggregator_projection_state().await.result_set().await;
+        let Rows::Convoys(rows) = result_set.rows else {
+            return Ok(None);
+        };
+        let mut hosts = rows
+            .into_iter()
+            .filter(|row| row.resource.namespace == namespace && row.resource.name == name)
+            .filter_map(|row| row.resource.host)
+            .collect::<Vec<_>>();
+        hosts.sort();
+        hosts.dedup();
+
+        let home = match hosts.as_slice() {
+            [] => return Ok(None),
+            [host] if host == &self.host_name => return Ok(Some(self.node_id.clone())),
+            [host] => host.clone(),
+            _ => {
+                let homes = hosts.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                return Err(format!("convoy {name} is present on multiple home hosts: {homes}"));
+            }
+        };
+
+        match self.host_registry.node_id_for_host_name(&home).await? {
+            Some(node_id) if self.host_registry.peer_connection_status(&node_id).await == PeerConnectionState::Connected => {
+                Ok(Some(node_id))
+            }
+            Some(_) | None => Err(format!("convoy {name} is homed on {home}, which is unreachable")),
+        }
+    }
+
     /// Admit a convoy against this daemon's authoritative project resources,
     /// then package immutable workflow and placement snapshots for the remote
     /// execution host. This prevents a peer from re-resolving names against a
