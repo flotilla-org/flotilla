@@ -427,11 +427,9 @@ fn write_attach_hosts_config(config_base: &Path, hosts: &[(&str, &str, Option<&s
 }
 
 fn non_local_attach_hosts() -> (&'static str, &'static str) {
-    if HostName::local().as_str() == "feta" {
-        ("kiwi", "gouda")
-    } else {
-        ("feta", "gouda")
-    }
+    let local = HostName::local();
+    let mut candidates = ["feta", "gouda", "kiwi"].into_iter().filter(|host| *host != local.as_str());
+    (candidates.next().expect("first non-local host"), candidates.next().expect("second non-local host"))
 }
 
 async fn publish_attach_host_summary(daemon: &InProcessDaemon, node_name: &str, host_name: &str) {

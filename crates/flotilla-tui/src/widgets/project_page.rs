@@ -9,7 +9,7 @@ use super::{
     Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::{NamespaceMap, QueryTableCache},
+    app::{ui_state::PendingStatus, NamespaceMap, QueryTableCache},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::{self, AvailableAction, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId, TableIntent, TableIssueStart},
@@ -221,14 +221,14 @@ impl ProjectPageWidget {
         let table_state = state.table(ProjectPanelKind::Issues);
         let mut selected = Vec::new();
         for row in &layout.panel.table.rows {
-            if table_state.multi_selected.contains(&row.id) {
+            if table_state.multi_selected.contains(&row.id) && !issue_start_is_pending(table_state, &row.id) {
                 if let Some(issue) = issue_start_from_row(row) {
                     selected.push(issue);
                 }
             }
         }
         if let Some(row) = table_state.selected_row(&layout.panel.table) {
-            if !table_state.multi_selected.contains(&row.id) {
+            if !table_state.multi_selected.contains(&row.id) && !issue_start_is_pending(table_state, &row.id) {
                 if let Some(issue) = issue_start_from_row(row) {
                     selected.push(issue);
                 }
@@ -489,12 +489,22 @@ fn issue_start_from_row(row: &table_view::ProjectedRow) -> Option<TableIssueStar
     })
 }
 
+fn issue_start_is_pending(table_state: &table_view::TableState, row_id: &RowId) -> bool {
+    table_state
+        .pending_actions
+        .get(row_id)
+        .is_some_and(|pending| matches!(pending.status, PendingStatus::Submitting | PendingStatus::InFlight { .. }))
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::*;
-    use crate::table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint};
+    use crate::{
+        app::ui_state::{PendingAction, PendingStatus},
+        table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint},
+    };
 
     fn panel(kind: ProjectPanelKind, title: &str, target: &str, row: &str) -> ProjectPanel {
         ProjectPanel {
@@ -612,6 +622,29 @@ mod tests {
         let TableIntent::StartConvoys { namespace, project, issues } = action.intent else { panic!("expected bulk start") };
         assert_eq!((namespace.as_str(), project.as_str()), ("flotilla", "roadmap"));
         assert_eq!(issues.iter().map(|issue| issue.issue.id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
+    }
+
+    #[test]
+    fn selected_issue_bulk_start_skips_rows_already_in_progress() {
+        let mut issues = panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "placeholder");
+        issues.table.rows = vec![issue_row("809"), issue_row("810"), issue_row("811")];
+        let panels = vec![issues];
+        let layouts = ProjectPageWidget::layouts(&panels);
+        let mut state = ProjectTableState::default();
+        state.set_active(ProjectPanelKind::Issues);
+        state.focus_rows();
+        state.table_mut(ProjectPanelKind::Issues).select_index(&panels[0].table, 2);
+        state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[0].id.clone());
+        state.table_mut(ProjectPanelKind::Issues).multi_selected.insert(panels[0].table.rows[1].id.clone());
+        state.table_mut(ProjectPanelKind::Issues).pending_actions.insert(panels[0].table.rows[1].id.clone(), PendingAction {
+            status: PendingStatus::InFlight { command_id: 9 },
+            description: "Start convoy".into(),
+        });
+
+        let action = ProjectPageWidget::selected_issue_bulk_action(&layouts, &state).expect("bulk action");
+
+        let TableIntent::StartConvoys { issues, .. } = action.intent else { panic!("expected bulk start") };
+        assert_eq!(issues.iter().map(|issue| issue.issue.id.as_str()).collect::<Vec<_>>(), vec!["809", "811"]);
     }
 
     #[test]
