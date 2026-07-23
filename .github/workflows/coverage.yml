@@ -14,6 +14,10 @@ concurrency:
   group: nightly
   cancel-in-progress: true
 
+env:
+  # These targets are cached, but no CI checkout has a long-lived edit-build loop.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   check-changes:
     name: Check for changes
@@ -53,9 +57,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coverage-nightly-2026-03-12-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-coverage-v2-nightly-2026-03-12-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-coverage-nightly-2026-03-12-
+            ${{ runner.os }}-cargo-coverage-v2-nightly-2026-03-12-
       - name: Generate coverage report
         run: |
           # NOTE: --branch crashes llvm-cov (SIGSEGV from --show-mcdc in nightly LLVM).
@@ -76,6 +80,12 @@ jobs:
         with:
           name: coverage-site
           path: target/llvm-cov/html/
+      - name: Remove incremental state before caching
+        if: always()
+        run: |
+          if [ -d target ]; then
+            find target -type d -name incremental -prune -exec rm -rf {} +
+          fi
 
   dylint:
     name: Dylint
@@ -98,9 +108,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-dylint-nightly-2026-03-12-${{ hashFiles('lints/**/Cargo.lock', 'Cargo.lock') }}
+          key: ${{ runner.os }}-dylint-v2-nightly-2026-03-12-${{ hashFiles('lints/**/Cargo.lock', 'Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-dylint-nightly-2026-03-12-
+            ${{ runner.os }}-dylint-v2-nightly-2026-03-12-
       - name: Install cargo-dylint
         run: |
           command -v cargo-dylint && command -v dylint-link || cargo install cargo-dylint dylint-link --locked
@@ -119,6 +129,12 @@ jobs:
         with:
           name: dylint-badge
           path: _badges/
+      - name: Remove incremental state before caching
+        if: always()
+        run: |
+          if [ -d target ]; then
+            find target -type d -name incremental -prune -exec rm -rf {} +
+          fi
 
   deploy:
     name: Deploy to Pages
