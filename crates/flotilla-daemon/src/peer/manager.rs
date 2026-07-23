@@ -1332,7 +1332,7 @@ impl PeerManager {
                         .and_then(|active| active.meta.config_label.as_ref())
                         .or_else(|| self.transport_peers.iter().find_map(|(label, node)| (node == target).then_some(label)))
                         .and_then(|label| self.peer_dial_status.get(label))
-                        .and_then(|status| status.last_attempt.clone()),
+                        .and_then(|status| status.last_attempt),
                     last_error: self
                         .active_connections
                         .get(target)
