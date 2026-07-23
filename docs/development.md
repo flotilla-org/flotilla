@@ -30,7 +30,7 @@ FLOTILLA_TARGET_GC_DAYS=14 \
   scripts/prune-target.sh
 ```
 
-Run the command in each long-lived checkout. With Cargo's default configuration it acts only on that checkout's `target/` and does not traverse sibling worktrees or shared development roots. When `CARGO_TARGET_DIR` is set, the command intentionally honors it; unset or redirect a shared target before pruning if other checkouts still use that cache.
+Run the command in each long-lived checkout. With Cargo's default configuration it acts only on that checkout's `target/` and does not traverse sibling worktrees or shared development roots. When `CARGO_TARGET_DIR` is set, the command intentionally honors it; unset or redirect a shared target before pruning if other checkouts still use that cache. Relative values are anchored to this checkout's root, so use an absolute value if Cargo is normally invoked elsewhere.
 
 ### CI decision
 
