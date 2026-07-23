@@ -19,25 +19,41 @@ pub(super) fn spawn_peer_replicators(
     peer: NodeId,
     resource_socket_path: Option<PathBuf>,
 ) {
-    let http = resource_socket_path.map(HttpBackend::from_unix_socket).transpose().map_err(|error| error.to_string());
-    match http {
-        Ok(http) => flotilla_resources::for_each_registered_resource!(spawn_kind, &router, &daemon, &peer, &http),
+    let transport = match resource_socket_path {
+        Some(path) => HttpBackend::from_unix_socket(path).map(ReplicationTransport::Http).map_err(|error| error.to_string()),
+        #[cfg(feature = "test-support")]
+        None => Ok(ReplicationTransport::Routed(router)),
+        #[cfg(not(feature = "test-support"))]
+        None => {
+            debug!(%peer, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
+            return;
+        }
+    };
+    match transport {
+        Ok(transport) => flotilla_resources::for_each_registered_resource!(spawn_kind, &daemon, &peer, &transport),
         Err(error) => warn!(%peer, %error, "could not start peer resource replicators"),
     }
 }
 
-fn spawn_kind<T: Resource>(router: &RemoteCommandRouter, daemon: &Arc<InProcessDaemon>, peer: &NodeId, http: &Option<HttpBackend>) {
+#[derive(Clone)]
+enum ReplicationTransport {
+    Http(HttpBackend),
+    #[cfg(feature = "test-support")]
+    Routed(RemoteCommandRouter),
+}
+
+fn spawn_kind<T: Resource>(daemon: &Arc<InProcessDaemon>, peer: &NodeId, transport: &ReplicationTransport) {
     if T::REPLICATION_CLASS != ReplicationClass::HomeBoundRuntime {
         return;
     }
-    let router = router.clone();
     let daemon = Arc::clone(daemon);
     let peer = peer.clone();
-    let http = http.clone();
+    let transport = transport.clone();
     tokio::spawn(async move {
-        let result = match http {
-            Some(http) => replicate_kind_over_http::<T>(http, &daemon, &peer).await,
-            None => replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await,
+        let result = match transport {
+            ReplicationTransport::Http(http) => replicate_kind_over_http::<T>(http, &daemon, &peer).await,
+            #[cfg(feature = "test-support")]
+            ReplicationTransport::Routed(router) => replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await,
         };
         if let Err(error) = result {
             debug!(%peer, kind = T::API_PATHS.kind, %error, "resource replicator stopped");
@@ -45,7 +61,11 @@ fn spawn_kind<T: Resource>(router: &RemoteCommandRouter, daemon: &Arc<InProcessD
     });
 }
 
-async fn replicate_kind_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<InProcessDaemon>, peer: &NodeId) -> Result<(), String> {
+pub(super) async fn replicate_kind_over_http<T: Resource>(
+    http: HttpBackend,
+    daemon: &Arc<InProcessDaemon>,
+    peer: &NodeId,
+) -> Result<(), String> {
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
@@ -80,6 +100,7 @@ async fn apply_http_watch<T: Resource>(
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
 async fn replicate_kind_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
@@ -99,6 +120,7 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn run_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
@@ -161,6 +183,7 @@ async fn run_routed_watch<T: Resource>(
     }
 }
 
+#[cfg(feature = "test-support")]
 async fn apply_response<T: Resource>(
     writer: &flotilla_resources::ReplicaWriter<T>,
     initial: &mut Vec<ResourceObject<T>>,

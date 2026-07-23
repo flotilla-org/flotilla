@@ -107,6 +107,7 @@ pub async fn spawn_in_memory_request_topology(
             Some(leader_peer_data_rx),
             leader_peer_data_tx.clone(),
             leader_remote_router.clone(),
+            None,
         );
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) =
         spawn_peer_networking_runtime(
@@ -115,6 +116,7 @@ pub async fn spawn_in_memory_request_topology(
             Some(follower_peer_data_rx),
             follower_peer_data_tx,
             follower_remote_router,
+            None,
         );
 
     let (client_session, server_session) = flotilla_transport::message::message_session_pair();
@@ -195,6 +197,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
             Some(leader_peer_data_rx),
             leader_peer_data_tx.clone(),
             leader_remote_router.clone(),
+            None,
         );
     let (follower_runtime_handle, _follower_peer_connected_tx): (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) =
         spawn_peer_networking_runtime(
@@ -203,6 +206,7 @@ async fn spawn_in_memory_request_topology_stateful_with_optional_surface(
             Some(follower_peer_data_rx),
             follower_peer_data_tx,
             follower_remote_router,
+            None,
         );
 
     // Spawn the server-side client session handler BEFORE the client handshake,
