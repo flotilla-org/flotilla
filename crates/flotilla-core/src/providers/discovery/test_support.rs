@@ -361,6 +361,7 @@ impl IssueProvider for FakeIssueProvider {
             .map(|(id, issue)| {
                 let mut issue = issue.clone();
                 issue.reference = IssueRef { source: source.clone(), id: id.clone() };
+                issue.observed_at = Some(Utc::now());
                 issue
             })
             .collect();
@@ -377,6 +378,7 @@ impl IssueProvider for FakeIssueProvider {
             .map(|(id, issue)| {
                 let mut issue = issue.clone();
                 issue.reference = IssueRef { source: reference.source.clone(), id: id.clone() };
+                issue.observed_at = Some(Utc::now());
                 issue
             })
             .ok_or_else(|| format!("issue {} not found", reference.id))
@@ -391,6 +393,7 @@ impl IssueProvider for FakeIssueProvider {
             .map(|(id, issue)| {
                 let mut issue = issue.clone();
                 issue.reference = IssueRef { source: source.clone(), id: id.clone() };
+                issue.observed_at = Some(Utc::now());
                 issue
             })
             .collect())
@@ -409,6 +412,7 @@ impl IssueProvider for FakeIssueProvider {
             let reference = IssueRef { source: source.clone(), id };
             if issue.state == IssueState::Open {
                 issue.reference = reference;
+                issue.observed_at = Some(Utc::now());
                 updated.push(issue);
             } else {
                 closed.push(reference);

@@ -11,8 +11,8 @@ use flotilla_protocol::{
     test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
     CrewCommandContext, DaemonEvent, EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostProviderStatus, HostSummary, ImageId,
-    QueryCursor, QueryScope, RepoSelector, RepositoryKey, ResourceRef, ResultSetCondition, SystemInfo, ToolInventory, TopologyRoute,
-    AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    IssueRef, IssueSource, QueryCursor, QueryScope, RepoSelector, RepositoryKey, ResourceRef, ResultSetCondition, SystemInfo,
+    ToolInventory, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -77,6 +77,62 @@ fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
         assert!(validate_convoy_branch(branch).is_err(), "{branch} should be rejected");
     }
     validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
+}
+
+#[tokio::test]
+async fn convoy_admission_uses_only_fresh_cached_issue_snapshots() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), fake_discovery(false), HostName::local()).await;
+    let identity = fallback_repo_identity(Path::new("/remote/issues"));
+    daemon.add_virtual_repo(identity.clone(), None, PathBuf::from("/remote/issues"), vec![], 0).await.expect("add virtual repo");
+    let reference =
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "897".into() };
+    let mut issue = TestIssue::new("Store-first admission").id("897").build();
+    issue.reference = reference.clone();
+    issue.observed_at = Some(Utc::now());
+    daemon
+        .repos
+        .write()
+        .await
+        .get_mut(&identity)
+        .expect("virtual repo state")
+        .last_local_providers
+        .issues
+        .insert(reference.id.clone(), issue.clone());
+
+    assert_eq!(daemon.resolve_convoy_issue_snapshot(&reference).await.expect("fresh cache resolves"), issue.clone());
+
+    daemon
+        .repos
+        .write()
+        .await
+        .get_mut(&identity)
+        .expect("virtual repo state")
+        .last_local_providers
+        .issues
+        .get_mut(&reference.id)
+        .expect("cached issue")
+        .observed_at = Some(Utc::now() - ISSUE_SNAPSHOT_FRESHNESS - ChronoDuration::seconds(1));
+
+    assert!(daemon.resolve_convoy_issue_snapshot(&reference).await.is_err(), "stale cache must fetch instead of dispatching its body");
+
+    daemon
+        .repos
+        .write()
+        .await
+        .get_mut(&identity)
+        .expect("virtual repo state")
+        .last_local_providers
+        .issues
+        .get_mut(&reference.id)
+        .expect("cached issue")
+        .observed_at = Some(Utc::now() + ChronoDuration::seconds(1));
+
+    assert!(daemon.resolve_convoy_issue_snapshot(&reference).await.is_err(), "future cache entry must not dispatch");
 }
 
 #[test]

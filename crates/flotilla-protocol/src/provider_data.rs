@@ -137,7 +137,11 @@ pub struct Issue {
     pub body: Option<String>,
     pub state: IssueState,
     pub labels: Vec<String>,
+    /// When the external source last changed the issue.
     pub as_of: DateTime<Utc>,
+    /// When Flotilla observed this exact snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
     pub association_keys: Vec<AssociationKey>,
     #[serde(default)]
     pub provider_name: String,
@@ -417,6 +421,7 @@ mod tests {
             state: IssueState::Open,
             labels: vec![],
             as_of: "2026-07-15T09:30:00Z".parse().expect("valid timestamp"),
+            observed_at: None,
             association_keys: vec![],
             provider_name: String::new(),
             provider_display_name: String::new(),
@@ -568,6 +573,7 @@ mod tests {
             state: IssueState::Open,
             labels: vec!["enhancement".into(), "provider".into()],
             as_of,
+            observed_at: Some(as_of),
             association_keys: vec![AssociationKey::IssueRef("github".into(), "747".into())],
             provider_name: "github".into(),
             provider_display_name: "GitHub".into(),
