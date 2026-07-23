@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Resource, ResourceObject, WatchEvent};
 
+pub(crate) const ORIGIN_ROOT_ANNOTATION: &str = "flotilla.work/origin-root";
+pub(crate) const LAST_SYNCED_AT_ANNOTATION: &str = "flotilla.work/last-synced-at";
+
 /// Cross-root behavior for a resource kind.
 ///
 /// Replication is deliberately opt-in at the kind declaration. Additional
@@ -55,7 +58,7 @@ pub struct ReplicaCursor {
     pub generation: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
 pub(crate) struct StoredReplicaEvent {
     pub origin_root: NodeId,
     pub synced_at: DateTime<Utc>,

@@ -29,10 +29,10 @@ use flotilla_protocol::{
     TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, InputMeta,
-    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend, ResourceError, Stance, StatusPatch,
-    TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch,
-    WorkflowTemplate,
+    Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy, ConvoySpec, HttpBackend, InMemoryBackend, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, ResourceBackend, ResourceError, ResourceProvenance, Stance,
+    StatusPatch, TerminalAttentionState, TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+    TerminalSessionStatusPatch, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use flotilla_transport::message::{message_session_pair, MessageSession};
 use indexmap::IndexMap;
@@ -55,10 +55,87 @@ use super::{
         PendingRemoteCommand, PendingRemoteCommandMap, RemoteCommandRouter,
     },
     request_dispatch::RequestDispatcher,
+    resource_http::serve_resource_http,
     shared::{sync_peer_query_state, write_message, SocketPeerSender},
     test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
     DaemonServer, PeerConnectedNotice,
 };
+
+#[tokio::test]
+async fn resource_http_lists_and_watches_over_a_unix_socket() {
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source_convoys = source.using::<Convoy>("flotilla");
+    source_convoys
+        .create(
+            &InputMeta::builder().name("before-watch".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create initial convoy");
+    source_convoys
+        .create(
+            &InputMeta::builder().name("replica-row".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create replica source row");
+    let replica_snapshot = source_convoys.list().await.expect("list replica source rows");
+    source
+        .replica_writer::<Convoy>(NodeId::new("remote-root"), "flotilla")
+        .replace(&replica_snapshot, chrono::Utc::now())
+        .await
+        .expect("seed replica rows");
+    source_convoys.delete("replica-row").await.expect("remove local copy of replica row");
+
+    let socket_path = PathBuf::from(format!("/tmp/flotilla-resource-http-{}.sock", uuid::Uuid::new_v4()));
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind resource HTTP socket");
+    let server_backend = source.clone();
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
+            let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
+            let backend = server_backend.clone();
+            tokio::spawn(async move {
+                serve_resource_http(stream, first_byte, backend).await.expect("serve resource HTTP request");
+            });
+        }
+    });
+
+    let remote = ResourceBackend::Http(HttpBackend::from_unix_socket(&socket_path).expect("build Unix-socket resource client"));
+    let overlay = remote.including_replicas::<Convoy>("flotilla").list().await.expect("list overlay over Unix-socket HTTP");
+    assert!(overlay.items.iter().any(|item| {
+        item.object.metadata.name == "replica-row"
+            && matches!(
+                item.provenance,
+                ResourceProvenance::Replica { ref origin_root, .. }
+                    if origin_root == &NodeId::new("remote-root")
+            )
+    }));
+    let listed = remote.using::<Convoy>("flotilla").list().await.expect("list convoys over Unix-socket HTTP");
+    assert_eq!(listed.items.len(), 1);
+    let mut watch =
+        remote.using::<Convoy>("flotilla").watch(WatchStart::resuming_from(&listed)).await.expect("watch convoys over Unix-socket HTTP");
+
+    source_convoys
+        .create(
+            &InputMeta::builder().name("after-watch".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create watched convoy");
+    let event = tokio::time::timeout(Duration::from_secs(2), futures::StreamExt::next(&mut watch))
+        .await
+        .expect("HTTP watch event timeout")
+        .expect("HTTP watch ended")
+        .expect("valid HTTP watch event");
+    assert!(matches!(
+        event,
+        WatchEvent::Added(object) if object.metadata.name == "after-watch"
+    ));
+
+    server.await.expect("resource HTTP server task");
+    std::fs::remove_file(&socket_path).expect("remove resource HTTP socket");
+}
 use crate::peer::{
     test_support::{ensure_test_connection_generation, handle_test_peer_data, wait_for_command_result, BlockingPeerSender, MockPeerSender},
     InboundPeerEnvelope, PeerConnectionStatus, PeerManager, PeerSender, PeerTransport,

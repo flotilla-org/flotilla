@@ -191,6 +191,7 @@ pub struct ConnectedConfiguredPeer {
     pub label: ConfigLabel,
     pub node: NodeInfo,
     pub generation: u64,
+    pub resource_socket_path: Option<PathBuf>,
     pub inbound_rx: mpsc::Receiver<PeerWireMessage>,
 }
 
@@ -1394,7 +1395,8 @@ impl PeerManager {
                         let subscribe_result = transport.subscribe().await;
                         let remote_node = transport.remote_node_info();
                         let remote_session_id = transport.remote_session_id();
-                        Ok((sender, subscribe_result, remote_node, remote_session_id))
+                        let resource_socket_path = transport.resource_socket_path();
+                        Ok((sender, subscribe_result, remote_node, remote_session_id, resource_socket_path))
                     }
                     Err(e) => Err(e),
                 }
@@ -1403,7 +1405,7 @@ impl PeerManager {
             };
 
             match connect_result {
-                Ok((sender, subscribe_result, remote_node, remote_session_id)) => {
+                Ok((sender, subscribe_result, remote_node, remote_session_id, resource_socket_path)) => {
                     let Some(remote_node) = remote_node else {
                         warn!(target = %label.0, "peer transport connected without remote node identity");
                         self.note_dial_result(&label, Err("peer transport connected without remote node identity"));
@@ -1449,7 +1451,13 @@ impl PeerManager {
                     match subscribe_result {
                         Ok(rx) => {
                             self.note_dial_result(&label, Ok(()));
-                            receivers.push(ConnectedConfiguredPeer { label: label.clone(), node: remote_node, generation, inbound_rx: rx })
+                            receivers.push(ConnectedConfiguredPeer {
+                                label: label.clone(),
+                                node: remote_node,
+                                generation,
+                                resource_socket_path,
+                                inbound_rx: rx,
+                            })
                         }
                         Err(e) => {
                             warn!(peer = %name, target = %label.0, err = %e, "failed to subscribe to peer");
@@ -1654,10 +1662,11 @@ impl PeerManager {
             let rx = transport.subscribe().await?;
             let remote_node = transport.remote_node_info();
             let remote_session_id = transport.remote_session_id();
-            Ok::<_, String>((sender, rx, remote_node, remote_session_id))
+            let resource_socket_path = transport.resource_socket_path();
+            Ok::<_, String>((sender, rx, remote_node, remote_session_id, resource_socket_path))
         }
         .await;
-        let (sender, rx, remote_node, remote_session_id) = match result {
+        let (sender, rx, remote_node, remote_session_id, resource_socket_path) = match result {
             Ok(connection) => connection,
             Err(error) => {
                 self.note_dial_result(label, Err(&error));
@@ -1706,7 +1715,7 @@ impl PeerManager {
         }
 
         self.note_dial_result(label, Ok(()));
-        Ok(ConnectedConfiguredPeer { label: label.clone(), node: remote_node, generation, inbound_rx: rx })
+        Ok(ConnectedConfiguredPeer { label: label.clone(), node: remote_node, generation, resource_socket_path, inbound_rx: rx })
     }
 
     /// Clear all stored peer data originating from a specific host.

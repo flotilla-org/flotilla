@@ -5,7 +5,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    api_version, Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList, ObjectMeta,
+    api_version,
+    replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
+    Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList, ObjectMeta,
     OwnerReference, PlacementPolicy, Presentation, Project, ReadWatchEvent, Regard, Repository, Resource, ResourceBackend, ResourceError,
     ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
@@ -396,7 +398,7 @@ async fn apply_typed<T: Resource>(
 
 fn list_value<T: Resource>(listed: &ResourceList<T>) -> Result<Value, ResourceError> {
     let list = K8sResourceList {
-        metadata: K8sListMeta { resource_version: listed.resource_version.clone() },
+        metadata: K8sListMeta { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() },
         items: listed.items.iter().map(ResourceObject::to_k8s_object).collect(),
     };
     serde_json::to_value(list).map_err(|error| ResourceError::decode(format!("encode resource list: {error}")))
@@ -412,8 +414,8 @@ fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<T>) -> Resu
         let annotations = value["metadata"]["annotations"]
             .as_object_mut()
             .ok_or_else(|| ResourceError::decode("resource metadata annotations are not an object"))?;
-        annotations.insert("flotilla.work/origin-root".to_string(), Value::String(origin_root.to_string()));
-        annotations.insert("flotilla.work/last-synced-at".to_string(), Value::String(last_synced_at.to_rfc3339()));
+        annotations.insert(ORIGIN_ROOT_ANNOTATION.to_string(), Value::String(origin_root.to_string()));
+        annotations.insert(LAST_SYNCED_AT_ANNOTATION.to_string(), Value::String(last_synced_at.to_rfc3339()));
     }
     Ok(value)
 }

@@ -115,7 +115,7 @@ impl PeerConnection {
 
         sync_peer_query_state(&self.peer_manager, &self.daemon).await;
         self.daemon.publish_peer_connection_status(&peer_node, PeerConnectionState::Connected).await;
-        let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: node_id.clone(), generation });
+        let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: node_id.clone(), generation, resource_socket_path: None });
 
         loop {
             tokio::select! {

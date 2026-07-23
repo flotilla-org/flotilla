@@ -134,10 +134,61 @@ async fn connected_daemons_replicate_home_bound_runtime_kinds_and_deletes() {
     .await
     .expect("last-known replication timed out");
 
+    let synced_before_disconnect = match &kiwi
+        .resource_backend()
+        .including_replicas::<Convoy>("flotilla")
+        .list()
+        .await
+        .expect("list replicas before disconnect")
+        .items
+        .iter()
+        .find(|item| item.object.metadata.name == "last-known-convoy")
+        .expect("last-known replica before disconnect")
+        .provenance
+    {
+        ResourceProvenance::Replica { last_synced_at, .. } => *last_synced_at,
+        ResourceProvenance::Local => panic!("expected replica provenance"),
+    };
+
     drop(topology);
     let disconnected = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("list disconnected replicas");
     assert!(
         disconnected.items.iter().any(|item| item.object.metadata.name == "last-known-convoy"),
         "origin absence must not remove last-known replica rows"
     );
+
+    remote
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("created-offline".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("create convoy while disconnected");
+    let reconnected = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("reconnect topology");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let listed = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("list reconnected replicas");
+            if listed.items.iter().any(|item| item.object.metadata.name == "created-offline") {
+                let retained = listed
+                    .items
+                    .iter()
+                    .find(|item| item.object.metadata.name == "last-known-convoy")
+                    .expect("retained replica after reconnect");
+                assert!(
+                    matches!(
+                        retained.provenance,
+                        ResourceProvenance::Replica { last_synced_at, .. }
+                            if last_synced_at == synced_before_disconnect
+                    ),
+                    "resume must not full-relist and restamp unchanged rows"
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconnect replication timed out");
+    drop(reconnected);
 }

@@ -68,13 +68,16 @@ pub struct ReplicaReadResolver<T: Resource> {
 impl<T: Resource> ReplicaReadResolver<T> {
     pub async fn list(&self) -> Result<ReadResourceList<T>, ResourceError> {
         ensure_replication_enabled::<T>()?;
+        if let ResourceBackend::Http(backend) = &self.backend {
+            return backend.list_including_replicas_typed::<T>(&self.namespace).await;
+        }
         let local = self.backend.using::<T>(&self.namespace).list().await?;
         let mut items =
             local.items.into_iter().map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local }).collect::<Vec<_>>();
         let replicas = match &self.backend {
             ResourceBackend::InMemory(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
             ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP replica read views are not available on this client")),
+            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
         };
         items.extend(replicas);
         items.sort_by(|left, right| {
@@ -93,10 +96,13 @@ impl<T: Resource> ReplicaReadResolver<T> {
 
     pub async fn watch(&self) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         ensure_replication_enabled::<T>()?;
+        if let ResourceBackend::Http(backend) = &self.backend {
+            return backend.watch_including_replicas_typed::<T>(&self.namespace).await;
+        }
         let replicas = match &self.backend {
             ResourceBackend::InMemory(backend) => backend.watch_replicas_typed::<T>(&self.namespace).await?,
             ResourceBackend::Sqlite(backend) => backend.watch_replicas_typed::<T>(&self.namespace).await?,
-            ResourceBackend::Http(_) => return Err(ResourceError::invalid("HTTP replica read views are not available on this client")),
+            ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
         };
         let local = self.backend.using::<T>(&self.namespace).watch(WatchStart::Now).await?.map(|event| event.map(ReadWatchEvent::local));
         Ok(stream::select(local, replicas).boxed())

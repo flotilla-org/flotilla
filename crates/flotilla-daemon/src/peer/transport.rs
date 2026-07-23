@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_protocol::{GoodbyeReason, NodeInfo, PeerWireMessage};
@@ -26,6 +26,12 @@ pub trait PeerTransport: Send + Sync {
 
     /// Human-readable address used for connection attempts and diagnostics.
     fn connection_address(&self) -> String;
+
+    /// A local Unix socket forwarded to the remote daemon, when this
+    /// transport provides one.
+    fn resource_socket_path(&self) -> Option<PathBuf> {
+        None
+    }
 
     /// Subscribe to inbound peer wire messages.
     async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String>;

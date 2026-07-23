@@ -180,7 +180,11 @@ impl PeerRuntime {
                             current_peer = Some(initial_connection.node.clone());
                             let mut inbound_rx = initial_connection.inbound_rx;
                             let generation = initial_connection.generation;
-                            let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
+                            let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
+                                peer: peer_name.clone(),
+                                generation,
+                                resource_socket_path: initial_connection.resource_socket_path,
+                            });
                             last_known_session_id = {
                                 let pm_lock = pm.lock().await;
                                 pm_lock.peer_session_id(&peer_name)
@@ -256,7 +260,11 @@ impl PeerRuntime {
                                             PeerConnectionState::Connected,
                                         )
                                         .await;
-                                    let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
+                                    let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
+                                        peer: peer_name.clone(),
+                                        generation,
+                                        resource_socket_path: connection.resource_socket_path,
+                                    });
                                     attempt = 1;
                                     let sender = {
                                         let pm_lock = pm.lock().await;
@@ -637,6 +645,7 @@ impl PeerRuntime {
                             outbound_remote_command_router.clone(),
                             Arc::clone(&outbound_daemon),
                             notice.peer.clone(),
+                            notice.resource_socket_path,
                         );
                         send_local_to_peer(
                             &outbound_daemon,

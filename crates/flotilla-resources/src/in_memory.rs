@@ -38,8 +38,8 @@ struct ReplicaState {
 #[derive(Debug, Default)]
 struct ReplicaPartition {
     objects: HashMap<String, Value>,
+    synced_at_by_name: HashMap<String, chrono::DateTime<Utc>>,
     cursor: Option<ReplicaCursor>,
-    synced_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Debug)]
@@ -178,12 +178,14 @@ impl InMemoryBackend {
             if partition_key != &key {
                 continue;
             }
-            let Some(last_synced_at) = partition.synced_at else {
-                continue;
-            };
-            for value in partition.objects.values().cloned() {
+            for (name, value) in &partition.objects {
+                let last_synced_at = partition
+                    .synced_at_by_name
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| ResourceError::other(format!("replica row '{name}' has no sync timestamp")))?;
                 items.push(ReadResourceObject {
-                    object: Self::decode_object(value)?,
+                    object: Self::decode_object(value.clone())?,
                     provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
                 });
             }
@@ -228,8 +230,10 @@ impl InMemoryBackend {
         let mut state = self.replicas.lock().await;
         let old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut objects = HashMap::new();
+        let mut synced_at_by_name = HashMap::new();
         for object in &listed.items {
             objects.insert(object.metadata.name.clone(), Self::encode_object(object)?);
+            synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
         }
         let mut events = Vec::new();
         for (name, value) in &objects {
@@ -252,8 +256,8 @@ impl InMemoryBackend {
         }
         state.partitions.insert(replica_key, ReplicaPartition {
             objects,
+            synced_at_by_name,
             cursor: Some(ReplicaCursor { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() }),
-            synced_at: Some(synced_at),
         });
         for event in events {
             Self::notify_replica_watchers(&mut state, &store_key, event);
@@ -277,12 +281,13 @@ impl InMemoryBackend {
         match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
                 partition.objects.insert(object.metadata.name.clone(), encoded.clone());
+                partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
             StoredReplicaEventKind::Deleted => {
                 partition.objects.remove(&object.metadata.name);
+                partition.synced_at_by_name.remove(&object.metadata.name);
             }
         }
-        partition.synced_at = Some(synced_at);
         partition.cursor = Some(ReplicaCursor {
             resource_version: object.metadata.resource_version.clone(),
             generation: partition.cursor.as_ref().and_then(|cursor| cursor.generation.clone()),

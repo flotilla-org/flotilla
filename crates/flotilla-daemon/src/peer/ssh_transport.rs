@@ -434,6 +434,10 @@ impl PeerTransport for SshTransport {
         }
     }
 
+    fn resource_socket_path(&self) -> Option<PathBuf> {
+        Some(self.local_socket_path.clone())
+    }
+
     async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
         if self.status != PeerConnectionStatus::Connected {
             return Err("not connected".to_string());

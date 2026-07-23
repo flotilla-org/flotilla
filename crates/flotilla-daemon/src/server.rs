@@ -5,6 +5,7 @@ mod peer_runtime;
 mod remote_commands;
 mod replicator;
 mod request_dispatch;
+mod resource_http;
 mod shared;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -24,7 +25,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, HostName, Message, NodeId, PROTOCOL_VERSION};
 use flotilla_resources::{ResourceBackend, SqliteBackend};
-use flotilla_transport::message::{unix_message_session, MessageSession};
+use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,
     sync::{mpsc, watch, Mutex, Notify},
@@ -51,6 +52,7 @@ use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, Peer
 pub(crate) struct PeerConnectedNotice {
     pub peer: NodeId,
     pub generation: u64,
+    pub resource_socket_path: Option<PathBuf>,
 }
 
 fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
@@ -403,7 +405,7 @@ fn spawn_peer_networking_runtime(
 /// (forward-compatible with HTTP transport).
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
-    stream: tokio::net::UnixStream,
+    mut stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
     shutdown_rx: watch::Receiver<bool>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
@@ -415,8 +417,22 @@ async fn handle_client(
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
 ) {
+    let mut first_byte = [0_u8; 1];
+    match tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte).await {
+        Ok(_) if first_byte[0].is_ascii_uppercase() => {
+            if let Err(error) = resource_http::serve_resource_http(stream, first_byte[0], daemon.resource_backend().clone()).await {
+                warn!(%error, "resource HTTP connection failed");
+            }
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(%error, "failed to read connection preface");
+            return;
+        }
+    }
     handle_client_session(
-        unix_message_session(stream),
+        unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
         shutdown_rx,
         peer_data_tx,

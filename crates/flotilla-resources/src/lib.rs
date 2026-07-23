@@ -90,6 +90,27 @@ pub use terminal_session::{
 };
 pub use vessel::{Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch};
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! for_each_registered_resource {
+    ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::Checkout>($($argument),*);
+        $callback::<$crate::Clone>($($argument),*);
+        $callback::<$crate::Convoy>($($argument),*);
+        $callback::<$crate::Demand>($($argument),*);
+        $callback::<$crate::Environment>($($argument),*);
+        $callback::<$crate::Host>($($argument),*);
+        $callback::<$crate::PlacementPolicy>($($argument),*);
+        $callback::<$crate::Presentation>($($argument),*);
+        $callback::<$crate::Project>($($argument),*);
+        $callback::<$crate::Regard>($($argument),*);
+        $callback::<$crate::Repository>($($argument),*);
+        $callback::<$crate::TerminalSession>($($argument),*);
+        $callback::<$crate::Vessel>($($argument),*);
+        $callback::<$crate::WorkflowTemplate>($($argument),*);
+    }};
+}
 pub use workflow_template::{
     single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation,
     Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,

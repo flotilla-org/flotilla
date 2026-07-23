@@ -1,20 +1,19 @@
-use std::path::Path;
+use std::{io::Cursor, path::Path};
 
 use flotilla_protocol::{framing::write_message_line, Message};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader, BufWriter},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader, BufWriter},
     net::UnixStream,
     sync::Mutex,
 };
 
 use crate::memory::{memory_session_pair, Session};
 
+type PrefixedUnixReader = tokio::io::Lines<BufReader<tokio::io::Chain<Cursor<Vec<u8>>, tokio::net::unix::OwnedReadHalf>>>;
+
 enum MessageSessionInner {
     Memory(Session<Message>),
-    Unix {
-        reader: Mutex<tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>>,
-        writer: Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>>,
-    },
+    Unix { reader: Box<Mutex<PrefixedUnixReader>>, writer: Mutex<BufWriter<tokio::net::unix::OwnedWriteHalf>> },
 }
 
 pub struct MessageSession {
@@ -52,10 +51,14 @@ pub async fn connect_unix_message_session(socket_path: &Path) -> Result<MessageS
 }
 
 pub fn unix_message_session(stream: UnixStream) -> MessageSession {
+    unix_message_session_with_prefix(stream, Vec::new())
+}
+
+pub fn unix_message_session_with_prefix(stream: UnixStream, prefix: Vec<u8>) -> MessageSession {
     let (read_half, write_half) = stream.into_split();
     MessageSession {
         inner: MessageSessionInner::Unix {
-            reader: Mutex::new(BufReader::new(read_half).lines()),
+            reader: Box::new(Mutex::new(BufReader::new(Cursor::new(prefix).chain(read_half)).lines())),
             writer: Mutex::new(BufWriter::new(write_half)),
         },
     }

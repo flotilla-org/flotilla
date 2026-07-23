@@ -1,45 +1,105 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use chrono::Utc;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, NodeId, ResourceWatchCursor, ResourceWatchResponse};
-use flotilla_resources::{Convoy, K8sWatchEvent, Resource, ResourceList, ResourceObject, TerminalSession, Vessel};
+use flotilla_resources::{
+    HttpBackend, K8sWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, WatchStart,
+};
+use futures::StreamExt;
 use tracing::{debug, warn};
 
 use super::remote_commands::RemoteCommandRouter;
 
 const REPLICATION_NAMESPACE: &str = "flotilla";
 
-pub(super) fn spawn_peer_replicators(router: RemoteCommandRouter, daemon: Arc<InProcessDaemon>, peer: NodeId) {
-    spawn_kind::<Convoy>(router.clone(), Arc::clone(&daemon), peer.clone());
-    spawn_kind::<Vessel>(router.clone(), Arc::clone(&daemon), peer.clone());
-    spawn_kind::<TerminalSession>(router, daemon, peer);
+pub(super) fn spawn_peer_replicators(
+    router: RemoteCommandRouter,
+    daemon: Arc<InProcessDaemon>,
+    peer: NodeId,
+    resource_socket_path: Option<PathBuf>,
+) {
+    let http = resource_socket_path.map(HttpBackend::from_unix_socket).transpose().map_err(|error| error.to_string());
+    match http {
+        Ok(http) => flotilla_resources::for_each_registered_resource!(spawn_kind, &router, &daemon, &peer, &http),
+        Err(error) => warn!(%peer, %error, "could not start peer resource replicators"),
+    }
 }
 
-fn spawn_kind<T: Resource>(router: RemoteCommandRouter, daemon: Arc<InProcessDaemon>, peer: NodeId) {
+fn spawn_kind<T: Resource>(router: &RemoteCommandRouter, daemon: &Arc<InProcessDaemon>, peer: &NodeId, http: &Option<HttpBackend>) {
+    if T::REPLICATION_CLASS != ReplicationClass::HomeBoundRuntime {
+        return;
+    }
+    let router = router.clone();
+    let daemon = Arc::clone(daemon);
+    let peer = peer.clone();
+    let http = http.clone();
     tokio::spawn(async move {
-        if let Err(error) = replicate_kind::<T>(&router, &daemon, &peer).await {
+        let result = match http {
+            Some(http) => replicate_kind_over_http::<T>(http, &daemon, &peer).await,
+            None => replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await,
+        };
+        if let Err(error) = result {
             debug!(%peer, kind = T::API_PATHS.kind, %error, "resource replicator stopped");
         }
     });
 }
 
-async fn replicate_kind<T: Resource>(router: &RemoteCommandRouter, daemon: &Arc<InProcessDaemon>, peer: &NodeId) -> Result<(), String> {
+async fn replicate_kind_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<InProcessDaemon>, peer: &NodeId) -> Result<(), String> {
+    let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
-    match run_watch::<T>(router, daemon, peer, cursor.clone()).await {
+    if let Some(cursor) = cursor {
+        let start = match cursor.generation {
+            Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: cursor.resource_version },
+            None => WatchStart::FromVersion(cursor.resource_version),
+        };
+        match remote.watch(start).await {
+            Ok(watch) => return apply_http_watch(watch, &writer).await,
+            Err(error @ (ResourceError::WatchExpired { .. } | ResourceError::Invalid { .. })) => {
+                debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor rejected; relisting origin");
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    let listed = remote.list().await.map_err(|error| error.to_string())?;
+    let start = WatchStart::resuming_from(&listed);
+    writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
+    let watch = remote.watch(start).await.map_err(|error| error.to_string())?;
+    apply_http_watch(watch, &writer).await
+}
+
+async fn apply_http_watch<T: Resource>(
+    mut watch: flotilla_resources::WatchStream<T>,
+    writer: &flotilla_resources::ReplicaWriter<T>,
+) -> Result<(), String> {
+    while let Some(event) = watch.next().await {
+        writer.apply(event.map_err(|error| error.to_string())?, Utc::now()).await.map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+async fn replicate_kind_over_routed_watch<T: Resource>(
+    router: &RemoteCommandRouter,
+    daemon: &Arc<InProcessDaemon>,
+    peer: &NodeId,
+) -> Result<(), String> {
+    let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
+    match run_routed_watch::<T>(router, daemon, peer, cursor.clone()).await {
         Ok(()) => Ok(()),
         Err(error)
             if cursor.is_some() && (error.contains("expired") || error.contains("generation") || error.contains("resourceVersion")) =>
         {
             debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor rejected; relisting origin");
-            run_watch::<T>(router, daemon, peer, None).await
+            run_routed_watch::<T>(router, daemon, peer, None).await
         }
         Err(error) => Err(error),
     }
 }
 
-async fn run_watch<T: Resource>(
+async fn run_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
