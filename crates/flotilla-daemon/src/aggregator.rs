@@ -1480,16 +1480,18 @@ impl Aggregator {
 
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
         let requested_stance = definition.stance.to_string();
-        let vessel_resource = state
-            .and_then(|state| state.placement.as_ref())
-            .and_then(|placement| placement.fields.get("vessel_ref"))
+        let placement = state.and_then(|state| state.placement.as_ref());
+        let vessel_host = placement
+            .and_then(|placement| placement.fields.get("host"))
             .and_then(serde_json::Value::as_str)
-            .map(|name| {
+            .map(HostName::new)
+            .unwrap_or_else(|| self.local_host.clone());
+        let vessel_resource =
+            placement.and_then(|placement| placement.fields.get("vessel_ref")).and_then(serde_json::Value::as_str).map(|name| {
                 ResourceRef::new(api_version(Vessel::API_PATHS), Vessel::API_PATHS.kind, &convoy_ref.namespace, name)
-                    .on_host(self.local_host.clone())
+                    .on_host(vessel_host.clone())
             });
-        let effective_stance = state
-            .and_then(|state| state.placement.as_ref())
+        let effective_stance = placement
             .and_then(|placement| placement.fields.get("effective_stance"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
@@ -1536,7 +1538,7 @@ impl Aggregator {
             .requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
             .depends_on(definition.depends_on.clone())
-            .host(self.local_host.clone())
+            .host(vessel_host)
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .maybe_materialize(self.vessel_materialize(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
             .complete_work(state.is_some_and(|state| !state.phase.is_terminal()))
@@ -1591,10 +1593,6 @@ fn set_convoy_row_host(row: &mut ConvoyRow, host: &HostName) {
     row.resource.host = Some(host.clone());
     for vessel in &mut row.vessels {
         vessel.resource.host = Some(host.clone());
-        if let Some(resource) = &mut vessel.vessel_resource {
-            resource.host = Some(host.clone());
-        }
-        vessel.host = host.clone();
     }
 }
 
@@ -2761,6 +2759,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remotely_placed_vessel_exposes_placement_host() {
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+        convoy.status.as_mut().expect("convoy status").work.get_mut("implement").expect("work state").placement = Some(PlacementStatus {
+            fields: BTreeMap::from([
+                ("host".to_string(), serde_json::json!("feta")),
+                ("vessel_ref".to_string(), serde_json::json!("convoy-a-implement")),
+            ]),
+        });
+
+        let vessel = emitted_vessel(convoy).await;
+
+        assert_eq!(vessel.host, HostName::new("feta"));
+        assert_eq!(vessel.vessel_resource.expect("vessel resource").host, Some(HostName::new("feta")));
+    }
+
+    #[tokio::test]
     async fn non_terminal_work_is_completable() {
         for phase in [ResourceWorkPhase::Pending, ResourceWorkPhase::Ready, ResourceWorkPhase::Launching, ResourceWorkPhase::Running] {
             let vessel = emitted_vessel(convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(phase).call()).await;
@@ -2804,6 +2818,37 @@ mod tests {
         let rows = result_set.rows.as_convoys().expect("convoy rows");
         let row = rows.first().expect("replica convoy row");
         assert_eq!(row.project_ref.as_deref(), Some("my-project"));
+    }
+
+    #[tokio::test]
+    async fn replica_cache_preserves_vessel_placement_host() {
+        let state = AggregatorProjectionState::new();
+        let mut snapshot = remote_snapshot("kiwi", "generation-1", "remote-convoy");
+        let vessel_host = HostName::new("feta");
+        let vessel = VesselRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "remote-convoy").subresource("vessels/implement"))
+            .vessel_resource(
+                ResourceRef::new("flotilla.work/v1", "Vessel", "flotilla", "remote-convoy-implement").on_host(vessel_host.clone()),
+            )
+            .name("implement")
+            .phase(WorkPhase::Running)
+            .host(vessel_host.clone())
+            .build();
+        let Rows::Convoys(rows) = &mut snapshot.result_sets[0].rows else {
+            panic!("expected convoy rows");
+        };
+        rows[0].vessels = vec![vessel];
+        let (tx, mut rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+
+        aggregator.apply_replica_cache(vec![snapshot]).await;
+        assert!(matches!(rx.recv().await.expect("initial event"), DaemonEvent::ResultSet(_)));
+
+        let result_set = state.result_set().await;
+        let vessel = &result_set.rows.as_convoys().expect("convoy rows")[0].vessels[0];
+        assert_eq!(vessel.resource.host, Some(HostName::new("kiwi")));
+        assert_eq!(vessel.host, vessel_host);
+        assert_eq!(vessel.vessel_resource.as_ref().expect("vessel resource").host, Some(HostName::new("feta")));
     }
 
     #[tokio::test]
