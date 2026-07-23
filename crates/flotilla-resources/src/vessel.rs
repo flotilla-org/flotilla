@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey, Stance};
+use crate::{resource::define_resource, status_patch::StatusPatch, ReplicationClass, RepositoryKey, Stance};
 
-define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch);
+define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch, replication = ReplicationClass::HomeBoundRuntime);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselSpec {

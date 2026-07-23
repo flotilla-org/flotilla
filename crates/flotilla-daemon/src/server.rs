@@ -3,7 +3,9 @@ pub mod environment_sockets;
 mod peer_connection;
 mod peer_runtime;
 mod remote_commands;
+mod replicator;
 mod request_dispatch;
+mod resource_http;
 mod shared;
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -23,7 +25,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{ConfigLabel, ConnectionRole, EnvironmentId, HostName, Message, NodeId, PROTOCOL_VERSION};
 use flotilla_resources::{ResourceBackend, SqliteBackend};
-use flotilla_transport::message::{unix_message_session, MessageSession};
+use flotilla_transport::message::{unix_message_session_with_prefix, MessageSession};
 use tokio::{
     net::UnixListener,
     sync::{mpsc, watch, Mutex, Notify},
@@ -50,6 +52,7 @@ use crate::peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, Peer
 pub(crate) struct PeerConnectedNotice {
     pub peer: NodeId,
     pub generation: u64,
+    pub resource_socket_path: Option<PathBuf>,
 }
 
 fn build_remote_command_router(daemon: &Arc<InProcessDaemon>, peer_manager: &Arc<Mutex<PeerManager>>) -> RemoteCommandRouter {
@@ -123,8 +126,14 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
     }
     let (peer_data_tx, peer_data_rx) = mpsc::channel(256);
     let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
-    let (handle, _peer_connected_tx) =
-        spawn_peer_networking_runtime(daemon, peer_manager, Some(peer_data_rx), peer_data_tx, remote_command_router);
+    let (handle, _peer_connected_tx) = spawn_peer_networking_runtime(
+        daemon,
+        peer_manager,
+        Some(peer_data_rx),
+        peer_data_tx,
+        remote_command_router,
+        Some(config.state_dir().as_path().join("peers")),
+    );
     Ok(handle)
 }
 
@@ -149,11 +158,14 @@ pub fn spawn_test_peer_networking(
         None, // No inbound task — test drives outbound via PeerConnectedNotice
         peer_data_tx,
         remote_command_router,
+        None,
     )
 }
 
 /// The daemon server that listens on a Unix socket and dispatches requests
 /// to an `InProcessDaemon`.
+#[derive(bon::Builder)]
+#[builder(builder_type(vis = "pub(in crate::server)"))]
 pub struct DaemonServer {
     daemon: Arc<InProcessDaemon>,
     socket_path: PathBuf,
@@ -169,6 +181,7 @@ pub struct DaemonServer {
     /// Manages connections to remote peer hosts and stores their provider data.
     peer_manager: Arc<Mutex<PeerManager>>,
     remote_command_router: RemoteCommandRouter,
+    peer_resource_socket_dir: PathBuf,
     agent_state_store: SharedAgentStateStore,
     /// Registry of per-environment Unix sockets. Initialized on startup and
     /// populated when environments are created (wired in Phase D).
@@ -203,6 +216,7 @@ impl DaemonServer {
 
         let agent_state_store = Arc::clone(daemon.agent_state_store());
         let remote_command_router = build_remote_command_router(&daemon, &peer_manager);
+        let peer_resource_socket_dir = config.state_dir().as_path().join("peers");
 
         Ok(Self {
             daemon,
@@ -217,6 +231,7 @@ impl DaemonServer {
             peer_data_rx: Some(peer_data_rx),
             peer_manager,
             remote_command_router,
+            peer_resource_socket_dir,
             agent_state_store,
             environment_sockets: Arc::new(tokio::sync::Mutex::new(EnvironmentSocketRegistry::new())),
         })
@@ -267,6 +282,7 @@ impl DaemonServer {
         let peer_data_tx = self.peer_data_tx;
         let agent_state_store = self.agent_state_store;
         let remote_command_router = self.remote_command_router;
+        let peer_resource_socket_dir = self.peer_resource_socket_dir;
 
         // Spawn idle timeout watcher (disabled for follower-mode daemons
         // which serve peer connections and should stay up indefinitely)
@@ -313,6 +329,7 @@ impl DaemonServer {
             peer_data_rx,
             peer_data_tx.clone(),
             remote_command_router.clone(),
+            Some(peer_resource_socket_dir),
         );
 
         // SIGTERM handler
@@ -390,8 +407,9 @@ fn spawn_peer_networking_runtime(
     peer_data_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
+    resource_socket_dir: Option<PathBuf>,
 ) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
-    PeerRuntime::new(daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router).spawn()
+    PeerRuntime::new(daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router, resource_socket_dir).spawn()
 }
 
 /// Handle a single client connection.
@@ -402,7 +420,7 @@ fn spawn_peer_networking_runtime(
 /// (forward-compatible with HTTP transport).
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
-    stream: tokio::net::UnixStream,
+    mut stream: tokio::net::UnixStream,
     daemon: Arc<InProcessDaemon>,
     shutdown_rx: watch::Receiver<bool>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
@@ -414,8 +432,22 @@ async fn handle_client(
     agent_state_store: SharedAgentStateStore,
     environment_context: Option<EnvironmentId>,
 ) {
+    let mut first_byte = [0_u8; 1];
+    match tokio::io::AsyncReadExt::read_exact(&mut stream, &mut first_byte).await {
+        Ok(_) if first_byte[0].is_ascii_uppercase() => {
+            if let Err(error) = resource_http::serve_resource_http(stream, first_byte[0], daemon.resource_backend().clone()).await {
+                warn!(%error, "resource HTTP connection failed");
+            }
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(%error, "failed to read connection preface");
+            return;
+        }
+    }
     handle_client_session(
-        unix_message_session(stream),
+        unix_message_session_with_prefix(stream, first_byte.to_vec()),
         daemon,
         shutdown_rx,
         peer_data_tx,

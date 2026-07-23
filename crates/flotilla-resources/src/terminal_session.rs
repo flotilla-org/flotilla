@@ -4,11 +4,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, Resource, ResourceObject, Selector, Vessel,
-    CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, ReplicationClass, Resource, ResourceObject, Selector,
+    Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
-define_resource!(TerminalSession, "terminalsessions", TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch);
+define_resource!(
+    TerminalSession,
+    "terminalsessions",
+    TerminalSessionSpec,
+    TerminalSessionStatus,
+    TerminalSessionStatusPatch,
+    replication = ReplicationClass::HomeBoundRuntime
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TerminalSessionIdentity {

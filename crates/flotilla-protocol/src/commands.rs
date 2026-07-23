@@ -59,7 +59,17 @@ pub struct ResourceWatchResponse {
     pub kind: String,
     pub plural: String,
     pub namespace: String,
+    pub resource_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     pub event: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceWatchCursor {
+    pub resource_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
 }
 
 /// Structured resolved attach command for a workspace pane.
@@ -371,6 +381,8 @@ pub enum CommandAction {
     QueryResourceList {
         namespace: String,
         kind: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_replicas: bool,
     },
     QueryResourceGet {
         namespace: String,
@@ -384,6 +396,10 @@ pub enum CommandAction {
     ResourceWatch {
         namespace: String,
         kind: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_replicas: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<ResourceWatchCursor>,
     },
 }
 
@@ -914,7 +930,7 @@ mod tests {
                 node_id: Some(NodeId::new("feta")),
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "convoys".into() },
+                action: CommandAction::QueryResourceList { namespace: "flotilla".into(), kind: "convoys".into(), include_replicas: false },
             },
             Command {
                 node_id: Some(NodeId::new("feta")),
@@ -930,7 +946,12 @@ mod tests {
                 node_id: Some(NodeId::new("feta")),
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ResourceWatch { namespace: "flotilla".into(), kind: "convoys".into() },
+                action: CommandAction::ResourceWatch {
+                    namespace: "flotilla".into(),
+                    kind: "convoys".into(),
+                    include_replicas: false,
+                    cursor: None,
+                },
             },
             Command {
                 node_id: None,
@@ -1196,6 +1217,8 @@ mod tests {
                 kind: "Convoy".into(),
                 plural: "convoys".into(),
                 namespace: "flotilla".into(),
+                resource_version: "7".into(),
+                generation: None,
                 event: serde_json::json!({
                     "type": "ADDED",
                     "object": { "apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": { "name": "demo" }, "spec": {} }

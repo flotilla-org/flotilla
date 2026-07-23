@@ -32,7 +32,8 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
-    list_resource_kind, normalize_project_spec, resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind,
+    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, resolve_project_issue_sources,
+    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
     Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
@@ -139,6 +140,8 @@ struct ResourceWatchCommandContext {
     backend: ResourceBackend,
     namespace: String,
     kind: String,
+    include_replicas: bool,
+    cursor: Option<flotilla_protocol::ResourceWatchCursor>,
     command_id: u64,
     node_id: NodeId,
     repo_identity: RepoIdentity,
@@ -147,7 +150,17 @@ struct ResourceWatchCommandContext {
 }
 
 async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> CommandValue {
-    let watch = match watch_resource_kind(&context.backend, &context.namespace, &context.kind).await {
+    let start = context.cursor.map(|cursor| match cursor.generation {
+        Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: cursor.resource_version },
+        None => WatchStart::FromVersion(cursor.resource_version),
+    });
+    let result = match (context.include_replicas, start) {
+        (true, Some(_)) => Err(ResourceError::invalid("include-replicas watches cannot resume from an origin resourceVersion")),
+        (true, None) => watch_resource_kind_including_replicas(&context.backend, &context.namespace, &context.kind).await,
+        (false, Some(start)) => watch_resource_kind_from(&context.backend, &context.namespace, &context.kind, start).await,
+        (false, None) => watch_resource_kind(&context.backend, &context.namespace, &context.kind).await,
+    };
+    let watch = match result {
         Ok(watch) => watch,
         Err(error) => return CommandValue::Error { message: error.to_string() },
     };
@@ -155,6 +168,8 @@ async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> Com
     let kind = watch.kind;
     let plural = watch.plural;
     let namespace = watch.namespace;
+    let initial_resource_version = watch.resource_version;
+    let generation = watch.generation;
     for event in watch.initial {
         if context.token.is_cancelled() {
             return CommandValue::Cancelled;
@@ -163,9 +178,19 @@ async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> Com
             kind: kind.clone(),
             plural: plural.clone(),
             namespace: namespace.clone(),
+            resource_version: initial_resource_version.clone(),
+            generation: generation.clone(),
             event,
         });
     }
+    send_resource_watch_event(&context.event_tx, context.command_id, &context.node_id, &context.repo_identity, ResourceWatchResponse {
+        kind: kind.clone(),
+        plural: plural.clone(),
+        namespace: namespace.clone(),
+        resource_version: initial_resource_version.clone(),
+        generation: generation.clone(),
+        event: serde_json::json!({"type": "BOOKMARK"}),
+    });
 
     let mut stream = watch.stream;
     loop {
@@ -174,12 +199,23 @@ async fn run_resource_watch_command(context: ResourceWatchCommandContext) -> Com
             event = stream.next() => {
                 match event {
                     Some(Ok(event)) => {
+                        let resource_version = event["object"]["metadata"]["resourceVersion"]
+                            .as_str()
+                            .unwrap_or(&initial_resource_version)
+                            .to_string();
                         send_resource_watch_event(
                             &context.event_tx,
                             context.command_id,
                             &context.node_id,
                             &context.repo_identity,
-                            ResourceWatchResponse { kind: kind.clone(), plural: plural.clone(), namespace: namespace.clone(), event },
+                            ResourceWatchResponse {
+                                kind: kind.clone(),
+                                plural: plural.clone(),
+                                namespace: namespace.clone(),
+                                resource_version,
+                                generation: generation.clone(),
+                                event,
+                            },
                         );
                     }
                     Some(Err(error)) => return CommandValue::Error { message: error.to_string() },
@@ -5548,7 +5584,7 @@ impl InProcessDaemon {
             return Ok(id);
         }
 
-        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind } = command.action {
+        if let flotilla_protocol::CommandAction::ResourceWatch { namespace, kind, include_replicas, cursor } = command.action {
             let repo_identity = empty_repo_identity();
             let description = format!("watch resource {namespace}/{kind}");
             let token = CancellationToken::new();
@@ -5573,6 +5609,8 @@ impl InProcessDaemon {
                         .backend(backend)
                         .namespace(namespace)
                         .kind(kind)
+                        .include_replicas(include_replicas)
+                        .maybe_cursor(cursor)
                         .command_id(id)
                         .node_id(command_node_id.clone())
                         .repo_identity(repo_identity.clone())
@@ -6521,8 +6559,11 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::FleetReplicaSnapshot(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
-            CommandAction::QueryResourceList { namespace, kind } => match list_resource_kind(&self.resource_backend, namespace, kind).await
-            {
+            CommandAction::QueryResourceList { namespace, kind, include_replicas } => match if *include_replicas {
+                list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await
+            } else {
+                list_resource_kind(&self.resource_backend, namespace, kind).await
+            } {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::ResourceList(Box::new(ResourceJsonResponse {
                     kind: v.kind,
                     plural: v.plural,

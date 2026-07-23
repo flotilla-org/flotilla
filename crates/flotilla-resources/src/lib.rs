@@ -15,6 +15,7 @@ mod principal_attention;
 mod project;
 mod provisioning_identity;
 mod registry;
+mod replica;
 mod repository;
 mod resource;
 mod retention;
@@ -25,7 +26,7 @@ mod vessel;
 mod watch;
 mod workflow_template;
 
-pub use backend::{ResourceBackend, TypedResolver};
+pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use checkout::{
     Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch,
     CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
@@ -64,9 +65,11 @@ pub use project::{
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
-    apply_resource_document, get_resource_kind, list_resource_kind, resource_list_api_version, watch_resource_kind, DynamicResourceList,
-    DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    apply_resource_document, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas, resource_list_api_version,
+    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, DynamicResourceList, DynamicResourceObject,
+    DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
+pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
     ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,
     RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,
@@ -87,6 +90,27 @@ pub use terminal_session::{
 };
 pub use vessel::{Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch};
 pub use watch::{ResourceList, WatchEvent, WatchStart, WatchStream};
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! for_each_registered_resource {
+    ($callback:ident, $($argument:expr),* $(,)?) => {{
+        $callback::<$crate::Checkout>($($argument),*);
+        $callback::<$crate::Clone>($($argument),*);
+        $callback::<$crate::Convoy>($($argument),*);
+        $callback::<$crate::Demand>($($argument),*);
+        $callback::<$crate::Environment>($($argument),*);
+        $callback::<$crate::Host>($($argument),*);
+        $callback::<$crate::PlacementPolicy>($($argument),*);
+        $callback::<$crate::Presentation>($($argument),*);
+        $callback::<$crate::Project>($($argument),*);
+        $callback::<$crate::Regard>($($argument),*);
+        $callback::<$crate::Repository>($($argument),*);
+        $callback::<$crate::TerminalSession>($($argument),*);
+        $callback::<$crate::Vessel>($($argument),*);
+        $callback::<$crate::WorkflowTemplate>($($argument),*);
+    }};
+}
 pub use workflow_template::{
     single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation,
     Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,

@@ -4,12 +4,14 @@ use std::{
 };
 
 use chrono::Utc;
+use flotilla_protocol::NodeId;
 use futures::{stream, StreamExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     error::ResourceError,
+    replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
@@ -17,11 +19,28 @@ use crate::{
 
 type StoreKey = (String, String, String, String);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(builder_type(vis = "pub(in crate::in_memory)"))]
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
+    replicas: Arc<Mutex<ReplicaState>>,
     generation: Option<String>,
     event_retention: EventRetention,
+}
+
+type ReplicaKey = (NodeId, StoreKey);
+
+#[derive(Debug, Default)]
+struct ReplicaState {
+    partitions: HashMap<ReplicaKey, ReplicaPartition>,
+    watchers: HashMap<StoreKey, Vec<mpsc::UnboundedSender<StoredReplicaEvent>>>,
+}
+
+#[derive(Debug, Default)]
+struct ReplicaPartition {
+    objects: HashMap<String, Value>,
+    synced_at_by_name: HashMap<String, chrono::DateTime<Utc>>,
+    cursor: Option<ReplicaCursor>,
 }
 
 #[derive(Debug)]
@@ -79,15 +98,20 @@ impl Default for ResourceStore {
 
 impl InMemoryBackend {
     pub fn observed() -> Self {
-        Self { stores: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()), event_retention: EventRetention::default() }
+        Self {
+            stores: Arc::default(),
+            replicas: Arc::default(),
+            generation: Some(uuid::Uuid::new_v4().to_string()),
+            event_retention: EventRetention::default(),
+        }
     }
 
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
-        Self { stores: Arc::default(), generation: None, event_retention }
+        Self { stores: Arc::default(), replicas: Arc::default(), generation: None, event_retention }
     }
 
     pub fn observed_with_event_retention(event_retention: EventRetention) -> Self {
-        Self { stores: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()), event_retention }
+        Self { stores: Arc::default(), replicas: Arc::default(), generation: Some(uuid::Uuid::new_v4().to_string()), event_retention }
     }
 
     pub(crate) async fn diagnostics(&self) -> Result<ResourceStoreDiagnostics, ResourceError> {
@@ -139,6 +163,152 @@ impl InMemoryBackend {
 
     fn encode_object<T: Resource>(object: &ResourceObject<T>) -> Result<Value, ResourceError> {
         serde_json::to_value(object.to_k8s_object()).map_err(|err| ResourceError::decode(format!("encode object: {err}")))
+    }
+
+    fn notify_replica_watchers(state: &mut ReplicaState, key: &StoreKey, event: StoredReplicaEvent) {
+        if let Some(watchers) = state.watchers.get_mut(key) {
+            watchers.retain(|watcher| watcher.send(event.clone()).is_ok());
+        }
+    }
+
+    pub(crate) async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let replicas = self.replicas.lock().await;
+        let mut items = Vec::new();
+        for ((origin_root, partition_key), partition) in &replicas.partitions {
+            if partition_key != &key {
+                continue;
+            }
+            for (name, value) in &partition.objects {
+                let last_synced_at = partition
+                    .synced_at_by_name
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| ResourceError::other(format!("replica row '{name}' has no sync timestamp")))?;
+                items.push(ReadResourceObject {
+                    object: Self::decode_object(value.clone())?,
+                    provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
+                });
+            }
+        }
+        Ok(items)
+    }
+
+    pub(crate) async fn watch_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.replicas.lock().await.watchers.entry(key).or_default().push(tx);
+        Ok(stream::unfold(rx, |mut rx| async {
+            let event = rx.recv().await?;
+            let decoded = Self::decode_object::<T>(event.object).map(|object| {
+                let object = ReadResourceObject {
+                    object,
+                    provenance: ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at },
+                };
+                match event.kind {
+                    StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
+                    StoredReplicaEventKind::Modified => ReadWatchEvent::Modified(object),
+                    StoredReplicaEventKind::Deleted => ReadWatchEvent::Deleted(object),
+                }
+            });
+            Some((decoded, rx))
+        })
+        .boxed())
+    }
+
+    pub(crate) async fn replace_replicas_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        listed: &ResourceList<T>,
+        synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let store_key = Self::store_key::<T>(namespace);
+        let replica_key = (origin_root.clone(), store_key.clone());
+        let mut state = self.replicas.lock().await;
+        let old = state.partitions.remove(&replica_key).unwrap_or_default();
+        let mut objects = HashMap::new();
+        let mut synced_at_by_name = HashMap::new();
+        for object in &listed.items {
+            objects.insert(object.metadata.name.clone(), Self::encode_object(object)?);
+            synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
+        }
+        let mut events = Vec::new();
+        for (name, value) in &objects {
+            events.push(StoredReplicaEvent {
+                origin_root: origin_root.clone(),
+                synced_at,
+                kind: if old.objects.contains_key(name) { StoredReplicaEventKind::Modified } else { StoredReplicaEventKind::Added },
+                object: value.clone(),
+            });
+        }
+        for (name, value) in old.objects {
+            if !objects.contains_key(&name) {
+                events.push(StoredReplicaEvent {
+                    origin_root: origin_root.clone(),
+                    synced_at,
+                    kind: StoredReplicaEventKind::Deleted,
+                    object: value,
+                });
+            }
+        }
+        state.partitions.insert(replica_key, ReplicaPartition {
+            objects,
+            synced_at_by_name,
+            cursor: Some(ReplicaCursor { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() }),
+        });
+        for event in events {
+            Self::notify_replica_watchers(&mut state, &store_key, event);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_replica_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        kind: StoredReplicaEventKind,
+        object: &ResourceObject<T>,
+        synced_at: chrono::DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let store_key = Self::store_key::<T>(namespace);
+        let replica_key = (origin_root.clone(), store_key.clone());
+        let encoded = Self::encode_object(object)?;
+        let mut state = self.replicas.lock().await;
+        let partition = state.partitions.entry(replica_key).or_default();
+        match kind {
+            StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                partition.objects.insert(object.metadata.name.clone(), encoded.clone());
+                partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
+            }
+            StoredReplicaEventKind::Deleted => {
+                partition.objects.remove(&object.metadata.name);
+                partition.synced_at_by_name.remove(&object.metadata.name);
+            }
+        }
+        partition.cursor = Some(ReplicaCursor {
+            resource_version: object.metadata.resource_version.clone(),
+            generation: partition.cursor.as_ref().and_then(|cursor| cursor.generation.clone()),
+        });
+        Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
+            origin_root: origin_root.clone(),
+            synced_at,
+            kind,
+            object: encoded,
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+    ) -> Result<Option<ReplicaCursor>, ResourceError> {
+        let key = (origin_root.clone(), Self::store_key::<T>(namespace));
+        Ok(self.replicas.lock().await.partitions.get(&key).and_then(|partition| partition.cursor.clone()))
     }
 
     fn decode_event<T: Resource>(event: StoredEvent) -> Result<WatchEvent<T>, ResourceError> {

@@ -11,6 +11,20 @@ use crate::{
 };
 
 macro_rules! define_resource {
+    ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, replication = $replication:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub struct $name;
+
+        impl $crate::resource::Resource for $name {
+            type Spec = $spec;
+            type Status = $status;
+            type StatusPatch = $patch;
+
+            const API_PATHS: $crate::resource::ApiPaths =
+                $crate::resource::ApiPaths { group: "flotilla.work", version: "v1", plural: $plural, kind: stringify!($name) };
+            const REPLICATION_CLASS: $crate::ReplicationClass = $replication;
+        }
+    };
     ($name:ident, $plural:literal, $spec:ty, $status:ty, $patch:ty, immutable_spec) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
@@ -67,6 +81,7 @@ pub trait Resource: Send + Sync + 'static {
     type StatusPatch: StatusPatch<Self::Status>;
 
     const API_PATHS: ApiPaths;
+    const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 
     fn validate_spec_update(_current: &Self::Spec, _requested: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())
@@ -303,6 +318,8 @@ pub struct K8sResourceObject<T: Resource> {
 pub struct K8sListMeta {
     #[serde(rename = "resourceVersion")]
     pub resource_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,7 +337,7 @@ impl<T: Resource> K8sResourceList<T> {
         Ok(ResourceList {
             items: self.items.into_iter().map(ResourceObject::from_k8s_object).collect::<Result<_, _>>()?,
             resource_version: self.metadata.resource_version,
-            generation: None,
+            generation: self.metadata.generation,
         })
     }
 }

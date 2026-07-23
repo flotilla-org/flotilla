@@ -11,6 +11,9 @@ use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::{
     error::ResourceError,
+    replica::{
+        ReadResourceList, ReadResourceObject, ReadWatchEvent, ResourceProvenance, LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION,
+    },
     resource::{
         ApiPaths, InputMeta, K8sInputResourceObject, K8sResourceList, K8sResourceObject, K8sStatusResourceObject, K8sWatchEvent, Resource,
         ResourceObject,
@@ -31,6 +34,15 @@ impl HttpBackend {
 
     pub fn from_kubeconfig(path: impl AsRef<std::path::Path>) -> Result<Self, ResourceError> {
         kubeconfig::from_kubeconfig(path)
+    }
+
+    #[cfg(unix)]
+    pub fn from_unix_socket(path: impl AsRef<std::path::Path>) -> Result<Self, ResourceError> {
+        let http = Client::builder()
+            .unix_socket(path.as_ref())
+            .build()
+            .map_err(|error| ResourceError::other(format!("build Unix-socket HTTP client: {error}")))?;
+        Ok(Self::new(http, "http://flotilla.local"))
     }
 
     fn namespaced_url(&self, paths: ApiPaths, namespace: &str, name: Option<&str>, status: bool) -> String {
@@ -82,6 +94,55 @@ impl HttpBackend {
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;
         let list: K8sResourceList<T> = Self::decode_response(response, None).await?;
         list.into_resource_list()
+    }
+
+    pub(crate) async fn list_including_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<ReadResourceList<T>, ResourceError> {
+        let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("includeReplicas", "true")])
+            .send()
+            .await
+            .map_err(|err| ResourceError::other(format!("LIST resources including replicas: {err}")))?;
+        let list: K8sResourceList<T> = Self::decode_response(response, None).await?;
+        let items = list
+            .items
+            .into_iter()
+            .map(ResourceObject::from_k8s_object)
+            .map(|object| object.and_then(read_resource_object))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ReadResourceList { items })
+    }
+
+    pub(crate) async fn watch_including_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
+        let response = self
+            .http
+            .get(url)
+            .query(&[("watch", "true"), ("includeReplicas", "true")])
+            .send()
+            .await
+            .map_err(|err| ResourceError::other(format!("WATCH resources including replicas: {err}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read watch error body: {err}")))?;
+            return Err(map_status_error(status, &bytes, None));
+        }
+        let state = HttpWatchState::<T> {
+            stream: Box::pin(response.bytes_stream()),
+            buffer: Vec::new(),
+            done: false,
+            _marker: std::marker::PhantomData,
+        };
+        Ok(stream::unfold(state, |mut state| async move {
+            let event = next_http_watch_event(&mut state).await?;
+            Some((event.and_then(read_watch_event), state))
+        })
+        .boxed())
     }
 
     pub(crate) async fn list_typed_matching_labels<T: Resource>(
@@ -161,8 +222,9 @@ impl HttpBackend {
         match &start {
             WatchStart::Now => {}
             WatchStart::FromVersion(version) => query.push(("resourceVersion", Cow::Owned(version.clone()))),
-            WatchStart::FromVersionInGeneration { .. } => {
-                return Err(ResourceError::invalid("http resource watches do not use generations"));
+            WatchStart::FromVersionInGeneration { generation, resource_version } => {
+                query.push(("resourceVersion", Cow::Owned(resource_version.clone())));
+                query.push(("generation", Cow::Owned(generation.clone())));
             }
         }
         let response =
@@ -170,9 +232,12 @@ impl HttpBackend {
         let status = response.status();
         if !status.is_success() {
             if status == StatusCode::GONE {
-                if let WatchStart::FromVersion(requested_version) = start {
-                    return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
-                }
+                let requested_version = match start {
+                    WatchStart::FromVersion(requested_version)
+                    | WatchStart::FromVersionInGeneration { resource_version: requested_version, .. } => requested_version,
+                    WatchStart::Now => String::new(),
+                };
+                return Err(ResourceError::WatchExpired { requested_version, compacted_through: None });
             }
             let bytes = response.bytes().await.map_err(|err| ResourceError::other(format!("read watch error body: {err}")))?;
             return Err(map_status_error(status, &bytes, None));
@@ -184,49 +249,15 @@ impl HttpBackend {
             done: false,
             _marker: std::marker::PhantomData,
         };
+        let generation = match start {
+            WatchStart::FromVersionInGeneration { generation, .. } => Some(generation),
+            _ => None,
+        };
         Ok(WatchStream::new(
-            None,
+            generation,
             Box::pin(stream::unfold(state, |mut state| async move {
-                if state.done {
-                    return None;
-                }
-                loop {
-                    if let Some(position) = state.buffer.iter().position(|byte| *byte == b'\n') {
-                        let line = state.buffer.drain(..=position).collect::<Vec<_>>();
-                        let mut line = &line[..line.len().saturating_sub(1)];
-                        if line.last() == Some(&b'\r') {
-                            line = &line[..line.len().saturating_sub(1)];
-                        }
-                        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                            continue;
-                        }
-                        let item = parse_watch_line::<T>(line);
-                        if item.is_err() {
-                            state.done = true;
-                        }
-                        return Some((item, state));
-                    }
-
-                    match state.stream.next().await {
-                        Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
-                        Some(Err(err)) => {
-                            state.done = true;
-                            return Some((Err(ResourceError::other(format!("watch stream error: {err}"))), state));
-                        }
-                        None if state.buffer.is_empty() => return None,
-                        None => {
-                            let line = std::mem::take(&mut state.buffer);
-                            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                                return None;
-                            }
-                            let item = parse_watch_line::<T>(&line);
-                            if item.is_err() {
-                                state.done = true;
-                            }
-                            return Some((item, state));
-                        }
-                    }
-                }
+                let event = next_http_watch_event(&mut state).await?;
+                Some((event, state))
             })),
         ))
     }
@@ -237,6 +268,73 @@ struct HttpWatchState<T: Resource> {
     buffer: Vec<u8>,
     done: bool,
     _marker: std::marker::PhantomData<T>,
+}
+
+async fn next_http_watch_event<T: Resource>(state: &mut HttpWatchState<T>) -> Option<Result<WatchEvent<T>, ResourceError>> {
+    if state.done {
+        return None;
+    }
+    loop {
+        if let Some(position) = state.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = state.buffer.drain(..=position).collect::<Vec<_>>();
+            let mut line = &line[..line.len().saturating_sub(1)];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len().saturating_sub(1)];
+            }
+            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                continue;
+            }
+            let item = parse_watch_line::<T>(line);
+            if item.is_err() {
+                state.done = true;
+            }
+            return Some(item);
+        }
+
+        match state.stream.next().await {
+            Some(Ok(chunk)) => state.buffer.extend_from_slice(&chunk),
+            Some(Err(err)) => {
+                state.done = true;
+                return Some(Err(ResourceError::other(format!("watch stream error: {err}"))));
+            }
+            None if state.buffer.is_empty() => return None,
+            None => {
+                let line = std::mem::take(&mut state.buffer);
+                if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    return None;
+                }
+                let item = parse_watch_line::<T>(&line);
+                if item.is_err() {
+                    state.done = true;
+                }
+                return Some(item);
+            }
+        }
+    }
+}
+
+fn read_resource_object<T: Resource>(object: ResourceObject<T>) -> Result<ReadResourceObject<T>, ResourceError> {
+    let origin = object.metadata.annotations.get(ORIGIN_ROOT_ANNOTATION);
+    let synced_at = object.metadata.annotations.get(LAST_SYNCED_AT_ANNOTATION);
+    let provenance = match (origin, synced_at) {
+        (None, None) => ResourceProvenance::Local,
+        (Some(origin), Some(synced_at)) => ResourceProvenance::Replica {
+            origin_root: flotilla_protocol::NodeId::new(origin.clone()),
+            last_synced_at: chrono::DateTime::parse_from_rfc3339(synced_at)
+                .map_err(|error| ResourceError::decode(format!("decode replica sync timestamp: {error}")))?
+                .with_timezone(&chrono::Utc),
+        },
+        _ => return Err(ResourceError::decode("replica provenance annotations are incomplete")),
+    };
+    Ok(ReadResourceObject { object, provenance })
+}
+
+fn read_watch_event<T: Resource>(event: WatchEvent<T>) -> Result<ReadWatchEvent<T>, ResourceError> {
+    match event {
+        WatchEvent::Added(object) => read_resource_object(object).map(ReadWatchEvent::Added),
+        WatchEvent::Modified(object) => read_resource_object(object).map(ReadWatchEvent::Modified),
+        WatchEvent::Deleted(object) => read_resource_object(object).map(ReadWatchEvent::Deleted),
+    }
 }
 
 #[derive(Debug, Deserialize)]

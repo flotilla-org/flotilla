@@ -53,22 +53,27 @@ impl PeerSender for NotifyPeerSender {
     }
 }
 
-/// Wait until the captured message count reaches `target`, or timeout.
-async fn wait_for_messages(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify: &Notify, target: usize) {
+async fn wait_for_local_state(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify: &Notify, node_id: &NodeId) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            // Register interest BEFORE checking the condition so a
-            // notify_waiters() that fires between the check and the
-            // await is not lost.
             let notified = notify.notified();
-            if sent.lock().expect("lock").len() >= target {
+            let complete = {
+                let messages = sent.lock().expect("lock");
+                messages.iter().any(|message| matches!(message, PeerWireMessage::HostSummary(summary) if summary.node.node_id == *node_id))
+                    && messages.iter().any(|message| matches!(message, PeerWireMessage::Data(data) if data.origin_node_id == *node_id))
+            };
+            if complete {
                 return;
             }
             notified.await;
         }
     })
     .await
-    .expect("timed out waiting for peer messages");
+    .expect("timed out waiting for local peer state");
+}
+
+fn local_data_count(messages: &[PeerWireMessage], node_id: &NodeId) -> usize {
+    messages.iter().filter(|message| matches!(message, PeerWireMessage::Data(data) if data.origin_node_id == *node_id)).count()
 }
 
 #[tokio::test]
@@ -96,10 +101,9 @@ async fn peer_connect_triggers_local_state_send() {
 
     let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
-    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation }).expect("send notice");
+    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation, resource_socket_path: None }).expect("send notice");
 
-    // Expect at least 2 messages: HostSummary + Data for the repo
-    wait_for_messages(&sent, &notify, 2).await;
+    wait_for_local_state(&sent, &notify, &node_a).await;
 
     let messages = sent.lock().expect("lock");
     assert!(
@@ -138,10 +142,13 @@ async fn peer_reconnect_resends_local_state() {
     let (_handle, peer_connected_tx) = flotilla_daemon::server::spawn_test_peer_networking(Arc::clone(&daemon), Arc::clone(&peer_manager));
 
     // First connection
-    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation: gen1 }).expect("send notice 1");
-    wait_for_messages(&sent, &notify, 2).await;
+    peer_connected_tx
+        .send(PeerConnectedNotice { peer: node_b.clone(), generation: gen1, resource_socket_path: None })
+        .expect("send notice 1");
+    wait_for_local_state(&sent, &notify, &node_a).await;
 
     let first_count = sent.lock().expect("lock").len();
+    let first_data_count = local_data_count(&sent.lock().expect("lock"), &node_a);
     assert!(first_count > 0, "first connect should have sent messages");
 
     // Disconnect + reconnect
@@ -151,9 +158,20 @@ async fn peer_reconnect_resends_local_state() {
         ensure_test_connection_generation(&mut pm, &node_b, || Arc::clone(&sender))
     };
 
-    // Second connection — expect at least first_count + 2 more messages
-    peer_connected_tx.send(PeerConnectedNotice { peer: node_b.clone(), generation: gen2 }).expect("send notice 2");
-    wait_for_messages(&sent, &notify, first_count + 2).await;
+    peer_connected_tx
+        .send(PeerConnectedNotice { peer: node_b.clone(), generation: gen2, resource_socket_path: None })
+        .expect("send notice 2");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let notified = notify.notified();
+            if local_data_count(&sent.lock().expect("lock"), &node_a) > first_data_count {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("timed out waiting for reconnect local state");
 
     let total_count = sent.lock().expect("lock").len();
     assert!(total_count > first_count, "reconnect should resend local state (first: {first_count}, total: {total_count})");

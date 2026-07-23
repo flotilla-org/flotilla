@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,7 +15,10 @@ use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use super::{remote_commands::RemoteCommandRouter, shared::sync_peer_query_state, PeerConnectedNotice, SshTransport};
+use super::{
+    remote_commands::RemoteCommandRouter, replicator::spawn_peer_replicators, shared::sync_peer_query_state, PeerConnectedNotice,
+    SshTransport,
+};
 use crate::peer::{dispatch_pending_sends, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
 pub(super) enum ForwardResult {
@@ -112,12 +116,15 @@ enum PostHandleAction {
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(90);
 
+#[derive(bon::Builder)]
+#[builder(builder_type(vis = "pub(super)"))]
 pub(super) struct PeerRuntime {
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
     peer_data_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
+    resource_socket_dir: Option<PathBuf>,
 }
 
 impl PeerRuntime {
@@ -127,8 +134,9 @@ impl PeerRuntime {
         peer_data_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
         peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
         remote_command_router: RemoteCommandRouter,
+        resource_socket_dir: Option<PathBuf>,
     ) -> Self {
-        Self { daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router }
+        Self { daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router, resource_socket_dir }
     }
 
     pub(super) fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
@@ -139,6 +147,7 @@ impl PeerRuntime {
         let peer_connected_tx_for_ssh = peer_connected_tx.clone();
         let peer_daemon = Arc::clone(&self.daemon);
         let remote_command_router_task = self.remote_command_router.clone();
+        let resource_socket_dir = self.resource_socket_dir;
         let peer_data_rx = self.peer_data_rx;
 
         let inbound_handle = tokio::spawn(async move {
@@ -167,6 +176,7 @@ impl PeerRuntime {
                     let initial_connection = initial_connections.remove(&target.label);
                     let peer_connected_tx_clone = peer_connected_tx_for_ssh.clone();
                     let target_label = target.label.clone();
+                    let resource_socket_dir = resource_socket_dir.clone();
 
                     tokio::spawn(async move {
                         let mut current_peer: Option<NodeInfo> = None;
@@ -177,7 +187,13 @@ impl PeerRuntime {
                             current_peer = Some(initial_connection.node.clone());
                             let mut inbound_rx = initial_connection.inbound_rx;
                             let generation = initial_connection.generation;
-                            let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
+                            let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
+                                peer: peer_name.clone(),
+                                generation,
+                                resource_socket_path: resource_socket_dir
+                                    .as_ref()
+                                    .map(|directory| directory.join(format!("{}.sock", target_label.0))),
+                            });
                             last_known_session_id = {
                                 let pm_lock = pm.lock().await;
                                 pm_lock.peer_session_id(&peer_name)
@@ -201,6 +217,7 @@ impl PeerRuntime {
                                 }
                             }
                             let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                            remote_command_router_for_cleanup.fail_pending_remote_commands_for_host(&peer_name).await;
                             remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                             if plan.was_active {
                                 daemon_for_cleanup
@@ -252,7 +269,13 @@ impl PeerRuntime {
                                             PeerConnectionState::Connected,
                                         )
                                         .await;
-                                    let _ = peer_connected_tx_clone.send(PeerConnectedNotice { peer: peer_name.clone(), generation });
+                                    let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
+                                        peer: peer_name.clone(),
+                                        generation,
+                                        resource_socket_path: resource_socket_dir
+                                            .as_ref()
+                                            .map(|directory| directory.join(format!("{}.sock", target_label.0))),
+                                    });
                                     attempt = 1;
                                     let sender = {
                                         let pm_lock = pm.lock().await;
@@ -273,6 +296,7 @@ impl PeerRuntime {
                                         }
                                     }
                                     let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                                    remote_command_router_for_cleanup.fail_pending_remote_commands_for_host(&peer_name).await;
                                     remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                                     if plan.was_active {
                                         daemon_for_cleanup
@@ -615,6 +639,7 @@ impl PeerRuntime {
         });
 
         let outbound_daemon = Arc::clone(&self.daemon);
+        let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tokio::spawn(async move {
             let mut event_rx = outbound_daemon.subscribe();
@@ -627,6 +652,12 @@ impl PeerRuntime {
                     notice = peer_connected_rx.recv() => {
                         let Some(notice) = notice else { break };
                         debug!(peer = %notice.peer, generation = notice.generation, "sending local state to newly connected peer");
+                        spawn_peer_replicators(
+                            outbound_remote_command_router.clone(),
+                            Arc::clone(&outbound_daemon),
+                            notice.peer.clone(),
+                            notice.resource_socket_path,
+                        );
                         send_local_to_peer(
                             &outbound_daemon,
                             &outbound_peer_manager,
