@@ -32,19 +32,19 @@ use flotilla_protocol::{
 use flotilla_resources::{
     api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, external_patches as convoy_external_patches, get_resource_kind,
-    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, resolve_project_issue_sources,
-    terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    Checkout as ResourceCheckout, CheckoutIntegrationStatus, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, ConditionValue, Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec,
-    ConvoyStatusPatch, CrewSource, Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition,
-    IssueSnapshot, IssueSourceResolution, IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec,
-    PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
-    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
-    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
-    VESSEL_LABEL, VESSEL_REF_LABEL,
+    list_resource_kind, list_resource_kind_including_replicas, normalize_project_spec, repository_display_labels,
+    resolve_project_issue_sources, terminal_session_attach_target, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, ConditionValue,
+    Convoy as ResourceConvoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CrewSource,
+    Environment as ResourceEnvironment, EnvironmentPhase, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
+    Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
+    ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
+    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
+    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -4471,11 +4471,12 @@ impl InProcessDaemon {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.clone().using::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
-        let repository_slugs = repositories
+        let repositories = repositories
             .items
             .into_iter()
-            .map(|repository| (RepositoryKey(repository.metadata.name), repository.spec.catalog_slug()))
-            .collect::<HashMap<_, _>>();
+            .map(|repository| (RepositoryKey(repository.metadata.name.clone()), repository))
+            .collect::<Vec<_>>();
+        let repository_slugs = repository_display_labels(repositories.iter().map(|(key, repository)| (key, &repository.spec)));
 
         let mut entries = projects
             .items

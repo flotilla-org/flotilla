@@ -1947,6 +1947,7 @@ fn app_applies_checkout_sets_and_removal_deltas_to_the_typed_query_cache() {
     let row = flotilla_protocol::CheckoutRow::builder()
         .resource(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "widgets"))
         .repo(flotilla_protocol::RepositoryKey("repo_widgets".into()))
+        .repo_label("widgets")
         .path("/work/widgets")
         .branch("main")
         .host(HostName::new("kiwi"))

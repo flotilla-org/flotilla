@@ -263,6 +263,27 @@ mod project_list_human {
         assert!(output.contains("4 repositories"));
         assert!(!output.contains("one, two, three, four"));
     }
+
+    #[test]
+    fn project_list_never_falls_back_to_a_repository_key() {
+        let project = ProjectListEntry::builder()
+            .namespace("flotilla".to_string())
+            .name("missing-repository".to_string())
+            .display_name("Missing repository".to_string())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: "missing-repository".into() })
+            .repositories(vec![ProjectListRepository {
+                key: RepositoryKey("umfdl0jvpivapi195j3h2n74gh69gbfub13294vogopginvd1m8g".to_string()),
+                slug: None,
+            }])
+            .maybe_issue_source(None)
+            .default_workflow_ref("single-agent-contained".to_string())
+            .build();
+
+        let output = format_project_list_human(&ProjectListResponse { projects: vec![project] });
+
+        assert!(output.contains("Unknown repository"));
+        assert!(!output.contains("umfdl0jvpivapi195j3h2n74gh69gbfub13294vogopginvd1m8g"));
+    }
 }
 
 mod watch_human {

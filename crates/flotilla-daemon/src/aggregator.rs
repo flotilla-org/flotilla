@@ -17,13 +17,14 @@ use flotilla_protocol::{
         ResultDelta, Rows, SessionPhase, VesselRow, WorkPhase,
     },
     Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ProviderData, RepoDelta, RepoIdentity, RepoSnapshot,
-    RepositoryKey, ResourceRef,
+    RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
-    api_version, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee,
-    DemandState, Environment, Presentation, Project, Regard, RegardExpiryPolicy, Repository, Resource, ResourceError, ResourceList,
-    ResourceObject, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent,
-    WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
+    api_version, repository_display_labels, Checkout, CheckoutSpec, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
+    Demand, DemandAddressee, DemandState, Environment, Presentation, Project, Regard, RegardExpiryPolicy, Repository, Resource,
+    ResourceError, ResourceList, ResourceObject, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel,
+    VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL,
+    REPO_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc};
@@ -1097,8 +1098,12 @@ impl Aggregator {
         self.rebuild_checkout_rows().await
     }
 
+    fn repository_labels(&self) -> HashMap<RepositoryKey, String> {
+        repository_display_labels(self.repositories.iter().map(|(key, repository)| (key, &repository.spec))).into_iter().collect()
+    }
+
     async fn rebuild_store_catalog(&self) {
-        let repositories = self.repositories.keys().cloned().collect();
+        let repositories = self.repository_labels();
         let projects = self
             .projects
             .values()
@@ -1125,6 +1130,12 @@ impl Aggregator {
                 Ok(CheckoutRow::builder()
                     .resource(self.checkout_ref(&checkout.metadata.namespace, &checkout.metadata.name))
                     .repo(spec.repo_ref.clone())
+                    .repo_label(
+                        self.repositories
+                            .get(&spec.repo_ref)
+                            .map(|repository| repository.spec.qualified_label())
+                            .unwrap_or_else(|| UNKNOWN_REPOSITORY_LABEL.to_string()),
+                    )
                     .path(spec.path.clone())
                     .branch(spec.r#ref.clone())
                     .host(self.local_host.clone())
@@ -1397,12 +1408,23 @@ impl Aggregator {
         }
         let name = &session.metadata.name;
         let attach = attachable_references.contains(name).then(|| name.clone());
+        let repository_key = session.metadata.labels.get(REPO_KEY_LABEL).cloned().map(RepositoryKey);
+        let repository_label = repository_key.as_ref().map_or_else(
+            || session.metadata.labels.get(REPO_LABEL).cloned(),
+            |key| {
+                self.repositories
+                    .get(key)
+                    .map(|repository| repository.spec.qualified_label())
+                    .or_else(|| session.metadata.labels.get(REPO_LABEL).filter(|label| *label != &key.0).cloned())
+                    .or_else(|| Some(UNKNOWN_REPOSITORY_LABEL.to_string()))
+            },
+        );
         Some(
             IndependentRow::builder()
                 .resource(self.session_ref(&session.metadata.namespace, name))
                 .name(name)
-                .maybe_repo(session.metadata.labels.get(REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
-                .maybe_repository_key(session.metadata.labels.get(REPO_KEY_LABEL).cloned().map(RepositoryKey))
+                .maybe_repo(repository_label.map(flotilla_protocol::RepoKey))
+                .maybe_repository_key(repository_key)
                 .host(self.local_host.clone())
                 .maybe_attach(attach)
                 .phase(SessionPhase::Running)
@@ -1659,10 +1681,10 @@ mod tests {
     };
     use flotilla_resources::{
         ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition, EnvironmentSpec,
-        HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, PlacementStatus, PresentationPhase, PresentationSpec,
-        PresentationStatus, PrincipalRef as AttentionPrincipalRef, RegardSource, RegardSpec, RegardStatus, ResourceBackend, Stance,
-        TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, VesselRequirement,
-        WorkflowSnapshot,
+        HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, PresentationPhase,
+        PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, RegardSource, RegardSpec, RegardStatus,
+        RepositorySpec, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec,
+        TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
     use futures::stream;
     use tokio::{sync::Mutex, time::timeout};
@@ -2132,6 +2154,109 @@ mod tests {
             })
             .await
             .expect("create scripted environment")
+    }
+
+    async fn repository_object(url: &str) -> ResourceObject<Repository> {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let spec = RepositorySpec::remote(url).expect("valid repository URL");
+        backend
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name(spec.key().to_string()).build(), &spec)
+            .await
+            .expect("create scripted repository")
+    }
+
+    async fn checkout_object(name: &str, path: &str, repo_ref: RepositoryKey) -> ResourceObject<Checkout> {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .using::<Checkout>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &CheckoutSpec::Observed(ObservedCheckoutSpec {
+                    r#ref: "main".to_string(),
+                    path: path.to_string(),
+                    repo_ref,
+                    host_ref: "local".to_string(),
+                    is_main: true,
+                }),
+            )
+            .await
+            .expect("create scripted checkout")
+    }
+
+    async fn repository_replica_snapshot(host: &str, url: &str) -> FleetReplicaSnapshot {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new(host), event_tx);
+        let repository = repository_object(url).await;
+        let repository_key = repository.spec.key();
+        aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
+        aggregator
+            .apply_checkout_event(WatchEvent::Added(checkout_object(host, &format!("/work/{host}"), repository_key).await))
+            .await
+            .expect("source checkout");
+        FleetReplicaSnapshot {
+            host: HostName::new(host),
+            generation: Some(format!("{host}-generation")),
+            rows: Vec::new(),
+            result_sets: state.local_result_sets().await,
+        }
+    }
+
+    #[tokio::test]
+    async fn awareness_repository_labels_use_forge_slugs_and_qualify_collisions() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let repositories = [
+            ("flotilla", Some("/work/flotilla"), repository_object("https://github.com/flotilla-org/flotilla").await),
+            ("flotilla-widgets", Some("/work/flotilla-widgets"), repository_object("https://github.com/flotilla-org/widgets").await),
+            ("acme-widgets", Some("/work/acme-widgets"), repository_object("https://gitlab.com/acme/widgets").await),
+            ("reticulate", None, repository_object("https://github.com/changedirection/reticulate").await),
+        ];
+        let reticulate_key = repositories[3].2.spec.key();
+
+        for (_, _, repository) in &repositories {
+            aggregator.apply_repository_event(WatchEvent::Added(repository.clone())).await;
+        }
+        for (name, path, repository) in repositories {
+            let Some(path) = path else { continue };
+            aggregator
+                .apply_checkout_event(WatchEvent::Added(checkout_object(name, path, repository.spec.key()).await))
+                .await
+                .expect("project checkout");
+        }
+        let mut reticulate_session = session_object("reticulate-scratch").await;
+        reticulate_session.metadata.labels = BTreeMap::from([
+            (REPO_KEY_LABEL.to_string(), reticulate_key.to_string()),
+            (REPO_LABEL.to_string(), reticulate_key.to_string()),
+        ]);
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(reticulate_session)).await;
+
+        let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+        let mut labels = result.rows.as_awareness().expect("awareness rows").iter().map(|node| node.label.as_str()).collect::<Vec<_>>();
+        labels.sort_unstable();
+
+        assert_eq!(labels, ["acme/widgets", "changedirection/reticulate", "flotilla-org/flotilla", "flotilla-org/widgets"]);
+    }
+
+    #[tokio::test]
+    async fn fleet_awareness_qualifies_matching_forge_slugs_from_different_services() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("receiver"), event_tx);
+        aggregator
+            .apply_replica_cache(vec![
+                repository_replica_snapshot("github-host", "https://github.com/acme/widgets").await,
+                repository_replica_snapshot("gitlab-host", "https://gitlab.com/acme/widgets").await,
+            ])
+            .await;
+
+        let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
+        let mut labels = result.rows.as_awareness().expect("awareness rows").iter().map(|node| node.label.as_str()).collect::<Vec<_>>();
+        labels.sort_unstable();
+
+        assert_eq!(labels, ["github.com/acme/widgets", "gitlab.com/acme/widgets"]);
     }
 
     #[tokio::test]
@@ -2855,11 +2980,12 @@ mod tests {
     async fn replica_cache_merges_repository_checkout_rows_and_sets_origin_host() {
         let state = AggregatorProjectionState::new();
         let repo = RepositoryKey("repo-widgets".into());
-        state.replace_store_catalog(HashSet::from([repo.clone()]), HashMap::new()).await;
+        state.replace_store_catalog(HashMap::from([(repo.clone(), "widgets".to_string())]), HashMap::new()).await;
         let scope = None;
         let row = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "remote-checkout"))
             .repo(repo)
+            .repo_label("widgets")
             .path("/srv/widgets")
             .branch("main")
             .host(HostName::new("incorrect-source-host"))
@@ -2892,7 +3018,12 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let repository = RepositoryKey("repo-flotilla".into());
         let scope = QueryScope::new("flotilla", "flotilla");
-        state.replace_store_catalog(HashSet::from([repository.clone()]), HashMap::from([(scope.clone(), vec![repository.clone()])])).await;
+        state
+            .replace_store_catalog(
+                HashMap::from([(repository.clone(), "flotilla".to_string())]),
+                HashMap::from([(scope.clone(), vec![repository.clone()])]),
+            )
+            .await;
         let (tx, mut rx) = broadcast::channel(8);
         let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
 

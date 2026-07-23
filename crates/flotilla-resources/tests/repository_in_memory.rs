@@ -1,7 +1,7 @@
 use flotilla_resources::{
-    normalize_project_spec, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance, InMemoryBackend, InputMeta,
-    IssueSource, IssueSourceResolution, IssueSourceUnavailable, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryIdentity,
-    RepositoryKey, RepositorySpec, ResourceBackend, SqliteBackend,
+    normalize_project_spec, repository_display_labels, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance,
+    InMemoryBackend, InputMeta, IssueSource, IssueSourceResolution, IssueSourceUnavailable, ProjectRepositorySpec, ProjectSpec, Repository,
+    RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, SqliteBackend,
 };
 
 #[tokio::test]
@@ -114,6 +114,27 @@ fn remote_less_worktrees_converge_on_host_and_git_common_directory() {
 
     assert_eq!(first.key(), second.key());
     assert!(matches!(first.identity(), RepositoryIdentity::Local { .. }));
+}
+
+#[test]
+fn repository_display_labels_use_forge_slugs_and_qualify_collisions() {
+    let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
+    let flotilla_widgets = RepositorySpec::remote("https://github.com/flotilla-org/widgets").expect("flotilla widgets repository");
+    let acme_widgets = RepositorySpec::remote("https://gitlab.com/acme/widgets").expect("acme widgets repository");
+    let mirrored_widgets = RepositorySpec::remote("https://github.com/acme/widgets").expect("mirrored widgets repository");
+    let repositories = [
+        (flotilla.key(), flotilla),
+        (flotilla_widgets.key(), flotilla_widgets),
+        (acme_widgets.key(), acme_widgets),
+        (mirrored_widgets.key(), mirrored_widgets),
+    ];
+
+    let labels = repository_display_labels(repositories.iter().map(|(key, spec)| (key, spec)));
+
+    assert_eq!(labels[&repositories[0].0], "flotilla-org/flotilla");
+    assert_eq!(labels[&repositories[1].0], "flotilla-org/widgets");
+    assert_eq!(labels[&repositories[2].0], "gitlab.com/acme/widgets");
+    assert_eq!(labels[&repositories[3].0], "github.com/acme/widgets");
 }
 
 #[test]

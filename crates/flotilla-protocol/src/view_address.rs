@@ -96,13 +96,7 @@ impl ViewAddress {
             Self::Issues { scope } => format!("issues?project={}/{}", scope.namespace, scope.name),
             Self::Checkouts { scope: Some(scope) } => format!("checkouts?project={}/{}", scope.namespace, scope.name),
             Self::Checkouts { scope: None } => "checkouts".to_string(),
-            Self::Repo { identity, repository_key } => {
-                let mut label = format!("repo/{}/{}", identity.authority, identity.path);
-                if let Some(key) = repository_key {
-                    label.push_str(&format!("?key={}", key.0));
-                }
-                label
-            }
+            Self::Repo { identity, .. } => format!("repo/{}/{}", identity.authority, identity.path),
         }
     }
 }
@@ -344,7 +338,7 @@ mod tests {
             identity: RepoIdentity { authority: "local".into(), path: "/tmp/repo 0".into() },
             repository_key: Some(RepositoryKey("repo/key with space".into())),
         };
-        assert_eq!(repo.human_label(), "repo/local//tmp/repo 0?key=repo/key with space");
+        assert_eq!(repo.human_label(), "repo/local//tmp/repo 0");
         assert_eq!(repo.to_string(), "repo/local/%2Ftmp%2Frepo%200?key=repo%2Fkey%20with%20space");
     }
 

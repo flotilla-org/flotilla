@@ -331,11 +331,11 @@ async fn project_list_query_returns_all_projects_with_addresses_and_repository_s
     assert_eq!(response.projects.iter().map(|project| project.name.as_str()).collect::<Vec<_>>(), vec!["cleat", "suite"]);
     assert_eq!(response.projects[0].address.to_string(), "project/flotilla/cleat");
     assert_eq!(response.projects[0].repositories.len(), 1);
-    assert_eq!(response.projects[0].repositories[0].slug.as_deref(), Some("github-com-flotilla-org-cleat"));
+    assert_eq!(response.projects[0].repositories[0].slug.as_deref(), Some("flotilla-org/cleat"));
     assert_eq!(response.projects[1].repositories.len(), 2, "repository slices should count as one repository");
     assert_eq!(response.projects[1].repositories.iter().filter_map(|repository| repository.slug.as_deref()).collect::<Vec<_>>(), vec![
-        "github-com-flotilla-org-cleat",
-        "github-com-flotilla-org-flotilla"
+        "flotilla-org/cleat",
+        "flotilla-org/flotilla"
     ]);
     assert_eq!(response.projects[1].issue_source.as_ref().map(|source| source.scope.as_str()), Some("FLOT"));
     assert_eq!(response.projects[1].default_workflow_ref, "review-and-fix");

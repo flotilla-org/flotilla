@@ -6,13 +6,14 @@ use std::{
 };
 
 use flotilla_protocol::{
-    CheckoutRow, HostName, IndependentRow, QueryChanges, QueryScope, RepositoryKey, ResourceRef, ResultDelta, ResultSet,
-    ResultSetCondition, ResultSetState, Rows,
+    CheckoutRow, HostName, IndependentRow, QueryChanges, QueryScope, RepoKey, RepositoryKey, ResourceRef, ResultDelta, ResultSet,
+    ResultSetCondition, ResultSetState, Rows, UNKNOWN_REPOSITORY_LABEL,
 };
 
 pub(crate) trait ScopedStoreRow: Clone + PartialEq {
     fn resource(&self) -> &ResourceRef;
     fn repository_key(&self) -> Option<&RepositoryKey>;
+    fn apply_repository_label(&mut self, labels: &HashMap<RepositoryKey, String>);
     fn compare(left: &Self, right: &Self) -> Ordering;
     fn rows(scope: Option<QueryScope>, rows: Vec<Self>) -> Rows;
     fn changes(scope: Option<QueryScope>, changed: Vec<Self>, removed: Vec<ResourceRef>) -> QueryChanges;
@@ -25,6 +26,14 @@ impl ScopedStoreRow for CheckoutRow {
 
     fn repository_key(&self) -> Option<&RepositoryKey> {
         Some(&self.repo)
+    }
+
+    fn apply_repository_label(&mut self, labels: &HashMap<RepositoryKey, String>) {
+        if let Some(label) = labels.get(&self.repo) {
+            self.repo_label = label.clone();
+        } else if self.repo_label == self.repo.0 {
+            self.repo_label = UNKNOWN_REPOSITORY_LABEL.to_string();
+        }
     }
 
     fn compare(left: &Self, right: &Self) -> Ordering {
@@ -52,6 +61,17 @@ impl ScopedStoreRow for IndependentRow {
 
     fn repository_key(&self) -> Option<&RepositoryKey> {
         self.repository_key.as_ref()
+    }
+
+    fn apply_repository_label(&mut self, labels: &HashMap<RepositoryKey, String>) {
+        if let Some(repository_key) = &self.repository_key {
+            let label = labels
+                .get(repository_key)
+                .cloned()
+                .or_else(|| self.repo.as_ref().filter(|label| label.0 != repository_key.0).map(|label| label.0.clone()))
+                .unwrap_or_else(|| UNKNOWN_REPOSITORY_LABEL.to_string());
+            self.repo = Some(RepoKey(label));
+        }
     }
 
     fn compare(left: &Self, right: &Self) -> Ordering {
@@ -104,6 +124,7 @@ impl<R: ScopedStoreRow> MaterializedSet<R> {
 #[builder(builder_type(vis = "pub(crate)"))]
 pub(crate) struct ScopedStoreProjection<R> {
     known_repositories: HashSet<RepositoryKey>,
+    repository_labels: HashMap<RepositoryKey, String>,
     projects: HashMap<QueryScope, Vec<RepositoryKey>>,
     local_by_repo: HashMap<Option<RepositoryKey>, HashMap<ResourceRef, R>>,
     replicas_by_repo: HashMap<Option<RepositoryKey>, HashMap<HostName, HashMap<ResourceRef, R>>>,
@@ -114,6 +135,7 @@ impl<R> Default for ScopedStoreProjection<R> {
     fn default() -> Self {
         Self {
             known_repositories: HashSet::new(),
+            repository_labels: HashMap::new(),
             projects: HashMap::new(),
             local_by_repo: HashMap::new(),
             replicas_by_repo: HashMap::new(),
@@ -125,10 +147,11 @@ impl<R> Default for ScopedStoreProjection<R> {
 impl<R: ScopedStoreRow> ScopedStoreProjection<R> {
     pub fn replace_catalog(
         &mut self,
-        repositories: HashSet<RepositoryKey>,
+        repositories: HashMap<RepositoryKey, String>,
         projects: HashMap<QueryScope, Vec<RepositoryKey>>,
     ) -> Vec<ResultDelta> {
-        self.known_repositories = repositories;
+        self.known_repositories = repositories.keys().cloned().collect();
+        self.repository_labels = repositories;
         self.projects = projects;
         self.recompute_all()
     }
@@ -218,10 +241,15 @@ impl<R: ScopedStoreRow> ScopedStoreProjection<R> {
                 };
                 let missing = repositories.iter().filter(|repo| !self.known_repositories.contains(*repo)).collect::<Vec<_>>();
                 if !missing.is_empty() {
-                    let missing = missing.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
                     return MaterializedSet::unavailable(
                         project,
-                        format!("project {}/{} references unavailable repositories: {missing}", project.namespace, project.name),
+                        format!(
+                            "project {}/{} references {} unavailable {}",
+                            project.namespace,
+                            project.name,
+                            missing.len(),
+                            if missing.len() == 1 { "repository" } else { "repositories" }
+                        ),
                     );
                 }
                 MaterializedSet {
@@ -237,13 +265,23 @@ impl<R: ScopedStoreRow> ScopedStoreProjection<R> {
         let mut rows = HashMap::new();
         for repository in repositories {
             rows.extend(
-                self.local_by_repo.get(&repository).into_iter().flat_map(|rows| rows.iter()).map(|(key, row)| (key.clone(), row.clone())),
+                self.local_by_repo
+                    .get(&repository)
+                    .into_iter()
+                    .flat_map(|rows| rows.iter())
+                    .map(|(key, row)| (key.clone(), self.label_row(row))),
             );
             if let Some(replicas) = self.replicas_by_repo.get(&repository) {
-                rows.extend(replicas.values().flat_map(|rows| rows.iter()).map(|(key, row)| (key.clone(), row.clone())));
+                rows.extend(replicas.values().flat_map(|rows| rows.iter()).map(|(key, row)| (key.clone(), self.label_row(row))));
             }
         }
         rows
+    }
+
+    fn label_row(&self, row: &R) -> R {
+        let mut row = row.clone();
+        row.apply_repository_label(&self.repository_labels);
+        row
     }
 }
 
@@ -283,6 +321,7 @@ mod tests {
         CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", name).on_host(HostName::new(host)))
             .repo(self::repo(repo))
+            .repo_label(name)
             .path(format!("/work/{name}"))
             .branch("main")
             .host(HostName::new(host))
@@ -313,7 +352,7 @@ mod tests {
         let mut projection = ScopedCheckoutProjection::default();
         let project = QueryScope::new("flotilla", "suite");
         projection.replace_catalog(
-            HashSet::from([repo("repo-a"), repo("repo-b")]),
+            HashMap::from([(repo("repo-a"), "a".to_string()), (repo("repo-b"), "b".to_string())]),
             HashMap::from([(project.clone(), vec![repo("repo-a"), repo("repo-b")])]),
         );
         projection.replace_local_rows(vec![checkout("repo-a", "local", "laptop")]);
@@ -327,10 +366,57 @@ mod tests {
     }
 
     #[test]
+    fn replica_checkout_keeps_its_forge_slug_without_a_local_repository_catalog() {
+        let mut projection = ScopedCheckoutProjection::default();
+        let mut row = checkout("remote-repo", "widgets", "kiwi");
+        row.repo_label = "flotilla-org/widgets".to_string();
+        projection.replace_replica_rows(HashMap::from([(HostName::new("kiwi"), vec![row])]));
+
+        let rows = projection.result_set(&None).rows.as_checkouts().expect("fleet checkout rows").to_vec();
+
+        assert!(matches!(rows.as_slice(), [row] if row.repo_label == "flotilla-org/widgets"));
+    }
+
+    #[test]
+    fn replica_independent_keeps_its_forge_slug_without_a_local_repository_catalog() {
+        let mut projection = ScopedIndependentProjection::default();
+        let mut row = independent(Some("remote-repo"), "governor", "kiwi");
+        row.repo = Some(RepoKey("flotilla-org/widgets".to_string()));
+        projection.replace_replica_rows(HashMap::from([(HostName::new("kiwi"), vec![row])]));
+
+        let rows = projection.result_set(&None).rows.as_independents().expect("fleet independent rows").to_vec();
+
+        assert!(matches!(rows.as_slice(), [row] if row.repo.as_ref().is_some_and(|label| label.0 == "flotilla-org/widgets")));
+    }
+
+    #[test]
+    fn replica_rows_never_use_the_identity_key_as_their_display_label() {
+        let repository = "opaque-repository-key";
+        let mut checkouts = ScopedCheckoutProjection::default();
+        let mut checkout = checkout(repository, "widgets", "kiwi");
+        checkout.repo_label = repository.to_string();
+        checkouts.replace_replica_rows(HashMap::from([(HostName::new("kiwi"), vec![checkout])]));
+
+        let mut independents = ScopedIndependentProjection::default();
+        let mut independent = independent(Some(repository), "governor", "kiwi");
+        independent.repo = Some(RepoKey(repository.to_string()));
+        independents.replace_replica_rows(HashMap::from([(HostName::new("kiwi"), vec![independent])]));
+
+        let checkout_rows = checkouts.result_set(&None).rows.as_checkouts().expect("fleet checkout rows").to_vec();
+        let independent_rows = independents.result_set(&None).rows.as_independents().expect("fleet independent rows").to_vec();
+        assert!(matches!(checkout_rows.as_slice(), [row] if row.repo_label == UNKNOWN_REPOSITORY_LABEL));
+        assert!(matches!(
+            independent_rows.as_slice(),
+            [row] if row.repo.as_ref().is_some_and(|label| label.0 == UNKNOWN_REPOSITORY_LABEL)
+        ));
+    }
+
+    #[test]
     fn project_independents_exclude_repositoryless_rows_but_fleet_keeps_them() {
         let mut projection = ScopedIndependentProjection::default();
         let project = QueryScope::new("flotilla", "suite");
-        projection.replace_catalog(HashSet::from([repo("repo-a")]), HashMap::from([(project.clone(), vec![repo("repo-a")])]));
+        projection
+            .replace_catalog(HashMap::from([(repo("repo-a"), "a".to_string())]), HashMap::from([(project.clone(), vec![repo("repo-a")])]));
         projection.replace_local_rows(vec![independent(Some("repo-a"), "governor", "laptop"), independent(None, "yeoman", "laptop")]);
 
         let project_rows = projection.result_set(&Some(project)).rows.as_independents().expect("project independent rows").to_vec();
@@ -345,7 +431,7 @@ mod tests {
         let mut projection = ScopedCheckoutProjection::default();
         let repository = repo("repo-a");
         let project = QueryScope::new("flotilla", "suite");
-        projection.replace_catalog(HashSet::from([repository.clone()]), HashMap::from([(project, vec![repository])]));
+        projection.replace_catalog(HashMap::from([(repository.clone(), "a".to_string())]), HashMap::from([(project, vec![repository])]));
 
         let sets = projection.local_result_sets();
 
@@ -356,15 +442,30 @@ mod tests {
     }
 
     #[test]
+    fn checkout_fleet_export_preserves_the_source_qualified_label() {
+        let mut projection = ScopedCheckoutProjection::default();
+        let repository = repo("repo-a");
+        projection.replace_catalog(HashMap::from([(repository, "flotilla-org/widgets".to_string())]), HashMap::new());
+        let mut row = checkout("repo-a", "widgets", "laptop");
+        row.repo_label = "github.com/flotilla-org/widgets".to_string();
+        projection.replace_local_rows(vec![row]);
+
+        let local_rows = projection.result_set(&None).rows.as_checkouts().expect("local checkout rows").to_vec();
+        let exported_rows = projection.local_result_sets()[0].rows.as_checkouts().expect("exported checkout rows").to_vec();
+
+        assert!(matches!(local_rows.as_slice(), [row] if row.repo_label == "flotilla-org/widgets"));
+        assert!(matches!(exported_rows.as_slice(), [row] if row.repo_label == "github.com/flotilla-org/widgets"));
+    }
+
+    #[test]
     fn project_membership_change_emits_typed_checkout_addition_and_removal() {
         let mut projection = ScopedCheckoutProjection::default();
         let project = QueryScope::new("flotilla", "suite");
-        projection
-            .replace_catalog(HashSet::from([repo("repo-a"), repo("repo-b")]), HashMap::from([(project.clone(), vec![repo("repo-a")])]));
+        let repositories = HashMap::from([(repo("repo-a"), "a".to_string()), (repo("repo-b"), "b".to_string())]);
+        projection.replace_catalog(repositories.clone(), HashMap::from([(project.clone(), vec![repo("repo-a")])]));
         projection.replace_local_rows(vec![checkout("repo-a", "a", "local"), checkout("repo-b", "b", "local")]);
 
-        let deltas = projection
-            .replace_catalog(HashSet::from([repo("repo-a"), repo("repo-b")]), HashMap::from([(project.clone(), vec![repo("repo-b")])]));
+        let deltas = projection.replace_catalog(repositories, HashMap::from([(project.clone(), vec![repo("repo-b")])]));
         let delta =
             deltas.into_iter().find(|delta| delta.query() == QueryId::Checkouts { scope: Some(project.clone()) }).expect("project delta");
         assert_eq!(delta.changes.as_checkouts().expect("changed checkout")[0].resource.name, "b");
@@ -374,13 +475,22 @@ mod tests {
     #[test]
     fn independent_fleet_export_is_unscoped_and_local_only() {
         let mut projection = ScopedIndependentProjection::default();
-        projection.replace_local_rows(vec![independent(Some("repo-a"), "local", "laptop")]);
+        projection.replace_catalog(HashMap::from([(repo("repo-a"), "flotilla-org/widgets".to_string())]), HashMap::new());
+        let mut local = independent(Some("repo-a"), "local", "laptop");
+        local.repo = Some(RepoKey("github.com/flotilla-org/widgets".to_string()));
+        projection.replace_local_rows(vec![local]);
         projection.replace_replica_rows(HashMap::from([(HostName::new("kiwi"), vec![independent(Some("repo-a"), "remote", "kiwi")])]));
 
         let sets = projection.local_result_sets();
+        let local_rows = projection.result_set(&None).rows.as_independents().expect("local independent rows").to_vec();
 
         assert_eq!(sets.len(), 1);
         assert_eq!(sets[0].query(), QueryId::Independents { scope: None });
-        assert!(matches!(sets[0].rows.as_independents().expect("independent rows"), [row] if row.name == "local"));
+        assert!(matches!(
+            sets[0].rows.as_independents().expect("exported independent rows"),
+            [row] if row.name == "local"
+                && row.repo.as_ref().is_some_and(|label| label.0 == "github.com/flotilla-org/widgets")
+        ));
+        assert!(local_rows.iter().all(|row| row.repo.as_ref().is_some_and(|label| label.0 == "flotilla-org/widgets")));
     }
 }

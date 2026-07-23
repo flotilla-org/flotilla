@@ -456,7 +456,7 @@ impl App {
                     .iter()
                     .find_map(|(identity, repo)| (repo.repository_key.as_ref() == Some(&repository_key)).then(|| identity.clone()))
                 else {
-                    self.set_status_message(Some(format!("Cannot open PR: repository {repository_key} is not tracked")));
+                    self.set_status_message(Some("Cannot open PR: repository is not tracked".to_string()));
                     return;
                 };
                 let Ok(node_id) = self.table_intent_node_id(host.as_ref()) else {
