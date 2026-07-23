@@ -41,10 +41,11 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LifecycleAuthority, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec,
     Project, ProjectRepositorySpec, ProjectSpec, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError,
-    ResourceObject, TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession,
-    TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch,
-    Vessel, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
-    CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    ResourceObject, ResourceProvenance, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
+    TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL,
+    VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use futures::{FutureExt, StreamExt};
 use sha2::{Digest, Sha256};
@@ -5171,12 +5172,20 @@ impl InProcessDaemon {
     }
 
     pub async fn resolve_attach_command_internal(&self, reference: &str) -> Result<ResolvedAttach, String> {
+        self.resolve_attach_command_on_host_internal(reference, None).await
+    }
+
+    pub async fn resolve_attach_command_on_host_internal(
+        &self,
+        reference: &str,
+        host: Option<&HostName>,
+    ) -> Result<ResolvedAttach, String> {
         // Preserve validation precedence without paying to build the candidate index.
         if reference.trim().is_empty() {
             return Err("attach reference is required".to_string());
         }
         let index = self.attach_candidate_index().await?;
-        index.resolve(self, reference, None, false).await
+        index.resolve(self, reference, host, false).await
     }
 
     pub async fn resolve_transient_attach_command_internal(
@@ -5198,17 +5207,41 @@ impl InProcessDaemon {
         let index = self.attach_candidate_index().await?;
         let mut resolved = HashSet::new();
         for reference in references {
-            if index.resolve(self, reference, Some(&self.host_name), false).await.is_ok() {
+            if index.resolve(self, reference, None, false).await.is_ok() {
                 resolved.insert(reference.clone());
             }
         }
         Ok(resolved)
     }
 
+    pub async fn resolvable_attach_targets_internal(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
+        let index = self.attach_candidate_index().await?;
+        let mut resolved = Vec::with_capacity(targets.len());
+        for (reference, host) in targets {
+            resolved.push(index.resolve(self, reference, Some(host), false).await.is_ok());
+        }
+        Ok(resolved)
+    }
+
+    pub async fn origin_host_names_internal(&self, origins: &HashSet<NodeId>) -> HashMap<NodeId, HostName> {
+        let mut hosts = HashMap::new();
+        for origin in origins {
+            if let Some(host) = self.host_registry.host_name_for_node(origin).await {
+                hosts.insert(origin.clone(), host);
+            }
+        }
+        hosts
+    }
+
     async fn attach_candidate_index(&self) -> Result<AttachCandidateIndex, String> {
         let namespace = self.provisioning_namespace().await;
-        let durable_sessions =
-            self.resource_backend.clone().using::<ResourceTerminalSession>(&namespace).list().await.map_err(|err| err.to_string())?.items;
+        let durable_sessions = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&namespace)
+            .list()
+            .await
+            .map_err(|err| err.to_string())?
+            .items;
         let observed_sessions = self
             .observed_resource_backend
             .clone()
@@ -5218,7 +5251,16 @@ impl InProcessDaemon {
             .map_err(|err| err.to_string())?
             .items;
         let mut sessions_by_name = HashMap::new();
-        for session in durable_sessions.into_iter().chain(observed_sessions) {
+        let mut replicated_sessions = Vec::new();
+        for session in durable_sessions {
+            match session.provenance {
+                ResourceProvenance::Local => {
+                    sessions_by_name.insert(session.object.metadata.name.clone(), session.object);
+                }
+                ResourceProvenance::Replica { .. } => replicated_sessions.push(session),
+            }
+        }
+        for session in observed_sessions {
             sessions_by_name.insert(session.metadata.name.clone(), session);
         }
         let mut candidates = Vec::new();
@@ -5231,6 +5273,39 @@ impl InProcessDaemon {
                 references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
                 host: self.host_name.clone(),
                 target: AttachTarget::Local(Box::new(session)),
+            });
+        }
+        let mut indexed_remote_sessions = HashSet::new();
+        for replicated in replicated_sessions {
+            let session = replicated.object;
+            if session.status.as_ref().map(|status| status.phase) != Some(ResourceTerminalSessionPhase::Running) {
+                continue;
+            }
+            let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
+                unreachable!("local durable sessions were partitioned above");
+            };
+            let Some(host) = self.host_registry.live_routed_host_name(&origin_root).await else {
+                continue;
+            };
+            indexed_remote_sessions.insert((host.clone(), session.metadata.name.clone()));
+            let convoy = session.metadata.labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
+            let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
+            let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
+            let row = FleetListRow::builder()
+                .convoy(convoy)
+                .vessel(session.spec.env_ref.clone())
+                .crew(crew)
+                .crew_state("running")
+                .host(host.clone())
+                .namespace(session.metadata.namespace.clone())
+                .session(session.metadata.name.clone())
+                .staleness(FleetStaleness::Local)
+                .build();
+            candidates.push(AttachCandidate {
+                label: attach_reference_label(&session.metadata.name, &session.metadata.labels),
+                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels),
+                host,
+                target: AttachTarget::Replica { row: Box::new(row) },
             });
         }
 
@@ -5255,6 +5330,9 @@ impl InProcessDaemon {
                         continue;
                     }
                     if let Some(session) = &row.session {
+                        if indexed_remote_sessions.contains(&(row.host.clone(), session.clone())) {
+                            continue;
+                        }
                         if independent_references.contains(session.as_str()) {
                             continue;
                         }
@@ -5343,9 +5421,9 @@ impl InProcessDaemon {
         let resolver = ssh_resolver_from_config(self.config.base_path())?;
         let mut command =
             vec![flotilla_protocol::arg::Arg::Literal("flotilla".to_string()), flotilla_protocol::arg::Arg::Literal("attach".to_string())];
+        command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
+        command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
         if transient {
-            command.push(flotilla_protocol::arg::Arg::Literal("--host".to_string()));
-            command.push(flotilla_protocol::arg::Arg::Quoted(target_host.to_string()));
             command.push(flotilla_protocol::arg::Arg::Literal("--transient".to_string()));
         }
         command.push(flotilla_protocol::arg::Arg::Quoted(reference.to_string()));
@@ -6584,7 +6662,8 @@ impl DaemonHandle for InProcessDaemon {
                     Err(error) => Ok(flotilla_protocol::CommandValue::Error { message: error.to_string() }),
                 }
             }
-            CommandAction::Attach { reference } => match self.resolve_attach_command_internal(reference).await {
+            CommandAction::Attach { reference, host } => match self.resolve_attach_command_on_host_internal(reference, host.as_ref()).await
+            {
                 Ok(resolved) => {
                     if let Some(binding) = &resolved.binding {
                         if let Err(error) = self.emit_attach_regard(binding, session_id).await {

@@ -171,7 +171,7 @@ fn convoy_with_project_ref_projects_the_full_spine() {
     assert_eq!(text(implement, KEY_STATUS_STATE), "active");
     assert_eq!(text(implement, KEY_VESSEL_HOST), "feta");
     assert_eq!(text(implement, KEY_MATERIALIZE_TARGET), "workspace");
-    assert_eq!(text(implement, KEY_MATERIALIZE_RECIPE), "flotilla attach terminal-implement");
+    assert_eq!(text(implement, KEY_MATERIALIZE_RECIPE), "flotilla attach --host 'feta' 'terminal-implement'");
     assert_eq!(text(implement, KEY_FACTORY_ID), "flotilla:convoys/dev/manifest-extraction/implement");
     assert_eq!(implement.set[KEY_CREW_ROLES].value, MetadataValue::StringList(vec!["coder".to_owned(), "reviewer".to_owned()]));
 
@@ -256,7 +256,7 @@ fn independent_with_repo_groups_under_project_and_publishes_identity() {
     let group_patch = find(&patches, &group_target);
     assert_eq!(text(group_patch, KEY_STATUS_STATE), "active");
     assert_eq!(text(group_patch, KEY_MATERIALIZE_TARGET), "pane");
-    assert_eq!(text(group_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach terminal-scratch");
+    assert_eq!(text(group_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach --host 'feta' 'terminal-scratch'");
     assert_eq!(text(group_patch, KEY_FACTORY_ID), "flotilla:independents/dev/terminal-scratch");
     assert_eq!(group_patch.set[KEY_STATUS_STATE].ordinal, None, "project-parented independents are not archipelago-ordered");
 

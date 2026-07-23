@@ -1,17 +1,16 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use flotilla_client::SocketDaemon;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
-    result_set::{ConvoyPhase, ConvoyRow, ResultSet, Rows},
-    FleetReplicaSnapshot, HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
+    result_set::{ConvoyPhase, ConvoyRow},
+    HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
 };
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, Stance, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use super::{build_remote_command_router, handle_client_session, spawn_peer_networking_runtime};
 use crate::{
-    aggregator::Aggregator,
     peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
     server::PeerConnectedNotice,
 };
@@ -19,14 +18,8 @@ use crate::{
 pub async fn apply_convoy_replica_feed(daemon: &InProcessDaemon, namespace: &str, name: &str, home: HostName) {
     let resource = ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, namespace, name).on_host(home.clone());
     let row = ConvoyRow::builder().resource(resource).name(name).workflow_ref("scratch").phase(ConvoyPhase::Pending).build();
-    let snapshot = FleetReplicaSnapshot {
-        host: home,
-        generation: Some("test-generation".to_string()),
-        rows: vec![],
-        result_sets: vec![ResultSet { seq: 1, rows: Rows::Convoys(vec![row]), state: Default::default() }],
-    };
-    let mut aggregator = Aggregator::new(daemon.aggregator_projection_state().await, daemon.host_name().clone(), daemon.event_sender());
-    aggregator.apply_replica_cache(vec![snapshot]).await;
+    let state = daemon.aggregator_projection_state().await;
+    state.write().await.replace_replica_rows(HashMap::from([(home, HashMap::from([(row.resource.clone(), row)]))]));
 }
 
 pub async fn seed_trusted_remote_convoy_project(daemon: &InProcessDaemon, namespace: &str) {

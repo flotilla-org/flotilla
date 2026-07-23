@@ -156,7 +156,8 @@ Three refinements from the openable-latent grill (2026-07-23):
   indicators, not curation.
 - **The materialize recipe is an address, not a promise.** The capability
   fact gates *listing* on best-known state; the recipe (`flotilla attach
-  <ref>`) re-resolves through the live hop chain at execution and fails
+  --host <host> <ref>`) preserves the advertising host as part of its
+  address, re-resolves through the live hop chain at execution, and fails
   honestly. For remote-placed vessels the fact derives from replicas
   (ADR 0016), so it is stale-affirmative by up to the watch latency —
   bounded by minting **only while the origin peer's route is live**.
@@ -165,8 +166,9 @@ Three refinements from the openable-latent grill (2026-07-23):
 - **"Disconnected" becomes a visible state eventually** — as an
   annotation-tier fact on the affected entries (the presentation twin of
   marking peer hosts unready), never a new member of the frozen
-  `status.state` vocabulary. Until built, recipe absence is the only
-  signal.
+  `status.state` vocabulary. The proposed fact key is
+  `status.connectivity=disconnected`; until built, recipe absence is the
+  only signal.
 
 Surfaces report **realization and focus observations** back to the mesh —
 one channel feeding regard decay, demand routing, and attention telemetry —

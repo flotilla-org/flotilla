@@ -1,10 +1,12 @@
 //! Recipe minting — the commands a PM runs to materialise a catalog entry.
 //!
 //! The formatter is pluggable so v0 can ship attach-only: entities with a
-//! live session get `flotilla attach <ref>`; everything else truthfully
+//! live session get a host-qualified `flotilla attach`; everything else truthfully
 //! lists without a recipe until `flotilla view <address>` (ADR 0013,
 //! flotilla-org/flotilla#589) gives scoped views a command. The connector
 //! owns the GroupPath → address mapping when that lands.
+
+use flotilla_protocol::{arg::shell_quote, HostName};
 
 /// A materialisation recipe. Command-only for now; the Leg-1 freeze is asked
 /// to bless a `{kind: command | layout}` shape (gap report §9.1) since
@@ -26,7 +28,7 @@ pub trait RecipeMint: Send + Sync {
     /// Recipe attaching a live entity — a session into a pane, or a vessel's
     /// running session into a workspace; `attach_ref` is any reference the
     /// daemon accepts (rows expose it as a capability fact).
-    fn attach(&self, attach_ref: &str) -> Option<Recipe>;
+    fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe>;
     /// Recipe materialising a scoped view of an entity with no live session.
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe>;
 }
@@ -44,8 +46,8 @@ impl FlotillaRecipes {
 }
 
 impl RecipeMint for FlotillaRecipes {
-    fn attach(&self, attach_ref: &str) -> Option<Recipe> {
-        Some(Recipe::Command(format!("{} attach {attach_ref}", self.flotilla_bin)))
+    fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
+        Some(Recipe::Command(format!("{} attach --host {} {}", self.flotilla_bin, shell_quote(host.as_str()), shell_quote(attach_ref))))
     }
 
     fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe> {
@@ -60,7 +62,10 @@ mod tests {
     #[test]
     fn flotilla_mint_formats_attach_and_scoped_view_recipes() {
         let mint = FlotillaRecipes::new("flotilla");
-        assert_eq!(mint.attach("implement"), Some(Recipe::Command("flotilla attach implement".to_owned())));
+        assert_eq!(
+            mint.attach("implement", &HostName::new("feta")),
+            Some(Recipe::Command("flotilla attach --host 'feta' 'implement'".to_owned()))
+        );
         assert_eq!(
             mint.scoped_view(&flotilla_protocol::ViewAddress::Vessel {
                 namespace: "dev".to_owned(),

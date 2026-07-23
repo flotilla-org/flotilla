@@ -1600,7 +1600,7 @@ async fn attach_query_resolves_running_terminal_session_by_convoy_task_role() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1680,7 +1680,7 @@ async fn attach_query_rejects_a_running_agent_without_a_recorded_launch_command(
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1721,7 +1721,7 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1737,6 +1737,191 @@ async fn attach_query_resolves_remote_session_as_one_recursive_hop() {
     assert!(command.contains("convoy-a/implement/coder"), "command should preserve the original reference: {command}");
     assert!(!command.contains("remote-provider-session"), "remote hop must not include terminal-provider attach args: {command}");
     assert_eq!(command.matches("flotilla attach").count(), 1, "command should contain exactly one recursive attach invocation: {command}");
+}
+
+#[tokio::test]
+async fn replicated_session_recipe_tracks_live_route_and_resolves_through_the_hop() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    publish_attach_host_summary(&daemon, remote_host, remote_host).await;
+    let remote_node = node(remote_host);
+    let remote_backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+    let remote_sessions = remote_backend.using::<ResourceTerminalSession>("flotilla");
+    let session_name = "terminal-convoy-a-implement-coder";
+    let created = remote_sessions
+        .create(
+            &input_meta_with_labels(
+                session_name,
+                BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+                    (VESSEL_LABEL.to_string(), "implement".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]),
+            ),
+            &ResourceTerminalSessionSpec {
+                env_ref: "remote-env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/repo".to_string(),
+                pool: "fake-terminals".to_string(),
+            },
+        )
+        .await
+        .expect("create remote session");
+    remote_sessions
+        .update_status(session_name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            session_id: Some("remote-provider-session".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark remote session running");
+    daemon
+        .resource_backend()
+        .replica_writer::<ResourceTerminalSession>(remote_node.node_id.clone(), "flotilla")
+        .replace(&remote_sessions.list().await.expect("list remote sessions"), Utc::now())
+        .await
+        .expect("store remote session replica");
+
+    let references = vec![session_name.to_string()];
+    assert!(
+        !daemon.resolvable_attach_references_internal(&references).await.expect("disconnected capability query").contains(session_name),
+        "a durable replica must not mint a recipe without a live route"
+    );
+
+    daemon
+        .set_topology_routes(vec![TopologyRoute {
+            target: remote_node.clone(),
+            next_hop: remote_node.clone(),
+            direct: true,
+            connected: true,
+            fallbacks: vec![],
+            last_attempt: None,
+            last_error: None,
+        }])
+        .await;
+    assert_eq!(
+        daemon.host_registry.live_routed_host_name(&remote_node.node_id).await,
+        Some(HostName::new(remote_host)),
+        "the route should resolve the replica origin to its advertised host name"
+    );
+
+    let resolved = daemon.resolve_attach_command_internal(session_name).await.expect("resolve replicated session through live route");
+    assert!(
+        daemon.resolvable_attach_references_internal(&references).await.expect("connected capability query").contains(session_name),
+        "the recipe should appear when the origin route becomes live"
+    );
+    assert!(resolved.command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")), "attach should use the live hop");
+    assert!(resolved.command.contains("flotilla attach"), "attach should re-resolve on the remote daemon");
+    assert_eq!(resolved.binding.expect("remote binding").host, HostName::new(remote_host));
+
+    daemon.set_topology_routes(Vec::new()).await;
+    assert!(
+        !daemon.resolvable_attach_references_internal(&references).await.expect("disconnected capability query").contains(session_name),
+        "the recipe should vanish when the route disconnects"
+    );
+}
+
+#[tokio::test]
+async fn host_qualified_attach_disambiguates_same_named_local_and_replica_sessions() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let (remote_host, _) = non_local_attach_hosts();
+    let remote_hostname = format!("{remote_host}.local");
+    write_attach_hosts_config(&config_base, &[(remote_host, &remote_hostname, Some("alice"))]);
+
+    let daemon = new_attach_test_daemon(&config_base).await;
+    let local_env = create_local_attach_environment(&daemon).await;
+    let session_name = "terminal-convoy-a-implement-coder";
+    create_running_attach_session(&daemon, &local_env, session_name, "local-provider-session", "convoy-a", "implement", "coder").await;
+
+    publish_attach_host_summary(&daemon, remote_host, remote_host).await;
+    let remote_node = node(remote_host);
+    let remote_backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+    let remote_sessions = remote_backend.using::<ResourceTerminalSession>("flotilla");
+    let created = remote_sessions
+        .create(
+            &input_meta_with_labels(
+                session_name,
+                BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+                    (VESSEL_LABEL.to_string(), "implement".to_string()),
+                    (ROLE_LABEL.to_string(), "coder".to_string()),
+                ]),
+            ),
+            &ResourceTerminalSessionSpec {
+                env_ref: "remote-env".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "bash".to_string() },
+                cwd: "/repo".to_string(),
+                pool: "fake-terminals".to_string(),
+            },
+        )
+        .await
+        .expect("create remote session");
+    remote_sessions
+        .update_status(session_name, &created.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            session_id: Some("remote-provider-session".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("mark remote session running");
+    daemon
+        .resource_backend()
+        .replica_writer::<ResourceTerminalSession>(remote_node.node_id.clone(), "flotilla")
+        .replace(&remote_sessions.list().await.expect("list remote sessions"), Utc::now())
+        .await
+        .expect("store remote session replica");
+    daemon
+        .set_topology_routes(vec![TopologyRoute {
+            target: remote_node.clone(),
+            next_hop: remote_node,
+            direct: true,
+            connected: true,
+            fallbacks: vec![],
+            last_attempt: None,
+            last_error: None,
+        }])
+        .await;
+
+    let local_host = daemon.host_name.clone();
+    let remote_host = HostName::new(remote_host);
+    assert!(daemon
+        .resolve_attach_command_internal(session_name)
+        .await
+        .expect_err("bare same-name reference should be ambiguous")
+        .contains("ambiguous"));
+    assert_eq!(
+        daemon
+            .resolvable_attach_targets_internal(&[
+                (session_name.to_string(), local_host.clone()),
+                (session_name.to_string(), remote_host.clone()),
+            ])
+            .await
+            .expect("host-qualified capability query"),
+        vec![true, true]
+    );
+
+    let local =
+        daemon.resolve_attach_command_on_host_internal(session_name, Some(&local_host)).await.expect("resolve local same-name session");
+    assert_eq!(local.command, "attach local-provider-session");
+    assert_eq!(local.binding.expect("local binding").host, local_host);
+
+    let remote =
+        daemon.resolve_attach_command_on_host_internal(session_name, Some(&remote_host)).await.expect("resolve remote same-name session");
+    assert!(remote.command.starts_with(&format!("ssh -t 'alice@{remote_hostname}' ")));
+    assert!(remote.command.contains("--host"));
+    assert_eq!(remote.binding.expect("remote binding").host, remote_host);
 }
 
 #[tokio::test]
@@ -1773,7 +1958,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1804,7 +1989,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "coder".to_string() },
+                action: CommandAction::Attach { reference: "coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1827,7 +2012,7 @@ async fn attach_query_resolves_fleet_replica_session_as_one_recursive_hop() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "terminal-remote-coder".to_string() },
+                action: CommandAction::Attach { reference: "terminal-remote-coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -1953,7 +2138,7 @@ async fn attach_query_ignores_fleet_replica_hosts_that_are_not_configured() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "removed-env".to_string() },
+                action: CommandAction::Attach { reference: "removed-env".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2010,7 +2195,7 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2063,7 +2248,7 @@ async fn attach_query_prefers_exact_reference_over_prefix_matches() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2138,7 +2323,7 @@ async fn attach_query_rejects_ambiguous_prefix() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2171,7 +2356,7 @@ async fn attach_query_reports_no_matching_reference() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "missing".to_string() },
+                action: CommandAction::Attach { reference: "missing".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2199,7 +2384,7 @@ async fn attach_query_reports_unreachable_next_hop_for_remote_session_without_ho
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2247,7 +2432,7 @@ async fn attach_query_reports_route_that_points_back_to_local_host() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2281,7 +2466,7 @@ async fn attach_query_reports_ambiguous_routed_host_name() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2305,7 +2490,7 @@ async fn attach_query_rejects_empty_reference() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "".to_string() },
+                action: CommandAction::Attach { reference: "".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
@@ -2342,7 +2527,7 @@ async fn attach_query_errors_when_recorded_terminal_pool_is_unavailable() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string() },
+                action: CommandAction::Attach { reference: "convoy-a/implement/coder".to_string(), host: None },
             },
             uuid::Uuid::new_v4(),
         )
