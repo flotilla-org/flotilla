@@ -309,7 +309,7 @@ interactions:
     let session = Session::replaying(&path, Masks::new());
     let client = ReplayHttpClient::new(session.clone());
 
-    let request = reqwest::Client::new()
+    let request = crate::tls::client()
         .get("https://example.test/v1/sessions")
         .header("authorization", "Bearer token-1")
         .header("anthropic-version", "2023-06-01")

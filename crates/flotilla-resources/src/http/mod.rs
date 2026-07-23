@@ -38,7 +38,7 @@ impl HttpBackend {
 
     #[cfg(unix)]
     pub fn from_unix_socket(path: impl AsRef<std::path::Path>) -> Result<Self, ResourceError> {
-        let http = Client::builder()
+        let http = crate::tls::client_builder()
             .unix_socket(path.as_ref())
             .build()
             .map_err(|error| ResourceError::other(format!("build Unix-socket HTTP client: {error}")))?;

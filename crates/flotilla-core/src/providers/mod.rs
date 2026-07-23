@@ -449,7 +449,7 @@ pub struct ReqwestHttpClient {
 impl ReqwestHttpClient {
     pub fn new() -> Self {
         const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        let client = reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build().expect("build HTTP client");
+        let client = crate::tls::client_builder().timeout(REQUEST_TIMEOUT).build().expect("build HTTP client");
         Self { client }
     }
 }
