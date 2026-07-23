@@ -3062,6 +3062,52 @@ async fn repository_identity_change_removes_old_repo_key_observed_checkouts() {
 }
 
 #[tokio::test]
+async fn repository_identity_change_tolerates_missing_superseded_repository_retained_by_durable_checkout() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let state = FakeVcsState::builder(repo.clone()).branch("main", true).checkout("main").is_main(true).path(&repo).build().build();
+    let discovered_repo = Arc::new(std::sync::RwLock::new("old-repo".to_string()));
+    let mut discovery = fake_vcs_discovery(state);
+    discovery.repo_detectors.push(Box::new(MutableRemoteHostDetector { owner: "owner", repo: Arc::clone(&discovered_repo) }));
+
+    let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::clone(&discovered_repo)).await;
+    daemon.add_repo(&repo).await.expect("add repository with old identity");
+
+    let old_key = RepositorySpec::remote("https://github.com/owner/old-repo").expect("old repository spec").key();
+    let new_key = RepositorySpec::remote("https://github.com/owner/new-repo").expect("new repository spec").key();
+    let durable = daemon.resource_backend().using::<ResourceCheckout>("flotilla");
+    durable
+        .create(
+            &InputMeta::builder().name("durable-old-checkout".to_string()).build(),
+            &ResourceCheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("main".to_string())
+                    .path(repo.to_string_lossy().into_owned())
+                    .repo_ref(old_key.clone())
+                    .host_ref("host-test".to_string())
+                    .is_main(true)
+                    .build(),
+            ),
+        )
+        .await
+        .expect("durable checkout create should succeed");
+
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    repositories.delete(&old_key.to_string()).await.expect("simulate already-disappeared old Repository");
+    *discovered_repo.write().expect("mutable remote detector should not be poisoned") = "new-repo".to_string();
+
+    daemon.add_repo(&repo).await.expect("migrate repository identity with missing superseded Repository");
+
+    repositories.get(&new_key.to_string()).await.expect("new Repository should be materialized");
+    assert!(matches!(repositories.get(&old_key.to_string()).await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    let projects = daemon.resource_backend().using::<Project>("flotilla").list().await.expect("project list");
+    assert!(projects.items.iter().any(|project| project.spec.repositories.iter().any(|entry| entry.repo == new_key)));
+}
+
+#[tokio::test]
 async fn repository_identity_change_reconciles_old_identity_shared_by_another_root() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo_a = temp.path().join("repo-a");

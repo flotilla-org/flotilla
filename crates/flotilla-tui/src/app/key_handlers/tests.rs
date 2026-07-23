@@ -60,7 +60,7 @@ async fn open_in_pm_intent_dispatches_only_local_targets_to_the_injected_connect
     let connector = Arc::new(RecordingPmConnector::default());
     app.pm_connector = Some(connector.clone());
 
-    let local_target = pm_target(local);
+    let local_target = pm_target(local.clone());
     app.execute_table_intent(TableIntent::OpenInPm(local_target.clone()));
     tokio::task::yield_now().await;
     app.drain_background_updates();
@@ -68,7 +68,7 @@ async fn open_in_pm_intent_dispatches_only_local_targets_to_the_injected_connect
     assert_eq!(*connector.calls.lock().expect("recorded calls"), vec![local_target]);
     assert_eq!(app.model.status_message.as_deref(), Some("Opened tables in PM"));
 
-    let remote_target = pm_target(HostName::new("feta"));
+    let remote_target = pm_target(HostName::new(format!("remote-{}", local.as_str())));
     app.execute_table_intent(TableIntent::OpenInPm(remote_target));
     assert_eq!(connector.calls.lock().expect("recorded calls").len(), 1, "remote targets must not dispatch");
     assert!(app.model.status_message.as_deref().is_some_and(|message| message.contains("not reachable from this PM yet")));

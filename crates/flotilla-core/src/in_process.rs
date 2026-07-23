@@ -3940,16 +3940,14 @@ impl InProcessDaemon {
                     Err(error) => return Err(error.to_string()),
                 }
             } else if !still_referenced && has_durable_checkout {
-                let old_repository = repository_objects
-                    .iter()
-                    .find(|repository| repository.metadata.name == old_key.to_string())
-                    .expect("superseded key came from the listed repositories");
-                let mut meta = InputMeta::from(&old_repository.metadata);
-                meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), repository_key.to_string());
-                repositories
-                    .update(&meta, &old_repository.metadata.resource_version, &old_repository.spec)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                if let Some(old_repository) = repository_objects.iter().find(|repository| repository.metadata.name == old_key.to_string()) {
+                    let mut meta = InputMeta::from(&old_repository.metadata);
+                    meta.annotations.insert(SUPERSEDED_BY_ANNOTATION.to_string(), repository_key.to_string());
+                    match repositories.update(&meta, &old_repository.metadata.resource_version, &old_repository.spec).await {
+                        Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
             }
         }
 
