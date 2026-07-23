@@ -281,7 +281,9 @@ fn format_topology_human(response: &TopologyResponse) -> String {
             Cell::new(node_label(&route.next_hop)),
             Cell::new(if route.direct { "yes" } else { "no" }),
             Cell::new(if route.connected { "yes" } else { "no" }),
-            Cell::new(route.last_attempt.map(|attempt| attempt.format("%H:%M:%S").to_string()).unwrap_or_else(|| "-".to_string())),
+            Cell::new(
+                route.last_attempt.map(|attempt| attempt.format("%Y-%m-%d %H:%M:%SZ").to_string()).unwrap_or_else(|| "-".to_string()),
+            ),
             Cell::new(route.last_error.as_deref().unwrap_or("-")),
             Cell::new(fallbacks),
         ]);

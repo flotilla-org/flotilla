@@ -1432,7 +1432,8 @@ impl PeerManager {
                                 displaced_generation
                             }
                             ActivationResult::Rejected { .. } => {
-                                self.note_dial_result(&label, Err("connection lost duplicate arbitration"));
+                                let error = format!("connection for {name} lost duplicate arbitration");
+                                self.note_dial_result(&label, Err(&error));
                                 if let Some(target) = self.configured_targets.get_mut(&label) {
                                     let _ = target.transport.disconnect().await;
                                 }
