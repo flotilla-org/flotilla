@@ -4,6 +4,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
     sync::Arc,
     time::Duration,
 };
@@ -11,7 +12,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_core::{
-    aggregator_projection::AggregatorProjectionState, in_process::InProcessDaemon, providers::issue_tracker::IssueProvider,
+    aggregator_projection::AggregatorProjectionState,
+    in_process::InProcessDaemon,
+    providers::{github_api::rate_limit_reset, issue_tracker::IssueProvider},
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
@@ -28,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 const PAGE_SIZE: usize = 50;
 const MAX_CONCURRENT_SOURCES: usize = 8;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_RATE_LIMIT_JITTER: Duration = Duration::from_secs(5);
 
 #[async_trait]
 pub(crate) trait IssueMaterializationResolver: Send + Sync {
@@ -161,6 +165,7 @@ struct MaterializedWindow {
     sources: Vec<IssueSourceWindow>,
     needs_full_reload: bool,
     conditions: Vec<ResultSetCondition>,
+    suspended_until: Option<tokio::time::Instant>,
 }
 
 impl MaterializedWindow {
@@ -171,6 +176,21 @@ impl MaterializedWindow {
     fn has_more(&self) -> bool {
         self.sources.iter().any(|source| source.has_more)
     }
+}
+
+fn suspension_deadline(query: &QueryId, reset: chrono::DateTime<Utc>) -> tokio::time::Instant {
+    let until_reset = reset.signed_duration_since(Utc::now()).to_std().unwrap_or(Duration::ZERO);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    query.hash(&mut hasher);
+    let jitter = Duration::from_secs(1 + hasher.finish() % MAX_RATE_LIMIT_JITTER.as_secs());
+    tokio::time::Instant::now() + until_reset + jitter
+}
+
+fn suspended_until(query: &QueryId, message: &str) -> Option<tokio::time::Instant> {
+    let reset = rate_limit_reset(message)?;
+    let deadline = suspension_deadline(query, reset);
+    tracing::warn!(scope = %query, reset_at = %reset, resume_at = ?deadline, "suspending forge polling after GitHub rate limit");
+    Some(deadline)
 }
 
 async fn run_materialization(
@@ -188,6 +208,7 @@ async fn run_materialization(
     };
     let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_INTERVAL, REFRESH_INTERVAL);
     loop {
+        let suspended = window.suspended_until;
         tokio::select! {
             _ = cancel.cancelled() => return,
             intent = intents.recv() => match intent {
@@ -209,12 +230,16 @@ async fn run_materialization(
                 }
                 None => return,
             },
-            _ = refresh.tick() => {
+            _ = refresh.tick(), if suspended.is_none_or(|deadline| deadline <= tokio::time::Instant::now()) => {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = refresh_window(&query, generation, resolver.as_ref(), &mut window, &state, &event_tx) => {}
                 }
-            }
+            },
+            _ = tokio::time::sleep_until(suspended.unwrap_or_else(tokio::time::Instant::now)), if suspended.is_some() => {
+                window.suspended_until = None;
+                refresh_window(&query, generation, resolver.as_ref(), &mut window, &state, &event_tx).await;
+            },
         }
     }
 }
@@ -233,12 +258,12 @@ async fn load_window(
         Ok(_) => {
             let conditions = vec![unavailable(None, "query scope has no issue source")];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
-            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions };
+            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
         Err(message) => {
             let conditions = vec![unavailable(None, message)];
             publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
-            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions };
+            return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
     };
 
@@ -275,19 +300,25 @@ async fn load_window(
     let mut rows = HashMap::<IssueRef, IssueRow>::new();
     let mut windows = Vec::new();
     let mut conditions = Vec::new();
+    let mut suspension = None;
     for result in loaded {
         match result {
             Ok((window, source_rows)) => {
                 rows.extend(source_rows.into_iter().map(|row| (row.reference.clone(), row)));
                 windows.push(window);
             }
-            Err(condition) => conditions.push(condition),
+            Err(condition) => {
+                if let ResultSetCondition::IssueSourceUnavailable { message, .. } = &condition {
+                    suspension = suspended_until(query, message);
+                }
+                conditions.push(condition);
+            }
         }
     }
     let rows = rows.into_values().collect::<Vec<_>>();
     let needs_full_reload = !conditions.is_empty();
     publish_loaded_window(query, generation, rows, windows.iter().any(|window| window.has_more), conditions.clone(), state, event_tx).await;
-    MaterializedWindow { sources: windows, needs_full_reload, conditions }
+    MaterializedWindow { sources: windows, needs_full_reload, conditions, suspended_until: suspension }
 }
 
 async fn fetch_more(
@@ -354,6 +385,9 @@ async fn refresh_window(
     state: &AggregatorProjectionState,
     event_tx: &broadcast::Sender<DaemonEvent>,
 ) {
+    if window.suspended_until.is_some_and(|deadline| deadline > tokio::time::Instant::now()) {
+        return;
+    }
     if matches!(query, QueryId::Issues { search: Some(_), .. }) {
         *window = load_window(query, generation, resolver, state, event_tx).await;
         return;
@@ -429,6 +463,9 @@ async fn refresh_window(
                 source.refresh_cursor = next_cursor;
             }
             Err(message) => {
+                if let Some(deadline) = suspended_until(query, &message) {
+                    window.suspended_until = Some(deadline);
+                }
                 conditions.push(unavailable(Some(source.source.clone()), message));
                 window.needs_full_reload = true;
             }
@@ -532,9 +569,12 @@ async fn changed_since(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, path::Path, sync::Mutex as StdMutex};
 
-    use chrono::Duration as ChronoDuration;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use flotilla_core::providers::{
+        github_api::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner,
+    };
     use flotilla_protocol::{
         issue_query::IssueResultPage,
         result_set::{ConvoyIssueRow, ConvoyPhase, ConvoyRow},
@@ -555,6 +595,39 @@ mod tests {
     impl ScriptedProvider {
         fn new(pages: Vec<IssueResultPage>, changes: Vec<IssueChangeset>) -> Self {
             Self { pages: Mutex::new(pages.into()), changes: Mutex::new(changes.into()), seen_since: Mutex::new(Vec::new()) }
+        }
+    }
+
+    /// A command runner for exercising GitHub's real `gh api --include`
+    /// response parsing without spawning `gh`.
+    struct ApiRunner {
+        outputs: StdMutex<VecDeque<CommandOutput>>,
+        calls: StdMutex<usize>,
+    }
+
+    impl ApiRunner {
+        fn new(outputs: Vec<CommandOutput>) -> Self {
+            Self { outputs: StdMutex::new(outputs.into()), calls: StdMutex::new(0) }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().expect("runner call count lock")
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for ApiRunner {
+        async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            unreachable!("GitHub API client uses run_output")
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            *self.calls.lock().expect("runner call count lock") += 1;
+            Ok(self.outputs.lock().expect("runner output lock").pop_front().expect("scripted gh response"))
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            true
         }
     }
 
@@ -794,6 +867,42 @@ mod tests {
         assert_eq!(result.rows.as_issues().expect("issue rows")[0].reference, IssueRef { source, id: "WIDGET-123".into() });
         assert!(!result.state.demand.expect("demand metadata").has_more);
         assert!(result.state.conditions.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn github_rate_limit_suspends_a_scope_until_reset_then_resumes() {
+        let state = AggregatorProjectionState::new();
+        let query = project_query("rate-limited");
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let reset = Utc::now().timestamp();
+        let runner = Arc::new(ApiRunner::new(vec![
+            CommandOutput {
+                stdout: format!("HTTP/2 403 Forbidden\\r\\nX-RateLimit-Reset: {reset}\\r\\n\\r\\n{{\\\"message\\\":\\\"API rate limit exceeded\\\"}}"),
+                stderr: "gh: API rate limit exceeded".into(),
+                success: false,
+            },
+            CommandOutput {
+                stdout: "HTTP/2 200 OK\\r\\n\\r\\n[{\\\"number\\\":896,\\\"title\\\":\\\"backoff\\\",\\\"state\\\":\\\"open\\\",\\\"labels\\\":[],\\\"updated_at\\\":\\\"2026-07-22T00:00:00Z\\\"}]".into(),
+                stderr: String::new(),
+                success: true,
+            },
+        ]));
+        let api = Arc::new(GhApiClient::new(runner.clone()));
+        let provider: Arc<dyn IssueProvider> = Arc::new(GitHubIssueProvider::new(api, runner.clone(), Path::new("/host")));
+        let (materializer, mut events) = manager(&state, &query, vec![source], provider);
+
+        let DaemonEvent::ResultSet(initial) = next_event(&mut events).await else { panic!("rate limit publishes unavailable result") };
+        assert!(initial.state.conditions.iter().any(|condition| matches!(condition, ResultSetCondition::IssueSourceUnavailable { message, .. } if rate_limit_reset(message).is_some())));
+        assert_eq!(runner.calls(), 1);
+
+        materializer.refresh(&query);
+        tokio::task::yield_now().await;
+        assert_eq!(runner.calls(), 1, "a suspended scope must not poll before reset plus jitter");
+
+        tokio::time::advance(MAX_RATE_LIMIT_JITTER + Duration::from_secs(1)).await;
+        let DaemonEvent::ResultSet(resumed) = next_event(&mut events).await else { panic!("reset resumes the suspended scope") };
+        assert_eq!(runner.calls(), 2);
+        assert_eq!(resumed.rows.as_issues().expect("issue rows")[0].reference.id, "896");
     }
 
     #[tokio::test]
