@@ -32,6 +32,7 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    flotilla_core::tls::install_default_provider();
     let cli = Cli::parse();
     let paths = PathPolicy::from_process_env();
     flotilla_daemon::cli::run(&cli.socket_path(), &cli.config_dir(), paths.state_dir.as_path(), cli.timeout).await

@@ -12,7 +12,7 @@ use crate::providers::types::{CloudAgentSession, RepoCriteria};
 /// `reqwest::Request` objects). Actual execution goes through the
 /// injected `HttpClient` trait, which has its own client. This is
 /// necessary because reqwest only exposes `RequestBuilder` via `Client`.
-static REQUEST_FACTORY: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+static REQUEST_FACTORY: LazyLock<reqwest::Client> = LazyLock::new(crate::tls::client);
 
 #[async_trait]
 pub trait CloudAgentService: Send + Sync {

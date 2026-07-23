@@ -285,6 +285,7 @@ impl Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    flotilla_core::tls::install_default_provider();
     color_eyre::install()?;
     let mut cli = Cli::try_parse().unwrap_or_else(|error| exit_cli_parse_error(error));
     let format = OutputFormat::from_json_flag(cli.json);

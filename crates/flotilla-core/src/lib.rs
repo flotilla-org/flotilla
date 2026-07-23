@@ -36,5 +36,6 @@ pub mod step;
 pub mod template;
 pub mod terminal_manager;
 
-// Re-export host types from protocol for convenience.
+// Re-export shared infrastructure and host types for convenience.
 pub use flotilla_protocol::HostName;
+pub use flotilla_resources::tls;

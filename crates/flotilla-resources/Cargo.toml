@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+aws-lc-provider = ["rustls/aws_lc_rs"]
 skip-no-sandbox-tests = []
 
 [dependencies]
@@ -16,7 +17,8 @@ tokio = { workspace = true }
 bon = { workspace = true }
 futures = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "query", "rustls", "stream"] }
+reqwest = { workspace = true, features = ["json", "query", "stream"] }
+rustls = { workspace = true }
 serde_yml = "0.0.12"
 base64 = "0.22"
 bytes = "1"

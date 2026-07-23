@@ -94,7 +94,7 @@ async fn http_list_decodes_owner_references() {
     })
     .to_string();
     let (base_url, _request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
+    let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
 
     let listed = resolver.list().await.expect("list should succeed");
@@ -134,7 +134,7 @@ async fn http_create_serializes_owner_references() {
     })
     .to_string();
     let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
-    let backend = ResourceBackend::Http(HttpBackend::new(reqwest::Client::new(), base_url));
+    let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), base_url));
     let resolver = backend.using::<Convoy>("flotilla");
     let meta = InputMeta {
         name: "alpha".to_string(),

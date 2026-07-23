@@ -22,6 +22,7 @@ mod retention;
 mod sqlite;
 mod status_patch;
 mod terminal_session;
+pub mod tls;
 mod vessel;
 mod watch;
 mod workflow_template;

@@ -31,12 +31,19 @@ indexmap = "2"
 color-eyre = "0.6"
 rstest = "0.23"
 bon = "3"
+# Keep the TLS provider explicit so reqwest does not pull aws-lc-sys onto the clean-build critical path.
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
 
 [package]
 name = "flotilla"
 version = "0.1.0"
 edition = "2021"
 license.workspace = true
+
+[features]
+default = []
+aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-provider"]
 
 [dependencies]
 flotilla-commands = { path = "crates/flotilla-commands" }
