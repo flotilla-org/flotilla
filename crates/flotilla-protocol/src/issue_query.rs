@@ -42,6 +42,7 @@ mod tests {
                 state: IssueState::Open,
                 labels: vec![],
                 as_of: "2026-07-15T09:30:00Z".parse().expect("valid timestamp"),
+                observed_at: None,
                 association_keys: vec![],
                 provider_name: "github".into(),
                 provider_display_name: "GitHub".into(),

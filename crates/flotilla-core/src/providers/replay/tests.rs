@@ -161,6 +161,33 @@ interactions:
 }
 
 #[tokio::test]
+async fn replay_gh_api_preserves_rate_limit_reset_time() {
+    let yaml = r#"
+interactions:
+  - channel: gh_api
+    method: GET
+    endpoint: "/repos/owner/repo/issues/42"
+    status: 403
+    body: '{"message": "API rate limit exceeded"}'
+    headers:
+      X-RateLimit-Reset: "1784822400"
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.yaml");
+    std::fs::write(&path, yaml).unwrap();
+
+    let session = Session::replaying(&path, Masks::new());
+    let api = ReplayGhApi::new(session.clone());
+    let endpoint = "/repos/owner/repo/issues/42";
+    let label = ChannelLabel::GhApi(endpoint.to_string());
+
+    let error = api.get(endpoint, Path::new("/repo"), &label).await.expect_err("403 must fail");
+
+    assert_eq!(error, "github rate limit exceeded; reset_at=2026-07-23T16:00:00+00:00");
+    session.assert_complete();
+}
+
+#[tokio::test]
 async fn replay_gh_api_get_with_headers() {
     let yaml = r#"
 interactions:

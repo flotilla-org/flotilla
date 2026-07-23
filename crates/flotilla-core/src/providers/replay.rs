@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    github_api::{GhApi, GhApiResponse},
+    github_api::{rate_limit_error, rate_limit_reset, GhApi, GhApiResponse},
     ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
 };
 
@@ -516,6 +516,22 @@ impl ReplayGhApi {
     }
 }
 
+fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> String {
+    if status == 403 {
+        if let Some(reset) = headers.iter().find_map(|(name, value)| name.eq_ignore_ascii_case("x-ratelimit-reset").then_some(value)) {
+            return rate_limit_error(reset);
+        }
+    }
+    format!("HTTP {status}: {body}")
+}
+
+fn recorded_gh_error(error: &str) -> (u16, HashMap<String, String>) {
+    let Some(reset) = rate_limit_reset(error) else {
+        return (500, HashMap::new());
+    };
+    (403, HashMap::from([("x-ratelimit-reset".to_string(), reset.to_rfc3339())]))
+}
+
 /// An `HttpClient` implementation that replays canned HTTP interactions
 /// from a `Session`.
 pub struct ReplayHttpClient {
@@ -575,7 +591,7 @@ impl super::HttpClient for ReplayHttpClient {
 impl GhApi for ReplayGhApi {
     async fn get(&self, endpoint: &str, _repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
         let interaction = self.session.next(label);
-        let Interaction::GhApi { endpoint: expected_endpoint, status, body, .. } = interaction else {
+        let Interaction::GhApi { endpoint: expected_endpoint, status, body, headers, .. } = interaction else {
             panic!("ReplayGhApi: expected gh_api interaction");
         };
 
@@ -584,7 +600,7 @@ impl GhApi for ReplayGhApi {
         if (200..300).contains(&status) {
             Ok(body)
         } else {
-            Err(format!("HTTP {status}: {body}"))
+            Err(replay_gh_error(status, &body, &headers))
         }
     }
 
@@ -603,7 +619,7 @@ impl GhApi for ReplayGhApi {
         if (200..300).contains(&status) || status == 304 {
             Ok(GhApiResponse { status, etag, body, has_next_page, total_count })
         } else {
-            Err(format!("HTTP {status}: {body}"))
+            Err(replay_gh_error(status, &body, &headers))
         }
     }
 }
@@ -799,13 +815,14 @@ impl GhApi for RecordingGhApi {
                 });
             }
             Err(err) => {
+                let (status, headers) = recorded_gh_error(err);
                 self.session.record(Interaction::GhApi {
                     label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
-                    status: 500,
+                    status,
                     body: err.clone(),
-                    headers: HashMap::new(),
+                    headers,
                 });
             }
         }
@@ -842,13 +859,14 @@ impl GhApi for RecordingGhApi {
                 });
             }
             Err(err) => {
+                let (status, headers) = recorded_gh_error(err);
                 self.session.record(Interaction::GhApi {
                     label: explicit,
                     method: "GET".to_string(),
                     endpoint: endpoint.to_string(),
-                    status: 500,
+                    status,
                     body: err.clone(),
-                    headers: HashMap::new(),
+                    headers,
                 });
             }
         }

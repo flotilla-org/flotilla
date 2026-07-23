@@ -93,7 +93,7 @@ async fn convoy_admission_uses_only_fresh_cached_issue_snapshots() {
         IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "897".into() };
     let mut issue = TestIssue::new("Store-first admission").id("897").build();
     issue.reference = reference.clone();
-    issue.as_of = Utc::now();
+    issue.observed_at = Some(Utc::now());
     daemon
         .repos
         .write()
@@ -116,7 +116,7 @@ async fn convoy_admission_uses_only_fresh_cached_issue_snapshots() {
         .issues
         .get_mut(&reference.id)
         .expect("cached issue")
-        .as_of = Utc::now() - ISSUE_SNAPSHOT_FRESHNESS - ChronoDuration::seconds(1);
+        .observed_at = Some(Utc::now() - ISSUE_SNAPSHOT_FRESHNESS - ChronoDuration::seconds(1));
 
     assert!(daemon.resolve_convoy_issue_snapshot(&reference).await.is_err(), "stale cache must fetch instead of dispatching its body");
 
@@ -130,7 +130,7 @@ async fn convoy_admission_uses_only_fresh_cached_issue_snapshots() {
         .issues
         .get_mut(&reference.id)
         .expect("cached issue")
-        .as_of = Utc::now() + ChronoDuration::seconds(1);
+        .observed_at = Some(Utc::now() + ChronoDuration::seconds(1));
 
     assert!(daemon.resolve_convoy_issue_snapshot(&reference).await.is_err(), "future cache entry must not dispatch");
 }

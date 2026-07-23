@@ -979,6 +979,7 @@ mod tests {
                         state: IssueState::Open,
                         labels: vec!["protocol".into()],
                         as_of: Utc.with_ymd_and_hms(2026, 7, 15, 9, 30, 0).unwrap(),
+                        observed_at: None,
                         association_keys: vec![],
                         provider_name: "linear".into(),
                         provider_display_name: "Linear".into(),

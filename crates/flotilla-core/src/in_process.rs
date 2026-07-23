@@ -1120,7 +1120,8 @@ struct ConvoyAdmission {
 const ISSUE_SNAPSHOT_FRESHNESS: ChronoDuration = ChronoDuration::minutes(5);
 
 fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
-    let age = Utc::now().signed_duration_since(issue.as_of);
+    let Some(observed_at) = issue.observed_at else { return false };
+    let age = Utc::now().signed_duration_since(observed_at);
     (ChronoDuration::zero()..=ISSUE_SNAPSHOT_FRESHNESS).contains(&age)
 }
 
@@ -1319,7 +1320,7 @@ impl InProcessDaemon {
             .flat_map(|state| state.last_local_providers.issues.values())
             .filter(|issue| issue.reference == *reference)
             .filter(|issue| issue_snapshot_is_fresh(issue))
-            .max_by_key(|issue| issue.as_of)
+            .max_by_key(|issue| issue.observed_at)
             .cloned()
     }
 
@@ -3291,7 +3292,13 @@ impl InProcessDaemon {
         Ok(ConvoyIssue {
             reference: issue.reference,
             repository_ref,
-            snapshot: IssueSnapshot { title: issue.title, body: issue.body, state: issue.state, labels: issue.labels, as_of: issue.as_of },
+            snapshot: IssueSnapshot {
+                title: issue.title,
+                body: issue.body,
+                state: issue.state,
+                labels: issue.labels,
+                as_of: issue.observed_at.expect("admission only accepts observed issue snapshots"),
+            },
         })
     }
 

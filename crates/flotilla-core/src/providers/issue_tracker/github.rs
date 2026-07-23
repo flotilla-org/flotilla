@@ -45,10 +45,7 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
         .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let id = number.to_string();
-    // `as_of` is the time Flotilla observed this snapshot, not GitHub's last
-    // mutation time. Admission uses it as a hard freshness bound for the
-    // issue body it passes to a crew.
-    let as_of = fetched_at;
+    let as_of = v["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).unwrap_or(fetched_at);
     let reference = IssueRef { source: source.clone(), id: id.clone() };
     let association_keys = vec![AssociationKey::IssueRef("github".to_string(), id)];
     Some(
@@ -59,6 +56,7 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
             .state(state)
             .labels(labels)
             .as_of(as_of)
+            .observed_at(fetched_at)
             .association_keys(association_keys)
             .provider_name("github".into())
             .provider_display_name("GitHub".into())
@@ -223,7 +221,7 @@ mod tests {
     async fn fetch_by_id_uses_source_identity_without_a_checkout() {
         let before = Utc::now();
         let api = Arc::new(MockGhApi::new(vec![ok_response(
-            r#"{"number":42,"title":"The answer","body":"Details","state":"closed","labels":[{"name":"bug"}]}"#,
+            r#"{"number":42,"title":"The answer","body":"Details","state":"closed","labels":[{"name":"bug"}],"updated_at":"2026-07-20T12:34:56Z"}"#,
             false,
         )]));
         let provider = GitHubIssueProvider::new(api.clone(), Arc::new(MockRunner::new(vec![])), Path::new("/host-capability"));
@@ -234,7 +232,8 @@ mod tests {
         assert_eq!(issue.reference, reference);
         assert_eq!(issue.body.as_deref(), Some("Details"));
         assert_eq!(issue.state, IssueState::Closed);
-        assert!(issue.as_of >= before && issue.as_of <= Utc::now());
+        assert_eq!(issue.as_of, "2026-07-20T12:34:56Z".parse::<DateTime<Utc>>().expect("timestamp"));
+        assert!(issue.observed_at.is_some_and(|observed_at| observed_at >= before && observed_at <= Utc::now()));
         assert_eq!(api.requests(), vec![("repos/owner/repo/issues/42".into(), PathBuf::from("/host-capability"))]);
     }
 
