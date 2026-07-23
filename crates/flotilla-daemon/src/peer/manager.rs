@@ -277,6 +277,10 @@ pub struct PeerManager {
     displaced_senders: HashMap<(NodeId, u64), Arc<dyn PeerSender>>,
     reconnect_suppressed_until: HashMap<NodeId, Instant>,
     transport_peers: HashMap<ConfigLabel, NodeId>,
+    /// Last node identity learned for each configured transport. Unlike
+    /// `transport_peers`, this survives disconnect so topology diagnostics
+    /// remain attributable while retries are failing.
+    learned_transport_peers: HashMap<ConfigLabel, NodeId>,
     generations: HashMap<NodeId, u64>,
     routes: HashMap<NodeId, RouteState>,
     /// TODO: expire abandoned reverse-path entries when routed replies time out
@@ -319,6 +323,7 @@ impl PeerManager {
             displaced_senders: HashMap::new(),
             reconnect_suppressed_until: HashMap::new(),
             transport_peers: HashMap::new(),
+            learned_transport_peers: HashMap::new(),
             generations: HashMap::new(),
             routes: HashMap::new(),
             reverse_paths: HashMap::new(),
@@ -602,7 +607,8 @@ impl PeerManager {
         self.install_direct_route(&host, generation);
 
         if let Some(label) = meta.config_label {
-            self.transport_peers.insert(label, host);
+            self.transport_peers.insert(label.clone(), host.clone());
+            self.learned_transport_peers.insert(label, host);
         }
 
         ActivationResult::Accepted { generation, displaced }
@@ -1327,17 +1333,11 @@ impl PeerManager {
                     connected: self.route_hop_is_live(&route.primary),
                     fallbacks: fallbacks.into_iter().map(|hop| self.node_info_for(&hop.next_hop)).collect(),
                     last_attempt: self
-                        .active_connections
-                        .get(target)
-                        .and_then(|active| active.meta.config_label.as_ref())
-                        .or_else(|| self.transport_peers.iter().find_map(|(label, node)| (node == target).then_some(label)))
+                        .configured_label_for_node(target)
                         .and_then(|label| self.peer_dial_status.get(label))
                         .and_then(|status| status.last_attempt),
                     last_error: self
-                        .active_connections
-                        .get(target)
-                        .and_then(|active| active.meta.config_label.as_ref())
-                        .or_else(|| self.transport_peers.iter().find_map(|(label, node)| (node == target).then_some(label)))
+                        .configured_label_for_node(target)
                         .and_then(|label| self.peer_dial_status.get(label))
                         .and_then(|status| status.last_error.clone()),
                 }
@@ -1345,6 +1345,19 @@ impl PeerManager {
             .collect();
         routes.sort_by(|a, b| a.target.node_id.cmp(&b.target.node_id));
         routes
+    }
+
+    fn configured_label_for_node(&self, node_id: &NodeId) -> Option<&ConfigLabel> {
+        self.active_connections
+            .get(node_id)
+            .and_then(|active| active.meta.config_label.as_ref())
+            .or_else(|| self.transport_peers.iter().find_map(|(label, node)| (node == node_id).then_some(label)))
+            .or_else(|| self.learned_transport_peers.iter().find_map(|(label, node)| (node == node_id).then_some(label)))
+            .or_else(|| {
+                self.configured_targets
+                    .iter()
+                    .find_map(|(label, target)| (target.expected_node_id.as_ref() == Some(node_id)).then_some(label))
+            })
     }
 
     /// Snapshot relay targets without performing any async sends.
