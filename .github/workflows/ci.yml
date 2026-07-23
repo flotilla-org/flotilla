@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Cached dependency artifacts pay off across runs; short-lived incremental
+  # generations cost more to upload and store than they save in CI.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   fmt:
     name: Format
@@ -20,7 +25,10 @@ jobs:
         with:
           toolchain: nightly-2026-03-12
           components: rustfmt
-      - run: cargo +nightly-2026-03-12 fmt --check
+      - name: Test target pruning policy
+        run: scripts/test-prune-target.sh
+      - name: Check Rust formatting
+        run: cargo +nightly-2026-03-12 fmt --check
 
   clippy:
     name: Clippy
@@ -38,10 +46,16 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-clippy-v2-
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Remove incremental state before caching
+        if: always()
+        run: |
+          if [ -d target ]; then
+            find target -type d -name incremental -prune -exec rm -rf {} +
+          fi
 
   test:
     name: Test
@@ -57,7 +71,13 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-test-v2-
       - run: cargo test --workspace --locked
+      - name: Remove incremental state before caching
+        if: always()
+        run: |
+          if [ -d target ]; then
+            find target -type d -name incremental -prune -exec rm -rf {} +
+          fi

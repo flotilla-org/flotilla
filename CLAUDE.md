@@ -24,9 +24,13 @@ cargo test --workspace --locked                # CI test gate
 cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
 cargo dylint --all -- --all-targets             # custom lints (requires cargo-dylint + dylint-link)
 cargo run                                      # run, auto-detect repo from cwd
+scripts/prune-target.sh --dry-run              # preview per-checkout target cache pruning
+scripts/prune-target.sh                        # prune aged/oversized target artifacts
 ```
 
 Before pushing, run the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
+
+Developer incrementals stay enabled, with aged generations pruned under the target cache policy. See [docs/development.md](docs/development.md) for setup, thresholds, measurement, and the CI decision.
 
 **Nightly toolchain:** All nightly-dependent tools (rustfmt, llvm-cov, Dylint) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
 
