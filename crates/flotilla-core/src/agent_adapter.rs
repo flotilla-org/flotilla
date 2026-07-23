@@ -63,7 +63,7 @@ pub fn build_crew_brief(
         content.push_str(&format!("Hand off to {} with `flotilla crew {} handoff --message '...'`.\n", member.role, member.role));
     }
     content.push_str(&format!(
-        "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
+        "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue (ready for review, never a draft), and shepherd the pull request until all checks pass; if it is a draft for any reason, mark it ready once checks are green. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
         match assignment {
             CrewAssignment::Prompt(prompt) => prompt,
             CrewAssignment::CarriedIssue =>
@@ -349,7 +349,7 @@ mod tests {
         );
 
         assert!(brief.content.contains(
-            "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue, and shepherd the pull request until all checks pass. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
+            "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue (ready for review, never a draft), and shepherd the pull request until all checks pass; if it is a draft for any reason, mark it ready once checks are green. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`."
         ));
         assert!(brief.content.contains("Clone scratch repositories outside the vessel checkout"));
     }
