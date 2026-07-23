@@ -26,6 +26,8 @@ The machine's global Cargo configuration used sccache 0.16.0. Before measurement
 
 The dev build was an empty-target build. The test build immediately reused that target, so its number is the marginal cost of going from a complete workspace dev build to all test executables, not a second clean build. Incremental results are single warm samples: each command was warmed to “fresh,” one string literal in a leaf source file was changed, the root build was timed, and the source was restored. This makes the numbers directional rather than a statistical benchmark.
 
+All measurements are from this Apple Silicon development machine. Flotilla's gating CI runs on `ubuntu-latest`, so the bottleneck shapes are useful hypotheses for CI work, but their magnitudes—especially native TLS compilation and linking—must be remeasured on the Linux runner before projecting CI savings.
+
 Commands:
 
 ```bash
@@ -143,6 +145,7 @@ The observed final gating chain was protocol → resources → core → daemon �
 | daemon | **32,105** | 308 | Serde `visit_content_map` |
 | daemon | **30,859** | 1,015 | Tokio loom `UnsafeCell<T>::with_mut` |
 | daemon | **29,699** | 275 | Serde `MapDeserializer::next_key_seed` |
+| daemon | **14,238** | 8 | `ControllerLoop<R>::run` closure |
 | core | **18,006** | 40 | `serde_json::Deserializer::deserialize_struct` |
 | core | **16,670** | 94 | stable-sort `stable_partition` |
 | core | **15,463** | 156 | generic `Vec::from_iter` |
@@ -246,7 +249,7 @@ As retrieved on 2026-07-23, the [Rust project describes the Cranelift backend](h
 
 1. **Remove or cache the `aws-lc-sys` native build from the clean critical path.** It consumed 182.91s in its build script and gated the final resources → core → daemon chain. First verify whether Reqwest/Rustls can use an explicitly selected lighter provider without changing security or platform requirements; otherwise make the sccache/CI cache retain this native output reliably. This is the largest plausible clean-build wall win.
 2. **Reduce the number and size of integration-test crate roots.** The marginal test build took 574.07s at 47% job-slot utilization; core's lib test alone was 329.07s, and resources accumulated 684.96 unit-seconds across many targets. Consolidating related files behind fewer integration harnesses, while retaining the same tests, reduces repeated generic instantiation and linking and attacks the crew's recurring round directly.
-3. **Profile and simplify daemon-boundary Serde shapes and task instantiations.** Daemon emitted 2.08 million LLVM lines; Serde content deserialization owns four top offenders, and a one-word daemon edit spent 12.42s in codegen. Start with the large internally/untagged protocol enums visible in daemon's profile and with the eight `ControllerLoop<R>` instantiations (14,238 lines), then re-run `llvm-lines`; do not broadly remove derives without measurement.
+3. **Profile and simplify daemon-boundary Serde shapes and task instantiations.** Daemon emitted 2.08 million LLVM lines; Serde content deserialization owns four top offenders, and a one-word daemon edit spent 12.42s in codegen. Start with the large internally/untagged protocol enums visible in daemon's profile and with the eight `ControllerLoop<R>` instantiations (14,238 lines in the daemon LLVM-lines run), then re-run `llvm-lines`; do not broadly remove derives without measurement.
 4. **Stop enabling every `image` format by default.** The five named image packages contributed 204.19 cumulative unit-seconds. Select only formats actually accepted by Flotilla previews and the ratatui image path. This is a large CPU and clean-target-size win, although it did not gate this particular clean wall-clock path.
 5. **Treat target storage as managed cache state.** Incremental data was 19 of 32 GiB in the representative target, and one controlled dev+test build already reached 11 GiB. Give CI short-lived or non-incremental targets when upload/disk cost outweighs reuse, keep developer incrementals, and add documented age/size-based cleanup rather than indiscriminate `cargo clean`.
 6. **Evaluate Cranelift only as an opt-in, non-gating dev lane.** The literature says Apple Silicon is supported, but the backend and Cargo selection remain nightly/preview and macOS unwinding is unsupported. The 9m34s test compile makes an experiment worthwhile, but it must include test runtime and compatibility, not compile time alone.
