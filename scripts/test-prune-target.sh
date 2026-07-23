@@ -74,6 +74,21 @@ run_gc() {
     "$repo_root/scripts/prune-target.sh" "$@"
 }
 
+assert_invalid_config() {
+  local output
+  local variable=$1
+  local value=$2
+
+  if output=$(env \
+    PATH="$stub_bin:$PATH" \
+    CARGO_TARGET_DIR="$target_dir" \
+    "$variable=$value" \
+    "$repo_root/scripts/prune-target.sh" --dry-run 2>&1); then
+    fail "$variable accepted invalid value '$value'"
+  fi
+  grep -Fq "$variable" <<< "$output" || fail "$variable error did not identify the invalid setting"
+}
+
 mkdir -p "$relative_target_dir/debug/deps"
 canonical_relative_target_dir=$(cd -- "$relative_target_dir" && pwd -P)
 ln -s "$relative_target_dir" "$relative_target_link"
@@ -91,6 +106,10 @@ grep -Fq "target=$canonical_relative_target_dir" "$relative_log" || fail "cargo-
 if PATH="$stub_bin:$PATH" CARGO_TARGET_DIR=// "$repo_root/scripts/prune-target.sh" --dry-run >/dev/null 2>&1; then
   fail "root alias was accepted as the target directory"
 fi
+
+assert_invalid_config FLOTILLA_TARGET_GC_DAYS nope
+assert_invalid_config FLOTILLA_TARGET_GC_INCREMENTAL_MAX_SIZE 3GB
+assert_invalid_config FLOTILLA_TARGET_GC_MAX_SIZE 20GB
 
 if FLOTILLA_SWEEP_TEST_FAIL=1 run_gc --dry-run >/dev/null 2>&1; then
   fail "preview ignored a cargo-sweep failure"
