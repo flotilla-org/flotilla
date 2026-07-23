@@ -165,7 +165,7 @@ impl AggregatorProjectionState {
 
     pub async fn replace_store_catalog(
         &self,
-        repositories: HashSet<RepositoryKey>,
+        repositories: HashMap<RepositoryKey, String>,
         projects: HashMap<QueryScope, Vec<RepositoryKey>>,
     ) -> Vec<ResultDelta> {
         let mut deltas = self.independents.write().await.replace_catalog(repositories.clone(), projects.clone());
@@ -427,7 +427,12 @@ mod tests {
     async fn fleet_awareness_subscription_demands_project_issue_windows() {
         let state = AggregatorProjectionState::new();
         let project = scope("roadmap");
-        state.replace_store_catalog(HashSet::from([RepositoryKey("repo-a".into())]), HashMap::from([(project.clone(), vec![])])).await;
+        state
+            .replace_store_catalog(
+                HashMap::from([(RepositoryKey("repo-a".into()), "a".to_string())]),
+                HashMap::from([(project.clone(), vec![])]),
+            )
+            .await;
 
         let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
         state.replace_subscriber_expanding_awareness(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]).await;
@@ -439,7 +444,12 @@ mod tests {
     async fn fleet_awareness_groups_loaded_project_issues_under_projects() {
         let state = AggregatorProjectionState::new();
         let project = scope("roadmap");
-        state.replace_store_catalog(HashSet::from([RepositoryKey("repo-a".into())]), HashMap::from([(project.clone(), vec![])])).await;
+        state
+            .replace_store_catalog(
+                HashMap::from([(RepositoryKey("repo-a".into()), "a".to_string())]),
+                HashMap::from([(project.clone(), vec![])]),
+            )
+            .await;
         let issue_query = QueryId::Issues { scope: project.clone(), search: None };
         state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: issue_query.clone(), since: None }]);
         let generation = *state.subscribe_demand().borrow().get(&issue_query).expect("issue query generation");

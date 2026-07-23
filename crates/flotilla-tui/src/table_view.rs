@@ -1027,7 +1027,7 @@ static CHECKOUT_COLUMNS: [ColumnSpec<CheckoutRow>; 5] = [
         label: "REPOSITORY",
         width: WidthHint::Flexible { minimum: 14, weight: 2 },
         alignment: Alignment::Left,
-        extract: |row| CellValue::plain(row.repo.to_string()),
+        extract: |row| CellValue::plain(&row.repo_label),
     },
     ColumnSpec {
         id: "authority",
@@ -1186,7 +1186,7 @@ fn checkout_description(row: &CheckoutRow) -> Vec<DetailField> {
         DetailField { label: "Host", value: row.host.to_string() },
         DetailField { label: "Path", value: row.path.clone() },
         DetailField { label: "Branch", value: row.branch.clone() },
-        DetailField { label: "Repository", value: row.repo.to_string() },
+        DetailField { label: "Repository", value: row.repo_label.clone() },
         DetailField { label: "Authority", value: row.authority.as_label_value().to_string() },
     ]
 }
@@ -1522,6 +1522,7 @@ mod tests {
         let checkout = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "roadmap"))
             .repo(RepositoryKey("repo_flotilla".into()))
+            .repo_label("flotilla")
             .path("/work/flotilla")
             .branch("main")
             .host(HostName::new("kiwi"))
@@ -1670,6 +1671,7 @@ mod tests {
         let row = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "widgets-api"))
             .repo(RepositoryKey("repo_widgets".into()))
+            .repo_label("widgets-api")
             .path("/work/widgets-api")
             .branch("feature/scoped-tabs")
             .host(HostName::new("kiwi"))
@@ -1694,7 +1696,7 @@ mod tests {
             "kiwi",
             "/work/widgets-api",
             "feature/scoped-tabs",
-            "repo_widgets",
+            "widgets-api",
             "observed",
         ]);
         assert!(view.rows[0].actions.is_empty());

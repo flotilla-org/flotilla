@@ -601,7 +601,10 @@ pub struct IssueRow {
 #[builder(on(String, into))]
 pub struct CheckoutRow {
     pub resource: ResourceRef,
+    /// Canonical Repository identity used for joins.
     pub repo: RepositoryKey,
+    /// Human-readable Repository presentation, never the opaque identity key.
+    pub repo_label: String,
     pub path: String,
     pub branch: String,
     pub host: HostName,
@@ -867,6 +870,7 @@ mod tests {
                 rows: vec![CheckoutRow::builder()
                     .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-a").on_host(HostName::new("kiwi")))
                     .repo(RepositoryKey("repo_abc123".into()))
+                    .repo_label("flotilla")
                     .path("/work/flotilla")
                     .branch("feature/query")
                     .host(HostName::new("kiwi"))
@@ -919,6 +923,7 @@ mod tests {
                 changed: vec![CheckoutRow::builder()
                     .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout-new").on_host(HostName::new("mango")))
                     .repo(RepositoryKey("repo_abc123".into()))
+                    .repo_label("flotilla")
                     .path("/work/flotilla")
                     .branch("feature/query")
                     .host(HostName::new("mango"))

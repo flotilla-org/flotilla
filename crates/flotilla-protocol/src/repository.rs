@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const UNKNOWN_REPOSITORY_LABEL: &str = "Unknown repository";
+
 /// Storage-safe key of a Repository resource.
 ///
 /// The key is opaque on the wire. Its derivation and referent verification

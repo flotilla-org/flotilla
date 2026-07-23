@@ -71,8 +71,8 @@ pub use registry::{
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
-    ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,
-    RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,
+    ensure_repository, repository_display_labels, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity,
+    Repository, RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,
     RepositoryStatusPatch,
 };
 pub use resource::{

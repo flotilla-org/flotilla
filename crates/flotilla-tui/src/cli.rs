@@ -164,7 +164,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
             project
                 .repositories
                 .iter()
-                .map(|repository| repository.slug.as_deref().unwrap_or(&repository.key.0))
+                .map(|repository| repository.slug.as_deref().unwrap_or(flotilla_protocol::UNKNOWN_REPOSITORY_LABEL))
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {

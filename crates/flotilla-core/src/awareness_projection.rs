@@ -9,7 +9,7 @@ use chrono::Utc;
 use flotilla_protocol::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,
     AwarenessNode, AwarenessPhase, AwarenessState, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryScope, ResourceRef,
-    ResultSetState, Salience, WorkPhase,
+    ResultSetState, Salience, WorkPhase, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{api_version, Project, Resource};
 
@@ -130,7 +130,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             .scope
             .as_ref()
             .map(group_key_for_scope)
-            .unwrap_or_else(|| GroupKey::new(format!("repo/{}", checkout.repo), checkout.repo.to_string()));
+            .unwrap_or_else(|| GroupKey::new(format!("repo/{}", checkout.repo), checkout.repo_label.clone()));
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
         let project_ancestors =
             input.scope.as_ref().map(|scope| project_resource_ref(&scope.namespace, &scope.name)).into_iter().collect::<Vec<_>>();
@@ -153,7 +153,12 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             .scope
             .as_ref()
             .map(group_key_for_scope)
-            .or_else(|| independent.repository_key.as_ref().map(|repo| GroupKey::new(format!("repo/{repo}"), repo.to_string())))
+            .or_else(|| {
+                independent.repository_key.as_ref().map(|repo| {
+                    let label = independent.repo.as_ref().map_or_else(|| UNKNOWN_REPOSITORY_LABEL.to_string(), |label| label.0.clone());
+                    GroupKey::new(format!("repo/{repo}"), label)
+                })
+            })
             .unwrap_or_else(|| GroupKey::new("unparented", "Unparented"));
         let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
         let project_ancestors =
@@ -444,6 +449,7 @@ mod tests {
             checkouts: vec![CheckoutRow::builder()
                 .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
                 .repo(RepositoryKey("repo-a".into()))
+                .repo_label("flotilla")
                 .path("/work/flotilla")
                 .branch("feat/awareness-band")
                 .host(HostName::new("local"))
@@ -523,6 +529,7 @@ mod tests {
             checkouts: vec![CheckoutRow::builder()
                 .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "platform"))
                 .repo(RepositoryKey("repo-a".into()))
+                .repo_label("platform")
                 .path("/work/platform")
                 .branch("main")
                 .host(HostName::new("local"))

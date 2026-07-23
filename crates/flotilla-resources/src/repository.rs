@@ -113,6 +113,47 @@ impl RepositorySpec {
             RepositoryIdentity::Local { .. } => self.leaf_slug(),
         }
     }
+
+    /// Globally qualified, human-readable label suitable for fleet exchange.
+    pub fn qualified_label(&self) -> String {
+        match &self.identity {
+            RepositoryIdentity::Remote { canonical_remote } => {
+                canonical_remote.split_once("://").map_or_else(|| canonical_remote.clone(), |(_, label)| label.to_string())
+            }
+            RepositoryIdentity::Local { .. } => identity_description(&self.identity),
+        }
+    }
+}
+
+/// Human-readable labels for a repository catalog.
+///
+/// Repository keys remain opaque identity. Remote presentation uses the
+/// forge's `owner/repository` slug; local repositories use their leaf slug.
+/// The full readable identity is the fallback when those labels collide.
+pub fn repository_display_labels<'a>(
+    repositories: impl IntoIterator<Item = (&'a RepositoryKey, &'a RepositorySpec)>,
+) -> BTreeMap<RepositoryKey, String> {
+    let repositories = repositories.into_iter().collect::<Vec<_>>();
+    let candidates = repositories
+        .iter()
+        .map(|(key, spec)| {
+            let label = spec.forge().map_or_else(|| spec.leaf_slug(), |forge| forge.repository.clone());
+            ((*key).clone(), label)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut candidate_counts = BTreeMap::<String, usize>::new();
+    for label in candidates.values() {
+        *candidate_counts.entry(label.clone()).or_default() += 1;
+    }
+
+    repositories
+        .into_iter()
+        .map(|(key, spec)| {
+            let candidate = &candidates[key];
+            let label = if candidate_counts[candidate] == 1 { candidate.clone() } else { spec.qualified_label() };
+            (key.clone(), label)
+        })
+        .collect()
 }
 
 pub async fn ensure_repository(
