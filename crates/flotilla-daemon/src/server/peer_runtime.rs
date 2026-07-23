@@ -285,6 +285,7 @@ impl PeerRuntime {
                                 }
                                 Err(e) => {
                                     warn!(target = %target_label.0, err = %e, %attempt, "reconnection failed");
+                                    sync_peer_query_state(&pm, &daemon_for_cleanup).await;
                                     attempt = attempt.saturating_add(1);
                                 }
                             }

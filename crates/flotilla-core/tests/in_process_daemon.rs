@@ -2554,6 +2554,8 @@ async fn list_hosts_counts_remote_repo_overlay_and_get_topology_returns_mirrored
             direct: false,
             connected: true,
             fallbacks: vec![test_node("backup-relay")],
+            last_attempt: None,
+            last_error: None,
         }])
         .await;
 
@@ -2597,6 +2599,8 @@ async fn get_topology_includes_configured_but_disconnected_peers() {
             direct: true,
             connected: true,
             fallbacks: vec![],
+            last_attempt: None,
+            last_error: None,
         }])
         .await;
 

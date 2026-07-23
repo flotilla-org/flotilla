@@ -1355,3 +1355,29 @@ async fn get_sender_if_current_returns_sender_for_matching_generation() {
     assert!(mgr.get_sender_if_current(&NodeId::new("peer"), generation + 1).is_none());
     assert!(mgr.get_sender_if_current(&NodeId::new("unknown"), 1).is_none());
 }
+
+#[test]
+fn topology_exposes_the_most_recent_dial_error_for_a_configured_peer() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let label = ConfigLabel("feta".into());
+    let peer = NodeId::new("feta");
+    mgr.add_configured_target(
+        label.clone(),
+        HostName::new("feta"),
+        Some(peer.clone()),
+        Box::new(MockTransport::new().with_remote_node(NodeInfo::new(peer.clone(), "feta"))),
+    );
+    let _generation = accepted_generation(mgr.activate_connection(peer.clone(), MockPeerSender::discard(), ConnectionMeta {
+        direction: ConnectionDirection::Outbound,
+        config_label: Some(label.clone()),
+        expected_peer: Some(peer.clone()),
+        config_backed: true,
+    }));
+
+    mgr.note_dial_attempt(&label);
+    mgr.note_dial_result(&label, Err("peer closed before sending hello"));
+
+    let route = mgr.topology_routes().into_iter().find(|route| route.target.node_id == peer).expect("feta route");
+    assert!(route.last_attempt.is_some());
+    assert_eq!(route.last_error.as_deref(), Some("peer closed before sending hello"));
+}

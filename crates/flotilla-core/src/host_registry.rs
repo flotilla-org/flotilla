@@ -760,7 +760,15 @@ fn build_topology(local_node: &NodeInfo, routes: &[TopologyRoute], configured_pe
         }
         if !routes.iter().any(|r| r.target.node_id == *node_id) {
             let node = NodeInfo::new(node_id.clone(), display_name.clone());
-            all_routes.push(TopologyRoute { target: node.clone(), next_hop: node, direct: true, connected: false, fallbacks: vec![] });
+            all_routes.push(TopologyRoute {
+                target: node.clone(),
+                next_hop: node,
+                direct: true,
+                connected: false,
+                fallbacks: vec![],
+                last_attempt: None,
+                last_error: None,
+            });
         }
     }
 

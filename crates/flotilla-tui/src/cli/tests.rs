@@ -204,6 +204,8 @@ mod status_human {
                 direct: false,
                 connected: true,
                 fallbacks: vec![NodeInfo::new(NodeId::new("backup"), "backup")],
+                last_attempt: None,
+                last_error: None,
             }],
         };
 
