@@ -177,6 +177,7 @@ impl SqliteBackend {
                     namespace TEXT NOT NULL,
                     name TEXT NOT NULL,
                     body_json TEXT NOT NULL,
+                    last_synced_at TEXT NOT NULL,
                     PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
                 );
 
@@ -194,6 +195,38 @@ impl SqliteBackend {
                 "#,
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
+        let has_replica_object_sync_timestamp = {
+            let mut statement = connection
+                .prepare("PRAGMA table_info(replica_objects)")
+                .map_err(|err| Self::map_sqlite(err, "inspect sqlite replica object schema"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|err| Self::map_sqlite(err, "query sqlite replica object schema"))?;
+            columns
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| Self::map_sqlite(err, "read sqlite replica object schema"))?
+                .iter()
+                .any(|column| column == "last_synced_at")
+        };
+        if !has_replica_object_sync_timestamp {
+            connection
+                .execute_batch(
+                    r#"
+                    ALTER TABLE replica_objects ADD COLUMN last_synced_at TEXT;
+                    UPDATE replica_objects
+                    SET last_synced_at = (
+                        SELECT c.last_synced_at
+                        FROM replica_cursors c
+                        WHERE c.origin_root = replica_objects.origin_root
+                          AND c.group_name = replica_objects.group_name
+                          AND c.version = replica_objects.version
+                          AND c.kind = replica_objects.kind
+                          AND c.namespace = replica_objects.namespace
+                    );
+                    "#,
+                )
+                .map_err(|err| Self::map_sqlite(err, "migrate sqlite replica object timestamps"))?;
+        }
         let startup_diagnostics = Self::diagnostics_from_connection(connection, event_retention)?;
         if !startup_diagnostics.warnings.is_empty() {
             tracing::warn!(
@@ -409,14 +442,8 @@ impl SqliteBackend {
             let mut statement = connection
                 .prepare(
                     r#"
-                    SELECT o.origin_root, c.last_synced_at, o.body_json
+                    SELECT o.origin_root, o.last_synced_at, o.body_json
                     FROM replica_objects o
-                    JOIN replica_cursors c
-                      ON c.origin_root = o.origin_root
-                     AND c.group_name = o.group_name
-                     AND c.version = o.version
-                     AND c.kind = o.kind
-                     AND c.namespace = o.namespace
                     WHERE o.group_name = ?1 AND o.version = ?2 AND o.kind = ?3 AND o.namespace = ?4
                     ORDER BY o.origin_root, o.name
                     "#,
@@ -529,10 +556,11 @@ impl SqliteBackend {
                 for (name, body) in &encoded {
                     tx.execute(
                         r#"
-                        INSERT INTO replica_objects (origin_root, group_name, version, kind, namespace, name, body_json)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        INSERT INTO replica_objects
+                            (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                         "#,
-                        params![origin, key.0, key.1, key.2, key.3, name, body],
+                        params![origin, key.0, key.1, key.2, key.3, name, body, synced],
                     )
                     .map_err(|err| Self::map_sqlite(err, "insert sqlite replica object"))?;
                 }
@@ -608,12 +636,14 @@ impl SqliteBackend {
                 StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
                     tx.execute(
                         r#"
-                        INSERT INTO replica_objects (origin_root, group_name, version, kind, namespace, name, body_json)
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        INSERT INTO replica_objects
+                            (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                         ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
-                        DO UPDATE SET body_json = excluded.body_json
+                        DO UPDATE SET body_json = excluded.body_json,
+                                      last_synced_at = excluded.last_synced_at
                         "#,
-                        params![origin, key.0, key.1, key.2, key.3, name, body],
+                        params![origin, key.0, key.1, key.2, key.3, name, body, synced],
                     )
                     .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
                 }

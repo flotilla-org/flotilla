@@ -189,6 +189,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let remote = remote_backend.using::<Convoy>("flotilla");
     remote.create(&convoy_meta("remote"), &convoy_spec("remote-template")).await.expect("create remote convoy");
+    remote.create(&convoy_meta("untouched"), &convoy_spec("untouched-template")).await.expect("create untouched remote convoy");
     let remote_list = remote.list().await.expect("list remote convoy");
     let synced_at = Utc::now();
 
@@ -198,7 +199,7 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     assert_eq!(local_only.items.iter().map(|item| item.metadata.name.as_str()).collect::<Vec<_>>(), ["local"]);
 
     let all = backend.including_replicas::<Convoy>("flotilla").list().await.expect("list resources including replicas");
-    assert_eq!(all.items.len(), 2);
+    assert_eq!(all.items.len(), 3);
     assert!(matches!(all.items[0].provenance, ResourceProvenance::Local));
     let replica = all.items.iter().find(|item| item.object.metadata.name == "remote").expect("remote replica row");
     assert_eq!(replica.provenance, ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: synced_at });
@@ -219,15 +220,33 @@ pub async fn assert_replica_read_view_contract(backend: ResourceBackend) {
     assert_eq!(cursor.generation, remote_list.generation);
 
     let mut watch = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch resources including replicas");
+    let remote_object = remote.get("remote").await.expect("get remote convoy before update");
+    remote
+        .update(&convoy_meta("remote"), &remote_object.metadata.resource_version, &convoy_spec("updated-template"))
+        .await
+        .expect("update one remote convoy");
+    let modified = remote.watch(WatchStart::resuming_from(&remote_list)).await.expect("watch remote update").next().await;
+    let modified = modified.expect("remote update event").expect("valid remote update");
+    let updated_sync = synced_at + chrono::Duration::seconds(1);
+    backend.replica_writer::<Convoy>(origin.clone(), "flotilla").apply(modified, updated_sync).await.expect("apply remote update");
+    let modified_event = timeout(Duration::from_secs(1), watch.next()).await.expect("replica update watch timeout");
+    assert!(matches!(modified_event, Some(Ok(flotilla_resources::ReadWatchEvent::Modified(_)))));
+    let after_update = backend.including_replicas::<Convoy>("flotilla").list().await.expect("list after replica update");
+    let updated = after_update.items.iter().find(|item| item.object.metadata.name == "remote").expect("updated replica row");
+    assert_eq!(updated.provenance, ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: updated_sync });
+    let untouched = after_update.items.iter().find(|item| item.object.metadata.name == "untouched").expect("untouched replica row");
+    assert_eq!(untouched.provenance, ResourceProvenance::Replica { origin_root: origin.clone(), last_synced_at: synced_at });
+
+    let before_delete = remote.list().await.expect("list before remote delete");
     remote.delete("remote").await.expect("delete remote convoy");
-    let deleted = remote.watch(WatchStart::resuming_from(&remote_list)).await.expect("watch remote delete").next().await;
+    let deleted = remote.watch(WatchStart::resuming_from(&before_delete)).await.expect("watch remote delete").next().await;
     let deleted = deleted.expect("remote delete event").expect("valid remote delete");
     backend.replica_writer::<Convoy>(origin, "flotilla").apply(deleted, Utc::now()).await.expect("apply remote delete");
 
     let event = timeout(Duration::from_secs(1), watch.next()).await.expect("replica delete watch timeout");
     assert!(matches!(event, Some(Ok(flotilla_resources::ReadWatchEvent::Deleted(_)))));
     let remaining = backend.including_replicas::<Convoy>("flotilla").list().await.expect("list after replica delete");
-    assert_eq!(remaining.items.len(), 1);
+    assert_eq!(remaining.items.len(), 2);
 
     let mut new_generation = remote.list().await.expect("list new origin generation");
     new_generation.generation = Some("generation-2".to_string());
