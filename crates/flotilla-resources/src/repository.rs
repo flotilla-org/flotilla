@@ -114,6 +114,13 @@ impl RepositorySpec {
         }
     }
 
+    /// Canonical value for the cross-producer `vcs.repo` fact: a forge slug
+    /// when one exists, otherwise the globally qualified `host:path`
+    /// Repository identity.
+    pub fn fact_slug(&self) -> String {
+        self.forge.as_ref().map_or_else(|| self.qualified_label(), |forge| forge.repository.clone())
+    }
+
     /// Globally qualified, human-readable label suitable for fleet exchange.
     pub fn qualified_label(&self) -> String {
         match &self.identity {
@@ -326,4 +333,18 @@ fn ssh_remote_host(remote: &str) -> Option<&str> {
         authority.rsplit_once('@').map_or(authority, |(_, host)| host)
     };
     Some(host)
+}
+
+#[cfg(test)]
+mod fact_dialect_tests {
+    use super::RepositorySpec;
+
+    #[test]
+    fn repo_fact_uses_forge_slug_with_host_path_fallback() {
+        let forge = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("forge repository");
+        let local = RepositorySpec::local("feta", "/srv/flotilla/.git").expect("local repository");
+
+        assert_eq!(forge.fact_slug(), "flotilla-org/flotilla");
+        assert_eq!(local.fact_slug(), "feta:/srv/flotilla/.git");
+    }
 }

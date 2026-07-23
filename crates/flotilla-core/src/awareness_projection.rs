@@ -3,7 +3,7 @@
 //! This module is deliberately pure: callers inject the row windows they
 //! already hold and choose the grouping parameter at query time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::Utc;
 use flotilla_protocol::{
@@ -14,6 +14,8 @@ use flotilla_protocol::{
 use flotilla_resources::{api_version, Project, Resource};
 
 use crate::salience::{evaluate_entry, SalienceFacts};
+
+const REPO_FACT_ANNOTATION: &str = "vcs.repo";
 
 #[derive(Debug, Clone, Default)]
 pub struct AwarenessInput {
@@ -71,6 +73,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .as_of(as_of)
                 .refs(vec![convoy.resource.clone()])
                 .issue_refs(convoy.issues.iter().map(|issue| issue.reference.clone()).collect())
+                .annotations(repo_fact_annotations(convoy.repo.as_ref()))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -89,6 +92,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                     .phase(AwarenessPhase::Work(vessel.phase))
                     .as_of(as_of)
                     .refs(refs)
+                    .annotations(repo_fact_annotations(convoy.repo.as_ref()))
                     .build(),
                 &input.salience,
                 &ancestors,
@@ -142,6 +146,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .state(AwarenessState::Active)
                 .as_of(as_of)
                 .refs(vec![checkout.resource.clone()])
+                .annotations(HashMap::from([(REPO_FACT_ANNOTATION.to_string(), checkout.repo_label.clone())]))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -177,6 +182,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .phase(AwarenessPhase::Session(independent.phase))
                 .as_of(as_of)
                 .refs(vec![independent.resource.clone()])
+                .annotations(repo_fact_annotations(independent.repo.as_ref()))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -210,6 +216,10 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
         })
         .collect();
     (rows, input.state)
+}
+
+fn repo_fact_annotations(repo: Option<&flotilla_protocol::RepoKey>) -> HashMap<String, String> {
+    repo.map(|repo| HashMap::from([(REPO_FACT_ANNOTATION.to_string(), repo.0.clone())])).unwrap_or_default()
 }
 
 fn awareness_family_summaries(entries: &[AwarenessEntry]) -> Vec<AwarenessFamilySummary> {

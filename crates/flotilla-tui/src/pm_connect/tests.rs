@@ -150,7 +150,7 @@ fn rebuild_prefers_awareness_transport_when_available() {
     assert!(patches.iter().any(|patch| {
         patch.target
             == MetadataTarget::Group(GroupPath(vec![
-                GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform"),
+                GroupSegment::text(SEGMENT_PROJECT, "platform"),
                 GroupSegment::text(SEGMENT_ISSUE, "issue/flotilla-org/flotilla/862").with_label("#862 awareness band"),
             ]))
     }));

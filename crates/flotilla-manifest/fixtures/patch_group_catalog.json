@@ -51,7 +51,7 @@
     "kind": "group",
     "value": [
       {
-        "key": "git.repo",
+        "key": "vcs.repo",
         "value": {
           "type": "text",
           "value": "flotilla-org/flotilla"

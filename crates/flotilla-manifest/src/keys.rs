@@ -17,6 +17,8 @@ pub const SOURCE_CONNECTOR: &str = "flotilla-connector";
 pub const SOURCE_ATTACH: &str = "flotilla-attach";
 /// Source id for tab stamps published by the workspace actuator.
 pub const SOURCE_ACTUATOR: &str = "flotilla-actuator";
+/// Producer provenance exposed as a fact for presentation surfaces.
+pub const SOURCE_FLOTILLA: &str = "flotilla";
 
 /// TTL for catalog facts. Pane/tab stamps carry no TTL: they are facts about
 /// the binding, not about the daemon being alive.
@@ -36,6 +38,7 @@ pub const KEY_SESSION: &str = "flotilla.session";
 /// Denormalized binding facts: survive daemon outages and give grouping
 /// rules something direct to match on.
 pub const KEY_VESSEL: &str = "flotilla.vessel";
+/// Canonical `<namespace>/<convoy>` resource identity.
 pub const KEY_CONVOY: &str = "flotilla.convoy";
 pub const KEY_NAMESPACE: &str = "flotilla.namespace";
 pub const KEY_HOST: &str = "flotilla.host";
@@ -57,6 +60,8 @@ pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
 
 // Cross-producer vocabulary (proposed for the Leg-1 freeze, design §6/§9).
 
+/// Producer provenance suitable for a surface badge.
+pub const KEY_SOURCE: &str = "source";
 /// Badge state: `idle | waiting | active | done | failed`.
 pub const KEY_STATUS_STATE: &str = "status.state";
 /// Boolean: needs a human/crew look.
@@ -83,10 +88,11 @@ pub const KEY_FACTORY_ID: &str = "factory.id";
 
 // GroupPath segment keys (design §4).
 
-/// Project segment key — deliberately the same spelling the git-watcher
-/// uses, so flotilla groups and git-watcher groups collide into one project
-/// cluster (v0; Leg 1 renames both producers to `vcs.repo` at once).
-pub const SEGMENT_PROJECT: &str = "git.repo";
+/// Project resource-name segment. Only Project knowledge may mint it.
+pub const SEGMENT_PROJECT: &str = "flotilla.project";
+/// Canonical forge slug, or the Repository's `host:path` fallback when it
+/// has no forge slug. Shared with repository observers such as git-watcher.
+pub const SEGMENT_REPO: &str = "vcs.repo";
 pub const SEGMENT_CONVOY: &str = "flotilla.convoy";
 pub const SEGMENT_VESSEL: &str = "flotilla.vessel";
 pub const SEGMENT_ISSUE: &str = "flotilla.issue";

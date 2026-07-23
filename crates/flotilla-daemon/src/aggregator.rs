@@ -1655,7 +1655,7 @@ impl Aggregator {
             .phase(convoy_phase(phase))
             .initializing(convoy_is_initializing(status))
             .maybe_message(status.and_then(|status| status.message.clone()))
-            .maybe_repo(convoy.metadata.labels.get(flotilla_resources::REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
+            .maybe_repo(self.convoy_repo_fact(convoy).map(flotilla_protocol::RepoKey))
             .maybe_started_at(status.and_then(|status| status.started_at))
             .maybe_finished_at(status.and_then(|status| status.finished_at))
             .maybe_observed_workflow_ref(status.and_then(|status| status.observed_workflow_ref.clone()))
@@ -1676,6 +1676,14 @@ impl Aggregator {
             .vessels(vessels)
             .needs_attention(needs_attention)
             .build()
+    }
+
+    fn convoy_repo_fact(&self, convoy: &ResourceObject<Convoy>) -> Option<String> {
+        match convoy.spec.repositories.as_slice() {
+            [snapshot] => self.repositories.get(&snapshot.repo_ref).map(|repository| repository.spec.fact_slug()),
+            [] => None,
+            _ => None,
+        }
     }
 
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
@@ -2638,6 +2646,23 @@ mod tests {
             rows: Vec::new(),
             result_sets: state.local_result_sets().await,
         }
+    }
+
+    #[tokio::test]
+    async fn convoy_repo_fact_comes_from_single_repository_knowledge() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(1);
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx);
+        let repository = repository_object("https://github.com/flotilla-org/flotilla").await;
+        let repository_key = repository.spec.key();
+        aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
+        let mut convoy = convoy_with_branch("dialect").await;
+        convoy.spec.repositories[0].repo_ref = repository_key;
+        let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "dialect");
+
+        let row = aggregator.summarize(&reference, &convoy);
+
+        assert_eq!(row.repo, Some(flotilla_protocol::RepoKey("flotilla-org/flotilla".to_string())));
     }
 
     #[tokio::test]

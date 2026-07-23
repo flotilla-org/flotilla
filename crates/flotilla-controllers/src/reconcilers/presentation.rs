@@ -20,14 +20,14 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_manifest::{
-    projection::{project_segment, vessel_factory_id, vessel_group_path},
+    projection::{project_segment, repo_segment, vessel_factory_id, vessel_group_path},
     stamp::WorkspaceStamp,
 };
 use flotilla_protocol::{arg, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    Convoy, Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
-    TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL, REPO_LABEL,
+    Convoy, Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, Repository, ResourceBackend, ResourceError,
+    ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -209,6 +209,7 @@ pub struct PresentationReconciler<R> {
     environments: TypedResolver<Environment>,
     hosts: TypedResolver<Host>,
     convoys: TypedResolver<Convoy>,
+    repositories: TypedResolver<Repository>,
     hop_chain: HopChainContext,
     policies: Arc<PresentationPolicyRegistry>,
 }
@@ -226,7 +227,8 @@ impl<R> PresentationReconciler<R> {
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             hosts: backend.clone().using::<Host>(namespace),
-            convoys: backend.using::<Convoy>(namespace),
+            convoys: backend.clone().using::<Convoy>(namespace),
+            repositories: backend.using::<Repository>(namespace),
             hop_chain,
             policies,
         }
@@ -280,9 +282,16 @@ impl<R> PresentationReconciler<R> {
         // project segment.
         let scope = match self.convoys.get(convoy_name).await {
             Ok(convoy) => {
-                let project =
-                    project_segment(convoy.spec.project_ref.as_deref(), convoy.metadata.labels.get(REPO_LABEL).map(String::as_str));
-                Some(vessel_group_path(project, namespace, convoy_name, vessel))
+                let project = project_segment(convoy.spec.project_ref.as_deref());
+                let repo_value = match convoy.spec.repositories.as_slice() {
+                    [snapshot] => {
+                        self.repositories.get(&snapshot.repo_ref.to_string()).await.ok().map(|repository| repository.spec.fact_slug())
+                    }
+                    [] => None,
+                    _ => None,
+                };
+                let repo = repo_segment(repo_value.as_deref());
+                Some(vessel_group_path(project, repo, namespace, convoy_name, vessel))
             }
             Err(err) => {
                 warn!(%err, convoy = %convoy_name, "convoy lookup failed; stamping workspace without a scope");
