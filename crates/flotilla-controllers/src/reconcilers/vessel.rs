@@ -7,12 +7,12 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, CrewSource, DockerCheckoutStrategy,
-    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, Stance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
-    VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
+    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
+    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource,
+    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -239,6 +239,14 @@ impl Reconciler for VesselReconciler {
         } else {
             None
         };
+        let clone_directory_slugs = if strategy.needs_shared_clone() {
+            let repository_catalog = self.repositories.list().await?;
+            let keyed_repositories =
+                repository_catalog.items.iter().map(|repository| (repository.spec.key(), &repository.spec)).collect::<Vec<_>>();
+            repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)))
+        } else {
+            BTreeMap::new()
+        };
 
         let precreated_environment_ref = match &strategy {
             PlacementStrategy::DockerFreshCloneInContainer { host_ref, image, env, .. } => {
@@ -320,7 +328,7 @@ impl Reconciler for VesselReconciler {
                 let clone_path = format!(
                     "{}/{}",
                     shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
-                    repo_key
+                    clone_directory_slugs.get(&repository_key).expect("repository catalog should contain the convoy repository")
                 );
                 match self.clones.get(&clone_name).await {
                     Ok(existing) => {
@@ -374,7 +382,7 @@ impl Reconciler for VesselReconciler {
                         checkout_target_path(
                             shared_clone_root.as_deref().expect("shared-clone placement has a root"),
                             &convoy_checkout_slug,
-                            &repository.spec.catalog_slug(),
+                            &convoy_repository.workspace_slug,
                             checkout_slug.as_deref().expect("repository checkout requires a branch"),
                         )
                     }

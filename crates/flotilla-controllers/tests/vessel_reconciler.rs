@@ -276,8 +276,8 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
     let first_path = checkout_path(&first_outcome);
     let second_path = checkout_path(&second_outcome);
 
-    assert_eq!(first_path, "/Users/alice/dev/flotilla-repos/convoy-one/github-com-flotilla-org-flotilla.feat-task-provisioning");
-    assert_eq!(second_path, "/Users/alice/dev/flotilla-repos/convoy-two/github-com-flotilla-org-flotilla.feat-task-provisioning");
+    assert_eq!(first_path, "/Users/alice/dev/flotilla-repos/convoy-one/flotilla.feat-task-provisioning");
+    assert_eq!(second_path, "/Users/alice/dev/flotilla-repos/convoy-two/flotilla.feat-task-provisioning");
     assert_ne!(first_path, second_path);
 }
 
@@ -822,7 +822,15 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
     let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.fetch_dependencies(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
-    assert_eq!(outcome.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateClone { .. })).count(), 1);
+    let clone = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateClone { spec, .. } => Some(spec),
+            _ => None,
+        })
+        .expect("scoped repository clone should be created");
+    assert_eq!(clone.path, "/Users/alice/dev/flotilla-repos/cleat");
     let (checkout_name, checkout) = outcome
         .actuations
         .iter()

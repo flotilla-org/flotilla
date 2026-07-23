@@ -3090,26 +3090,6 @@ pub struct AddRepoOutcome {
     pub identity_change: Option<RepositoryIdentityChange>,
 }
 
-fn normalize_workspace_slug(candidate: &str) -> String {
-    let normalized = candidate
-        .chars()
-        .map(|character| if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-    let normalized = if normalized.is_empty() { "repository" } else { &normalized };
-    normalized.chars().take(48).collect::<String>().trim_matches('-').to_string()
-}
-
-fn disambiguate_workspace_slug(slug: &str, repo_ref: &RepositoryKey) -> String {
-    let suffix = repo_ref.0.chars().take(8).collect::<String>();
-    let max_base_len = 48_usize.saturating_sub(suffix.len() + 1);
-    let base = slug.chars().take(max_base_len).collect::<String>().trim_matches('-').to_string();
-    format!("{base}-{suffix}")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectTargetSyntax {
     ExplicitPath,
@@ -3670,7 +3650,7 @@ impl InProcessDaemon {
             .map_err(|error| format!("project {project_ref} is not ready: {error}"))?;
         let repositories = self.resource_backend.clone().using::<Repository>(namespace);
         let mut unresolved = Vec::new();
-        let mut snapshots = BTreeMap::<RepositoryKey, (String, String, String, Option<String>, BTreeSet<String>)>::new();
+        let mut snapshots = BTreeMap::<RepositoryKey, (String, RepositorySpec, Option<String>, BTreeSet<String>)>::new();
         for entry in &project.spec.repositories {
             match repositories.get(&entry.repo.to_string()).await {
                 Ok(repository) => {
@@ -3686,20 +3666,20 @@ impl InProcessDaemon {
                         }
                     };
                     let base_ref = entry.default_branch.clone().or_else(|| repository.status.as_ref()?.default_branch.clone());
-                    let snapshot = snapshots.entry(entry.repo.clone()).or_insert_with(|| {
-                        (url, repository.spec.leaf_slug(), repository.spec.catalog_slug(), base_ref.clone(), BTreeSet::new())
-                    });
-                    if snapshot.3 != base_ref {
+                    let snapshot = snapshots
+                        .entry(entry.repo.clone())
+                        .or_insert_with(|| (url, repository.spec.clone(), base_ref.clone(), BTreeSet::new()));
+                    if snapshot.2 != base_ref {
                         unresolved.push(format!("repository {} has conflicting project default branches", entry.repo));
                     }
                     if let Some(subpath) = &entry.subpath {
-                        snapshot.4.insert(subpath.clone());
+                        snapshot.3.insert(subpath.clone());
                     }
                 }
                 Err(error) => unresolved.push(format!("repository {}: {error}", entry.repo)),
             }
         }
-        for (repo_ref, (_, _, _, base_ref, _)) in &snapshots {
+        for (repo_ref, (_, _, base_ref, _)) in &snapshots {
             if base_ref.is_none() {
                 unresolved.push(format!("repository {repo_ref} has no resolved default branch"));
             }
@@ -3708,42 +3688,15 @@ impl InProcessDaemon {
             return Err(format!("project {project_ref} is not ready: {}", unresolved.join("; ")));
         }
 
-        let leaf_slugs = snapshots
-            .iter()
-            .map(|(repo_ref, (_, leaf_slug, _, _, _))| (repo_ref.clone(), normalize_workspace_slug(leaf_slug)))
-            .collect::<BTreeMap<_, _>>();
-        let mut leaf_slug_counts = BTreeMap::<String, usize>::new();
-        for slug in leaf_slugs.values() {
-            *leaf_slug_counts.entry(slug.clone()).or_default() += 1;
-        }
-        let candidate_slugs = snapshots
-            .iter()
-            .map(|(repo_ref, (_, _, catalog_slug, _, _))| {
-                let leaf_slug = &leaf_slugs[repo_ref];
-                let slug = if leaf_slug_counts[leaf_slug] == 1 { leaf_slug.clone() } else { normalize_workspace_slug(catalog_slug) };
-                (repo_ref.clone(), slug)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut candidate_slug_counts = BTreeMap::<String, usize>::new();
-        for slug in candidate_slugs.values() {
-            *candidate_slug_counts.entry(slug.clone()).or_default() += 1;
-        }
+        let workspace_slugs = flotilla_resources::repository_workspace_slugs(snapshots.iter().map(|(key, (_, spec, _, _))| (key, spec)));
         let mut repositories = snapshots
             .into_iter()
-            .map(|(repo_ref, (url, _, _, base_ref, subpaths))| {
-                let candidate = &candidate_slugs[&repo_ref];
-                let workspace_slug = if candidate_slug_counts[candidate] == 1 {
-                    candidate.clone()
-                } else {
-                    disambiguate_workspace_slug(candidate, &repo_ref)
-                };
-                ConvoyRepositorySpec {
-                    url,
-                    repo_ref,
-                    base_ref: base_ref.expect("missing base refs were rejected"),
-                    workspace_slug,
-                    subpaths: subpaths.into_iter().collect(),
-                }
+            .map(|(repo_ref, (url, _, base_ref, subpaths))| ConvoyRepositorySpec {
+                url,
+                workspace_slug: workspace_slugs[&repo_ref].clone(),
+                repo_ref,
+                base_ref: base_ref.expect("missing base refs were rejected"),
+                subpaths: subpaths.into_iter().collect(),
             })
             .collect::<Vec<_>>();
         repositories.sort_by(|left, right| left.workspace_slug.cmp(&right.workspace_slug).then_with(|| left.repo_ref.cmp(&right.repo_ref)));
@@ -6077,13 +6030,10 @@ impl InProcessDaemon {
                         .and_then(|status| status.default_branch.clone())
                         .or_else(|| if adopted_checkout.is_some() { r#ref.clone() } else { None })
                         .ok_or_else(|| format!("repository {repo_ref} has no resolved default branch"))?;
-                    Ok::<_, String>(vec![ConvoyRepositorySpec {
-                        url,
-                        repo_ref,
-                        base_ref,
-                        workspace_slug: normalize_workspace_slug(&repository_spec.leaf_slug()),
-                        subpaths: Vec::new(),
-                    }])
+                    let workspace_slug = flotilla_resources::repository_workspace_slugs([(&repo_ref, &repository_spec)])
+                        .remove(&repo_ref)
+                        .expect("repository slug should resolve");
+                    Ok::<_, String>(vec![ConvoyRepositorySpec { url, repo_ref, base_ref, workspace_slug, subpaths: Vec::new() }])
                 }
                 .await;
                 match resolved {
