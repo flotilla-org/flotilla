@@ -31,6 +31,16 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Channel buffer size for inbound and outbound peer data messages.
 const CHANNEL_BUFFER: usize = 256;
 
+pub(crate) fn peer_resource_socket_path(peer_resource_socket_dir: &Path, config_label: &ConfigLabel) -> Result<PathBuf, String> {
+    // Sanitise: reject labels containing path separators to prevent path
+    // traversal (e.g. `../` in hosts.toml).
+    let name_str = config_label.0.as_str();
+    if name_str.contains('/') || name_str.contains('\\') || name_str.contains('\0') {
+        return Err(format!("peer host name must not contain path separators: {name_str:?}"));
+    }
+    Ok(peer_resource_socket_dir.join(format!("{}.sock", config_label.0)))
+}
+
 struct ChannelPeerSender {
     tx: tokio::sync::Mutex<Option<mpsc::Sender<PeerWireMessage>>>,
 }
@@ -97,13 +107,7 @@ impl SshTransport {
         local_session_id: uuid::Uuid,
         state_dir: &Path,
     ) -> Result<Self, String> {
-        // Sanitise: reject host names containing path separators to prevent
-        // path traversal (e.g. `../` in hosts.toml).
-        let name_str = config_label.0.as_str();
-        if name_str.contains('/') || name_str.contains('\\') || name_str.contains('\0') {
-            return Err(format!("peer host name must not contain path separators: {name_str:?}"));
-        }
-        let local_socket_path = state_dir.join("peers").join(format!("{}.sock", config_label.0));
+        let local_socket_path = peer_resource_socket_path(&state_dir.join("peers"), &config_label)?;
         let expected_host_name = HostName::new(&config.expected_host_name);
 
         Ok(Self {

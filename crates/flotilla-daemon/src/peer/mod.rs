@@ -13,6 +13,7 @@ pub use manager::{
     ReversePathKey, RouteHop, RouteState,
 };
 pub use merge::merge_provider_data;
+pub(crate) use ssh_transport::peer_resource_socket_path;
 pub use ssh_transport::SshTransport;
 pub use transport::{PeerConnectionStatus, PeerSender, PeerTransport};
 

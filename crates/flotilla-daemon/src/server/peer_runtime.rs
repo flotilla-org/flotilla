@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -9,7 +9,8 @@ use flotilla_core::{
     daemon::DaemonHandle, in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest,
 };
 use flotilla_protocol::{
-    DaemonEvent, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepositoryKey, RoutedPeerMessage,
+    ConfigLabel, DaemonEvent, NodeId, NodeInfo, PeerConnectionState, PeerDataMessage, PeerWireMessage, RepoIdentity, RepositoryKey,
+    RoutedPeerMessage,
 };
 use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
@@ -19,7 +20,7 @@ use super::{
     remote_commands::RemoteCommandRouter, replicator::spawn_peer_replicators, shared::sync_peer_query_state, PeerConnectedNotice,
     SshTransport,
 };
-use crate::peer::{dispatch_pending_sends, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
+use crate::peer::{dispatch_pending_sends, peer_resource_socket_path, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
 pub(super) enum ForwardResult {
     Disconnected,
@@ -116,6 +117,14 @@ enum PostHandleAction {
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(90);
 
+fn resource_socket_path_for(resource_socket_dir: Option<&Path>, target_label: &ConfigLabel) -> Option<PathBuf> {
+    resource_socket_dir.and_then(|directory| {
+        peer_resource_socket_path(directory, target_label)
+            .inspect_err(|error| warn!(target = %target_label.0, %error, "invalid peer resource socket path"))
+            .ok()
+    })
+}
+
 #[derive(bon::Builder)]
 #[builder(builder_type(vis = "pub(super)"))]
 pub(super) struct PeerRuntime {
@@ -190,9 +199,7 @@ impl PeerRuntime {
                             let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
                                 peer: peer_name.clone(),
                                 generation,
-                                resource_socket_path: resource_socket_dir
-                                    .as_ref()
-                                    .map(|directory| directory.join(format!("{}.sock", target_label.0))),
+                                resource_socket_path: resource_socket_path_for(resource_socket_dir.as_deref(), &target_label),
                             });
                             last_known_session_id = {
                                 let pm_lock = pm.lock().await;
@@ -272,9 +279,7 @@ impl PeerRuntime {
                                     let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
                                         peer: peer_name.clone(),
                                         generation,
-                                        resource_socket_path: resource_socket_dir
-                                            .as_ref()
-                                            .map(|directory| directory.join(format!("{}.sock", target_label.0))),
+                                        resource_socket_path: resource_socket_path_for(resource_socket_dir.as_deref(), &target_label),
                                     });
                                     attempt = 1;
                                     let sender = {
