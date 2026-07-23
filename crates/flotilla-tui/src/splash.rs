@@ -75,6 +75,9 @@ pub fn splash_scale(img_w: f64, img_h: f64, area_w: u16, area_h: u16, pixel_font
 
 #[cfg(test)]
 mod tests {
+    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui_image::{picker::Picker, StatefulImage};
+
     use super::splash_scale;
 
     const IMG: (f64, f64) = (1024.0, 559.0);
@@ -83,6 +86,23 @@ mod tests {
         let cells_w = (IMG.0 * scale).floor();
         let cells_h = (IMG.1 * scale / 2.0).floor();
         (cells_w * font.0 as f64, cells_h * font.1 as f64)
+    }
+
+    #[test]
+    fn bundled_webp_decodes_and_renders_as_halfblocks() {
+        let image = image::load_from_memory(include_bytes!("../../../assets/splash.webp")).expect("bundled WebP splash should decode");
+        assert_eq!((image.width(), image.height()), (1024, 559));
+
+        let mut protocol = Picker::halfblocks().new_resize_protocol(image);
+        let mut terminal = Terminal::new(TestBackend::new(16, 8)).expect("test terminal");
+        terminal
+            .draw(|frame| frame.render_stateful_widget(StatefulImage::default(), frame.area(), &mut protocol))
+            .expect("splash should render");
+
+        assert!(
+            terminal.backend().buffer().content().iter().any(|cell| matches!(cell.symbol(), "▀" | "▄")),
+            "rendered splash should contain half-block pixels"
+        );
     }
 
     #[test]

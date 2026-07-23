@@ -21,8 +21,9 @@ async-trait = { workspace = true }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tui-input = "0.15"
-ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
-image = "0.25.9"
+ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
+# image 0.25.8+ unconditionally pulls moxcms, even with default features disabled.
+image = { version = "=0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
 unicode-width = "0.2.2"
 dirs = "6"
 catppuccin = { version = "2", features = ["ratatui"] }
