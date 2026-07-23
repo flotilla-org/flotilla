@@ -852,11 +852,11 @@ fn spawn_aggregator_task(
                 aggregator
                     .run(
                         AggregatorResolvers::builder()
-                            .durable_convoys(durable.clone().using::<Convoy>(&namespace))
+                            .durable_convoys(durable.including_replicas::<Convoy>(&namespace))
                             .durable_demands(durable.clone().using::<Demand>(&namespace))
                             .durable_environments(durable.clone().using::<Environment>(&namespace))
                             .durable_presentations(durable.using::<Presentation>(&namespace))
-                            .durable_sessions(durable.using::<flotilla_resources::TerminalSession>(&namespace))
+                            .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
                             .durable_projects(durable.using::<Project>(&namespace))
                             .durable_repositories(durable.using::<Repository>(&namespace))
                             .durable_regards(durable.using::<Regard>(&namespace))

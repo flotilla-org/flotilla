@@ -61,6 +61,10 @@ pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
 pub const KEY_STATUS_STATE: &str = "status.state";
 /// Boolean: needs a human/crew look.
 pub const KEY_STATUS_ATTENTION: &str = "status.attention";
+/// Proposed annotation-tier connectivity fact: `connected | disconnected`.
+/// This is deliberately outside the frozen `status.state` badge vocabulary;
+/// producers do not emit it until the disconnected annotation slice lands.
+pub const KEY_STATUS_CONNECTIVITY: &str = "status.connectivity";
 /// Short human summary line, e.g. "2/3 vessels done".
 pub const KEY_SUMMARY_TEXT: &str = "summary.text";
 /// GroupPath an identity/tab belongs to — the join's catalog half

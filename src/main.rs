@@ -629,7 +629,7 @@ async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&s
                 action: if transient {
                     CommandAction::AttachTransient { reference: reference.to_string(), host: host.map(flotilla_protocol::HostName::new) }
                 } else {
-                    CommandAction::Attach { reference: reference.to_string() }
+                    CommandAction::Attach { reference: reference.to_string(), host: host.map(flotilla_protocol::HostName::new) }
                 },
             },
             uuid::Uuid::new_v4(),
@@ -1528,6 +1528,17 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(SubCommand::Attach { reference, transient: true, host: Some(host) })
+                if reference == "terminal-scratch" && host == "feta"
+        ));
+    }
+
+    #[test]
+    fn cli_parses_host_qualified_materialize_recipe() {
+        let cli = Cli::try_parse_from(["flotilla", "attach", "--host", "feta", "terminal-scratch"])
+            .expect("host-qualified attach cli should parse");
+        assert!(matches!(
+            cli.command,
+            Some(SubCommand::Attach { reference, transient: false, host: Some(host) })
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }

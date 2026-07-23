@@ -204,6 +204,9 @@ pub enum CommandAction {
     },
     Attach {
         reference: String,
+        /// Restrict resolution to the host that advertised the recipe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<crate::HostName>,
     },
     /// Resolve an attach for a temporary foreground excursion. Unlike the
     /// human-facing CLI attach, recursive hops must not stamp PM metadata.
@@ -757,7 +760,7 @@ mod tests {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::Attach { reference: "convoy-a".into() },
+                action: CommandAction::Attach { reference: "convoy-a".into(), host: None },
             },
             Command {
                 node_id: None,

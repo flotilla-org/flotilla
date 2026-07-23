@@ -24,7 +24,7 @@
       "ttl_ms": 30000,
       "value": {
         "type": "text",
-        "value": "flotilla attach implement"
+        "value": "flotilla attach --host 'feta' 'implement'"
       }
     },
     "materialize.target": {

@@ -229,6 +229,27 @@ impl HostRegistry {
             .map(Some)
     }
 
+    pub(crate) async fn host_name_for_node(&self, node_id: &NodeId) -> Option<HostName> {
+        let environment_id = self.node_environments.read().await.get(node_id).cloned()?;
+        self.hosts
+            .read()
+            .await
+            .get(&environment_id)
+            .filter(|state| !state.removed)
+            .and_then(|state| state.summary.as_ref()?.host_name.clone())
+    }
+
+    pub(crate) async fn live_routed_host_name(&self, target_node: &NodeId) -> Option<HostName> {
+        let routes = self.topology_routes.read().await;
+        let route = routes.iter().find(|route| route.target.node_id == *target_node)?;
+        if !route.connected && route.fallbacks.is_empty() {
+            return None;
+        }
+        drop(routes);
+
+        self.host_name_for_node(target_node).await
+    }
+
     pub(crate) async fn replay_host_events(&self, last_seen: &HashMap<StreamKey, u64>) -> Vec<DaemonEvent> {
         let configured = self.configured_peers.read().await.clone();
         let node_connectivity = self.node_connectivity.read().await.clone();

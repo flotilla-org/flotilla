@@ -68,7 +68,7 @@ fn main() {
             ("flotilla.work.phase", update(text("running"), Some(30_000))),
             ("status.state", update(text("active"), Some(30_000))),
             ("materialize.target", update(text("pane"), Some(30_000))),
-            ("materialize.recipe", update(text("flotilla attach implement"), Some(30_000))),
+            ("materialize.recipe", update(text("flotilla attach --host 'feta' 'implement'"), Some(30_000))),
             ("factory.id", update(text("flotilla:convoys/dev/manifest-extraction/implement"), Some(30_000))),
         ],
         vec!["status.attention"],
