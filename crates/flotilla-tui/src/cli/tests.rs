@@ -204,6 +204,8 @@ mod status_human {
                 direct: false,
                 connected: true,
                 fallbacks: vec![NodeInfo::new(NodeId::new("backup"), "backup")],
+                last_attempt: Some(serde_json::from_str("\"2026-07-23T10:15:30Z\"").expect("valid timestamp")),
+                last_error: Some("peer closed before sending hello".to_string()),
             }],
         };
 
@@ -211,6 +213,8 @@ mod status_human {
         assert!(output.contains("remote"));
         assert!(output.contains("relay"));
         assert!(output.contains("backup"));
+        assert!(output.contains("2026-07-23 10:15:30Z"));
+        assert!(output.contains("peer closed before sending hello"));
     }
 }
 

@@ -230,6 +230,7 @@ pub struct MockTransport {
     pub status: PeerConnectionStatus,
     sender: Option<Arc<dyn PeerSender>>,
     remote_node: Option<NodeInfo>,
+    subscribe_error: Option<String>,
 }
 
 impl Default for MockTransport {
@@ -240,17 +241,22 @@ impl Default for MockTransport {
 
 impl MockTransport {
     pub fn new() -> Self {
-        Self { status: PeerConnectionStatus::Connected, sender: None, remote_node: None }
+        Self { status: PeerConnectionStatus::Connected, sender: None, remote_node: None, subscribe_error: None }
     }
 
     pub fn with_sender() -> (Self, Arc<Mutex<Vec<PeerWireMessage>>>) {
         let (mock_sender, sent) = MockPeerSender::new();
         let sender: Arc<dyn PeerSender> = Arc::new(mock_sender);
-        (Self { status: PeerConnectionStatus::Connected, sender: Some(sender), remote_node: None }, sent)
+        (Self { status: PeerConnectionStatus::Connected, sender: Some(sender), remote_node: None, subscribe_error: None }, sent)
     }
 
     pub fn with_remote_node(mut self, node: NodeInfo) -> Self {
         self.remote_node = Some(node);
+        self
+    }
+
+    pub fn with_subscribe_error(mut self, error: impl Into<String>) -> Self {
+        self.subscribe_error = Some(error.into());
         self
     }
 }
@@ -276,6 +282,9 @@ impl PeerTransport for MockTransport {
     }
 
     async fn subscribe(&mut self) -> Result<tokio::sync::mpsc::Receiver<PeerWireMessage>, String> {
+        if let Some(error) = self.subscribe_error.take() {
+            return Err(error);
+        }
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)
     }

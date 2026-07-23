@@ -1931,6 +1931,8 @@ async fn attach_query_uses_topology_next_hop_for_multi_hop_route_shape() {
             direct: false,
             connected: true,
             fallbacks: vec![],
+            last_attempt: None,
+            last_error: None,
         }])
         .await;
 
@@ -2174,6 +2176,8 @@ async fn attach_query_reports_route_that_points_back_to_local_host() {
             direct: false,
             connected: true,
             fallbacks: vec![],
+            last_attempt: None,
+            last_error: None,
         }])
         .await;
 

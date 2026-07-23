@@ -322,6 +322,12 @@ pub struct TopologyRoute {
     pub connected: bool,
     #[serde(default)]
     pub fallbacks: Vec<NodeInfo>,
+    /// Most recent dial attempt for this configured direct peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt: Option<DateTime<Utc>>,
+    /// Error from the most recent failed dial. Cleared after a successful dial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[cfg(test)]
@@ -488,6 +494,8 @@ mod tests {
                 direct: false,
                 connected: true,
                 fallbacks: vec![NodeInfo::new(NodeId::new("node-backup-relay-1"), "Backup Relay")],
+                last_attempt: None,
+                last_error: None,
             }],
         };
 

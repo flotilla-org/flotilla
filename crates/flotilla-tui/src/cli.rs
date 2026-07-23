@@ -269,7 +269,7 @@ fn format_topology_human(response: &TopologyResponse) -> String {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Target", "Via", "Direct", "Connected", "Fallbacks"]);
+    table.set_header(vec!["Target", "Via", "Direct", "Connected", "Last attempt", "Last error", "Fallbacks"]);
     for route in &response.routes {
         let fallbacks = if route.fallbacks.is_empty() {
             "-".to_string()
@@ -281,6 +281,10 @@ fn format_topology_human(response: &TopologyResponse) -> String {
             Cell::new(node_label(&route.next_hop)),
             Cell::new(if route.direct { "yes" } else { "no" }),
             Cell::new(if route.connected { "yes" } else { "no" }),
+            Cell::new(
+                route.last_attempt.map(|attempt| attempt.format("%Y-%m-%d %H:%M:%SZ").to_string()).unwrap_or_else(|| "-".to_string()),
+            ),
+            Cell::new(route.last_error.as_deref().unwrap_or("-")),
             Cell::new(fallbacks),
         ]);
     }

@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostName, HostSummary, NodeId, NodeInfo,
     PeerDataKind, PeerDataMessage, PeerWireMessage, ProviderData, RepoIdentity, RepositoryKey, RoutedPeerMessage, Step, StepOutcome,
@@ -172,6 +173,12 @@ struct ConfiguredPeerTarget {
     transport: Box<dyn PeerTransport>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PeerDialStatus {
+    last_attempt: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredPeerTargetInfo {
     pub label: ConfigLabel,
@@ -264,11 +271,16 @@ pub struct PerRepoPeerState {
 pub struct PeerManager {
     local_node_id: NodeId,
     configured_targets: HashMap<ConfigLabel, ConfiguredPeerTarget>,
+    peer_dial_status: HashMap<ConfigLabel, PeerDialStatus>,
     senders: HashMap<NodeId, Arc<dyn PeerSender>>,
     active_connections: HashMap<NodeId, ActiveConnection>,
     displaced_senders: HashMap<(NodeId, u64), Arc<dyn PeerSender>>,
     reconnect_suppressed_until: HashMap<NodeId, Instant>,
     transport_peers: HashMap<ConfigLabel, NodeId>,
+    /// Last node identity learned for each configured transport. Unlike
+    /// `transport_peers`, this survives disconnect so topology diagnostics
+    /// remain attributable while retries are failing.
+    learned_transport_peers: HashMap<ConfigLabel, NodeId>,
     generations: HashMap<NodeId, u64>,
     routes: HashMap<NodeId, RouteState>,
     /// TODO: expire abandoned reverse-path entries when routed replies time out
@@ -305,11 +317,13 @@ impl PeerManager {
         Self {
             local_node_id,
             configured_targets: HashMap::new(),
+            peer_dial_status: HashMap::new(),
             senders: HashMap::new(),
             active_connections: HashMap::new(),
             displaced_senders: HashMap::new(),
             reconnect_suppressed_until: HashMap::new(),
             transport_peers: HashMap::new(),
+            learned_transport_peers: HashMap::new(),
             generations: HashMap::new(),
             routes: HashMap::new(),
             reverse_paths: HashMap::new(),
@@ -356,6 +370,15 @@ impl PeerManager {
         info!(target = %label.0, expected_host = %expected_host_name, expected_node_id = ?expected_node_id, "registered configured peer target");
         let connection_address = transport.connection_address();
         self.configured_targets.insert(label, ConfiguredPeerTarget { expected_host_name, expected_node_id, connection_address, transport });
+    }
+
+    pub fn note_dial_attempt(&mut self, label: &ConfigLabel) {
+        self.peer_dial_status.entry(label.clone()).or_default().last_attempt = Some(Utc::now());
+    }
+
+    pub fn note_dial_result(&mut self, label: &ConfigLabel, result: Result<(), &str>) {
+        let status = self.peer_dial_status.entry(label.clone()).or_default();
+        status.last_error = result.err().map(str::to_string);
     }
 
     /// Register or replace a sender for a connected peer.
@@ -584,7 +607,8 @@ impl PeerManager {
         self.install_direct_route(&host, generation);
 
         if let Some(label) = meta.config_label {
-            self.transport_peers.insert(label, host);
+            self.transport_peers.insert(label.clone(), host.clone());
+            self.learned_transport_peers.insert(label, host);
         }
 
         ActivationResult::Accepted { generation, displaced }
@@ -1308,11 +1332,32 @@ impl PeerManager {
                     direct: route.primary.next_hop == *target,
                     connected: self.route_hop_is_live(&route.primary),
                     fallbacks: fallbacks.into_iter().map(|hop| self.node_info_for(&hop.next_hop)).collect(),
+                    last_attempt: self
+                        .configured_label_for_node(target)
+                        .and_then(|label| self.peer_dial_status.get(label))
+                        .and_then(|status| status.last_attempt),
+                    last_error: self
+                        .configured_label_for_node(target)
+                        .and_then(|label| self.peer_dial_status.get(label))
+                        .and_then(|status| status.last_error.clone()),
                 }
             })
             .collect();
         routes.sort_by(|a, b| a.target.node_id.cmp(&b.target.node_id));
         routes
+    }
+
+    fn configured_label_for_node(&self, node_id: &NodeId) -> Option<&ConfigLabel> {
+        self.active_connections
+            .get(node_id)
+            .and_then(|active| active.meta.config_label.as_ref())
+            .or_else(|| self.transport_peers.iter().find_map(|(label, node)| (node == node_id).then_some(label)))
+            .or_else(|| self.learned_transport_peers.iter().find_map(|(label, node)| (node == node_id).then_some(label)))
+            .or_else(|| {
+                self.configured_targets
+                    .iter()
+                    .find_map(|(label, target)| (target.expected_node_id.as_ref() == Some(node_id)).then_some(label))
+            })
     }
 
     /// Snapshot relay targets without performing any async sends.
@@ -1340,6 +1385,7 @@ impl PeerManager {
         let labels: Vec<ConfigLabel> = self.configured_targets.keys().cloned().collect();
         let mut receivers = Vec::new();
         for label in labels {
+            self.note_dial_attempt(&label);
             let connect_result = if let Some(target) = self.configured_targets.get_mut(&label) {
                 let transport = &mut target.transport;
                 match transport.connect().await {
@@ -1360,6 +1406,7 @@ impl PeerManager {
                 Ok((sender, subscribe_result, remote_node, remote_session_id)) => {
                     let Some(remote_node) = remote_node else {
                         warn!(target = %label.0, "peer transport connected without remote node identity");
+                        self.note_dial_result(&label, Err("peer transport connected without remote node identity"));
                         if let Some(target) = self.configured_targets.get_mut(&label) {
                             let _ = target.transport.disconnect().await;
                         }
@@ -1385,6 +1432,8 @@ impl PeerManager {
                                 displaced_generation
                             }
                             ActivationResult::Rejected { .. } => {
+                                let error = format!("connection for {name} lost duplicate arbitration");
+                                self.note_dial_result(&label, Err(&error));
                                 if let Some(target) = self.configured_targets.get_mut(&label) {
                                     let _ = target.transport.disconnect().await;
                                 }
@@ -1399,15 +1448,22 @@ impl PeerManager {
                     }
                     match subscribe_result {
                         Ok(rx) => {
+                            self.note_dial_result(&label, Ok(()));
                             receivers.push(ConnectedConfiguredPeer { label: label.clone(), node: remote_node, generation, inbound_rx: rx })
                         }
                         Err(e) => {
                             warn!(peer = %name, target = %label.0, err = %e, "failed to subscribe to peer");
+                            self.note_dial_result(&label, Err(&e));
+                            let _ = self.disconnect_peer(&name, generation);
+                            if let Some(target) = self.configured_targets.get_mut(&label) {
+                                let _ = target.transport.disconnect().await;
+                            }
                         }
                     }
                 }
                 Err(e) => {
                     warn!(target = %label.0, err = %e, "failed to connect peer transport");
+                    self.note_dial_result(&label, Err(&e));
                 }
             }
         }
@@ -1586,7 +1642,8 @@ impl PeerManager {
             }
         }
 
-        let (sender, rx, remote_node, remote_session_id) = {
+        self.note_dial_attempt(label);
+        let result = async {
             let target = self.configured_targets.get_mut(label).ok_or_else(|| format!("unknown configured target: {}", label.0))?;
             let transport = &mut target.transport;
 
@@ -1597,10 +1654,22 @@ impl PeerManager {
             let rx = transport.subscribe().await?;
             let remote_node = transport.remote_node_info();
             let remote_session_id = transport.remote_session_id();
-            (sender, rx, remote_node, remote_session_id)
+            Ok::<_, String>((sender, rx, remote_node, remote_session_id))
+        }
+        .await;
+        let (sender, rx, remote_node, remote_session_id) = match result {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.note_dial_result(label, Err(&error));
+                return Err(error);
+            }
         };
 
-        let remote_node = remote_node.ok_or_else(|| format!("configured target {} connected without remote node identity", label.0))?;
+        let Some(remote_node) = remote_node else {
+            let error = format!("configured target {} connected without remote node identity", label.0);
+            self.note_dial_result(label, Err(&error));
+            return Err(error);
+        };
         let name = remote_node.node_id.clone();
 
         let mut generation = 0;
@@ -1624,7 +1693,9 @@ impl PeerManager {
                     if let Some(target) = self.configured_targets.get_mut(label) {
                         let _ = target.transport.disconnect().await;
                     }
-                    return Err(format!("connection for {name} lost duplicate arbitration"));
+                    let error = format!("connection for {name} lost duplicate arbitration");
+                    self.note_dial_result(label, Err(&error));
+                    return Err(error);
                 }
             };
             if let Some(displaced_generation) = displaced {
@@ -1634,6 +1705,7 @@ impl PeerManager {
             }
         }
 
+        self.note_dial_result(label, Ok(()));
         Ok(ConnectedConfiguredPeer { label: label.clone(), node: remote_node, generation, inbound_rx: rx })
     }
 

@@ -1355,3 +1355,32 @@ async fn get_sender_if_current_returns_sender_for_matching_generation() {
     assert!(mgr.get_sender_if_current(&NodeId::new("peer"), generation + 1).is_none());
     assert!(mgr.get_sender_if_current(&NodeId::new("unknown"), 1).is_none());
 }
+
+#[tokio::test]
+async fn failed_subscription_is_torn_down_diagnosed_and_retried() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let label = ConfigLabel("feta".into());
+    let peer = NodeId::new("feta");
+    let (transport, _sent) = MockTransport::with_sender();
+    mgr.add_configured_target(
+        label.clone(),
+        HostName::new("feta"),
+        Some(peer.clone()),
+        Box::new(transport.with_remote_node(NodeInfo::new(peer.clone(), "feta")).with_subscribe_error("peer closed before sending hello")),
+    );
+
+    assert!(mgr.connect_all().await.is_empty(), "failed subscription must not produce an owned connection");
+    assert!(mgr.resolve_sender(&peer).is_err(), "failed subscription must tear down the activated sender");
+
+    let route = mgr.topology_routes().into_iter().find(|route| route.target.node_id == peer).expect("feta route");
+    assert!(!route.connected);
+    assert!(route.last_attempt.is_some());
+    assert_eq!(route.last_error.as_deref(), Some("peer closed before sending hello"));
+
+    let connection = mgr.reconnect_target(&label).await.expect("next retry should establish a fully subscribed connection");
+    assert_eq!(connection.node.node_id, peer);
+    assert!(mgr.resolve_sender(&peer).is_ok());
+    let route = mgr.topology_routes().into_iter().find(|route| route.target.node_id == peer).expect("feta route after retry");
+    assert!(route.connected);
+    assert_eq!(route.last_error, None);
+}

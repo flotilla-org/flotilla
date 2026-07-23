@@ -437,6 +437,8 @@ async fn dispatch_host_query_methods_round_trip() {
             direct: false,
             connected: true,
             fallbacks: vec![],
+            last_attempt: None,
+            last_error: None,
         }])
         .await;
 
