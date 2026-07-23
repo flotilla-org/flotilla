@@ -111,6 +111,26 @@ durable replica area, resume from the stored version on reconnect.
 - The `FleetReplicaSnapshot` broadcast path and the Plane-A peer transport
   under it are **subsumed and deletable** — the deletion ADR 0002 promised.
 
+## The read side is store-level, not per-consumer
+
+*(Amendment, 2026-07-23 openable-latent grill.)* The "merge function over
+{own log, replica per peer}" is implemented **once, in the store's read
+layer**: list/watch grows an **include-replicas** option whose returned
+replica rows are origin-tagged and staleness-stamped. Consumers (aggregator,
+fleet views, CLI listing) opt in by asking; nobody hand-assembles a second
+watch over the replica area. Two invariants by construction, not convention:
+
+- **Local-only is the default.** A consumer that doesn't ask sees exactly
+  what it saw before replication existed — reconcilers therefore never
+  encounter a replica row, preserving "home-bound runtime is reconciled
+  only at home".
+- **The include-replicas view is read-only by type.** A write through it is
+  an API error, not a policy violation.
+
+Class-specific merge (MV-register for definitions, natural-key union for
+convergent facts) slots in as branches of this same read layer when those
+classes arrive; home-bound runtime needs no branch — the replica is the view.
+
 ## Deletion is an authored tombstone; tombstones are permanent
 
 You only ever write your own log, so delete is an ordinary authored write

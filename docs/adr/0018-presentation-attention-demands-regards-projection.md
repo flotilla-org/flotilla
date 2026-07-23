@@ -144,6 +144,30 @@ awareness queries → latent presence; searchlight → materialized attachments;
 materialize missing, retract expired, latent the marginal. Reconcile-on-
 connect (#835) is this convergence run at connect time.
 
+Three refinements from the openable-latent grill (2026-07-23):
+
+- **Latent tabs are a sanctioned rendering**: a surface may draw latents
+  *in place in its working-set idiom* — a dimmed tab where the live tab
+  would be, carrying the entry's metadata ("this tab could exist; here is
+  its metadata"). Latent-vs-live is the surface's join: an entry whose
+  group has a materialized member carrying the identity is live. The
+  constraints stay: presence data comes from awareness queries, and only
+  materialized attachments are working-set members — latent tabs are
+  indicators, not curation.
+- **The materialize recipe is an address, not a promise.** The capability
+  fact gates *listing* on best-known state; the recipe (`flotilla attach
+  <ref>`) re-resolves through the live hop chain at execution and fails
+  honestly. For remote-placed vessels the fact derives from replicas
+  (ADR 0016), so it is stale-affirmative by up to the watch latency —
+  bounded by minting **only while the origin peer's route is live**.
+  Recipes vanish on peer disconnect; hours-stale affirmation is a lie,
+  seconds-stale is honest.
+- **"Disconnected" becomes a visible state eventually** — as an
+  annotation-tier fact on the affected entries (the presentation twin of
+  marking peer hosts unready), never a new member of the frozen
+  `status.state` vocabulary. Until built, recipe absence is the only
+  signal.
+
 Surfaces report **realization and focus observations** back to the mesh —
 one channel feeding regard decay, demand routing, and attention telemetry —
 which preserves observability without maintaining a mirror desired-layer
