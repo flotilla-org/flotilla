@@ -15,6 +15,7 @@ mod principal_attention;
 mod project;
 mod provisioning_identity;
 mod registry;
+mod replica;
 mod repository;
 mod resource;
 mod retention;
@@ -25,7 +26,7 @@ mod vessel;
 mod watch;
 mod workflow_template;
 
-pub use backend::{ResourceBackend, TypedResolver};
+pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use checkout::{
     Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutStatusPatch,
     CheckoutWorktreeSpec, ConditionValue, FreshCloneCheckoutSpec, IntegrationCondition, LandedEvidence, ObservedCheckoutSpec,
@@ -64,9 +65,11 @@ pub use project::{
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, repo_key};
 pub use registry::{
-    apply_resource_document, get_resource_kind, list_resource_kind, resource_list_api_version, watch_resource_kind, DynamicResourceList,
-    DynamicResourceObject, DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
+    apply_resource_document, get_resource_kind, list_resource_kind, list_resource_kind_including_replicas, resource_list_api_version,
+    watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas, DynamicResourceList, DynamicResourceObject,
+    DynamicResourceWatch, RegisteredResourceKind, REGISTERED_RESOURCE_KINDS,
 };
+pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
     ensure_repository, resolve_default_branch, DefaultBranchObservation, DefaultBranchProvenance, ForgeIdentity, Repository,
     RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryStatus,

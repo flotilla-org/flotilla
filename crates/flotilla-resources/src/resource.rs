@@ -67,6 +67,7 @@ pub trait Resource: Send + Sync + 'static {
     type StatusPatch: StatusPatch<Self::Status>;
 
     const API_PATHS: ApiPaths;
+    const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 
     fn validate_spec_update(_current: &Self::Spec, _requested: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())

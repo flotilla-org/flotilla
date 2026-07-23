@@ -241,6 +241,9 @@ struct ResourceListArgs {
     /// Route the query to a peer host
     #[arg(long)]
     host: Option<String>,
+    /// Include read-only replicas from peer roots
+    #[arg(long)]
+    include_replicas: bool,
 }
 
 #[derive(clap::Args)]
@@ -722,7 +725,11 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                         node_id,
                         provisioning_target: None,
                         context_repo: None,
-                        action: CommandAction::QueryResourceList { namespace: args.namespace, kind: args.kind },
+                        action: CommandAction::QueryResourceList {
+                            namespace: args.namespace,
+                            kind: args.kind,
+                            include_replicas: args.include_replicas,
+                        },
                     },
                     uuid::Uuid::new_v4(),
                 )
@@ -809,7 +816,12 @@ async fn run_resource_watch(cli: &Cli, args: ResourceListArgs, format: OutputFor
             node_id,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ResourceWatch { namespace: args.namespace, kind: args.kind },
+            action: CommandAction::ResourceWatch {
+                namespace: args.namespace,
+                kind: args.kind,
+                include_replicas: args.include_replicas,
+                cursor: None,
+            },
         })
         .await
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
@@ -1442,7 +1454,7 @@ mod tests {
         assert!(matches!(
             list.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::List(ResourceListArgs { kind, namespace, host: Some(host) })
+                command: ResourceSubCommand::List(ResourceListArgs { kind, namespace, host: Some(host), include_replicas: false })
             }) if kind == "convoys" && namespace == "flotilla" && host == "feta"
         ));
 
@@ -1470,7 +1482,7 @@ mod tests {
         assert!(matches!(
             watch.command,
             Some(SubCommand::Resource {
-                command: ResourceSubCommand::Watch(ResourceListArgs { kind, namespace, host: None })
+                command: ResourceSubCommand::Watch(ResourceListArgs { kind, namespace, host: None, include_replicas: false })
             }) if kind == "terminalsessions" && namespace == "flotilla"
         ));
     }

@@ -14,7 +14,10 @@ use futures::future::join_all;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use super::{remote_commands::RemoteCommandRouter, shared::sync_peer_query_state, PeerConnectedNotice, SshTransport};
+use super::{
+    remote_commands::RemoteCommandRouter, replicator::spawn_peer_replicators, shared::sync_peer_query_state, PeerConnectedNotice,
+    SshTransport,
+};
 use crate::peer::{dispatch_pending_sends, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
 pub(super) enum ForwardResult {
@@ -201,6 +204,7 @@ impl PeerRuntime {
                                 }
                             }
                             let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                            remote_command_router_for_cleanup.fail_pending_remote_commands_for_host(&peer_name).await;
                             remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                             if plan.was_active {
                                 daemon_for_cleanup
@@ -273,6 +277,7 @@ impl PeerRuntime {
                                         }
                                     }
                                     let plan = disconnect_peer_and_rebuild(&pm, &daemon_for_cleanup, &peer_name, generation).await;
+                                    remote_command_router_for_cleanup.fail_pending_remote_commands_for_host(&peer_name).await;
                                     remote_command_router_for_cleanup.fail_pending_remote_steps_for_host(&peer_name).await;
                                     if plan.was_active {
                                         daemon_for_cleanup
@@ -615,6 +620,7 @@ impl PeerRuntime {
         });
 
         let outbound_daemon = Arc::clone(&self.daemon);
+        let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tokio::spawn(async move {
             let mut event_rx = outbound_daemon.subscribe();
@@ -627,6 +633,11 @@ impl PeerRuntime {
                     notice = peer_connected_rx.recv() => {
                         let Some(notice) = notice else { break };
                         debug!(peer = %notice.peer, generation = notice.generation, "sending local state to newly connected peer");
+                        spawn_peer_replicators(
+                            outbound_remote_command_router.clone(),
+                            Arc::clone(&outbound_daemon),
+                            notice.peer.clone(),
+                        );
                         send_local_to_peer(
                             &outbound_daemon,
                             &outbound_peer_manager,

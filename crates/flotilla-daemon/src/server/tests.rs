@@ -788,7 +788,12 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
             node_id: Some(node("feta")),
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ResourceWatch { namespace: "flotilla".into(), kind: "convoys".into() },
+            action: CommandAction::ResourceWatch {
+                namespace: "flotilla".into(),
+                kind: "convoys".into(),
+                include_replicas: false,
+                cursor: None,
+            },
         })
         .await
         .expect("dispatch_execute should succeed");
@@ -806,7 +811,12 @@ async fn dispatch_execute_remote_resource_watch_routes_through_peer_manager() {
                 node_id: Some(node("feta")),
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::ResourceWatch { namespace: "flotilla".into(), kind: "convoys".into() }
+                action: CommandAction::ResourceWatch {
+                    namespace: "flotilla".into(),
+                    kind: "convoys".into(),
+                    include_replicas: false,
+                    cursor: None,
+                }
             });
         }
         other => panic!("expected routed command request, got {other:?}"),

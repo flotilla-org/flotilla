@@ -587,6 +587,28 @@ impl RemoteCommandRouter {
         }
     }
 
+    pub(super) async fn fail_pending_remote_commands_for_host(&self, node_id: &NodeId) {
+        let failed = {
+            let mut pending = self.pending_remote_commands.lock().await;
+            pending.extract_if(|_, entry| entry.target_node_id == *node_id).map(|(_, entry)| entry).collect::<Vec<_>>()
+        };
+        for entry in failed {
+            let message = format!("remote command peer disconnected: {node_id}");
+            if let Some(completion) = entry.query_completion {
+                let _ = completion.send(CommandValue::Error { message });
+                continue;
+            }
+            let repo_identity = entry.repo_identity.unwrap_or_else(|| RepoIdentity { authority: "local".into(), path: String::new() });
+            self.daemon.send_event(DaemonEvent::CommandFinished {
+                command_id: entry.command_id,
+                node_id: node_id.clone(),
+                repo_identity,
+                repo: entry.repo,
+                result: CommandValue::Error { message },
+            });
+        }
+    }
+
     async fn execute_forwarded_command(
         &self,
         request_id: u64,

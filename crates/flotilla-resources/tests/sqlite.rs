@@ -8,9 +8,10 @@ use common::{
         assert_consumer_relists_after_expired_watch_and_converges_with_backend, assert_create_get_list_roundtrip_with_backend,
         assert_delete_emits_event_with_backend, assert_identical_status_update_is_noop_with_backend,
         assert_identical_update_is_noop_with_backend, assert_metadata_roundtrip_with_backend, assert_namespace_isolation_with_backend,
-        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend, assert_stale_resource_version_conflicts_with_backend,
-        assert_store_diagnostics_report_retained_events_with_backend, assert_watch_from_version_replays_with_backend,
-        assert_watch_now_semantics_with_backend, assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
+        assert_repeated_delete_with_pending_finalizers_is_noop_with_backend, assert_replica_read_view_contract,
+        assert_stale_resource_version_conflicts_with_backend, assert_store_diagnostics_report_retained_events_with_backend,
+        assert_watch_from_version_replays_with_backend, assert_watch_now_semantics_with_backend,
+        assert_watch_only_does_not_create_resource_stream_diagnostics_with_backend,
         assert_watch_retention_expires_only_versions_below_floor_with_backend, ConvoyFixture, DemandFixture, RegardFixture,
     },
     convoy_meta, convoy_spec, convoy_status, pending_task_state, resource_meta, TestLoopHarness,
@@ -18,9 +19,9 @@ use common::{
 use flotilla_controllers::reconcilers::VesselReconciler;
 use flotilla_resources::{
     controller::{Actuation, ControllerLoop, Reconciler},
-    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, NoStatusPatch, Resource, ResourceBackend, ResourceError,
-    SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart, WorkPhase,
-    WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
+    ApiPaths, Convoy, ConvoyPhase, ConvoyReconciler, EventRetention, InMemoryBackend, NoStatusPatch, Resource, ResourceBackend,
+    ResourceError, SqliteBackend, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselSpec, WatchEvent, WatchStart,
+    WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
@@ -154,6 +155,34 @@ macro_rules! resource_contract_tests {
 resource_contract_tests!(convoy_contract, ConvoyFixture);
 resource_contract_tests!(regard_contract, RegardFixture);
 resource_contract_tests!(demand_contract, DemandFixture);
+
+#[tokio::test]
+async fn replica_read_view_contract() {
+    assert_replica_read_view_contract(backend()).await;
+}
+
+#[tokio::test]
+async fn replica_rows_and_cursor_survive_backend_restart() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("resources.sqlite");
+    let origin = flotilla_protocol::NodeId::new("feta-root");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    source.using::<Convoy>("flotilla").create(&convoy_meta("remote"), &convoy_spec("template")).await.expect("create source convoy");
+    let listed = source.using::<Convoy>("flotilla").list().await.expect("list source convoy");
+
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open sqlite backend"));
+        backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, Utc::now()).await.expect("persist replica");
+    }
+
+    let reopened = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen sqlite backend"));
+    let replicas = reopened.including_replicas::<Convoy>("flotilla").list().await.expect("list persisted replicas");
+    assert_eq!(replicas.items.len(), 1);
+    assert_eq!(replicas.items[0].object.metadata.name, "remote");
+    let cursor =
+        reopened.replica_writer::<Convoy>(origin, "flotilla").cursor().await.expect("read persisted cursor").expect("persisted cursor");
+    assert_eq!(cursor.resource_version, listed.resource_version);
+}
 
 #[tokio::test]
 async fn objects_and_resource_versions_survive_restart() {

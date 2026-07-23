@@ -720,7 +720,11 @@ async fn resource_list_and_get_queries_return_wire_json() {
                 node_id: None,
                 provisioning_target: None,
                 context_repo: None,
-                action: CommandAction::QueryResourceList { namespace: "flotilla".to_string(), kind: "convoys".to_string() },
+                action: CommandAction::QueryResourceList {
+                    namespace: "flotilla".to_string(),
+                    kind: "convoys".to_string(),
+                    include_replicas: false,
+                },
             },
             uuid::Uuid::new_v4(),
         )
@@ -773,7 +777,12 @@ async fn resource_watch_emits_initial_resources_as_wire_events() {
             node_id: None,
             provisioning_target: None,
             context_repo: None,
-            action: CommandAction::ResourceWatch { namespace: "flotilla".to_string(), kind: "convoys".to_string() },
+            action: CommandAction::ResourceWatch {
+                namespace: "flotilla".to_string(),
+                kind: "convoys".to_string(),
+                include_replicas: false,
+                cursor: None,
+            },
         })
         .await
         .expect("watch command");
@@ -793,6 +802,72 @@ async fn resource_watch_emits_initial_resources_as_wire_events() {
 
     daemon.cancel(command_id).await.expect("cancel watch");
     assert!(matches!(recv_command_finished(&mut rx, command_id).await, CommandValue::Cancelled));
+}
+
+#[tokio::test]
+async fn resource_watch_resumes_after_a_stored_cursor_without_relisting() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let convoys = daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+    convoys
+        .create(
+            &InputMeta::builder().name("before-cursor".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create initial convoy");
+    let cursor = convoys.list().await.expect("list cursor").resource_version;
+
+    let mut rx = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ResourceWatch {
+                namespace: "flotilla".to_string(),
+                kind: "convoys".to_string(),
+                include_replicas: false,
+                cursor: Some(flotilla_protocol::ResourceWatchCursor { resource_version: cursor, generation: None }),
+            },
+        })
+        .await
+        .expect("resume watch command");
+
+    let bookmark = loop {
+        match recv_event(&mut rx).await {
+            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
+                let StepStatus::Produced { value } = status else { continue };
+                let CommandValue::ResourceWatchEvent(event) = *value else { continue };
+                break event;
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(bookmark.event["type"], "BOOKMARK");
+
+    convoys
+        .create(
+            &InputMeta::builder().name("after-cursor".to_string()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("wf".to_string()).build(),
+        )
+        .await
+        .expect("create convoy after cursor");
+    let added = loop {
+        match recv_event(&mut rx).await {
+            DaemonEvent::CommandStepUpdate { command_id: id, status, .. } if id == command_id => {
+                let StepStatus::Produced { value } = status else { continue };
+                let CommandValue::ResourceWatchEvent(event) = *value else { continue };
+                if event.event["type"] == "ADDED" {
+                    break event;
+                }
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(added.event["object"]["metadata"]["name"], "after-cursor");
+    daemon.cancel(command_id).await.expect("cancel resumed watch");
 }
 
 async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBackend, image: &str, agent_adapters: BTreeSet<String>) {

@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 
 use crate::{
     api_version, Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList, ObjectMeta,
-    OwnerReference, PlacementPolicy, Presentation, Project, Regard, Repository, Resource, ResourceBackend, ResourceError, ResourceList,
-    ResourceObject, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    OwnerReference, PlacementPolicy, Presentation, Project, ReadWatchEvent, Regard, Repository, Resource, ResourceBackend, ResourceError,
+    ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,8 @@ pub struct DynamicResourceWatch {
     pub kind: String,
     pub plural: String,
     pub namespace: String,
+    pub resource_version: String,
+    pub generation: Option<String>,
     pub initial: Vec<Value>,
     pub stream: BoxStream<'static, Result<Value, ResourceError>>,
 }
@@ -146,6 +148,14 @@ pub async fn list_resource_kind(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, list_typed(backend, namespace).await)
 }
 
+pub async fn list_resource_kind_including_replicas(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+) -> Result<DynamicResourceList, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, list_typed_including_replicas(backend, namespace).await)
+}
+
 pub async fn get_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
@@ -160,7 +170,24 @@ pub async fn watch_resource_kind(
     namespace: &str,
     requested_kind: &str,
 ) -> Result<DynamicResourceWatch, ResourceError> {
-    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace).await)
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, None).await)
+}
+
+pub async fn watch_resource_kind_from(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+    start: WatchStart,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, Some(start)).await)
+}
+
+pub async fn watch_resource_kind_including_replicas(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed_including_replicas(backend, namespace).await)
 }
 
 pub async fn apply_resource_document(
@@ -250,6 +277,25 @@ async fn list_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) -> 
     })
 }
 
+async fn list_typed_including_replicas<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<DynamicResourceList, ResourceError> {
+    let listed = backend.including_replicas::<T>(namespace).list().await?;
+    let items = listed.items.iter().map(read_object_value).collect::<Result<Vec<_>, _>>()?;
+    Ok(DynamicResourceList {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        value: json!({
+            "apiVersion": api_version(T::API_PATHS),
+            "kind": format!("{}List", T::API_PATHS.kind),
+            "metadata": {"resourceVersion": "overlay"},
+            "items": items,
+        }),
+    })
+}
+
 async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name: &str) -> Result<DynamicResourceObject, ResourceError> {
     let object = backend.using::<T>(namespace).get(name).await?;
     Ok(DynamicResourceObject {
@@ -260,16 +306,64 @@ async fn get_typed<T: Resource>(backend: &ResourceBackend, namespace: &str, name
     })
 }
 
-async fn watch_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<DynamicResourceWatch, ResourceError> {
+async fn watch_typed<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_start: Option<WatchStart>,
+) -> Result<DynamicResourceWatch, ResourceError> {
     let resolver = backend.using::<T>(namespace);
-    let listed = resolver.list().await?;
-    let start = WatchStart::resuming_from(&listed);
-    let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
-    let stream = resolver.watch(start).await?.map(|event| event.and_then(|event| typed_watch_event_value(&event))).boxed();
+    let (resource_version, generation, initial, start) = match requested_start {
+        Some(start) => {
+            let resource_version = match &start {
+                WatchStart::Now => String::new(),
+                WatchStart::FromVersion(resource_version) => resource_version.clone(),
+                WatchStart::FromVersionInGeneration { resource_version, .. } => resource_version.clone(),
+            };
+            let generation = match &start {
+                WatchStart::FromVersionInGeneration { generation, .. } => Some(generation.clone()),
+                _ => None,
+            };
+            (resource_version, generation, Vec::new(), start)
+        }
+        None => {
+            let listed = resolver.list().await?;
+            let initial = listed.items.iter().map(|object| watch_event_value("ADDED", object)).collect::<Result<Vec<_>, _>>()?;
+            (listed.resource_version.clone(), listed.generation.clone(), initial, WatchStart::resuming_from(&listed))
+        }
+    };
+    let watch = resolver.watch(start).await?;
+    let stream_generation = watch.generation().map(ToOwned::to_owned).or(generation);
+    let stream = watch.map(|event| event.and_then(|event| typed_watch_event_value(&event))).boxed();
     Ok(DynamicResourceWatch {
         kind: T::API_PATHS.kind.to_string(),
         plural: T::API_PATHS.plural.to_string(),
         namespace: namespace.to_string(),
+        resource_version,
+        generation: stream_generation,
+        initial,
+        stream,
+    })
+}
+
+async fn watch_typed_including_replicas<T: Resource>(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<DynamicResourceWatch, ResourceError> {
+    let resolver = backend.including_replicas::<T>(namespace);
+    let stream = resolver.watch().await?.map(|event| event.and_then(|event| read_watch_event_value(&event))).boxed();
+    let initial = resolver
+        .list()
+        .await?
+        .items
+        .iter()
+        .map(|object| Ok(json!({"type": "ADDED", "object": read_object_value(object)?})))
+        .collect::<Result<Vec<_>, ResourceError>>()?;
+    Ok(DynamicResourceWatch {
+        kind: T::API_PATHS.kind.to_string(),
+        plural: T::API_PATHS.plural.to_string(),
+        namespace: namespace.to_string(),
+        resource_version: "overlay".to_string(),
+        generation: None,
         initial,
         stream,
     })
@@ -310,6 +404,27 @@ fn list_value<T: Resource>(listed: &ResourceList<T>) -> Result<Value, ResourceEr
 
 fn object_value<T: Resource>(object: &ResourceObject<T>) -> Result<Value, ResourceError> {
     serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(format!("encode resource object: {error}")))
+}
+
+fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<T>) -> Result<Value, ResourceError> {
+    let mut value = object_value(&object.object)?;
+    if let ResourceProvenance::Replica { origin_root, last_synced_at } = &object.provenance {
+        let annotations = value["metadata"]["annotations"]
+            .as_object_mut()
+            .ok_or_else(|| ResourceError::decode("resource metadata annotations are not an object"))?;
+        annotations.insert("flotilla.work/origin-root".to_string(), Value::String(origin_root.to_string()));
+        annotations.insert("flotilla.work/last-synced-at".to_string(), Value::String(last_synced_at.to_rfc3339()));
+    }
+    Ok(value)
+}
+
+fn read_watch_event_value<T: Resource>(event: &ReadWatchEvent<T>) -> Result<Value, ResourceError> {
+    let (event_type, object) = match event {
+        ReadWatchEvent::Added(object) => ("ADDED", object),
+        ReadWatchEvent::Modified(object) => ("MODIFIED", object),
+        ReadWatchEvent::Deleted(object) => ("DELETED", object),
+    };
+    Ok(json!({"type": event_type, "object": read_object_value(object)?}))
 }
 
 fn typed_watch_event_value<T: Resource>(event: &WatchEvent<T>) -> Result<Value, ResourceError> {

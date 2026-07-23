@@ -3,9 +3,19 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, RepositoryKey, Stance};
+use crate::{status_patch::StatusPatch, ApiPaths, ReplicationClass, RepositoryKey, Resource, Stance};
 
-define_resource!(Vessel, "vessels", VesselSpec, VesselStatus, VesselStatusPatch);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vessel;
+
+impl Resource for Vessel {
+    type Spec = VesselSpec;
+    type Status = VesselStatus;
+    type StatusPatch = VesselStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "vessels", kind: "Vessel" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselSpec {

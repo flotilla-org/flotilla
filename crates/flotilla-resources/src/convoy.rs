@@ -4,13 +4,23 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{IssueRef, IssueState, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
-use crate::{resource::define_resource, status_patch::StatusPatch, workflow_template::VesselRequirement, RepositoryKey};
+use crate::{status_patch::StatusPatch, workflow_template::VesselRequirement, ApiPaths, ReplicationClass, RepositoryKey, Resource};
 
 mod reconcile;
 
 pub use reconcile::{reconcile, ConvoyEvent, ConvoyReconciler, ReconcileOutcome};
 
-define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Convoy;
+
+impl Resource for Convoy {
+    type Spec = ConvoySpec;
+    type Status = ConvoyStatus;
+    type StatusPatch = ConvoyStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "convoys", kind: "Convoy" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoySpec {

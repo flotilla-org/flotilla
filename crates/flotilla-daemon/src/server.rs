@@ -3,6 +3,7 @@ pub mod environment_sockets;
 mod peer_connection;
 mod peer_runtime;
 mod remote_commands;
+mod replicator;
 mod request_dispatch;
 mod shared;
 #[cfg(feature = "test-support")]

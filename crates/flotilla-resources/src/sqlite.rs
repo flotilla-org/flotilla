@@ -5,7 +5,8 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use flotilla_protocol::NodeId;
 use futures::{stream, StreamExt};
 use rusqlite::{params, Connection as RusqliteConnection, OptionalExtension};
 use serde_json::Value;
@@ -14,6 +15,7 @@ use tokio_rusqlite::Connection;
 
 use crate::{
     error::ResourceError,
+    replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics},
     watch::{ResourceList, WatchEvent, WatchStart, WatchStream},
@@ -22,6 +24,8 @@ use crate::{
 type StoreKey = (String, String, String, String);
 type WatchSender = mpsc::UnboundedSender<StoredEvent>;
 type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
+type ReplicaWatchSender = mpsc::UnboundedSender<StoredReplicaEvent>;
+type ReplicaWatchersByStore = HashMap<StoreKey, Vec<ReplicaWatchSender>>;
 
 #[derive(Debug, Clone)]
 pub struct SqliteBackend {
@@ -29,6 +33,7 @@ pub struct SqliteBackend {
     // Mutations notify and watches register from the connection thread so a
     // committed event cannot land between replay and live delivery.
     watchers: Arc<Mutex<WatchersByStore>>,
+    replica_watchers: Arc<Mutex<ReplicaWatchersByStore>>,
     event_retention: EventRetention,
 }
 
@@ -92,7 +97,12 @@ impl SqliteBackend {
 
     fn from_connection(mut connection: RusqliteConnection, event_retention: EventRetention) -> Result<Self, ResourceError> {
         Self::initialize_connection(&mut connection, event_retention)?;
-        Ok(Self { connection: connection.into(), watchers: Arc::new(Mutex::new(HashMap::new())), event_retention })
+        Ok(Self {
+            connection: connection.into(),
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            replica_watchers: Arc::new(Mutex::new(HashMap::new())),
+            event_retention,
+        })
     }
 
     async fn from_async_connection(connection: Connection, event_retention: EventRetention) -> Result<Self, ResourceError> {
@@ -100,7 +110,12 @@ impl SqliteBackend {
             .call(move |connection| Self::initialize_connection(connection, event_retention))
             .await
             .map_err(Self::map_connection_error)?;
-        Ok(Self { connection, watchers: Arc::new(Mutex::new(HashMap::new())), event_retention })
+        Ok(Self {
+            connection,
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            replica_watchers: Arc::new(Mutex::new(HashMap::new())),
+            event_retention,
+        })
     }
 
     fn initialize_connection(connection: &mut RusqliteConnection, event_retention: EventRetention) -> Result<(), ResourceError> {
@@ -151,6 +166,29 @@ impl SqliteBackend {
                     namespace TEXT NOT NULL,
                     compacted_through INTEGER NOT NULL,
                     PRIMARY KEY (group_name, version, kind, namespace)
+                );
+
+                CREATE TABLE IF NOT EXISTS replica_objects (
+                    origin_root TEXT NOT NULL,
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    body_json TEXT NOT NULL,
+                    PRIMARY KEY (origin_root, group_name, version, kind, namespace, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS replica_cursors (
+                    origin_root TEXT NOT NULL,
+                    group_name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    resource_version TEXT NOT NULL,
+                    generation TEXT,
+                    last_synced_at TEXT NOT NULL,
+                    PRIMARY KEY (origin_root, group_name, version, kind, namespace)
                 );
                 "#,
             )
@@ -354,6 +392,283 @@ impl SqliteBackend {
                 entries.retain(|watcher| watcher.send(event.clone()).is_ok());
             }
         }
+    }
+
+    fn notify_replica_watchers(watchers: &Mutex<ReplicaWatchersByStore>, key: &StoreKey, event: StoredReplicaEvent) {
+        if let Ok(mut watchers) = watchers.lock() {
+            if let Some(entries) = watchers.get_mut(key) {
+                entries.retain(|watcher| watcher.send(event.clone()).is_ok());
+            }
+        }
+    }
+
+    pub(crate) async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        self.call(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    r#"
+                    SELECT o.origin_root, c.last_synced_at, o.body_json
+                    FROM replica_objects o
+                    JOIN replica_cursors c
+                      ON c.origin_root = o.origin_root
+                     AND c.group_name = o.group_name
+                     AND c.version = o.version
+                     AND c.kind = o.kind
+                     AND c.namespace = o.namespace
+                    WHERE o.group_name = ?1 AND o.version = ?2 AND o.kind = ?3 AND o.namespace = ?4
+                    ORDER BY o.origin_root, o.name
+                    "#,
+                )
+                .map_err(|err| Self::map_sqlite(err, "prepare sqlite replica list"))?;
+            let rows = statement
+                .query_map(params![key.0, key.1, key.2, key.3], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|err| Self::map_sqlite(err, "query sqlite replica list"))?;
+            let mut items = Vec::new();
+            for row in rows {
+                let (origin_root, last_synced_at, body) = row.map_err(|err| Self::map_sqlite(err, "read sqlite replica list row"))?;
+                let value =
+                    serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode replica object JSON: {err}")))?;
+                let last_synced_at = DateTime::parse_from_rfc3339(&last_synced_at)
+                    .map_err(|err| ResourceError::decode(format!("decode replica sync timestamp: {err}")))?
+                    .with_timezone(&Utc);
+                items.push(ReadResourceObject {
+                    object: Self::decode_object(value)?,
+                    provenance: ResourceProvenance::Replica { origin_root: NodeId::new(origin_root), last_synced_at },
+                });
+            }
+            Ok(items)
+        })
+        .await
+    }
+
+    pub(crate) async fn watch_replicas_typed<T: Resource>(
+        &self,
+        namespace: &str,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.replica_watchers
+            .lock()
+            .map_err(|_| ResourceError::other("sqlite replica watch lock poisoned"))?
+            .entry(key)
+            .or_default()
+            .push(tx);
+        Ok(stream::unfold(rx, |mut rx| async {
+            let event = rx.recv().await?;
+            let decoded = Self::decode_object::<T>(event.object).map(|object| {
+                let object = ReadResourceObject {
+                    object,
+                    provenance: ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at },
+                };
+                match event.kind {
+                    StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
+                    StoredReplicaEventKind::Modified => ReadWatchEvent::Modified(object),
+                    StoredReplicaEventKind::Deleted => ReadWatchEvent::Deleted(object),
+                }
+            });
+            Some((decoded, rx))
+        })
+        .boxed())
+    }
+
+    pub(crate) async fn replace_replicas_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        listed: &ResourceList<T>,
+        synced_at: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let operation_key = key.clone();
+        let origin = origin_root.to_string();
+        let generation = listed.generation.clone();
+        let resource_version = listed.resource_version.clone();
+        let synced = synced_at.to_rfc3339();
+        let encoded = listed
+            .items
+            .iter()
+            .map(|object| {
+                Ok((
+                    object.metadata.name.clone(),
+                    serde_json::to_string(&Self::encode_object(object)?)
+                        .map_err(|err| ResourceError::decode(format!("encode replica object JSON: {err}")))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ResourceError>>()?;
+        let events = self
+            .call(move |connection| {
+                let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica replacement"))?;
+                let old = {
+                    let mut statement = tx
+                        .prepare(
+                            r#"
+                            SELECT name, body_json FROM replica_objects
+                            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
+                            "#,
+                        )
+                        .map_err(|err| Self::map_sqlite(err, "prepare old sqlite replicas"))?;
+                    let rows = statement
+                        .query_map(params![origin, key.0, key.1, key.2, key.3], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .map_err(|err| Self::map_sqlite(err, "query old sqlite replicas"))?;
+                    rows.collect::<Result<HashMap<_, _>, _>>().map_err(|err| Self::map_sqlite(err, "read old sqlite replica row"))?
+                };
+                tx.execute(
+                    r#"
+                    DELETE FROM replica_objects
+                    WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
+                    "#,
+                    params![origin, key.0, key.1, key.2, key.3],
+                )
+                .map_err(|err| Self::map_sqlite(err, "clear sqlite replica partition"))?;
+                for (name, body) in &encoded {
+                    tx.execute(
+                        r#"
+                        INSERT INTO replica_objects (origin_root, group_name, version, kind, namespace, name, body_json)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        "#,
+                        params![origin, key.0, key.1, key.2, key.3, name, body],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "insert sqlite replica object"))?;
+                }
+                tx.execute(
+                    r#"
+                    INSERT INTO replica_cursors
+                        (origin_root, group_name, version, kind, namespace, resource_version, generation, last_synced_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    ON CONFLICT(origin_root, group_name, version, kind, namespace)
+                    DO UPDATE SET resource_version = excluded.resource_version,
+                                  generation = excluded.generation,
+                                  last_synced_at = excluded.last_synced_at
+                    "#,
+                    params![origin, key.0, key.1, key.2, key.3, resource_version, generation, synced],
+                )
+                .map_err(|err| Self::map_sqlite(err, "write sqlite replica cursor"))?;
+                tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica replacement"))?;
+
+                let new_names = encoded.iter().map(|(name, _)| name.clone()).collect::<std::collections::HashSet<_>>();
+                let mut events = encoded
+                    .into_iter()
+                    .map(|(name, body)| {
+                        let kind = if old.contains_key(&name) { StoredReplicaEventKind::Modified } else { StoredReplicaEventKind::Added };
+                        Ok((
+                            kind,
+                            serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode replica event: {err}")))?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ResourceError>>()?;
+                for (name, body) in old {
+                    if !new_names.contains(&name) {
+                        events.push((
+                            StoredReplicaEventKind::Deleted,
+                            serde_json::from_str(&body)
+                                .map_err(|err| ResourceError::decode(format!("decode deleted replica event: {err}")))?,
+                        ));
+                    }
+                }
+                Ok(events)
+            })
+            .await?;
+        for (kind, object) in events {
+            Self::notify_replica_watchers(&self.replica_watchers, &operation_key, StoredReplicaEvent {
+                origin_root: origin_root.clone(),
+                synced_at,
+                kind,
+                object,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply_replica_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        kind: StoredReplicaEventKind,
+        object: &ResourceObject<T>,
+        synced_at: DateTime<Utc>,
+    ) -> Result<(), ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let operation_key = key.clone();
+        let origin = origin_root.to_string();
+        let name = object.metadata.name.clone();
+        let resource_version = object.metadata.resource_version.clone();
+        let value = Self::encode_object(object)?;
+        let body =
+            serde_json::to_string(&value).map_err(|err| ResourceError::decode(format!("encode sqlite replica event JSON: {err}")))?;
+        let synced = synced_at.to_rfc3339();
+        self.call(move |connection| {
+            let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica event"))?;
+            match kind {
+                StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                    tx.execute(
+                        r#"
+                        INSERT INTO replica_objects (origin_root, group_name, version, kind, namespace, name, body_json)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                        ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
+                        DO UPDATE SET body_json = excluded.body_json
+                        "#,
+                        params![origin, key.0, key.1, key.2, key.3, name, body],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "upsert sqlite replica event object"))?;
+                }
+                StoredReplicaEventKind::Deleted => {
+                    tx.execute(
+                        r#"
+                        DELETE FROM replica_objects
+                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+                        "#,
+                        params![origin, key.0, key.1, key.2, key.3, name],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "delete sqlite replica event object"))?;
+                }
+            }
+            tx.execute(
+                r#"
+                UPDATE replica_cursors
+                SET resource_version = ?6, last_synced_at = ?7
+                WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
+                "#,
+                params![origin, key.0, key.1, key.2, key.3, resource_version, synced],
+            )
+            .map_err(|err| Self::map_sqlite(err, "advance sqlite replica cursor"))?;
+            tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica event"))
+        })
+        .await?;
+        Self::notify_replica_watchers(&self.replica_watchers, &operation_key, StoredReplicaEvent {
+            origin_root: origin_root.clone(),
+            synced_at,
+            kind,
+            object: value,
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+    ) -> Result<Option<ReplicaCursor>, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let origin = origin_root.to_string();
+        self.call(move |connection| {
+            connection
+                .query_row(
+                    r#"
+                    SELECT resource_version, generation FROM replica_cursors
+                    WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
+                    "#,
+                    params![origin, key.0, key.1, key.2, key.3],
+                    |row| Ok(ReplicaCursor { resource_version: row.get(0)?, generation: row.get(1)? }),
+                )
+                .optional()
+                .map_err(|err| Self::map_sqlite(err, "read sqlite replica cursor"))
+        })
+        .await
     }
 
     pub(crate) async fn get_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<ResourceObject<T>, ResourceError> {

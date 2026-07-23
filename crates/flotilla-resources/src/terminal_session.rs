@@ -4,11 +4,21 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, Resource, ResourceObject, Selector, Vessel,
+    status_patch::StatusPatch, ApiPaths, InputMeta, OwnerReference, ReplicationClass, Resource, ResourceObject, Selector, Vessel,
     CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
-define_resource!(TerminalSession, "terminalsessions", TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSession;
+
+impl Resource for TerminalSession {
+    type Spec = TerminalSessionSpec;
+    type Status = TerminalSessionStatus;
+    type StatusPatch = TerminalSessionStatusPatch;
+
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "terminalsessions", kind: "TerminalSession" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TerminalSessionIdentity {
