@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitStatus, sync::Arc};
+use std::{future::Future, path::PathBuf, process::ExitStatus, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -389,6 +389,17 @@ async fn startup_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     select_startup_repo_roots(cli_roots, cwd_repo_root)
 }
 
+async fn show_startup_splash<F, Fut>(scoped_view: Option<&flotilla_protocol::ViewAddress>, show_splash: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if scoped_view.is_none() {
+        show_splash().await?;
+    }
+    Ok(())
+}
+
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
 async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
@@ -398,8 +409,8 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let resolved_config_dir = cli.config_dir();
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(&resolved_config_dir), paths.state_dir.clone()));
 
-    // Initialize terminal and show splash immediately for fast visual feedback.
-    // Mouse capture is enabled AFTER the splash so mouse events don't cut it short.
+    // Initialize the terminal immediately. Full-app mode shows the splash for
+    // fast visual feedback; scoped mode opens directly into its target view.
     let mut terminal = ratatui::init();
     flotilla_tui::terminal::install_panic_hook();
     #[cfg(unix)]
@@ -411,8 +422,8 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let config_dir_override = cli.config_dir.clone();
     let socket_override = cli.socket.clone();
 
-    // Spawn daemon init on a separate task so it runs concurrently with the splash
-    // (show_splash uses blocking crossterm::event::poll calls).
+    // Spawn daemon init on a separate task so full-app startup can run it
+    // concurrently with the splash (which uses blocking event polling).
     let daemon_log_path = paths.state_dir.as_path().join("daemon.log");
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
     let initial_socket_path = socket_path.clone();
@@ -430,7 +441,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         .map(|d| d as Arc<dyn DaemonHandle>)
     });
 
-    flotilla_tui::splash::show_splash(&mut terminal).await?;
+    show_startup_splash(scoped_view.as_ref(), || flotilla_tui::splash::show_splash(&mut terminal)).await?;
     let mut daemon = match daemon_task.await {
         Ok(Ok(daemon)) => {
             info!(elapsed = ?startup.elapsed(), "daemon ready");
@@ -1388,7 +1399,8 @@ mod tests {
 
     use super::{
         attach_exit_disposition, provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
+        show_startup_splash, AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand,
+        SubCommand,
     };
 
     #[test]
@@ -1427,6 +1439,31 @@ mod tests {
         let roots = select_startup_repo_roots(&[], Some(PathBuf::from("/repos/current")));
 
         assert_eq!(roots, vec![PathBuf::from("/repos/current")]);
+    }
+
+    #[tokio::test]
+    async fn scoped_tui_skips_splash_while_full_tui_shows_it() {
+        use std::cell::Cell;
+
+        let scoped_view = "convoys/flotilla".parse().expect("valid scoped view");
+        let scoped_splash_shown = Cell::new(false);
+        show_startup_splash(Some(&scoped_view), || async {
+            scoped_splash_shown.set(true);
+            Ok(())
+        })
+        .await
+        .expect("scoped startup");
+
+        let full_splash_shown = Cell::new(false);
+        show_startup_splash(None, || async {
+            full_splash_shown.set(true);
+            Ok(())
+        })
+        .await
+        .expect("full startup");
+
+        assert!(!scoped_splash_shown.get());
+        assert!(full_splash_shown.get());
     }
 
     #[test]
