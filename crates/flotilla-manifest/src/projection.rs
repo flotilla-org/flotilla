@@ -28,7 +28,7 @@ use crate::{
         KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_VESSEL,
         SOURCE_CONNECTOR,
     },
-    recipe::RecipeMint,
+    recipe::{Recipe, RecipeMint},
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
 };
 
@@ -171,7 +171,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     let mut catalog = Catalog::default();
     if let Some(nodes) = input.awareness {
         for node in nodes {
-            project_awareness_node(&mut catalog, node, mint);
+            project_awareness_node(&mut catalog, node, input.convoys, mint);
         }
         return catalog;
     }
@@ -184,33 +184,42 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     catalog
 }
 
-fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, mint: &dyn RecipeMint) {
+fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
     let project = GroupSegment::text(SEGMENT_PROJECT, node.id.clone()).with_label(node.label.clone());
     assert_project_group(catalog, &project);
     let project_path = GroupPath(vec![project.clone()]);
-    catalog.assert_facts(
-        MetadataTarget::Group(project_path),
-        vec![
-            (KEY_STATUS_STATE, MetadataValue::text(awareness_state(node.state))),
-            (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(&node.counts))),
-            (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:awareness/{}", node.id))),
-        ],
-        None,
-    );
+    let mut facts = vec![
+        (KEY_STATUS_STATE, MetadataValue::text(awareness_state(node.state))),
+        (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(&node.counts))),
+        (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:awareness/{}", node.id))),
+    ];
+    if let Some(recipe) = awareness_project_recipe(node, mint) {
+        facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("workspace")));
+        facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
+    }
+    catalog.assert_facts(MetadataTarget::Group(project_path), facts, None);
 
     for entry in &node.entries {
-        project_awareness_entry(catalog, &project, entry, mint);
+        project_awareness_entry(catalog, &project, entry, convoys, mint);
     }
 }
 
-fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry: &AwarenessEntry, mint: &dyn RecipeMint) {
+fn project_awareness_entry(
+    catalog: &mut Catalog,
+    project: &GroupSegment,
+    entry: &AwarenessEntry,
+    convoys: &[ConvoyRow],
+    mint: &dyn RecipeMint,
+) {
     let segment_key = match entry.kind {
         AwarenessKind::Convoy => SEGMENT_CONVOY,
         AwarenessKind::Issue => SEGMENT_ISSUE,
         AwarenessKind::Vessel | AwarenessKind::Independent | AwarenessKind::Checkout => SEGMENT_VESSEL,
         AwarenessKind::Fleet | AwarenessKind::Project => return,
     };
-    let path = GroupPath(vec![project.clone(), GroupSegment::text(segment_key, entry.id.clone()).with_label(entry.label.clone())]);
+    let path = awareness_entry_path(project, entry).unwrap_or_else(|| {
+        GroupPath(vec![project.clone(), GroupSegment::text(segment_key, entry.id.clone()).with_label(entry.label.clone())])
+    });
     let mut facts = vec![
         (KEY_STATUS_STATE, MetadataValue::text(awareness_state(entry.state))),
         (KEY_SUMMARY_TEXT, MetadataValue::text(entry.label.clone())),
@@ -225,18 +234,59 @@ fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry:
     if matches!(entry.state, AwarenessState::Waiting | AwarenessState::Failed) {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
-    if let Some(recipe) = awareness_view_target(&entry.id).and_then(|target| mint.scoped_view(&target)) {
+    // The awareness transport wins over raw convoy rows in `project_catalog`.
+    // Resolve attach recipes from the held fleet rows here; otherwise a
+    // scoped-view awareness recipe shadows the vessel's live attach recipe.
+    if let Some(recipe) = awareness_entry_recipe(entry, convoys, mint) {
         facts.push((KEY_MATERIALIZE_TARGET, MetadataValue::text("workspace")));
         facts.push((KEY_MATERIALIZE_RECIPE, MetadataValue::text(recipe.command())));
     }
     catalog.assert_facts(MetadataTarget::Group(path), facts, None);
 }
 
-fn awareness_view_target(id: &str) -> Option<ViewAddress> {
-    match id.parse().ok()? {
-        address @ (ViewAddress::Project { .. } | ViewAddress::Convoy { .. } | ViewAddress::Vessel { .. }) => Some(address),
+fn awareness_project_recipe(node: &AwarenessNode, mint: &dyn RecipeMint) -> Option<Recipe> {
+    if !matches!(node.kind, AwarenessKind::Project) {
+        return None;
+    }
+    let address = node.id.parse().ok()?;
+    let ViewAddress::Project { .. } = &address else {
+        return None;
+    };
+    mint.scoped_view(&address)
+}
+
+fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &dyn RecipeMint) -> Option<Recipe> {
+    if matches!(entry.kind, AwarenessKind::Issue) {
+        return None;
+    }
+    match entry.id.parse().ok()? {
+        ViewAddress::Project { namespace, name } => mint.scoped_view(&ViewAddress::Project { namespace, name }),
+        ViewAddress::Vessel { namespace, convoy, vessel } => find_vessel(convoys, &namespace, &convoy, &vessel)
+            .and_then(|vessel| vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host))),
+        ViewAddress::Convoy { namespace, name } => find_convoy(convoys, &namespace, &name).and_then(|convoy| {
+            let [vessel] = convoy.vessels.as_slice() else {
+                return None;
+            };
+            vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host))
+        }),
         _ => None,
     }
+}
+
+fn awareness_entry_path(project: &GroupSegment, entry: &AwarenessEntry) -> Option<GroupPath> {
+    match entry.id.parse().ok()? {
+        ViewAddress::Convoy { namespace, name } => Some(convoy_group_path(Some(project.clone()), &namespace, &name)),
+        ViewAddress::Vessel { namespace, convoy, vessel } => Some(vessel_group_path(Some(project.clone()), &namespace, &convoy, &vessel)),
+        _ => None,
+    }
+}
+
+fn find_convoy<'a>(convoys: &'a [ConvoyRow], namespace: &str, name: &str) -> Option<&'a ConvoyRow> {
+    convoys.iter().find(|convoy| convoy.resource.namespace == namespace && convoy.name == name)
+}
+
+fn find_vessel<'a>(convoys: &'a [ConvoyRow], namespace: &str, convoy_name: &str, vessel_name: &str) -> Option<&'a VesselRow> {
+    find_convoy(convoys, namespace, convoy_name)?.vessels.iter().find(|vessel| vessel.name == vessel_name)
 }
 
 fn awareness_state(state: AwarenessState) -> &'static str {

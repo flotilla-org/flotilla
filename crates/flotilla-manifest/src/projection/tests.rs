@@ -61,7 +61,7 @@ fn text(patch: &MetadataPatch, key: &str) -> String {
 }
 
 #[test]
-fn awareness_tree_projects_project_issue_and_materializable_entries() {
+fn awareness_tree_resolves_open_recipes_without_shadowing_live_attach() {
     let issue = AwarenessEntry::builder()
         .id("issue/flotilla-org/flotilla/862".to_string())
         .kind(AwarenessKind::Issue)
@@ -69,7 +69,14 @@ fn awareness_tree_projects_project_issue_and_materializable_entries() {
         .state(AwarenessState::Waiting)
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
         .build();
-    let vessel = AwarenessEntry::builder()
+    let convoy_entry = AwarenessEntry::builder()
+        .id("convoy/dev/ship-it".to_string())
+        .kind(AwarenessKind::Convoy)
+        .label("ship-it".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .build();
+    let vessel_entry = AwarenessEntry::builder()
         .id("vessel/dev/ship-it/coder".to_string())
         .kind(AwarenessKind::Vessel)
         .label("coder".to_string())
@@ -84,14 +91,26 @@ fn awareness_tree_projects_project_issue_and_materializable_entries() {
         .label("platform".to_string())
         .state(AwarenessState::Waiting)
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .counts(AwarenessCounts::builder().total(2).issues(1).vessels(1).build())
-        .entries(vec![issue, vessel])
+        .counts(AwarenessCounts::builder().total(3).issues(1).vessels(1).build())
+        .entries(vec![issue, convoy_entry, vessel_entry])
+        .build();
+    let reference = convoy_ref("dev", "ship-it");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone())
+        .name("ship-it")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-ship-it-coder").call()])
         .build();
 
-    let catalog = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint());
+    let catalog = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[convoy], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
 
     let project = GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform");
+    let project_patch = find(&patches, &group(vec![project.clone()]));
+    assert_eq!(text(project_patch, KEY_MATERIALIZE_TARGET), "workspace");
+    assert_eq!(text(project_patch, KEY_MATERIALIZE_RECIPE), "flotilla view 'project/dev/platform'");
+
     let issue_patch = find(
         &patches,
         &group(vec![
@@ -101,13 +120,104 @@ fn awareness_tree_projects_project_issue_and_materializable_entries() {
     );
     assert_eq!(text(issue_patch, KEY_STATUS_STATE), "waiting");
     assert_eq!(issue_patch.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));
+    assert!(!issue_patch.set.contains_key(KEY_MATERIALIZE_RECIPE));
 
-    let vessel_patch =
-        find(&patches, &group(vec![project, GroupSegment::text(SEGMENT_VESSEL, "vessel/dev/ship-it/coder").with_label("coder")]));
+    let convoy_target = MetadataTarget::Group(convoy_group_path(Some(project.clone()), "dev", "ship-it"));
+    let convoy_patch = find(&patches, &convoy_target);
+    assert_eq!(text(convoy_patch, KEY_MATERIALIZE_TARGET), "workspace");
+    assert_eq!(text(convoy_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach --host 'feta' 'terminal-ship-it-coder'");
+
+    let vessel_target = MetadataTarget::Group(vessel_group_path(Some(project), "dev", "ship-it", "coder"));
+    let vessel_patch = find(&patches, &vessel_target);
     assert_eq!(text(vessel_patch, KEY_WORK_PHASE), "running");
     assert_eq!(text(vessel_patch, KEY_VESSEL_HOST), "feta");
     assert_eq!(text(vessel_patch, KEY_MATERIALIZE_TARGET), "workspace");
-    assert_eq!(text(vessel_patch, KEY_MATERIALIZE_RECIPE), "flotilla view 'vessel/dev/ship-it/coder'");
+    assert_eq!(text(vessel_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach --host 'feta' 'terminal-ship-it-coder'");
+}
+
+#[test]
+fn local_one_vessel_convoy_awareness_materializes_the_local_agent_cli() {
+    let convoy_entry = AwarenessEntry::builder()
+        .id("convoy/dev/local-ship".to_string())
+        .kind(AwarenessKind::Convoy)
+        .label("local-ship".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .build();
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_string())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(1).vessels(1).build())
+        .entries(vec![convoy_entry])
+        .build();
+    let reference = convoy_ref("dev", "local-ship");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone().on_host(HostName::new("kiwi")))
+        .name("local-ship")
+        .workflow_ref("implement")
+        .phase(ConvoyPhase::Active)
+        .vessels(vec![VesselRow::builder()
+            .resource(reference.subresource("vessels/coder"))
+            .name("coder")
+            .phase(WorkPhase::Running)
+            .host(HostName::new("kiwi"))
+            .materialize("terminal-local-ship-coder")
+            .build()])
+        .build();
+
+    let catalog = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[convoy], independents: &[] }, &mint());
+    let patches = catalog.reassert_patches();
+
+    let project = GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform");
+    let convoy_patch = find(&patches, &MetadataTarget::Group(convoy_group_path(Some(project), "dev", "local-ship")));
+    assert_eq!(text(convoy_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach --host 'kiwi' 'terminal-local-ship-coder'");
+}
+
+#[test]
+fn multi_vessel_convoy_awareness_lists_without_recipe_until_pane_sets_are_representable() {
+    let convoy_entry = AwarenessEntry::builder()
+        .id("convoy/dev/ship-it".to_string())
+        .kind(AwarenessKind::Convoy)
+        .label("ship-it".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .build();
+    let node = AwarenessNode::builder()
+        .id("project/dev/platform".to_string())
+        .kind(AwarenessKind::Project)
+        .label("platform".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .counts(AwarenessCounts::builder().total(1).vessels(2).build())
+        .entries(vec![convoy_entry])
+        .build();
+    let reference = convoy_ref("dev", "ship-it");
+    let convoy = ConvoyRow::builder()
+        .resource(reference.clone())
+        .name("ship-it")
+        .workflow_ref("implement-review")
+        .phase(ConvoyPhase::Active)
+        .vessels(vec![
+            vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).materialize("terminal-ship-it-coder").call(),
+            vessel().convoy(&reference).name("reviewer").phase(WorkPhase::Running).materialize("terminal-ship-it-reviewer").call(),
+        ])
+        .build();
+
+    let catalog = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[convoy], independents: &[] }, &mint());
+    let patches = catalog.reassert_patches();
+
+    let convoy_patch = find(
+        &patches,
+        &group(vec![
+            GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform"),
+            GroupSegment::text(SEGMENT_CONVOY, "dev/ship-it").with_label("ship-it"),
+        ]),
+    );
+    assert!(!convoy_patch.set.contains_key(KEY_MATERIALIZE_RECIPE));
+    assert!(!convoy_patch.set.contains_key(KEY_MATERIALIZE_TARGET));
 }
 
 #[test]
