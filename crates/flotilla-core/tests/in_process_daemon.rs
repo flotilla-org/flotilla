@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use flotilla_core::{
     attachable::{shared_in_memory_attachable_store, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose},
     config::ConfigStore,
@@ -970,9 +971,11 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
     let mut issue = TestIssue::new("Start convoy from an issue").id("732").with_labels(vec!["enhancement".into()]).build();
     issue.reference = reference.clone();
     issue.body = Some("Capture the issue at admission time.".into());
+    issue.as_of = Utc::now();
     let mut issue_two = TestIssue::new("Carry a second issue").id("733").with_labels(vec!["quick-win".into()]).build();
     issue_two.reference = reference_two.clone();
     issue_two.body = Some("Include this issue in the same convoy.".into());
+    issue_two.as_of = Utc::now();
     let provider = Arc::new(FakeIssueProvider::new());
     provider.add_issues(vec![(reference.id.clone(), issue.clone()), (reference_two.id.clone(), issue_two.clone())]).await;
     let utility = Arc::new(CountingConvoyAiUtility { calls: AtomicUsize::new(0), fail: AtomicBool::new(false) });
@@ -1417,6 +1420,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
         IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "782".into() };
     let mut issue = TestIssue::new("Convoy start freezes the TUI").id("782").build();
     issue.reference = reference.clone();
+    issue.as_of = Utc::now();
     let provider = Arc::new(FakeIssueProvider::new());
     provider.add_issues(vec![(reference.id.clone(), issue)]).await;
     let utility = Arc::new(SlowAiUtility::new());

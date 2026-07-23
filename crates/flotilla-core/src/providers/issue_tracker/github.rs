@@ -45,7 +45,10 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
         .map(|arr| arr.iter().filter_map(|l| l["name"].as_str().map(|s| s.to_string())).collect())
         .unwrap_or_default();
     let id = number.to_string();
-    let as_of = v["updated_at"].as_str().and_then(|value| value.parse::<DateTime<Utc>>().ok()).unwrap_or(fetched_at);
+    // `as_of` is the time Flotilla observed this snapshot, not GitHub's last
+    // mutation time. Admission uses it as a hard freshness bound for the
+    // issue body it passes to a crew.
+    let as_of = fetched_at;
     let reference = IssueRef { source: source.clone(), id: id.clone() };
     let association_keys = vec![AssociationKey::IssueRef("github".to_string(), id)];
     Some(

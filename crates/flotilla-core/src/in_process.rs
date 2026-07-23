@@ -15,7 +15,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flotilla_protocol::{
     arg::{flatten, Arg},
     commands::RepositoryIdentityChange,
@@ -1114,6 +1114,16 @@ struct ConvoyAdmission {
     placement_policy: Option<PlacementPolicySpec>,
 }
 
+/// An issue body is the crew's contract, so admission may only reuse a
+/// recently observed snapshot. Keep this deliberately fixed until an
+/// operational need establishes that it should be configurable.
+const ISSUE_SNAPSHOT_FRESHNESS: ChronoDuration = ChronoDuration::minutes(5);
+
+fn issue_snapshot_is_fresh(issue: &flotilla_protocol::Issue) -> bool {
+    let age = Utc::now().signed_duration_since(issue.as_of);
+    (ChronoDuration::zero()..=ISSUE_SNAPSHOT_FRESHNESS).contains(&age)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ConvoyStartKey {
     namespace: String,
@@ -1301,6 +1311,30 @@ const FLEET_REPLICA_FRESH_SECS: i64 = 90;
 const FLEET_REPLICA_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl InProcessDaemon {
+    async fn fresh_cached_issue(&self, reference: &flotilla_protocol::IssueRef) -> Option<flotilla_protocol::Issue> {
+        self.repos
+            .read()
+            .await
+            .values()
+            .flat_map(|state| state.last_local_providers.issues.values())
+            .filter(|issue| issue.reference == *reference)
+            .filter(|issue| issue_snapshot_is_fresh(issue))
+            .max_by_key(|issue| issue.as_of)
+            .cloned()
+    }
+
+    async fn resolve_convoy_issue_snapshot(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
+        let issue = match self.fresh_cached_issue(reference).await {
+            Some(issue) => issue,
+            None => self.fetch_issue_by_ref(reference).await?,
+        };
+        if issue_snapshot_is_fresh(&issue) {
+            Ok(issue)
+        } else {
+            Err(format!("issue {} snapshot is too stale to admit", reference.id))
+        }
+    }
+
     async fn admission_ai_utility(&self) -> Option<Arc<dyn AiUtility>> {
         let environment = self.environment_manager.environment_bag(&self.local_environment_id)?;
         let runner = self.environment_manager.environment_runner(&self.local_environment_id)?;
@@ -3215,14 +3249,14 @@ impl InProcessDaemon {
                         reference.source.service, reference.source.scope, project.metadata.name
                     ));
                 }
-                self.fetch_issue_by_ref(reference).await?
+                self.resolve_convoy_issue_snapshot(reference).await?
             }
             flotilla_protocol::IssueSelector::Id(id) => {
                 let mut matches = Vec::new();
                 let mut failures = Vec::new();
                 for source in sources {
                     let reference = flotilla_protocol::IssueRef { source, id: id.clone() };
-                    match self.fetch_issue_by_ref(&reference).await {
+                    match self.resolve_convoy_issue_snapshot(&reference).await {
                         Ok(issue) => matches.push(issue),
                         Err(error) => failures.push(error),
                     }

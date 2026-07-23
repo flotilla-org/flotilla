@@ -71,7 +71,17 @@ pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
     GhApiResponse { status, etag, body, has_next_page, total_count: None }
 }
 
-fn rate_limit_error(raw: &str, _stderr: &str) -> Option<String> {
+pub(crate) fn rate_limit_error(reset: &str) -> String {
+    let reset = reset
+        .parse::<i64>()
+        .ok()
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| reset.to_string());
+    format!("{RATE_LIMIT_RESET_PREFIX}{reset}")
+}
+
+fn rate_limit_error_from_response(raw: &str) -> Option<String> {
     let response = parse_gh_api_response(raw);
     if response.status != 403 {
         return None;
@@ -79,10 +89,9 @@ fn rate_limit_error(raw: &str, _stderr: &str) -> Option<String> {
 
     let reset = raw.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("x-ratelimit-reset").then(|| value.trim().parse::<i64>().ok()).flatten()
+        name.eq_ignore_ascii_case("x-ratelimit-reset").then_some(value.trim())
     })?;
-    let reset = Utc.timestamp_opt(reset, 0).single()?;
-    Some(format!("{RATE_LIMIT_RESET_PREFIX}{}", reset.to_rfc3339()))
+    Some(rate_limit_error(reset))
 }
 
 #[async_trait]
@@ -154,7 +163,7 @@ impl GhApi for GhApiClient {
         }
 
         if !output.success {
-            if let Some(error) = rate_limit_error(&output.stdout, &output.stderr) {
+            if let Some(error) = rate_limit_error_from_response(&output.stdout) {
                 return Err(error);
             }
             return Err(output.stderr);
@@ -238,7 +247,7 @@ mod tests {
     #[test]
     fn extracts_rate_limit_reset_from_403_response() {
         let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}";
-        let error = rate_limit_error(raw, "gh: API rate limit exceeded").expect("rate limit error");
+        let error = rate_limit_error_from_response(raw).expect("rate limit error");
         assert_eq!(rate_limit_reset(&error).expect("reset timestamp"), Utc.timestamp_opt(1784736000, 0).single().expect("valid timestamp"));
     }
 }
