@@ -231,7 +231,7 @@ enum ResourceSubCommand {
     Watch(ResourceListArgs),
 }
 
-#[derive(clap::Args)]
+#[derive(clap::Args, bon::Builder)]
 struct ResourceListArgs {
     /// Resource kind or plural name, e.g. convoys or WorkflowTemplate
     kind: String,

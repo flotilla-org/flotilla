@@ -27,7 +27,8 @@ type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
 type ReplicaWatchSender = mpsc::UnboundedSender<StoredReplicaEvent>;
 type ReplicaWatchersByStore = HashMap<StoreKey, Vec<ReplicaWatchSender>>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(builder_type(vis = "pub(in crate::sqlite)"))]
 pub struct SqliteBackend {
     connection: Connection,
     // Mutations notify and watches register from the connection thread so a

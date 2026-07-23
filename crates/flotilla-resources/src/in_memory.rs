@@ -19,7 +19,8 @@ use crate::{
 
 type StoreKey = (String, String, String, String);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, bon::Builder)]
+#[builder(builder_type(vis = "pub(in crate::in_memory)"))]
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
     replicas: Arc<Mutex<ReplicaState>>,

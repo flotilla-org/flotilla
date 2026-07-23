@@ -109,11 +109,13 @@ impl<T: Resource> ReplicaReadResolver<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(builder_type(vis = "pub(in crate::backend)"))]
 pub struct ReplicaWriter<T: Resource> {
     backend: ResourceBackend,
     origin_root: NodeId,
     namespace: String,
+    #[builder(skip)]
     _marker: PhantomData<T>,
 }
 

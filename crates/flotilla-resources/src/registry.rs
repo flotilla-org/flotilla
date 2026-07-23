@@ -54,6 +54,7 @@ pub struct DynamicResourceObject {
     pub value: Value,
 }
 
+#[derive(bon::Builder)]
 pub struct DynamicResourceWatch {
     pub kind: String,
     pub plural: String,
