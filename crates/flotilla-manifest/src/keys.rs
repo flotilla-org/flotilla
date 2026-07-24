@@ -99,4 +99,6 @@ pub const SEGMENT_CONVOY: &str = "flotilla.convoy";
 pub const SEGMENT_VESSEL: &str = "flotilla.vessel";
 /// Independent terminal-session name, never a convoy vessel name.
 pub const SEGMENT_INDEPENDENT: &str = "flotilla.independent";
+/// Checkout awareness-entry identity, never a vessel or session name.
+pub const SEGMENT_CHECKOUT: &str = "flotilla.checkout";
 pub const SEGMENT_ISSUE: &str = "flotilla.issue";

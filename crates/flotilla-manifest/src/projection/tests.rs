@@ -210,20 +210,32 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
         .annotations(std::collections::HashMap::from([(SEGMENT_REPO.to_string(), "flotilla-org/flotilla".to_string())]))
         .build();
+    let checkout = AwarenessEntry::builder()
+        .id("checkout/feta/work/flotilla".to_string())
+        .kind(AwarenessKind::Checkout)
+        .label("main · /work/flotilla".to_string())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .annotations(std::collections::HashMap::from([(SEGMENT_REPO.to_string(), "flotilla-org/flotilla".to_string())]))
+        .build();
     let node = AwarenessNode::builder()
         .id("repo/opaque-repository-key".to_string())
         .kind(AwarenessKind::Project)
         .label("flotilla-org/flotilla".to_string())
         .state(AwarenessState::Active)
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
-        .entries(vec![independent])
+        .entries(vec![independent, checkout])
         .build();
 
     let catalog = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint());
     let patches = catalog.reassert_patches();
     let repo = GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla");
 
-    find(&patches, &group(vec![repo.clone(), GroupSegment::text(SEGMENT_VESSEL, "governor").with_label("governor")]));
+    find(&patches, &group(vec![repo.clone(), GroupSegment::text(SEGMENT_INDEPENDENT, "governor").with_label("governor")]));
+    find(
+        &patches,
+        &group(vec![repo.clone(), GroupSegment::text(SEGMENT_CHECKOUT, "checkout/feta/work/flotilla").with_label("main · /work/flotilla")]),
+    );
     assert!(
         patches
             .iter()
@@ -443,6 +455,10 @@ fn project_and_repo_segments_have_one_meaning_each() {
     assert_eq!(
         repo_segment(Some("github.com:flotilla-org/flotilla")),
         Some(GroupSegment::text(SEGMENT_REPO, "github.com:flotilla-org/flotilla").with_label("flotilla"))
+    );
+    assert_eq!(
+        repo_segment(Some("feta:/srv/flotilla/.git")),
+        Some(GroupSegment::text(SEGMENT_REPO, "feta:/srv/flotilla/.git").with_label("flotilla"))
     );
     assert_eq!(repo_segment(None), None);
 }

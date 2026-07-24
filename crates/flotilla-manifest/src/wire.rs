@@ -50,6 +50,7 @@
 //! | `flotilla.convoy` | `<namespace>/<convoy>` resource identity. |
 //! | `flotilla.vessel` | Convoy vessel name. |
 //! | `flotilla.independent` | Independent terminal-session name. |
+//! | `flotilla.checkout` | Checkout awareness-entry identity. |
 //! | `flotilla.issue` | Issue entry identity from the awareness projection. |
 
 use std::collections::BTreeMap;

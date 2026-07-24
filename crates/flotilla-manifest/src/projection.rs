@@ -25,8 +25,8 @@ use crate::{
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CONVOY_MESSAGE, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_CREW_ROLES, KEY_FACTORY_ID,
         KEY_INDEPENDENT_HOST, KEY_MATERIALIZE_RECIPE, KEY_MATERIALIZE_TARGET, KEY_PROJECT_NAME, KEY_SCOPE, KEY_SESSION, KEY_SOURCE,
-        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_INDEPENDENT,
-        SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_CONVOY,
+        SEGMENT_INDEPENDENT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::RecipeMint,
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -256,10 +256,10 @@ fn project_awareness_entry(catalog: &mut Catalog, parent: Option<&GroupSegment>,
         }
         AwarenessKind::Independent => {
             let value = entry.id.rsplit('/').next().unwrap_or(&entry.id);
-            segments.push(GroupSegment::text(SEGMENT_VESSEL, value).with_label(entry.label.clone()));
+            segments.push(GroupSegment::text(SEGMENT_INDEPENDENT, value).with_label(entry.label.clone()));
         }
         AwarenessKind::Checkout => {
-            segments.push(GroupSegment::text(SEGMENT_VESSEL, entry.id.clone()).with_label(entry.label.clone()));
+            segments.push(GroupSegment::text(SEGMENT_CHECKOUT, entry.id.clone()).with_label(entry.label.clone()));
         }
         AwarenessKind::Issue => {
             segments.push(GroupSegment::text(SEGMENT_ISSUE, entry.id.clone()).with_label(entry.label.clone()));
@@ -320,7 +320,8 @@ pub fn project_segment(project_ref: Option<&str>) -> Option<GroupSegment> {
 /// fallback.
 pub fn repo_segment(repo: Option<&str>) -> Option<GroupSegment> {
     let value = repo?;
-    let label = value.rsplit('/').next().filter(|short| !short.is_empty() && *short != value);
+    let label_source = value.strip_suffix("/.git").or_else(|| value.strip_suffix(".git")).unwrap_or(value);
+    let label = label_source.rsplit('/').next().filter(|short| !short.is_empty() && *short != value);
     let segment = GroupSegment::text(SEGMENT_REPO, value);
     Some(match label {
         Some(label) => segment.with_label(label),
