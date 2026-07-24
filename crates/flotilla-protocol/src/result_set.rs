@@ -270,11 +270,17 @@ pub struct ResultSetState {
     pub demand: Option<DemandBackedMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<ResultSetCondition>,
+    /// The query projection omitted rows after applying its own limit.
+    ///
+    /// This is independent of demand-backed [`DemandBackedMetadata::has_more`],
+    /// which reports whether the underlying source window can be expanded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl ResultSetState {
     pub fn is_empty(&self) -> bool {
-        self.demand.is_none() && self.conditions.is_empty()
+        self.demand.is_none() && self.conditions.is_empty() && !self.truncated
     }
 }
 
@@ -875,8 +881,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        CheckoutRow, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope, ResultDelta, ResultSet,
-        ResultSetState, Rows, SessionPhase,
+        AwarenessGrouping, AwarenessLimit, CheckoutRow, DemandBackedMetadata, IndependentRow, IssueRow, QueryChanges, QueryId, QueryScope,
+        ResultDelta, ResultSet, ResultSetState, Rows, SessionPhase,
     };
     use crate::{provider_data::Issue, HostName, IssueRef, IssueSource, IssueState, LifecycleAuthority, RepositoryKey, ResourceRef};
 
@@ -956,6 +962,7 @@ mod tests {
                     scope: scope.clone(),
                     message: "repository definition is temporarily unavailable".into(),
                 }],
+                truncated: false,
             }),
         };
 
@@ -1044,6 +1051,7 @@ mod tests {
                 has_more: true,
             }),
             conditions: vec![],
+            truncated: false,
         };
         let delta = ResultDelta {
             seq: 2,
@@ -1055,5 +1063,24 @@ mod tests {
         let decoded = serde_json::from_str::<ResultDelta>(&json).expect("deserialize metadata delta");
         assert_eq!(decoded.state, Some(state));
         assert!(decoded.changes.is_empty());
+    }
+
+    #[test]
+    fn projection_truncation_round_trips_without_demand_metadata() {
+        let state = ResultSetState { truncated: true, ..ResultSetState::default() };
+        let set = ResultSet {
+            seq: 1,
+            rows: Rows::Awareness {
+                scope: None,
+                grouping: AwarenessGrouping::Project,
+                limit: AwarenessLimit { groups: 1, entries: 1 },
+                rows: vec![],
+            },
+            state: state.clone(),
+        };
+
+        let json = serde_json::to_string(&set).expect("serialize truncated projection");
+        assert!(json.contains(r#""state":{"truncated":true}"#));
+        assert_eq!(serde_json::from_str::<ResultSet>(&json).expect("deserialize truncated projection").state, state);
     }
 }

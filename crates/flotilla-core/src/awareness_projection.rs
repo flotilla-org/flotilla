@@ -191,6 +191,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
 
     let mut nodes = groups.into_values().collect::<Vec<_>>();
     nodes.sort_by(|left, right| group_rank(left).cmp(&group_rank(right)).then_with(|| left.label.cmp(&right.label)));
+    let mut truncated = nodes.len() > input.limit.groups;
     nodes.truncate(input.limit.groups);
     let rows = nodes
         .into_iter()
@@ -206,6 +207,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             } else {
                 HashMap::new()
             };
+            truncated |= group.entries.len() > input.limit.entries;
             group.entries.truncate(input.limit.entries);
             AwarenessNode::builder()
                 .id(group.id)
@@ -223,7 +225,9 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .build()
         })
         .collect();
-    (rows, input.state)
+    let mut state = input.state;
+    state.truncated |= truncated;
+    (rows, state)
 }
 
 fn repo_fact_annotations(repo: Option<&flotilla_protocol::RepoKey>) -> HashMap<String, String> {
@@ -556,6 +560,52 @@ mod tests {
     }
 
     #[test]
+    fn awareness_state_distinguishes_projection_truncation_from_source_pagination() {
+        let source_state = ResultSetState {
+            demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
+            conditions: vec![],
+            truncated: false,
+        };
+        let (_, group_limited_state) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Convoy,
+            limit: AwarenessLimit { groups: 1, entries: 32 },
+            convoys: vec![
+                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
+                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+            ],
+            state: source_state.clone(),
+            ..AwarenessInput::default()
+        });
+        let (_, entry_limited_state) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Project,
+            limit: AwarenessLimit { groups: 1, entries: 1 },
+            convoys: vec![
+                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
+                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+            ],
+            state: source_state.clone(),
+            ..AwarenessInput::default()
+        });
+        let (_, complete_state) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Convoy,
+            limit: AwarenessLimit { groups: 2, entries: 1 },
+            convoys: vec![
+                convoy(Some("flotilla/platform"), "first", ConvoyPhase::Active),
+                convoy(Some("flotilla/platform"), "second", ConvoyPhase::Pending),
+            ],
+            state: source_state,
+            ..AwarenessInput::default()
+        });
+
+        assert!(group_limited_state.truncated);
+        assert!(entry_limited_state.truncated);
+        assert!(!complete_state.truncated, "an exact limit does not truncate");
+        for state in [group_limited_state, entry_limited_state, complete_state] {
+            assert!(!state.demand.expect("source pagination metadata").has_more);
+        }
+    }
+
+    #[test]
     fn salience_is_joined_onto_entries_and_aggregated_to_their_node() {
         let base = Utc.with_ymd_and_hms(2026, 7, 22, 12, 0, 0).single().expect("timestamp");
         let demand_at = Utc.with_ymd_and_hms(2026, 7, 22, 12, 1, 0).single().expect("timestamp");
@@ -602,6 +652,7 @@ mod tests {
             state: ResultSetState {
                 demand: Some(flotilla_protocol::DemandBackedMetadata { as_of: base, has_more: false }),
                 conditions: Vec::new(),
+                truncated: false,
             },
             ..AwarenessInput::default()
         });

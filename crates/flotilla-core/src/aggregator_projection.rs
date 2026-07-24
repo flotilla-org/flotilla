@@ -365,6 +365,7 @@ fn merged_issue_state(issue_sets: &[(QueryScope, ResultSet)]) -> ResultSetState 
     let mut state = ResultSetState::default();
     for (_, set) in issue_sets {
         state.conditions.extend(set.state.conditions.clone());
+        state.truncated |= set.state.truncated;
         if let Some(demand) = &set.state.demand {
             state.demand = Some(match state.demand {
                 Some(existing) => flotilla_protocol::DemandBackedMetadata {
@@ -463,6 +464,7 @@ mod tests {
         state.replace_issues(&issue_query, generation, vec![issue_row("flotilla-org/flotilla", "862")], ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
             conditions: vec![],
+            truncated: false,
         });
 
         let result = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
