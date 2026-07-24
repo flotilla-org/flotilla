@@ -231,6 +231,20 @@ Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-re
 | `duplicate` | Already exists |
 | `wontfix` | Will not be worked on |
 
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked on GitHub at `flotilla-org/flotilla` (always pass `-R flotilla-org/flotilla`); external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical triage roles map to repo labels; `ready-for-agent` maps to the existing `ready` label. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 ## Testing Providers with Record/Replay
 
 Providers (git, GitHub, Claude, etc.) integrate with external systems. The `replay` module captures and replays interactions to enable deterministic, offline testing.
