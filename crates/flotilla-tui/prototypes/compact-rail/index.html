@@ -1105,7 +1105,7 @@
       function toggleIssues() {
         state.issuesVisible = !state.issuesVisible;
         if (!state.issuesVisible && entities[state.selected].kind === "issue") {
-          state.selected = "flotilla";
+          state.selected = state.activeProject;
         }
         render();
       }
