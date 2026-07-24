@@ -208,7 +208,7 @@ Issues have a **type** (lifecycle stage) and **labels** (topic tags). `gh issue 
 | `Feature` | A request, idea, or new functionality |
 | `Brainstorm` | Needs design thinking before it can become a task or feature |
 
-Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`).
+Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`). Triage-state labels (`needs-triage`, `needs-info`, `ready`, `ready-for-human`, `wontfix`) are a separate, orthogonal vocabulary — see `docs/agents/triage-labels.md`.
 
 | Label | Use for |
 |-------|---------|
@@ -230,6 +230,20 @@ Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-re
 | `good first issue` | Good for newcomers |
 | `duplicate` | Already exists |
 | `wontfix` | Will not be worked on |
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked on GitHub at `flotilla-org/flotilla` (always pass `-R flotilla-org/flotilla`); external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical triage roles map to repo labels; `ready-for-agent` maps to the existing `ready` label. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ## Testing Providers with Record/Replay
 
