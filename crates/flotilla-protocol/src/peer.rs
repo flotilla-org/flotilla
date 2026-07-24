@@ -56,6 +56,7 @@ impl VectorClock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDataMessage {
     pub origin_node_id: NodeId,
+    pub origin_display_name: String,
     pub repo_identity: RepoIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_key: Option<RepositoryKey>,
@@ -100,6 +101,7 @@ pub enum RoutedPeerMessage {
         request_id: u64,
         requester_node_id: NodeId,
         responder_node_id: NodeId,
+        responder_display_name: String,
         remaining_hops: u8,
         repo_identity: RepoIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,7 +329,7 @@ mod tests {
     #[test]
     fn vector_clock_serde_default() {
         // Deserializing a message without a clock field should give default
-        let json = r#"{"origin_node_id":"desktop","repo_identity":{"authority":"github.com","path":"owner/repo"},"kind":{"type":"request_resync","since_seq":0}}"#;
+        let json = r#"{"origin_node_id":"desktop","origin_display_name":"Desktop","repo_identity":{"authority":"github.com","path":"owner/repo"},"kind":{"type":"request_resync","since_seq":0}}"#;
         let msg: PeerDataMessage = serde_json::from_str(json).expect("deserialize without clock");
         assert!(msg.clock.0.is_empty(), "default clock should be empty");
         assert_eq!(msg.host_repo_root, None);
@@ -337,6 +339,7 @@ mod tests {
     fn peer_data_message_snapshot_roundtrip() {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("desktop"),
+            origin_display_name: "Desktop".into(),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repository_key: Some(RepositoryKey("repo_opaque".into())),
             host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -345,9 +348,11 @@ mod tests {
         };
         let json_value = serde_json::to_value(&msg).expect("serialize");
         assert_eq!(json_value["origin_node_id"], "desktop");
+        assert_eq!(json_value["origin_display_name"], "Desktop");
         let json = serde_json::to_string(&msg).expect("serialize");
         let back: PeerDataMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.origin_node_id, msg.origin_node_id);
+        assert_eq!(back.origin_display_name, msg.origin_display_name);
         assert_eq!(back.repo_identity, msg.repo_identity);
         assert_eq!(back.host_repo_root, msg.host_repo_root);
     }
@@ -356,6 +361,7 @@ mod tests {
     fn peer_data_message_snapshot_roundtrip_without_host_repo_root() {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("desktop"),
+            origin_display_name: "Desktop".into(),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repository_key: None,
             host_repo_root: None,
@@ -372,6 +378,7 @@ mod tests {
     fn peer_data_message_request_resync() {
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("cloud"),
+            origin_display_name: "Cloud".into(),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repository_key: None,
             host_repo_root: Some(PathBuf::from("/opt/repo")),
@@ -417,6 +424,7 @@ mod tests {
 
         let msg = PeerDataMessage {
             origin_node_id: NodeId::new("laptop"),
+            origin_display_name: "Laptop".into(),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repository_key: None,
             host_repo_root: Some(PathBuf::from("/home/dev/repo")),

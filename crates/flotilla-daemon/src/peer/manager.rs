@@ -281,6 +281,9 @@ pub struct PeerManager {
     /// `transport_peers`, this survives disconnect so topology diagnostics
     /// remain attributable while retries are failing.
     learned_transport_peers: HashMap<ConfigLabel, NodeId>,
+    /// Self-declared display names learned from peer gossip, including nodes
+    /// reached through another peer.
+    learned_node_names: HashMap<NodeId, String>,
     generations: HashMap<NodeId, u64>,
     routes: HashMap<NodeId, RouteState>,
     /// TODO: expire abandoned reverse-path entries when routed replies time out
@@ -324,6 +327,7 @@ impl PeerManager {
             reconnect_suppressed_until: HashMap::new(),
             transport_peers: HashMap::new(),
             learned_transport_peers: HashMap::new(),
+            learned_node_names: HashMap::new(),
             generations: HashMap::new(),
             routes: HashMap::new(),
             reverse_paths: HashMap::new(),
@@ -356,6 +360,7 @@ impl PeerManager {
             .values()
             .find(|summary| summary.node.node_id == *node_id)
             .map(|summary| summary.node.clone())
+            .or_else(|| self.learned_node_names.get(node_id).map(|display_name| NodeInfo::new(node_id.clone(), display_name.clone())))
             .unwrap_or_else(|| NodeInfo::new(node_id.clone(), node_id.to_string()))
     }
 
@@ -616,6 +621,9 @@ impl PeerManager {
 
     fn store_snapshot_from(&mut self, via_peer: &NodeId, via_generation: u64, msg: PeerDataMessage) -> HandleResult {
         let origin = msg.origin_node_id.clone();
+        if !msg.origin_display_name.is_empty() {
+            self.learned_node_names.insert(origin.clone(), msg.origin_display_name.clone());
+        }
         let repo = msg.repo_identity.clone();
         let repository_key = msg.repository_key.clone();
         let host_repo_root = msg.host_repo_root.clone();
@@ -760,6 +768,7 @@ impl PeerManager {
                 request_id,
                 requester_node_id,
                 responder_node_id,
+                responder_display_name,
                 remaining_hops,
                 repo_identity,
                 repository_key,
@@ -782,6 +791,7 @@ impl PeerManager {
                     self.last_seen_clocks.remove(&(responder_node_id.clone(), repo_identity.clone()));
                     return self.store_snapshot_from(&connection_peer, connection_generation, PeerDataMessage {
                         origin_node_id: responder_node_id,
+                        origin_display_name: responder_display_name,
                         repo_identity,
                         repository_key,
                         host_repo_root,
@@ -806,6 +816,7 @@ impl PeerManager {
                     request_id,
                     requester_node_id,
                     responder_node_id,
+                    responder_display_name,
                     remaining_hops: remaining_hops.saturating_sub(1),
                     repo_identity,
                     repository_key,

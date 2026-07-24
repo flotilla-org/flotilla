@@ -48,6 +48,7 @@ fn snapshot_msg(origin: &str, seq: u64, data: ProviderData) -> PeerDataMessage {
     }
     PeerDataMessage {
         origin_node_id: node(origin),
+        origin_display_name: origin.to_string(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -606,6 +607,7 @@ async fn delta_message_returns_needs_resync() {
 
     let msg = PeerDataMessage {
         origin_node_id: node("follower"),
+        origin_display_name: "follower".into(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),

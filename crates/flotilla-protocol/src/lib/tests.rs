@@ -463,6 +463,7 @@ fn observe_focus_request_round_trips_typed_resource_targets() {
 fn message_peer_data_roundtrip() {
     let msg = Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
         origin_node_id: NodeId::new("desktop"),
+        origin_display_name: "Desktop".into(),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repository_key: Some(RepositoryKey("repo_peer".into())),
         host_repo_root: Some(PathBuf::from("/tmp/repo")),
@@ -493,6 +494,7 @@ fn message_peer_routed_resync_snapshot_roundtrip() {
         request_id: 6,
         requester_node_id: NodeId::new("laptop"),
         responder_node_id: NodeId::new("desktop"),
+        responder_display_name: "Desktop".into(),
         remaining_hops: 4,
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repository_key: Some(RepositoryKey("repo_peer".into())),

@@ -428,6 +428,7 @@ fn node_info(name: &str) -> NodeInfo {
 fn peer_snapshot(host: &str, repo_identity: &RepoIdentity, repo_path: &Path, checkout_path: &str, branch: &str) -> PeerDataMessage {
     PeerDataMessage {
         origin_node_id: NodeId::new(host),
+        origin_display_name: host.to_string(),
         repo_identity: repo_identity.clone(),
         repository_key: None,
         host_repo_root: Some(repo_path.to_path_buf()),
@@ -2651,6 +2652,7 @@ async fn daemon_server_does_not_replay_configured_peers_without_host_environment
 fn test_peer_msg(host: &str) -> PeerDataMessage {
     PeerDataMessage {
         origin_node_id: NodeId::new(host),
+        origin_display_name: host.to_string(),
         repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/tmp/repo")),

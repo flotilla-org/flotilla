@@ -348,6 +348,7 @@ mod tests {
     fn test_snapshot_msg(origin: &str, seq: u64) -> PeerWireMessage {
         PeerWireMessage::Data(PeerDataMessage {
             origin_node_id: NodeId::new(origin),
+            origin_display_name: origin.to_string(),
             repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             repository_key: None,
             host_repo_root: Some(PathBuf::from("/repo")),
