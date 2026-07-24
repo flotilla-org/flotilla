@@ -208,7 +208,7 @@ Issues have a **type** (lifecycle stage) and **labels** (topic tags). `gh issue 
 | `Feature` | A request, idea, or new functionality |
 | `Brainstorm` | Needs design thinking before it can become a task or feature |
 
-Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`).
+Use labels to tag topics. Combine as appropriate (e.g. `bug` + `ui`, or `from-review` + `refactor` + `quick-win`). Triage-state labels (`needs-triage`, `needs-info`, `ready`, `ready-for-human`, `wontfix`) are a separate, orthogonal vocabulary — see `docs/agents/triage-labels.md`.
 
 | Label | Use for |
 |-------|---------|
