@@ -19,6 +19,10 @@ fn write_repo_file(base: &Path, filename: &str, content: &str) {
     std::fs::write(repos_dir.join(filename), content).unwrap();
 }
 
+fn write_forgejo_config(base: &Path, service_url: &str) {
+    std::fs::write(base.join("config.toml"), format!("[issue_tracker.forgejo]\nservice_url = \"{service_url}\"\n")).unwrap();
+}
+
 fn legacy_path_to_slug(path: &Path) -> String {
     let raw = path.to_string_lossy().to_lowercase();
     let mut prev_hyphen = false;
@@ -99,6 +103,49 @@ fn load_and_migrate_repos_migrates_legacy_file_and_preserves_overrides() {
 
     store.remove_repo(&ee(&repo));
     assert!(store.load_and_migrate_repos().is_empty());
+}
+
+#[test]
+fn resolve_repo_issue_source_reads_forgejo_binding() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "forgejo-repo");
+    let content = format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"fork-issues/zellij\"\n", repo.display());
+    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
+    write_forgejo_config(base, "https://forgejo.example.test");
+
+    let store = ConfigStore::with_base(base);
+    let source = store.resolve_repo_issue_source(&ee(repo)).expect("repo issue source");
+
+    assert_eq!(source.service, "https://forgejo.example.test");
+    assert_eq!(source.scope, "fork-issues/zellij");
+}
+
+#[test]
+fn resolve_repo_issue_source_requires_global_forgejo_service_url() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "forgejo-repo");
+    let content = format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"team/widgets\"\n", repo.display());
+    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
+
+    let store = ConfigStore::with_base(base);
+
+    assert!(store.resolve_repo_issue_source(&ee(repo)).is_none());
+}
+
+#[test]
+fn resolve_repo_issue_source_ignores_mismatched_repo_file() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "forgejo-repo");
+    let other = make_dir(base, "other-repo");
+    let content = format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"fork-issues/zellij\"\n", other.display());
+    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
+
+    let store = ConfigStore::with_base(base);
+
+    assert!(store.resolve_repo_issue_source(&ee(repo)).is_none());
 }
 
 #[test]

@@ -237,6 +237,7 @@ pub fn unmet_requirement_to_proto(factory: &str, requirement: &UnmetRequirement)
         UnmetRequirement::MissingBinary(binary) => ("missing_binary", Some(binary.clone())),
         UnmetRequirement::MissingEnvVar(key) => ("missing_env_var", Some(key.clone())),
         UnmetRequirement::MissingAuth(provider) => ("missing_auth", Some(provider.clone())),
+        UnmetRequirement::MissingConfig(key) => ("missing_config", Some(key.clone())),
         UnmetRequirement::MissingRemoteHost(platform) => ("missing_remote_host", Some(host_platform_name(*platform).to_string())),
         UnmetRequirement::NoVcsCheckout => ("no_vcs_checkout", None),
         UnmetRequirement::UnknownProviderPreference { key, .. } => ("unknown_provider_preference", Some(key.clone())),

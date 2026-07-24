@@ -41,7 +41,7 @@ use crate::{
                 fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, DiscoveryMockRunner,
                 FakeDiscoveryProviders, FakeTerminalPool, MergedPrProcessRunner,
             },
-            EnvironmentAssertion, EnvironmentBag,
+            EnvironmentAssertion, EnvironmentBag, HostPlatform,
         },
         environment::{EnvironmentHandle, ProvisionedEnvironment, ProvisionedMount},
         ChannelLabel, CommandOutput, CommandRunner,
@@ -49,6 +49,16 @@ use crate::{
 };
 
 const TEST_LOCAL_ATTACH_HOST: &str = "local";
+
+fn overwrite_single_saved_repo_config(config_base: &Path, repo: &Path, body: String) {
+    let store = ConfigStore::with_base(config_base);
+    store.save_repo(&ExecutionEnvironmentPath::new(repo));
+    let repos_dir = config_base.join("repos");
+    let entries =
+        std::fs::read_dir(&repos_dir).expect("read repos dir").map(|entry| entry.expect("repo config entry").path()).collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1, "expected one saved repo config");
+    std::fs::write(&entries[0], body).expect("write repo config");
+}
 
 #[test]
 fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
@@ -79,6 +89,29 @@ fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
         assert!(validate_convoy_branch(branch).is_err(), "{branch} should be rejected");
     }
     validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
+}
+
+#[test]
+fn configured_repo_identity_prefers_repo_file_forgejo_binding() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("config.toml"), "[issue_tracker.forgejo]\nservice_url = \"https://forgejo.example.test\"\n")
+        .expect("write global config");
+    overwrite_single_saved_repo_config(
+        &config_base,
+        &repo,
+        format!("path = \"{}\"\n[issue_tracker.forgejo]\nscope = \"fork-issues/zellij\"\n", repo.display()),
+    );
+    let config = ConfigStore::with_base(config_base);
+    let bag = EnvironmentBag::new().with(EnvironmentAssertion::remote_host(HostPlatform::GitHub, "github-org", "github-repo", "origin"));
+
+    let identity = configured_repo_identity_or_bag_or_path(&config, &repo, &bag);
+
+    assert_eq!(identity.authority, "https://forgejo.example.test");
+    assert_eq!(identity.path, "fork-issues/zellij");
 }
 
 #[tokio::test]

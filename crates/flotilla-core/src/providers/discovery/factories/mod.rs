@@ -55,7 +55,7 @@ impl FactoryRegistry {
             vcs: vec![Box::new(git::GitVcsFactory)],
             checkout_managers: checkout_manager_factories(),
             change_requests: vec![Box::new(github::GitHubChangeRequestFactory)],
-            issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory)],
+            issue_trackers: vec![Box::new(github::GitHubIssueProviderFactory), Box::new(github::ForgejoIssueProviderFactory)],
             cloud_agents: vec![
                 Box::new(claude::ClaudeCodingAgentFactory),
                 Box::new(cursor::CursorCodingAgentFactory),

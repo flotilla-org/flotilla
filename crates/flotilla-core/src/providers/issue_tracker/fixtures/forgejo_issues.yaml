@@ -1,0 +1,83 @@
+rounds:
+- interactions:
+  - channel: http
+    method: GET
+    url: https://forgejo.lab.flotilla.work/api/v1/repos/fork-issues/zellij/issues?state=open&type=issues&sort=recentupdate&page=1&limit=30
+    request_headers:
+      accept: application/json
+      authorization: token <LAB_FORGEJO_TOKEN>
+    status: 200
+    response_body: |
+      [
+        {
+          "number": 9,
+          "title": "Wire Forgejo issue provider into convoy startup",
+          "body": "Synthetic Forgejo fixture issue used by replay tests.",
+          "state": "open",
+          "labels": [{"name": "ready"}],
+          "updated_at": "2026-07-24T12:00:00Z",
+          "pull_request": null
+        },
+        {
+          "number": 8,
+          "title": "List Forgejo issues by label",
+          "body": "Synthetic Forgejo fixture issue used by replay tests.",
+          "state": "open",
+          "labels": [{"name": "provider"}],
+          "updated_at": "2026-07-24T11:00:00Z",
+          "pull_request": null
+        }
+      ]
+    response_headers:
+      content-type: application/json;charset=utf-8
+      x-total-count: '2'
+  - channel: http
+    method: GET
+    url: https://forgejo.lab.flotilla.work/api/v1/repos/fork-issues/zellij/issues/9
+    request_headers:
+      authorization: token <LAB_FORGEJO_TOKEN>
+      accept: application/json
+    status: 200
+    response_body: |
+      {
+        "number": 9,
+        "title": "Wire Forgejo issue provider into convoy startup",
+        "body": "Synthetic Forgejo fixture issue used by replay tests.",
+        "state": "open",
+        "labels": [{"name": "ready"}],
+        "updated_at": "2026-07-24T12:00:00Z",
+        "pull_request": null
+      }
+    response_headers:
+      content-type: application/json;charset=utf-8
+  - channel: http
+    method: GET
+    url: https://forgejo.lab.flotilla.work/api/v1/repos/fork-issues/zellij/issues?state=all&type=issues&since=2026-01-01T00%3A00%3A00Z&sort=recentupdate&limit=30
+    request_headers:
+      accept: application/json
+      authorization: token <LAB_FORGEJO_TOKEN>
+    status: 200
+    response_body: |
+      [
+        {
+          "number": 9,
+          "title": "Wire Forgejo issue provider into convoy startup",
+          "body": "Synthetic Forgejo fixture issue used by replay tests.",
+          "state": "open",
+          "labels": [{"name": "ready"}],
+          "updated_at": "2026-07-24T12:00:00Z",
+          "pull_request": null
+        },
+        {
+          "number": 7,
+          "title": "Closed synthetic Forgejo issue",
+          "body": "Synthetic Forgejo fixture issue used by replay tests.",
+          "state": "closed",
+          "labels": [],
+          "updated_at": "2026-07-24T10:00:00Z",
+          "pull_request": null
+        }
+      ]
+    response_headers:
+      content-type: application/json;charset=utf-8
+      x-total-count: '2'
