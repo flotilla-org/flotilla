@@ -172,7 +172,7 @@ impl AggregatorProjectionState {
         let mut deltas = self.independents.write().await.replace_catalog(repositories.clone(), projects.clone());
         deltas.extend(self.checkouts.write().await.replace_catalog(repositories, projects));
         let scopes = self.checkouts.read().await.project_scopes();
-        self.demand_backed.expand_fleet_awareness_demands(&scopes);
+        self.demand_backed.replace_fleet_awareness_scopes(&scopes);
         deltas
     }
 
@@ -208,19 +208,6 @@ impl AggregatorProjectionState {
     /// materialization lifetime was newly created.
     pub fn replace_subscriber(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
         self.demand_backed.replace(subscriber, cursors)
-    }
-
-    pub async fn replace_subscriber_expanding_awareness(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
-        let mut expanded = cursors.to_vec();
-        if cursors.iter().any(|cursor| matches!(cursor.query, QueryId::Awareness { scope: None, .. })) {
-            for scope in self.checkouts.read().await.project_scopes() {
-                let query = QueryId::Issues { scope, search: None, label: Some(READY_ISSUE_LABEL.into()) };
-                if !expanded.iter().any(|cursor| cursor.query == query) {
-                    expanded.push(QueryCursor { query, since: None });
-                }
-            }
-        }
-        self.replace_subscriber(subscriber, &expanded)
     }
 
     pub fn remove_subscriber(&self, subscriber: Uuid) {
@@ -438,13 +425,42 @@ mod tests {
             .await;
 
         let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
-        state.replace_subscriber_expanding_awareness(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]).await;
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]);
 
         assert!(state.subscribe_demand().borrow().contains_key(&QueryId::Issues {
             scope: project,
             search: None,
             label: Some(READY_ISSUE_LABEL.into()),
         }));
+    }
+
+    #[tokio::test]
+    async fn fleet_awareness_subscription_retracts_removed_project_issue_windows_but_preserves_explicit_demand() {
+        let state = AggregatorProjectionState::new();
+        let retained = scope("retained");
+        let removed = scope("removed");
+        let repositories = HashMap::from([(RepositoryKey("repo-a".into()), "a".to_string())]);
+        state.replace_store_catalog(repositories.clone(), HashMap::from([(retained.clone(), vec![]), (removed.clone(), vec![])])).await;
+
+        let subscriber = Uuid::new_v4();
+        let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
+        state.replace_subscriber(subscriber, &[QueryCursor { query: awareness.clone(), since: None }]);
+        let retained_issues = QueryId::Issues { scope: retained.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) };
+        let removed_issues = QueryId::Issues { scope: removed.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) };
+        assert_eq!(
+            state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([retained_issues.clone(), removed_issues.clone()])
+        );
+
+        state.replace_store_catalog(repositories.clone(), HashMap::from([(retained, vec![])])).await;
+        assert_eq!(state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([retained_issues]));
+
+        state.replace_subscriber(subscriber, &[QueryCursor { query: awareness, since: None }, QueryCursor {
+            query: removed_issues.clone(),
+            since: None,
+        }]);
+        state.replace_store_catalog(repositories, HashMap::new()).await;
+        assert_eq!(state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([removed_issues]));
     }
 
     #[tokio::test]

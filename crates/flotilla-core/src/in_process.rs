@@ -6853,7 +6853,7 @@ impl DaemonHandle for InProcessDaemon {
 
     async fn subscribe_queries(&self, subscriber_id: uuid::Uuid, queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
         let state = self.aggregator_projection_state().await;
-        let newly_materialized = state.replace_subscriber_expanding_awareness(subscriber_id, queries).await;
+        let newly_materialized = state.replace_subscriber(subscriber_id, queries);
         let mut events = Vec::new();
         for cursor in queries {
             let result_set =
