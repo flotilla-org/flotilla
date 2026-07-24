@@ -530,7 +530,7 @@ async fn publish_awareness_sets(state: &AggregatorProjectionState, event_tx: &br
 }
 
 fn demand_state(has_more: bool, conditions: Vec<ResultSetCondition>) -> ResultSetState {
-    ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions }
+    ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more }), conditions, truncated: false }
 }
 
 fn unavailable(source: Option<IssueSource>, message: impl Into<String>) -> ResultSetCondition {

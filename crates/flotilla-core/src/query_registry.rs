@@ -246,6 +246,7 @@ fn unavailable_issues_result_set(query: QueryId) -> ResultSet {
                 source: None,
                 message: "issue source materialization is pending".to_string(),
             }],
+            truncated: false,
         },
     }
 }
@@ -335,7 +336,11 @@ mod tests {
         let query = issues("represented");
         registry.replace(Uuid::new_v4(), &[cursor(query.clone())]);
         let generation = registry.generation(&query);
-        let ready = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }), conditions: vec![] };
+        let ready = ResultSetState {
+            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
+            conditions: vec![],
+            truncated: false,
+        };
         registry.replace_issues(&query, generation, vec![issue_row("809"), issue_row("810")], ready).expect("issue window");
 
         let represented = HashSet::from([IssueRef {
@@ -366,7 +371,11 @@ mod tests {
         let second_generation = registry.generation(&query);
 
         assert!(second_generation > first_generation);
-        let ready = ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }), conditions: vec![] };
+        let ready = ResultSetState {
+            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
+            conditions: vec![],
+            truncated: false,
+        };
         assert!(registry.replace_issues(&query, first_generation, vec![], ready.clone()).is_none());
         assert!(registry.replace_issues(&query, second_generation, vec![], ready).is_some());
     }
@@ -416,6 +425,7 @@ mod tests {
         registry.replace_issues(&query, registry.generation(&query), vec![], ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
             conditions: vec![],
+            truncated: false,
         });
         let mut intents = registry.subscribe_fetch_more();
 
@@ -435,6 +445,7 @@ mod tests {
         registry.replace_issues(&query, first_generation, vec![], ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
             conditions: vec![],
+            truncated: false,
         });
         registry.request_fetch_more(&query).expect("first lifetime accepts fetch-more");
 
