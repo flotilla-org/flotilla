@@ -959,6 +959,18 @@ async fn convoy_resume_requires_a_selector_when_completed_crew_is_ambiguous() {
 }
 
 #[tokio::test]
+async fn convoy_resume_rejects_an_empty_protocol_prompt_before_delivery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+
+    let error = daemon.convoy_resume_internal("flotilla", "demo", "  ", None, None).await.expect_err("empty prompt should be rejected");
+
+    assert_eq!(error, "convoy resume requires a non-empty prompt");
+    assert!(terminal_pool.delivered.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn convoy_resume_restarts_an_intact_stopped_crew_session_with_the_follow_up_prompt() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");

@@ -4990,6 +4990,9 @@ impl InProcessDaemon {
         requested_vessel: Option<&str>,
         requested_role: Option<&str>,
     ) -> Result<(), String> {
+        if prompt.trim().is_empty() {
+            return Err("convoy resume requires a non-empty prompt".to_string());
+        }
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
