@@ -1424,3 +1424,26 @@ async fn failed_subscription_is_torn_down_diagnosed_and_retried() {
     assert!(route.connected);
     assert_eq!(route.last_error, None);
 }
+
+#[tokio::test]
+async fn reconnect_after_disconnect_mints_a_higher_generation() {
+    // Regression: disconnect_peer used to reset the mint counter, so every
+    // reconnect arrived as generation 1 and the replicator supervisor
+    // rejected its replicators as duplicates — wedging replication and
+    // heartbeats after any one-sided daemon restart.
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let first_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) });
+    let second_sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::new(Mutex::new(Vec::new())) });
+    let meta = || ConnectionMeta { direction: ConnectionDirection::Inbound, config_label: None, expected_peer: None, config_backed: false };
+
+    let gen1 = accepted_generation(mgr.activate_connection(NodeId::new("peer"), first_sender, meta()));
+    assert_eq!(gen1, 1);
+    let _ = mgr.disconnect_peer(&NodeId::new("peer"), gen1);
+
+    let gen2 = accepted_generation(mgr.activate_connection(NodeId::new("peer"), second_sender, meta()));
+    assert_eq!(gen2, 2, "reconnect after disconnect must mint a strictly higher generation");
+
+    // Validity still keys on the active connection: the disconnected
+    // generation is dead, the new one is current.
+    assert_eq!(mgr.current_generation(&NodeId::new("peer")), Some(gen2));
+}
