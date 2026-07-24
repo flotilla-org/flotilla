@@ -13,6 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
 };
+use serde::{Deserialize, Serialize};
 
 use super::{
     preview_panel::PreviewPanel,
@@ -127,6 +128,18 @@ pub struct RepoPage {
     pub active_search_query: Option<String>,
     last_seen_generation: u64,
     double_click: DoubleClickState,
+    reconnect_selection: Option<(WorkItemIdentity, usize)>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct RepoPageHandoff {
+    selected: Option<WorkItemIdentity>,
+    multi_selected: HashSet<WorkItemIdentity>,
+    layout: RepoViewLayout,
+    show_providers: bool,
+    show_archived: bool,
+    active_search_query: Option<String>,
+    scroll_offset: usize,
 }
 
 impl RepoPage {
@@ -144,7 +157,29 @@ impl RepoPage {
             active_search_query: None,
             last_seen_generation: 0,
             double_click: DoubleClickState::default(),
+            reconnect_selection: None,
         }
+    }
+
+    pub(crate) fn handoff(&self) -> RepoPageHandoff {
+        RepoPageHandoff {
+            selected: self.table.selected_identity(),
+            multi_selected: self.multi_selected.clone(),
+            layout: self.layout,
+            show_providers: self.show_providers,
+            show_archived: self.show_archived,
+            active_search_query: self.active_search_query.clone(),
+            scroll_offset: self.table.reconnect_scroll_offset(),
+        }
+    }
+
+    pub(crate) fn restore_handoff(&mut self, handoff: RepoPageHandoff) {
+        self.multi_selected = handoff.multi_selected;
+        self.layout = handoff.layout;
+        self.show_providers = handoff.show_providers;
+        self.show_archived = handoff.show_archived;
+        self.active_search_query = handoff.active_search_query;
+        self.reconnect_selection = handoff.selected.map(|selected| (selected, handoff.scroll_offset));
     }
 
     /// Identity of the repo this page represents.
@@ -181,6 +216,9 @@ impl RepoPage {
 
         // Query-driven issues go into a native IssueRow section.
         self.table.update_issue_section(data.issue_section_label.clone(), data.issue_rows.clone());
+        if let Some((identity, scroll_offset)) = self.reconnect_selection.take() {
+            self.table.restore_reconnect_selection(&identity, scroll_offset);
+        }
 
         let current_identities: HashSet<WorkItemIdentity> = self.table.all_identities().collect();
         self.multi_selected.retain(|id| current_identities.contains(id));

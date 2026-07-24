@@ -493,6 +493,30 @@ impl SplitTable {
         }
     }
 
+    pub fn reconnect_scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub fn restore_reconnect_selection(&mut self, identity: &WorkItemIdentity, scroll_offset: usize) {
+        let target = self.sections.iter().enumerate().find_map(|(section_idx, (_, section))| {
+            let item_idx = match section {
+                AnySection::WorkItems(table) => table.items.iter().position(|item| &item.identity == identity),
+                AnySection::Issues(table) => match identity {
+                    WorkItemIdentity::Issue(issue_id) => table.items.iter().position(|row| &row.id == issue_id),
+                    _ => None,
+                },
+            }?;
+            Some((section_idx, item_idx))
+        });
+        let Some((section_idx, item_idx)) = target else { return };
+        for (_, section) in &mut self.sections {
+            section.clear_selection();
+        }
+        self.active_section = section_idx;
+        self.sections[section_idx].1.select_idx(item_idx);
+        self.scroll_offset = scroll_offset;
+    }
+
     /// Iterate all selectable identities across all sections.
     pub fn all_identities(&self) -> impl Iterator<Item = WorkItemIdentity> + '_ {
         self.sections.iter().flat_map(|(_, section)| match section {

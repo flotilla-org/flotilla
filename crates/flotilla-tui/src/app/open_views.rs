@@ -8,20 +8,21 @@ use std::collections::HashMap;
 
 use flotilla_core::config::OpenViewEntry;
 use flotilla_protocol::{QueryId, RepoIdentity, RepositoryKey, ViewAddress};
+use serde::{Deserialize, Serialize};
 
 use crate::table_view::{AuthoritativeRowUpdate, PendingRowContext, ProjectPanelKind, ProjectTableState, TableState};
 
 /// What an open tab points at: a parsed View address, or the raw entry that
 /// failed to parse. A broken entry renders an error view in place — it never
 /// invalidates the rest of the tab set (ADR 0013 loud-failure rule).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewTarget {
     View(ViewAddress),
     Broken { raw: String, error: String },
 }
 
 /// One open View in this TUI instance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenView {
     pub target: ViewTarget,
     /// User-set label. Display-only; never part of view identity.
@@ -33,7 +34,7 @@ pub struct OpenView {
     pub(crate) history: Vec<NavigationFrame>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NavigationFrame {
     target: ViewTarget,
     table_state: TableState,
@@ -149,7 +150,7 @@ impl OpenView {
 /// Whether a set of open Views is the tabbed shell or a single scoped pane.
 /// This is the pinning policy: the tabbed shell pins the overview at index 0;
 /// a scoped pane pins its lone view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TabSetMode {
     /// The full tab shell: pinned overview at index 0, user-managed tabs,
     /// persisted to `open-views.toml`.
@@ -160,6 +161,7 @@ pub enum TabSetMode {
 }
 
 /// The ordered set of open Views and the active tab.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OpenViews {
     views: Vec<OpenView>,
     active: usize,

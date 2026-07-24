@@ -37,6 +37,11 @@ impl Drop for QuerySubscription {
 /// Both InProcessDaemon and SocketDaemon implement this.
 #[async_trait]
 pub trait DaemonHandle: Send + Sync {
+    /// Build identity advertised by the connected daemon, when available.
+    fn build_id(&self) -> Option<&str> {
+        Some(flotilla_protocol::BUILD_ID)
+    }
+
     /// Subscribe to daemon events (snapshots, repo changes).
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent>;
 

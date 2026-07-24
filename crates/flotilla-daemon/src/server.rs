@@ -515,7 +515,7 @@ async fn handle_client_session(
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
                         node_id: daemon.node_id().clone(),
-                        display_name: daemon.host_name().to_string(),
+                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str()),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,

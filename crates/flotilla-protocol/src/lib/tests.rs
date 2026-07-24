@@ -689,3 +689,11 @@ fn fetch_more_request_round_trips_parameterized_query() {
     assert!(encoded.contains("\"fetch_more\""));
     assert_eq!(serde_json::from_str::<Request>(&encoded).expect("deserialize fetch-more request"), request);
 }
+
+#[test]
+fn hello_display_name_carries_build_identity_without_changing_the_envelope() {
+    let display_name = hello_display_name("feta");
+    assert!(display_name.starts_with("feta"));
+    assert_eq!(hello_build_id(&display_name), Some(BUILD_ID));
+    assert_eq!(hello_build_id("legacy-daemon"), None);
+}

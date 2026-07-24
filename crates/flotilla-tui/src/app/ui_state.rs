@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use flotilla_protocol::{HostName, IssueRef, ProvisioningTarget, RepoIdentity, ViewAddress, WorkItemIdentity};
 use ratatui::layout::Rect;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     status_bar::StatusBarTarget,
@@ -25,7 +26,7 @@ pub enum BranchInputKind {
     Generating,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoViewLayout {
     #[default]
     Auto,

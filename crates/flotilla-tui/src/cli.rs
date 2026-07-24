@@ -694,20 +694,23 @@ fn print_bootstrap_events(events: &[DaemonEvent], replay_seqs: &mut HashMap<Stre
 }
 
 pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
-    let mut backoff = crate::pm_connect::ReconnectBackoff::default();
     loop {
-        match SocketDaemon::connect(socket_path).await {
-            Ok(daemon) => {
-                backoff.reset();
-                if let Err(error) = run_watch_connection(daemon, format).await {
-                    eprintln!("{error}; reconnecting...");
+        let daemon = flotilla_client::reconnect::connect_with_retry(
+            || SocketDaemon::connect(socket_path),
+            |notice| match notice {
+                flotilla_client::reconnect::ReconnectNotice::Attempt { attempt } => {
+                    eprintln!("connecting to daemon (attempt {attempt})...");
                 }
-            }
-            Err(error) if crate::pm_connect::is_incompatible_daemon_error(&error) => return Err(error),
-            Err(error) => eprintln!("cannot connect to daemon: {error}; retrying..."),
+                flotilla_client::reconnect::ReconnectNotice::Retry { error, delay, .. } => {
+                    eprintln!("cannot connect to daemon: {error}; retrying in {:.1}s...", delay.as_secs_f64());
+                }
+            },
+        )
+        .await?;
+        flotilla_client::reconnect::warn_on_build_mismatch(daemon.as_ref());
+        if let Err(error) = run_watch_connection(daemon, format).await {
+            eprintln!("{error}; reconnecting...");
         }
-
-        tokio::time::sleep(backoff.next_delay()).await;
     }
 }
 

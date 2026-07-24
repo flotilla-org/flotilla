@@ -92,6 +92,30 @@ fn session_harness() -> SessionHarness {
     SessionHarness { daemon, session: server }
 }
 
+#[tokio::test]
+async fn stateful_handshake_records_daemon_build_identity() {
+    let (client, server) = message_session_pair();
+    let server_task = tokio::spawn(async move {
+        let hello = server.read().await.expect("read client hello").expect("client hello");
+        assert!(matches!(hello, Message::Hello { .. }));
+        server
+            .write(Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                node_id: NodeId::new("daemon"),
+                display_name: flotilla_protocol::hello_display_name("daemon"),
+                session_id: uuid::Uuid::new_v4(),
+                connection_role: Some(ConnectionRole::Client),
+                surface: None,
+            })
+            .await
+            .expect("write daemon hello");
+    });
+
+    let daemon = SocketDaemon::from_session_stateful(client).await.expect("handshake succeeds");
+    assert_eq!(daemon.build_id(), Some(flotilla_protocol::BUILD_ID));
+    server_task.await.expect("server task");
+}
+
 fn broken_request_harness() -> (SharedSession, SharedPending, Arc<AtomicU64>) {
     let (client, server) = message_session_pair();
     drop(server);

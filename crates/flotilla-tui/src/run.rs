@@ -5,6 +5,12 @@ use crossterm::{
     event::{EnableMouseCapture, KeyCode, KeyModifiers, MouseEventKind},
     execute,
 };
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout},
+    style::Style,
+    text::{Line, Text},
+    widgets::{Block, Borders, Clear, Paragraph},
+};
 
 use crate::{
     app::{self, App},
@@ -12,10 +18,9 @@ use crate::{
     widgets::InteractiveWidget,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLoopExit {
     Quit,
-    DaemonDisconnected,
+    DaemonDisconnected(Box<App>),
 }
 
 /// Run the TUI event loop: replay initial state, then process events until quit.
@@ -98,7 +103,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
                 }
                 Event::DaemonDisconnected => {
                     crate::terminal::restore_terminal();
-                    return Ok(EventLoopExit::DaemonDisconnected);
+                    return Ok(EventLoopExit::DaemonDisconnected(Box::new(app)));
                 }
                 Event::CommandDispatchCompleted { result, pending_ctx } => {
                     app::executor::handle_dispatch_completion(result, pending_ctx, &mut app);
@@ -207,6 +212,42 @@ fn render_frame(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Resul
             query_tables: &app.query_tables,
         };
         app.screen.render(f, area, &mut ctx);
+    })?;
+    Ok(())
+}
+
+/// Draw the honest, minimal surface shown while the daemon is unavailable.
+pub fn render_reconnect_frame(
+    terminal: &mut ratatui::DefaultTerminal,
+    attempt: usize,
+    detail: Option<&str>,
+    theme: &crate::theme::Theme,
+) -> Result<()> {
+    terminal.draw(|frame| {
+        let area = frame.area();
+        frame.render_widget(Clear, area);
+        let popup = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Fill(1), Constraint::Length(7), Constraint::Fill(1)])
+            .split(area)[1];
+        let popup = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Fill(1), Constraint::Percentage(70), Constraint::Fill(1)])
+            .split(popup)[1];
+        let mut lines = vec![
+            Line::raw(""),
+            Line::styled(format!("Daemon disconnected — reconnecting (attempt {attempt})…"), Style::default().fg(theme.text).bold()),
+        ];
+        if let Some(detail) = detail {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled(detail, Style::default().fg(theme.muted)));
+        }
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).border_style(theme.block_style())),
+            popup,
+        );
     })?;
     Ok(())
 }

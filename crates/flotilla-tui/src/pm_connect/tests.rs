@@ -303,27 +303,7 @@ fn resolve_pm_prefers_explicit_socket_then_environment_detection() {
     assert!(error.contains("no presentation manager detected"));
 }
 
-#[test]
-fn reconnect_backoff_doubles_and_caps_with_jitter() {
-    let mut backoff = ReconnectBackoff::default();
-    let delays: Vec<_> = (0..8).map(|_| backoff.next_delay_with_jitter(1.0)).collect();
-
-    assert_eq!(delays, vec![
-        Duration::from_millis(500),
-        Duration::from_secs(1),
-        Duration::from_secs(2),
-        Duration::from_secs(4),
-        Duration::from_secs(8),
-        Duration::from_secs(16),
-        Duration::from_secs(30),
-        Duration::from_secs(30),
-    ]);
-
-    backoff.reset();
-    assert_eq!(backoff.next_delay_with_jitter(0.0), Duration::from_millis(250));
-}
-
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn reconnect_loop_retries_unavailable_daemon_but_exits_for_incompatible_daemon() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_connect = Arc::clone(&attempts);
@@ -341,7 +321,6 @@ async fn reconnect_loop_retries_unavailable_daemon_but_exits_for_incompatible_da
             }
         },
         |_| async { Ok(()) },
-        ReconnectBackoff { next_base: Duration::ZERO },
     )
     .await;
 
