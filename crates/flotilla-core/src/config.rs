@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use flotilla_protocol::NodeId;
+use flotilla_protocol::{IssueSource, NodeId};
 use serde::{Deserialize, Serialize};
 
 use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -25,6 +25,20 @@ pub struct ChangeRequestConfig {
 pub struct IssueTrackerConfig {
     #[serde(flatten)]
     pub preference: ProviderPreference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forgejo: Option<ForgejoIssueTrackerConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgejoIssueTrackerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -187,6 +201,8 @@ pub struct RepoFileConfig {
     pub path: String,
     #[serde(default)]
     pub vcs: RepoVcsConfig,
+    #[serde(default)]
+    pub issue_tracker: RepoIssueTrackerConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -201,6 +217,17 @@ pub struct RepoVcsConfig {
 pub struct RepoGitConfig {
     pub checkout_strategy: Option<String>,
     pub checkout_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoIssueTrackerConfig {
+    #[serde(default)]
+    pub forgejo: Option<RepoForgejoIssueTrackerConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoForgejoIssueTrackerConfig {
+    pub scope: Option<String>,
 }
 
 /// Global SSH settings for remote host connections.
@@ -539,6 +566,41 @@ impl ConfigStore {
     /// Resolve checkout config for a repo: per-repo override > global > defaults.
     pub fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
         let global = self.load_config();
+        if let Some(repo_cfg) = self.load_repo_file_config(repo_root) {
+            return ResolvedCheckoutConfig {
+                strategy: repo_cfg.vcs.git.checkout_strategy.unwrap_or_else(|| global.vcs.git.checkout_strategy.clone()),
+                path: repo_cfg.vcs.git.checkout_path.unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
+            };
+        }
+        ResolvedCheckoutConfig { strategy: global.vcs.git.checkout_strategy.clone(), path: global.vcs.git.checkout_path.clone() }
+    }
+
+    pub fn resolve_repo_issue_source(&self, repo_root: &ExecutionEnvironmentPath) -> Option<IssueSource> {
+        let repo_cfg = self.load_repo_file_config(repo_root)?;
+        let forgejo = repo_cfg.issue_tracker.forgejo?;
+        let scope = forgejo.scope?.trim().to_string();
+        if scope.is_empty() {
+            tracing::warn!(repo = %repo_root.as_path().display(), "repo Forgejo issue source scope is empty");
+            return None;
+        }
+        let service = self
+            .load_config()
+            .issue_tracker
+            .forgejo
+            .and_then(|config| config.service_url)
+            .map(|url| url.trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty());
+        let Some(service) = service else {
+            tracing::warn!(
+                repo = %repo_root.as_path().display(),
+                "repo has a Forgejo issue binding but [issue_tracker.forgejo].service_url is not configured"
+            );
+            return None;
+        };
+        Some(IssueSource { service, scope })
+    }
+
+    fn load_repo_file_config(&self, repo_root: &ExecutionEnvironmentPath) -> Option<RepoFileConfig> {
         let key = repo_file_key(repo_root.as_path());
         let repo_file = self.repos_dir().join(format!("{key}.toml"));
         if let Ok(content) = std::fs::read_to_string(repo_file.as_path()) {
@@ -546,22 +608,16 @@ impl ConfigStore {
                 Ok(repo_cfg) => {
                     if repo_cfg.path != repo_root.as_path().to_string_lossy() {
                         tracing::warn!(path = %repo_file, expected = %repo_root.as_path().display(), actual = %repo_cfg.path, "repo config path mismatch");
-                        return ResolvedCheckoutConfig {
-                            strategy: global.vcs.git.checkout_strategy.clone(),
-                            path: global.vcs.git.checkout_path.clone(),
-                        };
+                        return None;
                     }
-                    return ResolvedCheckoutConfig {
-                        strategy: repo_cfg.vcs.git.checkout_strategy.unwrap_or_else(|| global.vcs.git.checkout_strategy.clone()),
-                        path: repo_cfg.vcs.git.checkout_path.unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
-                    };
+                    return Some(repo_cfg);
                 }
                 Err(e) => {
                     tracing::warn!(path = %repo_file, err = %e, "failed to parse");
                 }
             }
         }
-        ResolvedCheckoutConfig { strategy: global.vcs.git.checkout_strategy.clone(), path: global.vcs.git.checkout_path.clone() }
+        None
     }
 }
 

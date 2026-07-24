@@ -244,6 +244,7 @@ pub enum UnmetRequirement {
     MissingBinary(String),
     MissingEnvVar(String),
     MissingAuth(String),
+    MissingConfig(String),
     MissingRemoteHost(HostPlatform),
     NoVcsCheckout,
     /// Config references a backend or implementation that no factory provides.

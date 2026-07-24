@@ -778,6 +778,14 @@ fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla
     bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
 }
 
+fn configured_repo_identity_or_bag_or_path(config: &ConfigStore, path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
+    let repo_root = ExecutionEnvironmentPath::new(path);
+    config
+        .resolve_repo_issue_source(&repo_root)
+        .map(|source| flotilla_protocol::RepoIdentity { authority: source.service, path: source.scope })
+        .unwrap_or_else(|| repo_identity_from_bag_or_path(path, bag))
+}
+
 fn normalize_checkout_for_environment(
     environment_manager: &EnvironmentManager,
     environment_id: Option<&EnvironmentId>,
@@ -1475,7 +1483,7 @@ impl InProcessDaemon {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
 
-            let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+            let identity = configured_repo_identity_or_bag_or_path(&config, &path, &host_repo_bag);
             match startup_repository_inspector.inspect_path(&path, None).await {
                 Ok(inspection) => {
                     repository_keys_by_path.insert(path.clone(), inspection.key());
@@ -2254,6 +2262,10 @@ impl InProcessDaemon {
     }
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
+        let repo_root = ExecutionEnvironmentPath::new(repo_path);
+        if let Some(source) = self.config.resolve_repo_issue_source(&repo_root) {
+            return flotilla_protocol::RepoIdentity { authority: source.service, path: source.scope };
+        }
         match discover_repo_for_environment(
             &self.environment_manager,
             &self.discovery,
@@ -4166,7 +4178,7 @@ impl InProcessDaemon {
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
-        let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+        let identity = configured_repo_identity_or_bag_or_path(&self.config, &path, &host_repo_bag);
         // Resolve the storage identity before publishing RepoTracked so a
         // surface can subscribe to issues{repository} immediately. The
         // background refresh also reconciles the Repository resource and

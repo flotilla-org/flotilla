@@ -125,6 +125,7 @@ fn unmet_requirement_variants() {
         UnmetRequirement::MissingBinary("git".into()),
         UnmetRequirement::MissingEnvVar("TOKEN".into()),
         UnmetRequirement::MissingAuth("github".into()),
+        UnmetRequirement::MissingConfig("[provider]".into()),
         UnmetRequirement::MissingRemoteHost(HostPlatform::GitHub),
         UnmetRequirement::NoVcsCheckout,
         UnmetRequirement::UnknownProviderPreference { category: ProviderCategory::AiUtility, key: "nonexistent".into() },
