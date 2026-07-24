@@ -41,6 +41,19 @@ pub struct ConvoySpec {
     pub instruction: Option<String>,
 }
 
+impl ConvoySpec {
+    /// The repository snapshot when this convoy has exactly one repository.
+    ///
+    /// A single repository is the only unambiguous source for one `vcs.repo`
+    /// grouping fact.
+    pub fn sole_repository(&self) -> Option<&ConvoyRepositorySpec> {
+        let [repository] = self.repositories.as_slice() else {
+            return None;
+        };
+        Some(repository)
+    }
+}
+
 /// Durable source-qualified issue context captured when a convoy is admitted.
 /// The reference remains stable if the Project later changes its Issue Source;
 /// the snapshot records exactly what the crew was asked to act on.

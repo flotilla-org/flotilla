@@ -10,9 +10,9 @@
 //! - `flotilla pm connect` publishes the catalog against `Group`/`Identity`
 //!   targets (TTL'd, re-asserted).
 //!
-//! v0 deliberately binds to andamento's *current* pipe names and key
-//! spellings (decision recorded on #667). Every spelling and serde shape a
-//! PM sees lives in this crate, so the Leg-1 contract rename (the
+//! v0 deliberately binds to andamento's *current* pipe names and the shared
+//! fact dialect recorded in [`wire`]. Every spelling and serde shape a PM
+//! sees lives in this crate, so the Leg-1 contract extraction (the
 //! `flotilla-org/manifest` extraction) is a change to this crate only. At
 //! that point the mirrored types in [`wire`] are deleted in favour of a
 //! dependency on the shared manifest crate — flotilla becomes its third

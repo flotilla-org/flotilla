@@ -605,6 +605,10 @@ pub struct CheckoutRow {
     pub repo: RepositoryKey,
     /// Human-readable Repository presentation, never the opaque identity key.
     pub repo_label: String,
+    /// Canonical cross-producer `vcs.repo` fact value. Kept separate from
+    /// `repo_label`, which scoped projections may rewrite for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_fact: Option<RepoKey>,
     pub path: String,
     pub branch: String,
     pub host: HostName,
@@ -648,6 +652,10 @@ pub struct IndependentRow {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoKey>,
+    /// Canonical cross-producer `vcs.repo` fact value. Kept separate from
+    /// `repo`, which is a presentation label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_fact: Option<RepoKey>,
     /// Canonical Repository membership fact used by the Aggregator to derive
     /// Project-scoped result sets. This is data on the row, not a query scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]

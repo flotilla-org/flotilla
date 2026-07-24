@@ -15,7 +15,7 @@ use flotilla_core::{
     },
 };
 use flotilla_manifest::{
-    projection::{convoy_group_path, project_segment, vessel_factory_id, vessel_group_path},
+    projection::{convoy_group_path, project_segment, repo_segment, vessel_factory_id, vessel_group_path},
     stamp::WorkspaceStamp,
 };
 use flotilla_protocol::{arg::shell_quote, HostName, RepoKey, ResourceRef};
@@ -61,17 +61,18 @@ impl PresentationPmConnector {
     }
 
     fn stamp(target: &OpenInPmTarget) -> WorkspaceStamp {
-        let project = project_segment(target.project_ref.as_deref(), target.repo_hint.as_ref().map(|repo| repo.0.as_str()));
+        let project = project_segment(target.project_ref.as_deref());
+        let repo = repo_segment(target.repo_hint.as_ref().map(|repo| repo.0.as_str()));
         match &target.vessel {
             Some(vessel) => WorkspaceStamp {
                 kind: "flotilla-vessel".to_owned(),
                 factory_id: vessel_factory_id(&target.namespace, &target.convoy, vessel),
-                scope: Some(vessel_group_path(project, &target.namespace, &target.convoy, vessel)),
+                scope: Some(vessel_group_path(project, repo, &target.namespace, &target.convoy, vessel)),
             },
             None => WorkspaceStamp {
                 kind: "flotilla-convoy".to_owned(),
                 factory_id: format!("flotilla:convoys/{}/{}", target.namespace, target.convoy),
-                scope: Some(convoy_group_path(project, &target.namespace, &target.convoy)),
+                scope: Some(convoy_group_path(project, repo, &target.namespace, &target.convoy)),
             },
         }
     }
@@ -151,6 +152,10 @@ mod tests {
     use std::sync::Mutex;
 
     use flotilla_core::providers::types::Workspace;
+    use flotilla_manifest::{
+        keys::{SEGMENT_CONVOY, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL},
+        wire::{GroupPath, GroupSegment},
+    };
 
     use super::*;
 
@@ -250,7 +255,18 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].0, "dev/tables/implement");
         assert_eq!(created[0].1, vec![("implement".into(), "'/opt/flotilla' attach 'terminal-implement'".into())]);
-        assert_eq!(created[0].2.as_ref().expect("workspace stamp").factory_id, "flotilla:convoys/dev/tables/implement");
+        let stamp = created[0].2.as_ref().expect("workspace stamp");
+        assert_eq!(stamp.factory_id, "flotilla:convoys/dev/tables/implement");
+        assert_eq!(
+            stamp.scope,
+            Some(GroupPath(vec![
+                GroupSegment::text(SEGMENT_PROJECT, "flotilla"),
+                GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla"),
+                GroupSegment::text(SEGMENT_CONVOY, "dev/tables").with_label("tables"),
+                GroupSegment::text(SEGMENT_VESSEL, "implement"),
+            ])),
+            "the live workspace stamp must match the catalog's latent vessel path"
+        );
     }
 
     #[tokio::test]

@@ -144,7 +144,20 @@ awareness queries → latent presence; searchlight → materialized attachments;
 materialize missing, retract expired, latent the marginal. Reconcile-on-
 connect (#835) is this convergence run at connect time.
 
-Three refinements from the openable-latent grill (2026-07-23):
+Five refinements from the openable-latent and fact-semantics grills
+(2026-07-23):
+
+- **Facts use one dialect, with one meaning per key.** Project and Repository
+  identity are separate grouping levels: `flotilla.project` is a Project
+  resource name and exists only with Project knowledge; `vcs.repo` is the
+  canonical forge slug, with the Repository's `host:path` identity as the
+  slugless fallback. A Repository never masquerades as a Project. Producers
+  that know the same Repository use the same `vcs.repo` value, so their
+  observations join there.
+- **Every producer publishes provenance as data.** Each assertion carries a
+  `source` fact (`flotilla`, `git-watcher`, and so on), distinct from the
+  patch protocol's authority-scoped `source_id`. Surfaces may therefore badge
+  provenance without interpreting transport bookkeeping.
 
 - **Latent tabs are a sanctioned rendering**: a surface may draw latents
   *in place in its working-set idiom* — a dimmed tab where the live tab

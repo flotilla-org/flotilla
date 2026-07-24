@@ -1273,6 +1273,11 @@ impl Aggregator {
                             .map(|repository| repository.spec.qualified_label())
                             .unwrap_or_else(|| UNKNOWN_REPOSITORY_LABEL.to_string()),
                     )
+                    .maybe_repo_fact(
+                        self.repositories
+                            .get(&spec.repo_ref)
+                            .map(|repository| flotilla_protocol::RepoKey(repository.spec.repo_fact_value())),
+                    )
                     .path(spec.path.clone())
                     .branch(spec.r#ref.clone())
                     .host(self.local_host.clone())
@@ -1578,11 +1583,11 @@ impl Aggregator {
         let name = &session.metadata.name;
         let attach = attachable_sessions.contains(&key).then(|| name.clone());
         let repository_key = session.metadata.labels.get(REPO_KEY_LABEL).cloned().map(RepositoryKey);
+        let repository = repository_key.as_ref().and_then(|key| self.repositories.get(key));
         let repository_label = repository_key.as_ref().map_or_else(
             || session.metadata.labels.get(REPO_LABEL).cloned(),
             |key| {
-                self.repositories
-                    .get(key)
+                repository
                     .map(|repository| repository.spec.qualified_label())
                     .or_else(|| session.metadata.labels.get(REPO_LABEL).filter(|label| *label != &key.0).cloned())
                     .or_else(|| Some(UNKNOWN_REPOSITORY_LABEL.to_string()))
@@ -1593,6 +1598,7 @@ impl Aggregator {
                 .resource(resource)
                 .name(name)
                 .maybe_repo(repository_label.map(flotilla_protocol::RepoKey))
+                .maybe_repo_fact(repository.map(|repository| flotilla_protocol::RepoKey(repository.spec.repo_fact_value())))
                 .maybe_repository_key(repository_key)
                 .host(host)
                 .maybe_attach(attach)
@@ -1655,7 +1661,7 @@ impl Aggregator {
             .phase(convoy_phase(phase))
             .initializing(convoy_is_initializing(status))
             .maybe_message(status.and_then(|status| status.message.clone()))
-            .maybe_repo(convoy.metadata.labels.get(flotilla_resources::REPO_LABEL).map(|repo| flotilla_protocol::RepoKey(repo.clone())))
+            .maybe_repo(self.convoy_repo_fact(convoy).map(flotilla_protocol::RepoKey))
             .maybe_started_at(status.and_then(|status| status.started_at))
             .maybe_finished_at(status.and_then(|status| status.finished_at))
             .maybe_observed_workflow_ref(status.and_then(|status| status.observed_workflow_ref.clone()))
@@ -1676,6 +1682,14 @@ impl Aggregator {
             .vessels(vessels)
             .needs_attention(needs_attention)
             .build()
+    }
+
+    fn convoy_repo_fact(&self, convoy: &ResourceObject<Convoy>) -> Option<String> {
+        convoy
+            .spec
+            .sole_repository()
+            .and_then(|snapshot| self.repositories.get(&snapshot.repo_ref))
+            .map(|repository| repository.spec.repo_fact_value())
     }
 
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
@@ -2638,6 +2652,23 @@ mod tests {
             rows: Vec::new(),
             result_sets: state.local_result_sets().await,
         }
+    }
+
+    #[tokio::test]
+    async fn convoy_repo_fact_comes_from_single_repository_knowledge() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(1);
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), event_tx);
+        let repository = repository_object("https://github.com/flotilla-org/flotilla").await;
+        let repository_key = repository.spec.key();
+        aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
+        let mut convoy = convoy_with_branch("dialect").await;
+        convoy.spec.repositories[0].repo_ref = repository_key;
+        let reference = ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "dialect");
+
+        let row = aggregator.summarize(&reference, &convoy);
+
+        assert_eq!(row.repo, Some(flotilla_protocol::RepoKey("flotilla-org/flotilla".to_string())));
     }
 
     #[tokio::test]

@@ -24,11 +24,16 @@ use flotilla_core::{
     },
     HostName,
 };
+use flotilla_manifest::{
+    keys::{SEGMENT_CONVOY, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL},
+    wire::{GroupPath, GroupSegment},
+};
 use flotilla_protocol::arg::Arg;
 use flotilla_resources::{
-    controller::Reconciler, Environment, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec,
-    HostSpec, HostStatus, HostStatusPatch, Presentation, PresentationSpec, PresentationStatus, PresentationStatusPatch, ResourceBackend,
-    StatusPatch, TerminalSession, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL,
+    controller::Reconciler, Convoy, ConvoyRepositorySpec, ConvoySpec, Environment, EnvironmentSpec, EnvironmentStatus,
+    EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, Presentation, PresentationSpec,
+    PresentationStatus, PresentationStatusPatch, Repository, RepositorySpec, ResourceBackend, StatusPatch, TerminalSession,
+    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_LABEL,
     VESSEL_ORDINAL_LABEL,
 };
 
@@ -197,6 +202,68 @@ async fn first_apply_marks_presentation_active() {
         Some(PresentationStatusPatch::MarkActive { ref presentation_manager, ref workspace_ref, .. })
             if presentation_manager == "fake-manager" && workspace_ref == "workspace-1"
     ));
+}
+
+#[tokio::test]
+async fn dispatched_convoy_workspace_stamp_uses_project_and_repository_dialect() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_host(&backend, HOST_REF).await;
+    create_ready_host_direct_env(&backend, "env-a").await;
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
+    let repository_key = repository_spec.key();
+    backend
+        .clone()
+        .using::<Repository>(NAMESPACE)
+        .create(&meta(&repository_key.to_string()), &repository_spec)
+        .await
+        .expect("repository create");
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .create(
+            &meta("convoy-a"),
+            &ConvoySpec::builder()
+                .workflow_ref("implement".to_string())
+                .project_ref("platform".to_string())
+                .repositories(vec![ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(repository_key)
+                    .base_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("convoy create");
+    create_running_terminal(
+        &backend,
+        "term-a",
+        "env-a",
+        BTreeMap::from([
+            (CONVOY_LABEL.to_string(), "convoy-a".to_string()),
+            (VESSEL_ORDINAL_LABEL.to_string(), "000".to_string()),
+            (CREW_ORDINAL_LABEL.to_string(), "000".to_string()),
+        ]),
+    )
+    .await;
+    let mut presentation = create_presentation(&backend, "presentation-a", "default").await;
+    presentation.metadata.labels.insert(VESSEL_LABEL.to_string(), "implement".to_string());
+    let runtime = Arc::new(FakePresentationRuntime::default());
+    let reconciler = reconciler(Arc::clone(&runtime), backend);
+
+    reconciler.fetch_dependencies(&presentation).await.expect("dependencies");
+
+    let plans = runtime.apply_calls.lock().expect("apply calls lock");
+    assert_eq!(
+        plans[0].stamp.as_ref().and_then(|stamp| stamp.scope.clone()),
+        Some(GroupPath(vec![
+            GroupSegment::text(SEGMENT_PROJECT, "platform"),
+            GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla"),
+            GroupSegment::text(SEGMENT_CONVOY, "flotilla/convoy-a").with_label("convoy-a"),
+            GroupSegment::text(SEGMENT_VESSEL, "implement"),
+        ]))
+    );
 }
 
 #[tokio::test]

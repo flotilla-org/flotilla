@@ -7,6 +7,51 @@
 //! replaced by a dependency on the shared `flotilla-org/manifest` crate.
 //! Never hand-tune a serde attribute here to make a test pass — regenerate
 //! the fixtures against andamento and match what it actually speaks.
+//!
+//! # Flotilla fact dialect v1
+//!
+//! Every key emitted by this crate has one value domain:
+//!
+//! | Key | Semantics |
+//! | --- | --- |
+//! | `source` | Producer provenance (`flotilla` here; other producers use their own stable name). |
+//! | `flotilla.session` | Canonical `<host>/<namespace>/<session>` pane-to-catalog join identity. |
+//! | `flotilla.vessel` | Vessel name bound to a pane. |
+//! | `flotilla.convoy` | Canonical `<namespace>/<convoy>` resource identity on panes and path segments. |
+//! | `flotilla.namespace` | Resource namespace bound to a pane. |
+//! | `flotilla.host` | Host bound to a pane. |
+//! | `flotilla.crew.role` | One bound pane's crew role. |
+//! | `flotilla.attach.ref` | Address accepted by `flotilla attach`. |
+//! | `flotilla.project.name` | Human-readable name of a Project group. |
+//! | `flotilla.convoy.phase` | Raw [`flotilla_protocol::ConvoyPhase`] value. |
+//! | `flotilla.convoy.workflow` | WorkflowTemplate resource name used by a convoy. |
+//! | `flotilla.convoy.message` | Convoy lifecycle diagnostic. |
+//! | `flotilla.work.phase` | Work phase aboard a vessel, not vessel lifecycle. |
+//! | `flotilla.vessel.host` | Host currently carrying a convoy vessel. |
+//! | `flotilla.independent.host` | Host currently carrying an independent terminal session. |
+//! | `flotilla.vessel.env` | Execution-environment reference for a vessel. |
+//! | `flotilla.crew.roles` | Complete crew-role list aboard a vessel. |
+//! | `status.state` | Normalized `idle`, `waiting`, `active`, `done`, or `failed` badge state. |
+//! | `status.attention` | Boolean human-attention demand. |
+//! | `status.connectivity` | Connectivity annotation (`connected` or `disconnected`); reserved until emitted. |
+//! | `summary.text` | Short human summary, never an identity. |
+//! | `tab.scope` | Typed [`MetadataValue::GroupPath`] locating a materialized tab or identity. |
+//! | `tab.kind` | Stable workspace/tab kind. |
+//! | `materialize.target` | Kind produced by a recipe (`workspace` or `pane`). |
+//! | `materialize.recipe` | Command address used to materialize an entry. |
+//! | `factory.id` | Stable cross-producer dedupe identity. |
+//!
+//! Group path segment keys are equally single-dialect:
+//!
+//! | Segment key | Value |
+//! | --- | --- |
+//! | `flotilla.project` | Project resource name, and only present when Project knowledge exists. |
+//! | `vcs.repo` | Canonical forge slug, falling back to Repository's `host:path` identity when slugless. |
+//! | `flotilla.convoy` | `<namespace>/<convoy>` resource identity. |
+//! | `flotilla.vessel` | Convoy vessel name. |
+//! | `flotilla.independent` | Independent terminal-session name. |
+//! | `flotilla.checkout` | Checkout awareness-entry identity. |
+//! | `flotilla.issue` | Issue entry identity from the awareness projection. |
 
 use std::collections::BTreeMap;
 

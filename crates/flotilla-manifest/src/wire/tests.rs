@@ -112,7 +112,7 @@ fn segment_identity_ignores_labels() {
     let labelled = GroupSegment::text("flotilla.convoy", "dev/manifest-extraction").with_label("manifest extraction");
     assert_eq!(plain, labelled);
 
-    let path_plain = MetadataPathSegmentValue::text("git.repo", "flotilla-org/flotilla");
-    let path_labelled = MetadataPathSegmentValue::text("git.repo", "flotilla-org/flotilla").with_label("flotilla");
+    let path_plain = MetadataPathSegmentValue::text("vcs.repo", "flotilla-org/flotilla");
+    let path_labelled = MetadataPathSegmentValue::text("vcs.repo", "flotilla-org/flotilla").with_label("flotilla");
     assert_eq!(path_plain, path_labelled);
 }

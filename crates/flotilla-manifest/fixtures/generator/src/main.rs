@@ -49,7 +49,7 @@ fn patch(target: MetadataTarget, source_id: &str, set: Vec<(&str, MetadataValueU
 
 fn group_target_vessel() -> MetadataTarget {
     MetadataTarget::Group(GroupPath(vec![
-        segment("git.repo", "flotilla-org/flotilla", None),
+        segment("vcs.repo", "flotilla-org/flotilla", None),
         segment("flotilla.convoy", "dev/manifest-extraction", Some("manifest extraction")),
         segment("flotilla.vessel", "implement", None),
     ]))
@@ -86,7 +86,7 @@ fn main() {
                 "tab.scope",
                 update(
                     MetadataValue::GroupPath(vec![
-                        path_segment("git.repo", "flotilla-org/flotilla", None),
+                        path_segment("vcs.repo", "flotilla-org/flotilla", None),
                         path_segment("flotilla.convoy", "dev/manifest-extraction", Some("manifest extraction")),
                         path_segment("flotilla.vessel", "implement", None),
                     ]),
@@ -125,7 +125,7 @@ fn main() {
             (
                 "tab.scope",
                 update(
-                    MetadataValue::GroupPath(vec![path_segment("git.repo", "flotilla-org/flotilla", Some("flotilla"))]),
+                    MetadataValue::GroupPath(vec![path_segment("vcs.repo", "flotilla-org/flotilla", Some("flotilla"))]),
                     None,
                 ),
             ),

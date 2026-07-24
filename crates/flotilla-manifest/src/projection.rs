@@ -24,9 +24,9 @@ use flotilla_protocol::{
 use crate::{
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CONVOY_MESSAGE, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_CREW_ROLES, KEY_FACTORY_ID,
-        KEY_MATERIALIZE_RECIPE, KEY_MATERIALIZE_TARGET, KEY_PROJECT_NAME, KEY_SCOPE, KEY_SESSION, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
-        KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_VESSEL,
-        SOURCE_CONNECTOR,
+        KEY_INDEPENDENT_HOST, KEY_MATERIALIZE_RECIPE, KEY_MATERIALIZE_TARGET, KEY_PROJECT_NAME, KEY_SCOPE, KEY_SESSION, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_CONVOY,
+        SEGMENT_INDEPENDENT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::RecipeMint,
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -146,7 +146,11 @@ impl Catalog {
         }
         for (target, facts) in &previous.facts {
             if !self.facts.contains_key(target) {
-                patches.push(patch(target.clone(), BTreeMap::new(), facts.keys().cloned().collect()));
+                patches.push(patch(
+                    target.clone(),
+                    BTreeMap::new(),
+                    facts.keys().filter(|key| key.as_str() != KEY_SOURCE).cloned().collect(),
+                ));
             }
         }
         patches
@@ -154,6 +158,9 @@ impl Catalog {
 
     fn assert_facts(&mut self, target: MetadataTarget, facts: Vec<(&str, MetadataValue)>, ordinal: Option<i64>) {
         let entry = self.facts.entry(target).or_default();
+        let mut source = MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), Some(CATALOG_TTL_MS));
+        source.ordinal = ordinal;
+        entry.insert(KEY_SOURCE.to_owned(), source);
         for (key, value) in facts {
             let mut update = MetadataValueUpdate::new(value, Some(CATALOG_TTL_MS));
             update.ordinal = ordinal;
@@ -162,7 +169,9 @@ impl Catalog {
     }
 }
 
-fn patch(target: MetadataTarget, set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>) -> MetadataPatch {
+fn patch(target: MetadataTarget, mut set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>) -> MetadataPatch {
+    set.entry(KEY_SOURCE.to_owned())
+        .or_insert_with(|| MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), Some(CATALOG_TTL_MS)));
     MetadataPatch { target, source_id: SOURCE_CONNECTOR.to_owned(), set, unset }
 }
 
@@ -185,32 +194,79 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
 }
 
 fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, mint: &dyn RecipeMint) {
-    let project = GroupSegment::text(SEGMENT_PROJECT, node.id.clone()).with_label(node.label.clone());
-    assert_project_group(catalog, &project);
-    let project_path = GroupPath(vec![project.clone()]);
-    catalog.assert_facts(
-        MetadataTarget::Group(project_path),
-        vec![
-            (KEY_STATUS_STATE, MetadataValue::text(awareness_state(node.state))),
-            (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(&node.counts))),
-            (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:awareness/{}", node.id))),
-        ],
-        None,
-    );
+    let parent = awareness_node_segment(node);
+    if let Some(segment) = &parent {
+        if segment.key == SEGMENT_PROJECT {
+            assert_project_group(catalog, segment);
+        }
+        catalog.assert_facts(
+            MetadataTarget::Group(GroupPath(vec![segment.clone()])),
+            vec![
+                (KEY_STATUS_STATE, MetadataValue::text(awareness_state(node.state))),
+                (KEY_SUMMARY_TEXT, MetadataValue::text(summary_text(&node.counts))),
+                (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:awareness/{}", node.id))),
+            ],
+            None,
+        );
+    }
 
     for entry in &node.entries {
-        project_awareness_entry(catalog, &project, entry, mint);
+        project_awareness_entry(catalog, parent.as_ref(), entry, mint);
     }
 }
 
-fn project_awareness_entry(catalog: &mut Catalog, project: &GroupSegment, entry: &AwarenessEntry, mint: &dyn RecipeMint) {
-    let segment_key = match entry.kind {
-        AwarenessKind::Convoy => SEGMENT_CONVOY,
-        AwarenessKind::Issue => SEGMENT_ISSUE,
-        AwarenessKind::Vessel | AwarenessKind::Independent | AwarenessKind::Checkout => SEGMENT_VESSEL,
+fn awareness_node_segment(node: &AwarenessNode) -> Option<GroupSegment> {
+    match node.kind {
+        AwarenessKind::Project => {
+            if let Some(scope) = &node.scope {
+                return project_segment(Some(&scope.name));
+            }
+            if let Some(address) = node.id.strip_prefix("project/") {
+                return project_segment(address.rsplit('/').next());
+            }
+            node.id.strip_prefix("repo/").and_then(|_| repo_segment(node.annotations.get(SEGMENT_REPO).map(String::as_str)))
+        }
+        AwarenessKind::Convoy => {
+            node.id.strip_prefix("convoy/").map(|value| GroupSegment::text(SEGMENT_CONVOY, value).with_label(node.label.clone()))
+        }
+        AwarenessKind::Fleet | AwarenessKind::Vessel | AwarenessKind::Independent | AwarenessKind::Checkout | AwarenessKind::Issue => None,
+    }
+}
+
+fn project_awareness_entry(catalog: &mut Catalog, parent: Option<&GroupSegment>, entry: &AwarenessEntry, mint: &dyn RecipeMint) {
+    let mut segments = parent.cloned().into_iter().collect::<Vec<_>>();
+    if let Some(repo) = repo_segment(entry.annotations.get(SEGMENT_REPO).map(String::as_str)) {
+        if !segments.contains(&repo) {
+            segments.push(repo);
+        }
+    }
+    match entry.kind {
+        AwarenessKind::Convoy => {
+            let value = entry.id.strip_prefix("convoy/").unwrap_or(&entry.id);
+            segments.push(GroupSegment::text(SEGMENT_CONVOY, value).with_label(entry.label.clone()));
+        }
+        AwarenessKind::Vessel => {
+            let parts = entry.id.strip_prefix("vessel/").unwrap_or(&entry.id).split('/').collect::<Vec<_>>();
+            if let [namespace, convoy, vessel] = parts.as_slice() {
+                segments.push(GroupSegment::text(SEGMENT_CONVOY, format!("{namespace}/{convoy}")).with_label((*convoy).to_owned()));
+                segments.push(GroupSegment::text(SEGMENT_VESSEL, *vessel));
+            } else {
+                segments.push(GroupSegment::text(SEGMENT_VESSEL, entry.id.clone()).with_label(entry.label.clone()));
+            }
+        }
+        AwarenessKind::Independent => {
+            let value = entry.id.rsplit('/').next().unwrap_or(&entry.id);
+            segments.push(GroupSegment::text(SEGMENT_INDEPENDENT, value).with_label(entry.label.clone()));
+        }
+        AwarenessKind::Checkout => {
+            segments.push(GroupSegment::text(SEGMENT_CHECKOUT, entry.id.clone()).with_label(entry.label.clone()));
+        }
+        AwarenessKind::Issue => {
+            segments.push(GroupSegment::text(SEGMENT_ISSUE, entry.id.clone()).with_label(entry.label.clone()));
+        }
         AwarenessKind::Fleet | AwarenessKind::Project => return,
-    };
-    let path = GroupPath(vec![project.clone(), GroupSegment::text(segment_key, entry.id.clone()).with_label(entry.label.clone())]);
+    }
+    let path = GroupPath(segments);
     let mut facts = vec![
         (KEY_STATUS_STATE, MetadataValue::text(awareness_state(entry.state))),
         (KEY_SUMMARY_TEXT, MetadataValue::text(entry.label.clone())),
@@ -253,15 +309,20 @@ fn summary_text(counts: &flotilla_protocol::AwarenessCounts) -> String {
     format!("{} entries · {} issues · {} vessels · {} checkouts", counts.total, counts.issues, counts.vessels, counts.checkouts)
 }
 
-/// The project-level segment: `project_ref` when set (the project→convoy
-/// spine's primary key), repo as fallback — under the *same* segment key the
-/// git-watcher publishes, so both producers' groups collide into one project
-/// cluster. Neither ⇒ `None`: the entity is truthfully unparented at
-/// archipelago level.
-pub fn project_segment(project_ref: Option<&str>, repo: Option<&str>) -> Option<GroupSegment> {
-    let value = project_ref.or(repo)?;
-    let label = value.rsplit('/').next().filter(|short| !short.is_empty() && *short != value);
-    let segment = GroupSegment::text(SEGMENT_PROJECT, value);
+/// The Project level of the grouping spine. Its value is exclusively a
+/// Project resource name; absence stays absent.
+pub fn project_segment(project_ref: Option<&str>) -> Option<GroupSegment> {
+    project_ref.and_then(|value| value.rsplit('/').next()).map(|name| GroupSegment::text(SEGMENT_PROJECT, name))
+}
+
+/// The Repository level of the grouping spine. `repo` is the canonical
+/// forge slug, with Repository's `host:path` identity as the slugless
+/// fallback.
+pub fn repo_segment(repo: Option<&str>) -> Option<GroupSegment> {
+    let value = repo?;
+    let label_source = value.strip_suffix("/.git").or_else(|| value.strip_suffix(".git")).unwrap_or(value);
+    let label = label_source.rsplit('/').next().filter(|short| !short.is_empty() && *short != value);
+    let segment = GroupSegment::text(SEGMENT_REPO, value);
     Some(match label {
         Some(label) => segment.with_label(label),
         None => segment,
@@ -270,9 +331,12 @@ pub fn project_segment(project_ref: Option<&str>, repo: Option<&str>) -> Option<
 
 /// The GroupPath of a convoy — shared spine construction so every producer
 /// lands on the same group node.
-pub fn convoy_group_path(project: Option<GroupSegment>, namespace: &str, convoy: &str) -> GroupPath {
+pub fn convoy_group_path(project: Option<GroupSegment>, repo: Option<GroupSegment>, namespace: &str, convoy: &str) -> GroupPath {
     let mut path = Vec::new();
     if let Some(segment) = project {
+        path.push(segment);
+    }
+    if let Some(segment) = repo {
         path.push(segment);
     }
     path.push(GroupSegment::text(SEGMENT_CONVOY, format!("{namespace}/{convoy}")).with_label(convoy.to_owned()));
@@ -281,8 +345,14 @@ pub fn convoy_group_path(project: Option<GroupSegment>, namespace: &str, convoy:
 
 /// The GroupPath of a convoy-hosted vessel — shared by the catalog and the
 /// actuator's tab stamp so both producers land on the same group node.
-pub fn vessel_group_path(project: Option<GroupSegment>, namespace: &str, convoy: &str, vessel: &str) -> GroupPath {
-    let mut path = convoy_group_path(project, namespace, convoy);
+pub fn vessel_group_path(
+    project: Option<GroupSegment>,
+    repo: Option<GroupSegment>,
+    namespace: &str,
+    convoy: &str,
+    vessel: &str,
+) -> GroupPath {
+    let mut path = convoy_group_path(project, repo, namespace, convoy);
     path.0.push(GroupSegment::text(SEGMENT_VESSEL, vessel.to_owned()));
     path
 }
@@ -307,13 +377,14 @@ fn assert_project_group(catalog: &mut Catalog, segment: &GroupSegment) {
 
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {
     let namespace = &convoy.resource.namespace;
-    let project = project_segment(convoy.project_ref.as_deref(), convoy.repo.as_ref().map(|repo| repo.0.as_str()));
+    let project = project_segment(convoy.project_ref.as_deref());
+    let repo = repo_segment(convoy.repo.as_ref().map(|repo| repo.0.as_str()));
     if let Some(segment) = &project {
         assert_project_group(catalog, segment);
     }
-    let ordinal = project.is_none().then_some(ARCHIPELAGO_ORDINAL);
+    let ordinal = (project.is_none() && repo.is_none()).then_some(ARCHIPELAGO_ORDINAL);
 
-    let convoy_path = convoy_group_path(project.clone(), namespace, &convoy.name);
+    let convoy_path = convoy_group_path(project.clone(), repo.clone(), namespace, &convoy.name);
     let badge = convoy_badge(convoy.phase, convoy.initializing);
     let done = convoy.vessels.iter().filter(|vessel| vessel.phase == WorkPhase::Complete).count();
     let mut facts = vec![
@@ -334,7 +405,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     catalog.assert_facts(MetadataTarget::Group(convoy_path), facts, ordinal);
 
     for vessel in &convoy.vessels {
-        project_vessel(catalog, convoy, vessel, project.clone(), ordinal, mint);
+        project_vessel(catalog, convoy, vessel, project.clone(), repo.clone(), ordinal, mint);
     }
 }
 
@@ -343,11 +414,12 @@ fn project_vessel(
     convoy: &ConvoyRow,
     vessel: &VesselRow,
     project: Option<GroupSegment>,
+    repo: Option<GroupSegment>,
     ordinal: Option<i64>,
     mint: &dyn RecipeMint,
 ) {
     let namespace = &convoy.resource.namespace;
-    let path = vessel_group_path(project, namespace, &convoy.name, &vessel.name);
+    let path = vessel_group_path(project, repo, namespace, &convoy.name, &vessel.name);
     let badge = work_badge(vessel.phase);
     let mut facts = vec![
         (KEY_WORK_PHASE, MetadataValue::text(vessel.phase.as_str())),
@@ -376,23 +448,22 @@ fn project_vessel(
 
 fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint: &dyn RecipeMint) {
     let namespace = &independent.resource.namespace;
-    let project = project_segment(None, independent.repo.as_ref().map(|repo| repo.0.as_str()));
+    let repo = repo_segment(independent.repo_fact.as_ref().map(|repo| repo.0.as_str()));
     let mut path = Vec::new();
-    if let Some(segment) = &project {
-        assert_project_group(catalog, segment);
+    if let Some(segment) = &repo {
         path.push(segment.clone());
     }
     // Free-floating vessels with no project prefix are archipelago-level:
     // grouped and ordered before everything else by default (design §4;
     // ordering semantics are gap §9.6 for the Leg-1 freeze).
-    let ordinal = project.is_none().then_some(ARCHIPELAGO_ORDINAL);
+    let ordinal = repo.is_none().then_some(ARCHIPELAGO_ORDINAL);
 
-    path.push(GroupSegment::text(SEGMENT_VESSEL, independent.name.clone()));
+    path.push(GroupSegment::text(SEGMENT_INDEPENDENT, independent.name.clone()));
     let group_path = GroupPath(path);
     let badge = session_badge(independent.phase);
     let mut facts = vec![
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
-        (KEY_VESSEL_HOST, MetadataValue::text(independent.host.to_string())),
+        (KEY_INDEPENDENT_HOST, MetadataValue::text(independent.host.to_string())),
         (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:independents/{namespace}/{}", independent.name))),
     ];
     if badge.attention {
