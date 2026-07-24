@@ -1,5 +1,5 @@
 //! Integration tests for the `ConvoyCreate` + `WorkflowTemplateApply` daemon actions
-//! and the seeded `scratch` WorkflowTemplate registered at startup.
+//! and the bundled WorkflowTemplates registered at startup.
 
 use std::{sync::Arc, time::Duration};
 
@@ -94,6 +94,24 @@ async fn scratch_workflow_template_is_seeded_at_startup() {
         [crew]
             if crew.role == "coder"
                 && matches!(&crew.source, CrewSource::Agent { selector, .. } if selector.capability == "code")
+    ));
+
+    let interactive = templates.get("interactive-single").await.expect("interactive template should be seeded");
+    assert_eq!(interactive.spec.vessels.len(), 1);
+    assert_eq!(interactive.spec.vessels[0].name, "work");
+    assert_eq!(interactive.spec.vessels[0].stance, Stance::Trusted);
+    assert!(matches!(
+        interactive.spec.vessels[0].crew.as_slice(),
+        [crew]
+            if crew.role == "coder"
+                && matches!(
+                    &crew.source,
+                    CrewSource::Agent {
+                        selector,
+                        brief_template: Some(brief_template),
+                        ..
+                    } if selector.capability == "code" && brief_template == "interactive-session"
+                )
     ));
 }
 

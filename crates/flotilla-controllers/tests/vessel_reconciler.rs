@@ -13,14 +13,14 @@ use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{Actuation, Reconciler},
-    ensure_repository, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Convoy, ConvoyIssue, ConvoyPhase,
-    ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec,
-    PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Selector, Stance, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec,
-    WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
-    VESSEL_REF_LABEL,
+    ensure_repository, interactive_single_workflow_spec, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec,
+    Convoy, ConvoyIssue, ConvoyPhase, ConvoyReconciler, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
+    HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus, InputMeta,
+    IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
+    ResourceError, Selector, Stance, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 
@@ -1436,22 +1436,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .clone()
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-issue-brief", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                vessels: vec![VesselRequirement {
-                    name: "implement".to_string(),
-                    stance: Stance::Trusted,
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    crew: vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Agent {
-                            selector: Selector { capability: "coding".to_string() },
-                            prompt: None,
-                            brief_template: None,
-                        })
-                        .build()],
-                }],
-            }),
+            workflow_snapshot: Some(WorkflowSnapshot { vessels: interactive_single_workflow_spec().vessels }),
             ..Default::default()
         })
         .await
@@ -1464,7 +1449,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .using::<Vessel>(NAMESPACE)
         .create(&vessel_meta("workspace-issue-brief", "https://github.com/flotilla-org/flotilla"), &VesselSpec {
             convoy_ref: "convoy-issue-brief".to_string(),
-            vessel_name: "implement".to_string(),
+            vessel_name: "work".to_string(),
             placement_policy_ref: "policy-issue-brief".to_string(),
             adopted_checkout_refs: BTreeMap::from([(repository_key, "adopted-checkout-issue-brief".to_string())]),
         })
@@ -1482,6 +1467,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         panic!("expected structured agent launch");
     };
     assert!(brief.content.contains("## Assignment\n\nYour assignment is the issue snapshot section below."));
+    assert!(brief.content.contains("For interactive sessions, keep the user-facing loop tight"));
     assert!(brief.content.contains("## Issue snapshot"));
     assert!(brief.content.contains("The issue body is the contract."));
     assert!(!brief.content.contains("No assignment was provided"));

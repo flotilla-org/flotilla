@@ -529,8 +529,10 @@ mod tests {
     }
 
     #[test]
-    fn convoy_start_bare_issue_resolves_to_project_defaulted_selector() {
-        let resolved = parse(&["convoy", "start", "--project", "flotilla", "--issue", "834"]).resolve().expect("resolve");
+    fn convoy_start_interactive_workflow_with_bare_issue_resolves() {
+        let resolved = parse(&["convoy", "start", "--project", "flotilla", "--workflow", "interactive-single", "--issue", "834"])
+            .resolve()
+            .expect("resolve");
 
         assert_eq!(resolved, Resolved::NeedsContext {
             command: Command {
@@ -544,7 +546,7 @@ mod tests {
                         issues: vec![IssueSelector::Id("834".into())],
                         name: None,
                         branch: None,
-                        workflow_ref: None,
+                        workflow_ref: Some("interactive-single".into()),
                         inputs: vec![],
                         instruction: None,
                         placement_policy: None,

@@ -172,7 +172,7 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
     let mut skip_overrides = 0;
     let mut current_template = match options.template.as_str() {
         DEFAULT_CREW_BRIEF_TEMPLATE => BUILTIN_CREW_BRIEF_TEMPLATE_NAME.to_string(),
-        "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
+        "interactive-session" | "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
         custom if !options.overrides.is_empty() => {
             let first = &options.overrides[0];
             if is_block_only_override(&first.source) {
