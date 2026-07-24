@@ -26,7 +26,7 @@ use flotilla_resources::{
     TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart,
     WatchStream, WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, VESSEL_LABEL,
 };
-use futures::{stream::BoxStream, StreamExt};
+use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer};
@@ -189,7 +189,8 @@ pub struct Aggregator {
 }
 
 struct ChangeRequestResolution {
-    targets: Vec<(ResourceRef, uuid::Uuid)>,
+    reference: ResourceRef,
+    generation: uuid::Uuid,
     branch: String,
     result: Result<Option<ConvoyChangeRequest>, String>,
 }
@@ -959,35 +960,29 @@ impl Aggregator {
         let task_reference = reference.clone();
         let task = tokio::spawn(async move {
             let result = resolver.resolve_change_request(&repositories, &branch).await;
-            let _ = refresh_tx.send(ChangeRequestResolution { targets: vec![(task_reference, generation)], branch, result });
+            let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
         });
         self.change_request_refresh_tasks.insert(reference, task);
     }
 
     async fn apply_change_request_resolution(&mut self, resolution: ChangeRequestResolution) {
-        let ChangeRequestResolution { targets, branch, result } = resolution;
-        let mut applied = false;
-        for (reference, generation) in targets {
-            if self.change_request_refresh_generations.get(&reference) != Some(&generation) {
-                continue;
+        let ChangeRequestResolution { reference, generation, branch, result } = resolution;
+        if self.change_request_refresh_generations.get(&reference) != Some(&generation) {
+            return;
+        }
+        self.change_request_refresh_tasks.remove(&reference);
+        match result {
+            Ok(Some(change_request)) => {
+                self.convoy_change_requests.insert(reference.clone(), change_request);
             }
-            applied = true;
-            self.change_request_refresh_tasks.remove(&reference);
-            match &result {
-                Ok(Some(change_request)) => {
-                    self.convoy_change_requests.insert(reference.clone(), change_request.clone());
-                }
-                Ok(None) => {
-                    self.convoy_change_requests.remove(&reference);
-                }
-                Err(error) => {
-                    tracing::warn!(convoy = %reference.name, %branch, %error, "failed to refresh convoy change request");
-                }
+            Ok(None) => {
+                self.convoy_change_requests.remove(&reference);
+            }
+            Err(error) => {
+                tracing::warn!(convoy = %reference.name, %branch, %error, "failed to refresh convoy change request");
             }
         }
-        if applied {
-            self.rebuild_local_projection().await;
-        }
+        self.rebuild_local_projection().await;
     }
 
     async fn refresh_all_change_requests(&mut self) {
@@ -1006,6 +1001,8 @@ impl Aggregator {
     }
 
     fn schedule_change_request_refresh_pass(&mut self, convoys: impl IntoIterator<Item = (ResourceRef, ResourceObject<Convoy>)>) {
+        // Repository order is resolver precedence, so only identical ordered
+        // repository lists may safely share one lookup.
         let mut lookups = HashMap::<(Vec<RepositoryKey>, String), Vec<(ResourceRef, uuid::Uuid)>>::new();
         for (reference, convoy) in convoys {
             let generation = uuid::Uuid::new_v4();
@@ -1030,11 +1027,19 @@ impl Aggregator {
         };
         for ((repositories, branch), targets) in lookups {
             let resolver = Arc::clone(&resolver);
-            let refresh_tx = self.change_request_refresh_queue.tx.clone();
-            tokio::spawn(async move {
-                let result = resolver.resolve_change_request(&repositories, &branch).await;
-                let _ = refresh_tx.send(ChangeRequestResolution { targets, branch, result });
-            });
+            let lookup_branch = branch.clone();
+            let lookup = async move { resolver.resolve_change_request(&repositories, &lookup_branch).await }.boxed().shared();
+            for (reference, generation) in targets {
+                let lookup = lookup.clone();
+                let refresh_tx = self.change_request_refresh_queue.tx.clone();
+                let task_reference = reference.clone();
+                let task_branch = branch.clone();
+                let task = tokio::spawn(async move {
+                    let result = lookup.await;
+                    let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch: task_branch, result });
+                });
+                self.change_request_refresh_tasks.insert(reference, task);
+            }
         }
     }
 
@@ -2892,7 +2897,8 @@ mod tests {
 
         aggregator
             .apply_change_request_resolution(ChangeRequestResolution {
-                targets: vec![(reference.clone(), stale_generation)],
+                reference: reference.clone(),
+                generation: stale_generation,
                 branch: "feat/convoy".to_string(),
                 result: Ok(Some(ConvoyChangeRequest {
                     id: "stale".to_string(),
@@ -3304,13 +3310,36 @@ mod tests {
                 path: "flotilla-org/flotilla".to_string(),
             })
             .await;
-        let resolution = timeout(Duration::from_secs(1), aggregator.change_request_refresh_queue.rx.recv())
-            .await
-            .expect("deduplicated resolution timed out")
-            .expect("resolution channel closed");
-
-        assert_eq!(resolution.targets.len(), 2);
+        apply_next_change_request_resolution(&mut aggregator).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn deduplicated_refresh_keeps_independently_cancellable_convoy_tasks() {
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::new(BlockingChangeRequestResolver));
+        for name in ["convoy-a", "convoy-b"] {
+            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch(name).await)).await;
+        }
+
+        aggregator
+            .refresh_repository_change_requests(&RepoIdentity {
+                authority: "github.com".to_string(),
+                path: "flotilla-org/flotilla".to_string(),
+            })
+            .await;
+        let convoy_a = aggregator.convoy_ref("flotilla", "convoy-a");
+        let convoy_b = aggregator.convoy_ref("flotilla", "convoy-b");
+        assert!(aggregator.change_request_refresh_tasks.contains_key(&convoy_a));
+        assert!(aggregator.change_request_refresh_tasks.contains_key(&convoy_b));
+
+        aggregator.invalidate_change_request(&convoy_a);
+
+        assert!(!aggregator.change_request_refresh_tasks.contains_key(&convoy_a));
+        assert!(aggregator.change_request_refresh_tasks.contains_key(&convoy_b));
+        assert!(!aggregator.change_request_refresh_tasks[&convoy_b].is_finished());
     }
 
     #[tokio::test]
