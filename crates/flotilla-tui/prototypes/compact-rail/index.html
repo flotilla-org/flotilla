@@ -1,0 +1,1095 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PROTOTYPE — Compact rail</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --base: #1e1e2e;
+        --mantle: #181825;
+        --crust: #11111b;
+        --surface-0: #313244;
+        --surface-1: #45475a;
+        --surface-2: #585b70;
+        --overlay: #6c7086;
+        --text: #cdd6f4;
+        --subtext: #a6adc8;
+        --blue: #89b4fa;
+        --sapphire: #74c7ec;
+        --green: #a6e3a1;
+        --yellow: #f9e2af;
+        --peach: #fab387;
+        --red: #f38ba8;
+        --mauve: #cba6f7;
+        --teal: #94e2d5;
+        --rail-width: 288px;
+        font-family:
+          "SFMono-Regular", "Cascadia Code", "Liberation Mono", Menlo, monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-width: 820px;
+        min-height: 100vh;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 12% 18%, rgb(116 199 236 / 5%), transparent 27rem),
+          var(--crust);
+        color: var(--text);
+      }
+
+      button {
+        font: inherit;
+      }
+
+      .prototype-note {
+        position: fixed;
+        z-index: 30;
+        top: 10px;
+        right: 12px;
+        padding: 5px 9px;
+        border: 1px solid rgb(249 226 175 / 35%);
+        border-radius: 999px;
+        color: var(--yellow);
+        background: rgb(17 17 27 / 88%);
+        font-size: 10px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .shell {
+        display: grid;
+        grid-template-rows: 34px 1fr 27px;
+        height: 100vh;
+        padding-bottom: 56px;
+      }
+
+      .titlebar {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        padding: 0 14px;
+        border-bottom: 1px solid var(--surface-0);
+        background: var(--mantle);
+        color: var(--subtext);
+        font-size: 12px;
+      }
+
+      .titlebar .logo {
+        align-self: stretch;
+        display: flex;
+        align-items: center;
+        margin-left: -14px;
+        padding: 0 14px;
+        background: var(--sapphire);
+        color: var(--crust);
+        font-weight: 800;
+      }
+
+      .titlebar .crumb {
+        color: var(--text);
+      }
+
+      .titlebar .host {
+        margin-left: auto;
+        color: var(--overlay);
+      }
+
+      .stage {
+        position: relative;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      .workspace {
+        height: 100%;
+        background:
+          linear-gradient(90deg, rgb(49 50 68 / 12%) 1px, transparent 1px),
+          linear-gradient(rgb(49 50 68 / 12%) 1px, transparent 1px),
+          var(--base);
+        background-size: 28px 28px;
+      }
+
+      .terminal {
+        height: 100%;
+        padding: 25px 30px 44px;
+        color: var(--overlay);
+        font-size: 12px;
+        line-height: 1.7;
+      }
+
+      .terminal .prompt {
+        color: var(--green);
+      }
+
+      .terminal .command {
+        color: var(--text);
+      }
+
+      .terminal .cursor {
+        display: inline-block;
+        width: 7px;
+        height: 14px;
+        margin-left: 3px;
+        translate: 0 3px;
+        background: var(--text);
+        animation: blink 1.1s steps(1) infinite;
+      }
+
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
+
+      .status-line {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        align-items: center;
+        gap: 16px;
+        padding: 0 11px;
+        border-top: 1px solid var(--surface-1);
+        background: var(--mantle);
+        font-size: 11px;
+      }
+
+      .status-detail {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--subtext);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .status-detail .kind {
+        color: var(--yellow);
+        text-transform: uppercase;
+      }
+
+      .status-detail strong {
+        color: var(--text);
+      }
+
+      .status-state {
+        color: var(--overlay);
+      }
+
+      .status-key {
+        padding: 2px 6px;
+        border-radius: 3px;
+        background: var(--surface-1);
+        color: var(--crust);
+        font-weight: 800;
+      }
+
+      .rail {
+        position: absolute;
+        z-index: 4;
+        inset: 0 auto 0 0;
+        border-right: 1px solid var(--surface-1);
+        background: rgb(24 24 37 / 97%);
+        box-shadow: 9px 0 30px rgb(0 0 0 / 18%);
+      }
+
+      .rail button {
+        color: inherit;
+      }
+
+      .section-label {
+        color: var(--overlay);
+        font-size: 9px;
+        font-weight: 800;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .class-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--yellow) !important;
+        cursor: pointer;
+      }
+
+      .class-toggle:hover {
+        background: var(--surface-0);
+      }
+
+      .class-toggle .toggle-mark {
+        display: inline-grid;
+        width: 13px;
+        height: 13px;
+        place-items: center;
+        border: 1px solid var(--yellow);
+        border-radius: 2px;
+        font-size: 9px;
+      }
+
+      .issues-hidden .issue-items {
+        display: none !important;
+      }
+
+      .issues-hidden .class-toggle {
+        color: var(--overlay) !important;
+      }
+
+      .issues-hidden .class-toggle .toggle-mark {
+        border-color: var(--overlay);
+      }
+
+      .issues-hidden .class-toggle .toggle-mark::after {
+        content: "·";
+      }
+
+      .entity {
+        border: 0;
+        background: transparent;
+        cursor: pointer;
+      }
+
+      .entity:hover,
+      .entity.selected {
+        background: var(--surface-0);
+      }
+
+      .attention {
+        display: inline-grid;
+        min-width: 15px;
+        height: 15px;
+        padding: 0 4px;
+        place-items: center;
+        border-radius: 999px;
+        background: var(--red);
+        color: var(--crust);
+        font-size: 9px;
+        font-weight: 900;
+        line-height: 1;
+      }
+
+      .attention.info {
+        background: var(--blue);
+      }
+
+      .attention.quiet {
+        width: 7px;
+        min-width: 7px;
+        height: 7px;
+        padding: 0;
+        background: var(--green);
+      }
+
+      .issue-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        min-width: 0;
+        padding: 4px 7px;
+        border: 1px solid var(--surface-1);
+        border-radius: 999px;
+        background: var(--surface-0);
+        color: var(--subtext);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      .issue-chip .number {
+        color: var(--yellow);
+      }
+
+      .issue-chip:hover,
+      .issue-chip.selected {
+        border-color: var(--yellow);
+        background: rgb(249 226 175 / 10%);
+        color: var(--text);
+      }
+
+      /* A — a quiet, conventional navigation rail whose selected node owns a
+         compact collection. */
+      .variant-a {
+        width: 306px;
+        padding: 13px 11px 8px;
+      }
+
+      .a-heading {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        margin: 2px 5px 13px;
+      }
+
+      .a-heading strong {
+        font-size: 12px;
+      }
+
+      .a-heading span {
+        color: var(--overlay);
+        font-size: 9px;
+      }
+
+      .a-project {
+        margin-bottom: 5px;
+        border-left: 1px solid var(--surface-1);
+      }
+
+      .a-project-head {
+        display: grid;
+        grid-template-columns: 14px minmax(0, 1fr) auto;
+        gap: 7px;
+        width: 100%;
+        padding: 7px 8px;
+        border: 0;
+        background: transparent;
+        color: var(--text);
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .a-project-head .chevron {
+        color: var(--overlay);
+      }
+
+      .a-project-head .meta {
+        color: var(--overlay);
+        font-size: 9px;
+      }
+
+      .a-children {
+        margin: 0 0 8px 22px;
+      }
+
+      .a-row {
+        display: grid;
+        grid-template-columns: 13px minmax(0, 1fr) auto;
+        gap: 7px;
+        width: 100%;
+        padding: 5px 6px;
+        border-radius: 4px;
+        color: var(--subtext);
+        text-align: left;
+      }
+
+      .a-row .glyph {
+        color: var(--mauve);
+      }
+
+      .a-row .phase {
+        color: var(--overlay);
+        font-size: 9px;
+      }
+
+      .a-issue-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin: 9px 6px 6px;
+      }
+
+      .a-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        padding: 0 6px 5px;
+      }
+
+      .a-chips .issue-chip .title {
+        display: none;
+      }
+
+      /* B — the spine is primary; each class is a lane that blooms sideways.
+         It spends width only on the currently regarded project. */
+      .variant-b {
+        display: grid;
+        width: 374px;
+        grid-template-columns: 49px 1fr;
+        padding: 0;
+        background: transparent;
+      }
+
+      .b-spine {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 5px;
+        padding: 11px 6px;
+        border-right: 1px solid var(--surface-1);
+        background: var(--crust);
+      }
+
+      .b-spine .section-label {
+        margin: 2px 0 5px;
+        writing-mode: vertical-rl;
+        rotate: 180deg;
+      }
+
+      .b-spine-button {
+        position: relative;
+        display: grid;
+        width: 34px;
+        height: 34px;
+        place-items: center;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--overlay) !important;
+        cursor: pointer;
+      }
+
+      .b-spine-button:hover,
+      .b-spine-button.selected {
+        border-color: var(--sapphire);
+        background: var(--surface-0);
+        color: var(--sapphire) !important;
+      }
+
+      .b-spine-button .attention {
+        position: absolute;
+        top: -3px;
+        right: -4px;
+      }
+
+      .b-body {
+        padding: 14px 12px;
+        background: rgb(24 24 37 / 97%);
+      }
+
+      .b-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 3px;
+        font-size: 14px;
+      }
+
+      .b-address {
+        margin-bottom: 16px;
+        color: var(--overlay);
+        font-size: 9px;
+      }
+
+      .b-lane {
+        margin-bottom: 15px;
+      }
+
+      .b-lane-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 7px;
+      }
+
+      .b-lane-head::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: var(--surface-0);
+      }
+
+      .b-cards {
+        display: grid;
+        gap: 5px;
+      }
+
+      .b-card {
+        display: grid;
+        grid-template-columns: 20px minmax(0, 1fr) auto;
+        gap: 7px;
+        align-items: center;
+        width: 100%;
+        padding: 6px 7px;
+        border: 0;
+        border-radius: 5px;
+        color: var(--subtext);
+        text-align: left;
+      }
+
+      .b-card .icon {
+        color: var(--mauve);
+      }
+
+      .b-card .sub {
+        overflow: hidden;
+        color: var(--overlay);
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .b-chips {
+        display: flex;
+        gap: 5px;
+        overflow: hidden;
+      }
+
+      .b-chips .issue-chip {
+        padding-block: 5px;
+      }
+
+      .b-chips .title {
+        max-width: 105px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* C — a dense, line-oriented instrument. Classes are columns, not
+         nested sections; the whole-class toggle sits in the column header. */
+      .variant-c {
+        width: min(690px, 72vw);
+        padding: 10px 11px;
+      }
+
+      .c-top {
+        display: grid;
+        grid-template-columns: 132px 1fr 1.2fr;
+        gap: 8px;
+        padding: 0 4px 7px;
+        border-bottom: 1px solid var(--surface-1);
+      }
+
+      .c-top .section-label {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .c-matrix {
+        display: grid;
+        grid-template-columns: 132px 1fr 1.2fr;
+        gap: 0 8px;
+      }
+
+      .c-project {
+        display: contents;
+      }
+
+      .c-project > * {
+        min-height: 77px;
+        padding: 9px 5px;
+        border-bottom: 1px solid var(--surface-0);
+      }
+
+      .c-project-id {
+        position: relative;
+        display: grid;
+        grid-template-columns: 12px minmax(0, 1fr);
+        align-content: start;
+        gap: 8px;
+        border: 0;
+        background: transparent;
+        color: var(--text);
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .c-project-id::before {
+        position: absolute;
+        top: 12px;
+        bottom: -14px;
+        left: 10px;
+        width: 1px;
+        background: var(--surface-1);
+        content: "";
+      }
+
+      .c-project:last-child .c-project-id::before {
+        display: none;
+      }
+
+      .c-node {
+        z-index: 1;
+        width: 9px;
+        height: 9px;
+        margin-top: 2px;
+        border: 2px solid var(--sapphire);
+        border-radius: 50%;
+        background: var(--mantle);
+      }
+
+      .c-project-id .meta {
+        margin-top: 4px;
+        color: var(--overlay);
+        font-size: 9px;
+      }
+
+      .c-project-id .attention {
+        margin-top: 6px;
+      }
+
+      .c-convoys {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .c-convoy {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        padding: 3px 5px;
+        border: 0;
+        border-radius: 3px;
+        color: var(--subtext);
+        text-align: left;
+      }
+
+      .c-convoy .phase-dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+      }
+
+      .c-convoy .phase-dot.waiting {
+        background: var(--yellow);
+      }
+
+      .c-convoy .phase-dot.failed {
+        background: var(--red);
+      }
+
+      .c-issues {
+        display: flex;
+        flex-wrap: wrap;
+        align-content: flex-start;
+        gap: 5px;
+      }
+
+      .c-issues .issue-chip {
+        padding: 3px 6px;
+        border-radius: 3px;
+      }
+
+      .c-issues .title {
+        max-width: 120px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .switcher {
+        position: fixed;
+        z-index: 100;
+        bottom: 11px;
+        left: 50%;
+        display: grid;
+        grid-template-columns: 32px minmax(220px, auto) 32px;
+        align-items: center;
+        overflow: hidden;
+        translate: -50% 0;
+        border: 1px solid var(--surface-2);
+        border-radius: 999px;
+        background: var(--crust);
+        box-shadow: 0 8px 30px rgb(0 0 0 / 55%);
+      }
+
+      .switcher button {
+        height: 31px;
+        border: 0;
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      .switcher button:hover {
+        background: var(--surface-1);
+      }
+
+      .variant-name {
+        border-inline: 1px solid var(--surface-0);
+        color: var(--subtext);
+        font-size: 11px;
+        text-align: center;
+      }
+
+      .variant-name strong {
+        color: var(--sapphire);
+      }
+    </style>
+  </head>
+  <body>
+    <!-- PROTOTYPE — delete after the template-model grills.
+         Three variants of the calm presentation-manager rail, switchable with
+         ?variant=A|B|C on this standalone route. -->
+    <div class="prototype-note">throwaway · fake data</div>
+    <main id="app"></main>
+
+    <script>
+      const variants = {
+        A: "Quiet tree",
+        B: "Spine + lanes",
+        C: "Class matrix",
+      };
+
+      const entities = {
+        flotilla: {
+          kind: "project",
+          label: "flotilla",
+          detail: "2 convoys · 4 issues · 2 calls for attention",
+          address: "project/flotilla",
+        },
+        andamento: {
+          kind: "project",
+          label: "andamento",
+          detail: "1 convoy · 2 issues · 1 call for attention",
+          address: "project/andamento",
+        },
+        lab: {
+          kind: "project",
+          label: "lab infrastructure",
+          detail: "no active convoy · 1 ready issue",
+          address: "project/lab",
+        },
+        compact: {
+          kind: "convoy",
+          label: "compact-rail-mock",
+          detail: "coder is active · vessel work · started 18m ago",
+          address: "convoy/flotilla/compact-rail-mock",
+        },
+        presentation: {
+          kind: "convoy",
+          label: "presentation-contract",
+          detail: "grill waiting for principal · 3/5 questions resolved",
+          address: "convoy/flotilla/presentation-contract",
+        },
+        release: {
+          kind: "convoy",
+          label: "release-0.12",
+          detail: "checks passing · 4 crew complete",
+          address: "convoy/andamento/release-0.12",
+        },
+        "issue-969": {
+          kind: "issue",
+          label: "#969 presentation contract",
+          detail: "map · 8 children · updated 3m ago",
+          address: "github.com/flotilla-org/flotilla#969",
+        },
+        "issue-973": {
+          kind: "issue",
+          label: "#973 compact rail mock",
+          detail: "prototype · assigned to compact-rail-mock",
+          address: "github.com/flotilla-org/flotilla#973",
+        },
+        "issue-961": {
+          kind: "issue",
+          label: "#961 attention v1",
+          detail: "ready · salience: attention · no active convoy",
+          address: "github.com/flotilla-org/flotilla#961",
+        },
+        "issue-982": {
+          kind: "issue",
+          label: "#982 enact flat facts",
+          detail: "blocked by presentation rulings",
+          address: "github.com/flotilla-org/flotilla#982",
+        },
+        "issue-27": {
+          kind: "issue",
+          label: "#27 chip collections",
+          detail: "andamento · needs design input",
+          address: "github.com/flotilla-org/andamento#27",
+        },
+        "issue-25": {
+          kind: "issue",
+          label: "#25 inspect surface",
+          detail: "andamento · queued after template model",
+          address: "github.com/flotilla-org/andamento#25",
+        },
+        "issue-604": {
+          kind: "issue",
+          label: "#604 control plane",
+          detail: "flotilla · active umbrella",
+          address: "github.com/flotilla-org/flotilla#604",
+        },
+      };
+
+      const state = {
+        variant: currentVariant(),
+        selected: "presentation",
+        issuesVisible: true,
+      };
+
+      function currentVariant() {
+        const requested = new URLSearchParams(window.location.search).get("variant")?.toUpperCase();
+        return variants[requested] ? requested : "A";
+      }
+
+      function entityAttrs(id) {
+        return `data-entity="${id}"`;
+      }
+
+      function chip(id, title = true) {
+        const entity = entities[id];
+        const [number, ...words] = entity.label.split(" ");
+        const selected = state.selected === id ? " selected" : "";
+        return `<button data-entity="${id}" class="issue-chip${selected}">
+          <span class="number">${number}</span>
+          ${title ? `<span class="title">${words.join(" ")}</span>` : ""}
+        </button>`;
+      }
+
+      function variantA() {
+        return `<aside class="rail variant-a">
+          <div class="a-heading">
+            <strong>Searchlight</strong>
+            <span>3 projects · 3 demands</span>
+          </div>
+          <section class="a-project">
+            <button ${entityAttrs("flotilla")} class="a-project-head entity${state.selected === "flotilla" ? " selected" : ""}">
+              <span class="chevron">⌄</span>
+              <span>flotilla <span class="meta">github.com/flotilla-org</span></span>
+              <span class="attention">2</span>
+            </button>
+            <div class="a-children">
+              <button ${entityAttrs("presentation")} class="a-row entity${state.selected === "presentation" ? " selected" : ""}">
+                <span class="glyph">◆</span><span>presentation-contract</span><span class="attention">1</span>
+              </button>
+              <button ${entityAttrs("compact")} class="a-row entity${state.selected === "compact" ? " selected" : ""}">
+                <span class="glyph">◆</span><span>compact-rail-mock</span><span class="phase">active</span>
+              </button>
+              <div class="a-issue-header">
+                <button class="class-toggle" data-toggle-issues>
+                  <span class="toggle-mark">${state.issuesVisible ? "✓" : ""}</span>
+                  <span class="section-label">Issues</span>
+                </button>
+                <span class="section-label">4</span>
+              </div>
+              <div class="a-chips issue-items">
+                ${chip("issue-969", false)}
+                ${chip("issue-973", false)}
+                ${chip("issue-961", false)}
+                ${chip("issue-982", false)}
+              </div>
+            </div>
+          </section>
+          <section class="a-project">
+            <button ${entityAttrs("andamento")} class="a-project-head entity${state.selected === "andamento" ? " selected" : ""}">
+              <span class="chevron">›</span>
+              <span>andamento <span class="meta">2 latent issues</span></span>
+              <span class="attention">1</span>
+            </button>
+          </section>
+          <section class="a-project">
+            <button ${entityAttrs("lab")} class="a-project-head entity${state.selected === "lab" ? " selected" : ""}">
+              <span class="chevron">›</span>
+              <span>lab infrastructure <span class="meta">quiet</span></span>
+              <span class="attention quiet"></span>
+            </button>
+          </section>
+        </aside>`;
+      }
+
+      function variantB() {
+        return `<aside class="rail variant-b">
+          <nav class="b-spine" aria-label="Project spine">
+            <span class="section-label">projects</span>
+            <button ${entityAttrs("flotilla")} class="b-spine-button entity${state.selected === "flotilla" ? " selected" : ""}" title="flotilla">
+              FL <span class="attention">2</span>
+            </button>
+            <button ${entityAttrs("andamento")} class="b-spine-button entity${state.selected === "andamento" ? " selected" : ""}" title="andamento">
+              AN <span class="attention">1</span>
+            </button>
+            <button ${entityAttrs("lab")} class="b-spine-button entity${state.selected === "lab" ? " selected" : ""}" title="lab infrastructure">
+              LB <span class="attention quiet"></span>
+            </button>
+          </nav>
+          <div class="b-body">
+            <div class="b-title"><strong>flotilla</strong><span class="attention">2</span></div>
+            <div class="b-address">github.com/flotilla-org/flotilla</div>
+            <section class="b-lane">
+              <div class="b-lane-head"><span class="section-label">Convoys · 2</span></div>
+              <div class="b-cards">
+                <button ${entityAttrs("presentation")} class="b-card entity${state.selected === "presentation" ? " selected" : ""}">
+                  <span class="icon">◆</span>
+                  <span>presentation-contract<div class="sub">waiting for principal</div></span>
+                  <span class="attention">1</span>
+                </button>
+                <button ${entityAttrs("compact")} class="b-card entity${state.selected === "compact" ? " selected" : ""}">
+                  <span class="icon">◆</span>
+                  <span>compact-rail-mock<div class="sub">coder · active 18m</div></span>
+                  <span class="attention info">i</span>
+                </button>
+              </div>
+            </section>
+            <section class="b-lane">
+              <div class="b-lane-head">
+                <button class="class-toggle" data-toggle-issues>
+                  <span class="toggle-mark">${state.issuesVisible ? "✓" : ""}</span>
+                  <span class="section-label">Issues · 4</span>
+                </button>
+              </div>
+              <div class="b-chips issue-items">
+                ${chip("issue-969")}
+                ${chip("issue-973")}
+                ${chip("issue-961")}
+                ${chip("issue-982")}
+              </div>
+            </section>
+            <section class="b-lane">
+              <div class="b-lane-head"><span class="section-label">Repositories · 1</span></div>
+              <div class="b-card" style="grid-template-columns:20px 1fr">
+                <span style="color:var(--green)">⌘</span>
+                <span>flotilla-org/flotilla<div class="sub">main · clean</div></span>
+              </div>
+            </section>
+          </div>
+        </aside>`;
+      }
+
+      function variantC() {
+        return `<aside class="rail variant-c">
+          <div class="c-top">
+            <span class="section-label">Project spine</span>
+            <span class="section-label">Convoys</span>
+            <button class="class-toggle" data-toggle-issues>
+              <span class="toggle-mark">${state.issuesVisible ? "✓" : ""}</span>
+              <span class="section-label">Issues · whole class</span>
+            </button>
+          </div>
+          <div class="c-matrix">
+            <section class="c-project">
+              <button ${entityAttrs("flotilla")} class="c-project-id entity${state.selected === "flotilla" ? " selected" : ""}">
+                <span class="c-node"></span>
+                <span><strong>flotilla</strong><div class="meta">github.com/flotilla-org</div><span class="attention">2</span></span>
+              </button>
+              <div class="c-convoys">
+                <button ${entityAttrs("presentation")} class="c-convoy entity${state.selected === "presentation" ? " selected" : ""}">
+                  <span class="phase-dot waiting"></span><span>presentation-contract</span><span class="attention">1</span>
+                </button>
+                <button ${entityAttrs("compact")} class="c-convoy entity${state.selected === "compact" ? " selected" : ""}">
+                  <span class="phase-dot"></span><span>compact-rail-mock</span>
+                </button>
+              </div>
+              <div class="c-issues issue-items">
+                ${chip("issue-969")}
+                ${chip("issue-973")}
+                ${chip("issue-961")}
+                ${chip("issue-982")}
+              </div>
+            </section>
+            <section class="c-project">
+              <button ${entityAttrs("andamento")} class="c-project-id entity${state.selected === "andamento" ? " selected" : ""}">
+                <span class="c-node"></span>
+                <span><strong>andamento</strong><div class="meta">github.com/flotilla-org</div><span class="attention">1</span></span>
+              </button>
+              <div class="c-convoys">
+                <button ${entityAttrs("release")} class="c-convoy entity${state.selected === "release" ? " selected" : ""}">
+                  <span class="phase-dot"></span><span>release-0.12</span>
+                </button>
+              </div>
+              <div class="c-issues issue-items">
+                ${chip("issue-27")}
+                ${chip("issue-25")}
+              </div>
+            </section>
+            <section class="c-project">
+              <button ${entityAttrs("lab")} class="c-project-id entity${state.selected === "lab" ? " selected" : ""}">
+                <span class="c-node"></span>
+                <span><strong>lab</strong><div class="meta">no active convoy</div><span class="attention quiet"></span></span>
+              </button>
+              <div class="c-convoys"><span style="padding:3px 5px;color:var(--overlay)">— latent —</span></div>
+              <div class="c-issues issue-items">${chip("issue-604")}</div>
+            </section>
+          </div>
+        </aside>`;
+      }
+
+      function shell() {
+        const selected = entities[state.selected];
+        const rail = state.variant === "A" ? variantA() : state.variant === "B" ? variantB() : variantC();
+        return `<div class="shell ${state.issuesVisible ? "" : "issues-hidden"}">
+          <header class="titlebar">
+            <span class="logo">⚓ flotilla</span>
+            <span>project / <span class="crumb">flotilla</span></span>
+            <span>convoy / <span class="crumb">presentation-contract</span></span>
+            <span class="host">local · 3 peers</span>
+          </header>
+          <div class="stage">
+            <section class="workspace">
+              <div class="terminal">
+                <div><span class="prompt">coder@work</span> <span class="command">cargo test -p flotilla-tui</span></div>
+                <div>running 184 tests</div>
+                <div>test result: <span style="color:var(--green)">ok</span>. 184 passed; 0 failed</div>
+                <div><span class="prompt">coder@work</span> <span class="cursor"></span></div>
+              </div>
+            </section>
+            ${rail}
+          </div>
+          <footer class="status-line">
+            <div class="status-detail">
+              <span class="kind">${selected.kind}</span>
+              <strong> ${selected.label}</strong>
+              <span> — ${selected.detail} · ${selected.address}</span>
+            </div>
+            <span class="status-state">variant=${state.variant} · issues=${state.issuesVisible ? "shown" : "hidden"}</span>
+            <span><span class="status-key">I</span> issues</span>
+          </footer>
+        </div>
+        <nav class="switcher" aria-label="Prototype variants">
+          <button data-cycle="-1" aria-label="Previous variant">←</button>
+          <div class="variant-name"><strong>${state.variant}</strong> — ${variants[state.variant]}</div>
+          <button data-cycle="1" aria-label="Next variant">→</button>
+        </nav>`;
+      }
+
+      function render() {
+        document.querySelector("#app").innerHTML = shell();
+        bind();
+      }
+
+      function bind() {
+        document.querySelectorAll("[data-entity]").forEach((button) => {
+          button.addEventListener("click", () => {
+            state.selected = button.dataset.entity;
+            render();
+          });
+        });
+        document.querySelectorAll("[data-toggle-issues]").forEach((button) => {
+          button.addEventListener("click", toggleIssues);
+        });
+        document.querySelectorAll("[data-cycle]").forEach((button) => {
+          button.addEventListener("click", () => cycleVariant(Number(button.dataset.cycle)));
+        });
+      }
+
+      function toggleIssues() {
+        state.issuesVisible = !state.issuesVisible;
+        if (!state.issuesVisible && entities[state.selected].kind === "issue") {
+          state.selected = "flotilla";
+        }
+        render();
+      }
+
+      function cycleVariant(delta) {
+        const keys = Object.keys(variants);
+        const next = (keys.indexOf(state.variant) + delta + keys.length) % keys.length;
+        state.variant = keys[next];
+        const url = new URL(window.location);
+        url.searchParams.set("variant", state.variant);
+        history.replaceState({}, "", url);
+        render();
+      }
+
+      window.addEventListener("keydown", (event) => {
+        const tag = event.target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || event.target.isContentEditable) return;
+        if (event.key === "ArrowLeft") cycleVariant(-1);
+        if (event.key === "ArrowRight") cycleVariant(1);
+        if (event.key.toLowerCase() === "i") toggleIssues();
+      });
+
+      window.addEventListener("popstate", () => {
+        state.variant = currentVariant();
+        render();
+      });
+
+      render();
+    </script>
+  </body>
+</html>
