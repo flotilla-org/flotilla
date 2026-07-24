@@ -7,12 +7,12 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, CrewSource, DockerCheckoutStrategy,
-    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy,
-    PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource, ResourceBackend, ResourceError, ResourceObject, Stance,
-    TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase,
-    VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
+    repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
+    CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
+    EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource,
+    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
+    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -317,11 +317,6 @@ impl Reconciler for VesselReconciler {
             let adopted_checkout_ref = obj.spec.adopted_checkout_refs.get(&repository_key).cloned();
             let clone_name = if adopted_checkout_ref.is_none() && strategy.needs_shared_clone() {
                 let clone_name = format!("clone-{}", clone_key(&canonical_repo, &clone_env_ref));
-                let clone_path = format!(
-                    "{}/{}",
-                    shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
-                    repo_key
-                );
                 match self.clones.get(&clone_name).await {
                     Ok(existing) => {
                         if existing.spec.repo_ref != repository_key || existing.spec.env_ref != clone_env_ref {
@@ -336,22 +331,40 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselDeps::failed(message));
                         }
                     }
-                    Err(ResourceError::NotFound { .. }) => actuations.push(Actuation::CreateClone {
-                        meta: InputMeta::builder()
-                            .name(clone_name.clone())
-                            .labels(BTreeMap::from([
-                                (REPO_KEY_LABEL.to_string(), repo_key.clone()),
-                                (ENV_LABEL.to_string(), clone_env_ref.clone()),
-                                (REPO_LABEL.to_string(), convoy_repository.workspace_slug.clone()),
-                            ]))
-                            .build(),
-                        spec: CloneSpec {
-                            repo_ref: repository_key.clone(),
-                            url: convoy_repository.url.clone(),
-                            env_ref: clone_env_ref.clone(),
-                            path: clone_path,
-                        },
-                    }),
+                    Err(ResourceError::NotFound { .. }) => {
+                        let repository_catalog = self.repositories.list().await?;
+                        let keyed_repositories = repository_catalog
+                            .items
+                            .iter()
+                            .filter(|candidate| candidate.spec.key() != repository_key)
+                            .map(|candidate| (candidate.spec.key(), &candidate.spec))
+                            .chain(std::iter::once((repository_key.clone(), &repository.spec)))
+                            .collect::<Vec<_>>();
+                        let clone_directory_slug = repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)))
+                            .remove(&repository_key)
+                            .expect("the current repository was included in slug allocation");
+                        let clone_path = format!(
+                            "{}/{}",
+                            shared_clone_root.as_deref().expect("shared-clone placement has a root").trim_end_matches('/'),
+                            clone_directory_slug
+                        );
+                        actuations.push(Actuation::CreateClone {
+                            meta: InputMeta::builder()
+                                .name(clone_name.clone())
+                                .labels(BTreeMap::from([
+                                    (REPO_KEY_LABEL.to_string(), repo_key.clone()),
+                                    (ENV_LABEL.to_string(), clone_env_ref.clone()),
+                                    (REPO_LABEL.to_string(), convoy_repository.workspace_slug.clone()),
+                                ]))
+                                .build(),
+                            spec: CloneSpec {
+                                repo_ref: repository_key.clone(),
+                                url: convoy_repository.url.clone(),
+                                env_ref: clone_env_ref.clone(),
+                                path: clone_path,
+                            },
+                        });
+                    }
                     Err(err) => return Err(err),
                 }
                 Some(clone_name)
@@ -374,7 +387,7 @@ impl Reconciler for VesselReconciler {
                         checkout_target_path(
                             shared_clone_root.as_deref().expect("shared-clone placement has a root"),
                             &convoy_checkout_slug,
-                            &repository.spec.catalog_slug(),
+                            &convoy_repository.workspace_slug,
                             checkout_slug.as_deref().expect("repository checkout requires a branch"),
                         )
                     }

@@ -156,6 +156,65 @@ pub fn repository_display_labels<'a>(
         .collect()
 }
 
+/// Short, path-safe repository names, qualified only when names collide.
+///
+/// Repository keys remain opaque identity and must not leak into paths as the
+/// whole directory name. A key prefix is used only as a final disambiguator,
+/// after both the URL basename and readable remote-derived slug collide.
+pub fn repository_workspace_slugs<'a>(
+    repositories: impl IntoIterator<Item = (&'a RepositoryKey, &'a RepositorySpec)>,
+) -> BTreeMap<RepositoryKey, String> {
+    let repositories = repositories.into_iter().collect::<Vec<_>>();
+    let leaf_slugs =
+        repositories.iter().map(|(key, spec)| ((*key).clone(), normalize_workspace_slug(&spec.leaf_slug()))).collect::<BTreeMap<_, _>>();
+    let mut leaf_slug_counts = BTreeMap::<String, usize>::new();
+    for slug in leaf_slugs.values() {
+        *leaf_slug_counts.entry(slug.clone()).or_default() += 1;
+    }
+
+    let candidates = repositories
+        .iter()
+        .map(|(key, spec)| {
+            let leaf_slug = &leaf_slugs[*key];
+            let candidate =
+                if leaf_slug_counts[leaf_slug] == 1 { leaf_slug.clone() } else { normalize_workspace_slug(&spec.catalog_slug()) };
+            ((*key).clone(), candidate)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut candidate_counts = BTreeMap::<String, usize>::new();
+    for slug in candidates.values() {
+        *candidate_counts.entry(slug.clone()).or_default() += 1;
+    }
+
+    candidates
+        .into_iter()
+        .map(|(key, candidate)| {
+            let slug = if candidate_counts[&candidate] == 1 { candidate } else { disambiguate_workspace_slug(&candidate, &key) };
+            (key, slug)
+        })
+        .collect()
+}
+
+fn normalize_workspace_slug(candidate: &str) -> String {
+    let normalized = candidate
+        .chars()
+        .map(|character| if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let normalized = if normalized.is_empty() { "repository" } else { &normalized };
+    normalized.chars().take(48).collect::<String>().trim_matches('-').to_string()
+}
+
+fn disambiguate_workspace_slug(slug: &str, repo_ref: &RepositoryKey) -> String {
+    let suffix = repo_ref.0.chars().take(8).collect::<String>();
+    let max_base_len = 48_usize.saturating_sub(suffix.len() + 1);
+    let base = slug.chars().take(max_base_len).collect::<String>().trim_matches('-').to_string();
+    format!("{base}-{suffix}")
+}
+
 pub async fn ensure_repository(
     repositories: &TypedResolver<Repository>,
     key: &RepositoryKey,

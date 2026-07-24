@@ -138,6 +138,25 @@ fn repository_display_labels_use_forge_slugs_and_qualify_collisions() {
 }
 
 #[test]
+fn repository_workspace_slugs_are_short_and_qualify_basename_collisions() {
+    let cleat = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("cleat repository");
+    let flotilla = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("flotilla repository");
+    let andamento = RepositorySpec::remote("https://github.com/flotilla-org/andamento").expect("andamento repository");
+    let github_shared = RepositorySpec::remote("https://github.com/org-a/shared").expect("github shared repository");
+    let gitlab_shared = RepositorySpec::remote("https://gitlab.com/org-b/shared").expect("gitlab shared repository");
+    let repositories = [cleat, flotilla, andamento, github_shared, gitlab_shared];
+    let keyed_repositories = repositories.iter().map(|spec| (spec.key(), spec)).collect::<Vec<_>>();
+    let slugs = flotilla_resources::repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)));
+
+    assert_eq!(slugs[&repositories[0].key()], "cleat");
+    assert_eq!(slugs[&repositories[1].key()], "flotilla");
+    assert_eq!(slugs[&repositories[2].key()], "andamento");
+    assert_eq!(slugs[&repositories[3].key()], "github-com-org-a-shared");
+    assert_eq!(slugs[&repositories[4].key()], "gitlab-com-org-b-shared");
+    assert!(repositories.iter().all(|repository| slugs[&repository.key()] != repository.key().to_string()));
+}
+
+#[test]
 fn repository_declarations_reject_unresolved_aliases_and_inconsistent_forges() {
     assert!(RepositorySpec::remote("work-github:flotilla-org/flotilla.git").is_err());
     assert!(RepositorySpec::remote("git@github.com:flotilla-org/flotilla.git").is_err());
