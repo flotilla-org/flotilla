@@ -800,7 +800,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                 }
                 let result = result.clone();
                 return match result {
-                    CommandValue::Error { message } => Err(message),
+                    CommandValue::Error { .. } => Ok(result),
                     CommandValue::Cancelled => Err("command cancelled".into()),
                     result => Ok(result),
                 };
@@ -829,7 +829,7 @@ async fn run_query_command(daemon: &dyn DaemonHandle, command: Command, format: 
         }
     }
     match result {
-        CommandValue::Error { message } => Err(message),
+        CommandValue::Error { .. } => Ok(result),
         CommandValue::Cancelled => Err("command cancelled".into()),
         result => Ok(result),
     }

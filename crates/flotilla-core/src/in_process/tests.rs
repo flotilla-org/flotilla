@@ -156,7 +156,7 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"]))].into_iter().collect(),
-            heartbeat_at: None,
+            heartbeat_at: Some(Utc::now()),
             ready: true,
             resource_store: None,
         })
@@ -185,6 +185,45 @@ async fn agent_adapter_admission_rejects_a_host_that_does_not_advertise_the_requ
         .expect_err("host without codex must be rejected");
 
     assert_eq!(error, "workflow requires agent adapter `codex`, which is not available in placement `host-direct-test` (host `host-test`)");
+}
+
+#[tokio::test]
+async fn agent_adapter_admission_rejects_a_host_with_stale_heartbeat() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name("host-test".to_string()).build(), &HostSpec {}).await.expect("host create");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now() - ChronoDuration::seconds(61)),
+            ready: true,
+            resource_store: None,
+        })
+        .await
+        .expect("host status update");
+    let placement = backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name("host-direct-test".to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host.metadata.name,
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("placement create");
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+
+    let error = validate_workflow_agent_adapters(&backend, "flotilla", &workflow, Some(&placement))
+        .await
+        .expect_err("stale host heartbeat must be rejected");
+
+    assert_eq!(error, "placement `host-direct-test` host `host-test` is not ready");
 }
 
 #[tokio::test]

@@ -3169,9 +3169,10 @@ async fn validate_workflow_agent_adapters(
             let host = backend.clone().using::<ResourceHost>(namespace).get(&host_direct.host_ref).await.map_err(|error| {
                 format!("placement `{}` host `{}` is not ready: {error}", placement.metadata.name, host_direct.host_ref)
             })?;
-            let status = host
+            let mut status = host
                 .status
                 .ok_or_else(|| format!("placement `{}` host `{}` has no observed status", placement.metadata.name, host_direct.host_ref))?;
+            status.apply_heartbeat_readiness(Utc::now());
             if !status.ready {
                 return Err(format!("placement `{}` host `{}` is not ready", placement.metadata.name, host_direct.host_ref));
             }
