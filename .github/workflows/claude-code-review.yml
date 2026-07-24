@@ -45,6 +45,11 @@ jobs:
 
             Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
 
+            You are a STATIC reviewer by design: you review the diff and repository source only.
+            Dedicated CI jobs run cargo fmt/clippy/test on this PR and their results are visible
+            as checks - do NOT attempt to run builds, tests, or linters, and do NOT disclaim or
+            apologize for not running them. A static review is the complete job, not a degraded one.
+
             AFTER reviewing, 
               * CHECK your findings against the existing comments and replies on the PR. e.g if followup issues are filed or the implementor pushed back, make sure that is 
               correct: drop issues that are already addressed, repeat issues that still need to be dealt with with an explanation.
