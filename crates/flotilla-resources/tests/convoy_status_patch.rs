@@ -25,6 +25,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                         source: CrewSource::Agent {
                             selector: Selector { capability: "code".to_string() },
                             prompt: Some("Implement {{inputs.feature}}".to_string()),
+                            brief_template: None,
                         },
                         labels: BTreeMap::new(),
                     },
@@ -45,6 +46,7 @@ fn sample_snapshot() -> WorkflowSnapshot {
                     source: CrewSource::Agent {
                         selector: Selector { capability: "code-review".to_string() },
                         prompt: Some("Review {{inputs.feature}}".to_string()),
+                        brief_template: None,
                     },
                     labels: BTreeMap::new(),
                 }],

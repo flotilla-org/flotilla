@@ -1,0 +1,2 @@
+{% extends "builtin/crew.md" %}
+{% block delivery %}For interactive sessions, keep the user-facing loop tight: make progress without waiting when the next step is clear, ask only when blocked by missing intent or external access, and complete with `flotilla crew complete --message '...'` when the session's requested outcome is reached. If the session cannot be completed, report the failure with `flotilla crew fail --message '...'`.{% endblock %}

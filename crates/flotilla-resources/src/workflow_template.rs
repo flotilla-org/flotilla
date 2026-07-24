@@ -72,6 +72,8 @@ pub enum CrewSource {
         selector: Selector,
         #[serde(default)]
         prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief_template: Option<String>,
     },
     Tool {
         command: String,
@@ -90,7 +92,7 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
             .stance(Stance::Contained)
             .crew(vec![CrewSpec::builder()
                 .role("coder".to_string())
-                .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None })
+                .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None, brief_template: None })
                 .build()])
             .build()])
         .build()
@@ -444,6 +446,7 @@ mod tests {
                             .source(CrewSource::Agent {
                                 selector: Selector { capability: "code".to_string() },
                                 prompt: Some("Implement {{inputs.feature}} for {{workflow.name}}".to_string()),
+                                brief_template: None,
                             })
                             .build(),
                         CrewSpec::builder()
@@ -460,6 +463,7 @@ mod tests {
                         .source(CrewSource::Agent {
                             selector: Selector { capability: "code-review".to_string() },
                             prompt: Some("Review {{workflow.namespace}}".to_string()),
+                            brief_template: None,
                         })
                         .build()])
                     .build(),
@@ -522,6 +526,7 @@ mod tests {
         spec.vessels[0].crew[0].source = CrewSource::Agent {
             selector: Selector { capability: "code".to_string() },
             prompt: Some("Implement {{inputs.branch}}".to_string()),
+            brief_template: None,
         };
 
         let errors = validate(&spec).expect_err("unknown input references should fail");
@@ -541,6 +546,7 @@ mod tests {
         spec.vessels[0].crew[0].source = CrewSource::Agent {
             selector: Selector { capability: "code".to_string() },
             prompt: Some("Implement {{workflow.uid}}".to_string()),
+            brief_template: None,
         };
 
         let errors = validate(&spec).expect_err("unknown workflow fields should fail");
@@ -560,6 +566,7 @@ mod tests {
         spec.vessels[0].crew[0].source = CrewSource::Agent {
             selector: Selector { capability: "code".to_string() },
             prompt: Some("Implement {{inputs.feature }} and {{workflow.name.extra}}".to_string()),
+            brief_template: None,
         };
 
         let errors = validate(&spec).expect_err("malformed owned interpolation should fail");

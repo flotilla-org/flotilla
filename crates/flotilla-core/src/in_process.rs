@@ -1076,13 +1076,14 @@ fn handoff_crew_brief(
     prompt: Option<&str>,
     members: &[CrewListMember],
     repository_refs: &[RepositoryKey],
-) -> TerminalBrief {
+    render_options: &crate::agent_adapter::CrewBriefRenderOptions,
+) -> Result<TerminalBrief, String> {
     let assignment = match prompt {
         Some(prompt) => crate::agent_adapter::CrewAssignment::Prompt(prompt),
         None if !convoy.spec.issues.is_empty() => crate::agent_adapter::CrewAssignment::CarriedIssue,
         None => crate::agent_adapter::CrewAssignment::Unassigned,
     };
-    let mut brief = crate::agent_adapter::build_crew_brief(
+    let brief = crate::agent_adapter::build_crew_brief_with_options(
         &TerminalCrewContext {
             namespace: context.namespace.clone(),
             convoy: context.convoy.clone(),
@@ -1099,9 +1100,36 @@ fn handoff_crew_brief(
                 is_agent: member.kind == "agent",
             })
             .collect::<Vec<_>>(),
+        render_options,
     );
+    let mut brief = brief?;
     crate::agent_adapter::append_convoy_work_context(&mut brief.content, convoy, repository_refs);
-    brief
+    Ok(brief)
+}
+
+async fn crew_brief_repo_roots(
+    backend: &ResourceBackend,
+    namespace: &str,
+    convoy: &flotilla_resources::ResourceObject<ResourceConvoy>,
+    repository_refs: &[RepositoryKey],
+) -> Vec<PathBuf> {
+    let checkouts = backend.clone().using::<ResourceCheckout>(namespace);
+    let mut roots = Vec::new();
+    for repository_ref in repository_refs {
+        let Some(checkout_ref) = convoy.spec.adopted_checkout_refs.get(repository_ref) else {
+            continue;
+        };
+        let Ok(checkout) = checkouts.get(checkout_ref).await else {
+            continue;
+        };
+        let Some(path) =
+            checkout.status.as_ref().and_then(|status| status.path.clone()).or_else(|| checkout.spec.target_path().map(str::to_string))
+        else {
+            continue;
+        };
+        roots.push(PathBuf::from(path));
+    }
+    roots
 }
 
 fn pending_crew_message(text: &str) -> TerminalCrewMessage {
@@ -4848,7 +4876,7 @@ impl InProcessDaemon {
             .enumerate()
             .find(|(_, process)| process.role == target && target != context.caller_role)
             .ok_or_else(|| crew_handoff_address_error(target, &context.vessel))?;
-        let CrewSource::Agent { selector, prompt } = &process.source else {
+        let CrewSource::Agent { selector, prompt, brief_template } = &process.source else {
             return Err(format!("crew target `{target}` is a tool process and cannot receive a handoff"));
         };
         let repository_refs = task
@@ -4908,7 +4936,11 @@ impl InProcessDaemon {
                         .ok_or_else(|| format!("vessel `{}` has no active session to anchor the handoff", context.vessel_ref))?
                 };
                 let current = self.crew_list_internal(requested).await?;
-                let brief = handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, &repository_refs);
+                let repo_roots = crew_brief_repo_roots(&self.resource_backend, &context.namespace, &convoy, &repository_refs).await;
+                let render_options = crate::agent_adapter::CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
+                    .render_options(brief_template.as_deref(), convoy.spec.project_ref.as_deref(), repo_roots);
+                let brief =
+                    handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, &repository_refs, &render_options)?;
                 sessions
                     .create(&identity.input_meta(), &flotilla_resources::TerminalSessionSpec {
                         env_ref: anchor.spec.env_ref,

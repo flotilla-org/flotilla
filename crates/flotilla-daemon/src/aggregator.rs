@@ -1711,7 +1711,7 @@ impl Aggregator {
             .map(|process| {
                 let command_preview = match &process.source {
                     CrewSource::Tool { command } => command.clone(),
-                    CrewSource::Agent { selector, prompt } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
+                    CrewSource::Agent { selector, prompt, .. } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
                 };
                 CrewMemberSummary {
                     role: process.role.clone(),

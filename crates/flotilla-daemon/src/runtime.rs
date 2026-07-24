@@ -731,16 +731,18 @@ fn spawn_controller_loops(
         tokio::spawn({
             let backend = backend.clone();
             let namespace_string = namespace_string.clone();
+            let config_dir = state.config.base_path().as_path().to_path_buf();
             let supervision = supervision.clone();
             async move {
                 supervise("vessel", supervision, move || {
                     let backend = backend.clone();
                     let namespace_string = namespace_string.clone();
+                    let config_dir = config_dir.clone();
                     async move {
                         ControllerLoop {
                             primary: backend.clone().using::<Vessel>(&namespace_string),
                             secondaries: VesselReconciler::secondary_watches(),
-                            reconciler: VesselReconciler::new(backend.clone(), &namespace_string),
+                            reconciler: VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir),
                             resync_interval: controller_resync_interval,
                             backend,
                         }
@@ -1995,6 +1997,7 @@ mod tests {
                     .source(CrewSource::Agent {
                         selector: Selector { capability: "custom-code".to_string() },
                         prompt: Some("Keep this definition".to_string()),
+                        brief_template: None,
                     })
                     .build()])
                 .build()])
@@ -2729,6 +2732,7 @@ mod tests {
                                     prompt: Some(
                                         "Implement issue 668 without leaking this full brief into the launch command.".to_string(),
                                     ),
+                                    brief_template: None,
                                 })
                                 .build(),
                             CrewSpec::builder()
@@ -2736,6 +2740,7 @@ mod tests {
                                 .source(CrewSource::Agent {
                                     selector: Selector { capability: "review".to_string() },
                                     prompt: Some("Review the coder's work.".to_string()),
+                                    brief_template: None,
                                 })
                                 .build(),
                             CrewSpec::builder()
@@ -3086,7 +3091,11 @@ mod tests {
                         .name("implement".to_string())
                         .crew(vec![CrewSpec::builder()
                             .role("architect".to_string())
-                            .source(CrewSource::Agent { selector: Selector { capability: "architect".to_string() }, prompt: None })
+                            .source(CrewSource::Agent {
+                                selector: Selector { capability: "architect".to_string() },
+                                prompt: None,
+                                brief_template: None,
+                            })
                             .build()])
                         .build()])
                     .build(),

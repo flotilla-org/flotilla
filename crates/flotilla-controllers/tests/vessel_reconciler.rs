@@ -369,6 +369,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
                         .source(CrewSource::Agent {
                             selector: Selector { capability: "coding".to_string() },
                             prompt: Some("Work across both repositories.".to_string()),
+                            brief_template: None,
                         })
                         .build()],
                 }],
@@ -1262,6 +1263,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             .source(CrewSource::Agent {
                 selector: Selector { capability: "coding".to_string() },
                 prompt: Some("Implement issue 668.".to_string()),
+                brief_template: None,
             })
             .build(),
         CrewSpec::builder()
@@ -1269,6 +1271,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
             .source(CrewSource::Agent {
                 selector: Selector { capability: "review".to_string() },
                 prompt: Some("Review the coder's work.".to_string()),
+                brief_template: None,
             })
             .build(),
     ];
@@ -1297,9 +1300,14 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
-    let Actuation::CreateTerminalSession { spec, .. } = outcome.actuations.first().expect("coder session actuation") else {
-        panic!("expected terminal session actuation");
-    };
+    let spec = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateTerminalSession { spec, .. } => Some(spec),
+            _ => None,
+        })
+        .expect("coder session actuation");
     let TerminalSessionSource::Agent { selector, brief, context, message } = &spec.source else {
         panic!("expected structured agent launch");
     };
@@ -1318,6 +1326,68 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .actuations
         .iter()
         .all(|actuation| { !matches!(actuation, Actuation::CreateTerminalSession { spec, .. } if spec.role == "reviewer") }));
+}
+
+#[tokio::test]
+async fn repo_level_brief_template_override_changes_one_block_for_that_repo_convoy() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let override_dir = repo_path.join(".flotilla/brief-templates");
+    std::fs::create_dir_all(&override_dir).expect("override dir");
+    std::fs::write(
+        override_dir.join("crew.md"),
+        "{% block delivery %}Repo-local delivery gate: stop after the fixture proves the override.{% endblock %}",
+    )
+    .expect("override file");
+
+    let backend = ResourceBackend::InMemory(Default::default());
+    let convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy-repo-override", "implement", REPO_URL, GIT_REF).await;
+    let repo_ref = convoy.spec.repositories[0].repo_ref.clone();
+    let mut status = convoy.status.expect("convoy status");
+    status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0].crew = vec![CrewSpec::builder()
+        .role("coder".to_string())
+        .source(CrewSource::Agent { selector: Selector { capability: "coding".to_string() }, prompt: None, brief_template: None })
+        .build()];
+    backend
+        .clone()
+        .using::<Convoy>(NAMESPACE)
+        .update_status("convoy-repo-override", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("update convoy crew");
+    create_host_direct_policy(&backend, NAMESPACE, "policy-repo-override", HOST_REF, "cleat").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, HOST_REF, "/Users/alice/dev/flotilla-repos").await;
+    create_ready_adopted_checkout(
+        &backend,
+        NAMESPACE,
+        "adopted-checkout-convoy-repo-override",
+        repo_path.to_str().expect("repo path should be utf-8"),
+    )
+    .await;
+    let workspace = backend
+        .clone()
+        .using::<Vessel>(NAMESPACE)
+        .create(&vessel_meta("workspace-repo-override", REPO_URL), &VesselSpec {
+            convoy_ref: "convoy-repo-override".to_string(),
+            vessel_name: "implement".to_string(),
+            placement_policy_ref: "policy-repo-override".to_string(),
+            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-repo-override".to_string())]),
+        })
+        .await
+        .expect("workspace create");
+
+    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let deps = reconciler.fetch_dependencies(&workspace).await.expect("deps");
+    let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
+
+    let Actuation::CreateTerminalSession { spec, .. } = outcome.actuations.first().expect("coder session actuation") else {
+        panic!("expected terminal session actuation");
+    };
+    let TerminalSessionSource::Agent { brief, .. } = &spec.source else {
+        panic!("expected agent source");
+    };
+    assert!(brief.content.contains("Repo-local delivery gate: stop after the fixture proves the override."));
+    assert!(brief.content.contains("## Assignment\n\nNo assignment was provided with this dispatch."));
+    assert!(!brief.content.contains("For assignments that change a repository"));
 }
 
 #[tokio::test]
@@ -1374,7 +1444,11 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
                     repository_refs: None,
                     crew: vec![CrewSpec::builder()
                         .role("coder".to_string())
-                        .source(CrewSource::Agent { selector: Selector { capability: "coding".to_string() }, prompt: None })
+                        .source(CrewSource::Agent {
+                            selector: Selector { capability: "coding".to_string() },
+                            prompt: None,
+                            brief_template: None,
+                        })
                         .build()],
                 }],
             }),

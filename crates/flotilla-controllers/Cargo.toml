@@ -20,3 +20,4 @@ sha2 = "0.10"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rstest = { workspace = true }
+tempfile = "3"

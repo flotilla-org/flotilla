@@ -660,11 +660,19 @@ async fn create_two_agent_crew(daemon: &InProcessDaemon, env_ref: &str) {
     let processes = vec![
         CrewSpec::builder()
             .role("coder".to_string())
-            .source(CrewSource::Agent { selector: Selector { capability: "coding".into() }, prompt: Some("Implement the change.".into()) })
+            .source(CrewSource::Agent {
+                selector: Selector { capability: "coding".into() },
+                prompt: Some("Implement the change.".into()),
+                brief_template: None,
+            })
             .build(),
         CrewSpec::builder()
             .role("reviewer".to_string())
-            .source(CrewSource::Agent { selector: Selector { capability: "review".into() }, prompt: Some("Review the change.".into()) })
+            .source(CrewSource::Agent {
+                selector: Selector { capability: "review".into() },
+                prompt: Some("Review the change.".into()),
+                brief_template: None,
+            })
             .build(),
     ];
     convoys

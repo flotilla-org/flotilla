@@ -1,7 +1,9 @@
-use std::{collections::BTreeMap, marker::PhantomData};
+use std::{collections::BTreeMap, marker::PhantomData, path::PathBuf};
 
 use chrono::{DateTime, Utc};
-use flotilla_core::agent_adapter::{append_convoy_work_context, build_crew_brief, CrewAssignment, CrewBriefMember};
+use flotilla_core::agent_adapter::{
+    append_convoy_work_context, build_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
+};
 use flotilla_resources::{
     clone_key,
     controller::{
@@ -29,6 +31,7 @@ pub struct VesselReconciler {
     checkouts: TypedResolver<Checkout>,
     terminal_sessions: TypedResolver<TerminalSession>,
     namespace: String,
+    brief_templates: CrewBriefTemplateResolver,
 }
 
 impl VesselReconciler {
@@ -42,7 +45,12 @@ impl VesselReconciler {
             checkouts: backend.clone().using::<Checkout>(namespace),
             terminal_sessions: backend.using::<TerminalSession>(namespace),
             namespace: namespace.to_string(),
+            brief_templates: CrewBriefTemplateResolver::default(),
         }
+    }
+
+    pub fn new_with_config_dir(backend: ResourceBackend, namespace: &str, config_dir: impl Into<PathBuf>) -> Self {
+        Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace) }
     }
 
     pub fn secondary_watches() -> Vec<Box<dyn SecondaryWatch<Primary = Vessel>>> {
@@ -608,7 +616,7 @@ impl Reconciler for VesselReconciler {
                     }
                     let source = match &process.source {
                         CrewSource::Tool { command } => flotilla_resources::TerminalSessionSource::Tool { command: command.clone() },
-                        CrewSource::Agent { selector, prompt } => {
+                        CrewSource::Agent { selector, prompt, brief_template } => {
                             let context = flotilla_resources::TerminalCrewContext {
                                 namespace: self.namespace.clone(),
                                 convoy: obj.spec.convoy_ref.clone(),
@@ -634,7 +642,22 @@ impl Reconciler for VesselReconciler {
                                 None if !convoy.spec.issues.is_empty() => CrewAssignment::CarriedIssue,
                                 None => CrewAssignment::Unassigned,
                             };
-                            let mut brief = build_crew_brief(&context, &obj.spec.vessel_name, &process.role, assignment, &members);
+                            let render_options = self.brief_templates.render_options(
+                                brief_template.as_deref(),
+                                convoy.spec.project_ref.as_deref(),
+                                checkout_paths.values().map(PathBuf::from),
+                            );
+                            let mut brief = match build_crew_brief_with_options(
+                                &context,
+                                &obj.spec.vessel_name,
+                                &process.role,
+                                assignment,
+                                &members,
+                                &render_options,
+                            ) {
+                                Ok(brief) => brief,
+                                Err(message) => return Ok(VesselDeps::failed(message)),
+                            };
                             append_convoy_work_context(&mut brief.content, &convoy, &repository_refs);
                             brief.copies = brief_copies.clone();
                             flotilla_resources::TerminalSessionSource::Agent { selector: selector.clone(), brief, context, message: None }
