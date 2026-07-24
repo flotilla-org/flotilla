@@ -39,6 +39,20 @@ pub enum ConvoyVerb {
         #[arg(long)]
         reason: String,
     },
+    /// Re-task completed crew in an intact convoy vessel
+    Resume {
+        /// Convoy resource name
+        name: String,
+        /// Follow-up brief delivered to the existing crew session
+        #[arg(long)]
+        prompt: String,
+        /// Vessel name; inferred when exactly one completed crew member matches
+        #[arg(long)]
+        vessel: Option<String>,
+        /// Crew role; inferred when exactly one completed crew member matches
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// Start a convoy through Project-scoped admission completion
     Start {
         /// Project whose definitions and repository set admission snapshots
@@ -188,6 +202,24 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
+            ConvoyVerb::Resume { name, prompt, vessel, role } => {
+                if self.subject.is_some() {
+                    return Err("convoy resume takes its name after `resume`".to_string());
+                }
+                if prompt.trim().is_empty() {
+                    return Err("convoy resume requires a non-empty --prompt".to_string());
+                }
+                Ok(Resolved::NeedsContext {
+                    command: Command {
+                        node_id: None,
+                        provisioning_target: None,
+                        context_repo: None,
+                        action: CommandAction::ConvoyResume { namespace: None, name, prompt, vessel, role },
+                    },
+                    repo: RepoContext::None,
+                    host: HostResolution::Local,
+                })
+            }
             ConvoyVerb::Start {
                 project,
                 issue,
@@ -321,6 +353,15 @@ impl std::fmt::Display for ConvoyNoun {
             }
             ConvoyVerb::Abandon { name, reason } => {
                 write!(f, " abandon {} --reason {}", quote_value(name), quote_value(reason))?;
+            }
+            ConvoyVerb::Resume { name, prompt, vessel, role } => {
+                write!(f, " resume {} --prompt {}", quote_value(name), quote_value(prompt))?;
+                if let Some(vessel) = vessel {
+                    write!(f, " --vessel {}", quote_value(vessel))?;
+                }
+                if let Some(role) = role {
+                    write!(f, " --role {}", quote_value(role))?;
+                }
             }
             ConvoyVerb::Start {
                 project,
@@ -472,6 +513,54 @@ mod tests {
     #[test]
     fn round_trip_delete() {
         assert_round_trip::<ConvoyNoun>(&["convoy", "delete", "failed-convoy"]);
+    }
+
+    #[test]
+    fn convoy_resume_resolves_with_optional_crew_selector() {
+        let resolved = parse(&[
+            "convoy",
+            "resume",
+            "convoy-a",
+            "--prompt",
+            "Rebase onto main and shepherd the PR",
+            "--vessel",
+            "implement",
+            "--role",
+            "coder",
+        ])
+        .resolve()
+        .expect("resolve");
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyResume {
+                    namespace: None,
+                    name: "convoy-a".into(),
+                    prompt: "Rebase onto main and shepherd the PR".into(),
+                    vessel: Some("implement".into()),
+                    role: Some("coder".into()),
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
+    fn round_trip_resume() {
+        assert_round_trip::<ConvoyNoun>(&[
+            "convoy",
+            "resume",
+            "convoy-a",
+            "--prompt",
+            "rebase",
+            "--vessel",
+            "implement",
+            "--role",
+            "coder",
+        ]);
     }
 
     #[test]

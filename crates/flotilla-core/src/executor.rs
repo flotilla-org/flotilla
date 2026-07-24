@@ -341,6 +341,7 @@ pub async fn build_plan(
         CommandAction::ConvoyWorkForceComplete { .. }
         | CommandAction::ConvoyDelete { .. }
         | CommandAction::ConvoyAbandon { .. }
+        | CommandAction::ConvoyResume { .. }
         | CommandAction::CrewComplete { .. }
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewHandoff { .. }

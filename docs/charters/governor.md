@@ -124,6 +124,17 @@ crew push, or land the PR), don't `--force` past it. `--force` skips the gate
 and nothing else; abandonment (best-effort push, stamped authority + reason)
 is the archive path for judged-out work.
 
+If a completed convoy's PR needs a rebase or late follow-up before landing,
+return ownership to its intact crew and warm vessel:
+
+```sh
+flotilla convoy resume <name> --prompt "Rebase onto main and shepherd the PR"
+```
+
+When more than one completed crew member matches, add `--vessel <name>` and
+`--role <role>`. Use direct `cleat send` only for live corrective intervention,
+not to reopen settled crew work.
+
 ## Recording
 
 - Rulings from grills and design decisions land on the issue **when made**,

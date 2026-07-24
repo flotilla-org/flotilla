@@ -212,6 +212,40 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
 }
 
 #[test]
+fn resume_reopens_completed_crew_without_restarting_its_timeline() {
+    let mut coder = crew_work(CrewWorkPhase::Done);
+    coder.finished_at = Some(ts(15));
+    coder.message = Some("ready".to_string());
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Completed,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Complete,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
+            ready_at: Some(ts(8)),
+            started_at: Some(ts(9)),
+            finished_at: Some(ts(16)),
+            message: Some("complete".to_string()),
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), coder)]))]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: Some(ts(16)),
+        observed_workflow_ref: Some("single-agent-contained".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    external_patches::resume_crew_work("implement".to_string(), "coder".to_string(), ts(20), "Rebase onto main".to_string())
+        .apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["coder"].started_at, Some(ts(10)));
+    assert_eq!(status.crew_work["implement"]["coder"].finished_at, None);
+    assert_eq!(status.crew_work["implement"]["coder"].message.as_deref(), Some("Rebase onto main"));
+}
+
+#[test]
 fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
     let mut pending_coder = crew_work(CrewWorkPhase::Pending);
     pending_coder.started_at = None;

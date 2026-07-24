@@ -275,6 +275,16 @@ pub enum CommandAction {
         name: String,
         reason: String,
     },
+    ConvoyResume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        name: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vessel: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
     CrewHandoff {
         context: CrewCommandContext,
         target: String,
@@ -456,6 +466,7 @@ impl Command {
             CommandAction::ConvoyWorkForceComplete { .. } => "Force-completing work...",
             CommandAction::ConvoyDelete { .. } => "Deleting convoy...",
             CommandAction::ConvoyAbandon { .. } => "Abandoning convoy...",
+            CommandAction::ConvoyResume { .. } => "Resuming convoy crew...",
             CommandAction::CrewHandoff { .. } => "Handing off to crew member...",
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
@@ -822,6 +833,18 @@ mod tests {
                 provisioning_target: None,
                 context_repo: None,
                 action: CommandAction::ConvoyDelete { namespace: Some("flotilla".into()), name: "failed-convoy".into(), force: false },
+            },
+            Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyResume {
+                    namespace: Some("flotilla".into()),
+                    name: "convoy-a".into(),
+                    prompt: "Rebase onto main".into(),
+                    vessel: Some("implement".into()),
+                    role: Some("coder".into()),
+                },
             },
             Command {
                 node_id: None,
