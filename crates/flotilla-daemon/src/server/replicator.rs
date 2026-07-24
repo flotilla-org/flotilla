@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
@@ -7,31 +7,72 @@ use flotilla_resources::{
     HttpBackend, K8sWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, WatchStart,
 };
 use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::remote_commands::RemoteCommandRouter;
 
 const REPLICATION_NAMESPACE: &str = "flotilla";
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
-pub(super) fn spawn_peer_replicators(
-    router: RemoteCommandRouter,
-    daemon: Arc<InProcessDaemon>,
-    peer: NodeId,
-    resource_socket_path: Option<PathBuf>,
-) {
-    let transport = match resource_socket_path {
-        Some(path) => HttpBackend::from_unix_socket(path).map(ReplicationTransport::Http).map_err(|error| error.to_string()),
-        #[cfg(feature = "test-support")]
-        None => Ok(ReplicationTransport::Routed(router)),
-        #[cfg(not(feature = "test-support"))]
-        None => {
-            debug!(%peer, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
+#[derive(Default)]
+pub(super) struct PeerReplicatorSupervisors {
+    generations: HashMap<NodeId, ActiveGeneration>,
+}
+
+struct ActiveGeneration {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+impl PeerReplicatorSupervisors {
+    pub(super) fn peer_connected(
+        &mut self,
+        router: RemoteCommandRouter,
+        daemon: Arc<InProcessDaemon>,
+        peer: NodeId,
+        generation: u64,
+        resource_socket_path: Option<PathBuf>,
+    ) {
+        let Some(cancellation) = self.begin_generation(&peer, generation) else {
             return;
+        };
+        let transport = match resource_socket_path {
+            Some(path) => HttpBackend::from_unix_socket(path).map(ReplicationTransport::Http).map_err(|error| error.to_string()),
+            #[cfg(feature = "test-support")]
+            None => Ok(ReplicationTransport::Routed(router)),
+            #[cfg(not(feature = "test-support"))]
+            None => {
+                debug!(%peer, generation, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
+                return;
+            }
+        };
+        match transport {
+            Ok(transport) => {
+                flotilla_resources::for_each_registered_resource!(spawn_kind, &daemon, &peer, generation, &transport, &cancellation)
+            }
+            Err(error) => warn!(%peer, generation, %error, "could not start peer resource replicators"),
         }
-    };
-    match transport {
-        Ok(transport) => flotilla_resources::for_each_registered_resource!(spawn_kind, &daemon, &peer, &transport),
-        Err(error) => warn!(%peer, %error, "could not start peer resource replicators"),
+    }
+
+    fn begin_generation(&mut self, peer: &NodeId, generation: u64) -> Option<CancellationToken> {
+        if let Some(active) = self.generations.get(peer) {
+            if generation <= active.generation {
+                debug!(
+                    %peer,
+                    generation,
+                    active_generation = active.generation,
+                    "ignoring stale or duplicate peer replicator generation"
+                );
+                return None;
+            }
+            active.cancellation.cancel();
+        }
+
+        let cancellation = CancellationToken::new();
+        self.generations.insert(peer.clone(), ActiveGeneration { generation, cancellation: cancellation.clone() });
+        Some(cancellation)
     }
 }
 
@@ -42,23 +83,67 @@ enum ReplicationTransport {
     Routed(RemoteCommandRouter),
 }
 
-fn spawn_kind<T: Resource>(daemon: &Arc<InProcessDaemon>, peer: &NodeId, transport: &ReplicationTransport) {
+fn spawn_kind<T: Resource>(
+    daemon: &Arc<InProcessDaemon>,
+    peer: &NodeId,
+    generation: u64,
+    transport: &ReplicationTransport,
+    cancellation: &CancellationToken,
+) {
     if T::REPLICATION_CLASS != ReplicationClass::HomeBoundRuntime {
         return;
     }
     let daemon = Arc::clone(daemon);
     let peer = peer.clone();
     let transport = transport.clone();
+    let cancellation = cancellation.clone();
     tokio::spawn(async move {
-        let result = match transport {
-            ReplicationTransport::Http(http) => replicate_kind_over_http::<T>(http, &daemon, &peer).await,
-            #[cfg(feature = "test-support")]
-            ReplicationTransport::Routed(router) => replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await,
-        };
-        if let Err(error) = result {
-            debug!(%peer, kind = T::API_PATHS.kind, %error, "resource replicator stopped");
-        }
+        supervise_kind(peer.clone(), generation, T::API_PATHS.kind, cancellation, INITIAL_RETRY_BACKOFF, MAX_RETRY_BACKOFF, || {
+            let transport = transport.clone();
+            let daemon = Arc::clone(&daemon);
+            let peer = peer.clone();
+            async move {
+                match transport {
+                    ReplicationTransport::Http(http) => replicate_kind_over_http::<T>(http, &daemon, &peer).await,
+                    #[cfg(feature = "test-support")]
+                    ReplicationTransport::Routed(router) => replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await,
+                }
+            }
+        })
+        .await;
     });
+}
+
+async fn supervise_kind<F, Fut>(
+    peer: NodeId,
+    generation: u64,
+    kind: &'static str,
+    cancellation: CancellationToken,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    mut run: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let mut backoff = initial_backoff;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            result = run() => result,
+        };
+        match result {
+            Ok(()) => warn!(%peer, generation, kind, "resource replicator ended; restarting after backoff"),
+            Err(error) => warn!(%peer, generation, kind, %error, "resource replicator failed; restarting after backoff"),
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = backoff.saturating_mul(2).min(max_backoff);
+    }
 }
 
 pub(super) async fn replicate_kind_over_http<T: Resource>(
@@ -220,4 +305,105 @@ async fn apply_response<T: Resource>(
         return Ok(());
     }
     writer.apply(event, Utc::now()).await.map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use flotilla_resources::Convoy;
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_event_failure_retries_the_kind() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(supervise_kind(
+            NodeId::new("peer"),
+            1,
+            Convoy::API_PATHS.kind,
+            cancellation.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        serde_json::from_value::<K8sWatchEvent<Convoy>>(json!({"type": "BROKEN"}))
+                            .map(|_| ())
+                            .map_err(|error| format!("decode replicated Convoy event: {error}"))
+                    }
+                }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        cancellation.cancel();
+        task.await.expect("replicator supervisor task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newer_generation_cancels_a_replicator_during_backoff() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let old_cancellation = supervisors.begin_generation(&peer, 7).expect("start old generation");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(supervise_kind(
+            peer.clone(),
+            7,
+            Convoy::API_PATHS.kind,
+            old_cancellation,
+            Duration::from_secs(1),
+            Duration::from_secs(4),
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err("transient watch failure".to_string())
+                    }
+                }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        supervisors.begin_generation(&peer, 8).expect("start new generation");
+        task.await.expect("cancelled old supervisor");
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "cancelled generation must not retry after its backoff");
+    }
+
+    #[test]
+    fn duplicate_and_stale_notices_do_not_cause_duplicate_application() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let mut applications = 0;
+
+        for generation in [4, 4, 3] {
+            if supervisors.begin_generation(&peer, generation).is_some() {
+                applications += 1;
+            }
+        }
+        assert_eq!(applications, 1, "one generation may apply only once despite duplicate or stale notices");
+
+        if supervisors.begin_generation(&peer, 5).is_some() {
+            applications += 1;
+        }
+        assert_eq!(applications, 2, "a newer generation starts exactly one new application stream");
+    }
 }

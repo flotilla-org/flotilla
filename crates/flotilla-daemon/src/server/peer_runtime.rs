@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::{
-    remote_commands::RemoteCommandRouter, replicator::spawn_peer_replicators, shared::sync_peer_query_state, PeerConnectedNotice,
+    remote_commands::RemoteCommandRouter, replicator::PeerReplicatorSupervisors, shared::sync_peer_query_state, PeerConnectedNotice,
     SshTransport,
 };
 use crate::peer::{dispatch_pending_sends, peer_resource_socket_path, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
@@ -651,16 +651,18 @@ impl PeerRuntime {
             let mut outbound_clock = flotilla_protocol::VectorClock::default();
             let node_id = outbound_daemon.node_id().clone();
             let mut last_sent_versions: std::collections::HashMap<RepoIdentity, u64> = std::collections::HashMap::new();
+            let mut peer_replicators = PeerReplicatorSupervisors::default();
 
             loop {
                 tokio::select! {
                     notice = peer_connected_rx.recv() => {
                         let Some(notice) = notice else { break };
                         debug!(peer = %notice.peer, generation = notice.generation, "sending local state to newly connected peer");
-                        spawn_peer_replicators(
+                        peer_replicators.peer_connected(
                             outbound_remote_command_router.clone(),
                             Arc::clone(&outbound_daemon),
                             notice.peer.clone(),
+                            notice.generation,
                             notice.resource_socket_path,
                         );
                         send_local_to_peer(
