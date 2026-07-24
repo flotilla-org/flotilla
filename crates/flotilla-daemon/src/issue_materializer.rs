@@ -581,7 +581,7 @@ mod tests {
         github_api::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner,
     };
     use flotilla_protocol::{
-        issue_query::IssueResultPage,
+        issue_query::{IssueResultPage, READY_ISSUE_LABEL},
         result_set::{ConvoyIssueRow, ConvoyPhase, ConvoyRow},
         test_support::TestIssue,
         Issue, IssueChangeset, QueryCursor, ResourceRef,
@@ -1091,6 +1091,49 @@ mod tests {
                 .map(|row| row.reference.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["NEW-10"]
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_refresh_reconciles_label_filter_membership() {
+        let state = AggregatorProjectionState::new();
+        let query = QueryId::Issues {
+            scope: QueryScope::new("flotilla", "repo_ready_refresh"),
+            search: None,
+            label: Some(READY_ISSUE_LABEL.into()),
+        };
+        let source = IssueSource { service: "https://issues.example".into(), scope: "ready/refresh".into() };
+        let mut loses_ready = issue("LOSES-READY");
+        loses_ready.labels = vec![READY_ISSUE_LABEL.into()];
+        let mut gains_ready = issue("GAINS-READY");
+        gains_ready.labels = vec![READY_ISSUE_LABEL.into()];
+        let provider =
+            Arc::new(ScriptedProvider::new(vec![IssueResultPage { items: vec![loses_ready], total: Some(1), has_more: false }], vec![
+                IssueChangeset { updated: vec![issue("LOSES-READY"), gains_ready], closed: vec![], has_more: false },
+            ]));
+        let (materializer, mut events) = manager(&state, &query, vec![source.clone()], provider);
+        let _ = next_event(&mut events).await;
+
+        materializer.refresh(&query);
+
+        let DaemonEvent::ResultDelta(delta) = next_event(&mut events).await else { panic!("refresh must emit a delta") };
+        assert_eq!(delta.changes.as_issues().expect("newly ready issue")[0].reference, IssueRef {
+            source: source.clone(),
+            id: "GAINS-READY".into()
+        });
+        assert_eq!(delta.changes.removed_issues().expect("issue that lost ready"), &[IssueRef { source, id: "LOSES-READY".into() }]);
+        assert_eq!(
+            state
+                .result_set_for(&query)
+                .await
+                .expect("refreshed ready window")
+                .rows
+                .as_issues()
+                .expect("ready issue rows")
+                .iter()
+                .map(|row| row.reference.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GAINS-READY"]
         );
     }
 
