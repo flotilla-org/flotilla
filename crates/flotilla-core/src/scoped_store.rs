@@ -107,6 +107,7 @@ impl<R: ScopedStoreRow> MaterializedSet<R> {
             state: ResultSetState {
                 demand: None,
                 conditions: vec![ResultSetCondition::QueryScopeUnavailable { scope: scope.clone(), message }],
+                truncated: false,
             },
         }
     }

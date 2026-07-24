@@ -645,6 +645,7 @@ mod tests {
                 source: None,
                 message: "one source unavailable".into(),
             }],
+            truncated: false,
         };
         let view = table_view::project(&"issues?project=flotilla%2Froadmap".parse().expect("address"), &table_view::TableRows {
             issue_results: vec![table_view::QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],

@@ -1939,6 +1939,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
                 has_more: true,
             }),
             conditions: vec![],
+            truncated: false,
         },
     })));
     assert_eq!(app.query_tables.issues[&query].rows[0].issue.reference.id, "LINEAR-1");
@@ -1961,6 +1962,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
                 has_more: false,
             }),
             conditions: vec![],
+            truncated: false,
         }),
     })));
 
@@ -2064,6 +2066,7 @@ async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
                 has_more: true,
             }),
             conditions: vec![],
+            truncated: false,
         },
     })));
 

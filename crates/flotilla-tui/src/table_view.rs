@@ -1647,6 +1647,7 @@ mod tests {
         let state = ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: "2026-07-20T12:00:00Z".parse().expect("timestamp"), has_more: true }),
             conditions: vec![ResultSetCondition::IssueSourceUnavailable { source: None, message: "one source is unavailable".into() }],
+            truncated: false,
         };
         let address: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("issues address");
 
