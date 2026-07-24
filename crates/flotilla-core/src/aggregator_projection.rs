@@ -210,10 +210,6 @@ impl AggregatorProjectionState {
         self.demand_backed.replace(subscriber, cursors)
     }
 
-    pub async fn replace_subscriber_expanding_awareness(&self, subscriber: Uuid, cursors: &[QueryCursor]) -> HashSet<QueryId> {
-        self.replace_subscriber(subscriber, cursors)
-    }
-
     pub fn remove_subscriber(&self, subscriber: Uuid) {
         self.demand_backed.remove(subscriber);
     }
@@ -429,7 +425,7 @@ mod tests {
             .await;
 
         let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
-        state.replace_subscriber_expanding_awareness(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]).await;
+        state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]);
 
         assert!(state.subscribe_demand().borrow().contains_key(&QueryId::Issues {
             scope: project,
@@ -448,7 +444,7 @@ mod tests {
 
         let subscriber = Uuid::new_v4();
         let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
-        state.replace_subscriber_expanding_awareness(subscriber, &[QueryCursor { query: awareness.clone(), since: None }]).await;
+        state.replace_subscriber(subscriber, &[QueryCursor { query: awareness.clone(), since: None }]);
         let retained_issues = QueryId::Issues { scope: retained.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) };
         let removed_issues = QueryId::Issues { scope: removed.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) };
         assert_eq!(
@@ -459,12 +455,10 @@ mod tests {
         state.replace_store_catalog(repositories.clone(), HashMap::from([(retained, vec![])])).await;
         assert_eq!(state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([retained_issues]));
 
-        state
-            .replace_subscriber_expanding_awareness(subscriber, &[QueryCursor { query: awareness, since: None }, QueryCursor {
-                query: removed_issues.clone(),
-                since: None,
-            }])
-            .await;
+        state.replace_subscriber(subscriber, &[QueryCursor { query: awareness, since: None }, QueryCursor {
+            query: removed_issues.clone(),
+            since: None,
+        }]);
         state.replace_store_catalog(repositories, HashMap::new()).await;
         assert_eq!(state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([removed_issues]));
     }
