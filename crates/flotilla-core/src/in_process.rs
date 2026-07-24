@@ -4163,7 +4163,8 @@ impl InProcessDaemon {
     ///
     /// If `path` is a git worktree, the main repo root is resolved via
     /// `git rev-parse --path-format=absolute --git-common-dir` and tracked
-    /// instead. `resolved_from` is `Some(original_path)` in that case.
+    /// instead. The returned `tracked_path` is canonicalized, and
+    /// `resolved_from` is `Some(original_path)` when the repo root changes.
     pub async fn add_repo(&self, path: &Path) -> Result<AddRepoOutcome, String> {
         let (path, resolved_from) = self.normalize_repo_path(path).await;
 
