@@ -144,7 +144,7 @@ awareness queries → latent presence; searchlight → materialized attachments;
 materialize missing, retract expired, latent the marginal. Reconcile-on-
 connect (#835) is this convergence run at connect time.
 
-Five refinements from the openable-latent and fact-semantics grills
+Six refinements from the openable-latent and fact-semantics grills
 (2026-07-23):
 
 - **Facts use one dialect, with one meaning per key.** Project and Repository
@@ -176,6 +176,14 @@ Five refinements from the openable-latent and fact-semantics grills
   bounded by minting **only while the origin peer's route is live**.
   Recipes vanish on peer disconnect; hours-stale affirmation is a lie,
   seconds-stale is honest.
+- **Open semantics are level-specific.** Opening a vessel latent attaches
+  to the vessel's primary crew session (`flotilla attach --host <host>
+  <session-ref>`). Opening a one-vessel convoy collapses to the same attach
+  target; multi-vessel convoys require a pane-set recipe shape before they
+  can honestly materialize as one action. Opening a Project latent opens
+  the scoped focal TUI (`flotilla view <project-address>`). Issue entries
+  deliberately carry no recipe: they are starting points, not tabs in
+  waiting.
 - **"Disconnected" becomes a visible state eventually** — as an
   annotation-tier fact on the affected entries (the presentation twin of
   marking peer hosts unready), never a new member of the frozen
