@@ -4,10 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider_data::Issue;
 
+/// The label that makes an issue eligible for the awareness band.
+pub const READY_ISSUE_LABEL: &str = "ready";
+
 /// Parameters for an issue query.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueQuery {
     pub search: Option<String>,
+    pub label: Option<String>,
 }
 
 /// A single page of query results.
@@ -27,6 +31,7 @@ mod tests {
     fn issue_query_default_has_no_search() {
         let q = IssueQuery::default();
         assert!(q.search.is_none());
+        assert!(q.label.is_none());
     }
 
     #[test]

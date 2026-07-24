@@ -10,6 +10,7 @@ use std::{
 };
 
 use flotilla_protocol::{
+    issue_query::READY_ISSUE_LABEL,
     result_set::{
         AwarenessGrouping, AwarenessLimit, CheckoutRow, ConvoyPhase, ConvoyRow, IndependentRow, IssueRow, QueryId, QueryScope, ResultDelta,
         ResultSet, ResultSetState, Rows,
@@ -213,7 +214,7 @@ impl AggregatorProjectionState {
         let mut expanded = cursors.to_vec();
         if cursors.iter().any(|cursor| matches!(cursor.query, QueryId::Awareness { scope: None, .. })) {
             for scope in self.checkouts.read().await.project_scopes() {
-                let query = QueryId::Issues { scope, search: None };
+                let query = QueryId::Issues { scope, search: None, label: Some(READY_ISSUE_LABEL.into()) };
                 if !expanded.iter().any(|cursor| cursor.query == query) {
                     expanded.push(QueryCursor { query, since: None });
                 }
@@ -340,7 +341,9 @@ impl AggregatorProjectionState {
         scopes
             .into_iter()
             .filter_map(|scope| {
-                self.demand_backed.result_set(&QueryId::Issues { scope: scope.clone(), search: None }).map(|set| (scope, set))
+                self.demand_backed
+                    .result_set(&QueryId::Issues { scope: scope.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) })
+                    .map(|set| (scope, set))
             })
             .collect()
     }
@@ -437,7 +440,11 @@ mod tests {
         let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
         state.replace_subscriber_expanding_awareness(Uuid::new_v4(), &[QueryCursor { query: awareness, since: None }]).await;
 
-        assert!(state.subscribe_demand().borrow().contains_key(&QueryId::Issues { scope: project, search: None }));
+        assert!(state.subscribe_demand().borrow().contains_key(&QueryId::Issues {
+            scope: project,
+            search: None,
+            label: Some(READY_ISSUE_LABEL.into()),
+        }));
     }
 
     #[tokio::test]
@@ -450,7 +457,7 @@ mod tests {
                 HashMap::from([(project.clone(), vec![])]),
             )
             .await;
-        let issue_query = QueryId::Issues { scope: project.clone(), search: None };
+        let issue_query = QueryId::Issues { scope: project.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) };
         state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: issue_query.clone(), since: None }]);
         let generation = *state.subscribe_demand().borrow().get(&issue_query).expect("issue query generation");
         state.replace_issues(&issue_query, generation, vec![issue_row("flotilla-org/flotilla", "862")], ResultSetState {

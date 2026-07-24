@@ -191,6 +191,7 @@ impl ProjectPageWidget {
         Some(QueryId::Issues {
             scope: scope.clone(),
             search: state.issue_source_search().filter(|search| !search.is_empty()).map(str::to_owned),
+            label: None,
         })
     }
 
@@ -692,7 +693,7 @@ mod tests {
         state
             .table_mut(ProjectPanelKind::Issues)
             .begin_pending(
-                QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None },
+                QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None, label: None },
                 panels[0].table.rows[1].id.clone(),
                 "Start convoy".into(),
             )

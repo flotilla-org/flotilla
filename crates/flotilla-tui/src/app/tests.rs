@@ -549,7 +549,7 @@ fn first_page_search_failure_clears_active_search_state() {
     let view = app.issue_views.entry(repo.clone()).or_default();
     view.search_query = Some("beta".into());
     view.search = Some(issue_view::IssuePagingState {
-        params: IssueQuery { search: Some("beta".into()) },
+        params: IssueQuery { search: Some("beta".into()), label: None },
         items: vec![],
         next_page: 1,
         total: None,
@@ -560,7 +560,7 @@ fn first_page_search_failure_clears_active_search_state() {
     app.issue_update_tx
         .send(issue_view::IssueQueryUpdate::QueryFailed {
             repo: repo.clone(),
-            params: IssueQuery { search: Some("beta".into()) },
+            params: IssueQuery { search: Some("beta".into()), label: None },
             requested_page: 1,
             message: "search failed".into(),
         })
@@ -1851,7 +1851,7 @@ fn app_keeps_fleet_and_project_independent_results_separate() {
 fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
     let mut app = stub_app();
     let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
-    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None };
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None, label: None };
     let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
     let mut first = TestIssue::new("First materialized issue").id("LINEAR-1").build();
     first.reference.source = source.clone();
@@ -1862,6 +1862,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
         rows: flotilla_protocol::Rows::Issues {
             scope: scope.clone(),
             search: None,
+            label: None,
             rows: vec![flotilla_protocol::IssueRow { reference: first_ref.clone(), issue: first }],
         },
         state: flotilla_protocol::ResultSetState {
@@ -1882,6 +1883,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
         changes: flotilla_protocol::QueryChanges::Issues {
             scope,
             search: None,
+            label: None,
             changed: vec![flotilla_protocol::IssueRow { reference: second_ref, issue: second }],
             removed: vec![first_ref],
         },
@@ -1902,7 +1904,7 @@ fn app_applies_materialized_issue_sets_and_deltas_to_the_typed_query_cache() {
 fn app_keeps_issue_rows_in_id_order_when_an_existing_issue_is_updated() {
     let mut app = stub_app();
     let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
-    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None };
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None, label: None };
     let mut high_id = TestIssue::new("High ID").id("10").build();
     high_id.as_of = "2026-07-15T12:00:00Z".parse().expect("timestamp");
     let mut low_id = TestIssue::new("Low ID").id("1").build();
@@ -1913,6 +1915,7 @@ fn app_keeps_issue_rows_in_id_order_when_an_existing_issue_is_updated() {
         rows: flotilla_protocol::Rows::Issues {
             scope: scope.clone(),
             search: None,
+            label: None,
             rows: vec![flotilla_protocol::IssueRow { reference: high_id.reference.clone(), issue: high_id }, flotilla_protocol::IssueRow {
                 reference: low_id.reference.clone(),
                 issue: low_id.clone(),
@@ -1927,6 +1930,7 @@ fn app_keeps_issue_rows_in_id_order_when_an_existing_issue_is_updated() {
         changes: flotilla_protocol::QueryChanges::Issues {
             scope,
             search: None,
+            label: None,
             changed: vec![flotilla_protocol::IssueRow { reference: low_id.reference.clone(), issue: low_id }],
             removed: vec![],
         },
@@ -1972,7 +1976,7 @@ fn app_applies_checkout_sets_and_removal_deltas_to_the_typed_query_cache() {
 async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
     let mut app = stub_app();
     let scope = flotilla_protocol::QueryScope::new("flotilla", "roadmap");
-    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None };
+    let query = flotilla_protocol::QueryId::Issues { scope: scope.clone(), search: None, label: None };
     app.open_view("issues?project=flotilla%2Froadmap".parse().expect("address"));
     let source = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
     let rows = (1..=50)
@@ -1985,7 +1989,7 @@ async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
 
     app.handle_daemon_event(DaemonEvent::ResultSet(Box::new(flotilla_protocol::ResultSet {
         seq: 1,
-        rows: flotilla_protocol::Rows::Issues { scope, search: None, rows },
+        rows: flotilla_protocol::Rows::Issues { scope, search: None, label: None, rows },
         state: flotilla_protocol::ResultSetState {
             demand: Some(flotilla_protocol::DemandBackedMetadata {
                 as_of: "2026-07-15T12:00:00Z".parse().expect("timestamp"),
@@ -2008,13 +2012,15 @@ async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
 fn source_search_replaces_the_issue_subscription_without_changing_the_persisted_view() {
     let mut app = stub_app();
     app.open_view("issues?project=flotilla%2Froadmap".parse().expect("address"));
-    let base = flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None };
+    let base =
+        flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None, label: None };
     assert!(app.query_cursors().iter().any(|cursor| cursor.query == base));
 
     app.process_app_actions(vec![crate::widgets::AppAction::SetSourceSearch(Some("widget".into()))]);
     let search = flotilla_protocol::QueryId::Issues {
         scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"),
         search: Some("widget".into()),
+        label: None,
     };
     let queries = app.query_cursors().into_iter().map(|cursor| cursor.query).collect::<Vec<_>>();
     assert!(queries.contains(&search));
@@ -2035,7 +2041,11 @@ fn escape_restores_the_base_issue_window_even_before_search_results_arrive() {
 
     assert_eq!(app.views.active_table_state().source_search, None);
     assert!(app.query_cursors().iter().any(|cursor| cursor.query
-        == flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"), search: None }));
+        == flotilla_protocol::QueryId::Issues {
+            scope: flotilla_protocol::QueryScope::new("flotilla", "roadmap"),
+            search: None,
+            label: None,
+        }));
 }
 
 // -- Convoys tab rendering --

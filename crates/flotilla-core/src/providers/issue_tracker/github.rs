@@ -75,8 +75,11 @@ impl super::IssueProvider for GitHubIssueProvider {
         let as_of = Utc::now();
         let (items, has_more, total) = match &params.search {
             None => {
-                let endpoint =
-                    format!("repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}", source.scope, per_page, page);
+                let label = params.label.as_ref().map(|label| format!("&labels={}", urlencoding::encode(label))).unwrap_or_default();
+                let endpoint = format!(
+                    "repos/{}/issues?state=open&sort=updated&direction=desc&per_page={}&page={}{}",
+                    source.scope, per_page, page, label
+                );
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
                 let raw_items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
                 let issues = raw_items
@@ -87,7 +90,8 @@ impl super::IssueProvider for GitHubIssueProvider {
                 (issues, response.has_next_page, None)
             }
             Some(search_term) => {
-                let raw_query = format!("repo:{} is:issue is:open {}", source.scope, search_term);
+                let label = params.label.as_ref().map(|label| format!(" label:\"{label}\"")).unwrap_or_default();
+                let raw_query = format!("repo:{} is:issue is:open{} {}", source.scope, label, search_term);
                 let encoded_query = urlencoding::encode(&raw_query);
                 let endpoint = format!("search/issues?q={}&sort=updated&order=desc&per_page={}&page={}", encoded_query, per_page, page);
                 let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
@@ -254,11 +258,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_sends_label_filter_to_github() {
+        let api = Arc::new(MockGhApi::new(vec![ok_response("[]", false)]));
+        let provider = GitHubIssueProvider::new(api.clone(), Arc::new(MockRunner::new(vec![])), Path::new("/neutral"));
+
+        provider
+            .query(&source(), &IssueQuery { search: None, label: Some("ready now".into()) }, 2, 10)
+            .await
+            .expect("label-filtered issue query should succeed");
+
+        assert_eq!(api.requests(), vec![(
+            "repos/owner/repo/issues?state=open&sort=updated&direction=desc&per_page=10&page=2&labels=ready%20now".into(),
+            PathBuf::from("/neutral"),
+        )]);
+    }
+
+    #[tokio::test]
     async fn search_query_returns_total_and_pagination() {
         let body = r#"{"total_count":5,"items":[{"number":1,"title":"Bug","state":"open","labels":[]}]}"#;
         let provider = mock_provider(vec![ok_response(body, true)]);
 
-        let page = provider.query(&source(), &IssueQuery { search: Some("bug".into()) }, 2, 10).await.expect("issue search should succeed");
+        let page = provider
+            .query(&source(), &IssueQuery { search: Some("bug".into()), label: None }, 2, 10)
+            .await
+            .expect("issue search should succeed");
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.total, Some(5));

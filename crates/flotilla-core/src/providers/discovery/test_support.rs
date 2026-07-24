@@ -1315,7 +1315,7 @@ mod tests {
         let second = provider.query(&source, &IssueQuery::default(), 2, 1).await.expect("second page");
         assert_eq!(second.items[0].reference.id, "opaque-A");
         assert!(!second.has_more);
-        let search = provider.query(&source, &IssueQuery { search: Some("newer".into()) }, 1, 10).await.expect("search");
+        let search = provider.query(&source, &IssueQuery { search: Some("newer".into()), label: None }, 1, 10).await.expect("search");
         assert_eq!(search.items[0].reference.id, "opaque-B");
 
         let changes = provider.list_changed_since(&source, &cutoff, 10).await.expect("cutoff changes");

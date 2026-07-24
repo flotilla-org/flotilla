@@ -385,7 +385,7 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options).await.expect("start runtime");
     let mut events = daemon.subscribe();
     let scope = QueryScope::new("flotilla", "widgets");
-    let query = QueryId::Issues { scope: scope.clone(), search: None };
+    let query = QueryId::Issues { scope: scope.clone(), search: None, label: None };
 
     daemon
         .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }])
@@ -424,7 +424,7 @@ async fn project_issue_subscription_materializes_window_and_ephemeral_search() {
     assert_eq!(delta.changes.as_issues().expect("appended issue rows")[0].reference.id, "WIDGET-050");
     assert!(!delta.state.as_ref().and_then(|state| state.demand.as_ref()).expect("updated demand metadata").has_more);
 
-    let search = QueryId::Issues { scope, search: Some("WIDGET-050".into()) };
+    let search = QueryId::Issues { scope, search: Some("WIDGET-050".into()), label: None };
     daemon
         .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: search.clone(), since: None }])
         .await
