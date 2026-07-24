@@ -27,6 +27,5 @@ fn main() {
         .filter(|value| !value.is_empty())
         .or_else(|| git_output(&["rev-parse", "--short=12", "HEAD"]))
         .unwrap_or_else(|| "unknown".to_string());
-
     println!("cargo::rustc-env=FLOTILLA_BUILD_ID={build_id}");
 }

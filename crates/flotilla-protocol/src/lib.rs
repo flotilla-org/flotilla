@@ -175,14 +175,13 @@ pub use snapshot::{
 pub struct ConfigLabel(pub String);
 
 pub const PROTOCOL_VERSION: u32 = 17;
-pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
 
 const BUILD_ID_SEPARATOR: &str = "\u{1f}flotilla-build:";
 
 /// Add this binary's build identity to a Hello display name without changing
 /// the wire shape. Older peers continue to see an ordinary display name.
-pub fn hello_display_name(label: &str) -> String {
-    format!("{label}{BUILD_ID_SEPARATOR}{BUILD_ID}")
+pub fn hello_display_name(label: &str, build_id: &str) -> String {
+    format!("{label}{BUILD_ID_SEPARATOR}{build_id}")
 }
 
 /// Extract the optional build identity advertised in a Hello display name.

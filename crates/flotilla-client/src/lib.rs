@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
 pub mod reconnect;
+pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
@@ -76,7 +77,7 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         .write(Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: NodeId::new("client"),
-            display_name: flotilla_protocol::hello_display_name("client"),
+            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID),
             session_id,
             connection_role: Some(ConnectionRole::Client),
             surface,
@@ -89,7 +90,7 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
             let daemon_build = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
             Err(format!(
                 "daemon protocol version mismatch: daemon has {protocol_version} ({daemon_build}), client has {PROTOCOL_VERSION} ({})",
-                flotilla_protocol::BUILD_ID
+                BUILD_ID
             ))
         }
         Some(Message::Hello { display_name, .. }) => Ok(flotilla_protocol::hello_build_id(&display_name).map(str::to_owned)),

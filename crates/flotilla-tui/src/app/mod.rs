@@ -749,6 +749,9 @@ impl App {
         self.acknowledged_dispatches.clear();
         self.pending_dispatch_acks = 0;
         self.recent_command_finishes.clear();
+        self.project_issue_start_batches.clear();
+        self.command_project_issue_starts.clear();
+        self.pending_cancel = None;
         self.subscriptions_dirty = true;
 
         let reconnect_note = flotilla_client::reconnect::build_mismatch(self.daemon.as_ref())

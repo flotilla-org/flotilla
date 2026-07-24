@@ -692,8 +692,8 @@ fn fetch_more_request_round_trips_parameterized_query() {
 
 #[test]
 fn hello_display_name_carries_build_identity_without_changing_the_envelope() {
-    let display_name = hello_display_name("feta");
+    let display_name = hello_display_name("feta", "abc123");
     assert!(display_name.starts_with("feta"));
-    assert_eq!(hello_build_id(&display_name), Some(BUILD_ID));
+    assert_eq!(hello_build_id(&display_name), Some("abc123"));
     assert_eq!(hello_build_id("legacy-daemon"), None);
 }

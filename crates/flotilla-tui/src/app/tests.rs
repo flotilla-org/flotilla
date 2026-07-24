@@ -304,6 +304,17 @@ async fn reconnect_daemon_preserves_ui_state_and_clears_daemon_caches() {
     app.ui.show_debug = true;
     app.namespaces.insert("stale".into(), NamespaceModel::default());
     app.query_seqs.insert(flotilla_protocol::QueryId::Convoys, 42);
+    let batch_id = app.begin_project_issue_start_batch(1);
+    app.command_project_issue_starts.insert(1, ProjectIssueStartContext {
+        address: ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() },
+        row_id: crate::table_view::RowId::new("issue:1"),
+        issue: IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "1".into(),
+        },
+        batch_id,
+    });
+    app.pending_cancel = Some(1);
     let daemon = Arc::clone(&app.daemon);
     let repos = daemon.list_repos().await.expect("list repos");
 
@@ -314,6 +325,9 @@ async fn reconnect_daemon_preserves_ui_state_and_clears_daemon_caches() {
     assert!(app.ui.show_debug);
     assert!(app.namespaces.is_empty());
     assert!(app.query_seqs.is_empty());
+    assert!(app.project_issue_start_batches.is_empty());
+    assert!(app.command_project_issue_starts.is_empty());
+    assert_eq!(app.pending_cancel, None);
     assert!(app.subscriptions_dirty);
     assert_eq!(app.ui.command_echo.as_deref(), Some("Reconnected to daemon"));
 }

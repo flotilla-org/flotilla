@@ -356,7 +356,7 @@ async fn main() -> Result<()> {
         let message = format!("{error:?}");
         let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
         if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref()) {
-            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_protocol::BUILD_ID);
+            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
             reexec_current_process()?;
         }
     }
@@ -364,7 +364,7 @@ async fn main() -> Result<()> {
 }
 
 fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>) -> bool {
-    flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error) && already_reexecuted_build != Some(flotilla_protocol::BUILD_ID)
+    flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error) && already_reexecuted_build != Some(flotilla_tui::socket::BUILD_ID)
 }
 
 fn reexec_current_process() -> Result<()> {
@@ -1486,7 +1486,7 @@ mod tests {
     fn incompatible_daemon_reexecs_once_per_client_build() {
         let mismatch = "daemon protocol version mismatch: daemon has 18, client has 17";
         assert!(should_reexec_for_incompatible_daemon(mismatch, None));
-        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_protocol::BUILD_ID)));
+        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID)));
         assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None));
     }
 

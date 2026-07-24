@@ -39,7 +39,7 @@ impl Drop for QuerySubscription {
 pub trait DaemonHandle: Send + Sync {
     /// Build identity advertised by the connected daemon, when available.
     fn build_id(&self) -> Option<&str> {
-        Some(flotilla_protocol::BUILD_ID)
+        None
     }
 
     /// Subscribe to daemon events (snapshots, repo changes).

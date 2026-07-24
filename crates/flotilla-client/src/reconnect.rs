@@ -48,8 +48,7 @@ pub fn is_incompatible_daemon_error(error: &str) -> bool {
 
 pub fn build_mismatch(daemon: &dyn DaemonHandle) -> Option<String> {
     let daemon_build = daemon.build_id()?;
-    (daemon_build != flotilla_protocol::BUILD_ID)
-        .then(|| format!("daemon build {daemon_build} differs from this client ({})", flotilla_protocol::BUILD_ID))
+    (daemon_build != crate::BUILD_ID).then(|| format!("daemon build {daemon_build} differs from this client ({})", crate::BUILD_ID))
 }
 
 /// Connect to a daemon with the shared retry policy used by every long-lived

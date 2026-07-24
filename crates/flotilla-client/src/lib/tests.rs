@@ -102,7 +102,7 @@ async fn stateful_handshake_records_daemon_build_identity() {
             .write(Message::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 node_id: NodeId::new("daemon"),
-                display_name: flotilla_protocol::hello_display_name("daemon"),
+                display_name: flotilla_protocol::hello_display_name("daemon", BUILD_ID),
                 session_id: uuid::Uuid::new_v4(),
                 connection_role: Some(ConnectionRole::Client),
                 surface: None,
@@ -112,7 +112,7 @@ async fn stateful_handshake_records_daemon_build_identity() {
     });
 
     let daemon = SocketDaemon::from_session_stateful(client).await.expect("handshake succeeds");
-    assert_eq!(daemon.build_id(), Some(flotilla_protocol::BUILD_ID));
+    assert_eq!(daemon.build_id(), Some(BUILD_ID));
     server_task.await.expect("server task");
 }
 
