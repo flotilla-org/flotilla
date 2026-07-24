@@ -618,6 +618,37 @@ mod tests {
     }
 
     #[test]
+    fn convoy_start_interactive_workflow_with_bare_issue_resolves() {
+        let resolved = parse(&["convoy", "start", "--project", "flotilla", "--workflow", "interactive-single", "--issue", "834"])
+            .resolve()
+            .expect("resolve");
+
+        assert_eq!(resolved, Resolved::NeedsContext {
+            command: Command {
+                node_id: None,
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyStart {
+                    intent: Box::new(ConvoyStartIntent {
+                        namespace: None,
+                        project_ref: "flotilla".into(),
+                        issues: vec![IssueSelector::Id("834".into())],
+                        name: None,
+                        branch: None,
+                        workflow_ref: Some("interactive-single".into()),
+                        inputs: vec![],
+                        instruction: None,
+                        placement_policy: None,
+                        auto_attach: true,
+                    }),
+                },
+            },
+            repo: RepoContext::None,
+            host: HostResolution::Local,
+        });
+    }
+
+    #[test]
     fn convoy_start_bare_issue_resolves_to_project_defaulted_selector() {
         let resolved = parse(&["convoy", "start", "--project", "flotilla", "--issue", "834"]).resolve().expect("resolve");
 

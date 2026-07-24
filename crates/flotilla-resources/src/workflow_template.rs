@@ -98,6 +98,23 @@ pub fn single_agent_contained_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
+pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
+    WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Trusted)
+            .crew(vec![CrewSpec::builder()
+                .role("coder".to_string())
+                .source(CrewSource::Agent {
+                    selector: Selector { capability: "code".to_string() },
+                    prompt: None,
+                    brief_template: Some("interactive-session".to_string()),
+                })
+                .build()])
+            .build()])
+        .build()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     DuplicateVesselName { name: String },

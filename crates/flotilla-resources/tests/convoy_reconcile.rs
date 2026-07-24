@@ -9,9 +9,10 @@ use common::{
 };
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
-    controller_patches, reconcile, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch, CrewSource, CrewWorkPhase,
-    InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend, ValidationError, Vessel,
-    VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL,
+    controller_patches, interactive_single_workflow_spec, reconcile, Convoy, ConvoyEvent, ConvoyPhase, ConvoyReconciler, ConvoyStatusPatch,
+    CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta, InputValue, OwnerReference, Presentation, PresentationSpec, ResourceBackend,
+    ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate,
+    CONVOY_LABEL, VESSEL_LABEL,
 };
 
 async fn reconcile_once_with_resources(
@@ -671,6 +672,33 @@ fn all_agent_crew_done_rolls_vessel_work_complete() {
     let outcome = reconcile(&convoy, None, timestamp(21));
 
     assert_eq!(outcome.patch, Some(controller_patches::roll_up_work("implement".to_string(), WorkPhase::Complete, timestamp(21), None,)));
+}
+
+#[test]
+fn interactive_convoy_stays_active_until_crew_reports_complete() {
+    let mut status = bootstrapped_convoy_status();
+    status.phase = ConvoyPhase::Active;
+    status.workflow_snapshot = Some(WorkflowSnapshot { vessels: interactive_single_workflow_spec().vessels });
+    let mut work = status.work.remove("implement").expect("seed work");
+    work.phase = WorkPhase::Running;
+    status.work = BTreeMap::from([("work".to_string(), work)]);
+    let mut crew = status.crew_work.remove("implement").expect("seed crew");
+    crew.get_mut("coder").expect("coder work").phase = CrewWorkPhase::Working;
+    status.crew_work = BTreeMap::from([("work".to_string(), crew)]);
+    status.observed_workflow_ref = Some("interactive-single".to_string());
+    status.observed_workflows = Some(BTreeMap::from([("interactive-single".to_string(), "42".to_string())]));
+    let mut spec = valid_convoy_spec();
+    spec.workflow_ref = "interactive-single".to_string();
+
+    let waiting = convoy_object("interactive", spec.clone(), Some(status.clone()));
+    assert_eq!(reconcile(&waiting, None, timestamp(21)).patch, None);
+
+    status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder work").phase = CrewWorkPhase::Done;
+    let completed = convoy_object("interactive", spec, Some(status));
+    assert_eq!(
+        reconcile(&completed, None, timestamp(22)).patch,
+        Some(controller_patches::roll_up_work("work".to_string(), WorkPhase::Complete, timestamp(22), None))
+    );
 }
 
 #[test]

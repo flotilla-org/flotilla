@@ -304,6 +304,7 @@ fn default_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
                     .build()])
                 .build(),
         ),
+        ("interactive-single", flotilla_resources::interactive_single_workflow_spec()),
         ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
     ]
 }

@@ -68,18 +68,22 @@ impl CrewBriefTemplateResolver {
         repo_roots: impl IntoIterator<Item = PathBuf>,
     ) -> CrewBriefRenderOptions {
         let template = template.filter(|template| !template.trim().is_empty()).unwrap_or(DEFAULT_CREW_BRIEF_TEMPLATE);
+        let override_filename = match template {
+            "interactive-session" => "interactive-session.md",
+            other => other,
+        };
         let mut overrides = Vec::new();
         if let Some(config_dir) = &self.config_dir {
-            push_template_override(&mut overrides, config_dir.join(BRIEF_TEMPLATE_DIR).join(template));
+            push_template_override(&mut overrides, config_dir.join(BRIEF_TEMPLATE_DIR).join(override_filename));
             if let Some(project_ref) = project_ref {
                 push_template_override(
                     &mut overrides,
-                    config_dir.join("projects").join(project_ref).join(BRIEF_TEMPLATE_DIR).join(template),
+                    config_dir.join("projects").join(project_ref).join(BRIEF_TEMPLATE_DIR).join(override_filename),
                 );
             }
         }
         for repo_root in repo_roots {
-            push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(template));
+            push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
         CrewBriefRenderOptions { template: template.to_string(), overrides }
     }
@@ -172,7 +176,7 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
     let mut skip_overrides = 0;
     let mut current_template = match options.template.as_str() {
         DEFAULT_CREW_BRIEF_TEMPLATE => BUILTIN_CREW_BRIEF_TEMPLATE_NAME.to_string(),
-        "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
+        "interactive-session" | "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
         custom if !options.overrides.is_empty() => {
             let first = &options.overrides[0];
             if is_block_only_override(&first.source) {
@@ -581,6 +585,37 @@ mod tests {
         assert!(selected.contains("For interactive sessions, keep the user-facing loop tight"));
         assert!(selected.contains("## Assignment\n\nPair with the user."));
         assert!(!default.contains("For interactive sessions"));
+    }
+
+    #[test]
+    fn extensionless_interactive_template_uses_markdown_override_filename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let override_dir = repo.join(".flotilla/brief-templates");
+        std::fs::create_dir_all(&override_dir).expect("override dir");
+        std::fs::write(
+            override_dir.join("interactive-session.md"),
+            "{% block delivery %}Interactive override from the conventional Markdown filename.{% endblock %}",
+        )
+        .expect("override file");
+
+        let options = CrewBriefTemplateResolver::default().render_options(Some("interactive-session"), None, [repo]);
+        let brief = build_crew_brief_with_options(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "interactive".to_string(),
+                vessel_ref: "interactive-work".to_string(),
+            },
+            "work",
+            "driver",
+            CrewAssignment::Prompt("Pair with the user."),
+            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
+            &options,
+        )
+        .expect("render selected template");
+
+        assert!(brief.content.contains("Interactive override from the conventional Markdown filename."));
+        assert_eq!(options.overrides[0].path, override_dir.join("interactive-session.md"));
     }
 
     #[test]

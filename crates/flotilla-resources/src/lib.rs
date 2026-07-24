@@ -113,6 +113,7 @@ macro_rules! for_each_registered_resource {
     }};
 }
 pub use workflow_template::{
-    single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation,
-    Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    interactive_single_workflow_spec, single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition,
+    InterpolationField, InterpolationLocation, Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate,
+    WorkflowTemplateSpec,
 };
