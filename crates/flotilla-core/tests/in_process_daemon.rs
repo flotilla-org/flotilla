@@ -49,9 +49,10 @@ use flotilla_resources::{
     apply_status_patch, controller_patches as convoy_controller_patches, single_agent_contained_workflow_spec,
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
     CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project,
-    ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositorySpec, TypedResolver, WorkPhase,
-    WorkState, WorkflowSnapshot, WorkflowTemplate, REPO_KEY_LABEL, REPO_LABEL,
+    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
+    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
+    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositorySpec, Stance, TypedResolver, WorkPhase, WorkState,
+    WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -918,6 +919,120 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         })
         .await
         .expect("project create");
+}
+
+async fn create_test_host_direct_policy(
+    backend: &flotilla_resources::ResourceBackend,
+    policy_name: &str,
+    host_ref: &str,
+    agent_adapters: BTreeSet<String>,
+) {
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&InputMeta::builder().name(host_ref.to_string()).build(), &HostSpec {}).await.expect("host create");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
+            heartbeat_at: Some(chrono::Utc::now()),
+            ready: true,
+            resource_store: None,
+        })
+        .await
+        .expect("host status update");
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &InputMeta::builder().name(policy_name.to_string()).build(),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host_ref.to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("host-direct policy create");
+}
+
+#[tokio::test]
+async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"local-host\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), fake_discovery(false), HostName::local()).await;
+    let local_host_ref = daemon.local_host_id().expect("local host id").to_string();
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    let mut workflow = single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+    backend
+        .clone()
+        .using::<WorkflowTemplate>("flotilla")
+        .create(&InputMeta::builder().name("single-agent-trusted".to_string()).build(), &workflow)
+        .await
+        .expect("workflow create");
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            display_name: "Flotilla".into(),
+            default_workflow_ref: "single-agent-trusted".into(),
+            issue_source: None,
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+    create_test_host_direct_policy(&backend, "host-direct-a-empty", "empty-host", BTreeSet::new()).await;
+    create_test_host_direct_policy(&backend, "host-direct-b-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
+    create_test_host_direct_policy(&backend, "host-direct-z-local", &local_host_ref, BTreeSet::from(["codex".to_string()])).await;
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    namespace: None,
+                    project_ref: "flotilla".into(),
+                    issues: Vec::new(),
+                    name: Some("local-default".into()),
+                    branch: Some("fix/local-default".into()),
+                    workflow_ref: None,
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    auto_attach: false,
+                }),
+            },
+        })
+        .await
+        .expect("start command accepted");
+
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(DaemonEvent::CommandFinished { command_id: id, result, .. }) if id == command_id => break result,
+                Ok(_) => {}
+                Err(error) => panic!("command event receive failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("start command should finish");
+    assert_eq!(result, CommandValue::ConvoyStarted { name: "local-default".into(), attach_command: None, binding: None });
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get("local-default").await.expect("persisted convoy");
+    assert_eq!(convoy.spec.placement_policy.as_deref(), Some("host-direct-z-local"));
 }
 
 #[tokio::test]

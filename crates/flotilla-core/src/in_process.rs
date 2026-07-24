@@ -753,25 +753,59 @@ async fn persist_adopted_checkout(
     }
 }
 
-async fn default_convoy_placement_policy(backend: &ResourceBackend, namespace: &str, contained: bool) -> Option<String> {
+async fn default_convoy_placement_policy(
+    backend: &ResourceBackend,
+    namespace: &str,
+    workflow: &WorkflowTemplateSpec,
+    local_host_ref: Option<&str>,
+) -> Result<Option<ResourceObject<PlacementPolicy>>, String> {
+    let contained = workflow.vessels.iter().any(|vessel| vessel.stance == flotilla_resources::Stance::Contained);
     let mut policies = match backend.clone().using::<PlacementPolicy>(namespace).list().await {
         Ok(list) => list.items,
         Err(err) => {
             warn!(%namespace, error = %err, "failed to list placement policies; convoy will remain Pending until one is registered");
-            return None;
+            return Ok(None);
         }
     };
     policies.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-    let policy = if contained {
-        policies.iter().find(|policy| policy.spec.docker_per_vessel.is_some())
-    } else {
-        policies.iter().find(|policy| policy.metadata.name.starts_with("host-direct-")).or_else(|| policies.first())
+    let candidates = policies.into_iter().filter(|policy| !contained || policy.spec.docker_per_vessel.is_some()).collect::<Vec<_>>();
+    let candidate_names = candidates.iter().map(|policy| policy.metadata.name.clone()).collect::<Vec<_>>();
+    let mut viable = Vec::new();
+    for policy in candidates {
+        if validate_workflow_agent_adapters(backend, namespace, workflow, Some(&policy)).await.is_ok() {
+            viable.push(policy);
+        }
     }
-    .map(|policy| policy.metadata.name.clone());
-    if policy.is_none() {
+    viable.sort_by_key(|policy| {
+        let target_host = policy
+            .spec
+            .host_direct
+            .as_ref()
+            .map(|spec| spec.host_ref.as_str())
+            .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|spec| spec.host_ref.as_str()));
+        let is_local = local_host_ref.is_some_and(|local| target_host == Some(local));
+        let is_host_direct = policy.spec.host_direct.is_some();
+        (!is_local, !is_host_direct, policy.metadata.name.clone())
+    });
+    if let Some(policy) = viable.into_iter().next() {
+        return Ok(Some(policy));
+    }
+
+    let required_adapters = required_workflow_agent_adapters(workflow)?;
+    if !required_adapters.is_empty() {
+        let requirement = if required_adapters.len() == 1 {
+            format!("adapter `{}`", required_adapters.first().expect("one required adapter"))
+        } else {
+            format!("adapters {}", required_adapters.iter().map(|adapter| format!("`{adapter}`")).collect::<Vec<_>>().join(", "))
+        };
+        let candidates = if candidate_names.is_empty() { "(none)".to_string() } else { candidate_names.join(", ") };
+        return Err(format!("no placement policy satisfies {requirement}; candidates: {candidates}"));
+    }
+
+    if candidate_names.is_empty() {
         warn!(%namespace, "no placement policy found; convoy will remain Pending until one is registered");
     }
-    policy
+    Ok(None)
 }
 
 fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
@@ -3164,41 +3198,13 @@ async fn validate_workflow_agent_adapters(
     workflow: &WorkflowTemplateSpec,
     placement: Option<&ResourceObject<PlacementPolicy>>,
 ) -> Result<(), String> {
-    let capabilities = CapabilityTable::seeded();
-    let mut required_adapters = BTreeSet::new();
-    for crew in workflow.vessels.iter().flat_map(|vessel| &vessel.crew) {
-        if let CrewSource::Agent { selector, .. } = &crew.source {
-            required_adapters.insert(capabilities.resolve(&selector.capability)?.adapter.clone());
-        }
-    }
+    let required_adapters = required_workflow_agent_adapters(workflow)?;
 
     for adapter in required_adapters {
         let Some(placement) = placement else {
             return Err(format!("workflow requires agent adapter `{adapter}`, but no placement is available"));
         };
-        let (available_adapters, detail) = if let Some(docker) = &placement.spec.docker_per_vessel {
-            (docker.agent_adapters.clone(), format!("image `{}`", docker.image))
-        } else if let Some(host_direct) = &placement.spec.host_direct {
-            let host = backend.clone().using::<ResourceHost>(namespace).get(&host_direct.host_ref).await.map_err(|error| {
-                format!("placement `{}` host `{}` is not ready: {error}", placement.metadata.name, host_direct.host_ref)
-            })?;
-            let mut status = host
-                .status
-                .ok_or_else(|| format!("placement `{}` host `{}` has no observed status", placement.metadata.name, host_direct.host_ref))?;
-            status.apply_heartbeat_readiness(Utc::now());
-            if !status.ready {
-                return Err(format!("placement `{}` host `{}` is not ready", placement.metadata.name, host_direct.host_ref));
-            }
-            let available_adapters = status.agent_adapters().map_err(|error| {
-                format!(
-                    "placement `{}` host `{}` has invalid agent adapter capabilities: {error}",
-                    placement.metadata.name, host_direct.host_ref
-                )
-            })?;
-            (available_adapters, format!("host `{}`", host_direct.host_ref))
-        } else {
-            (BTreeSet::new(), "unknown target environment".to_string())
-        };
+        let (available_adapters, detail) = placement_agent_adapters(backend, namespace, placement).await?;
         if available_adapters.contains(&adapter) {
             continue;
         }
@@ -3209,6 +3215,48 @@ async fn validate_workflow_agent_adapters(
     }
 
     Ok(())
+}
+
+fn required_workflow_agent_adapters(workflow: &WorkflowTemplateSpec) -> Result<BTreeSet<String>, String> {
+    let capabilities = CapabilityTable::seeded();
+    let mut required_adapters = BTreeSet::new();
+    for crew in workflow.vessels.iter().flat_map(|vessel| &vessel.crew) {
+        if let CrewSource::Agent { selector, .. } = &crew.source {
+            required_adapters.insert(capabilities.resolve(&selector.capability)?.adapter.clone());
+        }
+    }
+    Ok(required_adapters)
+}
+
+async fn placement_agent_adapters(
+    backend: &ResourceBackend,
+    namespace: &str,
+    placement: &ResourceObject<PlacementPolicy>,
+) -> Result<(BTreeSet<String>, String), String> {
+    if let Some(docker) = &placement.spec.docker_per_vessel {
+        Ok((docker.agent_adapters.clone(), format!("image `{}`", docker.image)))
+    } else if let Some(host_direct) = &placement.spec.host_direct {
+        let host =
+            backend.clone().using::<ResourceHost>(namespace).get(&host_direct.host_ref).await.map_err(|error| {
+                format!("placement `{}` host `{}` is not ready: {error}", placement.metadata.name, host_direct.host_ref)
+            })?;
+        let mut status = host
+            .status
+            .ok_or_else(|| format!("placement `{}` host `{}` has no observed status", placement.metadata.name, host_direct.host_ref))?;
+        status.apply_heartbeat_readiness(Utc::now());
+        if !status.ready {
+            return Err(format!("placement `{}` host `{}` is not ready", placement.metadata.name, host_direct.host_ref));
+        }
+        let available_adapters = status.agent_adapters().map_err(|error| {
+            format!(
+                "placement `{}` host `{}` has invalid agent adapter capabilities: {error}",
+                placement.metadata.name, host_direct.host_ref
+            )
+        })?;
+        Ok((available_adapters, format!("host `{}`", host_direct.host_ref)))
+    } else {
+        Ok((BTreeSet::new(), "unknown target environment".to_string()))
+    }
 }
 
 fn convoy_fallback_slug(title: &str, id: &str) -> String {
@@ -3513,21 +3561,18 @@ impl InProcessDaemon {
                 Some(resolved)
             }
             None => {
-                let policy = default_convoy_placement_policy(&self.resource_backend, namespace, contained).await;
-                if contained && policy.is_none() {
+                let local_host_id = self.local_host_id();
+                let placement = default_convoy_placement_policy(
+                    &self.resource_backend,
+                    namespace,
+                    workflow,
+                    local_host_id.as_ref().map(HostId::as_str),
+                )
+                .await?;
+                if contained && placement.is_none() {
                     return Err("contained workflow requires an available docker placement policy".to_string());
                 }
-                match policy {
-                    Some(policy) => Some(
-                        self.resource_backend
-                            .clone()
-                            .using::<PlacementPolicy>(namespace)
-                            .get(&policy)
-                            .await
-                            .map_err(|error| format!("placement policy {policy}: {error}"))?,
-                    ),
-                    None => None,
-                }
+                placement
             }
         };
         validate_workflow_agent_adapters(&self.resource_backend, namespace, workflow, placement.as_ref()).await?;
