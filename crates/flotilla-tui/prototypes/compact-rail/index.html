@@ -809,8 +809,42 @@
         },
       };
 
+      const projects = {
+        flotilla: {
+          label: "flotilla",
+          address: "github.com/flotilla-org/flotilla",
+          meta: "github.com/flotilla-org",
+          attention: 2,
+          convoys: [
+            { id: "presentation", phase: "waiting for principal", attention: 1 },
+            { id: "compact", phase: "coder · active 18m", info: true },
+          ],
+          issues: ["issue-969", "issue-973", "issue-961", "issue-982"],
+          repository: "flotilla-org/flotilla",
+        },
+        andamento: {
+          label: "andamento",
+          address: "github.com/flotilla-org/andamento",
+          meta: "github.com/flotilla-org",
+          attention: 1,
+          convoys: [{ id: "release", phase: "checks passing · 4 crew complete" }],
+          issues: ["issue-27", "issue-25"],
+          repository: "flotilla-org/andamento",
+        },
+        lab: {
+          label: "lab infrastructure",
+          address: "project/lab",
+          meta: "no active convoy",
+          attention: 0,
+          convoys: [],
+          issues: ["issue-604"],
+          repository: "forgejo.lab/flotilla",
+        },
+      };
+
       const state = {
         variant: currentVariant(),
+        activeProject: "flotilla",
         selected: "presentation",
         issuesVisible: true,
       };
@@ -835,107 +869,114 @@
       }
 
       function variantA() {
+        const projectChildren = (projectId) => {
+          if (state.activeProject !== projectId) return "";
+          const project = projects[projectId];
+          const convoys = project.convoys.length
+            ? project.convoys
+                .map(
+                  ({ id, phase, attention }) => `<button ${entityAttrs(id)} class="a-row entity${state.selected === id ? " selected" : ""}">
+                    <span class="glyph">◆</span><span>${entities[id].label}</span>
+                    ${attention ? `<span class="attention">${attention}</span>` : `<span class="phase">${phase}</span>`}
+                  </button>`,
+                )
+                .join("")
+            : `<div class="a-row"><span class="glyph" style="color:var(--overlay)">·</span><span style="color:var(--overlay)">no active convoy</span></div>`;
+          return `<div class="a-children">
+            ${convoys}
+            <div class="a-issue-header">
+              <button class="class-toggle" data-toggle-issues>
+                <span class="toggle-mark">${state.issuesVisible ? "✓" : ""}</span>
+                <span class="section-label">Issues</span>
+              </button>
+              <span class="section-label">${project.issues.length}</span>
+            </div>
+            <div class="a-chips issue-items">
+              ${project.issues.map((id) => chip(id, false)).join("")}
+            </div>
+          </div>`;
+        };
+
+        const projectSection = (projectId) => {
+          const project = projects[projectId];
+          const isActive = state.activeProject === projectId;
+          const badge = project.attention
+            ? `<span class="attention">${project.attention}</span>`
+            : `<span class="attention quiet"></span>`;
+          return `<section class="a-project">
+            <button ${entityAttrs(projectId)} class="a-project-head entity${state.selected === projectId ? " selected" : ""}">
+              <span class="chevron">${isActive ? "⌄" : "›"}</span>
+              <span>${project.label} <span class="meta">${project.meta}</span></span>
+              ${badge}
+            </button>
+            ${projectChildren(projectId)}
+          </section>`;
+        };
+
         return `<aside class="rail variant-a">
           <div class="a-heading">
             <strong>Searchlight</strong>
             <span>3 projects · 3 demands</span>
           </div>
-          <section class="a-project">
-            <button ${entityAttrs("flotilla")} class="a-project-head entity${state.selected === "flotilla" ? " selected" : ""}">
-              <span class="chevron">⌄</span>
-              <span>flotilla <span class="meta">github.com/flotilla-org</span></span>
-              <span class="attention">2</span>
-            </button>
-            <div class="a-children">
-              <button ${entityAttrs("presentation")} class="a-row entity${state.selected === "presentation" ? " selected" : ""}">
-                <span class="glyph">◆</span><span>presentation-contract</span><span class="attention">1</span>
-              </button>
-              <button ${entityAttrs("compact")} class="a-row entity${state.selected === "compact" ? " selected" : ""}">
-                <span class="glyph">◆</span><span>compact-rail-mock</span><span class="phase">active</span>
-              </button>
-              <div class="a-issue-header">
-                <button class="class-toggle" data-toggle-issues>
-                  <span class="toggle-mark">${state.issuesVisible ? "✓" : ""}</span>
-                  <span class="section-label">Issues</span>
-                </button>
-                <span class="section-label">4</span>
-              </div>
-              <div class="a-chips issue-items">
-                ${chip("issue-969", false)}
-                ${chip("issue-973", false)}
-                ${chip("issue-961", false)}
-                ${chip("issue-982", false)}
-              </div>
-            </div>
-          </section>
-          <section class="a-project">
-            <button ${entityAttrs("andamento")} class="a-project-head entity${state.selected === "andamento" ? " selected" : ""}">
-              <span class="chevron">›</span>
-              <span>andamento <span class="meta">2 latent issues</span></span>
-              <span class="attention">1</span>
-            </button>
-          </section>
-          <section class="a-project">
-            <button ${entityAttrs("lab")} class="a-project-head entity${state.selected === "lab" ? " selected" : ""}">
-              <span class="chevron">›</span>
-              <span>lab infrastructure <span class="meta">quiet</span></span>
-              <span class="attention quiet"></span>
-            </button>
-          </section>
+          ${projectSection("flotilla")}
+          ${projectSection("andamento")}
+          ${projectSection("lab")}
         </aside>`;
       }
 
       function variantB() {
+        const project = projects[state.activeProject];
+        const convoyCards = project.convoys.length
+          ? project.convoys
+              .map(
+                ({ id, phase, attention, info }) => `<button ${entityAttrs(id)} class="b-card entity${state.selected === id ? " selected" : ""}">
+                  <span class="icon">◆</span>
+                  <span>${entities[id].label}<div class="sub">${phase}</div></span>
+                  ${attention ? `<span class="attention">${attention}</span>` : info ? `<span class="attention info">i</span>` : ""}
+                </button>`,
+              )
+              .join("")
+          : `<div class="b-card" style="grid-template-columns:20px 1fr"><span style="color:var(--overlay)">·</span><span style="color:var(--overlay)">No active convoy</span></div>`;
+        const projectAttention = project.attention ? `<span class="attention">${project.attention}</span>` : `<span class="attention quiet"></span>`;
+
         return `<aside class="rail variant-b">
           <nav class="b-spine" aria-label="Project spine">
             <span class="section-label">projects</span>
-            <button ${entityAttrs("flotilla")} class="b-spine-button entity${state.selected === "flotilla" ? " selected" : ""}" title="flotilla">
+            <button ${entityAttrs("flotilla")} class="b-spine-button entity${state.activeProject === "flotilla" ? " selected" : ""}" title="flotilla">
               FL <span class="attention">2</span>
             </button>
-            <button ${entityAttrs("andamento")} class="b-spine-button entity${state.selected === "andamento" ? " selected" : ""}" title="andamento">
+            <button ${entityAttrs("andamento")} class="b-spine-button entity${state.activeProject === "andamento" ? " selected" : ""}" title="andamento">
               AN <span class="attention">1</span>
             </button>
-            <button ${entityAttrs("lab")} class="b-spine-button entity${state.selected === "lab" ? " selected" : ""}" title="lab infrastructure">
+            <button ${entityAttrs("lab")} class="b-spine-button entity${state.activeProject === "lab" ? " selected" : ""}" title="lab infrastructure">
               LB <span class="attention quiet"></span>
             </button>
           </nav>
           <div class="b-body">
-            <div class="b-title"><strong>flotilla</strong><span class="attention">2</span></div>
-            <div class="b-address">github.com/flotilla-org/flotilla</div>
+            <div class="b-title"><strong>${project.label}</strong>${projectAttention}</div>
+            <div class="b-address">${project.address}</div>
             <section class="b-lane">
-              <div class="b-lane-head"><span class="section-label">Convoys · 2</span></div>
+              <div class="b-lane-head"><span class="section-label">Convoys · ${project.convoys.length}</span></div>
               <div class="b-cards">
-                <button ${entityAttrs("presentation")} class="b-card entity${state.selected === "presentation" ? " selected" : ""}">
-                  <span class="icon">◆</span>
-                  <span>presentation-contract<div class="sub">waiting for principal</div></span>
-                  <span class="attention">1</span>
-                </button>
-                <button ${entityAttrs("compact")} class="b-card entity${state.selected === "compact" ? " selected" : ""}">
-                  <span class="icon">◆</span>
-                  <span>compact-rail-mock<div class="sub">coder · active 18m</div></span>
-                  <span class="attention info">i</span>
-                </button>
+                ${convoyCards}
               </div>
             </section>
             <section class="b-lane">
               <div class="b-lane-head">
                 <button class="class-toggle" data-toggle-issues>
                   <span class="toggle-mark">${state.issuesVisible ? "✓" : ""}</span>
-                  <span class="section-label">Issues · 4</span>
+                  <span class="section-label">Issues · ${project.issues.length}</span>
                 </button>
               </div>
               <div class="b-chips issue-items">
-                ${chip("issue-969")}
-                ${chip("issue-973")}
-                ${chip("issue-961")}
-                ${chip("issue-982")}
+                ${project.issues.map((id) => chip(id)).join("")}
               </div>
             </section>
             <section class="b-lane">
               <div class="b-lane-head"><span class="section-label">Repositories · 1</span></div>
               <div class="b-card" style="grid-template-columns:20px 1fr">
                 <span style="color:var(--green)">⌘</span>
-                <span>flotilla-org/flotilla<div class="sub">main · clean</div></span>
+                <span>${project.repository}<div class="sub">main · clean</div></span>
               </div>
             </section>
           </div>
@@ -1047,6 +1088,9 @@
         document.querySelectorAll("[data-entity]").forEach((button) => {
           button.addEventListener("click", () => {
             state.selected = button.dataset.entity;
+            if (entities[state.selected].kind === "project") {
+              state.activeProject = state.selected;
+            }
             render();
           });
         });
