@@ -885,6 +885,117 @@ async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
 }
 
 #[tokio::test]
+async fn convoy_resume_delivers_follow_up_to_unique_completed_crew_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    daemon
+        .crew_complete_internal(&CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() }, Some("ready".into()))
+        .await
+        .expect("complete coder work");
+
+    let mut events = daemon.subscribe();
+    let command_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ConvoyResume {
+                namespace: Some("flotilla".into()),
+                name: "demo".into(),
+                prompt: "Rebase onto main and shepherd the PR".into(),
+                vessel: None,
+                role: None,
+            },
+        })
+        .await
+        .expect("resume command");
+
+    assert_eq!(wait_for_command_result(&mut events, command_id).await, CommandValue::Ok);
+    assert_eq!(terminal_pool.delivered.lock().await.as_slice(), &[(
+        "session-coder".to_string(),
+        "Rebase onto main and shepherd the PR".to_string(),
+        true,
+    )]);
+    let convoy = daemon.resource_backend().using::<Convoy>("flotilla").get("demo").await.expect("convoy");
+    let coder = &convoy.status.expect("convoy status").crew_work["implement"]["coder"];
+    assert_eq!(coder.phase, CrewWorkPhase::Working);
+    assert_eq!(coder.finished_at, None);
+    assert_eq!(coder.message.as_deref(), Some("Rebase onto main and shepherd the PR"));
+}
+
+#[tokio::test]
+async fn convoy_resume_requires_a_selector_when_completed_crew_is_ambiguous() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    for role in ["coder", "reviewer"] {
+        daemon
+            .crew_complete_internal(
+                &CrewCommandContext {
+                    namespace: Some("flotilla".into()),
+                    convoy: Some("demo".into()),
+                    vessel_ref: Some("demo-implement".into()),
+                    role: Some(role.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("complete crew work");
+    }
+
+    let error = daemon
+        .convoy_resume_internal("flotilla", "demo", "Continue", None, None)
+        .await
+        .expect_err("ambiguous crew should require selection");
+
+    assert!(error.contains("--vessel and --role"), "unexpected error: {error}");
+    assert!(terminal_pool.delivered.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn convoy_resume_restarts_an_intact_stopped_crew_session_with_the_follow_up_prompt() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, terminal_pool) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+    daemon
+        .crew_complete_internal(&CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() }, None)
+        .await
+        .expect("complete coder work");
+    let terminals = daemon.resource_backend().using::<ResourceTerminalSession>("flotilla");
+    let coder = terminals.get("terminal-demo-implement-coder").await.expect("coder session");
+    terminals
+        .update_status("terminal-demo-implement-coder", &coder.metadata.resource_version, &ResourceTerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Stopped,
+            session_id: Some("session-coder".into()),
+            crew: coder.status.as_ref().and_then(|status| status.crew.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("stop coder session");
+
+    daemon
+        .convoy_resume_internal("flotilla", "demo", "Rebase onto main", Some("implement"), Some("coder"))
+        .await
+        .expect("resume stopped coder");
+
+    assert!(terminal_pool.delivered.lock().await.is_empty());
+    let coder = terminals.get("terminal-demo-implement-coder").await.expect("restarting coder session");
+    assert_eq!(coder.status.expect("coder status").phase, ResourceTerminalSessionPhase::Starting);
+    assert!(matches!(
+        coder.spec.source,
+        TerminalSessionSource::Agent { message: Some(ref message), .. } if message.text == "Rebase onto main"
+    ));
+}
+
+#[tokio::test]
 async fn crew_fail_uses_ambient_identity_to_fail_callers_work() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");

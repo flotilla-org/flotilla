@@ -2110,7 +2110,8 @@ impl InProcessDaemon {
     ) -> Result<Option<ExistingConvoyTarget>, String> {
         let (namespace, name) = match action {
             flotilla_protocol::CommandAction::ConvoyDelete { namespace, name, .. }
-            | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. } => {
+            | flotilla_protocol::CommandAction::ConvoyAbandon { namespace, name, .. }
+            | flotilla_protocol::CommandAction::ConvoyResume { namespace, name, .. } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
             flotilla_protocol::CommandAction::ConvoyWorkForceComplete { convoy, .. } => {
@@ -4981,6 +4982,83 @@ impl InProcessDaemon {
         .map_err(|err| err.to_string())
     }
 
+    pub async fn convoy_resume_internal(
+        &self,
+        namespace: &str,
+        name: &str,
+        prompt: &str,
+        requested_vessel: Option<&str>,
+        requested_role: Option<&str>,
+    ) -> Result<(), String> {
+        let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
+        let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
+        let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
+        let candidates = status
+            .crew_work
+            .iter()
+            .flat_map(|(vessel, crew)| crew.iter().map(move |(role, state)| (vessel, role, state)))
+            .filter(|(vessel, role, state)| {
+                state.phase == flotilla_resources::CrewWorkPhase::Done
+                    && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
+                    && requested_role.is_none_or(|requested| requested == role.as_str())
+            })
+            .map(|(vessel, role, _)| (vessel.clone(), role.clone()))
+            .collect::<Vec<_>>();
+        let (vessel, role) = match candidates.as_slice() {
+            [] => {
+                let scope = match (requested_vessel, requested_role) {
+                    (Some(vessel), Some(role)) => format!(" for vessel `{vessel}` role `{role}`"),
+                    (Some(vessel), None) => format!(" for vessel `{vessel}`"),
+                    (None, Some(role)) => format!(" for role `{role}`"),
+                    (None, None) => String::new(),
+                };
+                return Err(format!("convoy `{name}` has no completed crew work{scope}"));
+            }
+            [candidate] => candidate.clone(),
+            _ => {
+                let matches = candidates.iter().map(|(vessel, role)| format!("{vessel}/{role}")).collect::<Vec<_>>().join(", ");
+                return Err(format!(
+                    "convoy `{name}` has multiple completed crew members ({matches}); select one with --vessel and --role"
+                ));
+            }
+        };
+
+        let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(namespace);
+        let session = sessions
+            .list_matching_labels(&BTreeMap::from([
+                (CONVOY_LABEL.to_string(), name.to_string()),
+                (VESSEL_LABEL.to_string(), vessel.clone()),
+                (ROLE_LABEL.to_string(), role.clone()),
+            ]))
+            .await
+            .map_err(|err| err.to_string())?
+            .items
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("completed crew member `{role}` on vessel `{vessel}` has no intact terminal session"))?;
+        match session.status.as_ref().map(|status| status.phase) {
+            Some(ResourceTerminalSessionPhase::Running) => self.deliver_to_crew_session(&session, prompt).await?,
+            Some(ResourceTerminalSessionPhase::Stopped) => {
+                queue_pending_crew_message(&sessions, &session, prompt).await?;
+                apply_resource_status_patch(&sessions, &session.metadata.name, &TerminalSessionStatusPatch::MarkStarting)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            Some(ResourceTerminalSessionPhase::Starting) | None => queue_pending_crew_message(&sessions, &session, prompt).await?,
+            Some(ResourceTerminalSessionPhase::Failed) => {
+                return Err(format!("crew member `{role}` on vessel `{vessel}` failed provisioning and cannot be resumed"));
+            }
+        }
+        apply_resource_status_patch(
+            &convoys,
+            name,
+            &convoy_external_patches::resume_crew_work(vessel, role, chrono::Utc::now(), prompt.to_string()),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+    }
+
     async fn deliver_to_crew_session(
         &self,
         session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
@@ -5743,6 +5821,17 @@ impl InProcessDaemon {
         if let flotilla_protocol::CommandAction::CrewHandoff { context, target, message } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = match self.crew_handoff_internal(context, target, message).await {
+                Ok(()) => flotilla_protocol::CommandValue::Ok,
+                Err(message) => flotilla_protocol::CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, empty_identity, result);
+            return Ok(id);
+        }
+
+        if let flotilla_protocol::CommandAction::ConvoyResume { namespace, name, prompt, vessel, role } = &command.action {
+            let empty_identity = self.start_context_free_command(id, command.description().to_string());
+            let namespace = namespace.clone().unwrap_or(self.provisioning_namespace().await);
+            let result = match self.convoy_resume_internal(&namespace, name, prompt, vessel.as_deref(), role.as_deref()).await {
                 Ok(()) => flotilla_protocol::CommandValue::Ok,
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };

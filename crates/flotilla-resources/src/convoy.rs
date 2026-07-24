@@ -294,6 +294,12 @@ pub enum ConvoyStatusPatch {
         handed_off_at: DateTime<Utc>,
         message: String,
     },
+    ResumeCrewWork {
+        vessel: String,
+        role: String,
+        resumed_at: DateTime<Utc>,
+        prompt: String,
+    },
     RollUpWork {
         work: String,
         phase: WorkPhase,
@@ -476,6 +482,17 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     }
                 }
             }
+            Self::ResumeCrewWork { vessel, role, resumed_at, prompt } => {
+                if let Some(work) = status.work.get_mut(vessel) {
+                    work.completion_authority = WorkCompletionAuthority::CrewRollup;
+                }
+                if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
+                    state.phase = CrewWorkPhase::Working;
+                    state.started_at.get_or_insert(*resumed_at);
+                    state.finished_at = None;
+                    state.message = Some(prompt.clone());
+                }
+            }
             Self::RollUpWork { work, phase, transitioned_at, message } => {
                 if let Some(state) = status.work.get_mut(work) {
                     // Work roll-up reports the same process across continuation and re-settlement.
@@ -594,5 +611,9 @@ pub mod external_patches {
         message: String,
     ) -> ConvoyStatusPatch {
         ConvoyStatusPatch::HandoffCrewWork { vessel, sender_role, target_role, handed_off_at, message }
+    }
+
+    pub fn resume_crew_work(vessel: String, role: String, resumed_at: DateTime<Utc>, prompt: String) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::ResumeCrewWork { vessel, role, resumed_at, prompt }
     }
 }

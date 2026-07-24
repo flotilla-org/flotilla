@@ -63,6 +63,7 @@ define_patch_kinds! {
     ConvoyMarkCrewCompleted => DUPLICATE_RESETTLEMENT,
     ConvoyMarkCrewFailed => DUPLICATE_RESETTLEMENT,
     ConvoyHandoffCrewWork => CONTINUATION,
+    ConvoyResumeCrewWork => CONTINUATION,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalMarkRunning => DUPLICATE,
@@ -96,6 +97,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::MarkCrewCompleted { .. } => PatchKind::ConvoyMarkCrewCompleted,
         ConvoyStatusPatch::MarkCrewFailed { .. } => PatchKind::ConvoyMarkCrewFailed,
         ConvoyStatusPatch::HandoffCrewWork { .. } => PatchKind::ConvoyHandoffCrewWork,
+        ConvoyStatusPatch::ResumeCrewWork { .. } => PatchKind::ConvoyResumeCrewWork,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
     }
 }
@@ -675,6 +677,22 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     target_role: "coder".to_string(),
                     handed_off_at: ts(30),
                     message: "address review".to_string(),
+                };
+                apply_and_replay(&mut status, &patch);
+                (before, crew_timestamps(&status))
+            },
+        },
+        LifecycleCase {
+            name: "crew resume",
+            kind: PatchKind::ConvoyResumeCrewWork,
+            exercise: || {
+                let mut status = settled_convoy_status();
+                let before = crew_timestamps(&status);
+                let patch = ConvoyStatusPatch::ResumeCrewWork {
+                    vessel: "implement".to_string(),
+                    role: "coder".to_string(),
+                    resumed_at: ts(30),
+                    prompt: "rebase onto main".to_string(),
                 };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))

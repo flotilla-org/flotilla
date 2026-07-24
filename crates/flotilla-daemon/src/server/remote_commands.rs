@@ -182,6 +182,7 @@ impl RemoteCommandRouter {
                     CommandAction::ConvoyStartPrepared { .. }
                         | CommandAction::ConvoyDelete { .. }
                         | CommandAction::ConvoyAbandon { .. }
+                        | CommandAction::ConvoyResume { .. }
                         | CommandAction::ConvoyWorkForceComplete { .. }
                         | CommandAction::ResourceWatch { .. }
                 )
