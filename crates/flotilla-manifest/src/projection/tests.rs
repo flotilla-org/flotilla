@@ -125,10 +125,8 @@ fn awareness_tree_resolves_open_recipes_without_shadowing_live_attach() {
     assert_eq!(issue_patch.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));
     assert!(!issue_patch.set.contains_key(KEY_MATERIALIZE_RECIPE));
 
-    let convoy_patch = find(
-        &patches,
-        &group(vec![project.clone(), GroupSegment::text(SEGMENT_CONVOY, "dev/ship-it").with_label("ship-it")]),
-    );
+    let convoy_patch =
+        find(&patches, &group(vec![project.clone(), GroupSegment::text(SEGMENT_CONVOY, "dev/ship-it").with_label("ship-it")]));
     assert_eq!(text(convoy_patch, KEY_MATERIALIZE_TARGET), "workspace");
     assert_eq!(text(convoy_patch, KEY_MATERIALIZE_RECIPE), "flotilla attach --host 'feta' 'terminal-ship-it-coder'");
 
