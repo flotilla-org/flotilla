@@ -146,7 +146,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .state(AwarenessState::Active)
                 .as_of(as_of)
                 .refs(vec![checkout.resource.clone()])
-                .annotations(HashMap::from([(REPO_FACT_ANNOTATION.to_string(), checkout.repo_label.clone())]))
+                .annotations(repo_fact_annotations(checkout.repo_fact.as_ref()))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -182,7 +182,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .phase(AwarenessPhase::Session(independent.phase))
                 .as_of(as_of)
                 .refs(vec![independent.resource.clone()])
-                .annotations(repo_fact_annotations(independent.repo.as_ref()))
+                .annotations(repo_fact_annotations(independent.repo_fact.as_ref()))
                 .build(),
             &input.salience,
             &project_ancestors,
@@ -459,7 +459,8 @@ mod tests {
             checkouts: vec![CheckoutRow::builder()
                 .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
                 .repo(RepositoryKey("repo-a".into()))
-                .repo_label("flotilla")
+                .repo_label("github.com/flotilla-org/flotilla")
+                .repo_fact(flotilla_protocol::RepoKey("flotilla-org/flotilla".into()))
                 .path("/work/flotilla")
                 .branch("feat/awareness-band")
                 .host(HostName::new("local"))
@@ -468,6 +469,8 @@ mod tests {
             independents: vec![IndependentRow::builder()
                 .resource(ResourceRef::new("flotilla.work/v1", "TerminalSession", "flotilla", "scratch"))
                 .name("scratch")
+                .repo(flotilla_protocol::RepoKey("github.com/flotilla-org/flotilla".into()))
+                .repo_fact(flotilla_protocol::RepoKey("flotilla-org/flotilla".into()))
                 .repository_key(RepositoryKey("repo-a".into()))
                 .host(HostName::new("local"))
                 .phase(SessionPhase::Running)
@@ -481,6 +484,14 @@ mod tests {
         assert_eq!(nodes[0].counts.checkouts, 1);
         assert_eq!(nodes[0].counts.independents, 1);
         assert!(nodes[0].entries.iter().any(|entry| entry.kind == AwarenessKind::Convoy && entry.label == "ship-it"));
+        for kind in [AwarenessKind::Checkout, AwarenessKind::Independent] {
+            let entry = nodes[0].entries.iter().find(|entry| entry.kind == kind).expect("awareness entry");
+            assert_eq!(
+                entry.annotations.get(REPO_FACT_ANNOTATION).map(String::as_str),
+                Some("flotilla-org/flotilla"),
+                "repo grouping uses canonical fact value, not display label",
+            );
+        }
     }
 
     #[test]

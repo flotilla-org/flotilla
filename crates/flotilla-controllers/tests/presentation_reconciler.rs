@@ -33,7 +33,8 @@ use flotilla_resources::{
     controller::Reconciler, Convoy, ConvoyRepositorySpec, ConvoySpec, Environment, EnvironmentSpec, EnvironmentStatus,
     EnvironmentStatusPatch, Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, HostStatusPatch, Presentation, PresentationSpec,
     PresentationStatus, PresentationStatusPatch, Repository, RepositorySpec, ResourceBackend, StatusPatch, TerminalSession,
-    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
+    TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -246,7 +247,8 @@ async fn dispatched_convoy_workspace_stamp_uses_project_and_repository_dialect()
         ]),
     )
     .await;
-    let presentation = create_presentation(&backend, "presentation-a", "default").await;
+    let mut presentation = create_presentation(&backend, "presentation-a", "default").await;
+    presentation.metadata.labels.insert(VESSEL_LABEL.to_string(), "implement".to_string());
     let runtime = Arc::new(FakePresentationRuntime::default());
     let reconciler = reconciler(Arc::clone(&runtime), backend);
 
@@ -259,7 +261,7 @@ async fn dispatched_convoy_workspace_stamp_uses_project_and_repository_dialect()
             GroupSegment::text(SEGMENT_PROJECT, "platform"),
             GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla"),
             GroupSegment::text(SEGMENT_CONVOY, "flotilla/convoy-a").with_label("convoy-a"),
-            GroupSegment::text(SEGMENT_VESSEL, "convoy-a"),
+            GroupSegment::text(SEGMENT_VESSEL, "implement"),
         ]))
     );
 }

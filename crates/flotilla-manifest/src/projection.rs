@@ -24,9 +24,9 @@ use flotilla_protocol::{
 use crate::{
     keys::{
         ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CONVOY_MESSAGE, KEY_CONVOY_PHASE, KEY_CONVOY_WORKFLOW, KEY_CREW_ROLES, KEY_FACTORY_ID,
-        KEY_MATERIALIZE_RECIPE, KEY_MATERIALIZE_TARGET, KEY_PROJECT_NAME, KEY_SCOPE, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION,
-        KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO,
-        SEGMENT_VESSEL, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_INDEPENDENT_HOST, KEY_MATERIALIZE_RECIPE, KEY_MATERIALIZE_TARGET, KEY_PROJECT_NAME, KEY_SCOPE, KEY_SESSION, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_VESSEL_HOST, KEY_WORK_PHASE, SEGMENT_CONVOY, SEGMENT_INDEPENDENT,
+        SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::RecipeMint,
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -146,7 +146,11 @@ impl Catalog {
         }
         for (target, facts) in &previous.facts {
             if !self.facts.contains_key(target) {
-                patches.push(patch(target.clone(), BTreeMap::new(), facts.keys().cloned().collect()));
+                patches.push(patch(
+                    target.clone(),
+                    BTreeMap::new(),
+                    facts.keys().filter(|key| key.as_str() != KEY_SOURCE).cloned().collect(),
+                ));
             }
         }
         patches
@@ -165,7 +169,9 @@ impl Catalog {
     }
 }
 
-fn patch(target: MetadataTarget, set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>) -> MetadataPatch {
+fn patch(target: MetadataTarget, mut set: BTreeMap<String, MetadataValueUpdate>, unset: Vec<String>) -> MetadataPatch {
+    set.entry(KEY_SOURCE.to_owned())
+        .or_insert_with(|| MetadataValueUpdate::new(MetadataValue::text(SOURCE_FLOTILLA), Some(CATALOG_TTL_MS)));
     MetadataPatch { target, source_id: SOURCE_CONNECTOR.to_owned(), set, unset }
 }
 
@@ -441,7 +447,7 @@ fn project_vessel(
 
 fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint: &dyn RecipeMint) {
     let namespace = &independent.resource.namespace;
-    let repo = repo_segment(independent.repo.as_ref().map(|repo| repo.0.as_str()));
+    let repo = repo_segment(independent.repo_fact.as_ref().map(|repo| repo.0.as_str()));
     let mut path = Vec::new();
     if let Some(segment) = &repo {
         path.push(segment.clone());
@@ -451,12 +457,12 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
     // ordering semantics are gap §9.6 for the Leg-1 freeze).
     let ordinal = repo.is_none().then_some(ARCHIPELAGO_ORDINAL);
 
-    path.push(GroupSegment::text(SEGMENT_VESSEL, independent.name.clone()));
+    path.push(GroupSegment::text(SEGMENT_INDEPENDENT, independent.name.clone()));
     let group_path = GroupPath(path);
     let badge = session_badge(independent.phase);
     let mut facts = vec![
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
-        (KEY_VESSEL_HOST, MetadataValue::text(independent.host.to_string())),
+        (KEY_INDEPENDENT_HOST, MetadataValue::text(independent.host.to_string())),
         (KEY_FACTORY_ID, MetadataValue::text(format!("flotilla:independents/{namespace}/{}", independent.name))),
     ];
     if badge.attention {

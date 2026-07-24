@@ -117,7 +117,7 @@ impl RepositorySpec {
     /// Canonical value for the cross-producer `vcs.repo` fact: a forge slug
     /// when one exists, otherwise the globally qualified `host:path`
     /// Repository identity.
-    pub fn fact_slug(&self) -> String {
+    pub fn repo_fact_value(&self) -> String {
         self.forge.as_ref().map_or_else(|| self.qualified_label(), |forge| forge.repository.clone())
     }
 
@@ -344,7 +344,7 @@ mod fact_dialect_tests {
         let forge = RepositorySpec::remote("https://github.com/flotilla-org/flotilla.git").expect("forge repository");
         let local = RepositorySpec::local("feta", "/srv/flotilla/.git").expect("local repository");
 
-        assert_eq!(forge.fact_slug(), "flotilla-org/flotilla");
-        assert_eq!(local.fact_slug(), "feta:/srv/flotilla/.git");
+        assert_eq!(forge.repo_fact_value(), "flotilla-org/flotilla");
+        assert_eq!(local.repo_fact_value(), "feta:/srv/flotilla/.git");
     }
 }

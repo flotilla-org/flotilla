@@ -55,6 +55,8 @@ pub const KEY_CONVOY_MESSAGE: &str = "flotilla.convoy.message";
 /// lifecycle (vessels don't complete).
 pub const KEY_WORK_PHASE: &str = "flotilla.work.phase";
 pub const KEY_VESSEL_HOST: &str = "flotilla.vessel.host";
+/// Host currently carrying an independent terminal session.
+pub const KEY_INDEPENDENT_HOST: &str = "flotilla.independent.host";
 pub const KEY_VESSEL_ENV: &str = "flotilla.vessel.env";
 pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
 
@@ -95,4 +97,6 @@ pub const SEGMENT_PROJECT: &str = "flotilla.project";
 pub const SEGMENT_REPO: &str = "vcs.repo";
 pub const SEGMENT_CONVOY: &str = "flotilla.convoy";
 pub const SEGMENT_VESSEL: &str = "flotilla.vessel";
+/// Independent terminal-session name, never a convoy vessel name.
+pub const SEGMENT_INDEPENDENT: &str = "flotilla.independent";
 pub const SEGMENT_ISSUE: &str = "flotilla.issue";

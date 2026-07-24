@@ -27,7 +27,8 @@
 //! | `flotilla.convoy.workflow` | WorkflowTemplate resource name used by a convoy. |
 //! | `flotilla.convoy.message` | Convoy lifecycle diagnostic. |
 //! | `flotilla.work.phase` | Work phase aboard a vessel, not vessel lifecycle. |
-//! | `flotilla.vessel.host` | Host currently carrying a vessel or independent. |
+//! | `flotilla.vessel.host` | Host currently carrying a convoy vessel. |
+//! | `flotilla.independent.host` | Host currently carrying an independent terminal session. |
 //! | `flotilla.vessel.env` | Execution-environment reference for a vessel. |
 //! | `flotilla.crew.roles` | Complete crew-role list aboard a vessel. |
 //! | `status.state` | Normalized `idle`, `waiting`, `active`, `done`, or `failed` badge state. |
@@ -47,7 +48,8 @@
 //! | `flotilla.project` | Project resource name, and only present when Project knowledge exists. |
 //! | `vcs.repo` | Canonical forge slug, falling back to Repository's `host:path` identity when slugless. |
 //! | `flotilla.convoy` | `<namespace>/<convoy>` resource identity. |
-//! | `flotilla.vessel` | Vessel or independent name. |
+//! | `flotilla.vessel` | Convoy vessel name. |
+//! | `flotilla.independent` | Independent terminal-session name. |
 //! | `flotilla.issue` | Issue entry identity from the awareness projection. |
 
 use std::collections::BTreeMap;

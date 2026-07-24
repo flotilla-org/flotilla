@@ -35,6 +35,7 @@ fn independent(namespace: &str, name: &str, phase: SessionPhase, repo: Option<&s
         .resource(session_ref(namespace, name))
         .name(name)
         .maybe_repo(repo.map(|repo| RepoKey(repo.to_owned())))
+        .maybe_repo_fact(repo.map(|repo| RepoKey(repo.to_owned())))
         .host(HostName::new("feta"))
         .maybe_attach(attach.map(str::to_owned))
         .phase(phase)
@@ -290,18 +291,19 @@ fn ready_vessel_waits_with_attention() {
 
 #[test]
 fn independent_with_repo_groups_under_repo_and_publishes_identity() {
-    let independent = independent()
+    let mut independent = independent()
         .namespace("dev")
         .name("terminal-scratch")
         .phase(SessionPhase::Running)
         .repo("flotilla-org/flotilla")
         .attach("terminal-scratch")
         .call();
+    independent.repo = Some(RepoKey("github.com/flotilla-org/flotilla".to_owned()));
     let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
     let repo_segment = GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla");
-    let group_target = group(vec![repo_segment.clone(), GroupSegment::text(SEGMENT_VESSEL, "terminal-scratch")]);
+    let group_target = group(vec![repo_segment.clone(), GroupSegment::text(SEGMENT_INDEPENDENT, "terminal-scratch")]);
     let group_patch = find(&patches, &group_target);
     assert_eq!(text(group_patch, KEY_STATUS_STATE), "active");
     assert_eq!(text(group_patch, KEY_MATERIALIZE_TARGET), "pane");
@@ -320,7 +322,7 @@ fn independent_with_repo_groups_under_repo_and_publishes_identity() {
     };
     assert_eq!(scope.len(), 2);
     assert_eq!(scope[0].key, SEGMENT_REPO);
-    assert_eq!(scope[1].key, SEGMENT_VESSEL);
+    assert_eq!(scope[1].key, SEGMENT_INDEPENDENT);
     assert_eq!(scope[1].value, MetadataPathValue::Text("terminal-scratch".to_owned()));
 }
 
@@ -330,7 +332,7 @@ fn independent_without_repo_is_archipelago_ordered_first() {
     let catalog = project_catalog(&CatalogInput { awareness: None, convoys: &[], independents: &[independent] }, &mint());
     let patches = catalog.reassert_patches();
 
-    let group_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_VESSEL, "yeoman")]));
+    let group_patch = find(&patches, &group(vec![GroupSegment::text(SEGMENT_INDEPENDENT, "yeoman")]));
     assert_eq!(group_patch.set[KEY_STATUS_STATE].ordinal, Some(ARCHIPELAGO_ORDINAL));
     let identity = find(&patches, &session_identity("feta/dev/yeoman"));
     let MetadataValue::GroupPath(scope) = &identity.set[KEY_SCOPE].value else {
@@ -349,7 +351,7 @@ fn independent_without_attach_lists_without_recipe() {
         &patches,
         &group(vec![
             GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla"),
-            GroupSegment::text(SEGMENT_VESSEL, "wedged"),
+            GroupSegment::text(SEGMENT_INDEPENDENT, "wedged"),
         ]),
     );
     assert_eq!(text(group_patch, KEY_STATUS_STATE), "failed");
@@ -380,17 +382,18 @@ fn diff_sets_changes_and_unsets_disappearances() {
     let convoy_patch = find(&patches, &convoy_target);
     assert_eq!(text(convoy_patch, KEY_CONVOY_PHASE), "active");
     assert_eq!(text(convoy_patch, KEY_STATUS_STATE), "active");
+    assert_eq!(text(convoy_patch, KEY_SOURCE), SOURCE_FLOTILLA);
     assert!(!convoy_patch.set.contains_key(KEY_CONVOY_WORKFLOW), "unchanged facts are not re-sent in a diff");
     assert!(convoy_patch.unset.contains(&KEY_STATUS_ATTENTION.to_owned()));
     assert!(convoy_patch.unset.contains(&KEY_CONVOY_MESSAGE.to_owned()));
 
     // The vanished independent is explicitly unset on both its targets.
-    let independent_group = find(&patches, &group(vec![GroupSegment::text(SEGMENT_VESSEL, "scratch")]));
-    assert!(independent_group.set.is_empty());
+    let independent_group = find(&patches, &group(vec![GroupSegment::text(SEGMENT_INDEPENDENT, "scratch")]));
+    assert_eq!(text(independent_group, KEY_SOURCE), SOURCE_FLOTILLA);
     assert!(independent_group.unset.contains(&KEY_STATUS_STATE.to_owned()));
     assert!(independent_group.unset.contains(&KEY_MATERIALIZE_RECIPE.to_owned()));
     let identity_patch = find(&patches, &session_identity("feta/dev/scratch"));
-    assert!(identity_patch.set.is_empty());
+    assert_eq!(text(identity_patch, KEY_SOURCE), SOURCE_FLOTILLA);
     assert!(identity_patch.unset.contains(&KEY_SCOPE.to_owned()));
 
     assert!(current.diff_patches(&current).is_empty(), "identical catalogs need no patches");

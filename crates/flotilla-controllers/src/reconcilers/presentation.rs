@@ -27,7 +27,7 @@ use flotilla_protocol::{arg, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
     Convoy, Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, Repository, ResourceBackend, ResourceError,
-    ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL,
+    ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL, VESSEL_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -275,30 +275,42 @@ impl<R> PresentationReconciler<R> {
     async fn workspace_stamp(&self, obj: &ResourceObject<Presentation>) -> WorkspaceStamp {
         let namespace = &obj.metadata.namespace;
         let convoy_name = &obj.spec.convoy_ref;
-        let vessel = &obj.spec.name;
+        let vessel = obj.spec.process_selector.get(VESSEL_LABEL).or_else(|| obj.metadata.labels.get(VESSEL_LABEL));
         // Tab stamps have no TTL, so a wrong scope would stick: on a failed
-        // convoy lookup, stamp no scope at all (honestly absent — the pane
-        // identities still group the tab) rather than a spine missing its
-        // project segment.
-        let scope = match self.convoys.get(convoy_name).await {
-            Ok(convoy) => {
+        // dependency lookup, stamp no scope at all (honestly absent — the
+        // pane identities still group the tab) rather than an incomplete
+        // spine.
+        let scope = match (vessel, self.convoys.get(convoy_name).await) {
+            (Some(vessel), Ok(convoy)) => {
                 let project = project_segment(convoy.spec.project_ref.as_deref());
-                let repo_value = match convoy.spec.repositories.as_slice() {
-                    [snapshot] => {
-                        self.repositories.get(&snapshot.repo_ref.to_string()).await.ok().map(|repository| repository.spec.fact_slug())
-                    }
-                    [] => None,
-                    _ => None,
+                let repo_value = match convoy.spec.sole_repository() {
+                    Some(snapshot) => match self.repositories.get(&snapshot.repo_ref.to_string()).await {
+                        Ok(repository) => Some(repository.spec.repo_fact_value()),
+                        Err(err) => {
+                            warn!(%err, repository = %snapshot.repo_ref, convoy = %convoy_name, "repository lookup failed; stamping workspace without a scope");
+                            return WorkspaceStamp {
+                                kind: "flotilla-vessel".to_owned(),
+                                factory_id: vessel_factory_id(namespace, convoy_name, vessel),
+                                scope: None,
+                            };
+                        }
+                    },
+                    None => None,
                 };
                 let repo = repo_segment(repo_value.as_deref());
                 Some(vessel_group_path(project, repo, namespace, convoy_name, vessel))
             }
-            Err(err) => {
+            (_, Err(err)) => {
                 warn!(%err, convoy = %convoy_name, "convoy lookup failed; stamping workspace without a scope");
                 None
             }
+            (None, Ok(_)) => {
+                warn!(presentation = %obj.metadata.name, convoy = %convoy_name, "presentation has no vessel selector; stamping workspace without a scope");
+                None
+            }
         };
-        WorkspaceStamp { kind: "flotilla-vessel".to_owned(), factory_id: vessel_factory_id(namespace, convoy_name, vessel), scope }
+        let factory_vessel = vessel.map_or(obj.spec.name.as_str(), String::as_str);
+        WorkspaceStamp { kind: "flotilla-vessel".to_owned(), factory_id: vessel_factory_id(namespace, convoy_name, factory_vessel), scope }
     }
 
     fn build_attach_command(

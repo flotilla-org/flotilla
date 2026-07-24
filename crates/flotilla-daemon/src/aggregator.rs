@@ -1273,6 +1273,11 @@ impl Aggregator {
                             .map(|repository| repository.spec.qualified_label())
                             .unwrap_or_else(|| UNKNOWN_REPOSITORY_LABEL.to_string()),
                     )
+                    .maybe_repo_fact(
+                        self.repositories
+                            .get(&spec.repo_ref)
+                            .map(|repository| flotilla_protocol::RepoKey(repository.spec.repo_fact_value())),
+                    )
                     .path(spec.path.clone())
                     .branch(spec.r#ref.clone())
                     .host(self.local_host.clone())
@@ -1578,11 +1583,11 @@ impl Aggregator {
         let name = &session.metadata.name;
         let attach = attachable_sessions.contains(&key).then(|| name.clone());
         let repository_key = session.metadata.labels.get(REPO_KEY_LABEL).cloned().map(RepositoryKey);
+        let repository = repository_key.as_ref().and_then(|key| self.repositories.get(key));
         let repository_label = repository_key.as_ref().map_or_else(
             || session.metadata.labels.get(REPO_LABEL).cloned(),
             |key| {
-                self.repositories
-                    .get(key)
+                repository
                     .map(|repository| repository.spec.qualified_label())
                     .or_else(|| session.metadata.labels.get(REPO_LABEL).filter(|label| *label != &key.0).cloned())
                     .or_else(|| Some(UNKNOWN_REPOSITORY_LABEL.to_string()))
@@ -1593,6 +1598,7 @@ impl Aggregator {
                 .resource(resource)
                 .name(name)
                 .maybe_repo(repository_label.map(flotilla_protocol::RepoKey))
+                .maybe_repo_fact(repository.map(|repository| flotilla_protocol::RepoKey(repository.spec.repo_fact_value())))
                 .maybe_repository_key(repository_key)
                 .host(host)
                 .maybe_attach(attach)
@@ -1679,11 +1685,11 @@ impl Aggregator {
     }
 
     fn convoy_repo_fact(&self, convoy: &ResourceObject<Convoy>) -> Option<String> {
-        match convoy.spec.repositories.as_slice() {
-            [snapshot] => self.repositories.get(&snapshot.repo_ref).map(|repository| repository.spec.fact_slug()),
-            [] => None,
-            _ => None,
-        }
+        convoy
+            .spec
+            .sole_repository()
+            .and_then(|snapshot| self.repositories.get(&snapshot.repo_ref))
+            .map(|repository| repository.spec.repo_fact_value())
     }
 
     fn summarize_vessel(&self, convoy_ref: &ResourceRef, definition: &VesselRequirement, state: Option<&WorkState>) -> VesselRow {
