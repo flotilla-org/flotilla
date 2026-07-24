@@ -499,6 +499,7 @@ impl PeerRuntime {
                                                             request_id,
                                                             requester_node_id,
                                                             responder_node_id: local_node_id,
+                                                            responder_display_name: peer_daemon.host_name().to_string(),
                                                             remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
                                                             repo_identity: repo,
                                                             repository_key,
@@ -924,6 +925,7 @@ pub(super) async fn send_local_to_peers(
     clock.tick(node_id);
     let msg = PeerDataMessage {
         origin_node_id: node_id.clone(),
+        origin_display_name: daemon.host_name().to_string(),
         repo_identity: identity,
         repository_key: daemon.repository_key_for_path(repo_path).await,
         host_repo_root: Some(repo_path.to_path_buf()),
@@ -994,6 +996,7 @@ pub(super) async fn send_local_to_peer(
         clock.tick(node_id);
         let msg = PeerDataMessage {
             origin_node_id: node_id.clone(),
+            origin_display_name: daemon.host_name().to_string(),
             repo_identity: identity,
             repository_key: daemon.repository_key_for_path(&repo_path).await,
             host_repo_root: Some(repo_path.clone()),

@@ -739,6 +739,7 @@ mod tests {
             .expect("serialize hello");
             let peer = serde_json::to_string(&Message::Peer(Box::new(PeerWireMessage::Data(PeerDataMessage {
                 origin_node_id: NodeId::new("remote"),
+                origin_display_name: "remote".into(),
                 repo_identity: flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
                 repository_key: None,
                 host_repo_root: Some(PathBuf::from("/home/remote/repo")),

@@ -19,6 +19,7 @@ fn snapshot_msg(origin: &str, seq: u64) -> PeerDataMessage {
     }
     PeerDataMessage {
         origin_node_id: NodeId::new(origin),
+        origin_display_name: origin.to_string(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -105,6 +106,7 @@ async fn handle_snapshot_without_host_repo_root_stores_none() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("remote"),
+        origin_display_name: "remote".into(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: None,
@@ -126,6 +128,7 @@ async fn legacy_direct_request_resync_is_ignored() {
 
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("remote"),
+        origin_display_name: "remote".into(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -148,6 +151,7 @@ async fn handle_delta_returns_needs_resync() {
 
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("remote"),
+        origin_display_name: "remote".into(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -237,6 +241,7 @@ async fn relay_skips_peers_already_in_clock() {
     clock.tick(&NodeId::new("leader"));
     let msg = PeerDataMessage {
         origin_node_id: NodeId::new("F1"),
+        origin_display_name: "F1".into(),
         repo_identity: test_repo(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/home/dev/repo")),
@@ -694,6 +699,7 @@ async fn late_resync_snapshot_is_dropped_without_pending_request() {
                 request_id: 1,
                 requester_node_id: NodeId::new("local"),
                 responder_node_id: NodeId::new("target"),
+                responder_display_name: "target".into(),
                 remaining_hops: 3,
                 repo_identity: test_repo(),
                 repository_key: None,
@@ -923,6 +929,37 @@ async fn topology_routes_sort_fallbacks_by_most_recently_learned() {
 }
 
 #[tokio::test]
+async fn topology_routes_use_gossiped_name_for_learned_peer() {
+    let mut mgr = PeerManager::new(NodeId::new("feta-id"));
+    let relay_generation =
+        accepted_generation(mgr.activate_connection(NodeId::new("kiwi-id"), MockPeerSender::discard(), ConnectionMeta {
+            direction: ConnectionDirection::Inbound,
+            config_label: None,
+            expected_peer: None,
+            config_backed: false,
+        }));
+    let mut message = snapshot_msg("udder-id", 1);
+    message.origin_display_name = "udder".into();
+
+    let result = mgr
+        .handle_inbound(InboundPeerEnvelope {
+            msg: PeerWireMessage::Data(message),
+            connection_generation: relay_generation,
+            connection_peer: NodeId::new("kiwi-id"),
+        })
+        .await;
+
+    assert_eq!(result, HandleResult::Updated(test_repo()));
+    let route = mgr
+        .topology_routes()
+        .into_iter()
+        .find(|route| route.target.node_id == NodeId::new("udder-id"))
+        .expect("learned route should be exposed");
+    assert_eq!(route.target.display_name, "udder");
+    assert_eq!(route.next_hop.node_id, NodeId::new("kiwi-id"));
+}
+
+#[tokio::test]
 async fn disconnect_peer_keeps_unrelated_pending_resync_requests() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
     let _ = accepted_generation(mgr.activate_connection(NodeId::new("target"), MockPeerSender::discard(), ConnectionMeta {
@@ -1028,6 +1065,7 @@ async fn failover_resync_for_relayed_origin_accepts_same_clock_snapshot() {
                 request_id,
                 requester_node_id: NodeId::new("local"),
                 responder_node_id: NodeId::new("target"),
+                responder_display_name: "target".into(),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
                 repository_key: None,
@@ -1092,6 +1130,7 @@ async fn failover_resync_accepts_snapshot_without_host_repo_root() {
                 request_id,
                 requester_node_id: NodeId::new("local"),
                 responder_node_id: NodeId::new("target"),
+                responder_display_name: "target".into(),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
                 repository_key: None,
@@ -1213,6 +1252,7 @@ async fn failover_resync_clears_stale_and_rebinds_provenance() {
                 request_id: request,
                 requester_node_id: NodeId::new("local"),
                 responder_node_id: NodeId::new("target"),
+                responder_display_name: "target".into(),
                 remaining_hops: 4,
                 repo_identity: baseline.repo_identity.clone(),
                 repository_key: None,

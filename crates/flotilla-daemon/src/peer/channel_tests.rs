@@ -23,6 +23,7 @@ fn snapshot_msg(origin: &str, repo: &RepoIdentity, seq: u64) -> PeerDataMessage 
     }
     PeerDataMessage {
         origin_node_id: node(origin),
+        origin_display_name: origin.to_string(),
         repo_identity: repo.clone(),
         repository_key: None,
         host_repo_root: Some(PathBuf::from("/repo")),
