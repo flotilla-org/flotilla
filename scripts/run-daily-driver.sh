@@ -43,5 +43,5 @@ if [[ "$ZELLIJ_BIN" == "$ZELLIJ_NATIVE_ROOT/target/dev-opt/zellij" ]]; then
     fi
     "$ZELLIJ_NATIVE_ROOT/scripts/build-native-andamento"
 fi
-
+echo "Trying to run $ZELLIJ_BIN" 
 exec "$ZELLIJ_BIN" --layout "$FLOTILLA_ROOT/layouts/daily-driver.kdl"
