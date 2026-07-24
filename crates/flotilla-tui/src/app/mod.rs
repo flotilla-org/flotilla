@@ -692,7 +692,8 @@ impl App {
 
     pub(crate) fn set_project_issue_start_pending(&mut self, ctx: &ProjectIssueStartContext, status: PendingStatus, description: String) {
         let ViewAddress::Project { namespace, name } = &ctx.address else { return };
-        let query = flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new(namespace, name), search: None };
+        let query =
+            flotilla_protocol::QueryId::Issues { scope: flotilla_protocol::QueryScope::new(namespace, name), search: None, label: None };
         let Some(index) = self.views.find(&ctx.address) else { return };
         let Some(view) = self.views.get_mut(index) else { return };
         let state = view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues);

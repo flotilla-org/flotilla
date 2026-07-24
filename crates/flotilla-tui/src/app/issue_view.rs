@@ -306,7 +306,7 @@ mod tests {
             pending_fetch: None,
         });
         state.search = Some(IssuePagingState {
-            params: IssueQuery { search: Some("search".into()) },
+            params: IssueQuery { search: Some("search".into()), label: None },
             items: vec![test_issue("2", "Search result")],
             next_page: 2,
             total: Some(1),
@@ -381,7 +381,7 @@ mod tests {
             pending_fetch: None,
         });
         state.search = Some(IssuePagingState {
-            params: IssueQuery { search: Some("test".into()) },
+            params: IssueQuery { search: Some("test".into()), label: None },
             items: vec![],
             next_page: 1,
             total: None,

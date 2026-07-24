@@ -251,8 +251,8 @@ async fn load_window(
     state: &AggregatorProjectionState,
     event_tx: &broadcast::Sender<DaemonEvent>,
 ) -> MaterializedWindow {
-    let QueryId::Issues { scope, search } = query else { unreachable!("issue materializer only accepts issue queries") };
-    let params = IssueQuery { search: search.clone() };
+    let QueryId::Issues { scope, search, label } = query else { unreachable!("issue materializer only accepts issue queries") };
+    let params = IssueQuery { search: search.clone(), label: label.clone() };
     let sources = match resolver.resolve_issue_sources(scope).await {
         Ok(sources) if !sources.is_empty() => sources,
         Ok(_) => {
@@ -433,7 +433,7 @@ async fn refresh_window(
                 }
                 for issue in changes.updated {
                     let reference = issue.reference.clone();
-                    if issue.state == IssueState::Open {
+                    if issue.state == IssueState::Open && issue_matches_query(&issue, query) {
                         source.rows.insert(reference.clone(), IssueRow { reference, issue });
                     } else {
                         source.rows.remove(&reference);
@@ -557,8 +557,13 @@ async fn query_page(
 }
 
 fn issue_params(query: &QueryId) -> IssueQuery {
-    let QueryId::Issues { search, .. } = query else { unreachable!("issue params require an issue query") };
-    IssueQuery { search: search.clone() }
+    let QueryId::Issues { search, label, .. } = query else { unreachable!("issue params require an issue query") };
+    IssueQuery { search: search.clone(), label: label.clone() }
+}
+
+fn issue_matches_query(issue: &flotilla_protocol::Issue, query: &QueryId) -> bool {
+    let QueryId::Issues { label, .. } = query else { return false };
+    label.as_ref().is_none_or(|label| issue.labels.iter().any(|candidate| candidate.eq_ignore_ascii_case(label)))
 }
 
 async fn changed_since(
@@ -824,7 +829,7 @@ mod tests {
     }
 
     fn project_query(name: &str) -> QueryId {
-        QueryId::Issues { scope: QueryScope::new("flotilla", name), search: None }
+        QueryId::Issues { scope: QueryScope::new("flotilla", name), search: None, label: None }
     }
 
     fn subscribe(state: &AggregatorProjectionState, query: &QueryId) -> u64 {
@@ -952,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn project_demand_unions_constituent_source_windows() {
         let state = AggregatorProjectionState::new();
-        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "platform"), search: None };
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "platform"), search: None, label: None };
         let source_a = IssueSource { service: "https://issues.example".into(), scope: "widgets/api".into() };
         let source_b = IssueSource { service: "https://issues.example".into(), scope: "widgets/ui".into() };
         let provider = Arc::new(ScriptedProvider::new(vec![page(&["WIDGET-123"], false), page(&["WIDGET-123"], false)], vec![]));

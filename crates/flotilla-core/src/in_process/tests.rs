@@ -4229,7 +4229,7 @@ async fn issue_subscription_materializes_until_its_in_process_handle_drops() {
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
     let subscriber = uuid::Uuid::new_v4();
     let subscription = daemon.query_subscription(subscriber);
-    let query = QueryId::Issues { scope: QueryScope::new("flotilla", "abc"), search: None };
+    let query = QueryId::Issues { scope: QueryScope::new("flotilla", "abc"), search: None, label: None };
 
     let events =
         daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("subscribe to issue query");
@@ -4254,7 +4254,7 @@ async fn recreated_issue_materialization_replays_even_when_cursor_matches_initia
     let daemon =
         InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
     let subscriber = uuid::Uuid::new_v4();
-    let query = QueryId::Issues { scope: QueryScope::new("flotilla", "recreated"), search: None };
+    let query = QueryId::Issues { scope: QueryScope::new("flotilla", "recreated"), search: None, label: None };
 
     daemon.subscribe_queries(subscriber, &[QueryCursor { query: query.clone(), since: None }]).await.expect("initial subscription");
     daemon.unsubscribe_queries(subscriber).await;

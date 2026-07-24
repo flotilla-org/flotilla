@@ -544,9 +544,11 @@ pub struct QueryRows<'a, R> {
 /// curated table families to prevent subscription/projection drift.
 pub fn query_for(address: &ViewAddress, source_search: Option<&str>) -> Option<QueryId> {
     match address {
-        ViewAddress::Issues { scope } => {
-            Some(QueryId::Issues { scope: scope.clone(), search: source_search.filter(|search| !search.is_empty()).map(str::to_owned) })
-        }
+        ViewAddress::Issues { scope } => Some(QueryId::Issues {
+            scope: scope.clone(),
+            search: source_search.filter(|search| !search.is_empty()).map(str::to_owned),
+            label: None,
+        }),
         ViewAddress::Checkouts { scope } => Some(QueryId::Checkouts { scope: scope.clone() }),
         ViewAddress::Independents { scope } => Some(QueryId::Independents { scope: scope.clone() }),
         _ => None,
@@ -1531,7 +1533,7 @@ mod tests {
         let issue = TestIssue::new("Composite project issue").id("ENG-42").build();
         let issue_row = IssueRow { reference: issue.reference.clone(), issue };
         let independent = independent("governor", "feta", Some("terminal-governor"));
-        let issue_query = QueryId::Issues { scope: scope.clone(), search: None };
+        let issue_query = QueryId::Issues { scope: scope.clone(), search: None, label: None };
         let checkout_query = QueryId::Checkouts { scope: Some(scope.clone()) };
         let independent_query = QueryId::Independents { scope: Some(scope.clone()) };
         let awareness_query =
@@ -1640,7 +1642,7 @@ mod tests {
         let issue = TestIssue::new("Start convoy from scoped issue").id("ENG-42").build();
         let row = IssueRow { reference: issue.reference.clone(), issue };
         let scope = QueryScope::new("flotilla", "roadmap");
-        let query = QueryId::Issues { scope: scope.clone(), search: None };
+        let query = QueryId::Issues { scope: scope.clone(), search: None, label: None };
         let state = ResultSetState {
             demand: Some(DemandBackedMetadata { as_of: "2026-07-20T12:00:00Z".parse().expect("timestamp"), has_more: true }),
             conditions: vec![ResultSetCondition::IssueSourceUnavailable { source: None, message: "one source is unavailable".into() }],
@@ -1763,7 +1765,7 @@ mod tests {
         let mut state = TableState::default();
         let convoy = RowId::new("dev/tables");
         let issue = RowId::new("issue:809");
-        let issues_query = QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None };
+        let issues_query = QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None, label: None };
         state.begin_pending(QueryId::Convoys, convoy.clone(), "Delete convoy".into()).expect("convoy should become pending");
         state.begin_pending(issues_query.clone(), issue.clone(), "Start convoy".into()).expect("issue should become pending");
 

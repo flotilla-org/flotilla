@@ -41,6 +41,9 @@ pub enum QueryId {
         /// window for the Project.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search: Option<String>,
+        /// An optional provider-side label filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
     /// Concrete observed checkouts fleet-wide (`None`) or in one Project.
     Checkouts { scope: Option<QueryScope> },
@@ -151,6 +154,8 @@ pub enum QueryChanges {
         scope: QueryScope,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         changed: Vec<IssueRow>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<IssueRef>,
@@ -176,7 +181,9 @@ impl QueryChanges {
         match self {
             Self::Convoys { .. } => QueryId::Convoys,
             Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
-            Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
+            Self::Issues { scope, search, label, .. } => {
+                QueryId::Issues { scope: scope.clone(), search: search.clone(), label: label.clone() }
+            }
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
             Self::Awareness { scope, grouping, limit, .. } => {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
@@ -308,6 +315,8 @@ pub enum Rows {
         scope: QueryScope,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         search: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
         rows: Vec<IssueRow>,
     },
     Checkouts {
@@ -327,7 +336,9 @@ impl Rows {
         match self {
             Self::Convoys(_) => QueryId::Convoys,
             Self::Independents { scope, .. } => QueryId::Independents { scope: scope.clone() },
-            Self::Issues { scope, search, .. } => QueryId::Issues { scope: scope.clone(), search: search.clone() },
+            Self::Issues { scope, search, label, .. } => {
+                QueryId::Issues { scope: scope.clone(), search: search.clone(), label: label.clone() }
+            }
             Self::Checkouts { scope, .. } => QueryId::Checkouts { scope: scope.clone() },
             Self::Awareness { scope, grouping, limit, .. } => {
                 QueryId::Awareness { scope: scope.clone(), grouping: *grouping, limit: *limit }
@@ -957,7 +968,7 @@ mod tests {
 
     #[test]
     fn issues_query_round_trips_with_owned_project_scope() {
-        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: None };
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: None, label: None };
 
         let json = serde_json::to_string(&query).expect("serialize scoped query");
         assert_eq!(json, r#"{"issues":{"scope":{"namespace":"flotilla","name":"dashboard"}}}"#);
@@ -966,10 +977,19 @@ mod tests {
 
     #[test]
     fn ephemeral_issue_search_is_part_of_query_identity() {
-        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: Some("is:open crash".into()) };
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: Some("is:open crash".into()), label: None };
 
         let json = serde_json::to_string(&query).expect("serialize scoped query");
         assert_eq!(json, r#"{"issues":{"scope":{"namespace":"flotilla","name":"dashboard"},"search":"is:open crash"}}"#);
+        assert_eq!(serde_json::from_str::<QueryId>(&json).expect("deserialize scoped query"), query);
+    }
+
+    #[test]
+    fn issue_label_filter_is_part_of_query_identity() {
+        let query = QueryId::Issues { scope: QueryScope::new("flotilla", "dashboard"), search: None, label: Some("ready".into()) };
+
+        let json = serde_json::to_string(&query).expect("serialize scoped query");
+        assert_eq!(json, r#"{"issues":{"scope":{"namespace":"flotilla","name":"dashboard"},"label":"ready"}}"#);
         assert_eq!(serde_json::from_str::<QueryId>(&json).expect("deserialize scoped query"), query);
     }
 
@@ -983,6 +1003,7 @@ mod tests {
             changes: QueryChanges::Issues {
                 scope: scope.clone(),
                 search: None,
+                label: None,
                 changed: vec![IssueRow {
                     reference: reference.clone(),
                     issue: Issue {
@@ -1003,7 +1024,7 @@ mod tests {
             state: None,
         };
 
-        assert_eq!(delta.query(), QueryId::Issues { scope, search: None });
+        assert_eq!(delta.query(), QueryId::Issues { scope, search: None, label: None });
         let json = serde_json::to_string(&delta).expect("serialize issue delta");
         let decoded = serde_json::from_str::<ResultDelta>(&json).expect("deserialize issue delta");
         assert_eq!(decoded, delta);
@@ -1026,7 +1047,7 @@ mod tests {
         };
         let delta = ResultDelta {
             seq: 2,
-            changes: QueryChanges::Issues { scope, search: None, changed: vec![], removed: vec![] },
+            changes: QueryChanges::Issues { scope, search: None, label: None, changed: vec![], removed: vec![] },
             state: Some(state.clone()),
         };
 

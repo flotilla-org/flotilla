@@ -48,7 +48,7 @@ impl InteractiveWidget for IssueSearchWidget {
                         context_repo: None,
                         action: CommandAction::QueryIssues {
                             repo: RepoSelector::Identity(repo_identity.clone()),
-                            params: IssueQuery { search: Some(query.clone()) },
+                            params: IssueQuery { search: Some(query.clone()), label: None },
                             page: 1,
                             count: 50,
                         },

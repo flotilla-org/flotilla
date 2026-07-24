@@ -1848,7 +1848,7 @@ fn set_search_query_resets_search_paging_state() {
     let mut view = IssueViewState::new();
     view.search_query = Some("alpha".into());
     view.search = Some(IssuePagingState {
-        params: IssueQuery { search: Some("alpha".into()) },
+        params: IssueQuery { search: Some("alpha".into()), label: None },
         items: vec![TestIssue::new("Alpha result").id("1").build()],
         next_page: 2,
         total: Some(10),
@@ -1880,7 +1880,7 @@ fn stale_search_results_discarded_by_drain() {
     let mut view = IssueViewState::new();
     view.search_query = Some("beta".into());
     view.search = Some(IssuePagingState {
-        params: IssueQuery { search: Some("beta".into()) },
+        params: IssueQuery { search: Some("beta".into()), label: None },
         items: vec![],
         next_page: 1,
         total: None,
@@ -1893,7 +1893,7 @@ fn stale_search_results_discarded_by_drain() {
     app.issue_update_tx
         .send(IssueQueryUpdate::PageFetched {
             repo: repo.clone(),
-            params: IssueQuery { search: Some("alpha".into()) },
+            params: IssueQuery { search: Some("alpha".into()), label: None },
             requested_page: 1,
             page: IssueResultPage {
                 items: vec![TestIssue::new("Stale alpha result").id("stale").build()],
@@ -1907,7 +1907,7 @@ fn stale_search_results_discarded_by_drain() {
     app.issue_update_tx
         .send(IssueQueryUpdate::PageFetched {
             repo: repo.clone(),
-            params: IssueQuery { search: Some("beta".into()) },
+            params: IssueQuery { search: Some("beta".into()), label: None },
             requested_page: 1,
             page: IssueResultPage { items: vec![TestIssue::new("Fresh beta result").id("fresh").build()], total: Some(1), has_more: false },
         })

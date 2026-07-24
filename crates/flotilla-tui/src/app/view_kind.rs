@@ -27,6 +27,7 @@ pub(crate) fn queries(address: &ViewAddress, source_search: Option<&str>) -> Vec
                 QueryId::Issues {
                     scope: QueryScope::new(namespace, name),
                     search: source_search.filter(|search| !search.is_empty()).map(str::to_owned),
+                    label: None,
                 },
                 QueryId::Independents { scope: Some(QueryScope::new(namespace, name)) },
             ]
@@ -99,7 +100,7 @@ mod tests {
             },
             QueryId::Convoys,
             QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
-            QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None },
+            QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None, label: None },
             QueryId::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) },
         ]);
         assert_eq!(kind_modes(Some(&address)), vec![BindingModeId::Convoys, BindingModeId::DemandTable, BindingModeId::Project]);
@@ -111,6 +112,7 @@ mod tests {
         assert_eq!(queries(&address, Some("widget")), vec![QueryId::Issues {
             scope: QueryScope::new("flotilla", "roadmap"),
             search: Some("widget".into()),
+            label: None,
         }]);
     }
 
