@@ -20,6 +20,7 @@ use std::{
     time::Duration,
 };
 
+pub use flotilla_client::reconnect::is_incompatible_daemon_error;
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_manifest::{
     keys::REASSERT_INTERVAL_MS,
@@ -36,45 +37,9 @@ use flotilla_protocol::{
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
-const RECONNECT_INITIAL_DELAY: Duration = Duration::from_millis(500);
-const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
-
-pub struct ReconnectBackoff {
-    next_base: Duration,
-}
-
-impl Default for ReconnectBackoff {
-    fn default() -> Self {
-        Self { next_base: RECONNECT_INITIAL_DELAY }
-    }
-}
-
-impl ReconnectBackoff {
-    pub fn reset(&mut self) {
-        self.next_base = RECONNECT_INITIAL_DELAY;
-    }
-
-    pub fn next_delay(&mut self) -> Duration {
-        let random = uuid::Uuid::new_v4().as_u128() as u64;
-        self.next_delay_with_jitter(random as f64 / u64::MAX as f64)
-    }
-
-    fn next_delay_with_jitter(&mut self, unit: f64) -> Duration {
-        let base = self.next_base;
-        self.next_base = std::cmp::min(base.saturating_mul(2), RECONNECT_MAX_DELAY);
-        let factor = 0.5 + 0.5 * unit.clamp(0.0, 1.0);
-        Duration::from_secs_f64(base.as_secs_f64() * factor)
-    }
-}
-
-pub fn is_incompatible_daemon_error(error: &str) -> bool {
-    error.contains("protocol version mismatch")
-}
-
 async fn run_reconnecting<Connect, ConnectFuture, Connected, ConnectedFuture>(
     mut connect: Connect,
     mut run_connected: Connected,
-    mut backoff: ReconnectBackoff,
 ) -> Result<(), String>
 where
     Connect: FnMut() -> ConnectFuture,
@@ -83,21 +48,18 @@ where
     ConnectedFuture: Future<Output = Result<(), String>>,
 {
     loop {
-        match connect().await {
-            Ok(daemon) => {
-                backoff.reset();
-                info!("connected to daemon");
-                if let Err(error) = run_connected(daemon).await {
-                    info!(%error, "daemon connection ended; reconnecting");
-                }
+        let daemon = flotilla_client::reconnect::connect_with_retry(&mut connect, |notice| match notice {
+            flotilla_client::reconnect::ReconnectNotice::Attempt { attempt } => debug!(attempt, "connecting to daemon"),
+            flotilla_client::reconnect::ReconnectNotice::Retry { attempt, error, delay } => {
+                info!(attempt, %error, ?delay, "daemon unavailable; retrying")
             }
-            Err(error) if is_incompatible_daemon_error(&error) => return Err(error),
-            Err(error) => info!(%error, "daemon unavailable; retrying"),
+        })
+        .await?;
+        flotilla_client::reconnect::warn_on_build_mismatch(daemon.as_ref());
+        info!("connected to daemon");
+        if let Err(error) = run_connected(daemon).await {
+            info!(%error, "daemon connection ended; reconnecting");
         }
-
-        let delay = backoff.next_delay();
-        debug!(?delay, "waiting before daemon reconnect");
-        tokio::time::sleep(delay).await;
     }
 }
 
@@ -369,7 +331,6 @@ pub async fn run(
             .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },
         |daemon| run_connector(daemon, sink.clone(), mint.clone(), Duration::from_millis(REASSERT_INTERVAL_MS)),
-        ReconnectBackoff::default(),
     )
     .await
 }

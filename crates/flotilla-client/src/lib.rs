@@ -18,6 +18,9 @@ use flotilla_transport::message::{connect_unix_message_session, MessageSession};
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
+pub mod reconnect;
+pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
+
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
 /// avoids the race where a spawned seq update hasn't run before the next delta
@@ -60,21 +63,21 @@ impl Drop for SpawnLockGuard {
 ///
 /// Sends a `Hello` with `ConnectionRole::Client` and a fresh `session_id`,
 /// then waits for the server's Hello reply.
-async fn do_client_hello(session: &MessageSession) -> Result<(), String> {
+async fn do_client_hello(session: &MessageSession) -> Result<Option<String>, String> {
     do_client_hello_with_surface(session, None).await
 }
 
-async fn do_client_hello_with_declared_surface(session: &MessageSession, surface: SurfaceDeclaration) -> Result<(), String> {
+async fn do_client_hello_with_declared_surface(session: &MessageSession, surface: SurfaceDeclaration) -> Result<Option<String>, String> {
     do_client_hello_with_surface(session, Some(surface)).await
 }
 
-async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<SurfaceDeclaration>) -> Result<(), String> {
+async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<SurfaceDeclaration>) -> Result<Option<String>, String> {
     let session_id = uuid::Uuid::new_v4();
     session
         .write(Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: NodeId::new("client"),
-            display_name: "client".into(),
+            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID),
             session_id,
             connection_role: Some(ConnectionRole::Client),
             surface,
@@ -83,10 +86,14 @@ async fn do_client_hello_with_surface(session: &MessageSession, surface: Option<
         .map_err(|e| format!("failed to send Hello: {e}"))?;
 
     match session.read().await.map_err(|e| format!("failed to read Hello reply: {e}"))? {
-        Some(Message::Hello { protocol_version, .. }) if protocol_version != PROTOCOL_VERSION => Err(format!(
-            "daemon protocol version mismatch: daemon has {protocol_version}, client has {PROTOCOL_VERSION} — restart the daemon"
-        )),
-        Some(Message::Hello { .. }) => Ok(()),
+        Some(Message::Hello { protocol_version, display_name, .. }) if protocol_version != PROTOCOL_VERSION => {
+            let daemon_build = flotilla_protocol::hello_build_id(&display_name).unwrap_or("unknown");
+            Err(format!(
+                "daemon protocol version mismatch: daemon has {protocol_version} ({daemon_build}), client has {PROTOCOL_VERSION} ({})",
+                BUILD_ID
+            ))
+        }
+        Some(Message::Hello { display_name, .. }) => Ok(flotilla_protocol::hello_build_id(&display_name).map(str::to_owned)),
         Some(other) => Err(format!("expected Hello reply, got: {other:?}")),
         None => Err("connection closed before Hello reply".into()),
     }
@@ -103,6 +110,7 @@ pub struct SocketDaemon {
     local_seqs: Arc<SeqMap>,
     subscribed_queries: Arc<QuerySet>,
     initial_sync_complete: Arc<AtomicBool>,
+    daemon_build_id: Option<String>,
 }
 
 impl SocketDaemon {
@@ -126,16 +134,20 @@ impl SocketDaemon {
     /// handshake with `ConnectionRole::Client` so the server assigns cursor
     /// ownership to our `session_id`.
     pub async fn from_session_stateful(session: MessageSession) -> Result<Arc<Self>, String> {
-        do_client_hello(&session).await?;
-        Self::from_session(session)
+        let daemon_build_id = do_client_hello(&session).await?;
+        Self::from_session_with_build_id(session, daemon_build_id)
     }
 
     pub async fn from_session_stateful_with_surface(session: MessageSession, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
-        do_client_hello_with_declared_surface(&session, surface).await?;
-        Self::from_session(session)
+        let daemon_build_id = do_client_hello_with_declared_surface(&session, surface).await?;
+        Self::from_session_with_build_id(session, daemon_build_id)
     }
 
     pub fn from_session(session: MessageSession) -> Result<Arc<Self>, String> {
+        Self::from_session_with_build_id(session, None)
+    }
+
+    fn from_session_with_build_id(session: MessageSession, daemon_build_id: Option<String>) -> Result<Arc<Self>, String> {
         let session = Arc::new(session);
 
         let (event_tx, _) = broadcast::channel(256);
@@ -215,6 +227,7 @@ impl SocketDaemon {
             local_seqs: Arc::clone(&local_seqs),
             subscribed_queries: Arc::clone(&subscribed_queries),
             initial_sync_complete,
+            daemon_build_id,
         });
 
         Ok(daemon)
@@ -910,6 +923,10 @@ async fn recover_query_gap(ctx: &EventContext) {
 
 #[async_trait]
 impl DaemonHandle for SocketDaemon {
+    fn build_id(&self) -> Option<&str> {
+        self.daemon_build_id.as_deref()
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
         match self.event_tx.upgrade() {
             Some(event_tx) => event_tx.subscribe(),

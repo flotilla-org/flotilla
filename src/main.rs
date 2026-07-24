@@ -1,4 +1,9 @@
-use std::{future::Future, path::PathBuf, process::ExitStatus, sync::Arc};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    process::ExitStatus,
+    sync::Arc,
+};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -291,7 +296,7 @@ async fn main() -> Result<()> {
     let format = OutputFormat::from_json_flag(cli.json);
     let command = cli.command.take();
 
-    match command {
+    let result = match command {
         Some(SubCommand::View { address }) => {
             // Parse before touching the terminal so a bad address in a
             // recipe fails loudly at the shell (ADR 0013).
@@ -345,6 +350,37 @@ async fn main() -> Result<()> {
         }
 
         None => run_tui(cli, None).await,
+    };
+
+    if let Err(error) = &result {
+        let message = format!("{error:?}");
+        let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
+        if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref()) {
+            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
+            reexec_current_process()?;
+        }
+    }
+    result
+}
+
+fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>) -> bool {
+    flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error) && already_reexecuted_build != Some(flotilla_tui::socket::BUILD_ID)
+}
+
+fn reexec_current_process() -> Result<()> {
+    let executable = std::env::current_exe()?;
+    let mut command = std::process::Command::new(executable);
+    command.args(std::env::args_os().skip(1));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let error = command.exec();
+        Err(error.into())
+    }
+    #[cfg(not(unix))]
+    {
+        command.spawn()?;
+        std::process::exit(0);
     }
 }
 
@@ -442,22 +478,21 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     });
 
     show_startup_splash(scoped_view.as_ref(), || flotilla_tui::splash::show_splash(&mut terminal)).await?;
-    let mut daemon = match daemon_task.await {
+    let daemon = match daemon_task.await {
         Ok(Ok(daemon)) => {
+            std::env::remove_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV);
             info!(elapsed = ?startup.elapsed(), "daemon ready");
             daemon
         }
         Ok(Err(e)) => {
             flotilla_tui::terminal::restore_terminal();
-            eprintln!("Error: {e}");
             eprintln!("  Check daemon log at {}", daemon_log_path.display());
             eprintln!("  Check panic log at {}", daemon_panic_log_path.display());
-            std::process::exit(1);
+            return Err(color_eyre::eyre::eyre!(e));
         }
         Err(e) => {
             flotilla_tui::terminal::restore_terminal();
-            eprintln!("Error: daemon initialization panicked: {e}");
-            std::process::exit(1);
+            return Err(color_eyre::eyre::eyre!("daemon initialization panicked: {e}"));
         }
     };
 
@@ -482,47 +517,85 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     }
 
     let pm_connector = flotilla_tui::pm_open::detect_connector();
-    loop {
-        let repos_info = daemon.list_repos().await.unwrap_or_default();
-        let app = match scoped_view.clone() {
-            Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
-            None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
-        }
-        .with_pm_connector(pm_connector.clone());
+    let repos_info = daemon.list_repos().await.unwrap_or_default();
+    let mut app = match scoped_view.clone() {
+        Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
+        None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
+    }
+    .with_pm_connector(pm_connector.clone());
+    restore_tui_handoff(&mut app);
 
+    loop {
         match flotilla_tui::run::run_event_loop(terminal, app).await? {
             flotilla_tui::run::EventLoopExit::Quit => return Ok(()),
-            flotilla_tui::run::EventLoopExit::DaemonDisconnected => {
+            flotilla_tui::run::EventLoopExit::DaemonDisconnected(disconnected_app) => {
                 info!("daemon disconnected; reconnecting TUI");
+                app = *disconnected_app;
             }
         }
 
-        let mut backoff = flotilla_tui::pm_connect::ReconnectBackoff::default();
-        loop {
-            match flotilla_tui::socket::connect_or_spawn(
-                &socket_path,
-                &resolved_config_dir,
-                config_dir_override.as_deref(),
-                socket_override.as_deref(),
-            )
-            .await
-            {
-                Ok(connected) => {
-                    info!("TUI reconnected to daemon");
-                    daemon = connected as Arc<dyn DaemonHandle>;
-                    terminal = ratatui::init();
-                    break;
+        terminal = ratatui::init();
+        let connected = match flotilla_tui::socket::reconnect::connect_with_retry(
+            || {
+                flotilla_tui::socket::connect_or_spawn(
+                    &socket_path,
+                    &resolved_config_dir,
+                    config_dir_override.as_deref(),
+                    socket_override.as_deref(),
+                )
+            },
+            |notice| {
+                let (attempt, detail) = match notice {
+                    flotilla_tui::socket::reconnect::ReconnectNotice::Attempt { attempt } => (attempt, None),
+                    flotilla_tui::socket::reconnect::ReconnectNotice::Retry { attempt, error, delay } => {
+                        (attempt, Some(format!("{error} — retrying in {:.1}s", delay.as_secs_f64())))
+                    }
+                };
+                if let Err(error) = flotilla_tui::run::render_reconnect_frame(&mut terminal, attempt, detail.as_deref(), &initial_theme) {
+                    tracing::warn!(%error, "failed to render daemon reconnect status");
                 }
-                Err(error) if flotilla_tui::pm_connect::is_incompatible_daemon_error(&error) => {
-                    return Err(color_eyre::eyre::eyre!(error));
+            },
+        )
+        .await
+        {
+            Ok(connected) => connected,
+            Err(error) => {
+                if let Err(handoff_error) = persist_tui_handoff(&app, paths.state_dir.as_path()) {
+                    tracing::warn!(error = %handoff_error, "failed to persist TUI state for re-exec");
                 }
-                Err(error) => {
-                    let delay = backoff.next_delay();
-                    info!(%error, ?delay, "daemon unavailable; retrying TUI connection");
-                    tokio::time::sleep(delay).await;
-                }
+                flotilla_tui::terminal::restore_terminal();
+                return Err(color_eyre::eyre::eyre!(error));
             }
+        };
+        info!("TUI reconnected to daemon");
+        let repos_info = connected.list_repos().await.unwrap_or_default();
+        app.reconnect_daemon(connected as Arc<dyn DaemonHandle>, repos_info);
+    }
+}
+
+const TUI_HANDOFF_ENV: &str = "FLOTILLA_TUI_HANDOFF";
+
+fn persist_tui_handoff(app: &app::App, state_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let path = state_dir.join(format!("tui-handoff-{}-{}.json", std::process::id(), uuid::Uuid::new_v4()));
+    std::fs::write(&path, serde_json::to_vec(&app.handoff())?)?;
+    std::env::set_var(TUI_HANDOFF_ENV, &path);
+    Ok(())
+}
+
+fn restore_tui_handoff(app: &mut app::App) {
+    let Some(path) = std::env::var_os(TUI_HANDOFF_ENV).map(PathBuf::from) else { return };
+    std::env::remove_var(TUI_HANDOFF_ENV);
+    let handoff = std::fs::read(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|contents| serde_json::from_slice(&contents).map_err(|error| error.to_string()));
+    let _ = std::fs::remove_file(&path);
+    match handoff {
+        Ok(handoff) => {
+            app.restore_handoff(handoff);
+            app.ui.command_echo = Some("Re-executed and reconnected to daemon".to_string());
         }
+        Err(error) => tracing::warn!(%error, path = %path.display(), "could not restore TUI re-exec handoff"),
     }
 }
 
@@ -1413,14 +1486,22 @@ mod tests {
 
     use super::{
         attach_exit_disposition, provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        show_startup_splash, AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand,
-        SubCommand,
+        should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs,
+        ResourceListArgs, ResourceSubCommand, SubCommand,
     };
 
     #[test]
     fn attach_exit_disposition_preserves_child_exit_code() {
         let status = Command::new("sh").args(["-c", "exit 42"]).status().expect("run child");
         assert_eq!(attach_exit_disposition(status), AttachExitDisposition::Code(42));
+    }
+
+    #[test]
+    fn incompatible_daemon_reexecs_once_per_client_build() {
+        let mismatch = "daemon protocol version mismatch: daemon has 18, client has 17";
+        assert!(should_reexec_for_incompatible_daemon(mismatch, None));
+        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID)));
+        assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None));
     }
 
     #[cfg(unix)]

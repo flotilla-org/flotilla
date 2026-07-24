@@ -11,13 +11,14 @@ use flotilla_protocol::{
     IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience,
     SessionPhase, ViewAddress,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     convoy_model::{ConvoyPhase, ConvoySummary, VesselSummary, WorkPhase},
     pm_open::OpenInPmTarget,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RowId(String);
 
 impl RowId {
@@ -29,7 +30,7 @@ impl RowId {
 /// Transient state for a row while a user action is being reconciled by an
 /// authoritative query. Surfaces render this state in their own idiom; the
 /// state itself contains no ratatui types.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RowState {
     Submitting { query: QueryId, description: String },
     Pending { query: QueryId, command_id: u64, description: String },
@@ -62,7 +63,7 @@ pub struct PendingRowContext {
     pub row_id: RowId,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct TableState {
     selected: Option<RowId>,
     pub multi_selected: HashSet<RowId>,
@@ -206,7 +207,7 @@ impl TableState {
 /// Cursor and transient search state for the fixed Project composition. Each
 /// panel keeps the same tab-local state a standalone table owns; the page
 /// cursor selects which panel participates in keyboard actions.
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectTableState {
     active: ProjectPanelKind,
     header_focused: bool,
@@ -447,7 +448,7 @@ pub struct TableView {
 /// One fixed panel in the Project composite View. The panel owns no layout or
 /// input policy: it is the same curated table projection a single-kind View
 /// renders, with the address its header expands into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectPanelKind {
     Convoys,
     Checkouts,

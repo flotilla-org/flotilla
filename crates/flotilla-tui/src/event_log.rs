@@ -3,6 +3,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 /// Entry returned to the UI. Either a real log line or a retention marker.
@@ -19,6 +20,13 @@ pub struct LogEntry {
     /// Wall-clock hour, minute, second at time of logging.
     pub hms: (u8, u8, u8),
     pub level: tracing::Level,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffLogEntry {
+    pub hms: (u8, u8, u8),
+    pub level: String,
     pub message: String,
 }
 
@@ -187,6 +195,30 @@ static EVENT_LOG: LazyLock<Mutex<EventLog>> = LazyLock::new(|| Mutex::new(EventL
 /// Get display entries for the TUI, filtered by level, with retention markers.
 pub fn get_entries(filter: &tracing::Level) -> Vec<DisplayEntry> {
     EVENT_LOG.lock().unwrap().snapshot(filter)
+}
+
+pub fn handoff_entries() -> Vec<HandoffLogEntry> {
+    let log = EVENT_LOG.lock().expect("event log lock poisoned");
+    let mut entries: Vec<_> = [&log.error, &log.warn, &log.info, &log.debug, &log.trace]
+        .into_iter()
+        .flat_map(|bucket| bucket.entries.iter())
+        .map(|entry| {
+            (entry.seq, HandoffLogEntry { hms: entry.hms, level: entry.level.as_str().to_string(), message: entry.message.clone() })
+        })
+        .collect();
+    entries.sort_by_key(|(seq, _)| *seq);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+pub fn restore_handoff_entries(entries: Vec<HandoffLogEntry>) {
+    let mut log = EVENT_LOG.lock().expect("event log lock poisoned");
+    *log = EventLog::new();
+    for entry in entries {
+        let Ok(level) = entry.level.parse::<tracing::Level>() else { continue };
+        let seq = log.next_seq;
+        log.next_seq += 1;
+        log.bucket_mut(&level).push(LogEntry { seq, hms: entry.hms, level, message: entry.message });
+    }
 }
 
 /// Custom tracing layer that feeds the in-memory EventLog.

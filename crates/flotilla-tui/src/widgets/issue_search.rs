@@ -30,6 +30,10 @@ impl IssueSearchWidget {
     pub fn prefill(&mut self, text: &str) {
         self.input = Input::from(text);
     }
+
+    pub fn input_value(&self) -> &str {
+        self.input.value()
+    }
 }
 
 impl InteractiveWidget for IssueSearchWidget {

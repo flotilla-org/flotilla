@@ -30,6 +30,7 @@ use flotilla_protocol::{
 use indexmap::IndexMap;
 pub use intent::Intent;
 pub use open_views::{OpenView, OpenViews, ViewTarget};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tui_input::Input;
 use ui_state::PendingStatus;
@@ -42,7 +43,7 @@ use crate::{
     shared::Shared,
     theme::Theme,
     widgets::{
-        repo_page::{RepoData, RepoPage},
+        repo_page::{RepoData, RepoPage, RepoPageHandoff},
         section_table::IssueRow,
         split_table::SelectedRow,
     },
@@ -517,7 +518,67 @@ pub struct App {
     pub pending_attach_command: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct AppHandoff {
+    views: OpenViews,
+    provisioning_target: ProvisioningTarget,
+    view_layout: RepoViewLayout,
+    status_keys_visible: bool,
+    dismissed_status_ids: HashSet<usize>,
+    show_debug: bool,
+    help_scroll: u16,
+    command_echo: Option<String>,
+    event_log: Vec<crate::event_log::HandoffLogEntry>,
+    repo_pages: Vec<(RepoIdentity, RepoPageHandoff)>,
+    issue_search_input: Option<String>,
+}
+
 impl App {
+    pub fn handoff(&self) -> AppHandoff {
+        AppHandoff {
+            views: self.views.clone(),
+            provisioning_target: self.ui.provisioning_target.clone(),
+            view_layout: self.ui.view_layout,
+            status_keys_visible: self.ui.status_bar.show_keys,
+            dismissed_status_ids: self.ui.status_bar.dismissed_status_ids.clone(),
+            show_debug: self.ui.show_debug,
+            help_scroll: self.ui.help_scroll,
+            command_echo: self.ui.command_echo.clone(),
+            event_log: crate::event_log::handoff_entries(),
+            repo_pages: self.screen.repo_pages.iter().map(|(identity, page)| (identity.clone(), page.handoff())).collect(),
+            issue_search_input: self
+                .screen
+                .modal_stack
+                .last()
+                .and_then(|widget| widget.as_any().downcast_ref::<crate::widgets::issue_search::IssueSearchWidget>())
+                .map(|widget| widget.input_value().to_string()),
+        }
+    }
+
+    pub fn restore_handoff(&mut self, handoff: AppHandoff) {
+        self.views = handoff.views;
+        self.ui.provisioning_target = handoff.provisioning_target;
+        self.ui.view_layout = handoff.view_layout;
+        self.ui.status_bar.show_keys = handoff.status_keys_visible;
+        self.ui.status_bar.dismissed_status_ids = handoff.dismissed_status_ids;
+        self.ui.show_debug = handoff.show_debug;
+        self.ui.help_scroll = handoff.help_scroll;
+        self.ui.command_echo = handoff.command_echo;
+        crate::event_log::restore_handoff_entries(handoff.event_log);
+        for (identity, page_handoff) in handoff.repo_pages {
+            if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
+                page.restore_handoff(page_handoff);
+            }
+        }
+        if let Some(input) = handoff.issue_search_input {
+            let mut widget = crate::widgets::issue_search::IssueSearchWidget::new();
+            widget.prefill(&input);
+            self.screen.modal_stack.push(Box::new(widget));
+        }
+        self.subscriptions_dirty = true;
+        self.sync_active_view();
+    }
+
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
         let app = Self::new_unreported(daemon, repos_info, config, theme);
         app.report_active_view_focus();
@@ -544,6 +605,7 @@ impl App {
         views.bind_repository_keys(&repository_keys);
         model.active_repo = views.active_repo_identity().cloned();
         let mut ui = UiState::new(&model.repo_order);
+        ui.command_echo = flotilla_client::reconnect::build_mismatch(daemon.as_ref());
         let loaded_config = config.load_config();
         ui.view_layout = match loaded_config.ui.preview.layout {
             RepoViewLayoutConfig::Auto => RepoViewLayout::Auto,
@@ -619,6 +681,82 @@ impl App {
     pub fn with_pm_connector(mut self, connector: Option<Arc<dyn PmConnector>>) -> Self {
         self.pm_connector = connector;
         self
+    }
+
+    /// Attach this UI session to a replacement daemon while retaining the
+    /// interaction state owned by the TUI. Daemon-derived caches are emptied
+    /// so the event loop's replay and query re-subscription repopulate them.
+    pub fn reconnect_daemon(&mut self, daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>) {
+        self.daemon = daemon;
+        self.session_id = uuid::Uuid::new_v4();
+        self._query_subscription = self.daemon.query_subscription(self.session_id);
+
+        let repo_order: Vec<_> = repos_info.iter().map(|info| info.identity.clone()).collect();
+        let current_repos: HashSet<_> = repos_info.iter().map(|info| info.identity.clone()).collect();
+        let removed: Vec<_> = self.model.repos.keys().filter(|identity| !current_repos.contains(*identity)).cloned().collect();
+        for identity in removed {
+            self.handle_repo_removed(&identity);
+        }
+        for info in repos_info {
+            if self.model.repos.contains_key(&info.identity) {
+                let identity = info.identity.clone();
+                let path = TuiModel::display_path(&identity, info.path);
+                if let Some(repo) = self.model.repos.get_mut(&identity) {
+                    repo.repository_key = info.repository_key;
+                    repo.path = path;
+                    repo.providers = Arc::new(ProviderData::default());
+                    repo.labels = info.labels;
+                    repo.provider_names = info.provider_names;
+                    repo.provider_health = info.provider_health;
+                    repo.loading = info.loading;
+                    repo.has_unseen_changes = false;
+                }
+                if let Some(data) = self.repo_data.get(&identity) {
+                    let repo = &self.model.repos[&identity];
+                    data.mutate(|data| {
+                        data.path = repo.path.clone();
+                        data.providers = Arc::new(ProviderData::default());
+                        data.labels = repo.labels.clone();
+                        data.provider_names = repo.provider_names.clone();
+                        data.provider_health = repo.provider_health.clone();
+                        data.work_items.clear();
+                        data.issue_rows.clear();
+                        data.issue_section_label.clear();
+                        data.loading = repo.loading;
+                    });
+                }
+                if let Some(page) = self.screen.repo_pages.get_mut(&identity) {
+                    page.pending_actions.clear();
+                }
+            } else {
+                self.handle_repo_added(info);
+            }
+        }
+        self.model.repo_order = repo_order;
+        let repository_keys =
+            self.model.repos.iter().filter_map(|(identity, repo)| repo.repository_key.clone().map(|key| (identity.clone(), key))).collect();
+        self.views.bind_repository_keys(&repository_keys);
+        self.sync_active_view();
+
+        self.model.provider_statuses.clear();
+        self.model.hosts.clear();
+        self.query_tables = QueryTableCache::default();
+        self.namespaces.clear();
+        self.query_seqs.clear();
+        self.pending_fetch_more.clear();
+        self.issue_views.clear();
+        self.in_flight.clear();
+        self.acknowledged_dispatches.clear();
+        self.pending_dispatch_acks = 0;
+        self.recent_command_finishes.clear();
+        self.project_issue_start_batches.clear();
+        self.command_project_issue_starts.clear();
+        self.pending_cancel = None;
+        self.subscriptions_dirty = true;
+
+        let reconnect_note = flotilla_client::reconnect::build_mismatch(self.daemon.as_ref())
+            .map_or_else(|| "Reconnected to daemon".to_string(), |mismatch| format!("Reconnected — {mismatch}"));
+        self.ui.command_echo = Some(reconnect_note);
     }
 
     /// Construct an `App` in scoped mode: exactly the one View at `address`,

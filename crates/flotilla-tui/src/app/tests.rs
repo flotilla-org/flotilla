@@ -296,6 +296,74 @@ fn app_new_loads_layout_from_config() {
     assert_eq!(app.ui.view_layout, RepoViewLayout::Below);
 }
 
+#[tokio::test]
+async fn reconnect_daemon_preserves_ui_state_and_clears_daemon_caches() {
+    let mut app = stub_app();
+    app.views.open_or_focus(ViewAddress::Convoys { namespace: "flotilla".into() });
+    app.views.active_table_state_mut().filter = "needle".into();
+    app.ui.show_debug = true;
+    app.namespaces.insert("stale".into(), NamespaceModel::default());
+    app.query_seqs.insert(flotilla_protocol::QueryId::Convoys, 42);
+    let batch_id = app.begin_project_issue_start_batch(1);
+    app.command_project_issue_starts.insert(1, ProjectIssueStartContext {
+        address: ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() },
+        row_id: crate::table_view::RowId::new("issue:1"),
+        issue: IssueRef {
+            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "1".into(),
+        },
+        batch_id,
+    });
+    app.pending_cancel = Some(1);
+    let daemon = Arc::clone(&app.daemon);
+    let repos = daemon.list_repos().await.expect("list repos");
+
+    app.reconnect_daemon(daemon, repos);
+
+    assert_eq!(app.views.active_address(), Some(&ViewAddress::Convoys { namespace: "flotilla".into() }));
+    assert_eq!(app.views.active_table_state().filter, "needle");
+    assert!(app.ui.show_debug);
+    assert!(app.namespaces.is_empty());
+    assert!(app.query_seqs.is_empty());
+    assert!(app.project_issue_start_batches.is_empty());
+    assert!(app.command_project_issue_starts.is_empty());
+    assert_eq!(app.pending_cancel, None);
+    assert!(app.subscriptions_dirty);
+    assert_eq!(app.ui.command_echo.as_deref(), Some("Reconnected to daemon"));
+}
+
+#[test]
+fn handoff_round_trip_preserves_navigation_table_and_ui_state() {
+    let mut source = stub_app();
+    source.views.open_or_focus(ViewAddress::Convoys { namespace: "flotilla".into() });
+    source.views.active_table_state_mut().filter = "mine".into();
+    source.views.drill("convoy/flotilla/demo".parse().expect("valid drill address"));
+    source.ui.show_debug = true;
+    source.ui.help_scroll = 7;
+    let mut search = crate::widgets::issue_search::IssueSearchWidget::new();
+    search.prefill("half typed");
+    source.screen.modal_stack.push(Box::new(search));
+
+    let encoded = serde_json::to_vec(&source.handoff()).expect("serialize handoff");
+    let handoff = serde_json::from_slice(&encoded).expect("deserialize handoff");
+    let mut restored = stub_app();
+    restored.restore_handoff(handoff);
+
+    assert_eq!(restored.views.active_address(), Some(&"convoy/flotilla/demo".parse().expect("valid address")));
+    assert!(restored.views.active().has_history());
+    assert!(restored.views.back());
+    assert_eq!(restored.views.active_table_state().filter, "mine");
+    assert!(restored.ui.show_debug);
+    assert_eq!(restored.ui.help_scroll, 7);
+    let restored_search = restored
+        .screen
+        .modal_stack
+        .last()
+        .and_then(|widget| widget.as_any().downcast_ref::<crate::widgets::issue_search::IssueSearchWidget>())
+        .expect("search input restored");
+    assert_eq!(restored_search.input_value(), "half typed");
+}
+
 #[test]
 fn persist_layout_writes_current_ui_state() {
     let dir = tempdir().unwrap();

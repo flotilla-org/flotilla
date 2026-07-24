@@ -478,17 +478,19 @@ async fn handle_client_session(
 ) {
     let session = Arc::new(session);
     let first_msg = tokio::select! {
-        message_result = session.read() => {
-            match message_result {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!(err = %e, "error reading first message from client");
-                    None
+            message_result = session.read() => {
+                match message_result {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        error!(err = %e, "error reading first message from client");
+                        None
+                    }
                 }
             }
-        }
-        _ = shutdown_rx.changed() => None,
+            _ = shutdown_rx.changed() => None,
     };
+
+    const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
 
     let Some(first_msg) = first_msg else {
         return;
@@ -515,7 +517,7 @@ async fn handle_client_session(
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
                         node_id: daemon.node_id().clone(),
-                        display_name: daemon.host_name().to_string(),
+                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), BUILD_ID),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
