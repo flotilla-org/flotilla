@@ -634,7 +634,7 @@ fn bootstrap_preserves_agent_processes_for_runtime_resolution() {
     let Some(ConvoyStatusPatch::Bootstrap { workflow_snapshot, .. }) = outcome.patch else {
         panic!("agent workflow should bootstrap");
     };
-    let CrewSource::Agent { selector, prompt } = &workflow_snapshot.vessels[0].crew[0].source else {
+    let CrewSource::Agent { selector, prompt, .. } = &workflow_snapshot.vessels[0].crew[0].source else {
         panic!("agent source should survive in the workflow snapshot");
     };
     assert_eq!(selector.capability, "code");

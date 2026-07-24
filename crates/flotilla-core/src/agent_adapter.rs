@@ -1,8 +1,13 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
 use flotilla_resources::TerminalBrief;
+use serde::Serialize;
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
@@ -10,6 +15,10 @@ use crate::{
 };
 
 pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
+pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
+const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/crew.md");
+const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/interactive-session.md");
+const BRIEF_TEMPLATE_DIR: &str = "brief-templates";
 
 pub fn crew_brief_path(role: &str) -> String {
     let file_name: String = role
@@ -19,7 +28,7 @@ pub fn crew_brief_path(role: &str) -> String {
     format!(".flotilla/briefs/{}.md", if file_name.is_empty() { "crew" } else { &file_name })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CrewBriefMember {
     pub role: String,
     pub state: String,
@@ -42,6 +51,77 @@ pub enum CrewAssignment<'a> {
     Unassigned,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrewBriefTemplateResolver {
+    config_dir: Option<PathBuf>,
+}
+
+impl CrewBriefTemplateResolver {
+    pub fn with_config_dir(config_dir: impl Into<PathBuf>) -> Self {
+        Self { config_dir: Some(config_dir.into()) }
+    }
+
+    pub fn render_options(
+        &self,
+        template: Option<&str>,
+        project_ref: Option<&str>,
+        repo_roots: impl IntoIterator<Item = PathBuf>,
+    ) -> CrewBriefRenderOptions {
+        let template = template.filter(|template| !template.trim().is_empty()).unwrap_or(DEFAULT_CREW_BRIEF_TEMPLATE);
+        let mut overrides = Vec::new();
+        if let Some(config_dir) = &self.config_dir {
+            push_template_override(&mut overrides, config_dir.join(BRIEF_TEMPLATE_DIR).join(template));
+            if let Some(project_ref) = project_ref {
+                push_template_override(
+                    &mut overrides,
+                    config_dir.join("projects").join(project_ref).join(BRIEF_TEMPLATE_DIR).join(template),
+                );
+            }
+        }
+        for repo_root in repo_roots {
+            push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(template));
+        }
+        CrewBriefRenderOptions { template: template.to_string(), overrides }
+    }
+}
+
+fn push_template_override(overrides: &mut Vec<CrewBriefTemplateOverride>, path: PathBuf) {
+    match std::fs::read_to_string(&path) {
+        Ok(source) => overrides.push(CrewBriefTemplateOverride { path, source }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(path = %path.display(), err = %err, "failed to read crew brief template override"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewBriefRenderOptions {
+    pub template: String,
+    pub overrides: Vec<CrewBriefTemplateOverride>,
+}
+
+impl Default for CrewBriefRenderOptions {
+    fn default() -> Self {
+        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrewBriefTemplateOverride {
+    pub path: PathBuf,
+    pub source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CrewBriefTemplateContext<'a> {
+    role: &'a str,
+    convoy: &'a str,
+    vessel: &'a str,
+    vessel_ref: &'a str,
+    assignment_text: &'a str,
+    members: &'a [CrewBriefMember],
+    handoff_members: Vec<&'a CrewBriefMember>,
+}
+
 pub fn build_crew_brief(
     context: &flotilla_resources::TerminalCrewContext,
     vessel: &str,
@@ -49,30 +129,92 @@ pub fn build_crew_brief(
     assignment: CrewAssignment<'_>,
     members: &[CrewBriefMember],
 ) -> flotilla_resources::TerminalBrief {
-    let mut content = format!(
-        "# Flotilla crew brief\n\nYou are `{role}` in convoy `{}`, aboard vessel `{vessel}` (`{}`).\n\n## Crew\n\n",
-        context.convoy, context.vessel_ref
-    );
-    for member in members {
-        content.push_str(&format!("- `{}`: {}\n", member.role, member.state));
+    build_crew_brief_with_options(context, vessel, role, assignment, members, &CrewBriefRenderOptions::default())
+        .expect("built-in crew brief template should render")
+}
+
+pub fn build_crew_brief_with_options(
+    context: &flotilla_resources::TerminalCrewContext,
+    vessel: &str,
+    role: &str,
+    assignment: CrewAssignment<'_>,
+    members: &[CrewBriefMember],
+    options: &CrewBriefRenderOptions,
+) -> Result<flotilla_resources::TerminalBrief, String> {
+    let assignment_text = match assignment {
+        CrewAssignment::Prompt(prompt) => prompt,
+        CrewAssignment::CarriedIssue =>
+            "Your assignment is the issue snapshot section below. Its body is the contract: work it to completion and deliver as described above.",
+        CrewAssignment::Unassigned =>
+            "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
+    };
+    let mut content = render_crew_brief_template(options, &CrewBriefTemplateContext {
+        role,
+        convoy: &context.convoy,
+        vessel,
+        vessel_ref: &context.vessel_ref,
+        assignment_text,
+        members,
+        handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
+    })?;
+    if !content.ends_with('\n') {
+        content.push('\n');
     }
-    content.push_str(
-        "\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\n",
-    );
-    for member in members.iter().filter(|member| member.is_agent && member.role != role) {
-        content.push_str(&format!("Hand off to {} with `flotilla crew {} handoff --message '...'`.\n", member.role, member.role));
-    }
-    content.push_str(&format!(
-        "For assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue (ready for review, never a draft), and shepherd the pull request until all checks pass; if it is a draft for any reason, mark it ready once checks are green. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\n{}\n",
-        match assignment {
-            CrewAssignment::Prompt(prompt) => prompt,
-            CrewAssignment::CarriedIssue =>
-                "Your assignment is the issue snapshot section below. Its body is the contract: work it to completion and deliver as described above.",
-            CrewAssignment::Unassigned =>
-                "No assignment was provided with this dispatch. Check `## Human instruction` below if present; otherwise report via `flotilla crew fail` rather than inventing work.",
+    Ok(flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() })
+}
+
+fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBriefTemplateContext<'_>) -> Result<String, String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template(BUILTIN_CREW_BRIEF_TEMPLATE_NAME, BUILTIN_CREW_BRIEF_TEMPLATE)
+        .map_err(|err| format!("load built-in crew brief template: {err}"))?;
+    env.add_template(BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME, BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE)
+        .map_err(|err| format!("load built-in interactive-session brief template: {err}"))?;
+    let mut skip_overrides = 0;
+    let mut current_template = match options.template.as_str() {
+        DEFAULT_CREW_BRIEF_TEMPLATE => BUILTIN_CREW_BRIEF_TEMPLATE_NAME.to_string(),
+        "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
+        custom if !options.overrides.is_empty() => {
+            let first = &options.overrides[0];
+            if is_block_only_override(&first.source) {
+                BUILTIN_CREW_BRIEF_TEMPLATE_NAME.to_string()
+            } else {
+                skip_overrides = 1;
+                let name = format!("override/base/{custom}");
+                env.add_template_owned(name.clone(), first.source.clone())
+                    .map_err(|err| format!("load crew brief template {}: {err}", first.path.display()))?;
+                name
+            }
         }
-    ));
-    flotilla_resources::TerminalBrief { path: crew_brief_path(role), content, copies: Vec::new() }
+        custom => return Err(format!("unknown crew brief template `{custom}`")),
+    };
+    for (index, template_override) in options.overrides.iter().enumerate().skip(skip_overrides) {
+        let name = format!("override/{index}/{}", options.template);
+        let source = layered_override_source(&current_template, &template_override.source);
+        env.add_template_owned(name.clone(), source)
+            .map_err(|err| format!("load crew brief template {}: {err}", template_override.path.display()))?;
+        current_template = name;
+    }
+    env.get_template(&current_template)
+        .and_then(|template| template.render(context))
+        .map_err(|err| format!("render crew brief template {}: {err}", options.template))
+}
+
+const BUILTIN_CREW_BRIEF_TEMPLATE_NAME: &str = "builtin/crew.md";
+const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME: &str = "builtin/interactive-session.md";
+
+fn layered_override_source(parent: &str, source: &str) -> String {
+    if !is_block_only_override(source) {
+        source.to_string()
+    } else {
+        format!("{{% extends \"{parent}\" %}}\n{source}")
+    }
+}
+
+fn is_block_only_override(source: &str) -> bool {
+    // Override files without an explicit `{% extends %}` are treated as terse
+    // block fragments. A standalone template that declares its own blocks must
+    // include an explicit `{% extends %}` or avoid block declarations.
+    source.contains("{% block") && !source.contains("{% extends")
 }
 
 /// Appends the convoy's work context (branch, repositories, issue snapshots,
@@ -306,8 +448,8 @@ mod tests {
 
     use crate::{
         agent_adapter::{
-            append_convoy_work_context, build_crew_brief, AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment,
-            CrewBriefMember,
+            append_convoy_work_context, build_crew_brief, build_crew_brief_with_options, AgentAdapterRegistry, AgentLaunchRequest,
+            CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions, CrewBriefTemplateOverride, CrewBriefTemplateResolver,
         },
         path_context::ExecutionEnvironmentPath,
         providers::{
@@ -367,6 +509,134 @@ mod tests {
             &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
         )
         .content
+    }
+
+    #[test]
+    fn default_brief_template_matches_legacy_bytes() {
+        let content = build_crew_brief(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "fix-delivery".to_string(),
+                vessel_ref: "vessel-fix-delivery-work".to_string(),
+            },
+            "work",
+            "coder",
+            CrewAssignment::Prompt("Fix the flux capacitor."),
+            &[
+                CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true },
+                CrewBriefMember { role: "reviewer".to_string(), state: "latent".to_string(), is_agent: true },
+                CrewBriefMember { role: "watcher".to_string(), state: "active".to_string(), is_agent: false },
+            ],
+        )
+        .content;
+
+        assert_eq!(
+            content,
+            "# Flotilla crew brief\n\nYou are `coder` in convoy `fix-delivery`, aboard vessel `work` (`vessel-fix-delivery-work`).\n\n## Crew\n\n- `coder`: active\n- `reviewer`: latent\n- `watcher`: active\n\nRun `flotilla crew list` for current crew state.\nClone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.\nHand off to reviewer with `flotilla crew reviewer handoff --message '...'`.\nFor assignments that change a repository, delivery is part of the assignment: implement the change, push the branch, open a pull request that closes the issue (ready for review, never a draft), and shepherd the pull request until all checks pass; if it is a draft for any reason, mark it ready once checks are green. Do not merge it. Only then complete your assignment with `flotilla crew complete --message '<PR URL>'`. For other assignments, complete with `flotilla crew complete --message '...'`. If the assignment cannot be completed, report the failure with `flotilla crew fail --message '...'`.\n\n## Assignment\n\nFix the flux capacitor.\n"
+        );
+    }
+
+    #[test]
+    fn repo_level_override_can_replace_one_block() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let override_dir = repo.join(".flotilla/brief-templates");
+        std::fs::create_dir_all(&override_dir).expect("override dir");
+        std::fs::write(override_dir.join("crew.md"), "{% block delivery %}Complete when the local demo is ready.{% endblock %}")
+            .expect("override file");
+        let options = CrewBriefTemplateResolver::default().render_options(None, None, [repo]);
+        let brief = build_crew_brief_with_options(
+            &TerminalCrewContext { namespace: "flotilla".to_string(), convoy: "demo".to_string(), vessel_ref: "demo-work".to_string() },
+            "work",
+            "coder",
+            CrewAssignment::Prompt("Demo the override."),
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+            &options,
+        )
+        .expect("render brief");
+
+        assert!(brief.content.contains("Complete when the local demo is ready."));
+        assert!(brief.content.contains("## Assignment\n\nDemo the override."));
+        assert!(!brief.content.contains("For assignments that change a repository"));
+    }
+
+    #[test]
+    fn workflow_variant_selects_a_different_brief_template() {
+        let default = brief_for(CrewAssignment::Prompt("Pair with the user."));
+        let selected = build_crew_brief_with_options(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "interactive".to_string(),
+                vessel_ref: "interactive-work".to_string(),
+            },
+            "work",
+            "driver",
+            CrewAssignment::Prompt("Pair with the user."),
+            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
+            &CrewBriefRenderOptions { template: "interactive-session.md".to_string(), overrides: Vec::new() },
+        )
+        .expect("render selected template")
+        .content;
+
+        assert!(selected.contains("For interactive sessions, keep the user-facing loop tight"));
+        assert!(selected.contains("## Assignment\n\nPair with the user."));
+        assert!(!default.contains("For interactive sessions"));
+    }
+
+    #[test]
+    fn custom_block_only_template_inherits_the_default_brief_shape() {
+        let brief = build_crew_brief_with_options(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "pairing".to_string(),
+                vessel_ref: "pairing-work".to_string(),
+            },
+            "work",
+            "driver",
+            CrewAssignment::Prompt("Pair with the user."),
+            &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
+            &CrewBriefRenderOptions {
+                template: "pairing.md".to_string(),
+                overrides: vec![CrewBriefTemplateOverride {
+                    path: "pairing.md".into(),
+                    source: "{% block delivery %}Pairing-specific delivery gate.{% endblock %}".to_string(),
+                }],
+            },
+        )
+        .expect("render custom block-only template");
+
+        assert!(brief.content.starts_with("# Flotilla crew brief\n\nYou are `driver` in convoy `pairing`"));
+        assert!(brief.content.contains("Pairing-specific delivery gate."));
+        assert!(brief.content.contains("## Assignment\n\nPair with the user.\n"));
+    }
+
+    #[test]
+    fn repo_override_wins_over_project_and_fleet_blocks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = temp.path().join("config");
+        let repo = temp.path().join("repo");
+        for (dir, text) in [
+            (config.join("brief-templates"), "Fleet delivery."),
+            (config.join("projects/demo-project/brief-templates"), "Project delivery."),
+            (repo.join(".flotilla/brief-templates"), "Repo delivery."),
+        ] {
+            std::fs::create_dir_all(&dir).expect("override dir");
+            std::fs::write(dir.join("crew.md"), format!("{{% block delivery %}}{text}{{% endblock %}}")).expect("override file");
+        }
+        let options = CrewBriefTemplateResolver::with_config_dir(&config).render_options(None, Some("demo-project"), [repo]);
+        let brief = build_crew_brief_with_options(
+            &TerminalCrewContext { namespace: "flotilla".to_string(), convoy: "demo".to_string(), vessel_ref: "demo-work".to_string() },
+            "work",
+            "coder",
+            CrewAssignment::Prompt("Check precedence."),
+            &[CrewBriefMember { role: "coder".to_string(), state: "active".to_string(), is_agent: true }],
+            &options,
+        )
+        .expect("render brief");
+
+        assert!(brief.content.contains("Repo delivery."));
+        assert!(!brief.content.contains("Project delivery."));
+        assert!(!brief.content.contains("Fleet delivery."));
     }
 
     #[test]

@@ -132,6 +132,7 @@ pub fn valid_workflow_template_spec() -> WorkflowTemplateSpec {
                             prompt: Some(
                                 "Convoy {{workflow.name}} - implement {{inputs.feature}} on branch {{inputs.branch}}.".to_string(),
                             ),
+                            brief_template: None,
                         })
                         .build(),
                     CrewSpec::builder()
@@ -149,6 +150,7 @@ pub fn valid_workflow_template_spec() -> WorkflowTemplateSpec {
                         .source(CrewSource::Agent {
                             selector: Selector { capability: "code-review".to_string() },
                             prompt: Some("Review branch {{inputs.branch}} for correctness and style.".to_string()),
+                            brief_template: None,
                         })
                         .build(),
                     CrewSpec::builder()

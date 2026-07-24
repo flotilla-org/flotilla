@@ -1066,6 +1066,7 @@ dependencies = [
  "flotilla-resources",
  "rstest",
  "sha2",
+ "tempfile",
  "tokio",
  "tracing",
 ]

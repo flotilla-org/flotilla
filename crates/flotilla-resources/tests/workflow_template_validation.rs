@@ -239,6 +239,28 @@ vessels:
 }
 
 #[test]
+fn parse_preserves_agent_brief_template_selection() {
+    let spec = parse_spec(
+        r#"
+inputs: []
+vessels:
+  - name: interact
+    crew:
+      - role: driver
+        selector:
+          capability: code
+        brief_template: interactive-session.md
+"#,
+    );
+
+    let flotilla_resources::CrewSource::Agent { brief_template, .. } = &spec.vessels[0].crew[0].source else {
+        panic!("driver should be agent-backed");
+    };
+    assert_eq!(brief_template.as_deref(), Some("interactive-session.md"));
+    assert!(validate(&spec).is_ok(), "brief template selection should validate");
+}
+
+#[test]
 fn parser_round_trip_preserves_sample_workflow() {
     let first: WorkflowTemplateDocument = serde_yml::from_str(valid_workflow_template_yaml()).expect("parse workflow template document");
     let encoded = serde_yml::to_string(&first.spec).expect("serialize workflow template spec");
