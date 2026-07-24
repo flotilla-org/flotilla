@@ -3,7 +3,7 @@
 //! This module is deliberately pure: callers inject the row windows they
 //! already hold and choose the grouping parameter at query time.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::Utc;
 use flotilla_protocol::{
@@ -199,6 +199,13 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
             let salience = group.entries.iter().map(|entry| entry.salience).max().unwrap_or(Salience::None);
             let node_as_of = group.entries.iter().map(|entry| entry.as_of).max().unwrap_or(as_of);
             let family_summaries = awareness_family_summaries(&group.entries);
+            let repo_facts =
+                group.entries.iter().filter_map(|entry| entry.annotations.get(REPO_FACT_ANNOTATION).cloned()).collect::<BTreeSet<_>>();
+            let annotations = if repo_facts.len() == 1 {
+                HashMap::from([(REPO_FACT_ANNOTATION.to_string(), repo_facts.first().expect("one repository fact").clone())])
+            } else {
+                HashMap::new()
+            };
             group.entries.truncate(input.limit.entries);
             AwarenessNode::builder()
                 .id(group.id)
@@ -210,6 +217,7 @@ pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSe
                 .as_of(node_as_of)
                 .counts(group.counts)
                 .refs(group.refs)
+                .annotations(annotations)
                 .entries(group.entries)
                 .family_summaries(family_summaries)
                 .build()
@@ -492,6 +500,26 @@ mod tests {
                 "repo grouping uses canonical fact value, not display label",
             );
         }
+    }
+
+    #[test]
+    fn repository_group_carries_canonical_fact_separately_from_display_label() {
+        let (nodes, _) = project_awareness(AwarenessInput {
+            checkouts: vec![CheckoutRow::builder()
+                .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "checkout"))
+                .repo(RepositoryKey("repo-a".into()))
+                .repo_label("github.com/flotilla-org/flotilla")
+                .repo_fact(flotilla_protocol::RepoKey("flotilla-org/flotilla".into()))
+                .path("/work/flotilla")
+                .branch("main")
+                .host(HostName::new("local"))
+                .authority(flotilla_protocol::LifecycleAuthority::Observed)
+                .build()],
+            ..AwarenessInput::default()
+        });
+
+        assert_eq!(nodes[0].label, "github.com/flotilla-org/flotilla");
+        assert_eq!(nodes[0].annotations.get(REPO_FACT_ANNOTATION).map(String::as_str), Some("flotilla-org/flotilla"),);
     }
 
     #[test]

@@ -221,9 +221,10 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
     let node = AwarenessNode::builder()
         .id("repo/opaque-repository-key".to_string())
         .kind(AwarenessKind::Project)
-        .label("flotilla-org/flotilla".to_string())
+        .label("github.com/flotilla-org/flotilla".to_string())
         .state(AwarenessState::Active)
         .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .annotations(std::collections::HashMap::from([(SEGMENT_REPO.to_string(), "flotilla-org/flotilla".to_string())]))
         .entries(vec![independent, checkout])
         .build();
 
@@ -235,6 +236,12 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
     find(
         &patches,
         &group(vec![repo.clone(), GroupSegment::text(SEGMENT_CHECKOUT, "checkout/feta/work/flotilla").with_label("main · /work/flotilla")]),
+    );
+    assert!(
+        patches.iter().all(|patch| {
+            !matches!(&patch.target, MetadataTarget::Group(path) if path.0.iter().filter(|segment| segment.key == SEGMENT_REPO).count() > 1)
+        }),
+        "canonical node and entry repo facts must not duplicate the repo spine",
     );
     assert!(
         patches

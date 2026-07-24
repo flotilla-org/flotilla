@@ -224,7 +224,7 @@ fn awareness_node_segment(node: &AwarenessNode) -> Option<GroupSegment> {
             if let Some(address) = node.id.strip_prefix("project/") {
                 return project_segment(address.rsplit('/').next());
             }
-            node.id.strip_prefix("repo/").and_then(|_| repo_segment(Some(&node.label)))
+            node.id.strip_prefix("repo/").and_then(|_| repo_segment(node.annotations.get(SEGMENT_REPO).map(String::as_str)))
         }
         AwarenessKind::Convoy => {
             node.id.strip_prefix("convoy/").map(|value| GroupSegment::text(SEGMENT_CONVOY, value).with_label(node.label.clone()))
