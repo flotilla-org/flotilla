@@ -259,6 +259,82 @@ async fn agent_adapter_admission_rejects_a_host_with_stale_heartbeat() {
     assert_eq!(error, "placement `host-direct-test` host `host-test` is not ready");
 }
 
+async fn create_host_direct_placement(backend: &ResourceBackend, policy_name: &str, host_ref: &str, agent_adapters: BTreeSet<String>) {
+    let hosts = backend.clone().using::<ResourceHost>("flotilla");
+    let host = hosts.create(&empty_input_meta(host_ref), &HostSpec {}).await.expect("host create");
+    hosts
+        .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
+            heartbeat_at: Some(Utc::now()),
+            ready: true,
+            resource_store: None,
+        })
+        .await
+        .expect("host status update");
+    backend
+        .clone()
+        .using::<PlacementPolicy>("flotilla")
+        .create(
+            &empty_input_meta(policy_name),
+            &PlacementPolicySpec::builder()
+                .pool("passthrough".to_string())
+                .host_direct(HostDirectPlacementPolicySpec {
+                    host_ref: host_ref.to_string(),
+                    checkout: HostDirectPlacementPolicyCheckout::Worktree,
+                })
+                .build(),
+        )
+        .await
+        .expect("placement create");
+}
+
+fn trusted_codex_workflow() -> WorkflowTemplateSpec {
+    let mut workflow = flotilla_resources::single_agent_contained_workflow_spec();
+    workflow.vessels[0].stance = Stance::Trusted;
+    workflow
+}
+
+#[tokio::test]
+async fn default_placement_prefers_the_viable_local_host() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_host_direct_placement(&backend, "host-direct-a-remote", "remote-host", BTreeSet::from(["codex".to_string()])).await;
+    create_host_direct_placement(&backend, "host-direct-z-local", "local-host", BTreeSet::from(["codex".to_string()])).await;
+
+    let placement = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("local-host"))
+        .await
+        .expect("default placement")
+        .expect("viable placement");
+
+    assert_eq!(placement.metadata.name, "host-direct-z-local");
+}
+
+#[tokio::test]
+async fn default_placement_never_selects_a_host_without_the_required_adapter() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_host_direct_placement(&backend, "host-direct-a-no-adapters", "empty-host", BTreeSet::new()).await;
+    create_host_direct_placement(&backend, "host-direct-z-codex", "codex-host", BTreeSet::from(["codex".to_string()])).await;
+
+    let placement = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("unrelated-local-host"))
+        .await
+        .expect("default placement")
+        .expect("viable placement");
+
+    assert_eq!(placement.metadata.name, "host-direct-z-codex");
+}
+
+#[tokio::test]
+async fn default_placement_no_viable_candidate_error_names_the_adapter_and_candidates() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    create_host_direct_placement(&backend, "host-direct-a", "host-a", BTreeSet::new()).await;
+    create_host_direct_placement(&backend, "host-direct-b", "host-b", BTreeSet::from(["claude-code".to_string()])).await;
+
+    let error = default_convoy_placement_policy(&backend, "flotilla", &trusted_codex_workflow(), Some("host-a"))
+        .await
+        .expect_err("no candidate should admit codex");
+
+    assert_eq!(error, "no placement policy satisfies adapter `codex`; candidates: host-direct-a, host-direct-b");
+}
+
 #[tokio::test]
 async fn peer_summary_materializes_an_admissible_host_direct_placement_target() {
     let temp = tempfile::tempdir().expect("create tempdir");
