@@ -1078,7 +1078,7 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
 
     assert_eq!(
         remote_command_router.dispatch_execute(command.clone()).await.expect_err("missing live route must reject remote placement"),
-        format!("connect to feta at peer://feta for placement policy {remote_policy_name} (host {remote_host_id}): unknown peer: feta")
+        "peer host feta is not connected"
     );
 
     peer_manager.lock().await.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));

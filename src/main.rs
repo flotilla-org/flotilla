@@ -619,7 +619,13 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
 async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
     let daemon = connect_daemon(cli).await?;
-    let result = flotilla_tui::cli::run_command(&*daemon, command, format).await.map_err(|e| color_eyre::eyre::eyre!(e))?;
+    let result = match flotilla_tui::cli::run_command(&*daemon, command, format).await {
+        Ok(result) => result,
+        Err(message) => exit_command_error(message, format),
+    };
+    if let CommandValue::Error { .. } = result {
+        std::process::exit(1);
+    }
     if let CommandValue::ConvoyStarted { name, attach_command: Some(command), binding } = result {
         if matches!(format, OutputFormat::Human) {
             stamp_pane_identity(&name, binding.as_ref()).await;
@@ -627,6 +633,14 @@ async fn run_control_command(cli: &Cli, command: Command, format: OutputFormat) 
         }
     }
     Ok(())
+}
+
+fn exit_command_error(message: String, format: OutputFormat) -> ! {
+    match format {
+        OutputFormat::Human => eprintln!("error: {message}"),
+        OutputFormat::Json => println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::Error { message })),
+    }
+    std::process::exit(1);
 }
 
 async fn run_attach(cli: &Cli, reference: &str, transient: bool, host: Option<&str>, format: OutputFormat) -> Result<()> {

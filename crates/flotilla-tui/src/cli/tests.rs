@@ -1071,6 +1071,79 @@ mod query_event_formatting {
     }
 }
 
+mod command_query_execution {
+    use std::collections::HashMap;
+
+    use async_trait::async_trait;
+    use flotilla_core::daemon::DaemonHandle;
+    use flotilla_protocol::{
+        output::OutputFormat, Command, CommandAction, CommandValue, DaemonEvent, QueryCursor, RepoInfo, RepoSelector, RepoSnapshot,
+        StatusResponse, StreamKey, TopologyResponse,
+    };
+    use tokio::sync::broadcast;
+    use uuid::Uuid;
+
+    use crate::cli::run_command;
+
+    struct QueryDaemon {
+        result: CommandValue,
+    }
+
+    #[async_trait]
+    impl DaemonHandle for QueryDaemon {
+        fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+            let (_tx, rx) = broadcast::channel(1);
+            rx
+        }
+
+        async fn get_state(&self, _repo: &RepoSelector) -> Result<RepoSnapshot, String> {
+            unreachable!("query command test does not call get_state")
+        }
+
+        async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
+            unreachable!("query command test does not call list_repos")
+        }
+
+        async fn execute(&self, _command: Command) -> Result<u64, String> {
+            unreachable!("query command test does not call execute")
+        }
+
+        async fn cancel(&self, _command_id: u64) -> Result<(), String> {
+            unreachable!("query command test does not call cancel")
+        }
+
+        async fn replay_since(&self, _last_seen: &HashMap<StreamKey, u64>) -> Result<Vec<DaemonEvent>, String> {
+            unreachable!("query command test does not call replay_since")
+        }
+
+        async fn subscribe_queries(&self, _subscriber_id: Uuid, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
+            unreachable!("query command test does not call subscribe_queries")
+        }
+
+        async fn execute_query(&self, _command: Command, _session_id: Uuid) -> Result<CommandValue, String> {
+            Ok(self.result.clone())
+        }
+
+        async fn get_status(&self) -> Result<StatusResponse, String> {
+            unreachable!("query command test does not call get_status")
+        }
+
+        async fn get_topology(&self) -> Result<TopologyResponse, String> {
+            unreachable!("query command test does not call get_topology")
+        }
+    }
+
+    #[tokio::test]
+    async fn query_command_error_returns_result_after_formatting() {
+        let daemon = QueryDaemon { result: CommandValue::Error { message: "repo not found".into() } };
+        let command = Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} };
+
+        let result = run_command(&daemon, command, OutputFormat::Json).await.expect("query errors are command results");
+
+        assert_eq!(result, CommandValue::Error { message: "repo not found".into() });
+    }
+}
+
 mod result_set_event_formatting {
     use flotilla_protocol::{
         result_set::{QueryChanges, ResultDelta, ResultSet, Rows},

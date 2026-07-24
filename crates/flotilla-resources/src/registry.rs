@@ -6,10 +6,11 @@ use serde_json::{json, Value};
 
 use crate::{
     api_version,
+    host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
-    Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, K8sListMeta, K8sResourceList, ObjectMeta,
-    OwnerReference, PlacementPolicy, Presentation, Project, ReadWatchEvent, Regard, Repository, Resource, ResourceBackend, ResourceError,
-    ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    Checkout, Clone as CloneResource, Convoy, Demand, Environment, Host, InputMeta, ObjectMeta, OwnerReference, PlacementPolicy,
+    Presentation, Project, ReadWatchEvent, Regard, Repository, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject,
+    ResourceProvenance, TerminalSession, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,15 +399,24 @@ async fn apply_typed<T: Resource>(
 }
 
 fn list_value<T: Resource>(listed: &ResourceList<T>) -> Result<Value, ResourceError> {
-    let list = K8sResourceList {
-        metadata: K8sListMeta { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() },
-        items: listed.items.iter().map(ResourceObject::to_k8s_object).collect(),
-    };
-    serde_json::to_value(list).map_err(|error| ResourceError::decode(format!("encode resource list: {error}")))
+    let items = listed.items.iter().map(object_value).collect::<Result<Vec<_>, _>>()?;
+    let mut metadata = json!({"resourceVersion": listed.resource_version.clone()});
+    if let Some(generation) = &listed.generation {
+        metadata["generation"] = Value::String(generation.clone());
+    }
+    Ok(json!({
+        "apiVersion": api_version(T::API_PATHS),
+        "kind": format!("{}List", T::API_PATHS.kind),
+        "metadata": metadata,
+        "items": items,
+    }))
 }
 
 fn object_value<T: Resource>(object: &ResourceObject<T>) -> Result<Value, ResourceError> {
-    serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(format!("encode resource object: {error}")))
+    let mut value =
+        serde_json::to_value(object.to_k8s_object()).map_err(|error| ResourceError::decode(format!("encode resource object: {error}")))?;
+    apply_host_heartbeat_readiness::<T>(&mut value)?;
+    Ok(value)
 }
 
 fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<T>) -> Result<Value, ResourceError> {
@@ -441,8 +451,26 @@ fn typed_watch_event_value<T: Resource>(event: &WatchEvent<T>) -> Result<Value, 
 fn watch_event_value<T: Resource>(event_type: &str, object: &ResourceObject<T>) -> Result<Value, ResourceError> {
     Ok(json!({
         "type": event_type,
-        "object": object.to_k8s_object(),
+        "object": object_value(object)?,
     }))
+}
+
+fn apply_host_heartbeat_readiness<T: Resource>(value: &mut Value) -> Result<(), ResourceError> {
+    if T::API_PATHS.kind != Host::API_PATHS.kind {
+        return Ok(());
+    }
+    let Some(status_value) = value.get_mut("status") else {
+        return Ok(());
+    };
+    if status_value.is_null() {
+        return Ok(());
+    }
+    let mut status: HostStatus = serde_json::from_value(status_value.clone())
+        .map_err(|error| ResourceError::decode(format!("decode Host status for heartbeat readiness: {error}")))?;
+    status.apply_heartbeat_readiness(chrono::Utc::now());
+    *status_value = serde_json::to_value(status)
+        .map_err(|error| ResourceError::decode(format!("encode Host status for heartbeat readiness: {error}")))?;
+    Ok(())
 }
 
 pub fn resource_list_api_version(kind: &str) -> Result<String, ResourceError> {
@@ -457,11 +485,12 @@ fn api_version_typed<T: Resource>() -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use flotilla_protocol::ResourceRef;
+    use chrono::{Duration, Utc};
+    use flotilla_protocol::{NodeId, ResourceRef};
 
     use super::*;
     use crate::{
-        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, InMemoryBackend, InputMeta, PrincipalRef, Regard,
+        Convoy, ConvoySpec, Demand, DemandAddressee, DemandKind, DemandSpec, HostSpec, InMemoryBackend, InputMeta, PrincipalRef, Regard,
         RegardExpiryPolicy, RegardSource, RegardSpec,
     };
 
@@ -480,6 +509,56 @@ mod tests {
         assert_eq!(listed.value["items"][0]["apiVersion"], "flotilla.work/v1");
         assert_eq!(listed.value["items"][0]["kind"], "Convoy");
         assert_eq!(listed.value["items"][0]["metadata"]["name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn host_resource_list_marks_stale_heartbeat_not_ready() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let hosts = backend.using::<Host>("flotilla");
+        let host = hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec {}).await.expect("create host");
+        hosts
+            .update_status("feta", &host.metadata.resource_version, &HostStatus {
+                capabilities: BTreeMap::new(),
+                heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
+                ready: true,
+                resource_store: None,
+            })
+            .await
+            .expect("write stale heartbeat");
+
+        let listed = list_resource_kind(&backend, "flotilla", "hosts").await.expect("list hosts");
+
+        assert_eq!(listed.value["items"][0]["status"]["ready"], false);
+        assert!(listed.value["items"][0]["status"]["heartbeat_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn host_replica_resource_list_derives_ready_from_origin_heartbeat() {
+        let source = ResourceBackend::InMemory(InMemoryBackend::default());
+        let source_hosts = source.using::<Host>("flotilla");
+        let host =
+            source_hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec {}).await.expect("create source host");
+        source_hosts
+            .update_status("feta", &host.metadata.resource_version, &HostStatus {
+                capabilities: BTreeMap::new(),
+                heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
+                ready: true,
+                resource_store: None,
+            })
+            .await
+            .expect("write source stale heartbeat");
+        let source_list = source_hosts.list().await.expect("list source hosts");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .replica_writer::<Host>(NodeId::new("feta-node"), "flotilla")
+            .replace(&source_list, Utc::now())
+            .await
+            .expect("write host replica");
+
+        let listed = list_resource_kind_including_replicas(&backend, "flotilla", "hosts").await.expect("list host replicas");
+
+        assert_eq!(listed.value["items"][0]["status"]["ready"], false);
+        assert_eq!(listed.value["items"][0]["metadata"]["annotations"][ORIGIN_ROOT_ANNOTATION], "feta-node");
     }
 
     #[tokio::test]

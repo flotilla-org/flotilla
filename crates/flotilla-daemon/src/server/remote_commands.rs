@@ -105,10 +105,8 @@ pub(super) struct RemoteCommandRouter {
 
 #[derive(bon::Builder)]
 struct PlacementRoute {
-    target: ConvoyStartTarget,
     host_name: HostName,
     node_id: NodeId,
-    address: String,
     sender: Arc<dyn PeerSender>,
 }
 
@@ -212,12 +210,11 @@ impl RemoteCommandRouter {
                 let send_result = match &existing_convoy_target {
                     Some(target) => self.send_routed_to_convoy_home(&target.home, &target.node_id, routed).await,
                     None => match &placement_route {
-                        Some(route) => route.sender.send(PeerWireMessage::Routed(routed)).await.map_err(|cause| {
-                            format!(
-                                "connect to {} at {} for placement policy {} (host {}): {cause}",
-                                route.host_name, route.address, route.target.policy_name, route.target.host_id
-                            )
-                        }),
+                        Some(route) => route
+                            .sender
+                            .send(PeerWireMessage::Routed(routed))
+                            .await
+                            .map_err(|cause| format!("peer host {} is not connected: {cause}", route.host_name)),
                         None => self.send_routed_to(&target_node_id, routed).await,
                     },
                 };
@@ -882,21 +879,14 @@ impl RemoteStepExecutor for RemoteCommandRouter {
 impl RemoteCommandRouter {
     async fn resolve_placement_route(&self, target: ConvoyStartTarget) -> Result<PlacementRoute, String> {
         let environment_id = EnvironmentId::host(target.host_id.clone());
-        let (host_name, node_id, address, sender) = {
+        let (host_name, node_id, sender) = {
             let pm = self.peer_manager.lock().await;
-            let (node_id, host_name) = pm
-                .node_for_host_environment(&environment_id)
-                .map_err(|cause| format!("resolve placement policy {} target host {}: {cause}", target.policy_name, target.host_id))?;
-            let address = pm.connection_address_for(&node_id, &host_name);
-            let sender = pm.resolve_sender(&node_id).map_err(|cause| {
-                format!(
-                    "connect to {host_name} at {address} for placement policy {} (host {}): {cause}",
-                    target.policy_name, target.host_id
-                )
-            })?;
-            (host_name, node_id, address, sender)
+            let (node_id, host_name) =
+                pm.node_for_host_environment(&environment_id).map_err(|_| format!("peer host {} is not connected", target.host_id))?;
+            let sender = pm.resolve_sender(&node_id).map_err(|_| format!("peer host {host_name} is not connected"))?;
+            (host_name, node_id, sender)
         };
-        Ok(PlacementRoute::builder().target(target).host_name(host_name).node_id(node_id).address(address).sender(sender).build())
+        Ok(PlacementRoute::builder().host_name(host_name).node_id(node_id).sender(sender).build())
     }
 
     async fn send_routed_to_convoy_home(
