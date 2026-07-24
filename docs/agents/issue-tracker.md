@@ -54,3 +54,12 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 - **Frontier query**: list the map's open children (`gh issue list -R flotilla-org/flotilla --state open`, scoped to the map's sub-issues / task list), drop any with an open blocker (`issue_dependencies_summary.blocked_by > 0`, or an open issue in the `Blocked by` line) or an assignee; first in map order wins.
 - **Claim**: `gh issue edit <n> -R flotilla-org/flotilla --add-assignee @me` — the session's first write.
 - **Resolve**: `gh issue comment <n> -R flotilla-org/flotilla --body "<answer>"`, then `gh issue close <n> -R flotilla-org/flotilla`, then append a context pointer (gist + link) to the map's Decisions-so-far.
+
+## Wayfinding execution
+
+How `/wayfinder` tickets are executed in this repo (overrides the skill's work-inline default; the skill defers here):
+
+- **Solo-runnable tickets** (`wayfinder:prototype`, `wayfinder:research`, `wayfinder:task`): dispatch a convoy against the real ticket — `flotilla convoy start --project flotilla --issue <n> --placement-policy <policy> --no-attach`. The convoy is the claim; also set the assignee at dispatch so cross-session frontier queries see it. Artifacts land as PRs where sensible (e.g. prototypes under `prototypes/<map>-<ticket>/`); the standard crew workflow (PR + shepherd, never merge) applies unchanged.
+- **Wayfinder settlement is a governor action, not a crew action**: at dry-dock the governor posts the resolution comment on the ticket, closes it, and appends the context pointer to the map's Decisions-so-far. Crews do not close wayfinder tickets. (When a resolution-shaped workflow exists — flotilla-org/flotilla#959/#960 — non-code tickets stop being PR-shaped and this section should be revisited.)
+- **Grilling tickets** (`wayfinder:grilling`): conversational — run in the governor session with the human, or in an interactive-session vessel once flotilla-org/flotilla#959 lands. Never dispatched as autonomous convoys.
+- **Do not run wayfinder tickets as bare out-of-system agent sessions** when a convoy can carry them: bare sessions lose presence, placement, and recording.
