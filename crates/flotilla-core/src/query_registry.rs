@@ -24,6 +24,7 @@ pub struct QueryRegistry {
 #[derive(Default, Debug)]
 struct RegistryState {
     subscribers: HashMap<Uuid, HashSet<QueryId>>,
+    fleet_awareness_scopes: HashSet<flotilla_protocol::QueryScope>,
     demand_backed: HashMap<QueryId, ResultSet>,
     generations: HashMap<QueryId, u64>,
     next_generation: u64,
@@ -51,16 +52,11 @@ impl QueryRegistry {
         created
     }
 
-    pub fn expand_fleet_awareness_demands(&self, scopes: &[flotilla_protocol::QueryScope]) -> HashSet<QueryId> {
+    /// Replace the catalog scopes from which fleet-awareness issue demand is
+    /// derived. Explicit subscriber queries remain independently owned.
+    pub fn replace_fleet_awareness_scopes(&self, scopes: &[flotilla_protocol::QueryScope]) -> HashSet<QueryId> {
         let mut state = self.inner.lock().expect("query registry lock poisoned");
-        for queries in state.subscribers.values_mut() {
-            if !queries.iter().any(|query| matches!(query, QueryId::Awareness { scope: None, .. })) {
-                continue;
-            }
-            for scope in scopes {
-                queries.insert(QueryId::Issues { scope: scope.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) });
-            }
-        }
+        state.fleet_awareness_scopes = scopes.iter().cloned().collect();
         let created = reconcile_demand(&mut state);
         self.publish_demand(&state);
         created
@@ -209,7 +205,15 @@ impl QueryRegistry {
 }
 
 fn reconcile_demand(state: &mut RegistryState) -> HashSet<QueryId> {
-    let demanded: HashSet<QueryId> = state.subscribers.values().flat_map(|queries| queries.iter().filter_map(issue_demand_query)).collect();
+    let mut demanded: HashSet<QueryId> =
+        state.subscribers.values().flat_map(|queries| queries.iter().filter_map(issue_demand_query)).collect();
+    if state.subscribers.values().any(|queries| queries.iter().any(|query| matches!(query, QueryId::Awareness { scope: None, .. }))) {
+        demanded.extend(state.fleet_awareness_scopes.iter().cloned().map(|scope| QueryId::Issues {
+            scope,
+            search: None,
+            label: Some(READY_ISSUE_LABEL.into()),
+        }));
+    }
     state.demand_backed.retain(|query, _| demanded.contains(query));
     state.generations.retain(|query, _| demanded.contains(query));
     let mut created = HashSet::new();
