@@ -52,13 +52,15 @@ const TEST_LOCAL_ATTACH_HOST: &str = "local";
 
 #[test]
 fn workspace_slugs_are_dns_safe_bounded_and_disambiguatable() {
-    let normalized = normalize_workspace_slug("My_repo...with spaces");
-    assert_eq!(normalized, "my-repo-with-spaces");
-    assert!(normalize_workspace_slug(&"a".repeat(100)).len() <= 48);
+    let first = RepositorySpec::remote("https://github.com/org-a/My_repo...with spaces").expect("first repository");
+    let second = RepositorySpec::remote("https://gitlab.com/org-b/My_repo...with spaces").expect("second repository");
+    let first_key = first.key();
+    let second_key = second.key();
+    let slugs = flotilla_resources::repository_workspace_slugs([(&first_key, &first), (&second_key, &second)]);
 
-    let left = disambiguate_workspace_slug("same-repo", &flotilla_resources::RepositoryKey("abcdefgh1111".to_string()));
-    let right = disambiguate_workspace_slug("same-repo", &flotilla_resources::RepositoryKey("ijklmnop2222".to_string()));
-    assert_ne!(left, right);
+    assert_eq!(slugs[&first_key], "github-com-org-a-my-repo-with-spaces");
+    assert_eq!(slugs[&second_key], "gitlab-com-org-b-my-repo-with-spaces");
+    assert!(slugs.values().all(|slug| slug.len() <= 48));
 }
 
 #[test]

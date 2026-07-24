@@ -26,7 +26,7 @@
         "type": "group-path",
         "value": [
           {
-            "key": "git.repo",
+            "key": "vcs.repo",
             "label": "flotilla",
             "value": {
               "type": "text",

@@ -5,7 +5,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use flotilla_manifest::{
-    keys::{KEY_SESSION, KEY_STATUS_STATE, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_VESSEL},
+    keys::{KEY_SESSION, KEY_SOURCE, KEY_STATUS_STATE, SEGMENT_INDEPENDENT, SEGMENT_ISSUE, SEGMENT_PROJECT, SOURCE_FLOTILLA},
     wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataTarget, MetadataValue},
 };
 use flotilla_protocol::{
@@ -73,7 +73,7 @@ fn mint() -> FlotillaRecipes {
 }
 
 fn independent_group(name: &str) -> MetadataTarget {
-    MetadataTarget::Group(GroupPath(vec![GroupSegment::text(SEGMENT_VESSEL, name)]))
+    MetadataTarget::Group(GroupPath(vec![GroupSegment::text(SEGMENT_INDEPENDENT, name)]))
 }
 
 fn session_identity(value: &str) -> MetadataTarget {
@@ -135,7 +135,8 @@ fn rebuild_publishes_diffs_not_repeats() {
     let after_removal = state.rebuild(&mint());
     let group_patch =
         after_removal.iter().find(|patch| patch.target == independent_group("scratch")).expect("unset patch for removed independent");
-    assert!(group_patch.set.is_empty());
+    assert_eq!(group_patch.set.len(), 1, "retractions retain only producer provenance");
+    assert_eq!(group_patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
     assert!(group_patch.unset.contains(&KEY_STATUS_STATE.to_owned()));
 }
 
@@ -150,7 +151,7 @@ fn rebuild_prefers_awareness_transport_when_available() {
     assert!(patches.iter().any(|patch| {
         patch.target
             == MetadataTarget::Group(GroupPath(vec![
-                GroupSegment::text(SEGMENT_PROJECT, "project/dev/platform").with_label("platform"),
+                GroupSegment::text(SEGMENT_PROJECT, "platform"),
                 GroupSegment::text(SEGMENT_ISSUE, "issue/flotilla-org/flotilla/862").with_label("#862 awareness band"),
             ]))
     }));
