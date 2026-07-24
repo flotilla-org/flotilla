@@ -189,8 +189,7 @@ pub struct Aggregator {
 }
 
 struct ChangeRequestResolution {
-    reference: ResourceRef,
-    generation: uuid::Uuid,
+    targets: Vec<(ResourceRef, uuid::Uuid)>,
     branch: String,
     result: Result<Option<ConvoyChangeRequest>, String>,
 }
@@ -395,15 +394,17 @@ impl Aggregator {
                     }
                 },
                 event = daemon_event_rx.recv() => match event {
-                    Ok(DaemonEvent::RepoRefreshCompleted { .. }) => self.refresh_all_change_requests().await,
+                    Ok(DaemonEvent::RepoRefreshCompleted { repo_identity, .. }) => {
+                        self.refresh_repository_change_requests(&repo_identity).await;
+                    }
                     Ok(DaemonEvent::RepoSnapshot(snapshot)) => {
                         if self.repo_snapshot_changed_change_requests(&snapshot) {
-                            self.refresh_all_change_requests().await;
+                            self.refresh_repository_change_requests(&snapshot.repo_identity).await;
                         }
                     }
                     Ok(DaemonEvent::RepoDelta(delta)) => {
                         if self.repo_delta_changed_change_requests(&delta) {
-                            self.refresh_all_change_requests().await;
+                            self.refresh_repository_change_requests(&delta.repo_identity).await;
                         }
                     }
                     Ok(
@@ -958,39 +959,83 @@ impl Aggregator {
         let task_reference = reference.clone();
         let task = tokio::spawn(async move {
             let result = resolver.resolve_change_request(&repositories, &branch).await;
-            let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
+            let _ = refresh_tx.send(ChangeRequestResolution { targets: vec![(task_reference, generation)], branch, result });
         });
         self.change_request_refresh_tasks.insert(reference, task);
     }
 
     async fn apply_change_request_resolution(&mut self, resolution: ChangeRequestResolution) {
-        let ChangeRequestResolution { reference, generation, branch, result } = resolution;
-        if self.change_request_refresh_generations.get(&reference) != Some(&generation) {
-            return;
+        let ChangeRequestResolution { targets, branch, result } = resolution;
+        let mut applied = false;
+        for (reference, generation) in targets {
+            if self.change_request_refresh_generations.get(&reference) != Some(&generation) {
+                continue;
+            }
+            applied = true;
+            self.change_request_refresh_tasks.remove(&reference);
+            match &result {
+                Ok(Some(change_request)) => {
+                    self.convoy_change_requests.insert(reference.clone(), change_request.clone());
+                }
+                Ok(None) => {
+                    self.convoy_change_requests.remove(&reference);
+                }
+                Err(error) => {
+                    tracing::warn!(convoy = %reference.name, %branch, %error, "failed to refresh convoy change request");
+                }
+            }
         }
-        self.change_request_refresh_tasks.remove(&reference);
-        match result {
-            Ok(Some(change_request)) => {
-                self.convoy_change_requests.insert(reference.clone(), change_request);
-            }
-            Ok(None) => {
-                self.convoy_change_requests.remove(&reference);
-            }
-            Err(error) => {
-                tracing::warn!(convoy = %reference.name, %branch, %error, "failed to refresh convoy change request");
-            }
+        if applied {
+            self.rebuild_local_projection().await;
         }
-        self.rebuild_local_projection().await;
     }
 
     async fn refresh_all_change_requests(&mut self) {
         let effective_convoys = self.effective_convoys();
         self.convoy_change_requests.retain(|reference, _| effective_convoys.contains_key(reference));
         self.change_request_refresh_generations.retain(|reference, _| effective_convoys.contains_key(reference));
-        for convoy in effective_convoys.values() {
-            self.schedule_change_request_refresh(convoy);
-        }
+        self.schedule_change_request_refresh_pass(effective_convoys);
         self.rebuild_local_projection().await;
+    }
+
+    async fn refresh_repository_change_requests(&mut self, repo_identity: &RepoIdentity) {
+        let effective_convoys =
+            self.effective_convoys().into_iter().filter(|(_, convoy)| convoy_references_repo(convoy, repo_identity)).collect::<Vec<_>>();
+        self.schedule_change_request_refresh_pass(effective_convoys);
+        self.rebuild_local_projection().await;
+    }
+
+    fn schedule_change_request_refresh_pass(&mut self, convoys: impl IntoIterator<Item = (ResourceRef, ResourceObject<Convoy>)>) {
+        let mut lookups = HashMap::<(Vec<RepositoryKey>, String), Vec<(ResourceRef, uuid::Uuid)>>::new();
+        for (reference, convoy) in convoys {
+            let generation = uuid::Uuid::new_v4();
+            self.change_request_refresh_generations.insert(reference.clone(), generation);
+            if let Some(task) = self.change_request_refresh_tasks.remove(&reference) {
+                task.abort();
+            }
+            let Some(branch) = convoy.spec.r#ref.clone() else {
+                self.convoy_change_requests.remove(&reference);
+                continue;
+            };
+            let repositories = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
+            if repositories.is_empty() {
+                self.convoy_change_requests.remove(&reference);
+                continue;
+            }
+            lookups.entry((repositories, branch)).or_default().push((reference, generation));
+        }
+
+        let Some(resolver) = self.change_request_resolver.clone() else {
+            return;
+        };
+        for ((repositories, branch), targets) in lookups {
+            let resolver = Arc::clone(&resolver);
+            let refresh_tx = self.change_request_refresh_queue.tx.clone();
+            tokio::spawn(async move {
+                let result = resolver.resolve_change_request(&repositories, &branch).await;
+                let _ = refresh_tx.send(ChangeRequestResolution { targets, branch, result });
+            });
+        }
     }
 
     fn repo_snapshot_changed_change_requests(&mut self, snapshot: &RepoSnapshot) -> bool {
@@ -1810,6 +1855,15 @@ fn attention_needs_human(state: TerminalAttentionState, work_unsettled: bool) ->
 
 fn change_request_fingerprint(providers: &ProviderData) -> ChangeRequestFingerprint {
     providers.change_requests.iter().map(|(key, request)| (key.clone(), (request.branch.clone(), request.status.to_string()))).collect()
+}
+
+fn convoy_references_repo(convoy: &ResourceObject<Convoy>, repo_identity: &RepoIdentity) -> bool {
+    convoy
+        .spec
+        .repositories
+        .iter()
+        .filter_map(|repository| RepoIdentity::from_remote_url(&repository.url))
+        .any(|identity| identity == *repo_identity)
 }
 
 fn presentation_key(presentation: &ResourceObject<Presentation>) -> Option<PresentationKey> {
@@ -2838,8 +2892,7 @@ mod tests {
 
         aggregator
             .apply_change_request_resolution(ChangeRequestResolution {
-                reference: reference.clone(),
-                generation: stale_generation,
+                targets: vec![(reference.clone(), stale_generation)],
                 branch: "feat/convoy".to_string(),
                 result: Ok(Some(ConvoyChangeRequest {
                     id: "stale".to_string(),
@@ -3157,6 +3210,129 @@ mod tests {
             } => {}
         }
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unrelated_repository_refresh_does_not_resolve_convoy_again() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(16);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::from([
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+                Ok(Some(ConvoyChangeRequest {
+                    id: "815".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Closed,
+                    repository_key: RepositoryKey("repo_flotilla".into()),
+                })),
+            ])),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let durable_convoys = ScriptedSource::new(
+            vec![ResourceList { items: vec![convoy_with_branch("convoy-a").await], resource_version: "1".into(), generation: None }],
+            vec![Ok(pending_watch())],
+        );
+        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let (_replica_tx, replica_rx) = broadcast::channel(1);
+        let run = run_with_test_sources(
+            Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
+            &durable_convoys,
+            &durable_presentations,
+            &observed_convoys,
+            &observed_presentations,
+            replica_rx,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("aggregator stopped before refresh: {result:?}"),
+            () = async {
+                assert!(matches!(
+                    recv_query_event(&mut event_rx, QueryId::Convoys, "initial convoy result set").await,
+                    DaemonEvent::ResultSet(_)
+                ));
+                assert!(matches!(
+                    recv_query_event(&mut event_rx, QueryId::Convoys, "initial change request delta").await,
+                    DaemonEvent::ResultDelta(_)
+                ));
+                for repo_identity in [
+                    RepoIdentity { authority: "gitlab.com".into(), path: "other/widgets".into() },
+                    RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() },
+                ] {
+                    event_tx
+                        .send(DaemonEvent::RepoRefreshCompleted {
+                            repo_identity,
+                            repo: Some(std::path::PathBuf::from("/repo")),
+                        })
+                        .expect("publish provider refresh");
+                }
+                assert!(matches!(
+                    recv_query_event(&mut event_rx, QueryId::Convoys, "related repository refresh delta").await,
+                    DaemonEvent::ResultDelta(_)
+                ));
+            } => {}
+        }
+
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2, "only the initial and related repository refreshes should resolve");
+    }
+
+    #[tokio::test]
+    async fn repository_refresh_deduplicates_shared_repository_and_branch_lookup() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        for name in ["convoy-a", "convoy-b"] {
+            aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch(name).await)).await;
+        }
+        apply_next_change_request_resolution(&mut aggregator).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        resolver.calls.store(0, Ordering::SeqCst);
+
+        aggregator
+            .refresh_repository_change_requests(&RepoIdentity {
+                authority: "github.com".to_string(),
+                path: "flotilla-org/flotilla".to_string(),
+            })
+            .await;
+        let resolution = timeout(Duration::from_secs(1), aggregator.change_request_refresh_queue.rx.recv())
+            .await
+            .expect("deduplicated resolution timed out")
+            .expect("resolution channel closed");
+
+        assert_eq!(resolution.targets.len(), 2);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lag_recovery_global_refresh_still_resolves_convoys() {
+        let (event_tx, _) = broadcast::channel(8);
+        let resolver = Arc::new(ScriptedChangeRequestResolver {
+            results: Mutex::new(VecDeque::new()),
+            branches: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx)
+            .with_change_request_resolver(Arc::clone(&resolver));
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_branch("convoy-a").await)).await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+        resolver.calls.store(0, Ordering::SeqCst);
+
+        // The daemon-event lag branch uses this unscoped pass because the
+        // identities of the skipped refreshes are unknown.
+        aggregator.refresh_all_change_requests().await;
+        apply_next_change_request_resolution(&mut aggregator).await;
+
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
