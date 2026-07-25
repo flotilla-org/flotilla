@@ -4,6 +4,8 @@ import json
 import re
 import time
 
+import pytest
+
 from conftest import (
     compose,
     daemon_log,
@@ -15,6 +17,7 @@ from conftest import (
 )
 
 GENERATION_RE = re.compile(r"\bgeneration=(\d+)\b")
+BACKOFF_RE = re.compile(r"\battempt=(\d+)\b.*\bdelay_secs=(\d+)\b")
 RECONNECT_MESSAGES = (
     "SSH connection dropped, will reconnect",
     "reconnecting after backoff",
@@ -220,7 +223,55 @@ def test_03_idle_link_survives_three_ping_windows(topology):
     } == reconnect_counts
 
 
-def test_04_stopped_host_becomes_not_ready(topology):
+@pytest.mark.timeout(300)
+def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
+    """#1045: prolonged transport failure cannot strand a recovered peer."""
+    initial_generation = max(peer_generations())
+    initial_log = daemon_log("node-a")
+
+    stop_daemon("node-b")
+
+    def capped_attempt_observed():
+        recovery_log = daemon_log("node-a")[len(initial_log):]
+        attempts = [
+            (int(attempt), int(delay))
+            for attempt, delay in BACKOFF_RE.findall(recovery_log)
+        ]
+        assert all(delay <= 60 for _, delay in attempts), (
+            f"redial delay exceeded its 60-second cap: {attempts}"
+        )
+        return any(attempt >= 7 and delay == 60 for attempt, delay in attempts)
+
+    wait_for(
+        capped_attempt_observed,
+        "redial reaches its capped backoff during a long outage",
+        timeout=120,
+        interval=0.5,
+    )
+
+    woken_at = time.monotonic()
+    start_daemon("node-b")
+    wait_for(
+        lambda: docker_exec(
+            "node-b", "flotilla status --json"
+        ).returncode == 0,
+        "woken node-b daemon",
+        timeout=30,
+        interval=0.5,
+    )
+    wait_for(
+        lambda: max(peer_generations(), default=0) > initial_generation,
+        "node-a redials node-b after the long outage",
+        timeout=120,
+        interval=0.5,
+    )
+    assert time.monotonic() - woken_at <= 120, (
+        "peer should reconnect within two capped backoff intervals"
+    )
+    wait_connected()
+
+
+def test_05_stopped_host_becomes_not_ready(topology):
     """#976: TTL expiry is honest even before the peer route disappears."""
     remote_host = replicated_peer_host()
     host_id = remote_host["metadata"]["name"]
