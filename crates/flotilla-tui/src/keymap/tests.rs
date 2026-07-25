@@ -263,6 +263,13 @@ fn close_confirm_has_y_n_bindings() {
 }
 
 #[test]
+fn dispatch_confirm_has_enter_and_escape_bindings() {
+    let km = Keymap::defaults();
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DispatchConfirm), crokey::key!(enter)), Some(Action::Confirm));
+    assert_eq!(km.resolve(&KeyBindingMode::from(BindingModeId::DispatchConfirm), crokey::key!(esc)), Some(Action::Dismiss));
+}
+
+#[test]
 fn help_mode_toggle_with_h() {
     let km = Keymap::defaults();
     // h maps to ToggleHelp in TabPage (composed with top-level tabs) and in Help mode.

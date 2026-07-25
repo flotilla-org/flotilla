@@ -43,6 +43,7 @@ pub enum BindingModeId {
     ActionMenu,
     DeleteConfirm,
     CloseConfirm,
+    DispatchConfirm,
     BranchInput,
     FindInput,
     CommandPalette,
@@ -214,6 +215,9 @@ pub static BINDINGS: &[Binding] = &[
     h(BindingModeId::CloseConfirm, "y", Action::Confirm, "Yes"),
     h(BindingModeId::CloseConfirm, "n", Action::Dismiss, "No"),
     b(BindingModeId::CloseConfirm, "q", Action::Dismiss),
+    // ── DispatchConfirm ──
+    hk(BindingModeId::DispatchConfirm, "enter", "ENT", Action::Confirm, "Dispatch"),
+    hk(BindingModeId::DispatchConfirm, "esc", "ESC", Action::Dismiss, "Cancel"),
     // ── BranchInput ──
     hk(BindingModeId::BranchInput, "enter", "ENT", Action::Confirm, "Create"),
     hk(BindingModeId::BranchInput, "esc", "ESC", Action::Dismiss, "Cancel"),

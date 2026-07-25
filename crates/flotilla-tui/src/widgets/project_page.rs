@@ -517,7 +517,7 @@ impl InteractiveWidget for ProjectPageWidget {
 
 fn issue_start_from_row(row: &table_view::ProjectedRow) -> Option<TableIssueStart> {
     row.actions.iter().find_map(|action| match &action.intent {
-        TableIntent::StartConvoy { issue, .. } => Some(TableIssueStart { row_id: row.id.clone(), issue: issue.clone() }),
+        TableIntent::StartConvoy { issue, .. } => Some(issue.clone()),
         _ => None,
     })
 }
@@ -571,7 +571,16 @@ mod tests {
                 id: "start",
                 label: "Start convoy",
                 key: 'c',
-                intent: TableIntent::StartConvoy { namespace: "flotilla".into(), project: "roadmap".into(), issue },
+                intent: TableIntent::StartConvoy {
+                    namespace: "flotilla".into(),
+                    project: "roadmap".into(),
+                    issue: TableIssueStart {
+                        row_id: RowId::new(format!("issue:flotilla:roadmap:https://github.com:flotilla-org/flotilla:{id}")),
+                        issue,
+                        title: format!("Issue {id}"),
+                        ready: true,
+                    },
+                },
             }],
         }
     }

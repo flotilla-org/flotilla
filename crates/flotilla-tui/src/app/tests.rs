@@ -2379,9 +2379,13 @@ fn project_issue_bulk_start_queues_one_convoy_start_per_issue() {
             .map(|id| crate::table_view::TableIssueStart {
                 row_id: crate::table_view::RowId::new(format!("issue:{id}")),
                 issue: IssueRef { source: source.clone(), id: id.into() },
+                title: format!("Issue {id}"),
+                ready: true,
             })
             .collect(),
     });
+    assert!(app.proto_commands.take_next().is_none(), "bulk start must wait for confirmation");
+    app.handle_key(key(KeyCode::Enter));
 
     let mut queued = Vec::new();
     while let Some((command, ctx)) = app.proto_commands.take_next() {
@@ -2412,9 +2416,13 @@ fn project_issue_batch_start_queues_one_convoy_for_all_issues() {
             .map(|id| crate::table_view::TableIssueStart {
                 row_id: crate::table_view::RowId::new(format!("issue:{id}")),
                 issue: IssueRef { source: source.clone(), id: id.into() },
+                title: format!("Issue {id}"),
+                ready: true,
             })
             .collect(),
     });
+    assert!(app.proto_commands.take_next().is_none(), "batch start must wait for confirmation");
+    app.handle_key(key(KeyCode::Enter));
 
     let (command, ctx) = app.proto_commands.take_next().expect("expected command");
     assert!(app.proto_commands.take_next().is_none(), "batch start should queue exactly one command");

@@ -1443,6 +1443,9 @@ impl App {
                 AppAction::ExecuteTableIntent(intent) => {
                     self.execute_table_intent(intent);
                 }
+                AppAction::ConfirmConvoyDispatch { intent, instruction } => {
+                    self.execute_confirmed_convoy_dispatch(intent, instruction);
+                }
                 AppAction::SetTableFilter(filter) => {
                     self.views.active_table_state_mut().filter = filter;
                 }
