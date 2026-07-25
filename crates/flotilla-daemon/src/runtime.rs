@@ -1357,6 +1357,29 @@ impl TerminalRuntime for TerminalControllerRuntime {
             return Ok(None);
         };
         let Some(activity) = session.screen_activity else { return Ok(None) };
+        if activity == ScreenActivity::Stable {
+            if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
+                let requirement = CapabilityTable::seeded().resolve(&selector.capability)?.clone();
+                let registry = self.registry_for_env(&spec.env_ref)?;
+                let adapter = registry
+                    .agent_adapters
+                    .get(&requirement.adapter)
+                    .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+                match pool.capture_screen(session_id).await {
+                    Ok(Some(screen))
+                        if adapter.classify_screen_attention(&screen) == Some(flotilla_resources::TerminalAttentionState::NeedsInput) =>
+                    {
+                        return Ok(Some(flotilla_resources::TerminalAttention {
+                            state: flotilla_resources::TerminalAttentionState::NeedsInput,
+                            as_of: Utc::now(),
+                            source: flotilla_resources::TerminalAttentionSource::Screen,
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
+                }
+            }
+        }
         let state = match activity {
             ScreenActivity::Active => flotilla_resources::TerminalAttentionState::Working,
             ScreenActivity::Stable => flotilla_resources::TerminalAttentionState::Idle,
@@ -1497,8 +1520,9 @@ mod tests {
     use flotilla_resources::{
         Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
         CheckoutStatus as ResourceCheckoutStatus, ConvoyPhase, ConvoyRepositorySpec, ConvoySpec, CrewSource, CrewSpec, LifecycleAuthority,
-        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend, TerminalSession,
-        TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase, WorkflowTemplate, WorkflowTemplateSpec,
+        ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, RepositorySpec, Selector, SqliteBackend,
+        TerminalAttentionState, TerminalSession, TerminalSessionPhase, TypedResolver, VesselRequirement, WorkPhase, WorkflowTemplate,
+        WorkflowTemplateSpec,
     };
     use tempfile::TempDir;
 
@@ -2085,6 +2109,7 @@ mod tests {
 
     async fn crew_daemon_with_process_runner(config: Arc<ConfigStore>) -> (Arc<InProcessDaemon>, Arc<FakeTerminalPool>) {
         let pool = Arc::new(FakeTerminalPool::new());
+        let codex_home = config.base_path().join("codex-home");
         let mut discovery = fake_discovery_with_provider_set(
             FakeDiscoveryProviders::new()
                 .with_terminal_pool(Arc::clone(&pool) as Arc<dyn flotilla_core::providers::terminal::TerminalPool>),
@@ -2095,6 +2120,7 @@ mod tests {
             .replace_local_environment_bag_for_test(
                 EnvironmentBag::new()
                     .with(EnvironmentAssertion::env_var("HOME", "/Users/tester"))
+                    .with(EnvironmentAssertion::env_var("CODEX_HOME", codex_home.to_string()))
                     .with(EnvironmentAssertion::binary("git", "/usr/bin/git"))
                     .with(EnvironmentAssertion::binary("codex", "/tools/codex"))
                     .with(EnvironmentAssertion::binary("claude", "/tools/claude")),
@@ -2647,6 +2673,71 @@ mod tests {
         runtime.kill_session(session_name, &spec).await.expect("teardown should resolve the persisted session pool");
 
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn codex_interactive_prompt_is_observed_as_needing_input() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("config");
+        std::fs::create_dir_all(&config_path).expect("config dir");
+        std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_path));
+        let (daemon, pool) = crew_daemon(Arc::clone(&config)).await;
+        let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
+        let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
+        let runtime = TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                Arc::clone(&daemon),
+                config,
+                local_registry,
+                None,
+                profile.host_id.clone(),
+                None,
+                profile.host_direct_environment_name(),
+            )),
+        };
+        let session_name = "terminal-demo-work-coder";
+        pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession {
+            session_name: session_name.to_string(),
+            status: TerminalStatus::Running,
+            command: Some("codex".to_string()),
+            working_directory: Some(ExecutionEnvironmentPath::new("/workspace")),
+            screen_activity: Some(ScreenActivity::Stable),
+        }])
+        .await;
+        pool.set_captured_screen(
+            session_name,
+            "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, quit\n\nPress enter to continue",
+        )
+        .await;
+        let spec = flotilla_resources::TerminalSessionSpec {
+            env_ref: profile.host_direct_environment_name(),
+            role: "coder".to_string(),
+            source: TerminalSessionSource::Agent {
+                selector: Selector { capability: "coding".to_string() },
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".to_string(),
+                    content: "Implement the issue.".to_string(),
+                    copies: Vec::new(),
+                },
+                context: flotilla_resources::TerminalCrewContext {
+                    namespace: NAMESPACE.to_string(),
+                    convoy: "demo".to_string(),
+                    vessel_ref: "demo-work".to_string(),
+                },
+                message: None,
+            },
+            cwd: "/workspace".to_string(),
+            pool: "fake-terminals".to_string(),
+        };
+
+        let attention = runtime.observe_attention(session_name, &spec).await.expect("observe prompt").expect("attention observation");
+        assert_eq!(attention.state, TerminalAttentionState::NeedsInput);
+
+        pool.set_captured_screen(session_name, "› Ask Codex to do something\n\ngpt-5.6-sol high · /workspace").await;
+        let attention =
+            runtime.observe_attention(session_name, &spec).await.expect("observe normal composer").expect("attention observation");
+        assert_eq!(attention.state, TerminalAttentionState::Idle);
     }
 
     #[tokio::test]

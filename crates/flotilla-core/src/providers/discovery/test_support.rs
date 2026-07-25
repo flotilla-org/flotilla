@@ -242,6 +242,9 @@ impl EnvVars for TestEnvVars {
 impl CommandRunner for DiscoveryMockRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         self.seen_cwds.lock().expect("lock poisoned").push(cwd.to_path_buf());
+        if cmd == "pwd" && args == ["-P"] {
+            return Ok(format!("{}\n", cwd.display()));
+        }
         let key = (cmd.to_string(), args.join(" "));
         let mut map = self.responses.lock().expect("lock poisoned");
         if let Some(queue) = map.get_mut(&key) {
@@ -793,6 +796,7 @@ pub struct FakeTerminalPool {
     pub killed: Arc<TokioMutex<Vec<String>>>,
     pub delivered: Arc<TokioMutex<Vec<(String, String, bool)>>>,
     pub ensured: Arc<TokioMutex<Vec<EnsuredTerminalSession>>>,
+    pub captured_screens: Arc<TokioMutex<HashMap<String, String>>>,
 }
 
 pub struct EnsuredTerminalSession {
@@ -815,6 +819,7 @@ impl FakeTerminalPool {
             killed: Arc::new(TokioMutex::new(Vec::new())),
             delivered: Arc::new(TokioMutex::new(Vec::new())),
             ensured: Arc::new(TokioMutex::new(Vec::new())),
+            captured_screens: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -824,6 +829,10 @@ impl FakeTerminalPool {
 
     pub async fn remove_session(&self, session_name: &str) {
         self.sessions.lock().await.retain(|session| session.session_name != session_name);
+    }
+
+    pub async fn set_captured_screen(&self, session_name: &str, screen: &str) {
+        self.captured_screens.lock().await.insert(session_name.to_string(), screen.to_string());
     }
 }
 
@@ -879,6 +888,10 @@ impl TerminalPool for FakeTerminalPool {
         self.killed.lock().await.push(session_name.to_string());
         self.sessions.lock().await.retain(|session| session.session_name != session_name);
         Ok(())
+    }
+
+    async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
+        Ok(self.captured_screens.lock().await.get(session_name).cloned())
     }
 
     async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {

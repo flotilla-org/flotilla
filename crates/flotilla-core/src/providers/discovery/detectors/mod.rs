@@ -15,6 +15,8 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(claude::ClaudeDetector),
         Box::new(codex::CodexAuthDetector),
         Box::new(CommandDetector::new("codex", &["--version"], parse_first_dotted_version)),
+        Box::new(EnvVarDetector::new("HOME")),
+        Box::new(EnvVarDetector::new("CODEX_HOME")),
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
         Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
         Box::new(CommandDetector::new("agent", &["--version"], parse_first_dotted_version)),
@@ -117,10 +119,19 @@ mod tests {
             .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))
             .on_run("claude", &["--version"], Ok("1.0.0 (Claude Code)\n".into()))
             .build();
-        let bag = run_host_detectors(&default_host_detectors(), &runner, &TestEnvVars::default()).await;
+        let bag = run_host_detectors(&default_host_detectors(), &runner, &TestEnvVars::new([("HOME", "/mock/home")])).await;
 
         assert!(bag.find_binary("codex").is_some(), "codex binary must be detected for its agent adapter to register");
+        assert_eq!(bag.find_env_var("HOME"), Some("/mock/home"), "Codex config discovery needs the detected home directory");
         let adapters = crate::agent_adapter::AgentAdapterRegistry::discover(&bag, Arc::new(runner));
-        assert!(adapters.get("codex").is_some(), "codex agent adapter should register when the binary is present");
+        let codex = adapters.get("codex").expect("codex agent adapter should register when the binary is present");
+        codex
+            .prepare(&crate::path_context::ExecutionEnvironmentPath::new("/workspace"), &flotilla_resources::TerminalBrief {
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "Implement the issue.".into(),
+                copies: Vec::new(),
+            })
+            .await
+            .expect("production-shaped discovery should supply Codex config location");
     }
 }

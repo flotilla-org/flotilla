@@ -6,8 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use flotilla_protocol::arg::{flatten, Arg};
-use flotilla_resources::TerminalBrief;
+use flotilla_resources::{TerminalAttentionState, TerminalBrief};
 use serde::Serialize;
+use tokio::sync::Mutex;
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::{
     path_context::ExecutionEnvironmentPath,
@@ -321,6 +323,9 @@ pub trait AgentAdapter: Send + Sync {
     fn deliver_brief(&self, brief: &TerminalBrief) -> String {
         format!("Read your crew brief at {} and follow it.", brief.path)
     }
+    fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
+        None
+    }
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String>;
 }
 
@@ -329,6 +334,13 @@ struct CliAgentAdapter {
     binary: String,
     runner: Arc<dyn CommandRunner>,
     autonomy_args: &'static [&'static str],
+    trust_config: Option<CodexTrustConfig>,
+}
+
+#[derive(Clone)]
+struct CodexTrustConfig {
+    path: PathBuf,
+    lock: Arc<Mutex<()>>,
 }
 
 impl CliAgentAdapter {
@@ -350,6 +362,13 @@ impl AgentAdapter for CliAgentAdapter {
     }
 
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
+        if self.id == "codex" {
+            let config = self
+                .trust_config
+                .as_ref()
+                .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
+            seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config).await?;
+        }
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
         ensure_flotilla_git_exclude(&*self.runner, cwd.as_path()).await
     }
@@ -358,9 +377,61 @@ impl AgentAdapter for CliAgentAdapter {
         remove_agent_brief(&*self.runner, cwd.as_path(), brief).await
     }
 
+    fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
+        (self.id == "codex" && codex_screen_needs_input(screen)).then_some(TerminalAttentionState::NeedsInput)
+    }
+
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
         Ok(AgentLaunchPlan { command: self.command(request), env: Vec::new(), stance: TRUSTED_IMPLICIT_STANCE.into() })
     }
+}
+
+fn codex_screen_needs_input(screen: &str) -> bool {
+    let approval_prompt = [
+        "Do you trust the contents of this directory?",
+        "Would you like to run the following command?",
+        "Do you want to approve network access to ",
+        "Would you like to grant these permissions?",
+        "Would you like to make the following edits?",
+        " needs your approval.",
+    ]
+    .iter()
+    .any(|prompt| screen.contains(prompt));
+    let user_question = screen.contains("Question ") && (screen.contains(" to submit answer") || screen.contains(" to submit all"));
+    approval_prompt || user_question
+}
+
+async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, config: &CodexTrustConfig) -> Result<(), String> {
+    let _guard = config.lock.lock().await;
+    let output = runner
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .await
+        .map_err(|error| format!("resolve canonical Codex workspace {}: {error}", cwd.display()))?;
+    if !output.success {
+        return Err(format!("resolve canonical Codex workspace {}: {}", cwd.display(), output.stderr.trim()));
+    }
+    let canonical_cwd = output.stdout.trim();
+    if canonical_cwd.is_empty() {
+        return Err(format!("resolve canonical Codex workspace {}: `pwd -P` returned an empty path", cwd.display()));
+    }
+    let source = runner.ensure_file(&config.path, "").await?;
+    let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
+    let projects = document
+        .as_table_mut()
+        .entry("projects")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("Codex config {} has a non-table `projects` value", config.path.display()))?;
+    let project = projects
+        .entry(canonical_cwd)
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| format!("Codex config {} has a non-table project entry for {canonical_cwd}", config.path.display()))?;
+    if project.get("trust_level").and_then(Item::as_str) == Some("trusted") {
+        return Ok(());
+    }
+    project["trust_level"] = value("trusted");
+    runner.write_file(&config.path, &document.to_string()).await
 }
 
 async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> Result<(), String> {
@@ -413,14 +484,21 @@ impl AgentAdapterRegistry {
                 binary: binary.as_path().display().to_string(),
                 runner: Arc::clone(&runner),
                 autonomy_args: &["--dangerously-skip-permissions"],
+                trust_config: None,
             }));
         }
         if let Some(binary) = env.find_binary("codex") {
+            let config_path = env
+                .find_env_var("CODEX_HOME")
+                .map(PathBuf::from)
+                .or_else(|| env.find_env_var("HOME").map(|home| PathBuf::from(home).join(".codex")))
+                .map(|home| home.join("config.toml"));
             registry.insert(Arc::new(CliAgentAdapter {
                 id: "codex",
                 binary: binary.as_path().display().to_string(),
                 runner,
                 autonomy_args: &["--dangerously-bypass-approvals-and-sandbox"],
+                trust_config: config_path.map(|path| CodexTrustConfig { path, lock: Arc::new(Mutex::new(())) }),
             }));
         }
         registry
@@ -447,8 +525,9 @@ mod tests {
     use flotilla_protocol::{IssueRef, IssueSource, IssueState};
     use flotilla_resources::{
         single_agent_contained_workflow_spec, Convoy, ConvoyIssue, ConvoyRepositorySpec, ConvoySpec, CrewSource, IssueSnapshot, ObjectMeta,
-        RepositoryKey, ResourceObject, TerminalCrewContext,
+        RepositoryKey, ResourceObject, TerminalAttentionState, TerminalCrewContext,
     };
+    use toml_edit::DocumentMut;
 
     use crate::{
         agent_adapter::{
@@ -465,9 +544,13 @@ mod tests {
 
     fn discovered_registry() -> AgentAdapterRegistry {
         let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("HOME", "/home/test"))
             .with(EnvironmentAssertion::binary("claude", "/tools/claude"))
             .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
-        AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(vec![Ok(".git/info/exclude\n".into()), Ok(String::new())])))
+        AgentAdapterRegistry::discover(
+            &env,
+            Arc::new(MockRunner::new(vec![Ok("/workspace\n".into()), Ok(".git/info/exclude\n".into()), Ok(String::new())])),
+        )
     }
 
     #[test]
@@ -796,6 +879,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_prepare_preserves_config_while_trusting_the_canonical_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).expect("codex home");
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "# keep this comment\nmodel = \"gpt-5.6-sol\"\n\n[projects.\"/existing\"]\ntrust_level = \"trusted\"\n",
+        )
+        .expect("initial Codex config");
+        let workspace = temp.path().join(r#"quote"and\slash"#);
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("CODEX_HOME", codex_home.display().to_string()))
+            .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let codex = registry.get("codex").expect("codex adapter");
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: String::new(), copies: Vec::new() };
+        codex.prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare Codex workspace");
+
+        let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
+        assert!(config.contains("# keep this comment"));
+        let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace").display().to_string();
+        assert_eq!(parsed["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(parsed["projects"]["/existing"]["trust_level"].as_str(), Some("trusted"));
+        assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
+    }
+
+    #[test]
+    fn codex_classifies_interactive_trust_and_approval_prompts_as_needing_input() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+
+        for screen in [
+            "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, quit\n\nPress enter to continue",
+            "Would you like to run the following command?\n\n$ cargo test\n\n› 1. Yes, proceed\n  2. No, tell Codex what to do differently",
+            "Do you want to approve network access to \"github.com\"?\n\n› 1. Approve once\n  2. Deny",
+            "Would you like to grant these permissions?\n\n› 1. Yes\n  2. No",
+            "Would you like to make the following edits?\n\n› 1. Yes\n  2. No",
+            "github needs your approval.\n\n› 1. Approve\n  2. Deny",
+            "Question 1/2 (2 unanswered)\n\nWhich environment?\n\n› 1. Staging\n  2. Production\n\nenter to submit answer",
+        ] {
+            assert_eq!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::NeedsInput), "{screen}");
+        }
+    }
+
+    #[test]
+    fn codex_does_not_treat_its_normal_composer_as_an_interactive_prompt() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        let screen = "• Working (57s • esc to interrupt)\n\n› Run /review on my current changes\n\ngpt-5.6-sol high · /workspace";
+
+        assert_eq!(codex.classify_screen_attention(screen), None);
+    }
+
+    #[tokio::test]
     async fn prepare_excludes_flotilla_brief_from_git_status() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -826,7 +966,9 @@ mod tests {
             .expect("git commit")
             .success());
 
-        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        let env = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("CODEX_HOME", temp.path().join("codex-home").display().to_string()))
+            .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
         let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
         let brief = flotilla_resources::TerminalBrief {
             path: ".flotilla/briefs/coder.md".into(),

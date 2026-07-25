@@ -125,6 +125,13 @@ pub trait TerminalPool: Send + Sync {
 
     async fn kill_session(&self, session_name: &str) -> Result<(), String>;
 
+    /// Capture the currently rendered terminal screen when the pool has a
+    /// functional VT engine. This is level-triggered observation for prompts
+    /// that do not emit a harness hook event.
+    async fn capture_screen(&self, _session_name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// Deliver text to a running session. This trait grows only for concrete
     /// flotilla consumers; it is not intended to mirror a pool backend's API.
     async fn deliver(&self, _session_name: &str, _text: &str, _submit: bool) -> Result<(), String> {
