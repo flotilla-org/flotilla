@@ -58,15 +58,20 @@ impl TablePanel {
             && (trigger == FetchTrigger::Explicit || view.rows.len().saturating_sub(state.selected_index(view).unwrap_or(0) + 1) <= 5)
     }
 
-    fn rendered_cell_text(view: &TableView, row_index: usize, column_index: usize, width: usize) -> String {
+    fn rendered_cell_text(view: &TableView, row_index: usize, first_visible: usize, column_index: usize, width: usize) -> String {
         let row = &view.rows[row_index];
         let cell = &row.cells[column_index];
         let column = &view.columns[column_index];
-        let repeated = row_index.checked_sub(1).and_then(|previous| view.rows.get(previous)).is_some_and(|previous| match column.id {
-            "host" => previous.cells[column_index].text == cell.text,
-            "repository" => previous.cells[0].text == row.cells[0].text && previous.cells[column_index].text == cell.text,
-            _ => false,
-        });
+        let host_column = view.columns.iter().position(|candidate| candidate.id == "host");
+        let repeated = (row_index > first_visible)
+            && row_index.checked_sub(1).and_then(|previous| view.rows.get(previous)).is_some_and(|previous| match column.id {
+                "host" => previous.cells[column_index].text == cell.text,
+                "repository" => {
+                    host_column.is_some_and(|host| previous.cells[host].text == row.cells[host].text)
+                        && previous.cells[column_index].text == cell.text
+                }
+                _ => false,
+            });
         if repeated {
             String::new()
         } else if column.id == "path" {
@@ -147,7 +152,7 @@ impl TablePanel {
             });
             let mut offset = 0usize;
             let cells = row.cells.iter().zip(&view.columns).enumerate().map(|(index, (cell, column))| {
-                let mut text = Self::rendered_cell_text(view, row_index, index, column_widths[index]);
+                let mut text = Self::rendered_cell_text(view, row_index, first, index, column_widths[index]);
                 if index == 0 {
                     if matches!(row_state, Some(RowState::Failed { .. })) {
                         text = format!("x {text}");
@@ -543,13 +548,21 @@ mod tests {
     #[test]
     fn checkout_line_dedup_runs_after_filtering() {
         let unfiltered = checkout_view();
-        assert_eq!(TablePanel::rendered_cell_text(&unfiltered, 1, 0, 20), "");
-        assert_eq!(TablePanel::rendered_cell_text(&unfiltered, 1, 3, 20), "");
+        assert_eq!(TablePanel::rendered_cell_text(&unfiltered, 1, 0, 0, 20), "");
+        assert_eq!(TablePanel::rendered_cell_text(&unfiltered, 1, 0, 3, 20), "");
 
         let filtered = checkout_view().filtered("feature");
         assert_eq!(filtered.rows.len(), 1);
-        assert_eq!(TablePanel::rendered_cell_text(&filtered, 0, 0, 20), "kiwi");
-        assert_eq!(TablePanel::rendered_cell_text(&filtered, 0, 3, 20), "widgets");
+        assert_eq!(TablePanel::rendered_cell_text(&filtered, 0, 0, 0, 20), "kiwi");
+        assert_eq!(TablePanel::rendered_cell_text(&filtered, 0, 0, 3, 20), "widgets");
+    }
+
+    #[test]
+    fn checkout_line_dedup_restarts_at_the_top_of_the_visible_window() {
+        let view = checkout_view();
+
+        assert_eq!(TablePanel::rendered_cell_text(&view, 1, 1, 0, 20), "kiwi");
+        assert_eq!(TablePanel::rendered_cell_text(&view, 1, 1, 3, 20), "widgets");
     }
 
     fn snapshot_view() -> TableView {
