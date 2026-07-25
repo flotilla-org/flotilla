@@ -472,7 +472,11 @@ impl PeerManager {
     }
 
     fn generation_is_current(&self, name: &NodeId, generation: u64) -> bool {
-        generation != 0 && self.generations.get(name).copied() == Some(generation)
+        // Validity keys on the ACTIVE connection, not the mint counter: the
+        // counter must stay monotonic across disconnects (replicator
+        // supervision dedupes on it), while envelopes and hops from a
+        // disconnected generation must still be rejected.
+        generation != 0 && self.active_connections.get(name).map(|active| active.generation) == Some(generation)
     }
 
     fn install_direct_route(&mut self, host: &NodeId, generation: u64) {
@@ -1752,7 +1756,11 @@ impl PeerManager {
 
         self.senders.remove(name);
         self.active_connections.remove(name);
-        self.generations.remove(name);
+        // Deliberately NOT removing from self.generations: it is the
+        // monotonic mint counter. Resetting it made every reconnect mint
+        // generation 1 again, which the replicator supervisor rejected as
+        // a duplicate — wedging replication (and heartbeats) after any
+        // one-sided daemon restart.
         self.displaced_senders.retain(|(host, _), _| host != name);
         self.transport_peers.retain(|_, node_id| node_id != name);
         self.reverse_paths.retain(|_, hop| hop.next_hop != *name);
