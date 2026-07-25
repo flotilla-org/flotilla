@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     openssh-client \
     git \
+    tmux \
     ca-certificates \
     libssl3t64 \
     gosu \
@@ -48,7 +49,9 @@ CMD ["sleep", "infinity"]
 # --- Full build target (default): cargo-built binary ---
 FROM runtime-base AS full
 COPY --from=builder /app/target/release/flotilla /usr/local/bin/flotilla
+COPY --from=builder /app/target/release/flotillad /usr/local/bin/flotillad
 
 # --- Dev target: pre-built binary from host ---
 FROM runtime-base AS dev
 COPY target/release/flotilla /usr/local/bin/flotilla
+COPY target/release/flotillad /usr/local/bin/flotillad
