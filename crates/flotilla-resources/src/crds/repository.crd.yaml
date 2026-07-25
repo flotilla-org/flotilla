@@ -43,6 +43,17 @@ spec:
                       type: string
                     repository:
                       type: string
+                upstream:
+                  type: object
+                  required: [url, relation]
+                  properties:
+                    url:
+                      type: string
+                    relation:
+                      type: string
+                      enum: [fork]
+                allow_reviewless_workflows:
+                  type: boolean
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true

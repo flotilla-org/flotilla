@@ -137,6 +137,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_clone_uses_only_the_fork_url_and_never_adds_an_upstream_remote() {
+        let runner = Arc::new(RecordingRunner::with_responses(vec![Ok(String::new())]));
+        let provisioner = super::GitCloneProvisioner::new(runner.clone());
+
+        provisioner
+            .clone_repo("https://forgejo.lab/fork-issues/zellij", &ExecutionEnvironmentPath::new("/tmp/zellij"))
+            .await
+            .expect("clone should succeed");
+
+        assert_eq!(runner.calls(), vec![(
+            "git".to_string(),
+            vec!["clone".to_string(), "https://forgejo.lab/fork-issues/zellij".to_string(), "/tmp/zellij".to_string()],
+            PathBuf::from("/")
+        )]);
+    }
+
+    #[tokio::test]
     async fn inspect_clone_prefers_origin_head_for_default_branch() {
         let runner = Arc::new(RecordingRunner::with_responses(vec![Ok("origin/main\n".to_string())]));
         let provisioner = super::GitCloneProvisioner::new(runner);

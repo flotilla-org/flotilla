@@ -773,7 +773,7 @@ mod work_items_table {
 mod repo_detail_human {
     use std::{collections::HashMap, path::PathBuf};
 
-    use flotilla_protocol::{snapshot::ProviderError, RepoDetailResponse};
+    use flotilla_protocol::{snapshot::ProviderError, RepoDetailResponse, RepositoryRelation, RepositoryUpstream};
 
     use super::make_work_item;
     use crate::cli::format_repo_detail_human;
@@ -783,6 +783,7 @@ mod repo_detail_human {
         let detail = RepoDetailResponse {
             path: PathBuf::from("/tmp/my-repo"),
             slug: None,
+            upstream: None,
             provider_health: HashMap::new(),
             work_items: vec![],
             errors: vec![],
@@ -799,6 +800,7 @@ mod repo_detail_human {
         let detail = RepoDetailResponse {
             path: PathBuf::from("/tmp/my-repo"),
             slug: Some("org/my-repo".into()),
+            upstream: None,
             provider_health: HashMap::new(),
             work_items: vec![],
             errors: vec![],
@@ -808,10 +810,27 @@ mod repo_detail_human {
     }
 
     #[test]
+    fn with_fork_provenance() {
+        let detail = RepoDetailResponse {
+            path: PathBuf::from("/tmp/zellij"),
+            slug: Some("fork-issues/zellij".into()),
+            upstream: Some(RepositoryUpstream { url: "https://github.com/zellij-org/zellij".into(), relation: RepositoryRelation::Fork }),
+            provider_health: HashMap::new(),
+            work_items: vec![],
+            errors: vec![],
+        };
+
+        let output = format_repo_detail_human(&detail);
+
+        assert!(output.contains("Upstream: https://github.com/zellij-org/zellij (fork)"));
+    }
+
+    #[test]
     fn with_work_items() {
         let detail = RepoDetailResponse {
             path: PathBuf::from("/tmp/my-repo"),
             slug: None,
+            upstream: None,
             provider_health: HashMap::new(),
             work_items: vec![make_work_item(flotilla_protocol::snapshot::WorkItemKind::Checkout, Some("feat"), "My feature")],
             errors: vec![],
@@ -826,6 +845,7 @@ mod repo_detail_human {
         let detail = RepoDetailResponse {
             path: PathBuf::from("/tmp/my-repo"),
             slug: None,
+            upstream: None,
             provider_health: HashMap::new(),
             work_items: vec![],
             errors: vec![ProviderError { category: "change_request".into(), provider: "GitHub".into(), message: "rate limited".into() }],

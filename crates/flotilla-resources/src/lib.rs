@@ -74,7 +74,7 @@ pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaC
 pub use repository::{
     ensure_repository, repository_display_labels, repository_workspace_slugs, resolve_default_branch, DefaultBranchObservation,
     DefaultBranchProvenance, ForgeIdentity, Repository, RepositoryCheckoutKind, RepositoryCheckoutRef, RepositoryIdentity, RepositoryKey,
-    RepositorySpec, RepositoryStatus, RepositoryStatusPatch,
+    RepositoryRelation, RepositorySpec, RepositoryStatus, RepositoryStatusPatch, RepositoryUpstream,
 };
 pub use resource::{
     api_version, ApiPaths, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject, K8sWatchEvent, ObjectMeta,
@@ -113,7 +113,7 @@ macro_rules! for_each_registered_resource {
     }};
 }
 pub use workflow_template::{
-    interactive_single_workflow_spec, single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec, InputDefinition,
-    InterpolationField, InterpolationLocation, Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate,
+    implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_contained_workflow_spec, validate, CrewSource, CrewSpec,
+    InputDefinition, InterpolationField, InterpolationLocation, Selector, Stance, ValidationError, VesselRequirement, WorkflowTemplate,
     WorkflowTemplateSpec,
 };

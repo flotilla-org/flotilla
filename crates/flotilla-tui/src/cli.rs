@@ -594,6 +594,9 @@ fn format_repo_detail_human(detail: &RepoDetailResponse) -> String {
     if let Some(slug) = &detail.slug {
         out.push_str(&format!("Slug: {slug}\n"));
     }
+    if let Some(upstream) = &detail.upstream {
+        out.push_str(&format!("Upstream: {} ({})\n", upstream.url, upstream.relation));
+    }
     out.push('\n');
 
     if !detail.work_items.is_empty() {

@@ -46,13 +46,14 @@ use flotilla_protocol::{
     RepoIdentity, RepoSelector, StepStatus, StreamKey, SystemInfo, ToolInventory, TopologyRoute, WorkItemKind,
 };
 use flotilla_resources::{
-    apply_status_patch, controller_patches as convoy_controller_patches, single_agent_contained_workflow_spec,
-    Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
-    CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase, DockerCheckoutStrategy,
-    DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Project, ProjectRepositorySpec,
-    ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository, RepositorySpec, Stance, TypedResolver, WorkPhase, WorkState,
-    WorkflowSnapshot, WorkflowTemplate, AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
+    apply_status_patch, controller_patches as convoy_controller_patches, implement_review_workflow_spec,
+    single_agent_contained_workflow_spec, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Convoy as ResourceConvoy, ConvoyPhase,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Host as ResourceHost, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, InputMeta, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicy,
+    PlacementPolicySpec, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, Repository,
+    RepositoryRelation, RepositorySpec, Stance, TypedResolver, WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate,
+    AGENT_ADAPTERS_CAPABILITY, REPO_KEY_LABEL, REPO_LABEL,
 };
 use tokio::sync::Notify;
 
@@ -919,6 +920,104 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         })
         .await
         .expect("project create");
+}
+
+#[tokio::test]
+async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    let repository = RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij")
+        .expect("fork repository")
+        .with_upstream("https://github.com/zellij-org/zellij", RepositoryRelation::Fork)
+        .expect("upstream");
+    backend
+        .clone()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository create");
+    for (name, workflow) in
+        [("single-agent-contained", single_agent_contained_workflow_spec()), ("implement-review", implement_review_workflow_spec())]
+    {
+        backend
+            .clone()
+            .using::<WorkflowTemplate>("flotilla")
+            .create(&InputMeta::builder().name(name.to_string()).build(), &workflow)
+            .await
+            .expect("workflow create");
+    }
+    create_test_contained_policy(&backend, "flotilla-test", BTreeSet::from(["codex".to_string(), "claude-code".to_string()])).await;
+    backend
+        .clone()
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
+            display_name: "Zellij".into(),
+            default_workflow_ref: "single-agent-contained".into(),
+            issue_source: Some(IssueSource { service: "https://forgejo.lab".into(), scope: "fork-issues/zellij".into() }),
+            repositories: vec![ProjectRepositorySpec { repo: repository.key(), subpath: None, default_branch: Some("main".into()) }],
+        })
+        .await
+        .expect("project create");
+
+    let mut events = daemon.subscribe();
+    let start = |name: &str, workflow_ref: &str| Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::ConvoyStart {
+            intent: Box::new(ConvoyStartIntent {
+                namespace: None,
+                project_ref: "zellij".into(),
+                issues: Vec::new(),
+                name: Some(name.to_string()),
+                branch: Some(format!("stack/{name}")),
+                workflow_ref: Some(workflow_ref.to_string()),
+                inputs: Vec::new(),
+                instruction: None,
+                placement_policy: Some("docker-test".into()),
+                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
+            }),
+        },
+    };
+    let rejected_id = daemon.execute(start("reviewless", "single-agent-contained")).await.expect("dispatch command");
+    assert_eq!(recv_command_finished(&mut events, rejected_id).await, CommandValue::Error {
+        message: "workflow single-agent-contained not permitted for fork-stance repository — use implement-review".to_string()
+    });
+
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    let stored = repositories.get(&repository.key().to_string()).await.expect("fork repository");
+    repositories
+        .update(
+            &InputMeta::from(&stored.metadata),
+            &stored.metadata.resource_version,
+            &repository.clone().with_allow_reviewless_workflows(true),
+        )
+        .await
+        .expect("explicit reviewless override");
+    let overridden_id = daemon.execute(start("overridden", "single-agent-contained")).await.expect("override dispatch command");
+    assert_eq!(recv_command_finished(&mut events, overridden_id).await, CommandValue::ConvoyStarted {
+        name: "overridden".into(),
+        attach_command: None,
+        binding: None
+    });
+
+    let admitted_id = daemon.execute(start("reviewed", "implement-review")).await.expect("dispatch command");
+    assert_eq!(recv_command_finished(&mut events, admitted_id).await, CommandValue::ConvoyStarted {
+        name: "reviewed".into(),
+        attach_command: None,
+        binding: None
+    });
+    let convoy = backend.using::<ResourceConvoy>("flotilla").get("reviewed").await.expect("reviewed convoy");
+    assert_eq!(convoy.spec.workflow_ref, "implement-review");
+    let workflow = backend.using::<WorkflowTemplate>("flotilla").get("implement-review").await.expect("implement-review workflow");
+    assert_eq!(workflow.spec.vessels[0].crew.len(), 2);
+    assert!(matches!(
+        &workflow.spec.vessels[0].crew[1].source,
+        flotilla_resources::CrewSource::Agent { selector, brief_template: Some(template), .. }
+            if selector.capability == "code-review" && template == "diff-review"
+    ));
 }
 
 async fn create_test_host_direct_policy(
@@ -2578,6 +2677,39 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
     let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
     (temp, repo, daemon, identity)
+}
+
+#[tokio::test]
+async fn refresh_syncs_fork_stance_without_whole_project_migration_and_clears_removed_config() {
+    let (temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
+    ConfigStore::with_base(temp.path().join("config")).save_repo(&ExecutionEnvironmentPath::new(repo.clone()));
+    let repo_config = std::fs::read_dir(temp.path().join("config/repos"))
+        .expect("repo config directory")
+        .find_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension().is_some_and(|extension| extension == "toml")).then_some(path)
+        })
+        .expect("persisted repo config");
+    let path = repo.to_string_lossy();
+    std::fs::write(
+        &repo_config,
+        format!("path = \"{path}\"\n\n[upstream]\nurl = \"https://github.com/upstream/repo\"\nrelation = \"fork\"\n"),
+    )
+    .expect("write fork config");
+
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh fork config");
+
+    let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
+    assert!(stored.spec.is_fork(), "refresh should apply fork provenance without changing repository identity");
+
+    std::fs::write(&repo_config, format!("path = \"{path}\"\n")).expect("remove fork config");
+    daemon.refresh(&RepoSelector::Path(repo)).await.expect("refresh removed fork config");
+
+    let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
+    assert!(stored.spec.upstream().is_none(), "authoritative per-repository config removal should clear previously stored fork provenance");
 }
 
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {

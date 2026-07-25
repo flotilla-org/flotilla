@@ -20,6 +20,8 @@ pub const TRUSTED_IMPLICIT_STANCE: &str = "trusted-implicit";
 pub const DEFAULT_CREW_BRIEF_TEMPLATE: &str = "crew.md";
 const BUILTIN_CREW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/crew.md");
 const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/interactive-session.md");
+const BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE: &str = include_str!("agent_adapter/templates/diff-review.md");
+const BUILTIN_FORK_STANCE_BRIEF_LAYER: &str = include_str!("agent_adapter/templates/fork-stance.md");
 const BRIEF_TEMPLATE_DIR: &str = "brief-templates";
 
 pub fn crew_brief_path(role: &str) -> String {
@@ -69,9 +71,20 @@ impl CrewBriefTemplateResolver {
         project_ref: Option<&str>,
         repo_roots: impl IntoIterator<Item = PathBuf>,
     ) -> CrewBriefRenderOptions {
+        self.render_options_with_fork_stance(template, project_ref, repo_roots, false)
+    }
+
+    pub fn render_options_with_fork_stance(
+        &self,
+        template: Option<&str>,
+        project_ref: Option<&str>,
+        repo_roots: impl IntoIterator<Item = PathBuf>,
+        fork_stance: bool,
+    ) -> CrewBriefRenderOptions {
         let template = template.filter(|template| !template.trim().is_empty()).unwrap_or(DEFAULT_CREW_BRIEF_TEMPLATE);
         let override_filename = match template {
             "interactive-session" => "interactive-session.md",
+            "diff-review" => "diff-review.md",
             other => other,
         };
         let mut overrides = Vec::new();
@@ -87,7 +100,7 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides }
+        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance }
     }
 }
 
@@ -103,11 +116,12 @@ fn push_template_override(overrides: &mut Vec<CrewBriefTemplateOverride>, path: 
 pub struct CrewBriefRenderOptions {
     pub template: String,
     pub overrides: Vec<CrewBriefTemplateOverride>,
+    pub fork_stance: bool,
 }
 
 impl Default for CrewBriefRenderOptions {
     fn default() -> Self {
-        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new() }
+        Self { template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(), overrides: Vec::new(), fork_stance: false }
     }
 }
 
@@ -175,10 +189,13 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
         .map_err(|err| format!("load built-in crew brief template: {err}"))?;
     env.add_template(BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME, BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE)
         .map_err(|err| format!("load built-in interactive-session brief template: {err}"))?;
+    env.add_template(BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE_NAME, BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE)
+        .map_err(|err| format!("load built-in diff-review brief template: {err}"))?;
     let mut skip_overrides = 0;
     let mut current_template = match options.template.as_str() {
         DEFAULT_CREW_BRIEF_TEMPLATE => BUILTIN_CREW_BRIEF_TEMPLATE_NAME.to_string(),
         "interactive-session" | "interactive-session.md" => BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME.to_string(),
+        "diff-review" | "diff-review.md" => BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE_NAME.to_string(),
         custom if !options.overrides.is_empty() => {
             let first = &options.overrides[0];
             if is_block_only_override(&first.source) {
@@ -200,6 +217,12 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
             .map_err(|err| format!("load crew brief template {}: {err}", template_override.path.display()))?;
         current_template = name;
     }
+    if options.fork_stance {
+        let name = format!("builtin/fork-stance/{}", options.template);
+        let source = format!("{{% extends \"{current_template}\" %}}\n{BUILTIN_FORK_STANCE_BRIEF_LAYER}");
+        env.add_template_owned(name.clone(), source).map_err(|err| format!("load built-in fork-stance brief layer: {err}"))?;
+        current_template = name;
+    }
     env.get_template(&current_template)
         .and_then(|template| template.render(context))
         .map_err(|err| format!("render crew brief template {}: {err}", options.template))
@@ -207,6 +230,7 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
 
 const BUILTIN_CREW_BRIEF_TEMPLATE_NAME: &str = "builtin/crew.md";
 const BUILTIN_INTERACTIVE_SESSION_BRIEF_TEMPLATE_NAME: &str = "builtin/interactive-session.md";
+const BUILTIN_DIFF_REVIEW_BRIEF_TEMPLATE_NAME: &str = "builtin/diff-review.md";
 
 fn layered_override_source(parent: &str, source: &str) -> String {
     if !is_block_only_override(source) {
@@ -731,7 +755,7 @@ mod tests {
             "driver",
             CrewAssignment::Prompt("Pair with the user."),
             &[CrewBriefMember { role: "driver".to_string(), state: "active".to_string(), is_agent: true }],
-            &CrewBriefRenderOptions { template: "interactive-session.md".to_string(), overrides: Vec::new() },
+            &CrewBriefRenderOptions { template: "interactive-session.md".to_string(), overrides: Vec::new(), fork_stance: false },
         )
         .expect("render selected template")
         .content;
@@ -739,6 +763,34 @@ mod tests {
         assert!(selected.contains("For interactive sessions, keep the user-facing loop tight"));
         assert!(selected.contains("## Assignment\n\nPair with the user."));
         assert!(!default.contains("For interactive sessions"));
+    }
+
+    #[test]
+    fn diff_review_template_and_fork_layer_define_review_settlement() {
+        let brief = build_crew_brief_with_options(
+            &TerminalCrewContext {
+                namespace: "flotilla".to_string(),
+                convoy: "zellij-9".to_string(),
+                vessel_ref: "zellij-9-work".to_string(),
+            },
+            "work",
+            "reviewer",
+            CrewAssignment::CarriedIssue,
+            &[CrewBriefMember { role: "coder".to_string(), state: "handed-off".to_string(), is_agent: true }, CrewBriefMember {
+                role: "reviewer".to_string(),
+                state: "active".to_string(),
+                is_agent: true,
+            }],
+            &CrewBriefRenderOptions { template: "diff-review".to_string(), overrides: Vec::new(), fork_stance: true },
+        )
+        .expect("render fork review brief")
+        .content;
+
+        assert!(brief.contains("flotilla crew coder handoff --message"));
+        assert!(brief.contains("sign off on the fork PR"));
+        assert!(brief.contains("Never add a git remote"));
+        assert!(brief.contains("Never open issues, pull requests, or comments against the upstream repository"));
+        assert!(brief.contains("base set to the stack branch named in the dispatch inputs"));
     }
 
     #[test]
@@ -790,6 +842,7 @@ mod tests {
                     path: "pairing.md".into(),
                     source: "{% block delivery %}Pairing-specific delivery gate.{% endblock %}".to_string(),
                 }],
+                fork_stance: false,
             },
         )
         .expect("render custom block-only template");
