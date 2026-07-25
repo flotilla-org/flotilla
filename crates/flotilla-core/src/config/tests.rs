@@ -300,6 +300,16 @@ fn load_config_parses_full_overrides() {
 }
 
 #[test]
+fn load_config_parses_convoy_auto_attach_override() {
+    let dir = tempdir().expect("create config tempdir");
+    std::fs::write(dir.path().join("config.toml"), "[convoy]\nauto_attach = false\n").expect("write config");
+
+    let store = ConfigStore::with_base(dir.path());
+
+    assert_eq!(store.load_config().convoy.auto_attach, Some(false));
+}
+
+#[test]
 fn load_config_partial_override_keeps_defaults() {
     let dir = tempdir().unwrap();
     std::fs::write(dir.path().join("config.toml"), "[vcs.git]\ncheckout_strategy = \"worktree\"\n").unwrap();

@@ -1090,6 +1090,7 @@ async fn dispatch_execute_routes_remote_convoy_start_as_a_whole_daemon_command()
                     .name("remote-work".to_string())
                     .branch("feat/remote-work".to_string())
                     .placement_policy(remote_policy_name.clone())
+                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                     .build(),
             ),
         })

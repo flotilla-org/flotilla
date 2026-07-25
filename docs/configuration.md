@@ -9,6 +9,20 @@ Stored in `~/.config/flotilla/`:
 
 Repos are added interactively from within flotilla using the `a` key.
 
+## Convoy start attachment
+
+By default, `flotilla convoy start` attaches to the new convoy only when the
+daemon has no presentation-manager connector (`flotilla pm connect`) connected.
+`--attach` and `--no-attach` always override that heuristic.
+
+To override the default for every convoy start that omits those flags, set
+`auto_attach` in `~/.config/flotilla/config.toml`:
+
+```toml
+[convoy]
+auto_attach = false
+```
+
 ## Dependencies
 
 Flotilla auto-detects available tools. Nothing is strictly required beyond git, but more tools unlock more features.

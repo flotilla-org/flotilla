@@ -2444,7 +2444,10 @@ fn project_issue_bulk_start_queues_one_convoy_start_per_issue() {
 
     assert_eq!(queued.len(), 3);
     assert_eq!(queued.iter().map(|(_, id, _, _)| id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
-    assert!(queued.iter().all(|(_, _, auto_attach, _)| !auto_attach), "bulk convoy starts should not auto-attach one selected issue");
+    assert!(
+        queued.iter().all(|(_, _, auto_attach, _)| *auto_attach == flotilla_protocol::ConvoyAutoAttach::Never),
+        "bulk convoy starts should not auto-attach one selected issue"
+    );
     assert!(queued.iter().all(|(_, _, _, instruction)| instruction.as_deref() == Some("Keep each fix focused")));
     assert_eq!(app.model.status_message.as_deref(), Some("Starting 3 convoys..."));
 }
@@ -2491,7 +2494,11 @@ fn project_issue_batch_start_queues_one_convoy_for_all_issues() {
             .collect::<Vec<_>>(),
         vec!["809", "810", "811"]
     );
-    assert!(intent.auto_attach, "batch convoy start should auto-attach the single created convoy");
+    assert_eq!(
+        intent.auto_attach,
+        flotilla_protocol::ConvoyAutoAttach::Default,
+        "batch convoy start should use the presence-aware attach default"
+    );
     assert_eq!(intent.instruction.as_deref(), Some("Preserve shared behavior"));
     assert_eq!(app.model.status_message.as_deref(), Some("Starting batch convoy for 3 issues..."));
 }

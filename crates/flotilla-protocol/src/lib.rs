@@ -107,8 +107,8 @@ pub(crate) mod test_helpers {
 }
 
 pub use commands::{
-    AttachBinding, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyStartIntent,
-    IssueSelector, PreparedConvoyStart, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand,
+    AttachBinding, CheckoutSelector, CheckoutStatus, CheckoutTarget, Command, CommandAction, CommandValue, ConvoyAutoAttach,
+    ConvoyStartIntent, IssueSelector, PreparedConvoyStart, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand,
     ResourceJsonResponse, ResourceWatchCursor, ResourceWatchResponse, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
