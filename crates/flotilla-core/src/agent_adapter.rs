@@ -403,10 +403,17 @@ fn codex_screen_needs_input(screen: &str) -> bool {
 
 async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, config: &CodexTrustConfig) -> Result<(), String> {
     let _guard = config.lock.lock().await;
-    let canonical_cwd = match runner.run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop).await {
-        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
-        _ => cwd.display().to_string(),
-    };
+    let output = runner
+        .run_output("pwd", &["-P"], cwd, &ChannelLabel::Noop)
+        .await
+        .map_err(|error| format!("resolve canonical Codex workspace {}: {error}", cwd.display()))?;
+    if !output.success {
+        return Err(format!("resolve canonical Codex workspace {}: {}", cwd.display(), output.stderr.trim()));
+    }
+    let canonical_cwd = output.stdout.trim();
+    if canonical_cwd.is_empty() {
+        return Err(format!("resolve canonical Codex workspace {}: `pwd -P` returned an empty path", cwd.display()));
+    }
     let source = runner.ensure_file(&config.path, "").await?;
     let mut document = source.parse::<DocumentMut>().map_err(|error| format!("parse Codex config {}: {error}", config.path.display()))?;
     let projects = document
@@ -416,7 +423,7 @@ async fn seed_codex_workspace_trust(runner: &dyn CommandRunner, cwd: &Path, conf
         .as_table_mut()
         .ok_or_else(|| format!("Codex config {} has a non-table `projects` value", config.path.display()))?;
     let project = projects
-        .entry(&canonical_cwd)
+        .entry(canonical_cwd)
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
         .ok_or_else(|| format!("Codex config {} has a non-table project entry for {canonical_cwd}", config.path.display()))?;

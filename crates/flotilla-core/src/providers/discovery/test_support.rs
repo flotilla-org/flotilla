@@ -242,6 +242,9 @@ impl EnvVars for TestEnvVars {
 impl CommandRunner for DiscoveryMockRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         self.seen_cwds.lock().expect("lock poisoned").push(cwd.to_path_buf());
+        if cmd == "pwd" && args == ["-P"] {
+            return Ok(format!("{}\n", cwd.display()));
+        }
         let key = (cmd.to_string(), args.join(" "));
         let mut map = self.responses.lock().expect("lock poisoned");
         if let Some(queue) = map.get_mut(&key) {
