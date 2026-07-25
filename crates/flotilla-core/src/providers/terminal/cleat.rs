@@ -141,6 +141,10 @@ impl TerminalPool for CleatTerminalPool {
         Ok(())
     }
 
+    async fn capture_screen(&self, session_name: &str) -> Result<Option<String>, String> {
+        run!(self.runner, &self.binary, &["capture", session_name], Path::new("/")).map(Some)
+    }
+
     async fn deliver(&self, session_name: &str, text: &str, submit: bool) -> Result<(), String> {
         let mut args = vec!["send", session_name, text];
         if submit {
@@ -182,6 +186,18 @@ mod tests {
         assert!(sessions[1].command.is_none());
         assert_eq!(sessions[1].working_directory.as_ref().map(|p| p.as_path()), Some(Path::new("/other")));
         assert_eq!(sessions[1].screen_activity, Some(ScreenActivity::Stable));
+    }
+
+    #[tokio::test]
+    async fn capture_screen_reads_the_rendered_terminal() {
+        let runner = Arc::new(MockRunner::new(vec![Ok("Do you trust the contents of this directory?\n".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+
+        assert_eq!(
+            pool.capture_screen("terminal-demo-work-coder").await.expect("capture screen").as_deref(),
+            Some("Do you trust the contents of this directory?\n")
+        );
+        assert_eq!(runner.calls()[0], ("cleat".to_string(), vec!["capture".to_string(), "terminal-demo-work-coder".to_string()]));
     }
 
     #[tokio::test]
