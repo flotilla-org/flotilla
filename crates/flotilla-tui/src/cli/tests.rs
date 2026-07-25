@@ -224,7 +224,7 @@ mod project_list_human {
     use crate::cli::format_project_list_human;
 
     fn repository(name: &str) -> ProjectListRepository {
-        ProjectListRepository { key: RepositoryKey(format!("key-{name}")), slug: Some(name.to_string()) }
+        ProjectListRepository { key: RepositoryKey(format!("key-{name}")), slug: Some(name.to_string()), subpaths: vec![] }
     }
 
     #[test]
@@ -274,6 +274,7 @@ mod project_list_human {
             .repositories(vec![ProjectListRepository {
                 key: RepositoryKey("umfdl0jvpivapi195j3h2n74gh69gbfub13294vogopginvd1m8g".to_string()),
                 slug: None,
+                subpaths: vec![],
             }])
             .maybe_issue_source(None)
             .default_workflow_ref("single-agent-contained".to_string())

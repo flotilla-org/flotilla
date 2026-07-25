@@ -3,7 +3,7 @@ use std::{collections::VecDeque, path::Path, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_core::{
-    config::ConfigStore,
+    config::{ConfigStore, OpenViewEntry},
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
@@ -337,6 +337,31 @@ fn app_new_loads_layout_from_config() {
     let app = App::new(daemon, vec![repo_info("/tmp/repo-a", "repo-a", RepoLabels::default())], config, Theme::classic());
 
     assert_eq!(app.ui.view_layout, RepoViewLayout::Below);
+}
+
+#[test]
+fn persisted_open_views_take_precedence_over_a_fresh_project_landing() {
+    let dir = tempdir().expect("tempdir");
+    let config = Arc::new(ConfigStore::with_base(dir.path()));
+    config.save_open_views(&[OpenViewEntry { address: "overview".into(), label: None }, OpenViewEntry {
+        address: "repo/github.com/owner/repo-a".into(),
+        label: Some("saved".into()),
+    }]);
+    let daemon: Arc<dyn DaemonHandle> = Arc::new(test_support::StubDaemon::new());
+    let repo = repo_info("/tmp/repo-a", "repo-a", RepoLabels::default());
+
+    let app = App::new_with_default_landing(
+        daemon,
+        vec![repo.clone()],
+        config,
+        Theme::classic(),
+        Some((repo.identity, "project/flotilla/repo-a".parse().expect("project address"))),
+    );
+
+    assert_eq!(app.views.to_entries(), vec![OpenViewEntry { address: "overview".into(), label: None }, OpenViewEntry {
+        address: "repo/github.com/owner/repo-a".into(),
+        label: Some("saved".into())
+    },]);
 }
 
 #[tokio::test]

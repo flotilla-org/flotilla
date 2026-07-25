@@ -531,6 +531,8 @@ async fn project_list_query_returns_all_projects_with_addresses_and_repository_s
         "flotilla-org/cleat",
         "flotilla-org/flotilla"
     ]);
+    assert!(response.projects[1].repositories[0].subpaths.is_empty());
+    assert_eq!(response.projects[1].repositories[1].subpaths, vec!["crates/flotilla-core".to_string(), "crates/flotilla-tui".to_string()]);
     assert_eq!(response.projects[1].issue_source.as_ref().map(|source| source.scope.as_str()), Some("FLOT"));
     assert_eq!(response.projects[1].default_workflow_ref, "review-and-fix");
 }

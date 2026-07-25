@@ -20,7 +20,7 @@ use flotilla_core::{
 };
 use flotilla_protocol::{
     commands::CommandValue, output::OutputFormat, AgentHookEvent, AttachableId, Command, CommandAction, EnvironmentId, HostName,
-    RepoSelector, StepStatus,
+    ProjectListResponse, RepoIdentity, RepoInfo, RepoSelector, StepStatus, ViewAddress,
 };
 use flotilla_tui::{app, event_log, theme};
 use tracing::info;
@@ -436,6 +436,28 @@ where
     Ok(())
 }
 
+fn default_project_landing(
+    repos: &[RepoInfo],
+    startup_repo_roots: &[PathBuf],
+    projects: &ProjectListResponse,
+) -> Option<(RepoIdentity, ViewAddress)> {
+    let repo = startup_repo_roots.iter().find_map(|root| {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        repos
+            .iter()
+            .find(|repo| repo.path.as_ref().is_some_and(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()) == root))
+    })?;
+    let repository_key = repo.repository_key.as_ref()?;
+    let project = projects
+        .projects
+        .iter()
+        .filter(|project| {
+            matches!(project.repositories.as_slice(), [repository] if &repository.key == repository_key && repository.subpaths.is_empty())
+        })
+        .min_by_key(|project| (project.name != repo.name, project.namespace.as_str(), project.name.as_str()))?;
+    Some((repo.identity.clone(), project.address.clone()))
+}
+
 /// Run the TUI. With `scoped_view`, run in scoped mode: exactly that View,
 /// no tab shell, no open-view persistence.
 async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) -> Result<()> {
@@ -496,7 +518,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         }
     };
 
-    for root in startup_repo_roots {
+    for root in &startup_repo_roots {
         if let Err(e) = daemon
             .execute(flotilla_protocol::Command {
                 node_id: None,
@@ -518,9 +540,30 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
     let pm_connector = flotilla_tui::pm_open::detect_connector();
     let repos_info = daemon.list_repos().await.unwrap_or_default();
+    let default_landing = if scoped_view.is_none() && config.load_open_views().is_none() && !startup_repo_roots.is_empty() {
+        match daemon
+            .execute_query(
+                Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryProjectList {} },
+                uuid::Uuid::new_v4(),
+            )
+            .await
+        {
+            Ok(CommandValue::ProjectList(projects)) => default_project_landing(&repos_info, &startup_repo_roots, &projects),
+            Ok(value) => {
+                info!(?value, "default project query returned an unexpected result; using repo page");
+                None
+            }
+            Err(error) => {
+                info!(%error, "could not resolve default project landing; using repo page");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut app = match scoped_view.clone() {
         Some(address) => app::App::new_scoped(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), address),
-        None => app::App::new(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone()),
+        None => app::App::new_with_default_landing(daemon.clone(), repos_info, Arc::clone(&config), initial_theme.clone(), default_landing),
     }
     .with_pm_connector(pm_connector.clone());
     restore_tui_handoff(&mut app);
@@ -1471,14 +1514,48 @@ mod tests {
 
     use clap::Parser;
     use flotilla_protocol::{
-        qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState, ProvisioningTarget,
+        qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState, ProjectListEntry,
+        ProjectListRepository, ProjectListResponse, ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels, RepositoryKey, ViewAddress,
     };
 
     use super::{
-        attach_exit_disposition, provisioning_target_for_environment, run_replica_snapshot, select_host_target, select_startup_repo_roots,
-        should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition, Cli, ResourceApplyArgs, ResourceGetArgs,
-        ResourceListArgs, ResourceSubCommand, SubCommand,
+        attach_exit_disposition, default_project_landing, provisioning_target_for_environment, run_replica_snapshot, select_host_target,
+        select_startup_repo_roots, should_reexec_for_incompatible_daemon, show_startup_splash, AttachExitDisposition, Cli,
+        ResourceApplyArgs, ResourceGetArgs, ResourceListArgs, ResourceSubCommand, SubCommand,
     };
+
+    fn landing_repo(path: &str, name: &str, key: Option<&str>) -> RepoInfo {
+        RepoInfo {
+            identity: RepoIdentity { authority: "github.com".into(), path: format!("org/{name}") },
+            repository_key: key.map(|key| RepositoryKey(key.into())),
+            path: Some(PathBuf::from(path)),
+            name: name.into(),
+            labels: RepoLabels::default(),
+            provider_names: Default::default(),
+            provider_health: Default::default(),
+            loading: false,
+        }
+    }
+
+    fn landing_project(name: &str, repositories: &[(&str, Option<&str>)]) -> ProjectListEntry {
+        ProjectListEntry::builder()
+            .namespace("flotilla".to_string())
+            .name(name.to_string())
+            .display_name(name.to_string())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: name.into() })
+            .repositories(
+                repositories
+                    .iter()
+                    .map(|(key, subpath)| ProjectListRepository {
+                        key: RepositoryKey((*key).into()),
+                        slug: None,
+                        subpaths: subpath.iter().map(|subpath| (*subpath).to_string()).collect(),
+                    })
+                    .collect(),
+            )
+            .default_workflow_ref("single-agent-contained".to_string())
+            .build()
+    }
 
     #[test]
     fn attach_exit_disposition_preserves_child_exit_code() {
@@ -1517,6 +1594,51 @@ mod tests {
         let roots = select_startup_repo_roots(&explicit, None);
 
         assert_eq!(roots, vec![PathBuf::from("/repos/one"), PathBuf::from("/repos/two")]);
+    }
+
+    #[test]
+    fn fresh_landing_resolves_the_detected_repos_whole_repo_project() {
+        let repos = vec![
+            landing_repo("/repos/other", "other", Some("repo-other")),
+            landing_repo("/repos/flotilla", "flotilla", Some("repo-flotilla")),
+        ];
+        let projects = ProjectListResponse {
+            projects: vec![
+                landing_project("presentation", &[("repo-flotilla", None), ("repo-other", None)]),
+                landing_project("flotilla", &[("repo-flotilla", None)]),
+            ],
+        };
+
+        let landing = default_project_landing(&repos, &[PathBuf::from("/repos/flotilla")], &projects);
+
+        assert_eq!(
+            landing,
+            Some((repos[1].identity.clone(), ViewAddress::Project { namespace: "flotilla".into(), name: "flotilla".into() },))
+        );
+    }
+
+    #[test]
+    fn fresh_landing_falls_back_when_detected_repo_has_no_project() {
+        let repos = vec![landing_repo("/repos/plain", "plain", Some("repo-plain"))];
+        let projects = ProjectListResponse { projects: vec![landing_project("other", &[("repo-other", None)])] };
+
+        assert_eq!(default_project_landing(&repos, &[PathBuf::from("/repos/plain")], &projects), None);
+    }
+
+    #[test]
+    fn fresh_landing_does_not_confuse_a_subpath_project_for_the_whole_repo_project() {
+        let repos = vec![landing_repo("/repos/shared", "shared", Some("repo-shared"))];
+        let projects = ProjectListResponse {
+            projects: vec![
+                landing_project("docs", &[("repo-shared", Some("docs"))]),
+                landing_project("shared-a1b2c3d4", &[("repo-shared", None)]),
+            ],
+        };
+
+        assert_eq!(
+            default_project_landing(&repos, &[PathBuf::from("/repos/shared")], &projects),
+            Some((repos[0].identity.clone(), ViewAddress::Project { namespace: "flotilla".into(), name: "shared-a1b2c3d4".into() },))
+        );
     }
 
     #[test]
