@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    future::Future,
-    path::PathBuf,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
@@ -13,6 +7,7 @@ use flotilla_resources::{
     HttpBackend, K8sWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, WatchStart,
 };
 use futures::StreamExt;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -46,20 +41,32 @@ struct ActiveGeneration {
 /// from a dead forwarded socket, or from no socket, to the live transport.
 #[derive(Clone)]
 struct SocketPathSource {
-    path: Arc<RwLock<Option<PathBuf>>>,
+    path: watch::Sender<Option<PathBuf>>,
 }
 
 impl SocketPathSource {
     fn new(path: Option<PathBuf>) -> Self {
-        Self { path: Arc::new(RwLock::new(path)) }
+        let (path, _) = watch::channel(path);
+        Self { path }
     }
 
-    fn resolve(&self) -> Option<PathBuf> {
-        self.path.read().expect("socket path source read lock").clone()
+    async fn resolve(&self) -> Result<PathBuf, String> {
+        let mut path = self.path.subscribe();
+        loop {
+            if let Some(path) = path.borrow_and_update().clone() {
+                return Ok(path);
+            }
+            path.changed().await.map_err(|_| "peer resource socket path source closed".to_string())?;
+        }
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> Option<PathBuf> {
+        self.path.borrow().clone()
     }
 
     fn update(&self, path: PathBuf) {
-        *self.path.write().expect("socket path source write lock") = Some(path);
+        self.path.send_replace(Some(path));
     }
 }
 
@@ -156,9 +163,8 @@ fn spawn_kind<T: Resource>(
                     cancellation,
                     REPLICATION_RETRY,
                     move || {
-                        socket_path_source
-                            .resolve()
-                            .ok_or_else(|| "peer has no forwarded resource socket; waiting for an outbound SSH connection".to_string())
+                        let socket_path_source = socket_path_source.clone();
+                        async move { socket_path_source.resolve().await }
                     },
                     move |path| {
                         let daemon = Arc::clone(&run_daemon);
@@ -181,7 +187,7 @@ fn spawn_kind<T: Resource>(
                     T::API_PATHS.kind,
                     cancellation,
                     REPLICATION_RETRY,
-                    || Ok(()),
+                    || async { Ok(()) },
                     move |()| {
                         let router = router.clone();
                         let daemon = Arc::clone(&run_daemon);
@@ -195,7 +201,7 @@ fn spawn_kind<T: Resource>(
     });
 }
 
-async fn supervise_kind<I, S, F, Fut>(
+async fn supervise_kind<I, S, SourceFut, F, Fut>(
     peer: NodeId,
     generation: u64,
     kind: &'static str,
@@ -204,7 +210,8 @@ async fn supervise_kind<I, S, F, Fut>(
     mut source: S,
     mut run: F,
 ) where
-    S: FnMut() -> Result<I, String>,
+    S: FnMut() -> SourceFut,
+    SourceFut: Future<Output = Result<I, String>>,
     F: FnMut(I) -> Fut,
     Fut: Future<Output = Result<(), String>>,
 {
@@ -215,7 +222,7 @@ async fn supervise_kind<I, S, F, Fut>(
             biased;
             _ = cancellation.cancelled() => return,
             result = async {
-                let input = source()?;
+                let input = source().await?;
                 run(input).await
             } => result,
         };
@@ -421,7 +428,10 @@ mod tests {
             RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(4), reset_after: Duration::from_secs(60) },
             {
                 let source = source.clone();
-                move || source.resolve().ok_or_else(|| "peer has no forwarded resource socket".to_string())
+                move || {
+                    let source = source.clone();
+                    async move { source.resolve().await }
+                }
             },
             {
                 let attempted_paths = Arc::clone(&attempted_paths);
@@ -448,8 +458,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn missing_socket_path_retries_until_the_source_resolves() {
+    async fn missing_socket_path_waits_until_the_source_resolves() {
         let source = SocketPathSource::new(None);
+        let resolutions = Arc::new(AtomicUsize::new(0));
         let attempted_paths = Arc::new(Mutex::new(Vec::new()));
         let cancellation = CancellationToken::new();
         let task = tokio::spawn(supervise_kind(
@@ -460,7 +471,12 @@ mod tests {
             RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(4), reset_after: Duration::from_secs(60) },
             {
                 let source = source.clone();
-                move || source.resolve().ok_or_else(|| "peer has no forwarded resource socket".to_string())
+                let resolutions = Arc::clone(&resolutions);
+                move || {
+                    let source = source.clone();
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    async move { source.resolve().await }
+                }
             },
             {
                 let attempted_paths = Arc::clone(&attempted_paths);
@@ -473,9 +489,13 @@ mod tests {
 
         tokio::task::yield_now().await;
         assert!(attempted_paths.lock().expect("attempted paths lock").is_empty());
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1, "an unavailable source should wait instead of polling and warning");
 
         source.update(PathBuf::from("/tmp/ready.sock"));
-        tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(*attempted_paths.lock().expect("attempted paths lock"), vec![PathBuf::from("/tmp/ready.sock")]);
 
@@ -493,7 +513,7 @@ mod tests {
             Convoy::API_PATHS.kind,
             cancellation.clone(),
             RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(4), reset_after: Duration::from_secs(60) },
-            || Ok(()),
+            || async { Ok(()) },
             {
                 let attempts = Arc::clone(&attempts);
                 move |()| {
@@ -530,7 +550,7 @@ mod tests {
             Convoy::API_PATHS.kind,
             old_cancellation,
             RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(4), reset_after: Duration::from_secs(60) },
-            || Ok(()),
+            || async { Ok(()) },
             {
                 let attempts = Arc::clone(&attempts);
                 move |()| {
@@ -562,7 +582,7 @@ mod tests {
             Convoy::API_PATHS.kind,
             cancellation.clone(),
             RetryBackoff { initial: Duration::from_secs(1), maximum: Duration::from_secs(8), reset_after: Duration::from_secs(5) },
-            || Ok(()),
+            || async { Ok(()) },
             {
                 let attempts = Arc::clone(&attempts);
                 move |()| {
@@ -603,7 +623,7 @@ mod tests {
         assert!(supervisors.begin_generation(&peer, 4, Some(PathBuf::from("/tmp/current.sock"))).is_none());
         assert!(supervisors.begin_generation(&peer, 3, Some(PathBuf::from("/tmp/stale.sock"))).is_none());
         assert_eq!(
-            source.resolve(),
+            source.current(),
             Some(PathBuf::from("/tmp/current.sock")),
             "same-generation reconnects refresh the live source, while stale notices cannot replace it"
         );
