@@ -7,12 +7,15 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    result_set::{ConvoyPhase as WireConvoyPhase, ConvoyRow, IndependentRow, QueryId, ResultSet, Rows, SessionPhase},
+    result_set::{
+        AwarenessGrouping, AwarenessKind, AwarenessLimit, ConvoyPhase as WireConvoyPhase, ConvoyRow, DemandBackedMetadata, IndependentRow,
+        IssueRow, QueryId, ResultSet, ResultSetState, Rows, SessionPhase,
+    },
     test_support::TestIssue,
     AssociationKey, ChangeRequest, ChangeRequestStatus, Checkout, Command, CommandAction, CommandValue, ConvoyStartIntent,
     CrewCommandContext, DaemonEvent, EnvironmentId, EnvironmentStatus, HostEnvironment, HostPath, HostProviderStatus, HostSummary, ImageId,
-    IssueRef, IssueSource, QueryCursor, QueryScope, RepoSelector, RepositoryKey, ResourceRef, ResultSetCondition, SystemInfo,
-    ToolInventory, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
+    Issue, IssueRef, IssueSource, IssueState, QueryCursor, QueryScope, RepoSelector, RepositoryKey, ResourceRef, ResultSetCondition,
+    SystemInfo, ToolInventory, TopologyRoute, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
     Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec,
@@ -4655,6 +4658,75 @@ async fn subscribe_queries_resends_result_set_when_client_seq_is_ahead() {
         })
         .expect("client ahead of daemon must still receive a result set");
     assert_eq!(result_set.seq, 2, "result set reflects the daemon's current seq, not the client's stale claim");
+}
+
+#[tokio::test]
+async fn fleet_awareness_subscription_replays_project_convoy_and_issue_rows() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("write daemon config");
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(&config_base)), fake_discovery(false), HostName::local()).await;
+    let state = daemon.aggregator_projection_state().await;
+    let project = QueryScope::new("flotilla", "roadmap");
+    state.replace_store_catalog(HashMap::new(), HashMap::from([(project.clone(), vec![])])).await;
+    let mut convoy = convoy_row("flotilla", "ship-it", WireConvoyPhase::Active, None);
+    convoy.project_ref = Some(project.name.clone());
+    set_local_convoy_rows(&daemon, 1, vec![convoy]).await;
+
+    let subscriber = uuid::Uuid::new_v4();
+    let awareness = QueryId::Awareness { scope: None, grouping: AwarenessGrouping::Project, limit: AwarenessLimit::default() };
+    daemon
+        .subscribe_queries(subscriber, &[QueryCursor { query: awareness.clone(), since: None }])
+        .await
+        .expect("subscribe to fleet awareness");
+    let issue_query =
+        QueryId::Issues { scope: project.clone(), search: None, label: Some(flotilla_protocol::issue_query::READY_ISSUE_LABEL.into()) };
+    let generation = *state.subscribe_demand().borrow().get(&issue_query).expect("ready-issue demand");
+    let reference =
+        IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }, id: "1054".into() };
+    state.replace_issues(
+        &issue_query,
+        generation,
+        vec![IssueRow {
+            reference: reference.clone(),
+            issue: Issue {
+                reference,
+                title: "Restore PM awareness catalog".into(),
+                body: None,
+                state: IssueState::Open,
+                labels: vec![flotilla_protocol::issue_query::READY_ISSUE_LABEL.into()],
+                as_of: Utc::now(),
+                observed_at: None,
+                association_keys: vec![],
+                provider_name: "github".into(),
+                provider_display_name: "GitHub".into(),
+            },
+        }],
+        ResultSetState { demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }), conditions: vec![], truncated: false },
+    );
+
+    let events = daemon
+        .subscribe_queries(subscriber, &[QueryCursor { query: awareness.clone(), since: None }])
+        .await
+        .expect("replay populated fleet awareness");
+    let result_set = events
+        .into_iter()
+        .find_map(|event| match event {
+            DaemonEvent::ResultSet(result_set) if result_set.query() == awareness => Some(result_set),
+            _ => None,
+        })
+        .expect("fleet awareness result set");
+    let node = result_set
+        .rows
+        .as_awareness()
+        .expect("awareness rows")
+        .iter()
+        .find(|node| node.scope.as_ref() == Some(&project))
+        .expect("project awareness node");
+    assert!(node.entries.iter().any(|entry| entry.kind == AwarenessKind::Convoy));
+    assert!(node.entries.iter().any(|entry| entry.kind == AwarenessKind::Issue));
 }
 
 #[tokio::test]

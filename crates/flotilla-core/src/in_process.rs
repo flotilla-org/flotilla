@@ -7035,13 +7035,22 @@ impl DaemonHandle for InProcessDaemon {
         let state = self.aggregator_projection_state().await;
         let newly_materialized = state.replace_subscriber(subscriber_id, queries);
         let mut events = Vec::new();
+        let mut initial_row_counts = Vec::with_capacity(queries.len());
         for cursor in queries {
             let result_set =
                 state.result_set_for(&cursor.query).await.ok_or_else(|| format!("query is not materialized: {}", cursor.query))?;
+            initial_row_counts.push((cursor.query.clone(), result_set.rows.len()));
             if newly_materialized.contains(&cursor.query) || cursor.since.is_none_or(|seq| seq != result_set.seq) {
                 events.push(DaemonEvent::ResultSet(Box::new(result_set)));
             }
         }
+        info!(
+            subscriber = %subscriber_id,
+            queries = ?queries,
+            initial_row_counts = ?initial_row_counts,
+            replayed_result_sets = events.len(),
+            "query subscription initialized"
+        );
         Ok(events)
     }
 
