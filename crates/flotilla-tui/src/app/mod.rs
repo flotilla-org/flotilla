@@ -589,24 +589,45 @@ impl App {
     }
 
     pub fn new(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
-        let app = Self::new_unreported(daemon, repos_info, config, theme);
+        let app = Self::new_unreported(daemon, repos_info, config, theme, None);
         app.report_active_view_focus();
         app
     }
 
-    fn new_unreported(daemon: Arc<dyn DaemonHandle>, repos_info: Vec<RepoInfo>, config: Arc<ConfigStore>, theme: Theme) -> Self {
+    /// Construct the full TUI with an optional fresh-config landing View.
+    /// Persisted `open-views.toml` entries always take precedence.
+    pub fn new_with_default_landing(
+        daemon: Arc<dyn DaemonHandle>,
+        repos_info: Vec<RepoInfo>,
+        config: Arc<ConfigStore>,
+        theme: Theme,
+        landing: Option<(RepoIdentity, ViewAddress)>,
+    ) -> Self {
+        let app = Self::new_unreported(daemon, repos_info, config, theme, landing);
+        app.report_active_view_focus();
+        app
+    }
+
+    fn new_unreported(
+        daemon: Arc<dyn DaemonHandle>,
+        repos_info: Vec<RepoInfo>,
+        config: Arc<ConfigStore>,
+        theme: Theme,
+        landing: Option<(RepoIdentity, ViewAddress)>,
+    ) -> Self {
         let mut model = TuiModel::from_repo_info(repos_info);
-        // Open-view set: persisted if present, else seeded to match the
-        // pre-View tab bar (overview + convoys + one tab per tracked repo).
+        // Open-view set: persisted if present, else seeded with overview,
+        // convoys, and one landing View per tracked repo.
         // The seed isn't written back here — it is deterministic, and any
         // tab mutation persists the set (scoped mode must never write it).
         let mut views = match config.load_open_views() {
             Some(entries) => OpenViews::from_entries(entries),
-            None => OpenViews::seed_with_keys(
+            None => OpenViews::seed_with_landing(
                 model
                     .repo_order
                     .iter()
                     .filter_map(|identity| model.repos.get(identity).map(|repo| (identity.clone(), repo.repository_key.clone()))),
+                landing,
             ),
         };
         let repository_keys =
@@ -777,7 +798,7 @@ impl App {
         theme: Theme,
         address: ViewAddress,
     ) -> Self {
-        let mut app = Self::new_unreported(daemon, repos_info, config, theme);
+        let mut app = Self::new_unreported(daemon, repos_info, config, theme, None);
         app.views = OpenViews::scoped(address);
         app.subscriptions_dirty = true;
         app.sync_active_view();

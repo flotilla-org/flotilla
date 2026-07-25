@@ -252,23 +252,38 @@ impl OpenViews {
     }
 
     pub fn seed_with_keys(repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>) -> Self {
+        Self::seed_with_landing(repos, None)
+    }
+
+    /// Build the fresh-config tab set, replacing the selected repo's Plane-A
+    /// tab with its composite landing View when one was resolved.
+    pub fn seed_with_landing(
+        repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>,
+        landing: Option<(RepoIdentity, ViewAddress)>,
+    ) -> Self {
         let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None }, OpenViewEntry {
             address: ViewAddress::Convoys { namespace: "flotilla".to_string() }.to_string(),
             label: None,
         }];
         entries.extend(repos.into_iter().map(|(identity, repository_key)| {
-            OpenViewEntry {
-                address: match repository_key {
+            let address = landing
+                .as_ref()
+                .filter(|(landing_identity, _)| landing_identity == &identity)
+                .map(|(_, address)| address.clone())
+                .unwrap_or_else(|| match repository_key {
                     Some(key) => ViewAddress::repo_with_key(identity, key),
                     None => ViewAddress::repo(identity),
-                }
-                .to_string(),
-                label: None,
-            }
+                });
+            OpenViewEntry { address: address.to_string(), label: None }
         }));
         let mut views = Self::from_entries(entries);
-        // Land on the first repo tab when there is one, like the old TUI did.
-        views.active = if views.views.len() > 2 { 2 } else { views.views.len() - 1 };
+        views.active = landing.as_ref().and_then(|(_, address)| views.find(address)).unwrap_or_else(|| {
+            if views.views.len() > 2 {
+                2
+            } else {
+                views.views.len() - 1
+            }
+        });
         views
     }
 
@@ -596,6 +611,29 @@ mod tests {
         let addresses: Vec<String> = views.iter().map(|view| view.address().expect("parsed").to_string()).collect();
         assert_eq!(addresses, vec!["overview", "convoys/flotilla", "repo/github.com/o/r"]);
         assert_eq!(views.active_index(), 2, "seed lands on the first repo tab");
+    }
+
+    #[test]
+    fn fresh_project_landing_replaces_only_its_seeded_repo_view() {
+        let selected = RepoIdentity { authority: "github.com".to_string(), path: "o/selected".to_string() };
+        let other = RepoIdentity { authority: "github.com".to_string(), path: "o/other".to_string() };
+        let project = addr("project/flotilla/selected");
+        let views =
+            OpenViews::seed_with_landing(vec![(other.clone(), None), (selected.clone(), None)], Some((selected.clone(), project.clone())));
+
+        let addresses = views.iter().map(|view| view.address().expect("parsed").to_string()).collect::<Vec<_>>();
+        assert_eq!(addresses, vec!["overview", "convoys/flotilla", "repo/github.com/o/other", "project/flotilla/selected"]);
+        assert_eq!(views.active_address(), Some(&project));
+        assert!(views.find(&ViewAddress::repo(selected)).is_none());
+    }
+
+    #[test]
+    fn explicit_repo_address_remains_openable_after_project_landing() {
+        let repo = RepoIdentity { authority: "github.com".to_string(), path: "o/r".to_string() };
+        let mut views = OpenViews::seed_with_landing(vec![(repo.clone(), None)], Some((repo.clone(), addr("project/flotilla/r"))));
+
+        assert!(views.open_or_focus(ViewAddress::repo(repo.clone())));
+        assert_eq!(views.active_address(), Some(&ViewAddress::repo(repo)));
     }
 
     #[test]
