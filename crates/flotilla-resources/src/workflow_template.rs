@@ -35,6 +35,31 @@ pub struct VesselRequirement {
     pub crew: Vec<CrewSpec>,
 }
 
+impl VesselRequirement {
+    /// Whether this crew member's session is created when the vessel starts.
+    ///
+    /// Tool processes all start. Among agents only the first does: the rest are
+    /// *latent*, and their session is created on demand when someone hands work
+    /// off to them. Reporting is the reason this rule has to be shared rather
+    /// than re-derived — a latent agent that is described as working looks like
+    /// a healthy crew when in fact nothing has been launched.
+    pub fn starts_eagerly(&self, crew_index: usize) -> bool {
+        self.crew.get(crew_index).is_some_and(|member| match member.source {
+            CrewSource::Tool { .. } => true,
+            CrewSource::Agent { .. } => self.first_agent_index() == Some(crew_index),
+        })
+    }
+
+    /// The roles whose sessions the vessel creates up front.
+    pub fn eagerly_started_roles(&self) -> BTreeSet<String> {
+        self.crew.iter().enumerate().filter(|(index, _)| self.starts_eagerly(*index)).map(|(_, member)| member.role.clone()).collect()
+    }
+
+    fn first_agent_index(&self) -> Option<usize> {
+        self.crew.iter().position(|member| matches!(member.source, CrewSource::Agent { .. }))
+    }
+}
+
 /// The minimum isolation guarantee required while a vessel runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -446,10 +471,50 @@ fn push_error(errors: &mut Vec<ValidationError>, error: ValidationError) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         validate, CrewSource, CrewSpec, InputDefinition, InterpolationField, InterpolationLocation, Selector, ValidationError,
         VesselRequirement, WorkflowTemplateSpec,
     };
+
+    fn crew(role: &str, source: CrewSource) -> CrewSpec {
+        CrewSpec::builder().role(role.to_string()).source(source).build()
+    }
+
+    fn agent(capability: &str) -> CrewSource {
+        CrewSource::Agent { selector: Selector { capability: capability.to_string() }, prompt: None, brief_template: None }
+    }
+
+    #[test]
+    fn only_the_first_agent_starts_with_the_vessel() {
+        let vessel = VesselRequirement::builder()
+            .name("implement".to_string())
+            .crew(vec![
+                crew("watcher", CrewSource::Tool { command: "tail -f log".to_string() }),
+                crew("coder", agent("code")),
+                crew("reviewer", agent("code-review")),
+            ])
+            .build();
+
+        // Tools all start; the reviewer stays latent until a handoff creates its
+        // session, so nothing may describe it as running.
+        assert!(vessel.starts_eagerly(0), "tool process");
+        assert!(vessel.starts_eagerly(1), "first agent");
+        assert!(!vessel.starts_eagerly(2), "second agent is latent");
+        assert!(!vessel.starts_eagerly(3), "out of range");
+        assert_eq!(vessel.eagerly_started_roles(), BTreeSet::from(["watcher".to_string(), "coder".to_string()]));
+    }
+
+    #[test]
+    fn a_tool_before_an_agent_does_not_consume_the_agent_slot() {
+        let vessel = VesselRequirement::builder()
+            .name("implement".to_string())
+            .crew(vec![crew("build", CrewSource::Tool { command: "cargo test".to_string() }), crew("coder", agent("code"))])
+            .build();
+
+        assert_eq!(vessel.eagerly_started_roles(), BTreeSet::from(["build".to_string(), "coder".to_string()]));
+    }
 
     fn valid_spec() -> WorkflowTemplateSpec {
         WorkflowTemplateSpec::builder()

@@ -122,6 +122,18 @@ five hook events. Auto-discovered by Claude Code.
 **Phase 2 — CLI installer:** `flotilla hooks install claude-code` writes hook entries into
 settings idempotently. Supports `uninstall`. Extends to other harnesses.
 
+**Phase 3 — managed crew sessions self-provision.** Convoy crew must not depend on a human
+having run the installer on whichever host the vessel lands on: without hooks the crew runs
+normally but no phase or attention signal ever leaves the pane, and the failure is silent.
+The Claude Code adapter therefore writes `.flotilla/claude-settings.json` into the session's
+working directory and launches with `claude --settings .flotilla/claude-settings.json`, which
+layers the hooks on for that invocation only. User settings are never modified, and the
+overlay is removed with the brief at teardown.
+
+The subscription table in `flotilla-core/src/agents/hooks.rs` is the single producer for both
+the installer and the adapter, so a hook Flotilla subscribes to cannot drift from the parser
+arm that handles it.
+
 ### Cloud Agent Refactor
 
 Separate track, can ship after CLI agent hooks:

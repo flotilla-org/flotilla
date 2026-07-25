@@ -1,7 +1,10 @@
 pub mod hooks;
 pub mod store;
 
-pub use hooks::{parser_for_harness, HarnessHookParser, ParsedHookEvent};
+pub use hooks::{
+    claude_code_hook_entries, claude_code_hook_settings, parser_for_harness, HarnessHookParser, ParsedHookEvent,
+    CLAUDE_CODE_HOOK_COMMAND_PREFIX,
+};
 
 /// Allocate a fresh attachable ID for an agent in an unmanaged terminal.
 ///

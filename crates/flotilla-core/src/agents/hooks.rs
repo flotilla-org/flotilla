@@ -99,6 +99,57 @@ impl HarnessHookParser for ClaudeCodeParser {
     }
 }
 
+/// The Claude Code hook events Flotilla subscribes to: the native hook name, the
+/// matcher that narrows it, and the `flotilla hook claude-code <event>` argument
+/// it dispatches to.
+///
+/// This table lives next to [`ClaudeCodeParser`] on purpose. It is the only
+/// producer of Flotilla's hook configuration — both the `flotilla hooks install`
+/// CLI and the managed-crew adapter render from it — so a subscription can never
+/// drift away from the parser arm that has to handle it. The
+/// `every_subscription_has_a_parser_arm` test enforces that.
+const CLAUDE_CODE_HOOK_SUBSCRIPTIONS: &[ClaudeCodeHookSubscription] = &[
+    ClaudeCodeHookSubscription { hook: "SessionStart", matcher: "", event: "session-start" },
+    ClaudeCodeHookSubscription { hook: "SessionEnd", matcher: "", event: "session-end" },
+    ClaudeCodeHookSubscription { hook: "UserPromptSubmit", matcher: "", event: "user-prompt-submit" },
+    ClaudeCodeHookSubscription { hook: "Stop", matcher: "", event: "stop" },
+    ClaudeCodeHookSubscription { hook: "Notification", matcher: "permission_prompt", event: "notification" },
+];
+
+struct ClaudeCodeHookSubscription {
+    hook: &'static str,
+    matcher: &'static str,
+    event: &'static str,
+}
+
+/// Marks a hook command as Flotilla's, so installers can recognise entries they
+/// own without re-parsing the command line.
+pub const CLAUDE_CODE_HOOK_COMMAND_PREFIX: &str = "flotilla hook claude-code";
+
+/// The `hooks` object Flotilla installs into Claude Code settings.
+pub fn claude_code_hook_entries() -> serde_json::Value {
+    let mut entries = serde_json::Map::new();
+    for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
+        entries.insert(
+            subscription.hook.to_string(),
+            serde_json::json!([{
+                "matcher": subscription.matcher,
+                "hooks": [{ "type": "command", "command": format!("{CLAUDE_CODE_HOOK_COMMAND_PREFIX} {}", subscription.event) }],
+            }]),
+        );
+    }
+    serde_json::Value::Object(entries)
+}
+
+/// A complete Claude Code settings document carrying only Flotilla's hooks.
+///
+/// Managed crew sessions load this through `claude --settings <path>`, which
+/// layers on top of the user's own settings for one invocation instead of
+/// mutating them.
+pub fn claude_code_hook_settings() -> serde_json::Value {
+    serde_json::json!({ "hooks": claude_code_hook_entries() })
+}
+
 /// Look up the parser for a given harness name.
 pub fn parser_for_harness(harness: &str) -> Result<(AgentHarness, Box<dyn HarnessHookParser>), String> {
     match harness {
@@ -198,6 +249,34 @@ mod tests {
         assert_eq!(AgentEventType::Idle.to_status(), Some(AgentStatus::Idle));
         assert_eq!(AgentEventType::WaitingForPermission.to_status(), Some(AgentStatus::WaitingForPermission));
         assert_eq!(AgentEventType::NoChange.to_status(), None);
+    }
+
+    #[test]
+    fn every_subscription_has_a_parser_arm() {
+        let parser = ClaudeCodeParser;
+        let payload = serde_json::json!({ "session_id": "sess-abc" }).to_string();
+        for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
+            parser
+                .parse_event(subscription.event, payload.as_bytes())
+                .unwrap_or_else(|err| panic!("subscription `{}` has no parser arm: {err}", subscription.hook));
+        }
+    }
+
+    #[test]
+    fn hook_settings_dispatch_every_subscription_through_the_flotilla_cli() {
+        let settings = claude_code_hook_settings();
+        let hooks = settings["hooks"].as_object().expect("hooks object");
+
+        assert_eq!(hooks.len(), CLAUDE_CODE_HOOK_SUBSCRIPTIONS.len());
+        for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
+            let entry = &hooks[subscription.hook][0];
+            assert_eq!(entry["matcher"], subscription.matcher);
+            assert_eq!(entry["hooks"][0]["type"], "command");
+            assert_eq!(entry["hooks"][0]["command"], format!("flotilla hook claude-code {}", subscription.event));
+        }
+        // The permission prompt is what turns a stalled crew into visible
+        // attention rather than a healthy-looking phase.
+        assert_eq!(hooks["Notification"][0]["matcher"], "permission_prompt");
     }
 
     #[test]

@@ -2922,7 +2922,11 @@ mod tests {
         ]);
         let initial_status = convoys.get("crew-convoy").await.expect("crew convoy").status.expect("convoy status");
         assert_eq!(initial_status.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-        assert_eq!(initial_status.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Working);
+        // The reviewer is latent above and has no terminal session yet, so the
+        // convoy status has to agree rather than report a crew member that was
+        // never launched as working.
+        assert_eq!(initial_status.crew_work["implement"]["reviewer"].phase, flotilla_resources::CrewWorkPhase::Pending);
+        assert_eq!(initial_status.crew_work["implement"]["reviewer"].started_at, None);
         assert!(!initial_status.crew_work["implement"].contains_key("watcher"));
 
         let mut rx = daemon.subscribe();
