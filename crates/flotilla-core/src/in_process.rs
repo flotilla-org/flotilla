@@ -1717,9 +1717,10 @@ impl InProcessDaemon {
         git_ref: Option<&str>,
     ) -> Result<RepositoryInspection, String> {
         if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
-            if let Ok(spec) = RepositorySpec::remote(repository_url) {
+            if let Ok(mut spec) = RepositorySpec::remote(repository_url) {
                 let path = std::fs::canonicalize(path)
                     .map_err(|error| format!("adopted checkout path {} cannot be resolved: {error}", path.display()))?;
+                spec = self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&path), spec)?;
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
                     spec,

@@ -135,6 +135,31 @@ async fn convoy_auto_attach_config_overrides_presence_heuristic() {
     assert!(enabled.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default));
 }
 
+#[tokio::test]
+async fn adopted_checkout_with_explicit_transport_applies_fork_stance_config() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"adopted-fork-test\"\n").expect("write daemon config");
+    overwrite_single_saved_repo_config(
+        &config_base,
+        &repo,
+        format!("path = \"{}\"\n\n[upstream]\nurl = \"https://github.com/upstream/repo\"\nrelation = \"fork\"\n", repo.display()),
+    );
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), fake_discovery(false), HostName::local()).await;
+
+    let inspection = daemon
+        .inspect_adopted_checkout(&repo, Some("https://github.com/fork/repo"), Some("stack/feature"))
+        .await
+        .expect("inspect adopted checkout");
+
+    assert!(inspection.spec.is_fork());
+    assert_eq!(inspection.spec.upstream().expect("upstream").url, "https://github.com/upstream/repo");
+}
+
 #[test]
 fn configured_repo_identity_prefers_repo_file_forgejo_binding() {
     let temp = tempfile::tempdir().expect("create tempdir");
