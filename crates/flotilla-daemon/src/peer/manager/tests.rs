@@ -461,6 +461,32 @@ async fn send_to_reaches_registered_sender() {
 }
 
 #[tokio::test]
+async fn handle_ping_replies_with_matching_pong() {
+    let mut mgr = PeerManager::new(NodeId::new("local"));
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sender: Arc<dyn PeerSender> = Arc::new(MockPeerSender { sent: Arc::clone(&sent) });
+    let peer = NodeId::new("peer");
+    let generation = accepted_generation(mgr.activate_connection(peer.clone(), sender, ConnectionMeta {
+        direction: ConnectionDirection::Inbound,
+        config_label: None,
+        expected_peer: None,
+        config_backed: false,
+    }));
+
+    let result = mgr
+        .handle_inbound(InboundPeerEnvelope {
+            msg: PeerWireMessage::Ping { timestamp: 42 },
+            connection_generation: generation,
+            connection_peer: peer,
+        })
+        .await;
+    dispatch_pending_sends(mgr.take_pending_sends()).await;
+
+    assert_eq!(result, HandleResult::Ignored);
+    assert!(matches!(sent.lock().expect("lock").as_slice(), [PeerWireMessage::Pong { timestamp: 42 }]));
+}
+
+#[tokio::test]
 async fn activate_connection_rejects_same_direction_duplicate_sender() {
     let mut mgr = PeerManager::new(NodeId::new("local"));
     let first_sent = Arc::new(Mutex::new(Vec::new()));
