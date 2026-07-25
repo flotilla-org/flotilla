@@ -76,6 +76,21 @@ fn non_local_test_host() -> &'static str {
     }
 }
 
+#[test]
+fn table_rows_omits_home_dirs_for_ambiguous_host_names() {
+    let mut app = stub_app();
+    let first = EnvironmentId::host(HostId::new("desktop-a"));
+    let second = EnvironmentId::host(HostId::new("desktop-b"));
+    insert_host(&mut app.model, "desktop", first.clone(), NodeId::new("node-a"), "Desktop A", false, PeerStatus::Connected);
+    insert_host(&mut app.model, "desktop", second.clone(), NodeId::new("node-b"), "Desktop B", false, PeerStatus::Connected);
+    app.model.hosts.get_mut(&first).expect("first host").summary.system.home_dir = Some("/home/first".into());
+    app.model.hosts.get_mut(&second).expect("second host").summary.system.home_dir = Some("/home/second".into());
+
+    let rows = table_rows(&app.model, &app.namespaces, &app.query_tables, None);
+
+    assert!(!rows.host_home_dirs.contains_key(&HostName::new("desktop")));
+}
+
 #[derive(Clone)]
 struct QueryStep {
     expected_page: u32,
@@ -219,6 +234,34 @@ fn scoped_pane_esc_navigates_back() {
     assert_eq!(app.views.active_address(), Some(&"convoy/flotilla/alpha".parse().expect("valid address")));
     // Scoped sessions never persist an open-view set.
     assert!(app.config.load_open_views().is_none());
+}
+
+#[test]
+fn scoped_pane_back_header_is_mouse_clickable() {
+    let mut app = stub_app();
+    app.views = crate::app::OpenViews::scoped("convoy/flotilla/alpha".parse().expect("valid address"));
+    app.sync_active_view();
+    app.open_view("vessel/flotilla/alpha/build".parse().expect("valid address"));
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let mut ctx = crate::widgets::RenderContext {
+                model: &app.model,
+                views: &mut app.views,
+                ui: &mut app.ui,
+                theme: &app.theme,
+                keymap: &app.keymap,
+                in_flight: &app.in_flight,
+                namespaces: &app.namespaces,
+                query_tables: &app.query_tables,
+            };
+            app.screen.render(frame, frame.area(), &mut ctx);
+        })
+        .expect("draw");
+
+    app.handle_mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: 2, row: 0, modifiers: KeyModifiers::NONE });
+
+    assert_eq!(app.views.active_address(), Some(&"convoy/flotilla/alpha".parse().expect("valid address")));
 }
 
 #[test]
@@ -2070,7 +2113,7 @@ async fn materialized_issue_scroll_requests_the_next_demand_backed_page() {
         },
     })));
 
-    let rows = crate::app::table_rows(&app.namespaces, &app.query_tables, None);
+    let rows = crate::app::table_rows(&app.model, &app.namespaces, &app.query_tables, None);
     let view = crate::table_view::project(app.views.active_address().expect("active address"), &rows).expect("table");
     app.views.active_table_state_mut().reconcile(&view);
     app.views.active_table_state_mut().select_index(&view, 44);
@@ -2218,7 +2261,8 @@ fn selected_table_name(app: &App) -> Option<String> {
         ViewAddress::Issues { .. } | ViewAddress::Checkouts { .. } => 0,
         ViewAddress::Overview | ViewAddress::Repo { .. } => return None,
     };
-    let rows = crate::app::table_rows(&app.namespaces, &app.query_tables, app.views.active_table_state().source_search.as_deref());
+    let rows =
+        crate::app::table_rows(&app.model, &app.namespaces, &app.query_tables, app.views.active_table_state().source_search.as_deref());
     let view = crate::table_view::project(address, &rows).ok()?;
     app.views.active_table_state().selected_row(&view).map(|row| row.cells[name_column].text.clone())
 }
