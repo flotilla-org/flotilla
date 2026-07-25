@@ -19,6 +19,7 @@
 //! consumer — and this crate keeps only the flotilla-specific spellings
 //! ([`keys`]), recipe minting ([`recipe`]), and send plumbing ([`sink`]).
 
+pub mod entity;
 pub mod keys;
 pub mod pm;
 pub mod projection;

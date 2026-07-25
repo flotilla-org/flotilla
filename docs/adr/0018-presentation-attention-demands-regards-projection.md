@@ -135,6 +135,42 @@ convoy-born tabs by construction. Runtime-switchable grouping (by project /
 convoy / host / attention) is a different join over the same facts — a
 surface-mapping setting, no re-stamping.
 
+### Entity transport contract
+
+The metadata wire is entities-only. `MetadataPatch.target` may be `Root`,
+`Pane`, `Tab`, `Entity`, or `Identity`; producers never publish a Group
+target or a presentation path. `Entity` is the stable pair
+`{ entity.kind, entity.id }`. The permitted kinds are Project, Repo, Convoy,
+Vessel, Issue, Session, and Checkout, with exactly one id dialect per kind:
+
+- Project: `<namespace>/<name>@<origin>`
+- Repo: canonical forge slug, or the repository `host:path` fallback
+- Convoy: `<namespace>/<convoy>@<origin>`
+- Vessel: `<namespace>/<convoy>/<vessel>@<execution-host>`
+- Issue: `<service>/<scope>#<id>`
+- Session: `<host>/<namespace>/<session>`
+- Checkout: the canonical checkout ref from awareness
+
+Every entity assertion repeats `entity.kind` and `entity.id` as flat facts so
+tabs and panes can carry the same immutable identity. Catalog facts are
+TTL'd; pane and tab identity stamps are not. The consumer folds assertions
+independently per `(entity, key, source_id)`, retaining source provenance and
+TTL, then derives all hierarchy and presence from the selected named
+template. Missing facts remove levels; they never authorize inferred
+identity.
+
+Action affordances are facts, not entities:
+`action.primary.{key,label,vehicle,target,recipe}`. The stable action target
+is the live-focus and duplicate-suppression key. A one-vessel convoy and its
+vessel intentionally share the attach target, allowing a template to
+collapse the child while preserving both semantic entities. Recipe absence
+means visible but not currently actionable; it does not hide the entity.
+
+Ownership is strict: Flotilla owns resource-derived entity IDs and facts;
+git-watcher owns repository observations; the presentation manager owns
+grouping templates, presence classes, collapse policy, and rendering. A
+producer may publish facts it knows, but never surface structure.
+
 ## Realization: the searchlight is the desired state
 
 No per-surface desired-presentation resource for interactive surfaces. Each

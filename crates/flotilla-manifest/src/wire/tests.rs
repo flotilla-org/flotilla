@@ -22,25 +22,27 @@ fn assert_patch_round_trips(name: &str) -> MetadataPatch {
 }
 
 #[test]
-fn group_catalog_patch_round_trips() {
-    let patch = assert_patch_round_trips("patch_group_catalog.json");
-    let MetadataTarget::Group(path) = &patch.target else {
-        panic!("expected group target");
+fn entity_catalog_patch_round_trips() {
+    let patch = assert_patch_round_trips("patch_entity_catalog.json");
+    let MetadataTarget::Entity(entity) = &patch.target else {
+        panic!("expected entity target");
     };
-    assert_eq!(path.0.len(), 3);
-    assert_eq!(path.0[1].label.as_deref(), Some("manifest extraction"));
+    assert_eq!(entity.kind, EntityKind::Vessel);
+    assert_eq!(entity.id, "dev/manifest-extraction/implement@feta");
     assert_eq!(patch.unset, vec!["status.attention"]);
     assert_eq!(patch.set["status.state"].ttl_ms, Some(30_000));
+    assert_eq!(patch.set["action.primary.target"].value, MetadataValue::Text("vessel:dev/manifest-extraction/implement@feta".to_owned()));
 }
 
 #[test]
-fn identity_session_patch_round_trips() {
-    let patch = assert_patch_round_trips("patch_identity_session.json");
-    let MetadataTarget::Identity(identity) = &patch.target else {
-        panic!("expected identity target");
+fn session_entity_patch_round_trips() {
+    let patch = assert_patch_round_trips("patch_entity_session.json");
+    let MetadataTarget::Entity(entity) = &patch.target else {
+        panic!("expected entity target");
     };
-    assert_eq!(identity.key, "flotilla.session");
-    assert!(matches!(patch.set["tab.scope"].value, MetadataValue::GroupPath(_)));
+    assert_eq!(entity.kind, EntityKind::Session);
+    assert_eq!(entity.id, "feta/dev/terminal-impl-coder");
+    assert!(!patch.set.contains_key("tab.scope"));
 }
 
 #[test]
@@ -48,12 +50,16 @@ fn pane_stamp_patch_round_trips() {
     let patch = assert_patch_round_trips("patch_pane_stamp.json");
     assert_eq!(patch.target, MetadataTarget::Pane(PaneTarget::Terminal(42)));
     assert!(patch.set.values().all(|update| update.ttl_ms.is_none()), "pane stamps carry no TTL");
+    assert_eq!(patch.set["entity.id"].value, MetadataValue::Text("dev/manifest-extraction/implement@feta".to_owned()));
 }
 
 #[test]
-fn tab_factory_patch_round_trips() {
-    let patch = assert_patch_round_trips("patch_tab_factory.json");
+fn tab_entity_patch_round_trips() {
+    let patch = assert_patch_round_trips("patch_tab_entity.json");
     assert_eq!(patch.target, MetadataTarget::Tab(7));
+    assert_eq!(patch.set["entity.id"].value, MetadataValue::Text("dev/manifest-extraction/implement@feta".to_owned()));
+    assert!(!patch.set.contains_key("action.primary.target"));
+    assert!(!patch.set.contains_key("tab.scope"));
 }
 
 #[test]

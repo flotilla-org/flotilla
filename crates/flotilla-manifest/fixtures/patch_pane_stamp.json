@@ -1,5 +1,23 @@
 {
   "set": {
+    "entity.id": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "dev/manifest-extraction/implement@feta"
+      }
+    },
+    "entity.kind": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "vessel"
+      }
+    },
     "flotilla.attach.ref": {
       "ordinal": null,
       "precedence": null,
@@ -15,7 +33,7 @@
       "ttl_ms": null,
       "value": {
         "type": "text",
-        "value": "dev/manifest-extraction"
+        "value": "dev/manifest-extraction@feta"
       }
     },
     "flotilla.crew.role": {
@@ -60,7 +78,16 @@
       "ttl_ms": null,
       "value": {
         "type": "text",
-        "value": "implement"
+        "value": "dev/manifest-extraction/implement@feta"
+      }
+    },
+    "source": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": null,
+      "value": {
+        "type": "text",
+        "value": "flotilla"
       }
     }
   },

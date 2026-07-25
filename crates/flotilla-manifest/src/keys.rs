@@ -38,14 +38,14 @@ pub const KEY_SESSION: &str = "flotilla.session";
 /// Denormalized binding facts: survive daemon outages and give grouping
 /// rules something direct to match on.
 pub const KEY_VESSEL: &str = "flotilla.vessel";
-/// Canonical `<namespace>/<convoy>` resource identity.
+/// Canonical `<namespace>/<convoy>@<origin>` resource identity.
 pub const KEY_CONVOY: &str = "flotilla.convoy";
 pub const KEY_NAMESPACE: &str = "flotilla.namespace";
 pub const KEY_HOST: &str = "flotilla.host";
 pub const KEY_CREW_ROLE: &str = "flotilla.crew.role";
 pub const KEY_ATTACH_REF: &str = "flotilla.attach.ref";
 
-// Catalog keys (`flotilla pm connect`, Group/Identity targets, TTL'd).
+// Catalog keys (`flotilla pm connect`, Entity targets, TTL'd).
 
 pub const KEY_PROJECT_NAME: &str = "flotilla.project.name";
 pub const KEY_CONVOY_PHASE: &str = "flotilla.convoy.phase";
@@ -62,6 +62,13 @@ pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
 
 // Cross-producer vocabulary (proposed for the Leg-1 freeze, design §6/§9).
 
+/// Canonical presentation entity kind. Its value is one of the
+/// `EntityKind` wire spellings.
+pub const KEY_ENTITY_KIND: &str = "entity.kind";
+/// Canonical id within `entity.kind`'s one permitted id dialect.
+pub const KEY_ENTITY_ID: &str = "entity.id";
+/// Concise human label used by grouping levels and fallback rendering.
+pub const KEY_DISPLAY_LABEL: &str = "display.label";
 /// Producer provenance suitable for a surface badge.
 pub const KEY_SOURCE: &str = "source";
 /// Badge state: `idle | waiting | active | done | failed`.
@@ -74,21 +81,26 @@ pub const KEY_STATUS_ATTENTION: &str = "status.attention";
 pub const KEY_STATUS_CONNECTIVITY: &str = "status.connectivity";
 /// Short human summary line, e.g. "2/3 vessels done".
 pub const KEY_SUMMARY_TEXT: &str = "summary.text";
-/// GroupPath an identity/tab belongs to — the join's catalog half
-/// (v0 spelling; Leg 1: `workspace.scope`).
-pub const KEY_SCOPE: &str = "tab.scope";
-/// Workspace kind stamped on flotilla-created tabs (v0 spelling; Leg 1:
-/// `workspace.kind`).
-pub const KEY_TAB_KIND: &str = "tab.kind";
-/// `workspace | pane` — what materialising this entry produces.
-pub const KEY_MATERIALIZE_TARGET: &str = "materialize.target";
-/// The command a PM runs to materialise this entry (recipe schema pending
-/// the Leg-1 freeze, gap report §9.1).
-pub const KEY_MATERIALIZE_RECIPE: &str = "materialize.recipe";
-/// Dedupe key for factory-produced nodes: `flotilla:<kind>/<ns>/<name>`.
-pub const KEY_FACTORY_ID: &str = "factory.id";
+pub const KEY_COUNT_TOTAL: &str = "count.total";
+pub const KEY_COUNT_ISSUES: &str = "count.issues";
+pub const KEY_COUNT_CONVOYS: &str = "count.convoys";
+pub const KEY_COUNT_VESSELS: &str = "count.vessels";
+pub const KEY_COUNT_CHECKOUTS: &str = "count.checkouts";
+pub const KEY_COUNT_INDEPENDENTS: &str = "count.independents";
+/// Stable target of the primary action. Equal targets focus the same live
+/// attachment even when different entities expose the affordance.
+pub const KEY_PRIMARY_ACTION_TARGET: &str = "action.primary.target";
+pub const KEY_PRIMARY_ACTION_KEY: &str = "action.primary.key";
+pub const KEY_PRIMARY_ACTION_LABEL: &str = "action.primary.label";
+pub const KEY_PRIMARY_ACTION_VEHICLE: &str = "action.primary.vehicle";
+pub const KEY_PRIMARY_ACTION_RECIPE: &str = "action.primary.recipe";
+/// Labels for facts used as grouping levels. Identity facts stay canonical;
+/// these are display-only companions selected through `label-key`.
+pub const KEY_REPO_NAME: &str = "vcs.repo.name";
+pub const KEY_CONVOY_NAME: &str = "flotilla.convoy.name";
+pub const KEY_VESSEL_NAME: &str = "flotilla.vessel.name";
 
-// GroupPath segment keys (design §4).
+// Hierarchy fact keys used by presentation-side grouping templates.
 
 /// Project resource-name segment. Only Project knowledge may mint it.
 pub const SEGMENT_PROJECT: &str = "flotilla.project";
