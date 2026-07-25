@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 
 use super::{
     peer_runtime::disconnect_peer_and_rebuild, sync_peer_query_state, ConnectionDirection, ConnectionMeta, PeerConnectedNotice,
-    SocketPeerSender,
+    PeerConnectionEvent, SocketPeerSender,
 };
 use crate::peer::{ActivationResult, InboundPeerEnvelope, PeerManager};
 
@@ -20,7 +20,7 @@ pub(super) struct PeerConnection {
     shutdown_rx: watch::Receiver<bool>,
     peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
     peer_manager: Arc<Mutex<PeerManager>>,
-    peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+    peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
     client_count: Arc<AtomicUsize>,
     client_notify: Arc<tokio::sync::Notify>,
 }
@@ -31,7 +31,7 @@ impl PeerConnection {
         shutdown_rx: watch::Receiver<bool>,
         peer_data_tx: mpsc::Sender<InboundPeerEnvelope>,
         peer_manager: Arc<Mutex<PeerManager>>,
-        peer_connected_tx: mpsc::UnboundedSender<PeerConnectedNotice>,
+        peer_connected_tx: mpsc::UnboundedSender<PeerConnectionEvent>,
         client_count: Arc<AtomicUsize>,
         client_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
@@ -115,7 +115,11 @@ impl PeerConnection {
 
         sync_peer_query_state(&self.peer_manager, &self.daemon).await;
         self.daemon.publish_peer_connection_status(&peer_node, PeerConnectionState::Connected).await;
-        let _ = self.peer_connected_tx.send(PeerConnectedNotice { peer: node_id.clone(), generation, resource_socket_path: None });
+        let _ = self.peer_connected_tx.send(PeerConnectionEvent::Connected(PeerConnectedNotice {
+            peer: node_id.clone(),
+            generation,
+            resource_socket_path: None,
+        }));
 
         loop {
             tokio::select! {
@@ -158,6 +162,10 @@ impl PeerConnection {
         if plan.was_active {
             self.daemon.publish_peer_connection_status(&peer_node, PeerConnectionState::Disconnected).await;
         }
+        // Inbound connections never retry from this side — if the peer
+        // dials back in, it arrives as a fresh task with a fresh generation.
+        // So ending here is always a terminal teardown for this generation.
+        let _ = self.peer_connected_tx.send(PeerConnectionEvent::Disconnected { peer: node_id.clone(), generation });
         relay_task.abort();
         let count = self.client_count.fetch_sub(1, Ordering::SeqCst) - 1;
         info!(peer = %node_id, %count, "peer disconnected");

@@ -58,6 +58,27 @@ impl PeerReplicatorSupervisors {
         flotilla_resources::for_each_registered_resource!(spawn_kind, &daemon, &peer, generation, &transport, &cancellation)
     }
 
+    /// Cancel and drop a peer's resource replicators, but only if `generation`
+    /// still matches the generation currently tracked for that peer.
+    ///
+    /// Callers must only invoke this from a connection-owning task that has
+    /// no retry loop of its own (a terminal teardown), never from a
+    /// transient, still-retrying disconnect — otherwise replication could
+    /// not heal from a reconnect. The generation check guards against a
+    /// stale/displaced connection's belated teardown cancelling a newer,
+    /// already-reconnected generation's replicators.
+    pub(super) fn peer_disconnected(&mut self, peer: &NodeId, generation: u64) {
+        let is_current = self.generations.get(peer).is_some_and(|active| active.generation == generation);
+        if !is_current {
+            debug!(%peer, generation, "ignoring teardown for stale or already-superseded peer generation");
+            return;
+        }
+        if let Some(active) = self.generations.remove(peer) {
+            active.cancellation.cancel();
+            debug!(%peer, generation, "peer permanently disconnected; cancelled resource replicators");
+        }
+    }
+
     fn begin_generation(&mut self, peer: &NodeId, generation: u64) -> Option<CancellationToken> {
         if let Some(active) = self.generations.get(peer) {
             if generation <= active.generation {
@@ -450,5 +471,51 @@ mod tests {
             applications += 1;
         }
         assert_eq!(applications, 2, "a newer generation starts exactly one new application stream");
+    }
+
+    #[test]
+    fn permanent_disconnect_cancels_and_removes_the_current_generation() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let cancellation = supervisors.begin_generation(&peer, 3).expect("start generation");
+        assert!(!cancellation.is_cancelled());
+
+        supervisors.peer_disconnected(&peer, 3);
+
+        assert!(cancellation.is_cancelled(), "terminal teardown of the current generation must cancel its replicators");
+        assert!(
+            supervisors.begin_generation(&peer, 3).is_some(),
+            "removing the entry lets a later reconnect at the same generation number start fresh, \
+             instead of being rejected as stale"
+        );
+    }
+
+    #[test]
+    fn stale_disconnect_notice_does_not_cancel_a_newer_generation() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let _old_cancellation = supervisors.begin_generation(&peer, 1).expect("start old generation");
+        let new_cancellation = supervisors.begin_generation(&peer, 2).expect("start newer generation");
+
+        // A belated teardown notice for the superseded generation (e.g. the
+        // old connection's task finally winding down after being displaced)
+        // must not touch the newer, currently-active generation.
+        supervisors.peer_disconnected(&peer, 1);
+
+        assert!(!new_cancellation.is_cancelled(), "a stale-generation disconnect must not cancel the current generation's replicators");
+        assert!(
+            supervisors.begin_generation(&peer, 2).is_none(),
+            "the current generation's map entry must still be present after a stale disconnect notice"
+        );
+    }
+
+    #[test]
+    fn unknown_peer_disconnect_is_a_no_op() {
+        let peer = NodeId::new("peer");
+        let mut supervisors = PeerReplicatorSupervisors::default();
+
+        supervisors.peer_disconnected(&peer, 1);
+
+        assert!(supervisors.begin_generation(&peer, 1).is_some(), "disconnecting an untracked peer must not leave stray state behind");
     }
 }

@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     remote_commands::RemoteCommandRouter, replicator::PeerReplicatorSupervisors, shared::sync_peer_query_state, PeerConnectedNotice,
-    SshTransport,
+    PeerConnectionEvent, SshTransport,
 };
 use crate::peer::{dispatch_pending_sends, peer_resource_socket_path, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
@@ -148,11 +148,11 @@ impl PeerRuntime {
         Self { daemon, peer_manager, peer_data_rx, peer_data_tx, remote_command_router, resource_socket_dir }
     }
 
-    pub(super) fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectedNotice>) {
+    pub(super) fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
         let outbound_peer_manager = Arc::clone(&self.peer_manager);
         let peer_manager_task = Arc::clone(&self.peer_manager);
         let peer_data_tx_for_ssh = self.peer_data_tx.clone();
-        let (peer_connected_tx, peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+        let (peer_connected_tx, peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
         let peer_connected_tx_for_ssh = peer_connected_tx.clone();
         let peer_daemon = Arc::clone(&self.daemon);
         let remote_command_router_task = self.remote_command_router.clone();
@@ -196,11 +196,11 @@ impl PeerRuntime {
                             current_peer = Some(initial_connection.node.clone());
                             let mut inbound_rx = initial_connection.inbound_rx;
                             let generation = initial_connection.generation;
-                            let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
+                            let _ = peer_connected_tx_clone.send(PeerConnectionEvent::Connected(PeerConnectedNotice {
                                 peer: peer_name.clone(),
                                 generation,
                                 resource_socket_path: resource_socket_path_for(resource_socket_dir.as_deref(), &target_label),
-                            });
+                            }));
                             last_known_session_id = {
                                 let pm_lock = pm.lock().await;
                                 pm_lock.peer_session_id(&peer_name)
@@ -215,7 +215,13 @@ impl PeerRuntime {
                                 ForwardResult::Disconnected
                             };
                             match forward_result {
-                                ForwardResult::Shutdown => return,
+                                ForwardResult::Shutdown => {
+                                    let _ = peer_connected_tx_clone.send(PeerConnectionEvent::Disconnected {
+                                        peer: peer_name.clone(),
+                                        generation,
+                                    });
+                                    return;
+                                }
                                 ForwardResult::Disconnected => {
                                     info!(target = %target_label.0, peer = %peer_name, "SSH connection dropped, will reconnect");
                                 }
@@ -276,11 +282,11 @@ impl PeerRuntime {
                                             PeerConnectionState::Connected,
                                         )
                                         .await;
-                                    let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
+                                    let _ = peer_connected_tx_clone.send(PeerConnectionEvent::Connected(PeerConnectedNotice {
                                         peer: peer_name.clone(),
                                         generation,
                                         resource_socket_path: resource_socket_path_for(resource_socket_dir.as_deref(), &target_label),
-                                    });
+                                    }));
                                     attempt = 1;
                                     let sender = {
                                         let pm_lock = pm.lock().await;
@@ -292,7 +298,13 @@ impl PeerRuntime {
                                         ForwardResult::Disconnected
                                     };
                                     match forward_result {
-                                        ForwardResult::Shutdown => return,
+                                        ForwardResult::Shutdown => {
+                                            let _ = peer_connected_tx_clone.send(PeerConnectionEvent::Disconnected {
+                                                peer: peer_name.clone(),
+                                                generation,
+                                            });
+                                            return;
+                                        }
                                         ForwardResult::Disconnected => {
                                             info!(target = %target_label.0, peer = %peer_name, "SSH connection dropped, will reconnect");
                                         }
@@ -656,25 +668,32 @@ impl PeerRuntime {
 
             loop {
                 tokio::select! {
-                    notice = peer_connected_rx.recv() => {
-                        let Some(notice) = notice else { break };
-                        debug!(peer = %notice.peer, generation = notice.generation, "sending local state to newly connected peer");
-                        peer_replicators.peer_connected(
-                            outbound_remote_command_router.clone(),
-                            Arc::clone(&outbound_daemon),
-                            notice.peer.clone(),
-                            notice.generation,
-                            notice.resource_socket_path,
-                        );
-                        send_local_to_peer(
-                            &outbound_daemon,
-                            &outbound_peer_manager,
-                            &node_id,
-                            &mut outbound_clock,
-                            &notice.peer,
-                            notice.generation,
-                        )
-                        .await;
+                    event = peer_connected_rx.recv() => {
+                        let Some(event) = event else { break };
+                        match event {
+                            PeerConnectionEvent::Connected(notice) => {
+                                debug!(peer = %notice.peer, generation = notice.generation, "sending local state to newly connected peer");
+                                peer_replicators.peer_connected(
+                                    outbound_remote_command_router.clone(),
+                                    Arc::clone(&outbound_daemon),
+                                    notice.peer.clone(),
+                                    notice.generation,
+                                    notice.resource_socket_path,
+                                );
+                                send_local_to_peer(
+                                    &outbound_daemon,
+                                    &outbound_peer_manager,
+                                    &node_id,
+                                    &mut outbound_clock,
+                                    &notice.peer,
+                                    notice.generation,
+                                )
+                                .await;
+                            }
+                            PeerConnectionEvent::Disconnected { peer, generation } => {
+                                peer_replicators.peer_disconnected(&peer, generation);
+                            }
+                        }
                     }
                     event = event_rx.recv() => {
                         let repo_path = match event {

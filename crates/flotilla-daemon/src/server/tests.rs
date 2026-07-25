@@ -59,7 +59,7 @@ use super::{
     resource_http::serve_resource_http,
     shared::{sync_peer_query_state, write_message, SocketPeerSender},
     test_support::{apply_convoy_replica_feed, seed_trusted_remote_convoy_project},
-    DaemonServer, PeerConnectedNotice,
+    DaemonServer, PeerConnectionEvent,
 };
 
 #[tokio::test]
@@ -2678,7 +2678,7 @@ async fn handle_client_forwards_peer_data_and_registers_peer() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
 
     let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
 
@@ -2819,7 +2819,7 @@ async fn handle_client_streams_daemon_events_to_request_clients() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
 
     let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
     let daemon_for_task = Arc::clone(&daemon);
@@ -2901,7 +2901,7 @@ async fn handle_client_session_dispatches_request_messages() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
     let (client_session, server_session) = message_session_pair();
 
     let daemon_for_task = Arc::clone(&daemon);
@@ -2945,7 +2945,7 @@ async fn handle_client_session_streams_daemon_events_to_request_clients() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
     let (client_session, server_session) = message_session_pair();
 
     let daemon_for_task = Arc::clone(&daemon);
@@ -3014,7 +3014,7 @@ async fn handle_client_rejects_client_hello_with_version_mismatch() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
 
     let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
     let daemon_for_task = Arc::clone(&daemon);
@@ -3078,7 +3078,7 @@ async fn handle_client_session_filters_query_events_until_subscribed() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
     let (client_session, server_session) = message_session_pair();
 
     let daemon_for_task = Arc::clone(&daemon);
@@ -3486,7 +3486,7 @@ async fn handle_client_relays_outbound_peer_messages() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
 
     let (client_stream, server_stream) = tokio::net::UnixStream::pair().expect("pair");
 
@@ -3566,7 +3566,7 @@ async fn duplicate_inbound_peer_receives_goodbye_on_rejection() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let client_count = Arc::new(AtomicUsize::new(0));
     let client_notify = Arc::new(Notify::new());
-    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectedNotice>();
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
 
     let (client_stream_a, server_stream_a) = tokio::net::UnixStream::pair().expect("pair a");
     let (client_stream_b, server_stream_b) = tokio::net::UnixStream::pair().expect("pair b");
