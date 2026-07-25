@@ -449,6 +449,7 @@ pub enum AwarenessFamily {
 pub enum AwarenessState {
     #[default]
     Unknown,
+    Idle,
     Pending,
     Waiting,
     Active,

@@ -7,8 +7,8 @@ use super::*;
 use crate::{
     entity::{self, EntityKind},
     keys::{
-        KEY_CONVOY, KEY_COUNT_ISSUES, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE,
-        KEY_VESSEL, SEGMENT_PROJECT, SEGMENT_REPO,
+        KEY_CONVOY, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_PRIMARY_ACTION_RECIPE,
+        KEY_PRIMARY_ACTION_TARGET, KEY_SOURCE, KEY_STATUS_STATE, KEY_VESSEL, SEGMENT_PROJECT, SEGMENT_REPO,
     },
     recipe::FlotillaRecipes,
 };
@@ -119,6 +119,25 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
     );
     assert!(!issue_patch.set.contains_key(KEY_COUNT_ISSUES));
     assert!(!issue_patch.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+}
+
+#[test]
+fn empty_project_is_an_idle_zero_count_latent_that_opens_its_scoped_view() {
+    let node = AwarenessNode::builder()
+        .id("project/dev/empty".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("empty".to_owned())
+        .scope(flotilla_protocol::QueryScope::new("dev", "empty"))
+        .state(AwarenessState::Idle)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .build();
+
+    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+    let project = find_entity(&patches, &entity::project("dev", "empty", "fleet"));
+
+    assert_eq!(text(project, KEY_STATUS_STATE), "idle");
+    assert_eq!(project.set[KEY_COUNT_TOTAL].value, MetadataValue::Integer(0));
+    assert_eq!(text(project, KEY_PRIMARY_ACTION_RECIPE), "flotilla view 'project/dev/empty'");
 }
 
 #[test]

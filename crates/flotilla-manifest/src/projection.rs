@@ -398,7 +398,7 @@ fn find_vessel<'a>(convoys: &'a [ConvoyRow], namespace: &str, convoy_name: &str,
 
 fn awareness_state(state: AwarenessState) -> &'static str {
     match state {
-        AwarenessState::Unknown | AwarenessState::Pending | AwarenessState::Cancelled => "idle",
+        AwarenessState::Unknown | AwarenessState::Idle | AwarenessState::Pending | AwarenessState::Cancelled => "idle",
         AwarenessState::Waiting => "waiting",
         AwarenessState::Active => "active",
         AwarenessState::Done => "done",
