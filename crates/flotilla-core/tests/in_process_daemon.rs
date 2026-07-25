@@ -2679,6 +2679,39 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
     (temp, repo, daemon, identity)
 }
 
+#[tokio::test]
+async fn refresh_syncs_fork_stance_without_whole_project_migration_and_clears_removed_config() {
+    let (temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
+    ConfigStore::with_base(temp.path().join("config")).save_repo(&ExecutionEnvironmentPath::new(repo.clone()));
+    let repo_config = std::fs::read_dir(temp.path().join("config/repos"))
+        .expect("repo config directory")
+        .find_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension().is_some_and(|extension| extension == "toml")).then_some(path)
+        })
+        .expect("persisted repo config");
+    let path = repo.to_string_lossy();
+    std::fs::write(
+        &repo_config,
+        format!("path = \"{path}\"\n\n[upstream]\nurl = \"https://github.com/upstream/repo\"\nrelation = \"fork\"\n"),
+    )
+    .expect("write fork config");
+
+    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh fork config");
+
+    let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository spec");
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
+    assert!(stored.spec.is_fork(), "refresh should apply fork provenance without changing repository identity");
+
+    std::fs::write(&repo_config, format!("path = \"{path}\"\n")).expect("remove fork config");
+    daemon.refresh(&RepoSelector::Path(repo)).await.expect("refresh removed fork config");
+
+    let stored = repositories.get(&repository.key().to_string()).await.expect("stored repository");
+    assert!(stored.spec.upstream().is_none(), "authoritative per-repository config removal should clear previously stored fork provenance");
+}
+
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo_a = temp.path().join("repo-a");

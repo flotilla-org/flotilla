@@ -3043,7 +3043,7 @@ fn repository_matches_target(repository: &ResourceObject<Repository>, target: &s
     repository.metadata.name == target || repository.spec.matches_catalog_target(target)
 }
 
-async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
+async fn ensure_default_workflows(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
     for (name, spec) in [
         ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
@@ -3134,7 +3134,7 @@ async fn ensure_repository_and_default_project_workflow(
     flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(namespace), repository_key, repository_spec)
         .await
         .map_err(|error| error.to_string())?;
-    ensure_single_agent_contained_workflow(backend, namespace).await
+    ensure_default_workflows(backend, namespace).await
 }
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
@@ -3953,6 +3953,9 @@ impl InProcessDaemon {
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let stored = repositories.get(&repository_key.to_string()).await.map_err(|error| error.to_string())?;
         if stored.spec != *repository_spec {
+            // This path is authoritative for per-repository config, so it may
+            // intentionally clear provenance that identity-only observations
+            // preserve in `ensure_repository`.
             repositories
                 .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, repository_spec)
                 .await
@@ -4122,6 +4125,27 @@ impl InProcessDaemon {
         Err(format!("could not allocate a deterministic Project name for repository {repository_key}"))
     }
 
+    async fn reconcile_repository_config(
+        &self,
+        namespace: &str,
+        repository_key: &RepositoryKey,
+        repository_spec: &RepositorySpec,
+    ) -> Result<(), String> {
+        let repositories = self.resource_backend.clone().using::<Repository>(namespace);
+        let stored = flotilla_resources::ensure_repository(&repositories, repository_key, repository_spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        if stored.spec != *repository_spec {
+            // Unlike identity-only observations, the current per-repository
+            // config is authoritative and may remove a previously set stance.
+            repositories
+                .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, repository_spec)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub async fn materialize_tracked_repo_projects(&self) -> Result<(), String> {
         for repo_path in self.tracked_repo_paths().await {
             let inspection = match self.inspect_repository_path(&repo_path, None).await {
@@ -4199,7 +4223,13 @@ impl InProcessDaemon {
         let identity_change = match self.inspect_repository_path(&repo, None).await {
             Ok(inspection) => {
                 let key_changed = self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key());
-                let identity_change = self.reconcile_whole_repository_project(&inspection).await?;
+                let identity_change = if key_changed {
+                    self.reconcile_whole_repository_project(&inspection).await?
+                } else {
+                    let namespace = self.provisioning_namespace().await;
+                    self.reconcile_repository_config(&namespace, &inspection.key(), &inspection.spec).await?;
+                    None
+                };
                 if key_changed {
                     {
                         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
