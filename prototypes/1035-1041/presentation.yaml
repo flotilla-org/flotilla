@@ -18,6 +18,8 @@ relevance:
   default: all
 
 repositories:
+  # Flotilla supplies the work queue without surrendering its whole-repo
+  # controller Project; this Project controls andamento's presentation work.
   - repo: github.com/flotilla-org/flotilla
     role: member
     claim: association
