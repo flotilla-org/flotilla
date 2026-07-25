@@ -21,6 +21,19 @@ impl CloneRuntime for FakeCloneRuntime {
     }
 }
 
+struct FailingCloneRuntime;
+
+#[async_trait]
+impl CloneRuntime for FailingCloneRuntime {
+    async fn clone_and_inspect(&self, _repo_url: &str, _target_path: &str) -> Result<Option<String>, String> {
+        Err("authentication failed".to_string())
+    }
+
+    async fn inspect_existing(&self, _target_path: &str) -> Result<Option<String>, String> {
+        Err("clone does not exist".to_string())
+    }
+}
+
 #[tokio::test]
 async fn mismatched_clone_name_fails() {
     let backend = ResourceBackend::InMemory(Default::default());
@@ -73,4 +86,36 @@ async fn alias_transport_uses_typed_repository_identity_for_clone_name() {
     let outcome = reconciler.reconcile(&clone, &deps, chrono::Utc::now());
 
     assert!(matches!(outcome.patch, Some(flotilla_resources::CloneStatusPatch::MarkReady { .. })));
+}
+
+#[tokio::test]
+async fn clone_failure_remains_an_honest_failure_after_repository_registration() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/private").expect("repository spec");
+    let repository_key = repository_spec.key();
+    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>("flotilla"), &repository_key, &repository_spec)
+        .await
+        .expect("repository create should succeed");
+    let env_ref = "host-direct-01HXYZ";
+    let clone_name = format!("clone-{}", clone_key("https://github.com/flotilla-org/private", env_ref));
+    let clone = backend
+        .clone()
+        .using::<flotilla_resources::Clone>("flotilla")
+        .create(&meta(&clone_name), &CloneSpec {
+            repo_ref: repository_key,
+            url: "git@github.com:flotilla-org/private.git".to_string(),
+            env_ref: env_ref.to_string(),
+            path: "/Users/alice/dev/private".to_string(),
+        })
+        .await
+        .expect("clone should create");
+    let reconciler = CloneReconciler::new(Arc::new(FailingCloneRuntime), backend.using("flotilla"));
+
+    let deps = reconciler.fetch_dependencies(&clone).await.expect("deps should load");
+    let outcome = reconciler.reconcile(&clone, &deps, chrono::Utc::now());
+
+    assert!(matches!(
+        outcome.patch,
+        Some(flotilla_resources::CloneStatusPatch::MarkFailed { message }) if message == "authentication failed"
+    ));
 }
