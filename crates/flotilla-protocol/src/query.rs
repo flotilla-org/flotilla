@@ -142,6 +142,8 @@ pub struct ProjectListRepository {
     pub key: RepositoryKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subpaths: Vec<String>,
 }
 
 #[cfg(test)]
@@ -162,6 +164,7 @@ mod project_list_tests {
                 .repositories(vec![ProjectListRepository {
                     key: RepositoryKey("repo-key".into()),
                     slug: Some("flotilla-org/flotilla".into()),
+                    subpaths: vec![],
                 }])
                 .maybe_issue_source(Some(IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() }))
                 .default_workflow_ref("single-agent-contained".to_string())

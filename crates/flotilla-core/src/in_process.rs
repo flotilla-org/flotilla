@@ -4541,12 +4541,21 @@ impl InProcessDaemon {
             .items
             .into_iter()
             .map(|project| {
-                let mut repository_keys = project.spec.repositories.into_iter().map(|repository| repository.repo).collect::<Vec<_>>();
-                repository_keys.sort();
-                repository_keys.dedup();
-                let repositories = repository_keys
+                let mut project_repositories = BTreeMap::<RepositoryKey, BTreeSet<String>>::new();
+                for repository in project.spec.repositories {
+                    if let Some(subpath) = repository.subpath {
+                        project_repositories.entry(repository.repo).or_default().insert(subpath);
+                    } else {
+                        project_repositories.entry(repository.repo).or_default();
+                    }
+                }
+                let repositories = project_repositories
                     .into_iter()
-                    .map(|key| ProjectListRepository { slug: repository_slugs.get(&key).cloned(), key })
+                    .map(|(key, subpaths)| ProjectListRepository {
+                        slug: repository_slugs.get(&key).cloned(),
+                        key,
+                        subpaths: subpaths.into_iter().collect(),
+                    })
                     .collect::<Vec<_>>();
                 ProjectListEntry::builder()
                     .namespace(project.metadata.namespace.clone())

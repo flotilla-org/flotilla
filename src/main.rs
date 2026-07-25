@@ -451,10 +451,10 @@ fn default_project_landing(
     let project = projects
         .projects
         .iter()
-        .filter(|project| project.repositories.iter().any(|repository| &repository.key == repository_key))
-        .min_by_key(|project| {
-            (project.repositories.len() != 1, project.name != repo.name, project.namespace.as_str(), project.name.as_str())
-        })?;
+        .filter(|project| {
+            matches!(project.repositories.as_slice(), [repository] if &repository.key == repository_key && repository.subpaths.is_empty())
+        })
+        .min_by_key(|project| (project.name != repo.name, project.namespace.as_str(), project.name.as_str()))?;
     Some((repo.identity.clone(), project.address.clone()))
 }
 
@@ -549,7 +549,10 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
             .await
         {
             Ok(CommandValue::ProjectList(projects)) => default_project_landing(&repos_info, &startup_repo_roots, &projects),
-            Ok(_) => None,
+            Ok(value) => {
+                info!(?value, "default project query returned an unexpected result; using repo page");
+                None
+            }
             Err(error) => {
                 info!(%error, "could not resolve default project landing; using repo page");
                 None
@@ -1534,13 +1537,22 @@ mod tests {
         }
     }
 
-    fn landing_project(name: &str, repositories: &[&str]) -> ProjectListEntry {
+    fn landing_project(name: &str, repositories: &[(&str, Option<&str>)]) -> ProjectListEntry {
         ProjectListEntry::builder()
             .namespace("flotilla".to_string())
             .name(name.to_string())
             .display_name(name.to_string())
             .address(ViewAddress::Project { namespace: "flotilla".into(), name: name.into() })
-            .repositories(repositories.iter().map(|key| ProjectListRepository { key: RepositoryKey((*key).into()), slug: None }).collect())
+            .repositories(
+                repositories
+                    .iter()
+                    .map(|(key, subpath)| ProjectListRepository {
+                        key: RepositoryKey((*key).into()),
+                        slug: None,
+                        subpaths: subpath.iter().map(|subpath| (*subpath).to_string()).collect(),
+                    })
+                    .collect(),
+            )
             .default_workflow_ref("single-agent-contained".to_string())
             .build()
     }
@@ -1592,8 +1604,8 @@ mod tests {
         ];
         let projects = ProjectListResponse {
             projects: vec![
-                landing_project("presentation", &["repo-flotilla", "repo-other"]),
-                landing_project("flotilla", &["repo-flotilla"]),
+                landing_project("presentation", &[("repo-flotilla", None), ("repo-other", None)]),
+                landing_project("flotilla", &[("repo-flotilla", None)]),
             ],
         };
 
@@ -1608,9 +1620,25 @@ mod tests {
     #[test]
     fn fresh_landing_falls_back_when_detected_repo_has_no_project() {
         let repos = vec![landing_repo("/repos/plain", "plain", Some("repo-plain"))];
-        let projects = ProjectListResponse { projects: vec![landing_project("other", &["repo-other"])] };
+        let projects = ProjectListResponse { projects: vec![landing_project("other", &[("repo-other", None)])] };
 
         assert_eq!(default_project_landing(&repos, &[PathBuf::from("/repos/plain")], &projects), None);
+    }
+
+    #[test]
+    fn fresh_landing_does_not_confuse_a_subpath_project_for_the_whole_repo_project() {
+        let repos = vec![landing_repo("/repos/shared", "shared", Some("repo-shared"))];
+        let projects = ProjectListResponse {
+            projects: vec![
+                landing_project("docs", &[("repo-shared", Some("docs"))]),
+                landing_project("shared-a1b2c3d4", &[("repo-shared", None)]),
+            ],
+        };
+
+        assert_eq!(
+            default_project_landing(&repos, &[PathBuf::from("/repos/shared")], &projects),
+            Some((repos[0].identity.clone(), ViewAddress::Project { namespace: "flotilla".into(), name: "shared-a1b2c3d4".into() },))
+        );
     }
 
     #[test]
