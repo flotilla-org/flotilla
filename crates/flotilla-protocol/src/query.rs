@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     snapshot::{ProviderError, WorkItem},
-    EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, ViewAddress,
+    EnvironmentInfo, HostName, HostSummary, IssueSource, NodeInfo, PeerConnectionState, RepositoryKey, RepositoryUpstream, ViewAddress,
 };
 
 /// Provider health across categories. Outer key: category (e.g. "vcs",
@@ -71,6 +71,8 @@ pub struct RepoSummary {
 pub struct RepoDetailResponse {
     pub path: PathBuf,
     pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<RepositoryUpstream>,
     pub provider_health: ProviderHealthMap,
     pub work_items: Vec<WorkItem>,
     pub errors: Vec<ProviderError>,

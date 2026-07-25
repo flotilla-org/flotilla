@@ -140,6 +140,29 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
         .build()
 }
 
+pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
+    WorkflowTemplateSpec::builder()
+        .vessels(vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .stance(Stance::Contained)
+            .crew(vec![
+                CrewSpec::builder()
+                    .role("coder".to_string())
+                    .source(CrewSource::Agent { selector: Selector { capability: "code".to_string() }, prompt: None, brief_template: None })
+                    .build(),
+                CrewSpec::builder()
+                    .role("reviewer".to_string())
+                    .source(CrewSource::Agent {
+                        selector: Selector { capability: "code-review".to_string() },
+                        prompt: None,
+                        brief_template: Some("diff-review".to_string()),
+                    })
+                    .build(),
+            ])
+            .build()])
+        .build()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     DuplicateVesselName { name: String },

@@ -1105,6 +1105,7 @@ mod tests {
             CommandValue::RepoDetail(Box::new(RepoDetailResponse {
                 path: PathBuf::from("/repo"),
                 slug: Some("owner/repo".into()),
+                upstream: None,
                 provider_health: Default::default(),
                 work_items: vec![],
                 errors: vec![],

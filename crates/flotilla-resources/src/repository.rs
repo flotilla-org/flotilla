@@ -1,13 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use flotilla_protocol::RepositoryKey;
+pub use flotilla_protocol::{RepositoryKey, RepositoryRelation, RepositoryUpstream};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     resource::define_resource, status_patch::StatusPatch, InputMeta, LifecycleAuthority, ResourceError, ResourceObject, TypedResolver,
 };
 
-define_resource!(Repository, "repositories", RepositorySpec, RepositoryStatus, RepositoryStatusPatch, immutable_spec);
+define_resource!(
+    Repository,
+    "repositories",
+    RepositorySpec,
+    RepositoryStatus,
+    RepositoryStatusPatch,
+    validate_spec_update = validate_repository_spec_update
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -27,6 +34,10 @@ pub struct RepositorySpec {
     identity: RepositoryIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forge: Option<ForgeIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream: Option<RepositoryUpstream>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_reviewless_workflows: bool,
 }
 
 impl RepositorySpec {
@@ -37,7 +48,12 @@ impl RepositorySpec {
         }
         let canonical_remote = crate::canonicalize_repo_url(&remote)?;
         let forge = forge_from_canonical_remote(&canonical_remote)?;
-        Ok(Self { identity: RepositoryIdentity::Remote { canonical_remote }, forge: Some(forge) })
+        Ok(Self {
+            identity: RepositoryIdentity::Remote { canonical_remote },
+            forge: Some(forge),
+            upstream: None,
+            allow_reviewless_workflows: false,
+        })
     }
 
     pub fn local(host_ref: impl Into<String>, git_common_dir: impl Into<String>) -> Result<Self, String> {
@@ -51,7 +67,12 @@ impl RepositorySpec {
             return Err("local repository git_common_dir must be absolute".to_string());
         }
         let normalized = normalize_absolute_path(path)?;
-        Ok(Self { identity: RepositoryIdentity::Local { host_ref, git_common_dir: normalized }, forge: None })
+        Ok(Self {
+            identity: RepositoryIdentity::Local { host_ref, git_common_dir: normalized },
+            forge: None,
+            upstream: None,
+            allow_reviewless_workflows: false,
+        })
     }
 
     pub fn key(&self) -> RepositoryKey {
@@ -69,6 +90,29 @@ impl RepositorySpec {
 
     pub fn forge(&self) -> Option<&ForgeIdentity> {
         self.forge.as_ref()
+    }
+
+    pub fn upstream(&self) -> Option<&RepositoryUpstream> {
+        self.upstream.as_ref()
+    }
+
+    pub fn is_fork(&self) -> bool {
+        self.upstream.as_ref().is_some_and(|upstream| upstream.relation == RepositoryRelation::Fork)
+    }
+
+    pub fn allows_reviewless_workflows(&self) -> bool {
+        self.allow_reviewless_workflows
+    }
+
+    pub fn with_upstream(mut self, url: impl Into<String>, relation: RepositoryRelation) -> Result<Self, String> {
+        let url = crate::canonicalize_repo_url(&url.into())?;
+        self.upstream = Some(RepositoryUpstream { url, relation });
+        Ok(self)
+    }
+
+    pub fn with_allow_reviewless_workflows(mut self, allow: bool) -> Self {
+        self.allow_reviewless_workflows = allow;
+        self
     }
 
     pub fn verify_key(&self, key: &RepositoryKey) -> Result<(), String> {
@@ -234,7 +278,15 @@ pub async fn ensure_repository(
     };
     repository.spec.verify_key(key).map_err(ResourceError::invalid)?;
     if repository.spec != *spec {
-        return Err(ResourceError::invalid(format!("repository key {key} already refers to a different canonical identity")));
+        if repository.spec.identity != spec.identity || repository.spec.forge != spec.forge {
+            return Err(ResourceError::invalid(format!("repository key {key} already refers to a different canonical identity")));
+        }
+        // Identity-only observations are common during provisioning and must not
+        // erase provenance supplied by the per-repository config authority.
+        if spec.upstream.is_none() && !spec.allow_reviewless_workflows {
+            return Ok(repository);
+        }
+        return repositories.update(&InputMeta::from(&repository.metadata), &repository.metadata.resource_version, spec).await;
     }
     Ok(repository)
 }
@@ -249,10 +301,14 @@ impl<'de> Deserialize<'de> for RepositorySpec {
             identity: RepositoryIdentity,
             #[serde(default)]
             forge: Option<ForgeIdentity>,
+            #[serde(default)]
+            upstream: Option<RepositoryUpstream>,
+            #[serde(default)]
+            allow_reviewless_workflows: bool,
         }
 
         let stored = StoredRepositorySpec::deserialize(deserializer)?;
-        let normalized = match &stored.identity {
+        let mut normalized = match &stored.identity {
             RepositoryIdentity::Remote { canonical_remote } => RepositorySpec::remote(canonical_remote),
             RepositoryIdentity::Local { host_ref, git_common_dir } => RepositorySpec::local(host_ref, git_common_dir),
         }
@@ -263,8 +319,25 @@ impl<'de> Deserialize<'de> for RepositorySpec {
         if normalized.forge != stored.forge {
             return Err(serde::de::Error::custom("repository forge must be the identity-derived forge"));
         }
+        if let Some(upstream) = stored.upstream {
+            normalized = normalized.with_upstream(&upstream.url, upstream.relation).map_err(serde::de::Error::custom)?;
+            if normalized.upstream.as_ref() != Some(&upstream) {
+                return Err(serde::de::Error::custom("repository upstream URL must be canonical"));
+            }
+        }
+        normalized.allow_reviewless_workflows = stored.allow_reviewless_workflows;
         Ok(normalized)
     }
+}
+
+fn validate_repository_spec_update(current: &RepositorySpec, requested: &RepositorySpec) -> Result<(), ResourceError> {
+    if current.identity != requested.identity {
+        return Err(ResourceError::invalid("Repository identity is immutable after creation"));
+    }
+    if current.forge != requested.forge {
+        return Err(ResourceError::invalid("Repository forge is immutable and identity-derived"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

@@ -1048,6 +1048,94 @@ async fn handoff_brief_for_demo_repository_scope(repository_refs: Option<Vec<Rep
 }
 
 #[tokio::test]
+async fn fork_review_handoff_launches_reviewer_with_diff_review_and_fork_brief() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");
+    let (daemon, _) = new_attach_test_daemon_with_pool(temp.path()).await;
+    let env_ref = create_local_attach_environment(&daemon).await;
+    create_two_agent_crew(&daemon, &env_ref).await;
+
+    let repository = RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij")
+        .expect("fork repository")
+        .with_upstream("https://github.com/zellij-org/zellij", flotilla_protocol::RepositoryRelation::Fork)
+        .expect("upstream");
+    flotilla_resources::ensure_repository(&daemon.resource_backend().using::<Repository>("flotilla"), &repository.key(), &repository)
+        .await
+        .expect("repository create");
+    let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+    let convoy = convoys.get("demo").await.expect("convoy");
+    let mut spec = convoy.spec.clone();
+    spec.repositories = vec![ConvoyRepositorySpec::builder()
+        .url("https://forgejo.lab/fork-issues/zellij".to_string())
+        .repo_ref(repository.key())
+        .base_ref("stack/base".to_string())
+        .workspace_slug("zellij".to_string())
+        .subpaths(Vec::new())
+        .build()];
+    let convoy =
+        convoys.update(&input_meta_from_resource(&convoy), &convoy.metadata.resource_version, &spec).await.expect("convoy spec update");
+    let mut status = convoy.status.expect("convoy status");
+    let reviewer = status
+        .workflow_snapshot
+        .as_mut()
+        .expect("workflow snapshot")
+        .vessels
+        .iter_mut()
+        .find(|vessel| vessel.name == "implement")
+        .expect("implement vessel")
+        .crew
+        .iter_mut()
+        .find(|crew| crew.role == "reviewer")
+        .expect("reviewer");
+    let CrewSource::Agent { brief_template, .. } = &mut reviewer.source else {
+        panic!("reviewer should be an agent");
+    };
+    *brief_template = Some("diff-review".to_string());
+    convoys.update_status("demo", &convoy.metadata.resource_version, &status).await.expect("convoy status update");
+
+    daemon
+        .crew_handoff_internal(
+            &CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
+            "reviewer",
+            "Review the fork PR",
+        )
+        .await
+        .expect("review handoff");
+    let reviewer = daemon
+        .resource_backend()
+        .using::<ResourceTerminalSession>("flotilla")
+        .get("terminal-demo-implement-reviewer")
+        .await
+        .expect("reviewer session");
+    let TerminalSessionSource::Agent { selector, brief, message, .. } = reviewer.spec.source else {
+        panic!("reviewer should be agent-backed");
+    };
+    assert_eq!(selector.capability, "review");
+    assert_eq!(message.as_ref().map(|message| message.text.as_str()), Some("handoff from coder@implement\n\nReview the fork PR"));
+    assert!(brief.content.contains("sign off on the fork PR"));
+    assert!(brief.content.contains("Never add a git remote"));
+    assert!(brief.content.contains("Never open issues, pull requests, or comments against the upstream repository"));
+
+    daemon
+        .crew_complete_internal(
+            &CrewCommandContext {
+                namespace: Some("flotilla".into()),
+                convoy: Some("demo".into()),
+                vessel_ref: Some("demo-implement".into()),
+                role: Some("reviewer".into()),
+                ..Default::default()
+            },
+            Some("https://forgejo.lab/fork-issues/zellij/pulls/9".into()),
+        )
+        .await
+        .expect("reviewer sign-off completion");
+    let convoy = convoys.get("demo").await.expect("completed convoy");
+    let reviewer_work = &convoy.status.expect("convoy status").crew_work["implement"]["reviewer"];
+    assert_eq!(reviewer_work.phase, CrewWorkPhase::Done);
+    assert_eq!(reviewer_work.message.as_deref(), Some("https://forgejo.lab/fork-issues/zellij/pulls/9"));
+}
+
+#[tokio::test]
 async fn crew_complete_uses_ambient_identity_to_complete_callers_work() {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-machine\"\n").expect("daemon config");

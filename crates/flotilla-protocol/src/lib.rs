@@ -124,6 +124,7 @@ pub use query::{
     ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoDetailResponse, RepoProvidersResponse, RepoSummary,
     RepoWorkResponse, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
+pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;
 pub use result_set::{
     AwarenessCounts, AwarenessEntry, AwarenessFamily, AwarenessFamilySummary, AwarenessGrouping, AwarenessKind, AwarenessLimit,

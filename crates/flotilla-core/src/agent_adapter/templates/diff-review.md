@@ -1,0 +1,2 @@
+{% extends "builtin/crew.md" %}
+{% block delivery %}Review the implementation diff and the fork PR against the assignment. Send actionable findings to the coder with `flotilla crew coder handoff --message '...'`, then re-review the resulting changes. When the implementation is sound, sign off on the fork PR and complete with `flotilla crew complete --message '<PR URL>'`. Do not merge the PR; the human owns merge.{% endblock %}

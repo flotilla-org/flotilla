@@ -4,7 +4,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use flotilla_protocol::{IssueSource, NodeId};
+use flotilla_protocol::{IssueSource, NodeId, RepositoryRelation};
+use flotilla_resources::RepositorySpec;
 use serde::{Deserialize, Serialize};
 
 use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -215,6 +216,10 @@ pub struct RepoFileConfig {
     pub vcs: RepoVcsConfig,
     #[serde(default)]
     pub issue_tracker: RepoIssueTrackerConfig,
+    #[serde(default)]
+    pub upstream: Option<RepoUpstreamConfig>,
+    #[serde(default)]
+    pub workflow: RepoWorkflowConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -240,6 +245,18 @@ pub struct RepoIssueTrackerConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct RepoForgejoIssueTrackerConfig {
     pub scope: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RepoUpstreamConfig {
+    pub url: String,
+    pub relation: RepositoryRelation,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepoWorkflowConfig {
+    #[serde(default)]
+    pub allow_reviewless: bool,
 }
 
 /// Global SSH settings for remote host connections.
@@ -610,6 +627,20 @@ impl ConfigStore {
             return None;
         };
         Some(IssueSource { service, scope })
+    }
+
+    pub fn configure_repository_spec(
+        &self,
+        repo_root: &ExecutionEnvironmentPath,
+        mut spec: RepositorySpec,
+    ) -> Result<RepositorySpec, String> {
+        let Some(repo_cfg) = self.load_repo_file_config(repo_root) else {
+            return Ok(spec);
+        };
+        if let Some(upstream) = repo_cfg.upstream {
+            spec = spec.with_upstream(upstream.url, upstream.relation)?;
+        }
+        Ok(spec.with_allow_reviewless_workflows(repo_cfg.workflow.allow_reviewless))
     }
 
     fn load_repo_file_config(&self, repo_root: &ExecutionEnvironmentPath) -> Option<RepoFileConfig> {

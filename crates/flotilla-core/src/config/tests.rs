@@ -122,6 +122,32 @@ fn resolve_repo_issue_source_reads_forgejo_binding() {
 }
 
 #[test]
+fn configure_repository_spec_reads_fork_stance_and_reviewless_override() {
+    let dir = tempdir().expect("create config tempdir");
+    let base = dir.path();
+    let repo = make_dir(base, "zellij");
+    let content = format!(
+        "path = \"{}\"\n[upstream]\nurl = \"https://github.com/zellij-org/zellij.git\"\nrelation = \"fork\"\n[workflow]\nallow_reviewless = true\n",
+        repo.display()
+    );
+    write_repo_file(base, &format!("{}.toml", repo_file_key(&repo)), &content);
+
+    let store = ConfigStore::with_base(base);
+    let configured = store
+        .configure_repository_spec(&ee(repo), RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij").expect("fork repository"))
+        .expect("repository config");
+
+    assert_eq!(
+        configured.upstream(),
+        Some(&flotilla_protocol::RepositoryUpstream {
+            url: "https://github.com/zellij-org/zellij".to_string(),
+            relation: flotilla_protocol::RepositoryRelation::Fork,
+        })
+    );
+    assert!(configured.allows_reviewless_workflows());
+}
+
+#[test]
 fn resolve_repo_issue_source_requires_global_forgejo_service_url() {
     let dir = tempdir().expect("create config tempdir");
     let base = dir.path();

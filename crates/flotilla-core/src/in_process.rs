@@ -1696,7 +1696,10 @@ impl InProcessDaemon {
     }
 
     pub async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        self.repository_inspector().await?.inspect_path(path, remote).await
+        let mut inspection = self.repository_inspector().await?.inspect_path(path, remote).await?;
+        inspection.spec =
+            self.config.configure_repository_spec(&ExecutionEnvironmentPath::new(&inspection.checkout.path), inspection.spec)?;
+        Ok(inspection)
     }
 
     pub async fn repository_key_for_path(&self, path: &Path) -> Option<RepositoryKey> {
@@ -3042,11 +3045,17 @@ fn repository_matches_target(repository: &ResourceObject<Repository>, target: &s
 
 async fn ensure_single_agent_contained_workflow(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);
-    let meta = InputMeta::builder().name("single-agent-contained".to_string()).build();
-    match templates.create(&meta, &flotilla_resources::single_agent_contained_workflow_spec()).await {
-        Ok(_) | Err(ResourceError::Conflict { .. }) => Ok(()),
-        Err(error) => Err(error.to_string()),
+    for (name, spec) in [
+        ("single-agent-contained", flotilla_resources::single_agent_contained_workflow_spec()),
+        ("implement-review", flotilla_resources::implement_review_workflow_spec()),
+    ] {
+        let meta = InputMeta::builder().name(name.to_string()).build();
+        match templates.create(&meta, &spec).await {
+            Ok(_) | Err(ResourceError::Conflict { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
+    Ok(())
 }
 
 fn prepared_snapshot_name(convoy_name: &str, kind: &str, spec: &serde_json::Value) -> Result<String, String> {
@@ -3200,6 +3209,40 @@ fn required_admission_value<'a>(value: &'a str, field: &str) -> Result<&'a str, 
     } else {
         Ok(value)
     }
+}
+
+fn workflow_has_in_crew_review(workflow: &WorkflowTemplateSpec) -> bool {
+    workflow.vessels.iter().any(|vessel| {
+        let agent_count = vessel.crew.iter().filter(|crew| matches!(crew.source, CrewSource::Agent { .. })).count();
+        agent_count > 1
+            && vessel.crew.iter().any(|crew| {
+                matches!(
+                    &crew.source,
+                    CrewSource::Agent { selector, .. } if matches!(selector.capability.as_str(), "review" | "code-review")
+                )
+            })
+    })
+}
+
+async fn validate_fork_workflow_admission(
+    backend: &ResourceBackend,
+    namespace: &str,
+    repositories: &[ConvoyRepositorySpec],
+    workflow_ref: &str,
+    workflow: &WorkflowTemplateSpec,
+) -> Result<(), String> {
+    if workflow_has_in_crew_review(workflow) {
+        return Ok(());
+    }
+    let resolver = backend.clone().using::<Repository>(namespace);
+    for repository in repositories {
+        let repository =
+            resolver.get(&repository.repo_ref.to_string()).await.map_err(|error| format!("repository {}: {error}", repository.repo_ref))?;
+        if repository.spec.is_fork() && !repository.spec.allows_reviewless_workflows() {
+            return Err(format!("workflow {workflow_ref} not permitted for fork-stance repository — use implement-review"));
+        }
+    }
+    Ok(())
 }
 
 async fn validate_workflow_agent_adapters(
@@ -3452,6 +3495,7 @@ impl InProcessDaemon {
             .get(&workflow_ref)
             .await
             .map_err(|error| format!("workflow template {workflow_ref}: {error}"))?;
+        validate_fork_workflow_admission(&self.resource_backend, namespace, &repositories, &workflow_ref, &workflow.spec).await?;
 
         let fallback_slug = convoy_issues_fallback_slug(&issues, &project.spec.display_name, project_ref);
         let generated = if intent.name.is_none() || intent.branch.is_none() {
@@ -3906,9 +3950,16 @@ impl InProcessDaemon {
         let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
         ensure_repository_and_default_project_workflow(&self.resource_backend, &namespace, &repository_key, repository_spec).await?;
+        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let stored = repositories.get(&repository_key.to_string()).await.map_err(|error| error.to_string())?;
+        if stored.spec != *repository_spec {
+            repositories
+                .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, repository_spec)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
 
         let projects = self.resource_backend.clone().using::<Project>(&namespace);
-        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let repository_objects = repositories.list().await.map_err(|error| error.to_string())?.items;
         let repository_specs = repository_objects
             .iter()
@@ -4146,19 +4197,21 @@ impl InProcessDaemon {
         let repo = self.resolve_repo_selector(repo).await?;
         let identity = self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
         let identity_change = match self.inspect_repository_path(&repo, None).await {
-            Ok(inspection) if self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key()) => {
+            Ok(inspection) => {
+                let key_changed = self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key());
                 let identity_change = self.reconcile_whole_repository_project(&inspection).await?;
-                {
-                    let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-                    if self.tracked_repo_identity_for_path(&repo).await.as_ref() != Some(&identity) {
-                        return Err(format!("repo not tracked: {}", repo.display()));
+                if key_changed {
+                    {
+                        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+                        if self.tracked_repo_identity_for_path(&repo).await.as_ref() != Some(&identity) {
+                            return Err(format!("repo not tracked: {}", repo.display()));
+                        }
+                        self.repository_keys_by_path.write().await.insert(repo.clone(), inspection.key());
                     }
-                    self.repository_keys_by_path.write().await.insert(repo.clone(), inspection.key());
+                    self.publish_repo_info_update(&identity).await;
                 }
-                self.publish_repo_info_update(&identity).await;
                 identity_change
             }
-            Ok(_) => None,
             Err(error) => {
                 warn!(repo = %repo.display(), %error, "repository identity is unavailable during refresh");
                 None
@@ -4427,6 +4480,17 @@ impl InProcessDaemon {
 
     pub async fn get_repo_detail_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoDetailResponse, String> {
         let repo_path = self.resolve_repo_selector(repo).await?;
+        let upstream = match self.repository_keys_by_path.read().await.get(&repo_path).cloned() {
+            Some(key) => self
+                .resource_backend
+                .clone()
+                .using::<Repository>(&self.provisioning_namespace().await)
+                .get(&key.to_string())
+                .await
+                .ok()
+                .and_then(|repository| repository.spec.upstream().cloned()),
+            None => None,
+        };
         let identity =
             self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
         let peer_overlay = self.peer_providers.read().await.get(&identity).cloned();
@@ -4443,6 +4507,7 @@ impl InProcessDaemon {
         Ok(RepoDetailResponse {
             path: state.preferred_path().to_path_buf(),
             slug: state.slug().map(str::to_string),
+            upstream,
             provider_health: snapshot.provider_health.clone(),
             work_items: snapshot.work_items.clone(),
             errors: snapshot.errors.clone(),
@@ -5014,8 +5079,20 @@ impl InProcessDaemon {
                 };
                 let current = self.crew_list_internal(requested).await?;
                 let repo_roots = crew_brief_repo_roots(&self.resource_backend, &context.namespace, &convoy, &repository_refs).await;
+                let repositories = self.resource_backend.clone().using::<Repository>(&context.namespace);
+                let mut fork_stance = false;
+                for repository_ref in &repository_refs {
+                    if let Ok(repository) = repositories.get(&repository_ref.to_string()).await {
+                        fork_stance |= repository.spec.is_fork();
+                    }
+                }
                 let render_options = crate::agent_adapter::CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path())
-                    .render_options(brief_template.as_deref(), convoy.spec.project_ref.as_deref(), repo_roots);
+                    .render_options_with_fork_stance(
+                        brief_template.as_deref(),
+                        convoy.spec.project_ref.as_deref(),
+                        repo_roots,
+                        fork_stance,
+                    );
                 let brief =
                     handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, &repository_refs, &render_options)?;
                 sessions

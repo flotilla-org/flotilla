@@ -9,6 +9,32 @@ Stored in `~/.config/flotilla/`:
 
 Repos are added interactively from within flotilla using the `a` key.
 
+### Fork provenance
+
+Repositories that are maintained as forks declare their upstream provenance in
+the tracked repo's TOML file:
+
+```toml
+path = "/home/alice/dev/zellij"
+
+[upstream]
+url = "https://github.com/zellij-org/zellij"
+relation = "fork"
+
+[issue_tracker.forgejo]
+scope = "fork-issues/zellij"
+```
+
+Fork-stance provisioning clones only the repository's own URL as `origin`; it
+does not add the upstream as a remote. Convoy admission requires a workflow
+with an in-crew reviewer, such as `implement-review`. A deliberate per-repo
+override can admit review-less workflows:
+
+```toml
+[workflow]
+allow_reviewless = true
+```
+
 ## Convoy start attachment
 
 By default, `flotilla convoy start` attaches to the new convoy only when the

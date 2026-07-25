@@ -1,7 +1,7 @@
 use flotilla_resources::{
     normalize_project_spec, repository_display_labels, resolve_project_issue_sources, DefaultBranchObservation, DefaultBranchProvenance,
     InMemoryBackend, InputMeta, IssueSource, IssueSourceResolution, IssueSourceUnavailable, ProjectRepositorySpec, ProjectSpec, Repository,
-    RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, SqliteBackend,
+    RepositoryIdentity, RepositoryKey, RepositoryRelation, RepositorySpec, ResourceBackend, SqliteBackend,
 };
 
 #[tokio::test]
@@ -105,6 +105,23 @@ async fn repository_roundtrips_and_is_immutable_in_local_backends() {
             .await;
         assert!(update.expect_err("repository identity must be immutable").to_string().contains("immutable"));
     }
+}
+
+#[tokio::test]
+async fn repository_fork_provenance_roundtrips_and_can_enrich_identity() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.using::<Repository>("flotilla");
+    let identity = RepositorySpec::remote("https://forgejo.lab/fork-issues/zellij").expect("fork identity");
+    let key = identity.key();
+    repositories.create(&InputMeta::builder().name(key.to_string()).build(), &identity).await.expect("repository should create");
+    let fork =
+        identity.with_upstream("https://github.com/zellij-org/zellij.git", RepositoryRelation::Fork).expect("upstream should normalize");
+
+    let enriched = flotilla_resources::ensure_repository(&repositories, &key, &fork).await.expect("provenance should enrich");
+
+    assert_eq!(enriched.spec, fork);
+    assert!(enriched.spec.is_fork());
+    assert_eq!(enriched.spec.upstream().expect("upstream").url, "https://github.com/zellij-org/zellij");
 }
 
 #[test]

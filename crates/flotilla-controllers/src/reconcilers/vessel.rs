@@ -305,6 +305,7 @@ impl Reconciler for VesselReconciler {
         let mut checkout_refs = BTreeMap::new();
         let mut checkout_paths = BTreeMap::new();
         let mut waiting_for_checkouts = false;
+        let mut fork_stance = false;
         for convoy_repository in convoy_repositories {
             let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
                 Ok(repository) => repository.spec,
@@ -331,6 +332,7 @@ impl Reconciler for VesselReconciler {
             if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
                 return Ok(VesselDeps::failed(message));
             }
+            fork_stance |= repository_spec.is_fork();
             let canonical_repo = match repository_spec.identity() {
                 RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
                 RepositoryIdentity::Local { .. } => return Ok(VesselDeps::failed("convoy repository must have a transport remote")),
@@ -651,10 +653,11 @@ impl Reconciler for VesselReconciler {
                                 None if !convoy.spec.issues.is_empty() => CrewAssignment::CarriedIssue,
                                 None => CrewAssignment::Unassigned,
                             };
-                            let render_options = self.brief_templates.render_options(
+                            let render_options = self.brief_templates.render_options_with_fork_stance(
                                 brief_template.as_deref(),
                                 convoy.spec.project_ref.as_deref(),
                                 checkout_paths.values().map(PathBuf::from),
+                                fork_stance,
                             );
                             let mut brief = match build_crew_brief_with_options(
                                 &context,
