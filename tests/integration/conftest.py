@@ -83,7 +83,7 @@ def start_daemon(service: str):
     result = docker_exec(
         service,
         "mkdir -p ~/.config/flotilla ~/.local/state/flotilla; "
-        "tmux_env=$(tmux display-message -p "
+        "tmux_env=$(tmux display-message -t integration -p "
         "'#{socket_path},#{pid},#{window_index}'); "
         "nohup env TMUX=\"$tmux_env\" "
         "RUST_LOG=flotilla_daemon=debug flotillad --timeout 0 "
