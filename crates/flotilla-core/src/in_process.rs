@@ -3979,7 +3979,12 @@ impl InProcessDaemon {
         let spec = whole_repository_project_spec(repository_key.clone(), display_name)?;
         let primary_name = project_objects
             .iter()
-            .filter(|project| project.spec.repositories.iter().any(|entry| entry.repo == repository_key && entry.subpath.is_none()))
+            .filter(|project| {
+                matches!(
+                    project.spec.repositories.as_slice(),
+                    [entry] if entry.repo == repository_key && entry.subpath.is_none()
+                )
+            })
             .min_by_key(|project| {
                 (
                     !migrated_project_names.contains(&project.metadata.name),

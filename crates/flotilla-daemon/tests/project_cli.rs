@@ -538,6 +538,70 @@ async fn daemon_start_backfills_project_idempotently_and_preserves_edits() {
 }
 
 #[tokio::test]
+async fn daemon_restart_preserves_whole_repo_project_overlapped_by_applied_project_during_identity_change() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let checkout_path = tmp.path().join("flotilla");
+    std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![checkout_path.clone()],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
+    let local_key = local_spec.key();
+    let inspected_spec = Arc::new(RwLock::new(local_spec));
+    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    let options = RuntimeOptions {
+        namespace: "flotilla".to_string(),
+        heartbeat_interval: Duration::from_secs(300),
+        controller_resync_interval: Duration::from_secs(300),
+        start_controllers: false,
+        ..RuntimeOptions::default()
+    };
+    let runtime =
+        DaemonRuntime::start_with_options(Arc::clone(&daemon), Arc::clone(&config), None, options.clone()).await.expect("runtime start");
+
+    let projects = backend.clone().using::<Project>("flotilla");
+    projects.get("flotilla").await.expect("whole-repository project should exist before overlap");
+    let second_key = RepositoryKey("second-repository".to_string());
+    let mut rx = daemon.subscribe();
+    let apply_id = daemon
+        .execute(Command {
+            node_id: None,
+            provisioning_target: None,
+            context_repo: None,
+            action: CommandAction::ProjectApply {
+                name: "presentation".into(),
+                spec_yaml: format!(
+                    "display_name: Presentation\ndefault_workflow_ref: single-agent-contained\nrepositories:\n  - repo: {local_key}\n  - repo: {second_key}\n"
+                ),
+            },
+        })
+        .await
+        .expect("apply execute");
+    assert_eq!(await_command_result(&mut rx, apply_id).await, CommandValue::ProjectApplied { name: "presentation".into() });
+    projects.get("flotilla").await.expect("whole-repository project should survive applying the overlap");
+
+    let remote_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("remote repository spec");
+    let remote_key = remote_spec.key();
+    *inspected_spec.write().expect("repository identity lock should not be poisoned") = remote_spec;
+    drop(runtime);
+
+    let _restarted =
+        DaemonRuntime::start_with_options(daemon, config, None, options).await.expect("runtime should restart after project overlap");
+
+    let whole_repo = projects.get("flotilla").await.expect("whole-repository project should survive restart");
+    assert_eq!(whole_repo.spec.repositories[0].repo, remote_key);
+    let presentation = projects.get("presentation").await.expect("overlapping applied project should survive restart");
+    assert_eq!(presentation.spec.repositories.iter().map(|repository| &repository.repo).collect::<Vec<_>>(), [&second_key, &remote_key]);
+}
+
+#[tokio::test]
 async fn daemon_start_skips_a_tracked_repo_that_cannot_be_backfilled() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
