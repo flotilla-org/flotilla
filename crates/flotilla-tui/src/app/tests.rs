@@ -76,6 +76,21 @@ fn non_local_test_host() -> &'static str {
     }
 }
 
+#[test]
+fn table_rows_omits_home_dirs_for_ambiguous_host_names() {
+    let mut app = stub_app();
+    let first = EnvironmentId::host(HostId::new("desktop-a"));
+    let second = EnvironmentId::host(HostId::new("desktop-b"));
+    insert_host(&mut app.model, "desktop", first.clone(), NodeId::new("node-a"), "Desktop A", false, PeerStatus::Connected);
+    insert_host(&mut app.model, "desktop", second.clone(), NodeId::new("node-b"), "Desktop B", false, PeerStatus::Connected);
+    app.model.hosts.get_mut(&first).expect("first host").summary.system.home_dir = Some("/home/first".into());
+    app.model.hosts.get_mut(&second).expect("second host").summary.system.home_dir = Some("/home/second".into());
+
+    let rows = table_rows(&app.model, &app.namespaces, &app.query_tables, None);
+
+    assert!(!rows.host_home_dirs.contains_key(&HostName::new("desktop")));
+}
+
 #[derive(Clone)]
 struct QueryStep {
     expected_page: u32,

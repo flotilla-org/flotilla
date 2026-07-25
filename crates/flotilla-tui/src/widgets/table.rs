@@ -58,6 +58,24 @@ impl TablePanel {
             && (trigger == FetchTrigger::Explicit || view.rows.len().saturating_sub(state.selected_index(view).unwrap_or(0) + 1) <= 5)
     }
 
+    fn rendered_cell_text(view: &TableView, row_index: usize, column_index: usize, width: usize) -> String {
+        let row = &view.rows[row_index];
+        let cell = &row.cells[column_index];
+        let column = &view.columns[column_index];
+        let repeated = row_index.checked_sub(1).and_then(|previous| view.rows.get(previous)).is_some_and(|previous| match column.id {
+            "host" => previous.cells[column_index].text == cell.text,
+            "repository" => previous.cells[0].text == row.cells[0].text && previous.cells[column_index].text == cell.text,
+            _ => false,
+        });
+        if repeated {
+            String::new()
+        } else if column.id == "path" {
+            crate::ui_helpers::middle_elide(&cell.text, width)
+        } else {
+            cell.text.clone()
+        }
+    }
+
     pub(crate) fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, view: &TableView) {
         let header =
             Row::new(view.columns.iter().map(|column| Cell::from(Line::from(column.label).alignment(ratatui_alignment(column.alignment)))))
@@ -117,7 +135,7 @@ impl TablePanel {
                 _ => unreachable!("table width constraints are always resolved lengths"),
             })
             .collect::<Vec<_>>();
-        let rows = view.rows.iter().skip(first).take(count).map(|row| {
+        let rows = view.rows.iter().enumerate().skip(first).take(count).map(|(row_index, row)| {
             let selected = state.selected() == Some(&row.id);
             let multi = decorations.multi_selected.contains(&row.id);
             let row_state = state.row_state(&row.id);
@@ -129,8 +147,7 @@ impl TablePanel {
             });
             let mut offset = 0usize;
             let cells = row.cells.iter().zip(&view.columns).enumerate().map(|(index, (cell, column))| {
-                let mut text =
-                    if column.id == "path" { crate::ui_helpers::middle_elide(&cell.text, column_widths[index]) } else { cell.text.clone() };
+                let mut text = Self::rendered_cell_text(view, row_index, index, column_widths[index]);
                 if index == 0 {
                     if matches!(row_state, Some(RowState::Failed { .. })) {
                         text = format!("x {text}");
@@ -491,6 +508,48 @@ mod tests {
             }],
             meta: Default::default(),
         }
+    }
+
+    fn checkout_view() -> TableView {
+        let columns = [("host", "HOST"), ("path", "PATH"), ("branch", "BRANCH"), ("repository", "REPOSITORY")]
+            .into_iter()
+            .map(|(id, label)| ProjectedColumn {
+                id,
+                label,
+                width: WidthHint::Flexible { minimum: 8, weight: 1 },
+                alignment: Alignment::Left,
+            })
+            .collect();
+        let row = |id: &str, branch: &str| ProjectedRow {
+            id: RowId::new(id),
+            cells: vec![
+                CellValue { text: "kiwi".into(), tone: CellTone::Plain },
+                CellValue { text: format!("~/work/{id}"), tone: CellTone::Plain },
+                CellValue { text: branch.into(), tone: CellTone::Plain },
+                CellValue { text: "widgets".into(), tone: CellTone::Plain },
+            ],
+            drill: None,
+            describe: vec![],
+            actions: vec![],
+        };
+        TableView {
+            title: "Checkouts".into(),
+            columns,
+            rows: vec![row("main", "main"), row("feature", "feature/table-polish")],
+            meta: Default::default(),
+        }
+    }
+
+    #[test]
+    fn checkout_line_dedup_runs_after_filtering() {
+        let unfiltered = checkout_view();
+        assert_eq!(TablePanel::rendered_cell_text(&unfiltered, 1, 0, 20), "");
+        assert_eq!(TablePanel::rendered_cell_text(&unfiltered, 1, 3, 20), "");
+
+        let filtered = checkout_view().filtered("feature");
+        assert_eq!(filtered.rows.len(), 1);
+        assert_eq!(TablePanel::rendered_cell_text(&filtered, 0, 0, 20), "kiwi");
+        assert_eq!(TablePanel::rendered_cell_text(&filtered, 0, 3, 20), "widgets");
     }
 
     fn snapshot_view() -> TableView {

@@ -648,7 +648,7 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 .as_ref()
                 .map_or_else(|| "Checkouts · fleet".to_string(), |scope| format!("Checkouts · {}/{}", scope.namespace, scope.name));
             let mut view = checkout_spec().project(title, result.rows.iter().cloned());
-            polish_checkout_rows(&mut view, result.rows, &data.host_home_dirs);
+            shorten_checkout_paths(&mut view, result.rows, &data.host_home_dirs);
             view.meta = result_set_meta(result.state);
             Ok(view)
         }
@@ -656,21 +656,9 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
     }
 }
 
-fn polish_checkout_rows(view: &mut TableView, rows: &[CheckoutRow], home_dirs: &HashMap<HostName, &Path>) {
-    let mut previous_host: Option<&HostName> = None;
-    let mut previous_repo: Option<&RepositoryKey> = None;
+fn shorten_checkout_paths(view: &mut TableView, rows: &[CheckoutRow], home_dirs: &HashMap<HostName, &Path>) {
     for (projected, row) in view.rows.iter_mut().zip(rows) {
-        let same_host = previous_host == Some(&row.host);
-        let same_repo = same_host && previous_repo == Some(&row.repo);
-        if same_host {
-            projected.cells[0].text.clear();
-        }
-        projected.cells[1].text = crate::ui_helpers::shorten_home_path(Path::new(&row.path), home_dirs.get(&row.host).copied());
-        if same_repo {
-            projected.cells[3].text.clear();
-        }
-        previous_host = Some(&row.host);
-        previous_repo = Some(&row.repo);
+        projected.cells[1].text = crate::ui_helpers::shorten_against_home(Path::new(&row.path), home_dirs.get(&row.host).copied());
     }
 }
 
@@ -1730,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn checkout_table_shortens_home_paths_and_deduplicates_grouped_lines() {
+    fn checkout_table_shortens_home_paths_without_discarding_group_values() {
         let host = HostName::new("kiwi");
         let first = CheckoutRow::builder()
             .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "widgets-main"))
@@ -1763,9 +1751,9 @@ mod tests {
         assert_eq!(view.rows[0].cells[0].text, "kiwi");
         assert_eq!(view.rows[0].cells[1].text, "~/work/widgets");
         assert_eq!(view.rows[0].cells[3].text, "widgets");
-        assert_eq!(view.rows[1].cells[0].text, "");
+        assert_eq!(view.rows[1].cells[0].text, "kiwi");
         assert_eq!(view.rows[1].cells[1].text, "~/work/widgets-feature-with-a-long-name");
-        assert_eq!(view.rows[1].cells[3].text, "");
+        assert_eq!(view.rows[1].cells[3].text, "widgets");
     }
 
     #[test]

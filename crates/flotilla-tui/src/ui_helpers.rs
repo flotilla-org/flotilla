@@ -260,7 +260,7 @@ pub fn shorten_path(path: &Path, repo_root: &Path, col_width: usize, home_dir: O
     shorten_against_home(path, home_dir)
 }
 
-fn shorten_against_home(path: &Path, home_dir: Option<&Path>) -> String {
+pub(crate) fn shorten_against_home(path: &Path, home_dir: Option<&Path>) -> String {
     if let Some(home) = home_dir {
         if let Ok(rel) = path.strip_prefix(home) {
             let s = rel.to_string_lossy();
@@ -271,11 +271,6 @@ fn shorten_against_home(path: &Path, home_dir: Option<&Path>) -> String {
         }
     }
     path.display().to_string()
-}
-
-/// Shorten an arbitrary path against its host's home directory.
-pub fn shorten_home_path(path: &Path, home_dir: Option<&Path>) -> String {
-    shorten_against_home(path, home_dir)
 }
 
 /// Preserve both ends of long values, which is especially useful for paths

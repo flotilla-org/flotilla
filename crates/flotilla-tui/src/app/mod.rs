@@ -362,7 +362,10 @@ pub fn table_rows<'a>(
         host_home_dirs: model
             .hosts
             .values()
-            .filter_map(|host| host.summary.system.home_dir.as_deref().map(|home| (host.host_name.clone(), home)))
+            .filter_map(|host| {
+                let resolved = model.resolve_host(&host.host_name).ok()?;
+                resolved.summary.system.home_dir.as_deref().map(|home| (resolved.host_name.clone(), home))
+            })
             .collect(),
         source_search,
     }
