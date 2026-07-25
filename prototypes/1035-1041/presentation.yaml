@@ -1,0 +1,31 @@
+# The live "presentation" project without the hand-applied, schema-v0 shape.
+display_name: Presentation
+default_workflow_ref: single-agent-contained
+
+issue_sources:
+  - role: primary
+    source:
+      service: https://github.com
+      scope: flotilla-org/flotilla
+    repository_ref: github.com/flotilla-org/flotilla
+  - role: associated
+    source:
+      service: https://github.com
+      scope: flotilla-org/andamento
+    repository_ref: github.com/flotilla-org/andamento
+
+relevance:
+  default: all
+
+repositories:
+  - repo: github.com/flotilla-org/flotilla
+    role: member
+    claim: association
+    ref:
+      branch: main
+
+  - repo: github.com/flotilla-org/andamento
+    role: member
+    claim: controller
+    ref:
+      branch: main
