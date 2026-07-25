@@ -329,12 +329,58 @@ pub trait AgentAdapter: Send + Sync {
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String>;
 }
 
+/// Where a managed Claude Code session's Flotilla settings overlay is written,
+/// relative to the session's working directory. It lives under `.flotilla/`
+/// alongside the brief so it inherits the same git exclusion and teardown.
+pub const CLAUDE_MANAGED_SETTINGS_PATH: &str = ".flotilla/claude-settings.json";
+
 struct CliAgentAdapter {
-    id: &'static str,
     binary: String,
     runner: Arc<dyn CommandRunner>,
-    autonomy_args: &'static [&'static str],
-    trust_config: Option<CodexTrustConfig>,
+    flavor: AdapterFlavor,
+}
+
+/// Per-harness behaviour. Each CLI agent gates autonomy differently and needs a
+/// different thing seeded before it will run unattended, so the differences are
+/// named here rather than inferred from an id string.
+enum AdapterFlavor {
+    /// `--dangerously-skip-permissions` clears Claude Code's directory-trust and
+    /// tool-approval gates outright, so there is no persisted trust to pre-seed
+    /// for either a convoy checkout or a multi-repo workspace root. What a
+    /// managed session *does* need is Flotilla's hooks: without them the crew
+    /// runs, but no phase or attention signal ever leaves the pane. `--settings`
+    /// layers them on for this invocation only, leaving the user's own settings
+    /// untouched — which also means a crew works on a host where nobody has run
+    /// `flotilla hooks install`.
+    ClaudeCode,
+    /// Codex gates on a persisted per-project trust level, so the workspace has
+    /// to be marked trusted in its config before launch.
+    Codex { trust_config: Option<CodexTrustConfig> },
+}
+
+impl AdapterFlavor {
+    fn id(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex { .. } => "codex",
+        }
+    }
+
+    fn autonomy_args(&self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &["--dangerously-skip-permissions"],
+            Self::Codex { .. } => &["--dangerously-bypass-approvals-and-sandbox"],
+        }
+    }
+
+    /// Files the adapter writes into the working directory and must remove on
+    /// teardown, beyond the brief itself.
+    fn managed_files(&self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &[CLAUDE_MANAGED_SETTINGS_PATH],
+            Self::Codex { .. } => &[],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -346,7 +392,10 @@ struct CodexTrustConfig {
 impl CliAgentAdapter {
     fn command(&self, request: &AgentLaunchRequest) -> String {
         let mut args = vec![Arg::Literal(self.binary.clone())];
-        args.extend(self.autonomy_args.iter().map(|arg| Arg::Literal((*arg).into())));
+        args.extend(self.flavor.autonomy_args().iter().map(|arg| Arg::Literal((*arg).into())));
+        if matches!(self.flavor, AdapterFlavor::ClaudeCode) {
+            args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
+        }
         if let Some(model) = &request.model {
             args.extend([Arg::Literal("--model".into()), Arg::Literal(model.clone())]);
         }
@@ -358,27 +407,38 @@ impl CliAgentAdapter {
 #[async_trait]
 impl AgentAdapter for CliAgentAdapter {
     fn id(&self) -> &'static str {
-        self.id
+        self.flavor.id()
     }
 
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
-        if self.id == "codex" {
-            let config = self
-                .trust_config
-                .as_ref()
-                .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
-            seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config).await?;
+        match &self.flavor {
+            AdapterFlavor::ClaudeCode => {
+                let settings = serde_json::to_string_pretty(&crate::agents::claude_code_hook_settings())
+                    .map_err(|error| format!("render Claude Code settings overlay: {error}"))?;
+                self.runner.write_file(&cwd.as_path().join(CLAUDE_MANAGED_SETTINGS_PATH), &settings).await?;
+            }
+            AdapterFlavor::Codex { trust_config } => {
+                let config = trust_config
+                    .as_ref()
+                    .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
+                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config).await?;
+            }
         }
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
         ensure_flotilla_git_exclude(&*self.runner, cwd.as_path()).await
     }
 
     async fn cleanup(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String> {
-        remove_agent_brief(&*self.runner, cwd.as_path(), brief).await
+        remove_agent_files(&*self.runner, cwd.as_path(), brief, self.flavor.managed_files()).await
     }
 
     fn classify_screen_attention(&self, screen: &str) -> Option<TerminalAttentionState> {
-        (self.id == "codex" && codex_screen_needs_input(screen)).then_some(TerminalAttentionState::NeedsInput)
+        match self.flavor {
+            // Claude Code reports its own permission prompts through the hook
+            // path, which is more precise than matching rendered text.
+            AdapterFlavor::ClaudeCode => None,
+            AdapterFlavor::Codex { .. } => codex_screen_needs_input(screen).then_some(TerminalAttentionState::NeedsInput),
+        }
     }
 
     fn launch(&self, request: &AgentLaunchRequest) -> Result<AgentLaunchPlan, String> {
@@ -454,18 +514,31 @@ async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, cwd: &Path) -> 
     Ok(())
 }
 
-async fn remove_agent_brief(runner: &dyn CommandRunner, cwd: &Path, brief: &TerminalBrief) -> Result<(), String> {
-    let path = cwd.join(&brief.path);
-    let path_str = path.to_str().ok_or_else(|| format!("brief path is not valid UTF-8: {}", path.display()))?;
-    runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Noop).await?;
+/// Removes everything the adapter wrote into the working directory, then prunes
+/// the `.flotilla` scaffolding it left behind. Directories are pruned deepest
+/// first so an outer directory becomes empty in time to be removed.
+async fn remove_agent_files(runner: &dyn CommandRunner, cwd: &Path, brief: &TerminalBrief, managed_files: &[&str]) -> Result<(), String> {
+    let paths =
+        std::iter::once(brief.path.as_str()).chain(managed_files.iter().copied()).map(|relative| cwd.join(relative)).collect::<Vec<_>>();
 
-    for parent in [path.parent(), path.parent().and_then(Path::parent)].into_iter().flatten() {
-        if parent != cwd {
-            let Some(parent) = parent.to_str() else {
-                continue;
-            };
-            let _ = runner.run("rmdir", &[parent], Path::new("/"), &ChannelLabel::Noop).await;
-        }
+    for path in &paths {
+        let path_str = path.to_str().ok_or_else(|| format!("agent file path is not valid UTF-8: {}", path.display()))?;
+        runner.run("rm", &["-f", path_str], Path::new("/"), &ChannelLabel::Noop).await?;
+    }
+
+    let mut directories = paths
+        .iter()
+        // Strictly below cwd: an absolute or escaping relative path must never
+        // walk the prune up into directories the adapter did not create.
+        .flat_map(|path| path.ancestors().skip(1).take_while(|ancestor| *ancestor != cwd && ancestor.starts_with(cwd)))
+        .collect::<Vec<_>>();
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+    directories.dedup();
+    for directory in directories {
+        let Some(directory) = directory.to_str() else {
+            continue;
+        };
+        let _ = runner.run("rmdir", &[directory], Path::new("/"), &ChannelLabel::Noop).await;
     }
     Ok(())
 }
@@ -480,11 +553,9 @@ impl AgentAdapterRegistry {
         let mut registry = Self::default();
         if let Some(binary) = env.find_binary("claude") {
             registry.insert(Arc::new(CliAgentAdapter {
-                id: "claude-code",
                 binary: binary.as_path().display().to_string(),
                 runner: Arc::clone(&runner),
-                autonomy_args: &["--dangerously-skip-permissions"],
-                trust_config: None,
+                flavor: AdapterFlavor::ClaudeCode,
             }));
         }
         if let Some(binary) = env.find_binary("codex") {
@@ -494,11 +565,11 @@ impl AgentAdapterRegistry {
                 .or_else(|| env.find_env_var("HOME").map(|home| PathBuf::from(home).join(".codex")))
                 .map(|home| home.join("config.toml"));
             registry.insert(Arc::new(CliAgentAdapter {
-                id: "codex",
                 binary: binary.as_path().display().to_string(),
                 runner,
-                autonomy_args: &["--dangerously-bypass-approvals-and-sandbox"],
-                trust_config: config_path.map(|path| CodexTrustConfig { path, lock: Arc::new(Mutex::new(())) }),
+                flavor: AdapterFlavor::Codex {
+                    trust_config: config_path.map(|path| CodexTrustConfig { path, lock: Arc::new(Mutex::new(())) }),
+                },
             }));
         }
         registry
@@ -873,9 +944,76 @@ mod tests {
             claude.launch(&AgentLaunchRequest { role: "reviewer".into(), model: Some("opus".into()), brief }).expect("claude launch plan");
         assert_eq!(
             plan.command,
-            "/tools/claude --dangerously-skip-permissions --model opus 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model opus 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
         );
         assert!(!plan.command.contains("Implement the issue"));
+    }
+
+    #[tokio::test]
+    async fn claude_prepare_writes_a_settings_overlay_the_launch_command_loads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let claude = registry.get("claude-code").expect("claude adapter");
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+
+        claude.prepare(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("prepare claude workspace");
+
+        // The launch command names this path relatively, so it must resolve
+        // against the session's working directory.
+        let plan = claude.launch(&AgentLaunchRequest { role: "coder".into(), model: None, brief: brief.clone() }).expect("launch plan");
+        assert!(plan.command.contains("--settings .flotilla/claude-settings.json"), "{}", plan.command);
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(workspace.join(".flotilla/claude-settings.json")).expect("read settings"))
+                .expect("parse settings");
+        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "flotilla hook claude-code session-start");
+        assert_eq!(settings["hooks"]["Notification"][0]["matcher"], "permission_prompt");
+        // The overlay carries hooks only: anything else would silently override
+        // the user's own settings for the managed session.
+        assert_eq!(settings.as_object().expect("settings object").keys().collect::<Vec<_>>(), vec!["hooks"]);
+
+        claude.cleanup(&ExecutionEnvironmentPath::new(&workspace), &brief).await.expect("cleanup");
+        assert!(!workspace.join(".flotilla/claude-settings.json").exists(), "settings overlay should be removed");
+        assert!(!workspace.join(".flotilla").exists(), "settings overlay should not keep .flotilla alive");
+    }
+
+    #[tokio::test]
+    async fn claude_needs_no_workspace_trust_seeding_for_any_checkout_shape() {
+        // `--dangerously-skip-permissions` clears the directory-trust gate, so
+        // unlike Codex there is nothing to pre-seed — and preparing a workspace
+        // root that is not a git checkout (the multi-repo shape from #1002) must
+        // still succeed.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = temp.path().join("multi-repo-workspace");
+        std::fs::create_dir_all(workspace_root.join("repo-a")).expect("repo a");
+        std::fs::create_dir_all(workspace_root.join("repo-b")).expect("repo b");
+        let env = EnvironmentBag::new().with(EnvironmentAssertion::binary("claude", "/tools/claude"));
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(ProcessCommandRunner));
+        let brief =
+            flotilla_resources::TerminalBrief { path: ".flotilla/briefs/coder.md".into(), content: "brief".into(), copies: Vec::new() };
+
+        registry
+            .get("claude-code")
+            .expect("claude adapter")
+            .prepare(&ExecutionEnvironmentPath::new(&workspace_root), &brief)
+            .await
+            .expect("prepare multi-repo workspace root");
+
+        assert_eq!(std::fs::read_to_string(workspace_root.join(".flotilla/briefs/coder.md")).expect("brief"), "brief");
+        assert!(workspace_root.join(".flotilla/claude-settings.json").exists());
+    }
+
+    #[test]
+    fn claude_leaves_screen_classification_to_its_hook_path() {
+        let registry = discovered_registry();
+        let claude = registry.get("claude-code").expect("claude adapter");
+
+        // Codex's prompt vocabulary must not be matched against Claude screens.
+        assert_eq!(claude.classify_screen_attention("Do you trust the contents of this directory?"), None);
     }
 
     #[tokio::test]

@@ -357,11 +357,13 @@ fn backfill_crew_work_outcome(status: &super::ConvoyStatus) -> Option<InternalRe
         let missing_crew = vessel
             .crew
             .iter()
-            .filter(|member| matches!(member.source, CrewSource::Agent { .. }))
-            .filter(|member| existing.is_none_or(|crew| !crew.contains_key(&member.role)))
-            .map(|member| {
+            .enumerate()
+            .filter(|(_, member)| matches!(member.source, CrewSource::Agent { .. }))
+            .filter(|(_, member)| existing.is_none_or(|crew| !crew.contains_key(&member.role)))
+            .map(|(index, member)| {
                 let mut state = CrewWorkState::builder().phase(CrewWorkPhase::Pending).build();
-                if work.is_some_and(|work| work.phase == WorkPhase::Running) {
+                // A latent agent has no session even once the vessel is running.
+                if work.is_some_and(|work| work.phase == WorkPhase::Running) && vessel.starts_eagerly(index) {
                     state.phase = CrewWorkPhase::Working;
                     state.started_at = work.and_then(|work| work.started_at);
                 }
@@ -609,7 +611,11 @@ fn vessel_outcome(
                     }
                     if vessel.status.as_ref().map(|status| status.phase) == Some(VesselPhase::Ready) {
                         return InternalReconcileOutcome {
-                            patch: Some(provisioning_patches::work_running(requirement.name.clone(), now)),
+                            patch: Some(provisioning_patches::work_running(
+                                requirement.name.clone(),
+                                now,
+                                requirement.eagerly_started_roles(),
+                            )),
                             actuations,
                             events: vec![ConvoyEvent::WorkPhaseChanged {
                                 work: requirement.name.clone(),

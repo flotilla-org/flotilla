@@ -255,6 +255,9 @@ pub enum ConvoyStatusPatch {
     WorkRunning {
         work: String,
         started_at: DateTime<Utc>,
+        /// Crew whose sessions the vessel actually launched. Latent agents are
+        /// absent and stay `Pending` until a handoff starts them.
+        launched_roles: BTreeSet<String>,
     },
     ForceWorkCompleted {
         work: String,
@@ -388,13 +391,18 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.placement = Some(placement.clone());
                 }
             }
-            Self::WorkRunning { work, started_at } => {
+            Self::WorkRunning { work, started_at, launched_roles } => {
                 if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                 }
                 if let Some(crew) = status.crew_work.get_mut(work) {
-                    for state in crew.values_mut().filter(|state| state.phase == CrewWorkPhase::Pending) {
+                    // Only the crew the vessel launched are working. A latent
+                    // agent has no session yet, so it stays Pending until a
+                    // handoff starts it.
+                    for (_, state) in
+                        crew.iter_mut().filter(|(role, state)| state.phase == CrewWorkPhase::Pending && launched_roles.contains(*role))
+                    {
                         state.phase = CrewWorkPhase::Working;
                         state.started_at.get_or_insert(*started_at);
                     }
@@ -571,8 +579,8 @@ pub mod provisioning_patches {
         ConvoyStatusPatch::WorkLaunching { work, started_at, placement }
     }
 
-    pub fn work_running(work: String, started_at: DateTime<Utc>) -> ConvoyStatusPatch {
-        ConvoyStatusPatch::WorkRunning { work, started_at }
+    pub fn work_running(work: String, started_at: DateTime<Utc>, launched_roles: BTreeSet<String>) -> ConvoyStatusPatch {
+        ConvoyStatusPatch::WorkRunning { work, started_at, launched_roles }
     }
 }
 

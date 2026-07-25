@@ -590,10 +590,9 @@ impl Reconciler for VesselReconciler {
             })
             .collect::<Vec<_>>();
 
-        let first_agent_index = requirement.crew.iter().position(|process| matches!(process.source, CrewSource::Agent { .. }));
         let mut terminal_refs = Vec::new();
         for (crew_index, process) in requirement.crew.iter().enumerate() {
-            let should_start = matches!(process.source, CrewSource::Tool { .. }) || first_agent_index == Some(crew_index);
+            let should_start = requirement.starts_eagerly(crew_index);
             let identity = TerminalSessionIdentity::builder()
                 .vessel_ref(obj.metadata.name.clone())
                 .convoy(obj.spec.convoy_ref.clone())
@@ -643,12 +642,7 @@ impl Reconciler for VesselReconciler {
                                 .enumerate()
                                 .map(|(index, member)| CrewBriefMember {
                                     role: member.role.clone(),
-                                    state: if matches!(member.source, CrewSource::Tool { .. }) || first_agent_index == Some(index) {
-                                        "active"
-                                    } else {
-                                        "latent"
-                                    }
-                                    .to_string(),
+                                    state: if requirement.starts_eagerly(index) { "active" } else { "latent" }.to_string(),
                                     is_agent: matches!(member.source, CrewSource::Agent { .. }),
                                 })
                                 .collect::<Vec<_>>();

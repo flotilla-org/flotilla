@@ -1408,16 +1408,6 @@ fn resolve_settings_scope(user: bool, project: bool, local: bool) -> Result<Sett
     }
 }
 
-fn claude_code_hook_entries() -> serde_json::Value {
-    serde_json::json!({
-        "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code session-start"}]}],
-        "SessionEnd": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code session-end"}]}],
-        "UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code user-prompt-submit"}]}],
-        "Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "flotilla hook claude-code stop"}]}],
-        "Notification": [{"matcher": "permission_prompt", "hooks": [{"type": "command", "command": "flotilla hook claude-code notification"}]}]
-    })
-}
-
 fn install_claude_code_hooks(path: &std::path::Path) -> Result<()> {
     let mut settings: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(path).map_err(|e| color_eyre::eyre::eyre!("failed to read {}: {e}", path.display()))?;
@@ -1427,12 +1417,12 @@ fn install_claude_code_hooks(path: &std::path::Path) -> Result<()> {
     };
 
     let hooks = settings.as_object_mut().expect("settings is object").entry("hooks").or_insert_with(|| serde_json::json!({}));
-    let new_entries = claude_code_hook_entries();
+    let new_entries = agents::claude_code_hook_entries();
     for (event, matchers) in new_entries.as_object().expect("entries is object") {
         let event_hooks = hooks.as_object_mut().expect("hooks is object").entry(event).or_insert_with(|| serde_json::json!([]));
         let existing_arr = event_hooks.as_array().expect("event hooks is array");
         // Check if flotilla hooks are already present
-        let already_installed = existing_arr.iter().any(|m| m.to_string().contains("flotilla hook claude-code"));
+        let already_installed = existing_arr.iter().any(|m| m.to_string().contains(agents::CLAUDE_CODE_HOOK_COMMAND_PREFIX));
         if !already_installed {
             let arr = event_hooks.as_array_mut().expect("array");
             for entry in matchers.as_array().expect("matchers array") {
@@ -1460,7 +1450,7 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
     if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for (_event, matchers) in hooks.iter_mut() {
             if let Some(arr) = matchers.as_array_mut() {
-                arr.retain(|m| !m.to_string().contains("flotilla hook claude-code"));
+                arr.retain(|m| !m.to_string().contains(agents::CLAUDE_CODE_HOOK_COMMAND_PREFIX));
             }
         }
         // Remove empty event arrays

@@ -73,6 +73,9 @@ flotilla host <name> repo <args>                  # route repo commands to a hos
 
 ### Agent hooks
 
+Convoy crew sessions provision their own hooks at launch, so these commands are only needed
+for Claude Code sessions you start yourself.
+
 ```
 flotilla hooks install <harness> [--user|--project|--local]
 flotilla hooks install <harness> --plugin         # show plugin marketplace instructions

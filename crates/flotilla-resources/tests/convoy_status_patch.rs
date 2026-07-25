@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{TimeZone, Utc};
 use flotilla_resources::{
@@ -272,12 +272,52 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         observed_workflows: Some(BTreeMap::new()),
     };
 
-    provisioning_patches::work_running("implement".to_string(), ts(12)).apply(&mut status);
+    provisioning_patches::work_running("implement".to_string(), ts(12), BTreeSet::from(["coder".to_string()])).apply(&mut status);
 
     assert_eq!(status.work["implement"].phase, WorkPhase::Running);
     assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
     assert_eq!(status.crew_work["implement"]["coder"].started_at, Some(ts(12)));
     assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Done);
+}
+
+#[test]
+fn running_vessel_work_leaves_latent_agents_pending() {
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        workflow_snapshot: Some(sample_snapshot()),
+        work: BTreeMap::from([("implement".to_string(), WorkState {
+            phase: WorkPhase::Launching,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
+            ready_at: Some(ts(8)),
+            started_at: Some(ts(9)),
+            finished_at: None,
+            message: None,
+            placement: None,
+        })]),
+        crew_work: BTreeMap::from([(
+            "implement".to_string(),
+            // Bootstrapped crew, neither started yet.
+            BTreeMap::from([
+                ("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
+                ("reviewer".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build()),
+            ]),
+        )]),
+        message: None,
+        started_at: Some(ts(1)),
+        finished_at: None,
+        observed_workflow_ref: Some("review-and-fix".to_string()),
+        observed_workflows: Some(BTreeMap::new()),
+    };
+
+    // The vessel launches only the first agent; `reviewer` has no session until
+    // someone hands off to it, so reporting it as Working would describe a crew
+    // member that does not exist yet.
+    provisioning_patches::work_running("implement".to_string(), ts(12), BTreeSet::from(["coder".to_string()])).apply(&mut status);
+
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert_eq!(status.crew_work["implement"]["coder"].started_at, Some(ts(12)));
+    assert_eq!(status.crew_work["implement"]["reviewer"].phase, CrewWorkPhase::Pending);
+    assert_eq!(status.crew_work["implement"]["reviewer"].started_at, None, "a latent agent has not started");
 }
 
 #[test]

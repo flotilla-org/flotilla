@@ -403,7 +403,11 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let crew = status.crew_work.get_mut("implement").and_then(|crew| crew.get_mut("coder")).expect("coder work");
                 crew.phase = CrewWorkPhase::Working;
                 let before = crew_timestamps(&status);
-                let patch = ConvoyStatusPatch::WorkRunning { work: "implement".to_string(), started_at: ts(30) };
+                let patch = ConvoyStatusPatch::WorkRunning {
+                    work: "implement".to_string(),
+                    started_at: ts(30),
+                    launched_roles: BTreeSet::from(["coder".to_string()]),
+                };
                 apply_and_replay(&mut status, &patch);
                 (before, crew_timestamps(&status))
             },
