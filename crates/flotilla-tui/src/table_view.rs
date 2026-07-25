@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName,
-    IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience,
-    SessionPhase, ViewAddress,
+    issue_query::READY_ISSUE_LABEL, result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode,
+    ChangeRequestStatus, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey,
+    ResultSetCondition, ResultSetState, Salience, SessionPhase, ViewAddress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1182,7 +1182,7 @@ fn start_scoped_issue(row: &ScopedIssueProjection) -> Option<TableIntent> {
             row_id: scoped_issue_id(row),
             issue: row.row.reference.clone(),
             title: row.row.issue.title.clone(),
-            ready: row.row.issue.labels.iter().any(|label| label == "ready"),
+            ready: row.row.issue.labels.iter().any(|label| label == READY_ISSUE_LABEL),
         },
     })
 }
