@@ -29,12 +29,12 @@ use flotilla_core::{
     HostName,
 };
 use flotilla_resources::{
-    clone_key, controller::ControllerLoop, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
-    ClonePhase, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec,
-    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec,
-    HostStatus, Presentation, PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Stance,
-    StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL,
-    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    canonicalize_repo_url, clone_key, controller::ControllerLoop, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec,
+    CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec,
+    DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host,
+    HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation, PresentationPhase, PresentationSpec, Repository, RepositorySpec,
+    ResourceBackend, ResourceError, Stance, StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement,
+    CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
 const NAMESPACE: &str = "flotilla";
@@ -208,17 +208,17 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     create_ready_host(&backend, "01HXYZ").await;
     create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
     create_host_direct_policy(&backend, NAMESPACE, "policy-a", "01HXYZ", "cleat").await;
-    create_convoy_with_single_task(
-        &backend,
-        NAMESPACE,
-        "convoy-a",
-        "implement",
-        "git@github.com:flotilla-org/flotilla.git",
-        "feat/task-provisioning",
-    )
-    .await;
-    create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-a", "git@github.com:flotilla-org/flotilla.git")
-        .await;
+    let repository_url = "git@github.com:flotilla-org/flotilla.git";
+    create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", repository_url, "feat/task-provisioning").await;
+    let repository_spec = RepositorySpec::remote(canonicalize_repo_url(repository_url).expect("repository URL should canonicalize"))
+        .expect("repository spec");
+    backend
+        .clone()
+        .using::<Repository>(NAMESPACE)
+        .delete(&repository_spec.key().to_string())
+        .await
+        .expect("destination should start without the convoy repository");
+    create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-a", repository_url).await;
 
     let harness = full_controller_harness(backend.clone());
 
@@ -242,6 +242,12 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     assert_eq!(status.environment_ref.as_deref(), Some("host-direct-01HXYZ"));
     assert_eq!(status.checkout_refs.values().next().map(String::as_str), Some("checkout-convoy-a"));
     assert_eq!(status.terminal_session_refs, vec!["terminal-workspace-a-coder".to_string()]);
+    backend
+        .clone()
+        .using::<Repository>(NAMESPACE)
+        .get(&repository_spec.key().to_string())
+        .await
+        .expect("missing repository should be materialized");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let steady = workspaces.get("workspace-a").await.expect("ready workspace should remain readable");
