@@ -44,6 +44,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::warn;
 
 use crate::{
+    sleep_inhibitor,
     supervisor::{supervise, ControllerSupervision},
     Aggregator, AggregatorResolvers,
 };
@@ -110,6 +111,7 @@ impl DaemonRuntime {
             spawn_heartbeat_task(Arc::clone(&daemon), options.namespace.clone(), profile.clone(), options.heartbeat_interval),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
+            spawn_sleep_inhibitor_task(daemon.resource_backend(), options.namespace.clone(), options.controller_supervision.clone()),
             spawn_aggregator_task(
                 Arc::clone(&daemon),
                 options.namespace.clone(),
@@ -474,6 +476,16 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
     }
 
     Ok(())
+}
+
+fn spawn_sleep_inhibitor_task(backend: ResourceBackend, namespace: String, supervision: ControllerSupervision) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        supervise("sleep_inhibitor", supervision, move || {
+            let convoys = backend.clone().using::<Convoy>(&namespace);
+            async move { sleep_inhibitor::run(convoys).await }
+        })
+        .await;
+    })
 }
 
 fn spawn_heartbeat_task(

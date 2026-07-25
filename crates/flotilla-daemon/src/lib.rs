@@ -1,5 +1,6 @@
 mod aggregator;
 mod issue_materializer;
+mod sleep_inhibitor;
 pub use aggregator::{Aggregator, AggregatorResolvers};
 
 pub mod cli;
