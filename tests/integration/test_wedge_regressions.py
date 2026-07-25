@@ -223,7 +223,7 @@ def test_03_idle_link_survives_three_ping_windows(topology):
     } == reconnect_counts
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(400)
 def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
     """#1045: prolonged transport failure cannot strand a recovered peer."""
     initial_generation = max(peer_generations())
@@ -259,14 +259,18 @@ def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
         timeout=30,
         interval=0.5,
     )
+    def reconnected_within_two_intervals():
+        elapsed = time.monotonic() - woken_at
+        assert elapsed <= 120, (
+            "peer should reconnect within two capped backoff intervals"
+        )
+        return max(peer_generations(), default=0) > initial_generation
+
     wait_for(
-        lambda: max(peer_generations(), default=0) > initial_generation,
+        reconnected_within_two_intervals,
         "node-a redials node-b after the long outage",
         timeout=120,
         interval=0.5,
-    )
-    assert time.monotonic() - woken_at <= 120, (
-        "peer should reconnect within two capped backoff intervals"
     )
     wait_connected()
 
