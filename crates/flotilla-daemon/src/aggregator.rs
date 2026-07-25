@@ -355,6 +355,7 @@ impl Aggregator {
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
         let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
+        self.emit_awareness_result_sets().await;
 
         loop {
             let regard_expiry_delay = self.next_regard_expiry_delay();
@@ -1943,7 +1944,7 @@ mod tests {
     use flotilla_resources::{
         ConvoyRepositorySpec, ConvoySpec, CrewSpec, DemandKind, DemandSpec, DemandStatus, DemandTransition, EnvironmentSpec,
         HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec, PlacementStatus, PresentationPhase,
-        PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, RegardSource, RegardSpec, RegardStatus,
+        PresentationSpec, PresentationStatus, PrincipalRef as AttentionPrincipalRef, ProjectSpec, RegardSource, RegardSpec, RegardStatus,
         RepositorySpec, ResourceBackend, Stance, TerminalAttention, TerminalAttentionSource, TerminalSessionSource, TerminalSessionSpec,
         TerminalSessionStatus, VesselRequirement, WorkflowSnapshot,
     };
@@ -2141,7 +2142,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_bootstraps_materialization_from_the_store_replica_read_view() {
+    async fn subscribed_fleet_awareness_emits_when_project_catalog_changes() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let query = QueryId::Awareness {
+            scope: None,
+            grouping: flotilla_protocol::AwarenessGrouping::Project,
+            limit: flotilla_protocol::AwarenessLimit::default(),
+        };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: query.clone(), since: None }]);
+
+        aggregator.apply_project_event(WatchEvent::Added(project_object("widgets").await)).await;
+
+        let result_set = timeout(Duration::from_secs(1), async {
+            loop {
+                let event = event_rx.recv().await.expect("aggregator event");
+                if let DaemonEvent::ResultSet(result_set) = event {
+                    if result_set.query() == query {
+                        break result_set;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("project catalog change should publish fleet awareness");
+        assert_eq!(result_set.rows.as_awareness().expect("awareness rows")[0].label, "widgets");
+    }
+
+    #[tokio::test]
+    async fn run_bootstraps_materialization_and_subscribed_fleet_awareness() {
         let durable = ResourceBackend::InMemory(InMemoryBackend::default());
         let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
         let mut convoy = convoy_with_vessel("convoy-a").await;
@@ -2168,8 +2198,21 @@ mod tests {
             )
             .await
             .expect("seed remote session replica");
+        let project = project_object("widgets").await;
+        durable
+            .clone()
+            .using::<Project>("flotilla")
+            .create(&InputMeta::builder().name(project.metadata.name).build(), &project.spec)
+            .await
+            .expect("seed project");
 
         let state = AggregatorProjectionState::new();
+        let awareness_query = QueryId::Awareness {
+            scope: None,
+            grouping: flotilla_protocol::AwarenessGrouping::Project,
+            limit: flotilla_protocol::AwarenessLimit::default(),
+        };
+        state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: awareness_query.clone(), since: None }]);
         let (event_tx, mut event_rx) = broadcast::channel(8);
         let (replica_tx, replica_rx) = broadcast::channel(1);
         let attach_resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
@@ -2197,10 +2240,24 @@ mod tests {
                 .await
         });
 
-        let event = timeout(Duration::from_secs(1), event_rx.recv()).await.expect("aggregator bootstrap").expect("convoy result set");
-        let DaemonEvent::ResultSet(result) = event else { panic!("expected initial result set") };
-        let convoy = result.rows.as_convoys().expect("convoy rows").first().expect("local convoy");
+        let (convoy, awareness) = timeout(Duration::from_secs(1), async {
+            let mut convoy = None;
+            let mut awareness = None;
+            while convoy.is_none() || awareness.is_none() {
+                let event = event_rx.recv().await.expect("aggregator bootstrap event");
+                let DaemonEvent::ResultSet(result) = event else { continue };
+                if result.query() == QueryId::Convoys {
+                    convoy = result.rows.as_convoys().expect("convoy rows").first().cloned();
+                } else if result.query() == awareness_query {
+                    awareness = Some(result);
+                }
+            }
+            (convoy.expect("local convoy"), awareness.expect("fleet awareness"))
+        })
+        .await
+        .expect("aggregator bootstrap should publish convoy and fleet awareness result sets");
         assert_eq!(convoy.vessels[0].materialize.as_deref(), Some("terminal-convoy-a-implement-coder"));
+        assert!(awareness.rows.as_awareness().expect("awareness rows").iter().any(|node| node.label == "widgets"));
 
         drop(replica_tx);
         assert!(run
@@ -2553,6 +2610,22 @@ mod tests {
             )
             .await
             .expect("create scripted convoy")
+    }
+
+    async fn project_object(name: &str) -> ResourceObject<Project> {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name(name.to_string())
+                    .default_workflow_ref("scratch".to_string())
+                    .repositories(Vec::new())
+                    .build(),
+            )
+            .await
+            .expect("create scripted project")
     }
 
     async fn convoy_with_branch(name: &str) -> ResourceObject<Convoy> {
