@@ -489,10 +489,8 @@ async fn dispatch_add_list_remove_repo_round_trip() {
         other => panic!("expected list repos response, got {:?}", other),
     };
     assert_eq!(listed.len(), 1);
-    assert_eq!(
-        listed[0].path.as_ref().map(|path| path.canonicalize().expect("canonical listed repo path")),
-        Some(repo_path.canonicalize().expect("canonical requested repo path"))
-    );
+    let canonical_repo_path = repo_path.canonicalize().expect("canonical requested repo path");
+    assert_eq!(listed[0].path.as_deref(), Some(canonical_repo_path.as_path()));
 
     let remove = dispatch_request_test(&daemon, 12, Request::RemoveRepo {
         path: listed[0].path.clone().expect("tracked repo should have local path"),
