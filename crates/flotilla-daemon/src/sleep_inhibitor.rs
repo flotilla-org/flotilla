@@ -21,7 +21,8 @@ pub(super) async fn run(convoys: TypedResolver<Convoy>) -> Result<(), ResourceEr
 async fn run_with_inhibitor<I: SleepInhibitor>(convoys: TypedResolver<Convoy>, mut inhibitor: I) -> Result<(), ResourceError> {
     let listed = convoys.list().await?;
     let mut active = ActiveConvoys::from_objects(&listed.items);
-    maintain_and_log(&mut inhibitor, active.required()).await;
+    let mut last_error = None;
+    maintain_and_log(&mut inhibitor, active.required(), &mut last_error).await;
 
     let mut watch = convoys.watch(WatchStart::resuming_from(&listed)).await?;
     let mut recheck = tokio::time::interval(RECHECK_INTERVAL);
@@ -34,22 +35,27 @@ async fn run_with_inhibitor<I: SleepInhibitor>(convoys: TypedResolver<Convoy>, m
                 match event {
                     Some(Ok(event)) => {
                         active.apply(event);
-                        maintain_and_log(&mut inhibitor, active.required()).await;
+                        maintain_and_log(&mut inhibitor, active.required(), &mut last_error).await;
                     }
                     Some(Err(error)) => return Err(error),
                     None => return Err(ResourceError::other("sleep inhibitor convoy watch ended")),
                 }
             }
             _ = recheck.tick() => {
-                maintain_and_log(&mut inhibitor, active.required()).await;
+                maintain_and_log(&mut inhibitor, active.required(), &mut last_error).await;
             }
         }
     }
 }
 
-async fn maintain_and_log(inhibitor: &mut impl SleepInhibitor, required: bool) {
-    if let Err(error) = inhibitor.maintain(required).await {
-        warn!(%error, required, "failed to update system sleep inhibitor");
+async fn maintain_and_log(inhibitor: &mut impl SleepInhibitor, required: bool, last_error: &mut Option<String>) {
+    match inhibitor.maintain(required).await {
+        Ok(()) => *last_error = None,
+        Err(error) if last_error.as_ref() == Some(&error) => {}
+        Err(error) => {
+            warn!(%error, required, "failed to update system sleep inhibitor");
+            *last_error = Some(error);
+        }
     }
 }
 
@@ -120,12 +126,12 @@ impl SleepInhibitor for SystemSleepInhibitor {
 
 impl SystemSleepInhibitor {
     fn acquire(&mut self) -> Result<(), String> {
-        let (program, args) = platform_inhibitor_command()?;
-        let mut command = Command::new(program);
-        command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
-        let child = command.spawn().map_err(|error| format!("start {program}: {error}"))?;
+        let command_spec = platform_inhibitor_command(std::process::id())?;
+        let mut command = Command::new(command_spec.program);
+        command.args(&command_spec.args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        let child = command.spawn().map_err(|error| format!("start {}: {error}", command_spec.program))?;
         self.child = Some(child);
-        info!(program, reason = INHIBITOR_REASON, "acquired system sleep inhibitor");
+        info!(program = command_spec.program, reason = INHIBITOR_REASON, "acquired system sleep inhibitor");
         Ok(())
     }
 
@@ -139,25 +145,35 @@ impl SystemSleepInhibitor {
     }
 }
 
+struct InhibitorCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
 #[cfg(target_os = "linux")]
-fn platform_inhibitor_command() -> Result<(&'static str, Vec<&'static str>), String> {
-    Ok(("systemd-inhibit", vec![
-        "--what=sleep",
-        "--who=flotillad",
-        "--why=Flotilla vessel crew is active",
-        "--mode=block",
-        "sleep",
-        "infinity",
-    ]))
+fn platform_inhibitor_command(daemon_pid: u32) -> Result<InhibitorCommand, String> {
+    Ok(InhibitorCommand {
+        program: "systemd-inhibit",
+        args: vec![
+            "--what=sleep".to_string(),
+            "--who=flotillad".to_string(),
+            format!("--why={INHIBITOR_REASON}"),
+            "--mode=block".to_string(),
+            "tail".to_string(),
+            format!("--pid={daemon_pid}"),
+            "-f".to_string(),
+            "/dev/null".to_string(),
+        ],
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn platform_inhibitor_command() -> Result<(&'static str, Vec<&'static str>), String> {
-    Ok(("caffeinate", vec!["-i"]))
+fn platform_inhibitor_command(daemon_pid: u32) -> Result<InhibitorCommand, String> {
+    Ok(InhibitorCommand { program: "caffeinate", args: vec!["-i".to_string(), "-w".to_string(), daemon_pid.to_string()] })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn platform_inhibitor_command() -> Result<(&'static str, Vec<&'static str>), String> {
+fn platform_inhibitor_command(_daemon_pid: u32) -> Result<InhibitorCommand, String> {
     Err("system sleep inhibition is unsupported on this platform".to_string())
 }
 
@@ -260,10 +276,12 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn linux_uses_a_visible_logind_block_inhibitor() {
-        let (program, args) = platform_inhibitor_command().expect("Linux inhibitor command");
-        assert_eq!(program, "systemd-inhibit");
-        assert!(args.contains(&"--what=sleep"));
-        assert!(args.contains(&"--mode=block"));
-        assert!(args.contains(&"--who=flotillad"));
+        let command = platform_inhibitor_command(42).expect("Linux inhibitor command");
+        assert_eq!(command.program, "systemd-inhibit");
+        assert!(command.args.iter().any(|arg| arg == "--what=sleep"));
+        assert!(command.args.iter().any(|arg| arg == "--mode=block"));
+        assert!(command.args.iter().any(|arg| arg == "--who=flotillad"));
+        assert!(command.args.iter().any(|arg| arg == &format!("--why={INHIBITOR_REASON}")));
+        assert!(command.args.iter().any(|arg| arg == "--pid=42"));
     }
 }
