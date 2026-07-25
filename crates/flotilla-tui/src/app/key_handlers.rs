@@ -6,7 +6,7 @@ use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::{PendingRowContext, TableIntent},
-    widgets::{convoy_delete_confirm::ConvoyDeleteConfirmWidget, InteractiveWidget},
+    widgets::{convoy_delete_confirm::ConvoyDeleteConfirmWidget, dispatch_confirm::DispatchConfirmWidget, InteractiveWidget},
 };
 
 impl App {
@@ -470,22 +470,39 @@ impl App {
             TableIntent::ForceCompleteWork { convoy, vessel, host } => {
                 (self.command(CommandAction::ConvoyWorkForceComplete { convoy, work: vessel, message: None }), host)
             }
+            intent @ (TableIntent::StartConvoy { .. } | TableIntent::StartConvoys { .. } | TableIntent::StartBatchConvoy { .. }) => {
+                self.screen.modal_stack.push(Box::new(DispatchConfirmWidget::new(intent)));
+                return;
+            }
+        };
+        let node_id = match self.panel_target_node(&host) {
+            Ok(node_id) => node_id,
+            Err(message) => {
+                self.set_status_message(Some(message));
+                return;
+            }
+        };
+        command.node_id = node_id;
+        self.proto_commands.push(command);
+    }
+
+    pub(super) fn execute_confirmed_convoy_dispatch(&mut self, intent: TableIntent, instruction: Option<String>) {
+        match intent {
             TableIntent::StartConvoy { namespace, project, issue } => {
                 self.proto_commands.push(self.command(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
                         namespace: Some(namespace),
                         project_ref: project,
-                        issues: vec![IssueSelector::Reference(issue)],
+                        issues: vec![IssueSelector::Reference(issue.issue)],
                         name: None,
                         branch: None,
                         workflow_ref: None,
                         inputs: Vec::new(),
-                        instruction: None,
+                        instruction,
                         placement_policy: None,
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));
-                return;
             }
             TableIntent::StartConvoys { namespace, project, issues } => {
                 let Some(address) = self.views.active_address().cloned() else { return };
@@ -500,7 +517,7 @@ impl App {
                             branch: None,
                             workflow_ref: None,
                             inputs: Vec::new(),
-                            instruction: None,
+                            instruction: instruction.clone(),
                             placement_policy: None,
                             auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
@@ -521,7 +538,6 @@ impl App {
                         view.project_table_state.table_mut(crate::table_view::ProjectPanelKind::Issues).multi_selected.clear();
                     }
                 }
-                return;
             }
             TableIntent::StartBatchConvoy { namespace, project, issues } => {
                 let Some(address) = self.views.active_address().cloned() else { return };
@@ -535,7 +551,7 @@ impl App {
                         branch: None,
                         workflow_ref: None,
                         inputs: Vec::new(),
-                        instruction: None,
+                        instruction,
                         placement_policy: None,
                         auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
@@ -546,18 +562,9 @@ impl App {
                     }
                 }
                 self.set_status_message(Some(format!("Starting batch convoy for {issue_count} issues...")));
-                return;
             }
-        };
-        let node_id = match self.panel_target_node(&host) {
-            Ok(node_id) => node_id,
-            Err(message) => {
-                self.set_status_message(Some(message));
-                return;
-            }
-        };
-        command.node_id = node_id;
-        self.proto_commands.push(command);
+            _ => unreachable!("dispatch confirmation only returns convoy-start table intents"),
+        }
     }
 
     fn table_action_repo(&self, hint: Option<&RepoKey>) -> Option<RepoIdentity> {

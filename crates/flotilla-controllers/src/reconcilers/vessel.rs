@@ -5,16 +5,16 @@ use flotilla_core::agent_adapter::{
     append_convoy_work_context, build_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
 };
 use flotilla_resources::{
-    clone_key,
+    canonicalize_repo_url, clone_key,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
     repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
     EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource,
-    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey,
+    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -306,17 +306,32 @@ impl Reconciler for VesselReconciler {
         let mut checkout_paths = BTreeMap::new();
         let mut waiting_for_checkouts = false;
         for convoy_repository in convoy_repositories {
-            let repository = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
-                Ok(repository) => repository,
+            let repository_spec = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
+                Ok(repository) => repository.spec,
                 Err(ResourceError::NotFound { .. }) => {
-                    return Ok(VesselDeps::failed(format!("repository {} not found", convoy_repository.repo_ref)))
+                    // Convoy URLs are clone transports and may use SCP-like SSH syntax.
+                    // Pre-canonicalize them before constructing the identity-bearing spec.
+                    let repository_spec = match canonicalize_repo_url(&convoy_repository.url).and_then(RepositorySpec::remote) {
+                        Ok(spec) => spec,
+                        Err(message) => {
+                            return Ok(VesselDeps::failed(format!(
+                                "convoy repository {} has invalid URL: {message}",
+                                convoy_repository.repo_ref
+                            )))
+                        }
+                    };
+                    if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
+                        return Ok(VesselDeps::failed(message));
+                    }
+                    actuations.push(Actuation::CreateRepository { key: convoy_repository.repo_ref.clone(), spec: repository_spec.clone() });
+                    repository_spec
                 }
                 Err(err) => return Err(err),
             };
-            if let Err(message) = repository.spec.verify_key(&convoy_repository.repo_ref) {
+            if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
                 return Ok(VesselDeps::failed(message));
             }
-            let canonical_repo = match repository.spec.identity() {
+            let canonical_repo = match repository_spec.identity() {
                 RepositoryIdentity::Remote { canonical_remote } => canonical_remote.clone(),
                 RepositoryIdentity::Local { .. } => return Ok(VesselDeps::failed("convoy repository must have a transport remote")),
             };
@@ -346,7 +361,7 @@ impl Reconciler for VesselReconciler {
                             .iter()
                             .filter(|candidate| candidate.spec.key() != repository_key)
                             .map(|candidate| (candidate.spec.key(), &candidate.spec))
-                            .chain(std::iter::once((repository_key.clone(), &repository.spec)))
+                            .chain(std::iter::once((repository_key.clone(), &repository_spec)))
                             .collect::<Vec<_>>();
                         let clone_directory_slug = repository_workspace_slugs(keyed_repositories.iter().map(|(key, spec)| (key, *spec)))
                             .remove(&repository_key)

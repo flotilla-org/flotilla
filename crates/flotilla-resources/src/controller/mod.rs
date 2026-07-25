@@ -69,6 +69,7 @@ impl<T: Resource> ReconcileOutcome<T> {
 
 #[derive(Debug, Clone)]
 pub enum Actuation {
+    CreateRepository { key: crate::RepositoryKey, spec: crate::RepositorySpec },
     CreateEnvironment { meta: InputMeta, spec: EnvironmentSpec },
     CreateClone { meta: InputMeta, spec: CloneSpec },
     CreateCheckout { meta: InputMeta, spec: CheckoutSpec },
@@ -278,6 +279,10 @@ impl<R: Reconciler> ControllerLoop<R> {
 
     async fn apply_actuation(backend: &ResourceBackend, namespace: &str, actuation: Actuation) -> Result<(), ResourceError> {
         match actuation {
+            Actuation::CreateRepository { key, spec } => {
+                let resolver = backend.using::<crate::Repository>(namespace);
+                crate::ensure_repository(&resolver, &key, &spec).await.map(|_| ())
+            }
             Actuation::CreateEnvironment { meta, spec } => {
                 let resolver = backend.using::<crate::Environment>(namespace);
                 Self::create_if_missing(&resolver, meta, spec).await

@@ -337,6 +337,26 @@ impl PeerSender for FailingPeerSender {
     }
 }
 
+struct PongingPeerSender {
+    inbound_tx: mpsc::Sender<PeerWireMessage>,
+    ping_count: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl PeerSender for PongingPeerSender {
+    async fn send(&self, msg: PeerWireMessage) -> Result<(), String> {
+        if let PeerWireMessage::Ping { timestamp } = msg {
+            self.ping_count.fetch_add(1, Ordering::SeqCst);
+            self.inbound_tx.send(PeerWireMessage::Pong { timestamp }).await.map_err(|_| "inbound channel closed".to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn retire(&self, _reason: flotilla_protocol::GoodbyeReason) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 struct FailingPeerTransport;
 
 #[async_trait::async_trait]
@@ -3218,6 +3238,37 @@ async fn forward_with_keepalive_times_out_after_silence() {
     assert!(matches!(result, ForwardResult::KeepaliveTimeout));
     let sent = sent.lock().expect("lock");
     assert!(sent.iter().any(|msg| matches!(msg, PeerWireMessage::Ping { .. })), "keepalive loop should send ping messages");
+}
+
+#[tokio::test(start_paused = true)]
+async fn forward_with_keepalive_stays_connected_when_pongs_arrive() {
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(4);
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+    let ping_count = Arc::new(AtomicUsize::new(0));
+    let sender: Arc<dyn PeerSender> = Arc::new(PongingPeerSender { inbound_tx, ping_count: Arc::clone(&ping_count) });
+
+    let task = tokio::spawn(async move {
+        forward_with_keepalive_for_test(
+            &peer_data_tx,
+            &mut inbound_rx,
+            &NodeId::new("remote-host"),
+            1,
+            sender,
+            Duration::from_secs(30),
+            Duration::from_secs(90),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+
+    for _ in 0..4 {
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(!task.is_finished(), "keepalive loop should stay connected while pongs arrive");
+    assert_eq!(ping_count.load(Ordering::SeqCst), 4);
+    task.abort();
 }
 
 #[tokio::test]

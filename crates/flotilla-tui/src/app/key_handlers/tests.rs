@@ -112,19 +112,84 @@ fn setup_native_issue_rows(app: &mut App, issue_ids: &[&str]) {
 }
 
 #[test]
-fn project_issue_start_preserves_the_selected_namespace() {
+fn project_issue_start_requires_confirmation_and_preserves_guidance_and_namespace() {
     let mut app = stub_app();
     let issue = flotilla_protocol::IssueRef {
         source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
         id: "732".into(),
     };
-    app.execute_table_intent(TableIntent::StartConvoy { namespace: "other-team".into(), project: "roadmap".into(), issue: issue.clone() });
+    app.execute_table_intent(TableIntent::StartConvoy {
+        namespace: "other-team".into(),
+        project: "roadmap".into(),
+        issue: crate::table_view::TableIssueStart {
+            row_id: crate::table_view::RowId::new("issue:732"),
+            issue: issue.clone(),
+            title: "Protect the API".into(),
+            ready: true,
+        },
+    });
+
+    assert!(app.proto_commands.take_next().is_none(), "opening the dispatch action must not queue a command");
+    assert_eq!(
+        app.screen.modal_stack.last().expect("dispatch confirmation").binding_mode(),
+        KeyBindingMode::from(BindingModeId::DispatchConfirm)
+    );
+    for character in "Keep the API stable".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
 
     let (command, _) = app.proto_commands.take_next().expect("start command");
     let flotilla_protocol::CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
     assert_eq!(intent.namespace.as_deref(), Some("other-team"));
     assert_eq!(intent.project_ref, "roadmap");
     assert_eq!(intent.issues, vec![flotilla_protocol::IssueSelector::Reference(issue)]);
+    assert_eq!(intent.instruction.as_deref(), Some("Keep the API stable"));
+}
+
+#[test]
+fn dispatch_confirmation_warns_for_non_ready_issue_and_cancel_queues_nothing() {
+    let mut app = stub_app();
+    let issue = flotilla_protocol::IssueRef {
+        source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+        id: "1012".into(),
+    };
+    app.execute_table_intent(TableIntent::StartConvoy {
+        namespace: "flotilla".into(),
+        project: "roadmap".into(),
+        issue: crate::table_view::TableIssueStart {
+            row_id: crate::table_view::RowId::new("issue:1012"),
+            issue,
+            title: "Confirm expensive dispatches".into(),
+            ready: false,
+        },
+    });
+
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            let mut ctx = crate::widgets::RenderContext {
+                model: &app.model,
+                views: &mut app.views,
+                ui: &mut app.ui,
+                theme: &app.theme,
+                keymap: &app.keymap,
+                in_flight: &app.in_flight,
+                namespaces: &app.namespaces,
+                query_tables: &app.query_tables,
+            };
+            app.screen.render(frame, frame.area(), &mut ctx);
+        })
+        .expect("draw");
+    let rendered: String = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect();
+    assert!(rendered.contains("#1012 Confirm expensive dispatches"));
+    assert!(rendered.contains("Target project: flotilla/roadmap"));
+    assert!(rendered.contains("Placement:"));
+    assert!(rendered.contains("Workflow:"));
+    assert!(rendered.contains("Issue is not marked ready"));
+
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.proto_commands.take_next().is_none());
 }
 
 #[test]

@@ -7,9 +7,9 @@
 use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode, ChangeRequestStatus, CheckoutRow, HostName,
-    IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey, ResultSetCondition, ResultSetState, Salience,
-    SessionPhase, ViewAddress,
+    issue_query::READY_ISSUE_LABEL, result_set::Timestamp, AwarenessFamily, AwarenessGrouping, AwarenessLimit, AwarenessNode,
+    ChangeRequestStatus, CheckoutRow, HostName, IndependentRow, IssueRef, IssueRow, QueryId, QueryScope, RepoKey, RepositoryKey,
+    ResultSetCondition, ResultSetState, Salience, SessionPhase, ViewAddress,
 };
 use serde::{Deserialize, Serialize};
 
@@ -409,7 +409,7 @@ pub enum TableIntent {
     DeleteConvoy { row_id: RowId, namespace: String, name: String, host: Option<HostName> },
     OpenChangeRequest { id: String, repository_key: RepositoryKey, host: Option<HostName> },
     ForceCompleteWork { convoy: String, vessel: String, host: HostName },
-    StartConvoy { namespace: String, project: String, issue: IssueRef },
+    StartConvoy { namespace: String, project: String, issue: TableIssueStart },
     StartConvoys { namespace: String, project: String, issues: Vec<TableIssueStart> },
     StartBatchConvoy { namespace: String, project: String, issues: Vec<TableIssueStart> },
 }
@@ -418,6 +418,8 @@ pub enum TableIntent {
 pub struct TableIssueStart {
     pub row_id: RowId,
     pub issue: IssueRef,
+    pub title: String,
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -1176,7 +1178,12 @@ fn start_scoped_issue(row: &ScopedIssueProjection) -> Option<TableIntent> {
     Some(TableIntent::StartConvoy {
         namespace: row.scope.namespace.clone(),
         project: row.scope.name.clone(),
-        issue: row.row.reference.clone(),
+        issue: TableIssueStart {
+            row_id: scoped_issue_id(row),
+            issue: row.row.reference.clone(),
+            title: row.row.issue.title.clone(),
+            ready: row.row.issue.labels.iter().any(|label| label == READY_ISSUE_LABEL),
+        },
     })
 }
 
@@ -1614,7 +1621,12 @@ mod tests {
         assert_eq!(panels[2].table.rows[0].actions[0].intent, TableIntent::StartConvoy {
             namespace: "flotilla".into(),
             project: "roadmap".into(),
-            issue: issue_row.reference,
+            issue: TableIssueStart {
+                row_id: issue_row_id(&scope, &issue_row.reference),
+                issue: issue_row.reference,
+                title: "Composite project issue".into(),
+                ready: false,
+            },
         });
         assert_eq!(panels[3].table.rows[0].actions[0].intent, TableIntent::AttachPane {
             reference: "terminal-governor".into(),
@@ -1663,7 +1675,12 @@ mod tests {
         assert_eq!(view.rows[0].actions[0].intent, TableIntent::StartConvoy {
             namespace: "flotilla".into(),
             project: "roadmap".into(),
-            issue: row.reference,
+            issue: TableIssueStart {
+                row_id: issue_row_id(&scope, &row.reference),
+                issue: row.reference,
+                title: "Start convoy from scoped issue".into(),
+                ready: false,
+            },
         });
         assert_eq!(view.meta.as_of, state.demand.as_ref().map(|metadata| metadata.as_of));
         assert!(view.meta.has_more);
