@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{cmp::Ordering, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
@@ -112,12 +112,14 @@ pub struct IssueRef {
 
 impl IssueRef {
     /// Compare issue references for the default issue-panel order: newest ID
-    /// first. Numeric IDs use numeric ordering; opaque IDs fall back to
-    /// descending lexical order. The source is a deterministic tie-breaker.
-    pub fn cmp_id_desc(&self, other: &Self) -> std::cmp::Ordering {
+    /// first. Numeric IDs sort before opaque IDs; each bucket sorts descending
+    /// numerically or lexically. The source is a deterministic tie-breaker.
+    pub fn cmp_id_desc(&self, other: &Self) -> Ordering {
         let by_id = match (self.id.parse::<u64>(), other.id.parse::<u64>()) {
             (Ok(left), Ok(right)) => right.cmp(&left),
-            _ => other.id.cmp(&self.id),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => other.id.cmp(&self.id),
         };
         by_id.then_with(|| self.source.cmp(&other.source))
     }
@@ -544,10 +546,47 @@ mod tests {
         let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
         let newer = IssueRef { source: source.clone(), id: "10".into() };
         let older = IssueRef { source: source.clone(), id: "9".into() };
-        let opaque = IssueRef { source, id: "WIDGET-123".into() };
+        let opaque = IssueRef { source: source.clone(), id: "WIDGET-123".into() };
+        let earlier_opaque = IssueRef { source, id: "LINEAR-456".into() };
 
         assert!(newer.cmp_id_desc(&older).is_lt(), "numeric IDs sort numerically");
-        assert!(opaque.cmp_id_desc(&newer).is_lt(), "opaque IDs retain a deterministic lexical order");
+        assert!(newer.cmp_id_desc(&opaque).is_lt(), "numeric IDs sort before opaque IDs");
+        assert!(opaque.cmp_id_desc(&earlier_opaque).is_lt(), "opaque IDs sort lexically");
+    }
+
+    #[test]
+    fn issue_reference_default_order_uses_source_as_same_id_tie_breaker() {
+        let alpha = IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "owner/alpha".into() }, id: "42".into() };
+        let beta = IssueRef { source: IssueSource { service: "https://github.com".into(), scope: "owner/beta".into() }, id: "42".into() };
+
+        assert!(alpha.cmp_id_desc(&beta).is_lt());
+        assert!(beta.cmp_id_desc(&alpha).is_gt());
+    }
+
+    #[test]
+    fn issue_reference_default_order_is_transitive_for_mixed_id_formats() {
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let references =
+            [IssueRef { source: source.clone(), id: "10".into() }, IssueRef { source: source.clone(), id: "9".into() }, IssueRef {
+                source,
+                id: "3abc".into(),
+            }];
+
+        for left in &references {
+            for middle in &references {
+                for right in &references {
+                    if left.cmp_id_desc(middle).is_le() && middle.cmp_id_desc(right).is_le() {
+                        assert!(
+                            left.cmp_id_desc(right).is_le(),
+                            "comparison must be transitive for {}, {}, and {}",
+                            left.id,
+                            middle.id,
+                            right.id
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
