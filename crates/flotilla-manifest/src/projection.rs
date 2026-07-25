@@ -176,7 +176,7 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
 }
 
 fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
-    let parent = awareness_parent_facts(catalog, node, convoys);
+    let parent = awareness_parent_facts(node, convoys);
     if let Some((entity, mut facts)) = awareness_node_entity(node, convoys) {
         facts.extend(status_and_counts(node.state, &node.counts));
         if let Some(recipe) = awareness_project_recipe(node, mint) {
@@ -189,26 +189,17 @@ fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: 
     }
 }
 
-fn awareness_parent_facts(catalog: &mut Catalog, node: &AwarenessNode, convoys: &[ConvoyRow]) -> Vec<(&'static str, MetadataValue)> {
+fn awareness_parent_facts(node: &AwarenessNode, convoys: &[ConvoyRow]) -> Vec<(&'static str, MetadataValue)> {
     match node.kind {
         AwarenessKind::Project => {
-            let (namespace, name) = node
-                .scope
-                .as_ref()
-                .map(|scope| (scope.namespace.as_str(), scope.name.as_str()))
-                .or_else(|| {
-                    let mut parts = node.id.strip_prefix("project/")?.split('/');
-                    Some((parts.next()?, parts.next()?))
-                })
-                .unwrap_or(("flotilla", node.label.as_str()));
-            let project = entity::project(namespace, name, "fleet");
-            let facts = vec![
-                (SEGMENT_PROJECT, MetadataValue::text(project.id.clone())),
+            let Some((project, _)) = awareness_node_entity(node, convoys) else {
+                return vec![];
+            };
+            vec![
+                (SEGMENT_PROJECT, MetadataValue::text(project.id)),
                 (KEY_PROJECT_NAME, MetadataValue::text(node.label.clone())),
                 (KEY_DISPLAY_LABEL, MetadataValue::text(node.label.clone())),
-            ];
-            catalog.assert_entity(project, facts.clone(), None);
-            facts
+            ]
         }
         AwarenessKind::Convoy => {
             let value = node.id.strip_prefix("convoy/").unwrap_or(&node.id);

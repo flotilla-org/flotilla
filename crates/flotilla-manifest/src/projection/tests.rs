@@ -155,6 +155,35 @@ fn awareness_children_use_their_convoys_canonical_origin() {
 }
 
 #[test]
+fn awareness_repository_group_does_not_masquerade_as_project() {
+    let independent = AwarenessEntry::builder()
+        .id("independent/dev/governor".to_owned())
+        .kind(AwarenessKind::Independent)
+        .label("governor".to_owned())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .annotations(std::collections::HashMap::from([(SEGMENT_REPO.to_owned(), "flotilla-org/flotilla".to_owned())]))
+        .build();
+    let node = AwarenessNode::builder()
+        .id("repo/opaque-repository-key".to_owned())
+        .kind(AwarenessKind::Project)
+        .label("github.com/flotilla-org/flotilla".to_owned())
+        .state(AwarenessState::Active)
+        .as_of(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)
+        .entries(vec![independent])
+        .build();
+
+    let patches = project_catalog(&CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[] }, &mint()).reassert_patches();
+
+    find_entity(&patches, &entity::repo("flotilla-org/flotilla"));
+    find_entity(&patches, &entity::session("independent/dev/governor"));
+    assert!(
+        patches.iter().all(|patch| !matches!(&patch.target, MetadataTarget::Entity(entity) if entity.kind == EntityKind::Project)),
+        "repository-only awareness must not mint a project entity"
+    );
+}
+
+#[test]
 fn independent_session_uses_the_canonical_session_ref() {
     let row = IndependentRow::builder()
         .resource(ResourceRef::new("flotilla/v1", "TerminalSession", "dev", "scratch").on_host(HostName::new("feta")))
