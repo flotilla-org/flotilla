@@ -129,7 +129,8 @@ impl TablePanel {
             });
             let mut offset = 0usize;
             let cells = row.cells.iter().zip(&view.columns).enumerate().map(|(index, (cell, column))| {
-                let mut text = cell.text.clone();
+                let mut text =
+                    if column.id == "path" { crate::ui_helpers::middle_elide(&cell.text, column_widths[index]) } else { cell.text.clone() };
                 if index == 0 {
                     if matches!(row_state, Some(RowState::Failed { .. })) {
                         text = format!("x {text}");
@@ -173,7 +174,7 @@ impl TableWidget {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let filter = ctx.views.active_table_state().filter.clone();
         let source_search = ctx.views.active_table_state().source_search.as_deref();
-        let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
+        let rows = crate::app::table_rows(ctx.model, ctx.namespaces, ctx.query_tables, source_search);
         table_view::project(address, &rows).map(|view| view.filtered(&filter))
     }
 
@@ -222,9 +223,6 @@ impl TableWidget {
         if !state.filter.is_empty() {
             title.push_str(&format!(" · find \"{}\"", state.filter));
         }
-        if let Some(as_of) = view.meta.as_of {
-            title.push_str(&format!(" · as of {}", as_of.format("%Y-%m-%d %H:%M")));
-        }
         if view.meta.has_more {
             title.push_str(" · more available");
         }
@@ -234,7 +232,10 @@ impl TableWidget {
         if !view.meta.conditions.is_empty() {
             title.push_str(&format!(" · ⚠ {}", view.meta.conditions.join("; ")));
         }
-        let block = Block::bordered().style(theme.block_style()).title(format!(" {title} "));
+        let mut block = Block::bordered().style(theme.block_style()).title(format!(" {title} "));
+        if let Some(as_of) = view.meta.as_of {
+            block = block.title_top(Line::from(format!(" as of {} ", as_of.format("%Y-%m-%d %H:%M"))).right_aligned());
+        }
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -443,7 +444,7 @@ impl InteractiveWidget for TableWidget {
         let Some(address) = ctx.views.active_address().cloned() else { return };
         let filter = ctx.views.active_table_state().filter.clone();
         let source_search = ctx.views.active_table_state().source_search.as_deref();
-        let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
+        let rows = crate::app::table_rows(ctx.model, ctx.namespaces, ctx.query_tables, source_search);
         let Ok(view) = table_view::project(&address, &rows).map(|view| view.filtered(&filter)) else { return };
         let breadcrumbs = ctx.views.active().breadcrumb_addresses();
         self.render_table(frame, area, ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);

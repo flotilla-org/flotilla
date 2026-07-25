@@ -4,6 +4,7 @@ use color_eyre::Result;
 use crossterm::{
     event::{EnableMouseCapture, KeyCode, KeyModifiers, MouseEventKind},
     execute,
+    terminal::SetTitle,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
@@ -45,6 +46,8 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
     resync_subscriptions(&mut app).await;
 
     execute!(stdout(), EnableMouseCapture)?;
+    let mut terminal_title = None;
+    sync_terminal_title(&app, &mut terminal_title)?;
     let mut events = event::EventHandler::new(Duration::from_millis(50));
     events.attach_daemon(daemon_rx);
 
@@ -155,6 +158,7 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
             events.pause_terminal_input().await;
             let (next_terminal, result) = crate::terminal::run_temporary_attach(&command);
             terminal = next_terminal;
+            terminal_title = None;
             events.resume_terminal_input();
             if let Err(message) = result {
                 app.set_status_message(Some(message));
@@ -173,12 +177,24 @@ pub async fn run_event_loop(mut terminal: ratatui::DefaultTerminal, mut app: App
         }
 
         // ── Draw once ──
+        sync_terminal_title(&app, &mut terminal_title)?;
         render_frame(&mut terminal, &mut app)?;
     }
 
     app.daemon.unsubscribe_queries(app.session_id).await;
     crate::terminal::restore_terminal();
     Ok(EventLoopExit::Quit)
+}
+
+fn sync_terminal_title(app: &App, current: &mut Option<String>) -> Result<()> {
+    let next = app.views.is_scoped().then(|| crate::widgets::tabs::tab_label(app.views.active(), &app.model).trim().to_string());
+    if next != *current {
+        if let Some(title) = &next {
+            execute!(stdout(), SetTitle(format!("{title} — flotilla")))?;
+        }
+        *current = next;
+    }
+    Ok(())
 }
 
 /// Replace the daemon-side query subscription set with the union the open

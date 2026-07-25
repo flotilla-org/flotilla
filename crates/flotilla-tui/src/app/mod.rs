@@ -332,6 +332,7 @@ impl<R: Clone> QueryTableResult<R> {
 }
 
 pub fn table_rows<'a>(
+    model: &'a TuiModel,
     namespaces: &'a NamespaceMap,
     queries: &'a QueryTableCache,
     source_search: Option<&'a str>,
@@ -357,6 +358,11 @@ pub fn table_rows<'a>(
             .awareness
             .iter()
             .map(|(query, result)| crate::table_view::QueryRows { query, rows: &result.rows, state: &result.state })
+            .collect(),
+        host_home_dirs: model
+            .hosts
+            .values()
+            .filter_map(|host| host.summary.system.home_dir.as_deref().map(|home| (host.host_name.clone(), home)))
             .collect(),
         source_search,
     }

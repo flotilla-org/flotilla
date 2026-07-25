@@ -67,18 +67,36 @@ pub fn render_popup_frame(
     (area, inner)
 }
 
-/// Render a full-width section divider: "── Label ──".
-pub fn render_section_divider(frame: &mut ratatui::Frame, label: &str, theme: &Theme, area: Rect, row_style: Style, label_style: Style) {
+/// Render a full-width section header with optional right-aligned metadata.
+pub fn render_section_header(
+    frame: &mut ratatui::Frame,
+    label: &str,
+    metadata: Option<&str>,
+    theme: &Theme,
+    area: Rect,
+    row_style: Style,
+    label_style: Style,
+) {
     let dashes_left = 2;
     let left = "\u{2500}".repeat(dashes_left);
-    let right_width = area.width.saturating_sub(dashes_left as u16 + label.chars().count() as u16 + 4);
+    let metadata_width = metadata.map_or(0, |value| value.chars().count() as u16 + 1);
+    let right_width = area.width.saturating_sub(dashes_left as u16 + label.chars().count() as u16 + metadata_width + 4);
     let right = "\u{2500}".repeat(right_width as usize);
-    let header_line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("{left} "), Style::default().fg(theme.muted)),
         Span::styled(label.to_string(), label_style),
         Span::styled(format!(" {right}"), Style::default().fg(theme.muted)),
-    ]);
+    ];
+    if let Some(metadata) = metadata {
+        spans.push(Span::styled(format!(" {metadata}"), Style::default().fg(theme.muted)));
+    }
+    let header_line = Line::from(spans);
     frame.render_widget(Paragraph::new(header_line).style(row_style), area);
+}
+
+/// Render a full-width section divider: "── Label ──".
+pub fn render_section_divider(frame: &mut ratatui::Frame, label: &str, theme: &Theme, area: Rect, row_style: Style, label_style: Style) {
+    render_section_header(frame, label, None, theme, area, row_style, label_style);
 }
 
 pub fn bottom_anchored_overlay(frame_area: Rect, reserved_top_rows: u16, requested_body_rows: u16) -> BottomAnchoredOverlayLayout {
@@ -253,6 +271,27 @@ fn shorten_against_home(path: &Path, home_dir: Option<&Path>) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// Shorten an arbitrary path against its host's home directory.
+pub fn shorten_home_path(path: &Path, home_dir: Option<&Path>) -> String {
+    shorten_against_home(path, home_dir)
+}
+
+/// Preserve both ends of long values, which is especially useful for paths
+/// where the home/repository prefix and leaf checkout name both carry meaning.
+pub fn middle_elide(value: &str, width: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let available = width - 1;
+    let left = available.div_ceil(2);
+    let right = available - left;
+    chars[..left].iter().chain(std::iter::once(&'…')).chain(chars[chars.len() - right..].iter()).collect()
 }
 
 const BRAILLE_SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
@@ -521,6 +560,12 @@ mod tests {
         let home = dirs::home_dir().expect("home dir");
         let root = home.join("dev/flotilla");
         assert_eq!(shorten_path(&root, &root, 40, Some(&home)), "~/dev/flotilla");
+    }
+
+    #[test]
+    fn middle_elision_preserves_path_prefix_and_leaf() {
+        assert_eq!(middle_elide("~/dev/projects/flotilla-feature", 16), "~/dev/pr…feature");
+        assert_eq!(middle_elide("short", 16), "short");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::{
     Outcome, RenderContext, WidgetContext,
 };
 use crate::{
-    app::{NamespaceMap, QueryTableCache},
+    app::{NamespaceMap, QueryTableCache, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode},
     keymap::Action,
     table_view::{self, AvailableAction, ProjectPanel, ProjectPanelKind, ProjectTableState, RowId, TableIntent, TableIssueStart},
@@ -60,24 +60,25 @@ impl ProjectPageWidget {
 
     fn project_panels(
         address: &ViewAddress,
+        model: &TuiModel,
         namespaces: &NamespaceMap,
         query_tables: &QueryTableCache,
         state: &ProjectTableState,
     ) -> Result<Vec<ProjectPanel>, String> {
-        let rows = crate::app::table_rows(namespaces, query_tables, state.issue_source_search());
+        let rows = crate::app::table_rows(model, namespaces, query_tables, state.issue_source_search());
         Self::filtered_panels(address, &rows, state)
     }
 
     fn panels(ctx: &WidgetContext<'_>) -> Result<Vec<ProjectPanel>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let state = ctx.views.active_project_table_state();
-        Self::project_panels(address, ctx.namespaces, ctx.query_tables, state)
+        Self::project_panels(address, ctx.model, ctx.namespaces, ctx.query_tables, state)
     }
 
     fn render_panels(ctx: &RenderContext<'_>) -> Result<Vec<ProjectPanel>, String> {
         let address = ctx.views.active_address().ok_or_else(|| "active view has no valid address".to_string())?;
         let state = ctx.views.active_project_table_state();
-        Self::project_panels(address, ctx.namespaces, ctx.query_tables, state)
+        Self::project_panels(address, ctx.model, ctx.namespaces, ctx.query_tables, state)
     }
 
     fn layouts(panels: &[ProjectPanel]) -> Vec<PanelLayout<'_>> {
@@ -181,7 +182,11 @@ impl ProjectPageWidget {
     }
 
     fn fetch_more_query(layouts: &[PanelLayout<'_>], state: &ProjectTableState, trigger: super::table::FetchTrigger) -> Option<QueryId> {
-        let layout = layouts.iter().find(|layout| layout.panel.kind == state.active())?;
+        let (index, layout) = layouts.iter().enumerate().find(|(_, layout)| layout.panel.kind == state.active())?;
+        let is_terminal = index + 1 == layouts.len();
+        if trigger == super::table::FetchTrigger::NearBottom && !is_terminal {
+            return None;
+        }
         if layout.panel.kind != ProjectPanelKind::Issues
             || !super::table::TablePanel::should_fetch_more(&layout.panel.table, state.table(layout.panel.kind), trigger)
         {
@@ -264,17 +269,15 @@ impl ProjectPageWidget {
         let layouts = Self::layouts(panels);
         Self::reconcile(&layouts, state);
         self.ensure_active_visible(&layouts, state);
-        for layout in &layouts {
+        for (index, layout) in layouts.iter().enumerate() {
             if let Some(header_area) = self.line_area(layout.header_line, state) {
                 let mut label = format!("{}  › {}", layout.panel.table.title, layout.panel.target.human_label());
                 if let Some(marker) = salience_marker(layout.panel.table.meta.salience) {
                     label = format!("{marker} {label}");
                 }
-                if let Some(as_of) = layout.panel.table.meta.as_of {
-                    label.push_str(&format!(" · as of {}", as_of.format("%Y-%m-%d %H:%M")));
-                }
                 if layout.panel.table.meta.has_more {
-                    label.push_str(" · more available");
+                    let is_terminal = index + 1 == layouts.len();
+                    label.push_str(if is_terminal { " · more available" } else { " · f fetch more" });
                 }
                 if layout.panel.table.meta.availability == table_view::TableAvailability::Loading {
                     label.push_str(" · loading");
@@ -291,7 +294,8 @@ impl ProjectPageWidget {
                 };
                 let style = if focused { style.add_modifier(Modifier::REVERSED) } else { style };
                 let row_style = if focused { style } else { Default::default() };
-                ui_helpers::render_section_divider(frame, &label, theme, header_area, row_style, style);
+                let timestamp = layout.panel.table.meta.as_of.map(|as_of| format!("as of {}", as_of.format("%Y-%m-%d %H:%M")));
+                ui_helpers::render_section_header(frame, &label, timestamp.as_deref(), theme, header_area, row_style, style);
             }
             if let Some(columns_area) = self.line_area(layout.columns_line, state) {
                 super::table::TablePanel::render_header(frame, columns_area, theme, &layout.panel.table);
@@ -606,7 +610,7 @@ mod tests {
         assert!(rendered.contains("issues?project=flotilla/roadmap"));
         assert!(!rendered.contains("%2F"));
         assert!(rendered.contains("as of 2026-07-21 12:30"));
-        assert!(rendered.contains("more available"));
+        assert!(rendered.contains("f fetch more"));
         assert!(rendered.contains("⚠ one source stale"));
     }
 
@@ -724,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn panel_navigation_crosses_a_growing_issue_window_without_disabling_fetch_on_scroll() {
+    fn non_terminal_issue_panel_requires_explicit_fetch_more() {
         let mut panels = vec![
             panel(ProjectPanelKind::Issues, "Issues", "issues?project=flotilla%2Froadmap", "issue-0"),
             panel(ProjectPanelKind::Independents, "Independents", "independents?project=flotilla%2Froadmap", "governor"),
@@ -740,23 +744,25 @@ mod tests {
         state.set_active(ProjectPanelKind::Issues);
         state.focus_rows();
         state.table_mut(ProjectPanelKind::Issues).select_index(&panels[0].table, 0);
+        assert!(ProjectPageWidget::fetch_more_query(
+            &ProjectPageWidget::layouts(&panels),
+            &state,
+            crate::widgets::table::FetchTrigger::Explicit
+        )
+        .is_some());
 
-        for keypress in 0..20 {
+        for _ in 0..20 {
             let layouts = ProjectPageWidget::layouts(&panels);
             ProjectPageWidget::select_delta(&layouts, &mut state, 1);
-            if ProjectPageWidget::fetch_more_query(&layouts, &state, crate::widgets::table::FetchTrigger::NearBottom).is_some() {
-                let mut row = panels[0].table.rows[0].clone();
-                row.id = RowId::new(format!("fetched-{keypress}"));
-                panels[0].table.rows.push(row);
-            }
+            assert!(
+                ProjectPageWidget::fetch_more_query(&layouts, &state, crate::widgets::table::FetchTrigger::NearBottom).is_none(),
+                "a non-terminal panel must not auto-extend"
+            );
             ProjectPageWidget::reconcile(&ProjectPageWidget::layouts(&panels), &mut state);
         }
 
-        assert!(panels[0].table.rows.len() > 8, "near-bottom row navigation should still fetch more issues");
-        assert_eq!(state.active(), ProjectPanelKind::Issues, "the growing issue window should reproduce the row-navigation trap");
-        ProjectPageWidget::select_panel_delta(&ProjectPageWidget::layouts(&panels), &mut state, 1);
-        assert_eq!(state.active(), ProjectPanelKind::Independents);
-        assert!(state.header_focused());
+        assert_eq!(panels[0].table.rows.len(), 8);
+        assert_eq!(state.active(), ProjectPanelKind::Independents, "navigation should escape the finite issue window");
     }
 
     #[test]

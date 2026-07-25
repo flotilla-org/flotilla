@@ -60,6 +60,7 @@ pub struct Screen {
     pub overview_page: OverviewPage,
     pub table: TableWidget,
     pub project_page: ProjectPageWidget,
+    view_header_area: Option<Rect>,
 }
 
 impl Default for Screen {
@@ -78,6 +79,7 @@ impl Screen {
             overview_page: OverviewPage::new(),
             table: TableWidget::default(),
             project_page: ProjectPageWidget::default(),
+            view_header_area: None,
         }
     }
 
@@ -309,6 +311,11 @@ impl InteractiveWidget for Screen {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.view_header_area.is_some_and(|area| area.contains(ratatui::layout::Position::new(x, y))) {
+                    ctx.app_actions.push(AppAction::BackView);
+                    return Outcome::Consumed;
+                }
+
                 // Tab bar click
                 let tab_actions = self.tabs.handle_mouse(mouse);
                 if !tab_actions.is_empty() {
@@ -367,10 +374,11 @@ impl InteractiveWidget for Screen {
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         // Scoped mode: the pane is one View — no tab bar row.
+        let view_header_height = u16::from(ctx.views.active().has_history());
         let constraints = if ctx.views.is_scoped() {
-            vec![Constraint::Length(0), Constraint::Min(0), Constraint::Length(1)]
+            vec![Constraint::Length(0), Constraint::Length(view_header_height), Constraint::Min(0), Constraint::Length(1)]
         } else {
-            vec![Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]
+            vec![Constraint::Length(1), Constraint::Length(view_header_height), Constraint::Min(0), Constraint::Length(1)]
         };
         let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(frame.area());
 
@@ -379,43 +387,57 @@ impl InteractiveWidget for Screen {
             self.tabs.render(ctx.views, ctx.model, ctx.ui, ctx.theme, frame, chunks[0]);
         }
 
-        // 2. Content: dispatch to the active View's page
+        // 2. Tab-local navigation header
+        self.view_header_area = (view_header_height == 1).then_some(chunks[1]);
+        if let Some(area) = self.view_header_area {
+            let path = ctx.views.active().breadcrumb_addresses().iter().map(ViewAddress::human_label).collect::<Vec<_>>().join("  ›  ");
+            frame.render_widget(
+                Paragraph::new(Line::styled(format!(" ← Back  {path}"), ratatui::style::Style::default().fg(ctx.theme.info))),
+                area,
+            );
+        }
+
+        // 3. Content: dispatch to the active View's page
         let active_page = self.active_page(ctx.views.active(), &ctx.model.repos);
         match &active_page {
             ActivePage::Table => {
                 let address = ctx.views.active_address().cloned().expect("table page has a parsed address");
                 let filter = ctx.views.active_table_state().filter.clone();
                 let source_search = ctx.views.active_table_state().source_search.as_deref();
-                let rows = crate::app::table_rows(ctx.namespaces, ctx.query_tables, source_search);
+                let rows = crate::app::table_rows(ctx.model, ctx.namespaces, ctx.query_tables, source_search);
                 match crate::table_view::project(&address, &rows).map(|view| view.filtered(&filter)) {
                     Ok(view) => {
-                        let breadcrumbs = ctx.views.active().breadcrumb_addresses();
-                        self.table.render_table(frame, chunks[1], ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
+                        let breadcrumbs = if ctx.views.active().has_history() {
+                            Vec::new()
+                        } else {
+                            ctx.views.active().address().cloned().into_iter().collect()
+                        };
+                        self.table.render_table(frame, chunks[2], ctx.theme, &view, ctx.views.active_table_state_mut(), &breadcrumbs);
                     }
-                    Err(detail) => Self::render_error_page(frame, chunks[1], ctx.theme, "table view unavailable", &detail),
+                    Err(detail) => Self::render_error_page(frame, chunks[2], ctx.theme, "table view unavailable", &detail),
                 }
             }
-            ActivePage::Project => self.project_page.render(frame, chunks[1], ctx),
-            ActivePage::Overview => self.overview_page.render(frame, chunks[1], ctx),
+            ActivePage::Project => self.project_page.render(frame, chunks[2], ctx),
+            ActivePage::Overview => self.overview_page.render(frame, chunks[2], ctx),
             ActivePage::Repo(identity) => {
                 let identity = identity.clone();
                 match self.repo_pages.get_mut(&identity) {
-                    Some(page) => page.render(frame, chunks[1], ctx),
+                    Some(page) => page.render(frame, chunks[2], ctx),
                     None => Self::render_error_page(
                         frame,
-                        chunks[1],
+                        chunks[2],
                         ctx.theme,
                         &format!("no page for repo: {}/{}", identity.authority, identity.path),
                         "",
                     ),
                 }
             }
-            ActivePage::Error { title, detail } => Self::render_error_page(frame, chunks[1], ctx.theme, title, detail),
+            ActivePage::Error { title, detail } => Self::render_error_page(frame, chunks[2], ctx.theme, title, detail),
         }
 
-        // 3. Status bar — resolve all content, then call the pure renderer.
+        // 4. Status bar — resolve all content, then call the pure renderer.
 
-        // 3a. Resolve binding mode and status fragment.
+        // 4a. Resolve binding mode and status fragment.
         // Modal stack takes priority; otherwise the active View's kind
         // supplies its mode stack.
         let scoped = ctx.views.is_scoped();
@@ -441,7 +463,7 @@ impl InteractiveWidget for Screen {
 
         let active_mode = binding_mode.primary();
 
-        // 3b. Resolve key chips from binding mode via compiled binding table.
+        // 4b. Resolve key chips from binding mode via compiled binding table.
         //     Progress fragments suppress key chips (user can't interact during progress).
         let interactions = crate::interaction::InteractionContext::for_active_view(
             ctx.views.active_address(),
@@ -464,11 +486,11 @@ impl InteractiveWidget for Screen {
                 .collect()
         };
 
-        // 3c. Resolve status section from fragment (with fallback)
+        // 4c. Resolve status section from fragment (with fallback)
         let fallback_label = ": for commands";
         let status = status_bar_widget::resolve_status_section(&fragment, fallback_label);
 
-        // 3d. Task spinner — fragment progress takes priority over in-flight commands.
+        // 4d. Task spinner — fragment progress takes priority over in-flight commands.
         //     Only Normal/Overview modes show in-flight tasks.
         let task = status_bar_widget::resolve_task_from_fragment(&fragment).or_else(|| {
             if self.modal_stack.is_empty() {
@@ -478,14 +500,14 @@ impl InteractiveWidget for Screen {
             }
         });
 
-        // 3e. Error items — only override status in Normal mode (no modals)
+        // 4e. Error items — only override status in Normal mode (no modals)
         let error_items = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
             collect_visible_status_items(ctx.model, ctx.ui)
         } else {
             vec![]
         };
 
-        // 3f. Mode indicators — only for Normal mode (no modals, not config or issue search)
+        // 4f. Mode indicators — only for Normal mode (no modals, not config or issue search)
         let mode_indicators = if active_mode == BindingModeId::Normal && self.modal_stack.is_empty() {
             status_bar_widget::normal_mode_indicators(ctx.ui, ctx.namespaces)
         } else if active_mode == BindingModeId::CommandPalette {
@@ -495,15 +517,15 @@ impl InteractiveWidget for Screen {
             vec![]
         };
 
-        // 3g. show_keys flag
+        // 4g. show_keys flag
         let show_keys = ctx.ui.status_bar.show_keys;
 
-        // 3h. Status bar area — CommandPalette moves it to the overlay position
+        // 4h. Status bar area — CommandPalette moves it to the overlay position
         let is_command_palette = self.modal_stack.last().map(|w| w.binding_mode().primary()) == Some(BindingModeId::CommandPalette);
         let status_bar_area = if is_command_palette {
             ui_helpers::bottom_anchored_overlay(frame.area(), 1, crate::palette::MAX_PALETTE_ROWS as u16).status_row
         } else {
-            chunks[2]
+            chunks[3]
         };
 
         self.status_bar.render_bespoke(
