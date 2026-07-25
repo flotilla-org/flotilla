@@ -5,16 +5,16 @@ use flotilla_core::agent_adapter::{
     append_convoy_work_context, build_crew_brief_with_options, CrewAssignment, CrewBriefMember, CrewBriefTemplateResolver,
 };
 use flotilla_resources::{
-    clone_key,
+    canonicalize_repo_url, clone_key,
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
     repository_workspace_slugs, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone, ClonePhase, CloneSpec, Convoy,
     CrewSource, DockerCheckoutStrategy, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase,
     EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta,
-    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey, Resource,
-    ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase,
-    TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
+    LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec, Repository, RepositoryIdentity, RepositoryKey,
+    RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject, Stance, TerminalSession, TerminalSessionIdentity,
+    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, CONVOY_LABEL, VESSEL_REF_LABEL,
 };
 
 const REPO_KEY_LABEL: &str = "flotilla.work/repo-key";
@@ -309,7 +309,21 @@ impl Reconciler for VesselReconciler {
             let repository = match self.repositories.get(&convoy_repository.repo_ref.to_string()).await {
                 Ok(repository) => repository,
                 Err(ResourceError::NotFound { .. }) => {
-                    return Ok(VesselDeps::failed(format!("repository {} not found", convoy_repository.repo_ref)))
+                    let repository_spec = match canonicalize_repo_url(&convoy_repository.url).and_then(RepositorySpec::remote) {
+                        Ok(spec) => spec,
+                        Err(message) => {
+                            return Ok(VesselDeps::failed(format!(
+                                "convoy repository {} has invalid URL: {message}",
+                                convoy_repository.repo_ref
+                            )))
+                        }
+                    };
+                    if let Err(message) = repository_spec.verify_key(&convoy_repository.repo_ref) {
+                        return Ok(VesselDeps::failed(message));
+                    }
+                    actuations.push(Actuation::CreateRepository { key: convoy_repository.repo_ref.clone(), spec: repository_spec });
+                    waiting_for_checkouts = true;
+                    continue;
                 }
                 Err(err) => return Err(err),
             };

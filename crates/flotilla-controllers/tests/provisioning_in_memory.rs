@@ -30,9 +30,10 @@ use flotilla_core::{
 };
 use flotilla_resources::{
     clone_key, controller::ControllerLoop, Checkout, CheckoutBranchProvenance, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
-    ClonePhase, CloneSpec, DockerEnvironmentSpec, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
-    Host, HostDirectEnvironmentSpec, HostSpec, HostStatus, Presentation, PresentationPhase, PresentationSpec, ResourceBackend,
-    ResourceError, StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, CONVOY_LABEL, CREW_ORDINAL_LABEL,
+    ClonePhase, CloneSpec, Convoy, ConvoyRepositorySpec, ConvoySpec, ConvoyStatus, CrewSource, CrewSpec, DockerEnvironmentSpec,
+    Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, Host, HostDirectEnvironmentSpec, HostSpec,
+    HostStatus, Presentation, PresentationPhase, PresentationSpec, Repository, RepositorySpec, ResourceBackend, ResourceError, Stance,
+    StatusPatch, TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL,
     VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
@@ -249,6 +250,103 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
         "steady-state reconciliation must not create new resource versions"
     );
     assert_eq!(steady.status.expect("steady workspace status").ready_at, status.ready_at);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn controller_materializes_a_missing_repository_for_a_multi_repository_convoy() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_host(&backend, "01HXYZ").await;
+    create_ready_host_direct_environment(&backend, NAMESPACE, "01HXYZ", "/Users/alice/dev/flotilla-repos").await;
+    create_host_direct_policy(&backend, NAMESPACE, "policy-multi", "01HXYZ", "cleat").await;
+
+    let known = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("known repository");
+    let missing = RepositorySpec::remote("https://github.com/flotilla-org/cleat").expect("missing repository");
+    flotilla_resources::ensure_repository(&backend.clone().using::<Repository>(NAMESPACE), &known.key(), &known)
+        .await
+        .expect("known repository should create");
+
+    let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+    let convoy = convoys
+        .create(&controller_meta().name("convoy-multi").call(), &ConvoySpec {
+            workflow_ref: "wf".to_string(),
+            dispatching_principal_ref: Default::default(),
+            inputs: BTreeMap::new(),
+            placement_policy: None,
+            repositories: vec![
+                ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/flotilla".to_string())
+                    .repo_ref(known.key())
+                    .base_ref("main".to_string())
+                    .workspace_slug("flotilla".to_string())
+                    .subpaths(Vec::new())
+                    .build(),
+                ConvoyRepositorySpec::builder()
+                    .url("https://github.com/flotilla-org/cleat".to_string())
+                    .repo_ref(missing.key())
+                    .base_ref("main".to_string())
+                    .workspace_slug("cleat".to_string())
+                    .subpaths(Vec::new())
+                    .build(),
+            ],
+            r#ref: Some("fix/multi".to_string()),
+            project_ref: Some("flotilla-suite".to_string()),
+            adopted_checkout_refs: BTreeMap::new(),
+            issues: Vec::new(),
+            instruction: None,
+        })
+        .await
+        .expect("convoy should create");
+    convoys
+        .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
+            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                vessels: vec![VesselRequirement {
+                    name: "implement".to_string(),
+                    stance: Stance::Trusted,
+                    depends_on: Vec::new(),
+                    repository_refs: None,
+                    crew: vec![CrewSpec::builder()
+                        .role("coder".to_string())
+                        .source(CrewSource::Tool { command: "cargo test".to_string() })
+                        .build()],
+                }],
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("convoy status should update");
+    create_workspace(
+        &backend,
+        NAMESPACE,
+        "workspace-multi",
+        "convoy-multi",
+        "implement",
+        "policy-multi",
+        "https://github.com/flotilla-org/flotilla",
+    )
+    .await;
+
+    let harness = full_controller_harness(backend.clone());
+    let vessels = backend.clone().using::<Vessel>(NAMESPACE);
+    harness
+        .wait_until(Duration::from_secs(3), || {
+            let vessels = vessels.clone();
+            async move {
+                matches!(
+                    vessels.get("workspace-multi").await.ok().and_then(|vessel| vessel.status).map(|status| status.phase),
+                    Some(VesselPhase::Ready)
+                )
+            }
+        })
+        .await;
+
+    let repositories = backend.clone().using::<Repository>(NAMESPACE);
+    repositories.get(&known.key().to_string()).await.expect("known repository should remain registered");
+    repositories.get(&missing.key().to_string()).await.expect("missing repository should be materialized");
+    let clones = backend.clone().using::<Clone>(NAMESPACE).list().await.expect("clones should list");
+    assert_eq!(clones.items.len(), 2);
+    assert!(clones.items.iter().all(|clone| clone.status.as_ref().map(|status| status.phase) == Some(ClonePhase::Ready)));
 
     harness.shutdown().await;
 }
