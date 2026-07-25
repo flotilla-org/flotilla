@@ -2379,21 +2379,29 @@ fn project_issue_bulk_start_queues_one_convoy_start_per_issue() {
             .map(|id| crate::table_view::TableIssueStart {
                 row_id: crate::table_view::RowId::new(format!("issue:{id}")),
                 issue: IssueRef { source: source.clone(), id: id.into() },
+                title: format!("Issue {id}"),
+                ready: true,
             })
             .collect(),
     });
+    assert!(app.proto_commands.take_next().is_none(), "bulk start must wait for confirmation");
+    for character in "Keep each fix focused".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
 
     let mut queued = Vec::new();
     while let Some((command, ctx)) = app.proto_commands.take_next() {
         let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
         let ctx = ctx.expect("pending context");
         let project_ctx = ctx.project_issue_start_context().expect("project context");
-        queued.push((intent.issues, project_ctx.issue.id.clone(), intent.auto_attach));
+        queued.push((intent.issues, project_ctx.issue.id.clone(), intent.auto_attach, intent.instruction));
     }
 
     assert_eq!(queued.len(), 3);
-    assert_eq!(queued.iter().map(|(_, id, _)| id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
-    assert!(queued.iter().all(|(_, _, auto_attach)| !auto_attach), "bulk convoy starts should not auto-attach one selected issue");
+    assert_eq!(queued.iter().map(|(_, id, _, _)| id.as_str()).collect::<Vec<_>>(), vec!["809", "810", "811"]);
+    assert!(queued.iter().all(|(_, _, auto_attach, _)| !auto_attach), "bulk convoy starts should not auto-attach one selected issue");
+    assert!(queued.iter().all(|(_, _, _, instruction)| instruction.as_deref() == Some("Keep each fix focused")));
     assert_eq!(app.model.status_message.as_deref(), Some("Starting 3 convoys..."));
 }
 
@@ -2412,9 +2420,16 @@ fn project_issue_batch_start_queues_one_convoy_for_all_issues() {
             .map(|id| crate::table_view::TableIssueStart {
                 row_id: crate::table_view::RowId::new(format!("issue:{id}")),
                 issue: IssueRef { source: source.clone(), id: id.into() },
+                title: format!("Issue {id}"),
+                ready: true,
             })
             .collect(),
     });
+    assert!(app.proto_commands.take_next().is_none(), "batch start must wait for confirmation");
+    for character in "Preserve shared behavior".chars() {
+        app.handle_key(key(KeyCode::Char(character)));
+    }
+    app.handle_key(key(KeyCode::Enter));
 
     let (command, ctx) = app.proto_commands.take_next().expect("expected command");
     assert!(app.proto_commands.take_next().is_none(), "batch start should queue exactly one command");
@@ -2433,6 +2448,7 @@ fn project_issue_batch_start_queues_one_convoy_for_all_issues() {
         vec!["809", "810", "811"]
     );
     assert!(intent.auto_attach, "batch convoy start should auto-attach the single created convoy");
+    assert_eq!(intent.instruction.as_deref(), Some("Preserve shared behavior"));
     assert_eq!(app.model.status_message.as_deref(), Some("Starting batch convoy for 3 issues..."));
 }
 

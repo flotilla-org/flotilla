@@ -314,6 +314,7 @@ impl Keymap {
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
             (&config.close_confirm, BindingModeId::CloseConfirm),
+            (&config.dispatch_confirm, BindingModeId::DispatchConfirm),
             (&config.command_palette, BindingModeId::CommandPalette),
             (&config.file_picker, BindingModeId::FilePicker),
         ];

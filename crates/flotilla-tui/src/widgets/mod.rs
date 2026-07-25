@@ -6,6 +6,7 @@ pub mod command_palette;
 pub mod convoy_delete_confirm;
 pub mod delete_confirm;
 pub mod describe;
+pub mod dispatch_confirm;
 pub mod event_log;
 pub mod file_picker;
 pub mod help;
@@ -84,6 +85,10 @@ pub enum AppAction {
     /// Pop the active tab's in-place navigation history.
     BackView,
     ExecuteTableIntent(crate::table_view::TableIntent),
+    ConfirmConvoyDispatch {
+        intent: crate::table_view::TableIntent,
+        instruction: Option<String>,
+    },
     SetTableFilter(String),
     SetSourceSearch(Option<String>),
     FetchMore(flotilla_protocol::QueryId),
