@@ -1918,6 +1918,16 @@ impl InProcessDaemon {
         self.regard_lifecycle.principal_for_surface(surface_id)
     }
 
+    fn should_auto_attach(&self, requested: flotilla_protocol::ConvoyAutoAttach) -> bool {
+        match requested {
+            flotilla_protocol::ConvoyAutoAttach::Always => true,
+            flotilla_protocol::ConvoyAutoAttach::Never => false,
+            flotilla_protocol::ConvoyAutoAttach::Default => {
+                self.config.load_config().convoy.auto_attach.unwrap_or_else(|| !self.regard_lifecycle.has_ambient_surface())
+            }
+        }
+    }
+
     pub async fn disconnect_surface(&self, surface_id: uuid::Uuid) -> Result<(), String> {
         self.regard_lifecycle.disconnect_surface(surface_id).await
     }
@@ -2231,7 +2241,7 @@ impl InProcessDaemon {
             .workflow_spec(workflow_value)
             .maybe_placement_policy_name(placement_policy_name)
             .maybe_placement_policy_spec(placement_policy_spec)
-            .auto_attach(intent.auto_attach)
+            .auto_attach(self.should_auto_attach(intent.auto_attach))
             .build())
     }
 
@@ -3591,8 +3601,9 @@ impl InProcessDaemon {
                 message: format!("namespace `{requested_namespace}` is not served by this daemon (configured namespace: `{namespace}`)"),
             };
         }
+        let auto_attach = self.should_auto_attach(intent.auto_attach);
         match self.admit_convoy_start(&namespace, &intent, &dispatching_principal_ref).await {
-            Ok(name) if intent.auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
+            Ok(name) if auto_attach => match self.wait_for_convoy_attach(&namespace, &name).await {
                 Ok(resolved) => flotilla_protocol::CommandValue::ConvoyStarted {
                     name,
                     attach_command: Some(resolved.command),

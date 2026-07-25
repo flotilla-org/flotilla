@@ -1012,7 +1012,7 @@ async fn bare_convoy_start_uses_the_viable_local_host_direct_policy() {
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1084,7 +1084,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: Some("docker-test".into()),
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1215,7 +1215,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     inputs: vec![("review".into(), "required".into())],
                     instruction: Some("Keep the snapshot durable.".into()),
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1274,7 +1274,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     inputs: Vec::new(),
                     instruction: Some("Fix both issues in one convoy.".into()),
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1313,7 +1313,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1366,7 +1366,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1401,7 +1401,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1440,7 +1440,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1516,7 +1516,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
                     inputs: Vec::new(),
                     instruction: Some("Implement the admission snapshot.".into()),
                     placement_policy: None,
-                    auto_attach: false,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                 }),
             },
         })
@@ -1568,7 +1568,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                             inputs: Vec::new(),
                             instruction: None,
                             placement_policy: None,
-                            auto_attach: false,
+                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
                     },
                 })
@@ -1632,7 +1632,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
                 inputs: Vec::new(),
                 instruction: Some("Implement issue 782".into()),
                 placement_policy: None,
-                auto_attach: false,
+                auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
             }),
         },
     };
@@ -1682,7 +1682,14 @@ async fn convoy_start_worker_panic_finishes_the_command_and_allows_retry() {
         node_id: None,
         provisioning_target: None,
         context_repo: None,
-        action: CommandAction::ConvoyStart { intent: Box::new(ConvoyStartIntent::builder().project_ref("flotilla".to_string()).build()) },
+        action: CommandAction::ConvoyStart {
+            intent: Box::new(
+                ConvoyStartIntent::builder()
+                    .project_ref("flotilla".to_string())
+                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                    .build(),
+            ),
+        },
     };
     let mut events = daemon.subscribe();
 
@@ -1719,7 +1726,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
                     inputs: Vec::new(),
                     instruction: None,
                     placement_policy: None,
-                    auto_attach: true,
+                    auto_attach: flotilla_protocol::ConvoyAutoAttach::Always,
                 }),
             },
         })

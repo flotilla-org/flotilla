@@ -75,6 +75,16 @@ impl RegardLifecycle {
             .map(|surface| surface.declaration.principal_ref.clone()))
     }
 
+    /// Whether a headless presentation connector is currently projecting
+    /// daemon state into a presentation manager.
+    pub fn has_ambient_surface(&self) -> bool {
+        self.surfaces
+            .lock()
+            .expect("regard surfaces lock poisoned")
+            .values()
+            .any(|surface| surface.declaration.character == SurfaceCharacter::Ambient)
+    }
+
     pub async fn emit_expressed(&self, principal: &PrincipalRef, target: &ResourceRef) -> Result<(), String> {
         self.record_regard(principal, target, RegardSource::Expressed).await
     }

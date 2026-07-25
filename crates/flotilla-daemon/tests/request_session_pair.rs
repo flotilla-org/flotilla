@@ -505,6 +505,7 @@ async fn convoy_start_uses_live_peer_route_when_presentation_membership_is_stale
                         .name("remote-work".to_string())
                         .branch("fix/remote-work".to_string())
                         .placement_policy(placement_policy)
+                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
                         .build(),
                 ),
             },

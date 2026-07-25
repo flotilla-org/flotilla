@@ -90,6 +90,16 @@ pub struct FlotillaConfig {
     pub presentation_manager: PresentationManagerConfig,
     #[serde(default)]
     pub terminal_pool: TerminalPoolConfig,
+    #[serde(default)]
+    pub convoy: ConvoyConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ConvoyConfig {
+    /// Override presence-aware auto-attach for convoy starts without an
+    /// explicit `--attach` or `--no-attach`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_attach: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

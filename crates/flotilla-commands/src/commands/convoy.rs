@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use flotilla_protocol::{Command, CommandAction, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
+use flotilla_protocol::{Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
 
 use crate::{
     quote::quote_value,
@@ -86,8 +86,11 @@ pub enum ConvoyVerb {
         #[arg(long = "placement-policy")]
         placement_policy: Option<String>,
         /// Create the convoy without attaching the caller to its first crew session
-        #[arg(long, default_value_t = false)]
+        #[arg(long, conflicts_with = "attach")]
         no_attach: bool,
+        /// Attach to the convoy's first crew session even when a presentation surface is connected
+        #[arg(long, conflicts_with = "no_attach")]
+        attach: bool,
     },
     /// Create a convoy from a workflow template
     Create {
@@ -232,6 +235,7 @@ impl ConvoyNoun {
                 instruction,
                 placement_policy,
                 no_attach,
+                attach,
             } => {
                 if self.subject.is_some() {
                     return Err("convoy start does not take a positional convoy name; use --name".to_string());
@@ -265,7 +269,12 @@ impl ConvoyNoun {
                                 inputs,
                                 instruction,
                                 placement_policy,
-                                auto_attach: !no_attach,
+                                auto_attach: match (attach, no_attach) {
+                                    (true, false) => ConvoyAutoAttach::Always,
+                                    (false, true) => ConvoyAutoAttach::Never,
+                                    (false, false) => ConvoyAutoAttach::Default,
+                                    (true, true) => unreachable!("clap rejects conflicting attach flags"),
+                                },
                             }),
                         },
                     },
@@ -292,7 +301,7 @@ impl ConvoyNoun {
                                     inputs,
                                     instruction: None,
                                     placement_policy,
-                                    auto_attach: false,
+                                    auto_attach: ConvoyAutoAttach::Never,
                                 }),
                             },
                         },
@@ -375,6 +384,7 @@ impl std::fmt::Display for ConvoyNoun {
                 instruction,
                 placement_policy,
                 no_attach,
+                attach,
             } => {
                 write!(f, " start --project {}", quote_value(project))?;
                 if let Some(issue) = issue {
@@ -407,6 +417,9 @@ impl std::fmt::Display for ConvoyNoun {
                 if *no_attach {
                     write!(f, " --no-attach")?;
                 }
+                if *attach {
+                    write!(f, " --attach")?;
+                }
             }
             ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy, adopted_checkout } => {
                 write!(f, " create --template {}", quote_value(template))?;
@@ -437,7 +450,7 @@ impl std::fmt::Display for ConvoyNoun {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use flotilla_protocol::{Command, CommandAction, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
+    use flotilla_protocol::{Command, CommandAction, ConvoyAutoAttach, ConvoyStartIntent, IssueRef, IssueSelector, IssueSource};
 
     use super::ConvoyNoun;
     use crate::{
@@ -608,7 +621,7 @@ mod tests {
                         inputs: vec![],
                         instruction: Some("Preserve the public API.".into()),
                         placement_policy: None,
-                        auto_attach: false,
+                        auto_attach: ConvoyAutoAttach::Never,
                     }),
                 },
             },
@@ -639,7 +652,7 @@ mod tests {
                         inputs: vec![],
                         instruction: None,
                         placement_policy: None,
-                        auto_attach: true,
+                        auto_attach: ConvoyAutoAttach::Default,
                     }),
                 },
             },
@@ -668,13 +681,31 @@ mod tests {
                         inputs: vec![],
                         instruction: None,
                         placement_policy: None,
-                        auto_attach: true,
+                        auto_attach: ConvoyAutoAttach::Default,
                     }),
                 },
             },
             repo: RepoContext::None,
             host: HostResolution::Local,
         });
+    }
+
+    #[test]
+    fn convoy_start_attach_flags_are_explicit_overrides() {
+        for (flag, expected) in [("--attach", ConvoyAutoAttach::Always), ("--no-attach", ConvoyAutoAttach::Never)] {
+            let Resolved::NeedsContext { command, .. } =
+                parse(&["convoy", "start", "--project", "flotilla", flag]).resolve().expect("resolve attach override")
+            else {
+                panic!("expected daemon command");
+            };
+            let CommandAction::ConvoyStart { intent } = command.action else { panic!("expected convoy start") };
+            assert_eq!(intent.auto_attach, expected);
+        }
+
+        assert!(
+            ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--attach", "--no-attach"]).is_err(),
+            "opposing attach flags must conflict"
+        );
     }
 
     #[test]
@@ -769,7 +800,7 @@ mod tests {
                 inputs: Vec::new(),
                 instruction: None,
                 placement_policy: None,
-                auto_attach: false,
+                auto_attach: ConvoyAutoAttach::Never,
             }),
         });
     }

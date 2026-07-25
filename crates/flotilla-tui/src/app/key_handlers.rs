@@ -482,7 +482,7 @@ impl App {
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
-                        auto_attach: true,
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));
                 return;
@@ -502,7 +502,7 @@ impl App {
                             inputs: Vec::new(),
                             instruction: None,
                             placement_policy: None,
-                            auto_attach: false,
+                            auto_attach: flotilla_protocol::ConvoyAutoAttach::Never,
                         }),
                     });
                     let pending_ctx = PendingActionContext::project_issue_start(
@@ -537,7 +537,7 @@ impl App {
                         inputs: Vec::new(),
                         instruction: None,
                         placement_policy: None,
-                        auto_attach: true,
+                        auto_attach: flotilla_protocol::ConvoyAutoAttach::Default,
                     }),
                 }));
                 if let Some(index) = self.views.find(&address) {

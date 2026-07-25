@@ -135,6 +135,19 @@ pub enum IssueSelector {
 ///
 /// This type lives in protocol rather than resources because incomplete
 /// intent must never enter the resource store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConvoyAutoAttach {
+    /// Let the dispatching daemon choose from configuration and connected
+    /// presentation-surface presence.
+    #[default]
+    Default,
+    /// Attach even when a presentation surface is connected.
+    Always,
+    /// Leave the convoy latent even when no presentation surface is connected.
+    Never,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyStartIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,7 +171,7 @@ pub struct ConvoyStartIntent {
     pub placement_policy: Option<String>,
     #[builder(default)]
     #[serde(default)]
-    pub auto_attach: bool,
+    pub auto_attach: ConvoyAutoAttach,
 }
 
 /// A convoy launch admitted by the presentation host and ready to be

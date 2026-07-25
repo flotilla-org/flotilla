@@ -91,6 +91,50 @@ fn convoy_branch_validation_rejects_refs_that_checkout_cannot_create() {
     validate_convoy_branch("fix/issue-732").expect("normal branch should be accepted");
 }
 
+async fn daemon_for_auto_attach_config(config: Option<bool>) -> (tempfile::TempDir, Arc<InProcessDaemon>) {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let config_base = temp.path().join("config");
+    std::fs::create_dir_all(&config_base).expect("create config dir");
+    std::fs::write(config_base.join("daemon.toml"), "machine_id = \"auto-attach-test\"\n").expect("write daemon config");
+    if let Some(auto_attach) = config {
+        std::fs::write(config_base.join("config.toml"), format!("[convoy]\nauto_attach = {auto_attach}\n")).expect("write flotilla config");
+    }
+    let daemon =
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_base)), fake_discovery(false), HostName::local()).await;
+    (temp, daemon)
+}
+
+#[tokio::test]
+async fn convoy_auto_attach_default_tracks_ambient_surface_presence_and_explicit_modes_win() {
+    let (_temp, daemon) = daemon_for_auto_attach_config(None).await;
+    let tui_id = uuid::Uuid::new_v4();
+    let connector_id = uuid::Uuid::new_v4();
+
+    assert!(daemon.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default));
+    daemon.connect_surface(tui_id, flotilla_protocol::SurfaceDeclaration::focal_for_namespace("flotilla"));
+    assert!(
+        daemon.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default),
+        "a TUI client alone is not a presentation-manager connector"
+    );
+    daemon.connect_surface(connector_id, flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla"));
+    assert!(!daemon.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default));
+    assert!(daemon.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Always));
+    assert!(!daemon.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Never));
+
+    daemon.disconnect_surface(connector_id).await.expect("disconnect ambient connector");
+    assert!(daemon.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default));
+}
+
+#[tokio::test]
+async fn convoy_auto_attach_config_overrides_presence_heuristic() {
+    let (_disabled_temp, disabled) = daemon_for_auto_attach_config(Some(false)).await;
+    assert!(!disabled.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default));
+
+    let (_enabled_temp, enabled) = daemon_for_auto_attach_config(Some(true)).await;
+    enabled.connect_surface(uuid::Uuid::new_v4(), flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla"));
+    assert!(enabled.should_auto_attach(flotilla_protocol::ConvoyAutoAttach::Default));
+}
+
 #[test]
 fn configured_repo_identity_prefers_repo_file_forgejo_binding() {
     let temp = tempfile::tempdir().expect("create tempdir");
