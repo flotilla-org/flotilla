@@ -259,6 +259,7 @@ def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
         timeout=30,
         interval=0.5,
     )
+
     def reconnected_within_two_intervals():
         elapsed = time.monotonic() - woken_at
         assert elapsed <= 120, (
