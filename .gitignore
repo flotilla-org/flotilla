@@ -2,6 +2,7 @@
 .codex-tmp/
 .idea/
 __pycache__/
+*.egg-info/
 .playwright-mcp/
 .claude/worktrees/
 .worktrees/

@@ -196,6 +196,7 @@ impl PeerRuntime {
                             current_peer = Some(initial_connection.node.clone());
                             let mut inbound_rx = initial_connection.inbound_rx;
                             let generation = initial_connection.generation;
+                            info!(peer = %peer_name, generation, "connected successfully");
                             let _ = peer_connected_tx_clone.send(PeerConnectedNotice {
                                 peer: peer_name.clone(),
                                 generation,
@@ -266,7 +267,7 @@ impl PeerRuntime {
                                     current_peer = Some(connection.node.clone());
                                     let generation = connection.generation;
                                     let mut inbound_rx = connection.inbound_rx;
-                                    info!(peer = %peer_name, "reconnected successfully");
+                                    info!(peer = %peer_name, generation, "reconnected successfully");
                                     last_known_session_id =
                                         handle_remote_restart_if_needed(&pm, &daemon_for_cleanup, &peer_name, last_known_session_id).await;
                                     sync_peer_query_state(&pm, &daemon_for_cleanup).await;

@@ -9,6 +9,7 @@ import pytest
 
 COMPOSE_DIR = Path(__file__).parent
 COMPOSE_FILE = str(COMPOSE_DIR / "docker-compose.yml")
+DAEMON_LOG = "~/.local/state/flotilla/daemon.log"
 
 
 def docker_exec(
@@ -26,9 +27,19 @@ def docker_exec(
     )
 
 
+def compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Run docker compose against the integration topology."""
+    return subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
 def flotilla_json(service: str, args: str, timeout: int = 30) -> dict | list:
     """Run a flotilla CLI command with --json and return parsed output."""
-    result = docker_exec(service, f"flotilla {args} --json", timeout=timeout)
+    result = docker_exec(service, f"flotilla --json {args}", timeout=timeout)
     assert result.returncode == 0, (
         f"flotilla {args} failed (rc={result.returncode}):\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -67,14 +78,57 @@ def wait_for(
     raise TimeoutError(msg)
 
 
-@pytest.fixture(scope="session")
+def start_daemon(service: str):
+    """Start flotillad directly and record its PID for deterministic restarts."""
+    result = docker_exec(
+        service,
+        "mkdir -p ~/.config/flotilla ~/.local/state/flotilla; "
+        "tmux_env=$(tmux display-message -t integration -p "
+        "'#{socket_path},#{pid},#{window_index}'); "
+        "nohup env TMUX=\"$tmux_env\" "
+        "RUST_LOG=flotilla_daemon=debug flotillad --timeout 0 "
+        ">~/.config/flotilla/daemon-stdio.log 2>&1 & "
+        "echo $! > ~/.config/flotilla/flotillad.pid",
+    )
+    assert result.returncode == 0, (
+        f"flotillad start failed on {service}:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def stop_daemon(service: str):
+    """Stop the recorded flotillad process, if it is still running."""
+    result = docker_exec(
+        service,
+        "if test -f ~/.config/flotilla/flotillad.pid; then "
+        "pid=$(cat ~/.config/flotilla/flotillad.pid); "
+        "kill \"$pid\" 2>/dev/null || true; "
+        "for attempt in $(seq 1 50); do "
+        "state=$(ps -o stat= -p \"$pid\" 2>/dev/null || true); "
+        "case \"$state\" in ''|Z*) exit 0 ;; esac; sleep 0.1; "
+        "done; exit 1; "
+        "fi",
+    )
+    assert result.returncode == 0, (
+        f"flotillad stop failed on {service}:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
+def daemon_log(service: str) -> str:
+    """Read a node's structured daemon log."""
+    result = docker_exec(service, f"cat {DAEMON_LOG}")
+    return result.stdout if result.returncode == 0 else ""
+
+
+@pytest.fixture(scope="module")
 def topology():
     """Spin up 2-node topology, wait for peering, yield, tear down."""
-    subprocess.run(
-        ["docker", "compose", "-f", COMPOSE_FILE, "up", "-d", "--build",
-         "--force-recreate"],
-        check=True,
-        timeout=600,
+    result = compose(
+        "up", "-d", "--build", "--force-recreate", timeout=900
+    )
+    assert result.returncode == 0, (
+        f"compose up failed:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     try:
         # Wait for SSH readiness between nodes
@@ -125,12 +179,16 @@ def topology():
             f"daemon.toml write failed: {result.stderr}"
         )
 
-        # Start daemons (backgrounded, reparented to container PID 1)
+        # Give discovery a real presentation surface, then start the current
+        # standalone daemon binary on both nodes.
         for node in ("node-a", "node-b"):
-            docker_exec(
-                node,
-                "nohup flotilla daemon >/dev/null 2>~/.config/flotilla/daemon-panic.log &",
+            result = docker_exec(
+                node, "tmux new-session -d -s integration"
             )
+            assert result.returncode == 0, (
+                f"tmux start failed on {node}: {result.stderr}"
+            )
+            start_daemon(node)
 
         # Wait for daemon readiness on each node
         for node in ("node-a", "node-b"):
@@ -155,7 +213,7 @@ def topology():
         def peers_connected():
             result = flotilla_json("node-a", "host list")
             return any(
-                h["host"] == "node-b"
+                h["host_name"] == "node-b"
                 and h["connection_status"] == "Connected"
                 for h in result.get("hosts", [])
             )
@@ -167,22 +225,16 @@ def topology():
     finally:
         # Print daemon logs for debugging (daemon writes to state_dir/daemon.log)
         for node in ("node-a", "node-b"):
-            result = docker_exec(node, "cat ~/.local/state/flotilla/daemon.log")
-            if result.stdout:
-                print(f"\n=== {node} daemon log ===\n{result.stdout}")
-            panic_result = docker_exec(node, "cat ~/.config/flotilla/daemon-panic.log")
-            if panic_result.stdout:
-                print(f"\n=== {node} daemon panic log ===\n{panic_result.stdout}")
+            log = daemon_log(node)
+            if log:
+                print(f"\n=== {node} daemon log ===\n{log}")
+            stdio = docker_exec(
+                node, "cat ~/.config/flotilla/daemon-stdio.log"
+            )
+            if stdio.stdout:
+                print(f"\n=== {node} daemon stdio ===\n{stdio.stdout}")
 
-        result = subprocess.run(
-            [
-                "docker", "compose", "-f", COMPOSE_FILE,
-                "down", "-v", "--remove-orphans",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        result = compose("down", "-v", "--remove-orphans")
         if result.returncode != 0:
             print(f"\n=== teardown failed (rc={result.returncode}) ===")
             print(result.stderr)

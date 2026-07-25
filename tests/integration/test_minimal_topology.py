@@ -22,7 +22,7 @@ def test_host_list_shows_peer(topology):
     # Should see at least local host + node-b
     assert len(hosts) >= 2
 
-    peer = next((h for h in hosts if h["host"] == "node-b"), None)
+    peer = next((h for h in hosts if h["host_name"] == "node-b"), None)
     assert peer is not None, f"node-b not in host list: {hosts}"
     assert peer["connection_status"] == "Connected"
     assert not peer["is_local"]
@@ -34,37 +34,40 @@ def test_host_list_shows_local(topology):
     result = flotilla_json(topology["node-a"], "host list")
     local = next((h for h in result["hosts"] if h["is_local"]), None)
     assert local is not None, "no local host in host list"
-    assert local["host"] == "node-a"
+    assert local["host_name"] == "node-a"
 
 
 def test_topology_shows_direct_route(topology):
     """Topology shows a direct, connected route to node-b."""
     result = flotilla_json(topology["node-a"], "topology")
-    assert result["local_host"] == "node-a"
+    assert result["local_node"]["display_name"] == "node-a"
 
     routes = result["routes"]
     node_b_route = next(
-        (r for r in routes if r["target"] == "node-b"), None
+        (r for r in routes if r["target"]["display_name"] == "node-b"), None
     )
     assert node_b_route is not None, f"no route to node-b: {routes}"
     assert node_b_route["direct"]
     assert node_b_route["connected"]
-    assert node_b_route["next_hop"] == "node-b"
+    assert node_b_route["next_hop"]["display_name"] == "node-b"
 
 
 def test_host_status_peer(topology):
     """Can query node-b's status from node-a."""
     result = flotilla_json(topology["node-a"], "host node-b status")
-    assert result["host"] == "node-b"
+    assert result["host_name"] == "node-b"
     assert result["connection_status"] == "Connected"
-    assert not result["is_local"]
-    assert result["repo_count"] >= 1
+    # The query executes on node-b, so the returned status is local from
+    # node-b's point of view.
+    assert result["is_local"]
+    assert result["summary"]["host_name"] == "node-b"
+    assert result["visible_environments"]
 
 
 def test_host_providers_peer(topology):
     """Can query node-b's providers from node-a."""
     result = flotilla_json(topology["node-a"], "host node-b providers")
-    assert result["host"] == "node-b"
+    assert result["host_name"] == "node-b"
     assert result["connection_status"] == "Connected"
 
     summary = result["summary"]
@@ -83,10 +86,15 @@ def test_status_shows_repos(topology):
     assert "work_item_count" in repo
 
 
-def test_peer_repo_visible_via_host_status(topology):
-    """node-b's tracked repo is visible from node-a via host status."""
-    result = flotilla_json(topology["node-a"], "host node-b status")
-    assert result["repo_count"] >= 1
+def test_peer_repo_visible_in_merged_repo_work(topology):
+    """node-b's tracked repo is visible in node-a's merged repo work."""
+    result = flotilla_json(
+        topology["node-a"], "repo /home/flotilla/repo work"
+    )
+    assert any(
+        item.get("source") == "node-b"
+        for item in result.get("work_items", [])
+    )
 
 
 def test_remote_prepare_terminal_returns_attachable_set_id(topology):
@@ -95,13 +103,14 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
         topology["node-b"],
         "repo /home/flotilla/repo checkout --fresh feat-prepare",
     )
-    assert checkout["status"] == "checkout_created"
-    checkout_path = checkout["path"]
+    assert checkout["kind"] == "checkout_created"
+    checkout_path = checkout["path"]["path"]
 
     def checkout_visible_on_node_a():
         result = flotilla_json(topology["node-a"], "repo /home/flotilla/repo work")
         return any(
-            item.get("branch") == "feat-prepare" and item.get("host") == "node-b"
+            item.get("branch") == "feat-prepare"
+            and item.get("source") == "node-b"
             for item in result.get("work_items", [])
         )
 
@@ -117,7 +126,7 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
         f"host node-b repo /home/flotilla/repo prepare-terminal {checkout_path}",
         timeout=60,
     )
-    assert prepared["status"] == "terminal_prepared"
+    assert prepared["kind"] == "terminal_prepared"
     assert prepared.get("attachable_set_id"), (
         "remote prepare-terminal should include attachable_set_id"
     )
