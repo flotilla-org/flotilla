@@ -116,6 +116,12 @@ struct SalienceProjection {
     revision: u64,
 }
 
+#[derive(Debug, Default)]
+struct ProjectCatalogProjection {
+    projects: HashMap<QueryScope, Vec<RepositoryKey>>,
+    revision: u64,
+}
+
 #[derive(Debug, Default, Clone, bon::Builder)]
 pub struct AggregatorProjectionState {
     convoys: Arc<RwLock<QueryProjection<ConvoyRow>>>,
@@ -125,6 +131,8 @@ pub struct AggregatorProjectionState {
     checkouts: Arc<RwLock<ScopedCheckoutProjection>>,
     #[builder(skip)]
     salience: Arc<RwLock<SalienceProjection>>,
+    #[builder(skip)]
+    project_catalog: Arc<RwLock<ProjectCatalogProjection>>,
     /// Subscriber ownership and demand-backed materializations belong to the
     /// Aggregator state, shared with the daemon's subscription transport.
     demand_backed: QueryRegistry,
@@ -169,10 +177,17 @@ impl AggregatorProjectionState {
         repositories: HashMap<RepositoryKey, String>,
         projects: HashMap<QueryScope, Vec<RepositoryKey>>,
     ) -> Vec<ResultDelta> {
+        let project_scopes = {
+            let mut catalog = self.project_catalog.write().await;
+            if catalog.projects != projects {
+                catalog.projects = projects.clone();
+                catalog.revision = catalog.revision.saturating_add(1);
+            }
+            sorted_project_scopes(&catalog.projects)
+        };
         let mut deltas = self.independents.write().await.replace_catalog(repositories.clone(), projects.clone());
         deltas.extend(self.checkouts.write().await.replace_catalog(repositories, projects));
-        let scopes = self.checkouts.read().await.project_scopes();
-        self.demand_backed.replace_fleet_awareness_scopes(&scopes);
+        self.demand_backed.replace_fleet_awareness_scopes(&project_scopes);
         deltas
     }
 
@@ -276,6 +291,14 @@ impl AggregatorProjectionState {
     }
 
     pub async fn awareness_result_set(&self, scope: &Option<QueryScope>, grouping: AwarenessGrouping, limit: AwarenessLimit) -> ResultSet {
+        let (projects, project_catalog_revision) = {
+            let catalog = self.project_catalog.read().await;
+            let projects = sorted_project_scopes(&catalog.projects)
+                .into_iter()
+                .filter(|project| scope.as_ref().is_none_or(|scope| project == scope))
+                .collect::<Vec<_>>();
+            (projects, catalog.revision)
+        };
         let convoys = {
             let set = self.result_set().await;
             let rows = match set.rows {
@@ -305,11 +328,12 @@ impl AggregatorProjectionState {
                 .into_iter()
                 .max()
                 .unwrap_or(0);
-        let seq = base_seq.saturating_add(salience_revision);
+        let seq = base_seq.saturating_add(project_catalog_revision).saturating_add(salience_revision);
         let (rows, state) = project_awareness(AwarenessInput {
             scope: scope.clone(),
             grouping,
             limit,
+            projects,
             convoys,
             issues,
             checkouts,
@@ -323,7 +347,7 @@ impl AggregatorProjectionState {
     async fn issue_sets_for_awareness(&self, scope: &Option<QueryScope>) -> Vec<(QueryScope, ResultSet)> {
         let scopes = match scope {
             Some(scope) => vec![scope.clone()],
-            None => self.checkouts.read().await.project_scopes(),
+            None => sorted_project_scopes(&self.project_catalog.read().await.projects),
         };
         scopes
             .into_iter()
@@ -334,6 +358,12 @@ impl AggregatorProjectionState {
             })
             .collect()
     }
+}
+
+fn sorted_project_scopes(projects: &HashMap<QueryScope, Vec<RepositoryKey>>) -> Vec<QueryScope> {
+    let mut scopes = projects.keys().cloned().collect::<Vec<_>>();
+    scopes.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    scopes
 }
 
 fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
@@ -491,6 +521,46 @@ mod tests {
                 && node.scope.as_ref() == Some(&project)
                 && node.entries.iter().any(|entry| entry.kind == AwarenessKind::Issue)
         }));
+    }
+
+    #[tokio::test]
+    async fn fleet_awareness_emits_every_catalogued_project_including_empty_projects() {
+        let state = AggregatorProjectionState::new();
+        let active = scope("active");
+        let empty = scope("empty");
+        state
+            .replace_store_catalog(
+                HashMap::from([(RepositoryKey("repo-a".into()), "a".to_string())]),
+                HashMap::from([(active.clone(), vec![]), (empty.clone(), vec![])]),
+            )
+            .await;
+        let active_convoy = convoy_row("flotilla", "ship-it", "active");
+        {
+            let mut convoys = state.write().await;
+            convoys.local_rows.insert(active_convoy.resource.clone(), active_convoy);
+        }
+
+        let result = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        let Rows::Awareness { rows, .. } = result.rows else { panic!("awareness rows") };
+
+        assert_eq!(rows.len(), 2);
+        let empty_node = rows.iter().find(|node| node.scope.as_ref() == Some(&empty)).expect("empty project awareness node");
+        assert_eq!(empty_node.state, flotilla_protocol::AwarenessState::Idle);
+        assert_eq!(empty_node.counts, flotilla_protocol::AwarenessCounts::default());
+        assert!(empty_node.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_project_catalog_changes_advance_awareness_sequence() {
+        let state = AggregatorProjectionState::new();
+        state.write().await.seq = 10;
+        let before = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+
+        state.replace_store_catalog(HashMap::new(), HashMap::from([(scope("empty"), vec![])])).await;
+
+        let after = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
+        assert!(after.seq > before.seq);
+        assert_eq!(after.rows.as_awareness().expect("awareness rows").len(), 1);
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ pub struct AwarenessInput {
     pub scope: Option<QueryScope>,
     pub grouping: AwarenessGrouping,
     pub limit: AwarenessLimit,
+    pub projects: Vec<QueryScope>,
     pub convoys: Vec<ConvoyRow>,
     pub issues: Vec<ScopedIssueRow>,
     pub checkouts: Vec<CheckoutRow>,
@@ -51,6 +52,14 @@ struct Group {
 pub fn project_awareness(input: AwarenessInput) -> (Vec<AwarenessNode>, ResultSetState) {
     let as_of = input.state.demand.as_ref().map_or_else(Utc::now, |metadata| metadata.as_of);
     let mut groups = BTreeMap::<String, Group>::new();
+
+    if input.grouping == AwarenessGrouping::Project || input.scope.is_some() {
+        for project in input.projects.iter().filter(|project| input.scope.as_ref().is_none_or(|scope| *project == scope)) {
+            let key = group_key_for_scope(project);
+            let group = groups.entry(key.id.clone()).or_insert_with(|| Group::new(key, AwarenessKind::Project));
+            group.refs.push(project_resource_ref(&project.namespace, &project.name));
+        }
+    }
 
     for convoy in &input.convoys {
         let key = input.scope.as_ref().map(group_key_for_scope).unwrap_or_else(|| group_key_for_convoy(input.grouping, convoy));
@@ -297,7 +306,7 @@ impl Group {
             refs: Vec::new(),
             entries: Vec::new(),
             counts: AwarenessCounts::default(),
-            state: AwarenessState::Unknown,
+            state: AwarenessState::Idle,
         }
     }
 
@@ -316,9 +325,9 @@ impl Group {
             AwarenessState::Active => self.counts.active += 1,
             AwarenessState::Done => self.counts.done += 1,
             AwarenessState::Failed => self.counts.failed += 1,
-            AwarenessState::Unknown | AwarenessState::Pending | AwarenessState::Cancelled => {}
+            AwarenessState::Unknown | AwarenessState::Idle | AwarenessState::Pending | AwarenessState::Cancelled => {}
         }
-        self.state = stronger_state(self.state, entry.state);
+        self.state = if self.entries.is_empty() { entry.state } else { stronger_state(self.state, entry.state) };
         self.entries.push(entry);
     }
 }
@@ -339,21 +348,23 @@ fn group_kind_for_query(scope: Option<&QueryScope>, grouping: AwarenessGrouping)
 
 fn group_key_for_convoy(grouping: AwarenessGrouping, convoy: &ConvoyRow) -> GroupKey {
     match grouping {
-        AwarenessGrouping::Project => convoy.project_ref.as_deref().map(project_ref_key).unwrap_or_else(|| {
-            convoy
-                .repo
-                .as_ref()
-                .map_or_else(|| GroupKey::new("unparented", "Unparented"), |repo| GroupKey::new(format!("repo/{}", repo.0), repo.0.clone()))
-        }),
+        AwarenessGrouping::Project => {
+            convoy.project_ref.as_deref().map(|project| project_ref_key(&convoy.resource.namespace, project)).unwrap_or_else(|| {
+                convoy.repo.as_ref().map_or_else(
+                    || GroupKey::new("unparented", "Unparented"),
+                    |repo| GroupKey::new(format!("repo/{}", repo.0), repo.0.clone()),
+                )
+            })
+        }
         AwarenessGrouping::Convoy => GroupKey::new(format!("convoy/{}/{}", convoy.resource.namespace, convoy.name), convoy.name.clone()),
     }
 }
 
-fn project_ref_key(value: &str) -> GroupKey {
+fn project_ref_key(default_namespace: &str, value: &str) -> GroupKey {
     if let Some((namespace, name)) = value.split_once('/') {
         return GroupKey::scoped(QueryScope::new(namespace, name));
     }
-    GroupKey::new(format!("project/{value}"), value.to_string())
+    GroupKey::scoped(QueryScope::new(default_namespace, value))
 }
 
 fn convoy_label(convoy: &ConvoyRow) -> String {
@@ -402,12 +413,12 @@ fn state_rank(state: AwarenessState) -> u8 {
         AwarenessState::Active => 3,
         AwarenessState::Pending => 2,
         AwarenessState::Unknown => 1,
-        AwarenessState::Done | AwarenessState::Cancelled => 0,
+        AwarenessState::Idle | AwarenessState::Done | AwarenessState::Cancelled => 0,
     }
 }
 
-fn group_rank(group: &Group) -> (u8, std::cmp::Reverse<usize>, String) {
-    (std::cmp::Reverse(state_rank(group.state)).0, std::cmp::Reverse(group.counts.total), group.label.clone())
+fn group_rank(group: &Group) -> (std::cmp::Reverse<u8>, std::cmp::Reverse<usize>, String) {
+    (std::cmp::Reverse(state_rank(group.state)), std::cmp::Reverse(group.counts.total), group.label.clone())
 }
 
 fn entry_rank(entry: &AwarenessEntry) -> (u8, u8) {
@@ -524,6 +535,42 @@ mod tests {
 
         assert_eq!(nodes[0].label, "github.com/flotilla-org/flotilla");
         assert_eq!(nodes[0].annotations.get(REPO_FACT_ANNOTATION).map(String::as_str), Some("flotilla-org/flotilla"),);
+    }
+
+    #[test]
+    fn project_grouping_emits_idle_projects_without_children_within_the_group_limit() {
+        let active = QueryScope::new("flotilla", "active");
+        let empty = QueryScope::new("flotilla", "empty");
+        let overflow = QueryScope::new("flotilla", "overflow");
+
+        let (nodes, state) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Project,
+            limit: AwarenessLimit { groups: 2, entries: 32 },
+            projects: vec![empty.clone(), active.clone(), overflow],
+            convoys: vec![convoy(Some("flotilla/active"), "ship-it", ConvoyPhase::Active)],
+            ..AwarenessInput::default()
+        });
+
+        assert_eq!(nodes.len(), 2);
+        assert!(state.truncated, "project inventory remains subject to the awareness group window");
+        assert_eq!(nodes[0].scope.as_ref(), Some(&active), "active projects rank ahead of idle projects");
+        let empty_node = nodes.iter().find(|node| node.scope.as_ref() == Some(&empty)).expect("empty project node");
+        assert_eq!(empty_node.kind, AwarenessKind::Project);
+        assert_eq!(empty_node.state, AwarenessState::Idle);
+        assert_eq!(empty_node.counts, AwarenessCounts::default());
+        assert!(empty_node.entries.is_empty());
+        assert_eq!(empty_node.refs, vec![project_resource_ref("flotilla", "empty")]);
+    }
+
+    #[test]
+    fn convoy_grouping_does_not_turn_empty_projects_into_convoy_nodes() {
+        let (nodes, _) = project_awareness(AwarenessInput {
+            grouping: AwarenessGrouping::Convoy,
+            projects: vec![QueryScope::new("flotilla", "empty")],
+            ..AwarenessInput::default()
+        });
+
+        assert!(nodes.is_empty());
     }
 
     #[test]
