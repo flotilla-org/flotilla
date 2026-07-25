@@ -4,7 +4,7 @@
 //! live session get a host-qualified `flotilla attach`; everything else truthfully
 //! lists without a recipe until `flotilla view <address>` (ADR 0013,
 //! flotilla-org/flotilla#589) gives scoped views a command. The connector
-//! owns the GroupPath → address mapping when that lands.
+//! owns the entity-facts → action-address mapping.
 
 use flotilla_protocol::{arg::shell_quote, HostName};
 

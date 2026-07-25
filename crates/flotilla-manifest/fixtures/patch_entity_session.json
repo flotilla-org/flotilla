@@ -1,0 +1,77 @@
+{
+  "set": {
+    "display.label": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "terminal-impl-coder"
+      }
+    },
+    "entity.id": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "feta/dev/terminal-impl-coder"
+      }
+    },
+    "entity.kind": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "session"
+      }
+    },
+    "flotilla.crew.role": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "coder"
+      }
+    },
+    "flotilla.session": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "feta/dev/terminal-impl-coder"
+      }
+    },
+    "source": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "flotilla"
+      }
+    },
+    "status.state": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "active"
+      }
+    }
+  },
+  "source_id": "flotilla-connector",
+  "target": {
+    "kind": "entity",
+    "value": {
+      "id": "feta/dev/terminal-impl-coder",
+      "kind": "session"
+    }
+  },
+  "type": "metadata-patch",
+  "unset": []
+}

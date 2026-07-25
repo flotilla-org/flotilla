@@ -19,15 +19,12 @@ use flotilla_core::{
     providers::{registry::ProviderRegistry, types::WorkspaceAttachRequest},
     HostName,
 };
-use flotilla_manifest::{
-    projection::{project_segment, repo_segment, vessel_factory_id, vessel_group_path},
-    stamp::WorkspaceStamp,
-};
+use flotilla_manifest::{entity, stamp::WorkspaceStamp};
 use flotilla_protocol::{arg, EnvironmentId};
 use flotilla_resources::{
     controller::{LabelJoinWatch, ReconcileOutcome, Reconciler, SecondaryWatch},
-    Convoy, Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, Repository, ResourceBackend, ResourceError,
-    ResourceObject, TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL, VESSEL_LABEL,
+    Environment, Host, Presentation, PresentationStatus, PresentationStatusPatch, ResourceBackend, ResourceError, ResourceObject,
+    TerminalSession, TerminalSessionPhase, TypedResolver, CONVOY_LABEL, VESSEL_LABEL,
 };
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -89,6 +86,7 @@ pub struct ResolvedProcess {
     pub role: String,
     pub labels: BTreeMap<String, String>,
     pub attach_command: String,
+    pub host: HostName,
 }
 
 #[derive(Debug, Clone)]
@@ -208,8 +206,6 @@ pub struct PresentationReconciler<R> {
     terminal_sessions: TypedResolver<TerminalSession>,
     environments: TypedResolver<Environment>,
     hosts: TypedResolver<Host>,
-    convoys: TypedResolver<Convoy>,
-    repositories: TypedResolver<Repository>,
     hop_chain: HopChainContext,
     policies: Arc<PresentationPolicyRegistry>,
 }
@@ -227,8 +223,6 @@ impl<R> PresentationReconciler<R> {
             terminal_sessions: backend.clone().using::<TerminalSession>(namespace),
             environments: backend.clone().using::<Environment>(namespace),
             hosts: backend.clone().using::<Host>(namespace),
-            convoys: backend.clone().using::<Convoy>(namespace),
-            repositories: backend.using::<Repository>(namespace),
             hop_chain,
             policies,
         }
@@ -266,51 +260,31 @@ impl<R> PresentationReconciler<R> {
         let attach_args = pool.attach_args(attach_target.session_id, attach_target.launch_command, &session_cwd, &Vec::new())?;
         let attach_command = self.build_attach_command(session, &environment, host_ref, attach_args)?;
 
-        Ok(ResolvedProcess { role: session.spec.role.clone(), labels: session.metadata.labels.clone(), attach_command })
+        Ok(ResolvedProcess {
+            role: session.spec.role.clone(),
+            labels: session.metadata.labels.clone(),
+            attach_command,
+            host: self.hop_chain.target_host(host_ref),
+        })
     }
 
-    /// The manifest stamp for this presentation's workspace: the vessel's
-    /// GroupPath spine, built exactly as the connector's catalog builds it so
-    /// the tab and the vessel land on the same group node.
-    async fn workspace_stamp(&self, obj: &ResourceObject<Presentation>) -> WorkspaceStamp {
+    /// The canonical entity represented by this presentation's workspace.
+    ///
+    /// The connector derives grouping independently from the entity's flat
+    /// facts; the actuator stamps only identity.
+    fn workspace_stamp(&self, obj: &ResourceObject<Presentation>, processes: &[ResolvedProcess]) -> WorkspaceStamp {
         let namespace = &obj.metadata.namespace;
         let convoy_name = &obj.spec.convoy_ref;
         let vessel = obj.spec.process_selector.get(VESSEL_LABEL).or_else(|| obj.metadata.labels.get(VESSEL_LABEL));
-        // Tab stamps have no TTL, so a wrong scope would stick: on a failed
-        // dependency lookup, stamp no scope at all (honestly absent — the
-        // pane identities still group the tab) rather than an incomplete
-        // spine.
-        let scope = match (vessel, self.convoys.get(convoy_name).await) {
-            (Some(vessel), Ok(convoy)) => {
-                let project = project_segment(convoy.spec.project_ref.as_deref());
-                let repo_value = match convoy.spec.sole_repository() {
-                    Some(snapshot) => match self.repositories.get(&snapshot.repo_ref.to_string()).await {
-                        Ok(repository) => Some(repository.spec.repo_fact_value()),
-                        Err(err) => {
-                            warn!(%err, repository = %snapshot.repo_ref, convoy = %convoy_name, "repository lookup failed; stamping workspace without a scope");
-                            return WorkspaceStamp {
-                                kind: "flotilla-vessel".to_owned(),
-                                factory_id: vessel_factory_id(namespace, convoy_name, vessel),
-                                scope: None,
-                            };
-                        }
-                    },
-                    None => None,
-                };
-                let repo = repo_segment(repo_value.as_deref());
-                Some(vessel_group_path(project, repo, namespace, convoy_name, vessel))
-            }
-            (_, Err(err)) => {
-                warn!(%err, convoy = %convoy_name, "convoy lookup failed; stamping workspace without a scope");
-                None
-            }
-            (None, Ok(_)) => {
-                warn!(presentation = %obj.metadata.name, convoy = %convoy_name, "presentation has no vessel selector; stamping workspace without a scope");
-                None
-            }
-        };
         let factory_vessel = vessel.map_or(obj.spec.name.as_str(), String::as_str);
-        WorkspaceStamp { kind: "flotilla-vessel".to_owned(), factory_id: vessel_factory_id(namespace, convoy_name, factory_vessel), scope }
+        WorkspaceStamp {
+            entity: entity::vessel(
+                namespace,
+                convoy_name,
+                factory_vessel,
+                processes.first().map(|process| process.host.as_str()).unwrap_or("fleet"),
+            ),
+        }
     }
 
     fn build_attach_command(
@@ -420,11 +394,11 @@ where
         let plan = PresentationPlan::builder()
             .policy(obj.spec.presentation_policy_ref.clone())
             .name(obj.spec.name.clone())
-            .crew(processes)
+            .crew(processes.clone())
             .presentation_local_cwd(self.hop_chain.presentation_local_cwd())
             .maybe_previous(previous)
             .spec_hash(spec_hash)
-            .stamp(self.workspace_stamp(obj).await)
+            .stamp(self.workspace_stamp(obj, &processes))
             .build();
 
         // This dependency fetch intentionally performs the runtime apply. The apply result is the

@@ -14,10 +14,7 @@ use flotilla_core::{
         ProcessCommandRunner,
     },
 };
-use flotilla_manifest::{
-    projection::{convoy_group_path, project_segment, repo_segment, vessel_factory_id, vessel_group_path},
-    stamp::WorkspaceStamp,
-};
+use flotilla_manifest::{entity, stamp::WorkspaceStamp};
 use flotilla_protocol::{arg::shell_quote, HostName, RepoKey, ResourceRef};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +32,10 @@ pub struct OpenInPmTarget {
 
 impl OpenInPmTarget {
     pub fn resource_ref(&self) -> ResourceRef {
-        let convoy = ResourceRef::new("flotilla.work/v1", "Convoy", &self.namespace, &self.convoy);
+        let mut convoy = ResourceRef::new("flotilla.work/v1", "Convoy", &self.namespace, &self.convoy);
+        if let Some(host) = &self.host {
+            convoy = convoy.on_host(host.clone());
+        }
         self.vessel.as_ref().map_or_else(|| convoy.clone(), |vessel| convoy.subresource(format!("vessels/{vessel}")))
     }
 }
@@ -61,19 +61,10 @@ impl PresentationPmConnector {
     }
 
     fn stamp(target: &OpenInPmTarget) -> WorkspaceStamp {
-        let project = project_segment(target.project_ref.as_deref());
-        let repo = repo_segment(target.repo_hint.as_ref().map(|repo| repo.0.as_str()));
+        let origin = target.host.as_ref().map(HostName::as_str).unwrap_or("fleet");
         match &target.vessel {
-            Some(vessel) => WorkspaceStamp {
-                kind: "flotilla-vessel".to_owned(),
-                factory_id: vessel_factory_id(&target.namespace, &target.convoy, vessel),
-                scope: Some(vessel_group_path(project, repo, &target.namespace, &target.convoy, vessel)),
-            },
-            None => WorkspaceStamp {
-                kind: "flotilla-convoy".to_owned(),
-                factory_id: format!("flotilla:convoys/{}/{}", target.namespace, target.convoy),
-                scope: Some(convoy_group_path(project, repo, &target.namespace, &target.convoy)),
-            },
+            Some(vessel) => WorkspaceStamp { entity: entity::vessel(&target.namespace, &target.convoy, vessel, origin) },
+            None => WorkspaceStamp { entity: entity::convoy(&target.namespace, &target.convoy, origin) },
         }
     }
 
@@ -97,27 +88,28 @@ impl PresentationPmConnector {
 impl PmConnector for PresentationPmConnector {
     async fn open(&self, target: &OpenInPmTarget, working_directory: &Path) -> Result<(), String> {
         let stamp = Self::stamp(target);
+        let stamp_key = stamp.entity.action_target();
         let workspace_name = Self::workspace_name(target);
         let mut realized = self.realized.lock().await;
         if let Some(workspace_ref) = target.workspace_ref.as_deref().filter(|reference| self.workspace_ref_belongs_to_manager(reference)) {
             if self.manager.select_workspace(workspace_ref).await.is_ok() {
-                realized.insert(stamp.factory_id, workspace_ref.to_owned());
+                realized.insert(stamp_key.clone(), workspace_ref.to_owned());
                 return Ok(());
             }
         }
 
-        if let Some(workspace_ref) = realized.get(&stamp.factory_id).cloned() {
+        if let Some(workspace_ref) = realized.get(&stamp_key).cloned() {
             if self.manager.select_workspace(&workspace_ref).await.is_ok() {
                 return Ok(());
             }
-            realized.remove(&stamp.factory_id);
+            realized.remove(&stamp_key);
         }
 
         if let Some((workspace_ref, _)) =
             self.manager.list_workspaces().await?.into_iter().find(|(_, workspace)| workspace.name == workspace_name)
         {
             self.manager.select_workspace(&workspace_ref).await?;
-            realized.insert(stamp.factory_id, workspace_ref);
+            realized.insert(stamp_key, workspace_ref);
             return Ok(());
         }
 
@@ -131,7 +123,7 @@ impl PmConnector for PresentationPmConnector {
             .stamp(stamp.clone())
             .build();
         let (workspace_ref, _) = self.manager.create_workspace(&request).await?;
-        realized.insert(stamp.factory_id, workspace_ref);
+        realized.insert(stamp.entity.action_target(), workspace_ref);
         Ok(())
     }
 }
@@ -152,10 +144,6 @@ mod tests {
     use std::sync::Mutex;
 
     use flotilla_core::providers::types::Workspace;
-    use flotilla_manifest::{
-        keys::{SEGMENT_CONVOY, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL},
-        wire::{GroupPath, GroupSegment},
-    };
 
     use super::*;
 
@@ -256,16 +244,10 @@ mod tests {
         assert_eq!(created[0].0, "dev/tables/implement");
         assert_eq!(created[0].1, vec![("implement".into(), "'/opt/flotilla' attach 'terminal-implement'".into())]);
         let stamp = created[0].2.as_ref().expect("workspace stamp");
-        assert_eq!(stamp.factory_id, "flotilla:convoys/dev/tables/implement");
         assert_eq!(
-            stamp.scope,
-            Some(GroupPath(vec![
-                GroupSegment::text(SEGMENT_PROJECT, "flotilla"),
-                GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla"),
-                GroupSegment::text(SEGMENT_CONVOY, "dev/tables").with_label("tables"),
-                GroupSegment::text(SEGMENT_VESSEL, "implement"),
-            ])),
-            "the live workspace stamp must match the catalog's latent vessel path"
+            stamp.entity,
+            entity::vessel("dev", "tables", "implement", "kiwi"),
+            "the live workspace stamp carries only canonical semantic identity"
         );
     }
 

@@ -1,39 +1,30 @@
 {
   "set": {
-    "factory.id": {
+    "entity.id": {
       "ordinal": null,
       "precedence": null,
       "ttl_ms": null,
       "value": {
         "type": "text",
-        "value": "flotilla:convoys/dev/manifest-extraction/implement"
+        "value": "dev/manifest-extraction/implement@feta"
       }
     },
-    "tab.kind": {
+    "entity.kind": {
       "ordinal": null,
       "precedence": null,
       "ttl_ms": null,
       "value": {
         "type": "text",
-        "value": "flotilla-vessel"
+        "value": "vessel"
       }
     },
-    "tab.scope": {
+    "source": {
       "ordinal": null,
       "precedence": null,
       "ttl_ms": null,
       "value": {
-        "type": "group-path",
-        "value": [
-          {
-            "key": "vcs.repo",
-            "label": "flotilla",
-            "value": {
-              "type": "text",
-              "value": "flotilla-org/flotilla"
-            }
-          }
-        ]
+        "type": "text",
+        "value": "flotilla"
       }
     }
   },

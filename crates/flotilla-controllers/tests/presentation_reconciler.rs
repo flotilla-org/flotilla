@@ -24,10 +24,7 @@ use flotilla_core::{
     },
     HostName,
 };
-use flotilla_manifest::{
-    keys::{SEGMENT_CONVOY, SEGMENT_PROJECT, SEGMENT_REPO, SEGMENT_VESSEL},
-    wire::{GroupPath, GroupSegment},
-};
+use flotilla_manifest::entity;
 use flotilla_protocol::arg::Arg;
 use flotilla_resources::{
     controller::Reconciler, Convoy, ConvoyRepositorySpec, ConvoySpec, Environment, EnvironmentSpec, EnvironmentStatus,
@@ -255,15 +252,7 @@ async fn dispatched_convoy_workspace_stamp_uses_project_and_repository_dialect()
     reconciler.fetch_dependencies(&presentation).await.expect("dependencies");
 
     let plans = runtime.apply_calls.lock().expect("apply calls lock");
-    assert_eq!(
-        plans[0].stamp.as_ref().and_then(|stamp| stamp.scope.clone()),
-        Some(GroupPath(vec![
-            GroupSegment::text(SEGMENT_PROJECT, "platform"),
-            GroupSegment::text(SEGMENT_REPO, "flotilla-org/flotilla").with_label("flotilla"),
-            GroupSegment::text(SEGMENT_CONVOY, "flotilla/convoy-a").with_label("convoy-a"),
-            GroupSegment::text(SEGMENT_VESSEL, "implement"),
-        ]))
-    );
+    assert_eq!(plans[0].stamp.as_ref().map(|stamp| &stamp.entity), Some(&entity::vessel("flotilla", "convoy-a", "implement", "local")));
 }
 
 #[tokio::test]
@@ -602,11 +591,7 @@ async fn provider_runtime_threads_the_workspace_stamp_into_the_attach_request() 
     registry.presentation_managers.prefer_by_implementation("pm");
     let runtime = ProviderPresentationRuntime::new(Arc::new(registry), Arc::clone(&policies));
 
-    let stamp = flotilla_manifest::stamp::WorkspaceStamp {
-        kind: "flotilla-vessel".to_string(),
-        factory_id: "flotilla:convoys/flotilla/convoy-a/implement".to_string(),
-        scope: None,
-    };
+    let stamp = flotilla_manifest::stamp::WorkspaceStamp { entity: entity::vessel("flotilla", "convoy-a", "implement", "local") };
     runtime
         .apply(
             &PresentationPlan::builder()
@@ -820,5 +805,6 @@ fn resolved_process(role: &str, attach_command: &str) -> flotilla_controllers::r
         role: role.to_string(),
         labels: BTreeMap::new(),
         attach_command: attach_command.to_string(),
+        host: HostName::new("local"),
     }
 }

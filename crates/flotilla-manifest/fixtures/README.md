@@ -6,11 +6,10 @@ implementations**, not written by hand. They pin the mirrored types in
 deserialize each fixture with the mirror and require value-identical JSON on
 re-serialization.
 
-- Generated: 2026-07-13
-- Source of truth: `andamento-shared` at andamento commit
-  `f4f0a35d71b9eb129a8bdbac1d5d25c63cc11814`
+- Generated: 2026-07-25
+- Source of truth: the sibling `andamento/crates/andamento-shared` checkout
 - Generator: `generator/` (not a workspace member — it path-depends on a
-  local andamento checkout; edit the path in its `Cargo.toml` to yours)
+  sibling andamento checkout)
 
 **Never hand-edit these files.** If a round-trip test fails after an
 andamento change, regenerate against andamento and adapt the mirror:

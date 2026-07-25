@@ -17,7 +17,7 @@
 //! | `source` | Producer provenance (`flotilla` here; other producers use their own stable name). |
 //! | `flotilla.session` | Canonical `<host>/<namespace>/<session>` pane-to-catalog join identity. |
 //! | `flotilla.vessel` | Vessel name bound to a pane. |
-//! | `flotilla.convoy` | Canonical `<namespace>/<convoy>` resource identity on panes and path segments. |
+//! | `flotilla.convoy` | Canonical `<namespace>/<convoy>@<origin>` resource identity on panes and path segments. |
 //! | `flotilla.namespace` | Resource namespace bound to a pane. |
 //! | `flotilla.host` | Host bound to a pane. |
 //! | `flotilla.crew.role` | One bound pane's crew role. |
@@ -31,23 +31,27 @@
 //! | `flotilla.independent.host` | Host currently carrying an independent terminal session. |
 //! | `flotilla.vessel.env` | Execution-environment reference for a vessel. |
 //! | `flotilla.crew.roles` | Complete crew-role list aboard a vessel. |
+//! | `entity.kind` | Canonical presentation entity kind. |
+//! | `entity.id` | Canonical id in that kind's single permitted dialect. |
+//! | `display.label` | Concise human label, never identity. |
 //! | `status.state` | Normalized `idle`, `waiting`, `active`, `done`, or `failed` badge state. |
 //! | `status.attention` | Boolean human-attention demand. |
 //! | `status.connectivity` | Connectivity annotation (`connected` or `disconnected`); reserved until emitted. |
 //! | `summary.text` | Short human summary, never an identity. |
-//! | `tab.scope` | Typed [`MetadataValue::GroupPath`] locating a materialized tab or identity. |
-//! | `tab.kind` | Stable workspace/tab kind. |
-//! | `materialize.target` | Kind produced by a recipe (`workspace` or `pane`). |
-//! | `materialize.recipe` | Command address used to materialize an entry. |
-//! | `factory.id` | Stable cross-producer dedupe identity. |
+//! | `action.primary.key` | Stable verb for the primary action. |
+//! | `action.primary.label` | Human label for the primary action. |
+//! | `action.primary.vehicle` | Execution vehicle for the action. |
+//! | `action.primary.target` | Stable focus/deduplication target. |
+//! | `action.primary.recipe` | Command address used to materialize an entry, when known. |
 //!
-//! Group path segment keys are equally single-dialect:
+//! Hierarchy facts are equally single-dialect. The presentation manager
+//! derives paths from them using its active grouping template:
 //!
 //! | Segment key | Value |
 //! | --- | --- |
 //! | `flotilla.project` | Project resource name, and only present when Project knowledge exists. |
 //! | `vcs.repo` | Canonical forge slug, falling back to Repository's `host:path` identity when slugless. |
-//! | `flotilla.convoy` | `<namespace>/<convoy>` resource identity. |
+//! | `flotilla.convoy` | `<namespace>/<convoy>@<origin>` resource identity. |
 //! | `flotilla.vessel` | Convoy vessel name. |
 //! | `flotilla.independent` | Independent terminal-session name. |
 //! | `flotilla.checkout` | Checkout awareness-entry identity. |
@@ -56,6 +60,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub use crate::entity::{EntityKind, EntityRef};
 
 /// A metadata fact value.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -132,15 +138,12 @@ pub enum MetadataPathValue {
     StringList(Vec<String>),
 }
 
-/// A hierarchical grouping path — the catalog's project → convoy → vessel
-/// spine is expressed as one of these per group target.
+/// A presentation-side hierarchical grouping path.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct GroupPath(pub Vec<GroupSegment>);
 
 impl GroupPath {
-    /// This path as a scope *value* (for `tab.scope` facts). Nested
-    /// group-path values are unrepresentable in path segments and are
-    /// skipped; the catalog only builds paths from text segments.
+    /// Convert a derived presentation path into the generic metadata value.
     pub fn to_scope_value(&self) -> MetadataValue {
         let segments = self
             .0
@@ -228,7 +231,7 @@ pub enum MetadataTarget {
     Root,
     Pane(PaneTarget),
     Tab(u64),
-    Group(GroupPath),
+    Entity(EntityRef),
     Identity(MetadataIdentity),
 }
 

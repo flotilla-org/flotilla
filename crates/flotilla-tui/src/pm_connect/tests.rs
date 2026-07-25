@@ -5,8 +5,9 @@ use std::sync::{
 
 use async_trait::async_trait;
 use flotilla_manifest::{
-    keys::{KEY_SESSION, KEY_SOURCE, KEY_STATUS_STATE, SEGMENT_INDEPENDENT, SEGMENT_ISSUE, SEGMENT_PROJECT, SOURCE_FLOTILLA},
-    wire::{GroupPath, GroupSegment, MetadataIdentity, MetadataTarget, MetadataValue},
+    entity,
+    keys::{KEY_SOURCE, KEY_STATUS_STATE, SOURCE_FLOTILLA},
+    wire::{EntityKind, EntityRef, MetadataTarget, MetadataValue},
 };
 use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessState, SessionPhase},
@@ -72,12 +73,8 @@ fn mint() -> FlotillaRecipes {
     FlotillaRecipes::new("flotilla")
 }
 
-fn independent_group(name: &str) -> MetadataTarget {
-    MetadataTarget::Group(GroupPath(vec![GroupSegment::text(SEGMENT_INDEPENDENT, name)]))
-}
-
-fn session_identity(value: &str) -> MetadataTarget {
-    MetadataTarget::Identity(MetadataIdentity { key: KEY_SESSION.to_owned(), value: MetadataValue::text(value) })
+fn independent_entity(name: &str) -> MetadataTarget {
+    MetadataTarget::Entity(entity::session(&format!("feta/dev/{name}")))
 }
 
 #[test]
@@ -125,19 +122,18 @@ fn rebuild_publishes_diffs_not_repeats() {
     state.apply_event(&independents_set(1, vec![independent_row("scratch", SessionPhase::Running)]));
 
     let first = state.rebuild(&mint());
-    assert!(first.iter().any(|patch| patch.target == independent_group("scratch")));
-    assert!(first.iter().any(|patch| patch.target == session_identity("feta/dev/scratch")));
+    assert!(first.iter().any(|patch| patch.target == independent_entity("scratch")));
 
     assert!(state.rebuild(&mint()).is_empty(), "unchanged rows publish nothing");
 
     let removed = independent_row("scratch", SessionPhase::Running).resource;
     state.apply_event(&independents_delta(2, vec![], vec![removed]));
     let after_removal = state.rebuild(&mint());
-    let group_patch =
-        after_removal.iter().find(|patch| patch.target == independent_group("scratch")).expect("unset patch for removed independent");
-    assert_eq!(group_patch.set.len(), 1, "retractions retain only producer provenance");
-    assert_eq!(group_patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
-    assert!(group_patch.unset.contains(&KEY_STATUS_STATE.to_owned()));
+    let entity_patch =
+        after_removal.iter().find(|patch| patch.target == independent_entity("scratch")).expect("unset patch for removed independent");
+    assert_eq!(entity_patch.set.len(), 1, "retractions retain only producer provenance");
+    assert_eq!(entity_patch.set[KEY_SOURCE].value, MetadataValue::text(SOURCE_FLOTILLA));
+    assert!(entity_patch.unset.contains(&KEY_STATUS_STATE.to_owned()));
 }
 
 #[test]
@@ -148,15 +144,11 @@ fn rebuild_prefers_awareness_transport_when_available() {
 
     let patches = state.rebuild(&mint());
 
-    assert!(patches.iter().any(|patch| {
-        patch.target
-            == MetadataTarget::Group(GroupPath(vec![
-                GroupSegment::text(SEGMENT_PROJECT, "platform"),
-                GroupSegment::text(SEGMENT_ISSUE, "issue/flotilla-org/flotilla/862").with_label("#862 awareness band"),
-            ]))
-    }));
+    assert!(patches
+        .iter()
+        .any(|patch| { patch.target == MetadataTarget::Entity(EntityRef::new(EntityKind::Issue, "issue/flotilla-org/flotilla/862",)) }));
     assert!(
-        !patches.iter().any(|patch| patch.target == independent_group("scratch")),
+        !patches.iter().any(|patch| patch.target == independent_entity("scratch")),
         "raw independent fallback is not projected once awareness is available"
     );
 }
@@ -262,17 +254,16 @@ async fn connector_publishes_bootstrap_deltas_gap_recovery_and_reasserts() {
         Duration::from_millis(50),
     ));
 
-    // Bootstrap: the independent's group and identity facts are published.
+    // Bootstrap: the independent session entity is published.
     wait_until(|| {
         let patches = sink.recorded();
-        patches.iter().any(|patch| patch.target == independent_group("scratch"))
-            && patches.iter().any(|patch| patch.target == session_identity("feta/dev/scratch"))
+        patches.iter().any(|patch| patch.target == independent_entity("scratch"))
     })
     .await;
 
     // A contiguous delta publishes the change.
     daemon.tx.send(independents_delta(2, vec![independent_row("yeoman", SessionPhase::Running)], vec![])).expect("send delta");
-    wait_until(|| sink.recorded().iter().any(|patch| patch.target == independent_group("yeoman"))).await;
+    wait_until(|| sink.recorded().iter().any(|patch| patch.target == independent_entity("yeoman"))).await;
 
     // The reassert tick republishes the full catalog.
     let seen = sink.recorded().len();

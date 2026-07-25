@@ -1,0 +1,151 @@
+{
+  "set": {
+    "action.primary.key": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "materialize"
+      }
+    },
+    "action.primary.label": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "Open"
+      }
+    },
+    "action.primary.recipe": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "flotilla attach --host 'feta' 'implement'"
+      }
+    },
+    "action.primary.target": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "vessel:dev/manifest-extraction/implement@feta"
+      }
+    },
+    "action.primary.vehicle": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "workspace"
+      }
+    },
+    "entity.id": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "dev/manifest-extraction/implement@feta"
+      }
+    },
+    "entity.kind": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "vessel"
+      }
+    },
+    "flotilla.convoy": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "dev/manifest-extraction@feta"
+      }
+    },
+    "flotilla.convoy.name": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "manifest extraction"
+      }
+    },
+    "flotilla.vessel": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "dev/manifest-extraction/implement@feta"
+      }
+    },
+    "flotilla.vessel.name": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "implement"
+      }
+    },
+    "flotilla.work.phase": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "running"
+      }
+    },
+    "source": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "flotilla"
+      }
+    },
+    "status.state": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "active"
+      }
+    },
+    "vcs.repo": {
+      "ordinal": null,
+      "precedence": null,
+      "ttl_ms": 30000,
+      "value": {
+        "type": "text",
+        "value": "flotilla-org/flotilla"
+      }
+    }
+  },
+  "source_id": "flotilla-connector",
+  "target": {
+    "kind": "entity",
+    "value": {
+      "id": "dev/manifest-extraction/implement@feta",
+      "kind": "vessel"
+    }
+  },
+  "type": "metadata-patch",
+  "unset": [
+    "status.attention"
+  ]
+}

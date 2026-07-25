@@ -5,7 +5,7 @@
 use std::{collections::BTreeMap, env, fs, path::Path};
 
 use andamento_shared::{
-    ExternalMessage, GroupPath, GroupSegment, MetadataIdentity, MetadataPatch, MetadataPathSegmentValue, MetadataPathValue, MetadataTarget,
+    EntityKind, EntityRef, ExternalMessage, MetadataIdentity, MetadataPatch, MetadataTarget,
     MetadataValue, MetadataValueUpdate, ObservedMetadataIdentity, PaneTarget,
 };
 
@@ -22,22 +22,6 @@ fn update(value: MetadataValue, ttl_ms: Option<u64>) -> MetadataValueUpdate {
     }
 }
 
-fn segment(key: &str, value: &str, label: Option<&str>) -> GroupSegment {
-    GroupSegment {
-        key: key.to_owned(),
-        value: text(value),
-        label: label.map(str::to_owned),
-    }
-}
-
-fn path_segment(key: &str, value: &str, label: Option<&str>) -> MetadataPathSegmentValue {
-    MetadataPathSegmentValue {
-        key: key.to_owned(),
-        value: MetadataPathValue::Text(value.to_owned()),
-        label: label.map(str::to_owned),
-    }
-}
-
 fn patch(target: MetadataTarget, source_id: &str, set: Vec<(&str, MetadataValueUpdate)>, unset: Vec<&str>) -> ExternalMessage {
     ExternalMessage::MetadataPatch(MetadataPatch {
         target,
@@ -47,12 +31,11 @@ fn patch(target: MetadataTarget, source_id: &str, set: Vec<(&str, MetadataValueU
     })
 }
 
-fn group_target_vessel() -> MetadataTarget {
-    MetadataTarget::Group(GroupPath(vec![
-        segment("vcs.repo", "flotilla-org/flotilla", None),
-        segment("flotilla.convoy", "dev/manifest-extraction", Some("manifest extraction")),
-        segment("flotilla.vessel", "implement", None),
-    ]))
+fn entity_target(kind: EntityKind, id: &str) -> MetadataTarget {
+    MetadataTarget::Entity(EntityRef {
+        kind,
+        id: id.to_owned(),
+    })
 }
 
 fn main() {
@@ -60,41 +43,42 @@ fn main() {
     let out = Path::new(&out);
     fs::create_dir_all(out).expect("create out dir");
 
-    // 1. Catalog patch: Group target, TTL'd facts, one unset — the design §7 shape.
-    let group_patch = patch(
-        group_target_vessel(),
+    // 1. Catalog patch: a stable entity target with flat facts and one unset.
+    let entity_patch = patch(
+        entity_target(EntityKind::Vessel, "dev/manifest-extraction/implement@feta"),
         "flotilla-connector",
         vec![
+            ("entity.kind", update(text("vessel"), Some(30_000))),
+            ("entity.id", update(text("dev/manifest-extraction/implement@feta"), Some(30_000))),
+            ("vcs.repo", update(text("flotilla-org/flotilla"), Some(30_000))),
+            ("flotilla.convoy", update(text("dev/manifest-extraction@feta"), Some(30_000))),
+            ("flotilla.convoy.name", update(text("manifest extraction"), Some(30_000))),
+            ("flotilla.vessel", update(text("dev/manifest-extraction/implement@feta"), Some(30_000))),
+            ("flotilla.vessel.name", update(text("implement"), Some(30_000))),
             ("flotilla.work.phase", update(text("running"), Some(30_000))),
             ("status.state", update(text("active"), Some(30_000))),
-            ("materialize.target", update(text("pane"), Some(30_000))),
-            ("materialize.recipe", update(text("flotilla attach --host 'feta' 'implement'"), Some(30_000))),
-            ("factory.id", update(text("flotilla:convoys/dev/manifest-extraction/implement"), Some(30_000))),
+            ("source", update(text("flotilla"), Some(30_000))),
+            ("action.primary.key", update(text("materialize"), Some(30_000))),
+            ("action.primary.label", update(text("Open"), Some(30_000))),
+            ("action.primary.vehicle", update(text("workspace"), Some(30_000))),
+            ("action.primary.target", update(text("vessel:dev/manifest-extraction/implement@feta"), Some(30_000))),
+            ("action.primary.recipe", update(text("flotilla attach --host 'feta' 'implement'"), Some(30_000))),
         ],
         vec!["status.attention"],
     );
 
-    // 2. Identity patch: the session join key carrying a group-path value for tab.scope.
-    let identity_patch = patch(
-        MetadataTarget::Identity(MetadataIdentity {
-            key: "flotilla.session".to_owned(),
-            value: text("feta/dev/terminal-impl-coder"),
-        }),
+    // 2. Independent sessions remain first-class entities.
+    let session_patch = patch(
+        entity_target(EntityKind::Session, "feta/dev/terminal-impl-coder"),
         "flotilla-connector",
         vec![
-            (
-                "tab.scope",
-                update(
-                    MetadataValue::GroupPath(vec![
-                        path_segment("vcs.repo", "flotilla-org/flotilla", None),
-                        path_segment("flotilla.convoy", "dev/manifest-extraction", Some("manifest extraction")),
-                        path_segment("flotilla.vessel", "implement", None),
-                    ]),
-                    Some(30_000),
-                ),
-            ),
+            ("entity.kind", update(text("session"), Some(30_000))),
+            ("entity.id", update(text("feta/dev/terminal-impl-coder"), Some(30_000))),
+            ("flotilla.session", update(text("feta/dev/terminal-impl-coder"), Some(30_000))),
+            ("display.label", update(text("terminal-impl-coder"), Some(30_000))),
             ("flotilla.crew.role", update(text("coder"), Some(30_000))),
             ("status.state", update(text("active"), Some(30_000))),
+            ("source", update(text("flotilla"), Some(30_000))),
         ],
         vec![],
     );
@@ -104,13 +88,16 @@ fn main() {
         MetadataTarget::Pane(PaneTarget::Terminal(42)),
         "flotilla-attach",
         vec![
+            ("entity.kind", update(text("vessel"), None)),
+            ("entity.id", update(text("dev/manifest-extraction/implement@feta"), None)),
             ("flotilla.session", update(text("feta/dev/terminal-impl-coder"), None)),
-            ("flotilla.vessel", update(text("implement"), None)),
-            ("flotilla.convoy", update(text("dev/manifest-extraction"), None)),
+            ("flotilla.vessel", update(text("dev/manifest-extraction/implement@feta"), None)),
+            ("flotilla.convoy", update(text("dev/manifest-extraction@feta"), None)),
             ("flotilla.namespace", update(text("dev"), None)),
             ("flotilla.host", update(text("feta"), None)),
             ("flotilla.crew.role", update(text("coder"), None)),
             ("flotilla.attach.ref", update(text("implement"), None)),
+            ("source", update(text("flotilla"), None)),
         ],
         vec![],
     );
@@ -120,15 +107,9 @@ fn main() {
         MetadataTarget::Tab(7),
         "flotilla-actuator",
         vec![
-            ("tab.kind", update(text("flotilla-vessel"), None)),
-            ("factory.id", update(text("flotilla:convoys/dev/manifest-extraction/implement"), None)),
-            (
-                "tab.scope",
-                update(
-                    MetadataValue::GroupPath(vec![path_segment("vcs.repo", "flotilla-org/flotilla", Some("flotilla"))]),
-                    None,
-                ),
-            ),
+            ("entity.kind", update(text("vessel"), None)),
+            ("entity.id", update(text("dev/manifest-extraction/implement@feta"), None)),
+            ("source", update(text("flotilla"), None)),
         ],
         vec![],
     );
@@ -179,10 +160,10 @@ fn main() {
     ];
 
     let fixtures: Vec<(&str, serde_json::Value)> = vec![
-        ("patch_group_catalog.json", serde_json::to_value(&group_patch).expect("serialize")),
-        ("patch_identity_session.json", serde_json::to_value(&identity_patch).expect("serialize")),
+        ("patch_entity_catalog.json", serde_json::to_value(&entity_patch).expect("serialize")),
+        ("patch_entity_session.json", serde_json::to_value(&session_patch).expect("serialize")),
         ("patch_pane_stamp.json", serde_json::to_value(&pane_patch).expect("serialize")),
-        ("patch_tab_factory.json", serde_json::to_value(&tab_patch).expect("serialize")),
+        ("patch_tab_entity.json", serde_json::to_value(&tab_patch).expect("serialize")),
         ("patch_value_variants.json", serde_json::to_value(&variants_patch).expect("serialize")),
         ("patch_pane_plugin.json", serde_json::to_value(&plugin_pane_patch).expect("serialize")),
         ("observed_identities.json", serde_json::to_value(&observed).expect("serialize")),
