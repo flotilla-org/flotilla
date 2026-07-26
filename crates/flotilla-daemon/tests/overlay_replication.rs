@@ -346,3 +346,82 @@ async fn a_peer_relays_another_origins_project_definition() {
     );
     drop(feta_gouda);
 }
+
+#[tokio::test]
+async fn a_peer_relays_another_origins_home_bound_runtime_resource() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let gouda = daemon(temp.path().join("gouda"), "gouda-root", "gouda").await;
+    kiwi.resource_backend()
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder().name("kiwi-session".to_string()).build(),
+            &TerminalSessionSpec::builder()
+                .env_ref("env".to_string())
+                .role("coder".to_string())
+                .source(TerminalSessionSource::Tool { command: "true".to_string() })
+                .cwd("/tmp".to_string())
+                .pool("passthrough".to_string())
+                .build(),
+        )
+        .await
+        .expect("create TerminalSession on kiwi");
+
+    let kiwi_feta = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect kiwi and feta");
+    let kiwi_origin = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions =
+                feta.resource_backend().including_replicas::<TerminalSession>("flotilla").list().await.expect("list feta sessions");
+            if let Some(session) = sessions.items.into_iter().find(|session| session.object.metadata.name == "kiwi-session") {
+                match session.provenance {
+                    ResourceProvenance::Replica { origin_root, .. } => break origin_root,
+                    ResourceProvenance::Local => panic!("kiwi TerminalSession must be a replica on feta"),
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("kiwi-to-feta TerminalSession replication timed out");
+    drop(kiwi_feta);
+
+    let feta_gouda = spawn_in_memory_request_topology(Arc::clone(&feta), Arc::clone(&gouda)).await.expect("connect feta and gouda");
+    let relayed_origin = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions =
+                gouda.resource_backend().including_replicas::<TerminalSession>("flotilla").list().await.expect("list gouda sessions");
+            if let Some(session) = sessions.items.into_iter().find(|session| session.object.metadata.name == "kiwi-session") {
+                match session.provenance {
+                    ResourceProvenance::Replica { origin_root, .. } => break origin_root,
+                    ResourceProvenance::Local => panic!("relayed TerminalSession must remain a replica"),
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("feta did not relay kiwi TerminalSession to gouda");
+    assert_eq!(relayed_origin, kiwi_origin, "relay must preserve the first hop's origin");
+    assert!(
+        gouda
+            .resource_backend()
+            .using::<TerminalSession>("flotilla")
+            .list()
+            .await
+            .expect("gouda local TerminalSession log")
+            .items
+            .is_empty(),
+        "relay must not re-author the TerminalSession on gouda"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut raw_session_watch = watch_resource_kind_replica_sources(&feta.resource_backend(), "flotilla", "terminalsessions")
+        .await
+        .expect("watch raw TerminalSession replica sources");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), raw_session_watch.stream.next()).await.is_err(),
+        "peers must not echo an unchanged third-origin TerminalSession indefinitely"
+    );
+    drop(feta_gouda);
+}

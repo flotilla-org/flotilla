@@ -42,9 +42,8 @@ pub(super) async fn serve_resource_http(mut stream: UnixStream, first_byte: u8, 
         return write_error(&mut stream, 404, "unknown resource API path").await;
     };
     let query = parse_query(raw_query);
-    let include_replicas =
-        ["includeReplicas", "include-replicas", "include_replicas"].iter().filter_map(|key| query.get(*key)).any(|value| value == "true");
-    let replica_sources = query.get("replicaSources").is_some_and(|value| value == "true");
+    let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
+    let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
     let watch = query.get("watch").is_some_and(|value| value == "true");
 
     if !watch {
@@ -98,6 +97,10 @@ fn parse_query(raw_query: &str) -> BTreeMap<String, String> {
         .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+fn query_flag(query: &BTreeMap<String, String>, names: &[&str]) -> bool {
+    names.iter().filter_map(|name| query.get(*name)).any(|value| value == "true")
 }
 
 async fn stream_watch(stream: &mut UnixStream, mut watch: DynamicResourceWatch) -> Result<(), String> {

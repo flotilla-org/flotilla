@@ -11,7 +11,9 @@ define_resource!(Project, "projects", ProjectSpec, (), NoStatusPatch, replicatio
 pub struct ProjectSpec {
     pub display_name: String,
     pub default_workflow_ref: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Definitions-class fields must serialize `None` as JSON null so clearing
+    // an optional value participates in the field-level causal merge.
+    #[serde(default)]
     pub issue_source: Option<IssueSource>,
     #[builder(default)]
     #[serde(default)]

@@ -92,11 +92,18 @@ impl<T: Resource> DefinitionResolver<T> {
         let next_counter = context.get(&local_root).copied().unwrap_or_default().saturating_add(1);
         let dot = CausalDot { author_root: local_root.clone(), author_counter: next_counter };
         let now = Utc::now();
+        let has_value_changes =
+            requested.iter().any(|(field, value)| current_spec.as_ref().and_then(|current| current.get(field)) != Some(value));
+        let resolves_existing_view = current.is_some() && !has_value_changes;
 
         for (field, value) in &requested {
             let path = format!("spec.{field}");
             let value_changed = current_spec.as_ref().and_then(|current| current.get(field)) != Some(value);
-            let resolves_conflict = merge.conflicts.contains_key(&path);
+            // A full-spec apply cannot distinguish an echoed merged value from
+            // an intentional choice of that sibling. Treat a pure no-op apply
+            // as conflict resolution, but do not let an edit to one field
+            // silently collapse conflicts in untouched fields.
+            let resolves_conflict = resolves_existing_view && merge.conflicts.contains_key(&path);
             if value_changed || resolves_conflict || current.is_none() {
                 changed = true;
                 merge.fields.insert(path, FieldMergeMetadata { dot: dot.clone(), seen: context.clone(), written_at: now });

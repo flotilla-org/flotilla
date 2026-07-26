@@ -3,9 +3,9 @@ use std::{collections::BTreeSet, time::Duration};
 use chrono::Utc;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
-    Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, OwnerReference, PrincipalRef,
-    Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
+    Convoy, Demand, DemandAddressee, DemandKind, DemandPoolRef, DemandSpec, InMemoryBackend, InputMeta, IssueSource, OwnerReference,
+    PrincipalRef, Project, ProjectRepositorySpec, ProjectSpec, Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RepositoryKey,
+    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, TypedResolver, WatchEvent, WatchStart, WorkflowTemplate,
 };
 use futures::StreamExt;
 use tokio::time::timeout;
@@ -371,6 +371,81 @@ pub async fn assert_project_definition_causal_merge_with_backend(backend: Resour
     ] {
         assert_eq!(merged.spec.display_name, "Feta Widgets");
         assert!(merged.metadata.merge.as_ref().expect("definition merge metadata").conflicts.is_empty());
+    }
+}
+
+pub async fn assert_project_definition_optional_field_can_be_cleared_with_backend(backend: ResourceBackend) {
+    let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
+    let feta_root = flotilla_protocol::NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = backend.with_local_root(feta_root.clone());
+    let meta = InputMeta::builder().name("widgets".to_string()).build();
+    let mut original = project_spec("Widgets", "default");
+    original.issue_source = Some(IssueSource { service: "github".to_string(), scope: "acme/widgets".to_string() });
+
+    kiwi.definitions::<Project>("flotilla").apply(&meta, &original).await.expect("create Project with issue source");
+    let baseline = kiwi.using::<Project>("flotilla").list().await.expect("list Project baseline");
+    feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla").replace(&baseline, Utc::now()).await.expect("replicate baseline");
+
+    let mut cleared = feta.definitions::<Project>("flotilla").get("widgets").await.expect("get replicated Project").spec;
+    cleared.issue_source = None;
+    feta.definitions::<Project>("flotilla").apply(&meta, &cleared).await.expect("clear replicated issue source");
+    assert_eq!(
+        feta.definitions::<Project>("flotilla").get("widgets").await.expect("get locally cleared Project").spec.issue_source,
+        None,
+        "an explicit null must causally supersede the replicated value"
+    );
+
+    let feta_log = feta.using::<Project>("flotilla").list().await.expect("list cleared Project log");
+    kiwi.replica_writer::<Project>(feta_root, "flotilla").replace(&feta_log, Utc::now()).await.expect("replicate cleared Project");
+    for merged in [
+        kiwi.definitions::<Project>("flotilla").get("widgets").await.expect("cleared Project on kiwi"),
+        feta.definitions::<Project>("flotilla").get("widgets").await.expect("cleared Project on feta"),
+    ] {
+        assert_eq!(merged.spec.issue_source, None);
+        assert!(merged.metadata.merge.as_ref().expect("definition merge metadata").conflicts.is_empty());
+    }
+}
+
+pub async fn assert_project_definition_edit_preserves_unrelated_conflict_with_backend(backend: ResourceBackend) {
+    let kiwi_root = flotilla_protocol::NodeId::new("kiwi-root");
+    let feta_root = flotilla_protocol::NodeId::new("feta-root");
+    let kiwi = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(kiwi_root.clone());
+    let feta = backend.with_local_root(feta_root.clone());
+    let meta = InputMeta::builder().name("widgets".to_string()).build();
+
+    kiwi.definitions::<Project>("flotilla").apply(&meta, &project_spec("Widgets", "default")).await.expect("create Project baseline");
+    let baseline = kiwi.using::<Project>("flotilla").list().await.expect("list Project baseline");
+    feta.replica_writer::<Project>(kiwi_root.clone(), "flotilla").replace(&baseline, Utc::now()).await.expect("replicate baseline");
+
+    kiwi.definitions::<Project>("flotilla").apply(&meta, &project_spec("Kiwi Widgets", "kiwi-flow")).await.expect("concurrent kiwi edit");
+    feta.definitions::<Project>("flotilla").apply(&meta, &project_spec("Feta Widgets", "feta-flow")).await.expect("concurrent feta edit");
+    let kiwi_log = kiwi.using::<Project>("flotilla").list().await.expect("list kiwi edit");
+    let feta_log = feta.using::<Project>("flotilla").list().await.expect("list feta edit");
+    kiwi.replica_writer::<Project>(feta_root.clone(), "flotilla").replace(&feta_log, Utc::now()).await.expect("sync feta edit");
+    feta.replica_writer::<Project>(kiwi_root, "flotilla").replace(&kiwi_log, Utc::now()).await.expect("sync kiwi edit");
+
+    let conflicted = feta.definitions::<Project>("flotilla").get("widgets").await.expect("get conflicted Project");
+    let conflicts = &conflicted.metadata.merge.as_ref().expect("definition merge metadata").conflicts;
+    assert!(conflicts.contains_key("spec.display_name"));
+    assert!(conflicts.contains_key("spec.default_workflow_ref"));
+
+    let mut resolved_display_name = conflicted.spec;
+    resolved_display_name.display_name = "Resolved Widgets".to_string();
+    feta.definitions::<Project>("flotilla").apply(&meta, &resolved_display_name).await.expect("resolve only the display-name conflict");
+    let resolution_log = feta.using::<Project>("flotilla").list().await.expect("list partial resolution");
+    kiwi.replica_writer::<Project>(feta_root, "flotilla").replace(&resolution_log, Utc::now()).await.expect("replicate partial resolution");
+
+    for merged in [
+        kiwi.definitions::<Project>("flotilla").get("widgets").await.expect("partially resolved Project on kiwi"),
+        feta.definitions::<Project>("flotilla").get("widgets").await.expect("partially resolved Project on feta"),
+    ] {
+        let conflicts = &merged.metadata.merge.as_ref().expect("definition merge metadata").conflicts;
+        assert!(!conflicts.contains_key("spec.display_name"), "the edited field should be resolved");
+        assert!(
+            conflicts.contains_key("spec.default_workflow_ref"),
+            "editing one field must not resolve an unrelated conflict echoed from the merged view"
+        );
     }
 }
 
